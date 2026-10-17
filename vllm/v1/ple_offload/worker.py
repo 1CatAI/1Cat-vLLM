@@ -246,7 +246,8 @@ def _prefault_module_storage(modules: Iterable[torch.nn.Module]) -> int:
         return 0
 
     page_bytes = int(os.sysconf("SC_PAGE_SIZE"))
-    chunk_bytes = 256 * 1024 * 1024
+    # Small steps: this runs beside the serving loop, so return the GIL often.
+    chunk_bytes = 16 * 1024 * 1024
     checksum = 0
     started = time.perf_counter()
     for view in storage_views:
@@ -563,7 +564,15 @@ class PleOffloadWorker:
             # READY means that the process can immediately serve requests. Wait
             # for every DP/TP worker to register before notifying the parent.
             runner.accept_registrations(pull_socket, num_workers)
-            _prefault_module_storage(runner._layers.values())
+            # Prefault only warms pages of the disk-backed table: rows are
+            # served from the same mapping meanwhile. Touching ~26 GiB took
+            # ~2 min, all of it on the startup critical path.
+            threading.Thread(
+                target=_prefault_module_storage,
+                args=(list(runner._layers.values()),),
+                name="ple-prefault",
+                daemon=True,
+            ).start()
             ready_writer.send(
                 {
                     "status": PleOffloadWorker.READY_STR,

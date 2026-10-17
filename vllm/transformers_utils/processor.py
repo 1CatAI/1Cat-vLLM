@@ -161,6 +161,27 @@ def get_processor_cls_name_from_config(
     return None
 
 
+def _from_pretrained_with_tokenizer(cls, processor_name, *args, **kwargs):
+    """``cls.from_pretrained`` that attaches a given tokenizer afterwards.
+
+    Transformers deep-copies its kwargs at each nested ``from_pretrained``,
+    so a passed tokenizer (large vocabulary maps) was copied several times:
+    ~6 s per processor build, ~23 s of multimodal startup warmup. Loading
+    from the same path and attaching the caller's tokenizer is equivalent.
+    """
+    tokenizer = kwargs.pop("tokenizer", None)
+    if tokenizer is None:
+        return cls.from_pretrained(processor_name, *args, **kwargs)
+    try:
+        processor = cls.from_pretrained(processor_name, *args, **kwargs)
+    except (OSError, ValueError, TypeError):
+        # The path holds no tokenizer files: let the processor take ours.
+        return cls.from_pretrained(processor_name, *args, tokenizer=tokenizer, **kwargs)
+    if "tokenizer" in getattr(processor, "attributes", ()):
+        processor.tokenizer = tokenizer
+    return processor
+
+
 def get_processor(
     processor_name: str,
     *args: Any,
@@ -187,7 +208,8 @@ def get_processor(
         # and explicit processor_cls is not set.
         if isinstance(processor_cls, tuple) or processor_cls == ProcessorMixin:
             _processor_cls = registered_processor_cls or AutoProcessor
-            processor = _processor_cls.from_pretrained(
+            processor = _from_pretrained_with_tokenizer(
+                _processor_cls,
                 processor_name,
                 *args,
                 revision=revision,
@@ -195,7 +217,8 @@ def get_processor(
                 **kwargs,
             )
         elif issubclass(processor_cls, ProcessorMixin):
-            processor = processor_cls.from_pretrained(
+            processor = _from_pretrained_with_tokenizer(
+                processor_cls,
                 processor_name,
                 *args,
                 revision=revision,
