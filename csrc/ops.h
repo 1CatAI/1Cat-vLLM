@@ -981,6 +981,10 @@ int64_t ple_fast_lane_start(
     bool clamp_tokens, std::optional<torch::Tensor> draft_ring,
     int64_t ring_reqs, int64_t ring_spec);
 torch::Tensor ple_fast_lane_stats(int64_t handle);
+
+std::vector<torch::Tensor> gguf_dmv13_decode_pack(torch::Tensor raw,
+                                                   int64_t gtype,
+                                                   int64_t num_threads);
 void ple_fast_lane_stop(int64_t handle);
 
 void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,

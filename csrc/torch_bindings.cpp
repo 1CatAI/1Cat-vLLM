@@ -219,6 +219,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("ple_fast_lane_stats", &ple_fast_lane_stats);
   ops.def("ple_fast_lane_stop(int handle) -> ()");
   ops.impl("ple_fast_lane_stop", &ple_fast_lane_stop);
+  // GGUF -> dense_mv (dmv13) decode+pack on the host (startup weight prep).
+  ops.def(
+      "gguf_dmv13_decode_pack(Tensor raw, int gtype, int num_threads) -> "
+      "Tensor[]");
+  ops.impl("gguf_dmv13_decode_pack", torch::kCPU, &gguf_dmv13_decode_pack);
 
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
 #ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C

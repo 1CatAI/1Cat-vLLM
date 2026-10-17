@@ -192,8 +192,33 @@ def _shard_key(raw, qtype):
     return raw.data_ptr(), tuple(raw.shape), int(qtype)
 
 
-def _decode_pack(raw, qtype):
+# GGUF type -> (block bytes, elements per block) for the native packer.
+_BLOCKS = {8: (34, 32), 12: (144, 256), 13: (176, 256), 14: (210, 256),
+           20: (18, 32), 23: (136, 256)}
+
+
+def _native_packer():
+    try:
+        return torch.ops._C.gguf_dmv13_decode_pack
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _pack_threads() -> int:
+    return max(1, min(8, (os.cpu_count() or 1) // 4))
+
+
+def _decode_pack(raw, qtype, threads: int = 1):
     """(format, rows, cols, codes, high, scale) of one raw GGUF shard."""
+    native = _native_packer()
+    if native is not None and qtype in _BLOCKS:
+        # Byte-identical to dense.pack(*dense.decode(...)) below.
+        host = raw.detach().cpu().contiguous()
+        codes, high, scale = native(host, qtype, threads)
+        block_bytes, block_elems = _BLOCKS[qtype]
+        cols = host.shape[1] // block_bytes * block_elems
+        return (_DENSE_FORMATS[qtype], host.shape[0], cols, codes.numpy(),
+                high.numpy(), scale.numpy())
     fmt, q, s, m, gs = dense.decode(raw.detach().cpu().numpy(), qtype)
     codes, high, scale = dense.pack(fmt, q, s, m, gs)
     if fmt == dense.LUT4:
@@ -217,9 +242,13 @@ def prepack(layers) -> None:
             shards.extend(found)
     if not shards:
         return
-    workers = max(1, min(8, (os.cpu_count() or 1) // 4))
-    with ThreadPoolExecutor(workers) as pool:
-        results = list(pool.map(lambda shard: _decode_pack(*shard), shards))
+    workers = _pack_threads()
+    if _native_packer() is not None:
+        # The native packer parallelizes tiles itself.
+        results = [_decode_pack(*shard, threads=workers) for shard in shards]
+    else:
+        with ThreadPoolExecutor(workers) as pool:
+            results = list(pool.map(lambda shard: _decode_pack(*shard), shards))
     for (raw, qtype), result in zip(shards, results):
         _PREPACKED[_shard_key(raw, qtype)] = result
 
