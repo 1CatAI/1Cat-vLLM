@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 # Model knobs (PORT_DESIGN §5.5: "--ds41-*" flags are L-CORE knobs)
 ENGRAM_DIR_KNOB = "VLLM_DS41_CORE_ENGRAM_DIR"
 SPILL_KNOB = "VLLM_DS41_CORE_SPILL_EXPERTS_PER_LAYER"
+SPILL_RANKING_KNOB = "VLLM_DS41_CORE_SPILL_RANKING"   # dir of layer<L>.npy routing counts (VLLM_DS41_MOE_ROUTE_HIST)
 LAYER_SUBSET_KNOB = "VLLM_DS41_CORE_LAYER_SUBSET"   # e.g. "0,1,2,3": run only these backbone layers (I1 / smoke)
 LAYER_SUBSET_ALLOW_KNOB = "VLLM_DS41_CORE_ALLOW_LAYER_SUBSET"   # must be 1 too: a subset is a debug-only partial model
 # L-ATTN's cross-stage KV-mirror check (ds41/attn kv_mirror.py MIRROR_CHECK_ENV / PP_KEY_KV20_CRC; contracts.py is
@@ -266,11 +267,12 @@ class DeepseekV41Model(nn.Module):
                 engram_row_dir(vllm_config.model_config.model), vllm_config.model_config.tokenizer,
                 max_tokens, device, io_threads=engram_io_threads(pp.world_size))
         self.spill: ExpertSpillPlan | None = None
-        n_spill = knobs.env_int(SPILL_KNOB, 0, minimum=0, maximum=C.N_EXPERTS - 1)
-        if n_spill > 0:
+        self.n_spill = knobs.env_int(SPILL_KNOB, 0, minimum=0, maximum=C.N_EXPERTS - 1)
+        self.spill_ranking_dir = knobs.env_str(SPILL_RANKING_KNOB, "")
+        if self.n_spill > 0:
             from .moe import make_spill_plan
 
-            self.spill = make_spill_plan(n_spill, C.N_EXPERTS)
+            self.spill = make_spill_plan(self.n_spill, C.N_EXPERTS)
 
         if self.pp_is_first:
             self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size,
@@ -283,7 +285,7 @@ class DeepseekV41Model(nn.Module):
             if not self._in_subset(layer_id):
                 return PPMissingLayer()
             return DeepseekV41DecoderLayer(vllm_config, prefix, layer_topology(config, layer_id), self.stage,
-                                           self.shared, self._engram_service, self.spill)
+                                           self.shared, self._engram_service, self._spill_plan(layer_id))
 
         layers_prefix = f"{prefix}.layers"
         self.start_layer, self.end_layer, self.layers = make_layers(config.num_hidden_layers, build,
@@ -308,6 +310,26 @@ class DeepseekV41Model(nn.Module):
 
             self.mirror = DeepseekV41KVSourceMirror(vllm_config, C.CAND_SOURCE, self.shared)
         self.norm = DeepseekV41Norm(C.HIDDEN) if self.pp_is_last else PPMissingLayer()
+
+    def _spill_plan(self, layer_id: int) -> ExpertSpillPlan | None:
+        """The layer's expert spill: without SPILL_RANKING the highest ids, else the least-routed experts of the
+        layer's decode-step counts (row 1 of ``layer<L>.npy``, written by VLLM_DS41_MOE_ROUTE_HIST)."""
+        if self.spill is None or not self.spill_ranking_dir:
+            return self.spill
+        import numpy as np
+
+        from .moe import spill_plan_from_ranking
+
+        path = os.path.join(self.spill_ranking_dir, f"layer{layer_id:02d}.npy")
+        counts = np.load(path)
+        if counts.shape != (2, C.N_EXPERTS) or counts[1].sum() <= 0:
+            raise ValueError(f"{SPILL_RANKING_KNOB}: {path} has shape {counts.shape} / no decode counts; expected "
+                             f"int64 [2, {C.N_EXPERTS}] with row 1 > 0")
+        plan = spill_plan_from_ranking(self.n_spill, counts[1])
+        spilled_share = counts[1][list(plan.spilled_expert_ids)].sum() / counts[1].sum()
+        logger.info("DeepSeek-V4.1 layer %d: ranked spill of %d experts carries %.1f%% of decode routes (%s)",
+                    layer_id, self.n_spill, 100.0 * spilled_share, path)
+        return plan
 
     def _in_subset(self, layer_id: int) -> bool:
         return self.layer_subset is None or layer_id in self.layer_subset

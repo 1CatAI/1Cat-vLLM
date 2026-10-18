@@ -20,7 +20,10 @@ gate-up GEMV, the combine fused into the down GEMV); larger T uses cuBLAS with F
 Knobs (``knobs.py`` helpers): ``VLLM_DS41_MOE_IMPL`` = sm70 | torch (per-expert FP32-dequantised oracle, §7.1);
 ``VLLM_DS41_MOE_BACKEND`` = skinny | turbomind; ``VLLM_DS41_MOE_DECODE_GEMV`` (default 1);
 ``VLLM_DS41_MOE_TOPK_CHECK`` (default 0: all-gathers a router-id checksum across TP each step and asserts
-equality, §4.1; debug only — it syncs the host, so it refuses to run under CUDA-graph capture: use enforce_eager).
+equality, §4.1; debug only — it syncs the host, so it refuses to run under CUDA-graph capture: use enforce_eager);
+``VLLM_DS41_MOE_ROUTE_HIST`` = directory (default unset: off): TP rank 0 counts the router's expert ids per layer and
+rewrites ``layer<L>.npy`` = int64 [2, n_experts] (row 0 all tokens, row 1 decode steps, T <= 8) after every
+forward. The input for a ranked expert spill (§5.2); it syncs the host each step, so measure speed without it.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import math
+import os
 from collections.abc import Iterator
 
 import numpy as np
@@ -38,7 +42,8 @@ from torch.nn import Parameter
 
 import vllm._custom_ops as ops
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group, tensor_model_parallel_all_reduce
+from vllm.distributed import (get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size, get_tp_group,
+                              tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEConfig, FusedMoEMethodBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.utils import set_weight_attrs
@@ -55,6 +60,7 @@ IMPL_KNOB = "VLLM_DS41_MOE_IMPL"
 BACKEND_KNOB = "VLLM_DS41_MOE_BACKEND"
 DECODE_GEMV_KNOB = "VLLM_DS41_MOE_DECODE_GEMV"
 TOPK_CHECK_KNOB = "VLLM_DS41_MOE_TOPK_CHECK"
+ROUTE_HIST_KNOB = "VLLM_DS41_MOE_ROUTE_HIST"
 _GATE_TARGET_MAX = 32768.0  # largest |W| * 2^e kept in FP16 (half the FP16 range, leaves headroom)
 
 _SPILL: contextvars.ContextVar[ExpertSpillPlan | None] = contextvars.ContextVar("ds41_moe_spill", default=None)
@@ -161,6 +167,10 @@ class DeepseekV41MoE(nn.Module):
         self.decode_gemv = knobs.env_bool(DECODE_GEMV_KNOB, True)
         self.topk_check = knobs.env_bool(TOPK_CHECK_KNOB, False)
         self.tp_size = get_tensor_model_parallel_world_size()
+        hist_dir = knobs.env_str(ROUTE_HIST_KNOB, "")
+        self.route_hist_path = (os.path.join(hist_dir, f"layer{layer_id:02d}.npy")
+                                if hist_dir and get_tensor_model_parallel_rank() == 0 else None)
+        self.route_hist = np.zeros((2, self.n_experts), dtype=np.int64)
         quant_config = vllm_config.quant_config
         self.gate = DeepseekV41Gate(self.n_experts, self.hidden)
         with expert_spill_context(spill):
@@ -236,11 +246,22 @@ class DeepseekV41MoE(nn.Module):
         topk_w, topk_ids = self.route(self.gate_logits(x))
         if self.topk_check and self.tp_size > 1:
             self._check_topk_consistent(topk_ids)
+        if self.route_hist_path is not None:
+            self._record_routes(topk_ids)
         y_slots = self.method.expert_slots(self.experts, x, topk_ids)
         out = self.shared_and_combine(x, y_slots, topk_w)
         if self.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
         return out
+
+    def _record_routes(self, topk_ids: torch.Tensor) -> None:
+        counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=self.n_experts).cpu().numpy()
+        self.route_hist[0] += counts
+        if topk_ids.shape[0] <= 8:
+            self.route_hist[1] += counts
+        tmp = f"{self.route_hist_path}.tmp.npy"
+        np.save(tmp, self.route_hist)
+        os.replace(tmp, self.route_hist_path)
 
     def _check_topk_consistent(self, topk_ids: torch.Tensor) -> None:
         if torch.cuda.is_current_stream_capturing():
