@@ -9,6 +9,8 @@
   permutation, so each partition runs its own launch on its own weight stack.
 * ``swiglu_fp32``: the reference SwiGLU with the training clamps (up to ``[-limit, limit]``, gate to
   ``<= limit``), computed in FP32 and rounded to FP16 once (ref:m.py:840-848; §4.1 "clamp + SiLU in FP32").
+* ``stage_spilled``: copies the routed spilled experts of one decode step from their UVA host stacks into a small HBM
+  stage, masked on the device so it lives inside decode CUDA graphs (expert spill staging, gpubox).
 * ``combine_fp32``: ``out = sum_j w[t, j] * y[t * top_k + j] + shared[t]`` in FP32, slot order, separate
   multiply and add (no FMA), so it reproduces :func:`combine_reference` bit for bit.
 
@@ -267,3 +269,49 @@ def combine_fp32(
         enable_fp_fusion=False,
     )
     return out
+
+
+# Words copied per program of the spill stage; 4096 int32 (16 KiB) keeps ~180 programs in flight per W13 expert, which
+# is what lifts the PCIe read from the skinny kernel's latency-bound in-place rate to ~10 GB/s (spill_microbench, case D).
+STAGE_BLOCK = 4096
+
+
+@triton.jit
+def _stage_spilled_kernel(src_ptr, dst_ptr, gids_ptr, goff_ptr, n_words, BLOCK: tl.constexpr):
+    g = tl.program_id(0)
+    used = tl.load(goff_ptr + g + 1) > tl.load(goff_ptr + g)
+    expert = tl.load(gids_ptr + g).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = (offs < n_words) & used
+    words = tl.load(src_ptr + expert * n_words + offs, mask=mask)
+    tl.store(dst_ptr + g.to(tl.int64) * n_words + offs, words, mask=mask)
+
+
+def stage_spilled_reference(src: torch.Tensor, dst: torch.Tensor, gids: torch.Tensor, goff: torch.Tensor) -> None:
+    """Torch twin of :func:`stage_spilled`: slot ``g`` of ``dst`` receives expert ``gids[g]`` of ``src`` when group
+    ``g`` owns slots (``goff[g] < goff[g + 1]``); slots of empty groups are left as they were."""
+    for g in range(dst.shape[0]):
+        if int(goff[g + 1]) > int(goff[g]):
+            dst[g].copy_(src[int(gids[g])])
+
+
+def stage_spilled(src: torch.Tensor, dst: torch.Tensor, gids: torch.Tensor, goff: torch.Tensor) -> None:
+    """Copy the routed spilled experts into an HBM stage (expert spill staging, decode only).
+
+    ``src`` [E_spill, ...] uint8 is the UVA view of a spilled weight stack, ``dst`` [S, ...] uint8 the stage (same
+    per-expert shape), ``gids``/``goff`` the spilled partition's group table from :func:`route_prep` with at least ``S``
+    groups. Device-side masking (no host sync), so it is captured inside decode CUDA graphs; the grouped skinny kernel
+    then reads stage slot ``g`` for group ``g``."""
+    slots = dst.shape[0]
+    if src.dtype != torch.uint8 or dst.dtype != torch.uint8 or src.shape[1:] != dst.shape[1:]:
+        raise TypeError(f"stage_spilled: uint8 stacks of one expert shape needed, got {tuple(src.shape)} -> {tuple(dst.shape)}")
+    if gids.numel() < slots or goff.numel() < slots + 1:
+        raise ValueError(f"stage_spilled: group table of {gids.numel()} groups is smaller than the {slots}-slot stage")
+    per_expert = dst[0].numel()
+    if per_expert % 4:
+        raise ValueError(f"stage_spilled: {per_expert} bytes per expert is not a whole number of int32 words")
+    src_w = src.view(src.shape[0], -1).view(torch.int32)
+    dst_w = dst.view(slots, -1).view(torch.int32)
+    n_words = per_expert // 4
+    _stage_spilled_kernel[(slots, triton.cdiv(n_words, STAGE_BLOCK))](
+        src_w, dst_w, gids, goff, n_words, BLOCK=STAGE_BLOCK, num_warps=4)

@@ -22,6 +22,13 @@ a pageable zero tensor that ``get_accelerator_view_from_cpu_tensor`` copies into
 a failed ``cudaHostAlloc`` raises. Physical expert ids put the resident experts first; the resident and spilled
 partitions run one launch each over one shared routing permutation. The spilled weights are never allocated in HBM,
 not even during loading.
+
+Spill staging (gpubox, ``VLLM_DS41_MOE_SPILL_STAGE_SLOTS`` = S > 0): a decode step with at most S routing slots first
+copies its routed spilled experts into an S-slot HBM stage shared by all layers of the device (``mk.stage_spilled``, a
+wide masked gather at ~10 GB/s), then runs the spilled launch on the stage. The skinny kernel's own in-place UVA read is
+latency-bound (0.89 ms for one spilled route vs 0.50 ms staged, 2.4 vs 0.95 ms for two). Device-side masking only, so
+the stage lives inside decode CUDA graphs; prefill and larger batches keep the in-place read. S = 6 covers one
+sequence at top-6 for ~27 MiB per GPU.
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
     validate_mxfp4_sm70_moe_contract,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.deepseek_v41 import knobs
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from . import moe_kernels as mk
@@ -59,6 +67,19 @@ SKINNY_GRID_Y_LIMIT = 65535
 W13_SPLITK = 16
 W2_SPLITK = 6
 _PARAMS = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+STAGE_SLOTS_KNOB = "VLLM_DS41_MOE_SPILL_STAGE_SLOTS"
+# (device, per-expert shapes, slots) -> {param name: [slots, *shape] uint8 HBM stage}; layers run one after another,
+# so every spilled layer of a device shares one stage.
+_STAGES: dict[tuple, dict[str, torch.Tensor]] = {}
+
+
+def _shared_stage(device: torch.device, shapes: dict[str, tuple[int, ...]], slots: int) -> dict[str, torch.Tensor]:
+    key = (str(device), tuple(sorted(shapes.items())), slots)
+    if key not in _STAGES:
+        _STAGES[key] = {n: torch.empty((slots, *shp), dtype=torch.uint8, device=device) for n, shp in shapes.items()}
+        logger.info("DeepSeek-V4.1 MoE: %d-slot HBM stage for spilled experts on %s (%.1f MiB)", slots, device,
+                    sum(t.numel() for t in _STAGES[key].values()) / 2**20)
+    return _STAGES[key]
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
@@ -266,6 +287,11 @@ class DeepseekV41Mxfp4MoEMethod(FusedMoEMethodBase):
             gscales.append((g13.to(device=device, dtype=torch.float32).contiguous(),
                             g2.to(device=device, dtype=torch.float32).contiguous()))
         layer.ds41_gscales = gscales
+        slots = knobs.env_int(STAGE_SLOTS_KNOB, 0, minimum=0, maximum=mk.ROUTE_PREP_MAX_SMALL_SLOTS)
+        layer.ds41_stage = None
+        if slots and int(layer.ds41_n_spilled):
+            layer.ds41_stage = _shared_stage(
+                device, {n: tuple(getattr(layer, f"{n}_spill").shape[1:]) for n in _PARAMS}, slots)
         torch.accelerator.empty_cache()
 
     # ---- compute ----
@@ -297,11 +323,24 @@ class DeepseekV41Mxfp4MoEMethod(FusedMoEMethodBase):
         perm, tables = mk.route_prep(topk_ids, layer.ds41_phys_map, int(layer.ds41_n_resident), spill)
         y13 = torch.empty((num_tokens * top_k, 2 * inter), dtype=torch.float16, device=x.device)
         parts = self._partitions(layer)
-        for (w13, s13, _, _), (g13, _), (gids, goff) in zip(parts, layer.ds41_gscales, tables):
+        gscales = list(layer.ds41_gscales)
+        stage = getattr(layer, "ds41_stage", None)
+        num_slots = num_tokens * top_k
+        if spill and stage is not None and num_slots <= stage["w13_weight"].shape[0] \
+                and num_slots <= mk.ROUTE_PREP_MAX_SMALL_SLOTS:
+            gids1, goff1 = tables[1]
+            staged = tuple(stage[n][:num_slots] for n in _PARAMS)
+            for src, dst in zip(parts[1], staged):
+                mk.stage_spilled(src, dst, gids1, goff1)
+            parts[1] = staged
+            sel = gids1[:num_slots].long()
+            gscales[1] = (gscales[1][0].index_select(0, sel), gscales[1][1].index_select(0, sel))
+            tables[1] = (torch.arange(num_slots, dtype=torch.int32, device=x.device), goff1)
+        for (w13, s13, _, _), (g13, _), (gids, goff) in zip(parts, gscales, tables):
             torch.ops._C.skinny_moe_qpn_sm70(x, w13, s13, g13, perm, gids, goff, top_k, y13, False, num_tokens,
                                              layer.ds41_splitk13, 1, SKINNY_SCALE_MODE_MXFP4)
         act = mk.swiglu_fp32(y13, float(layer.swiglu_limit))
-        for (_, _, w2, s2), (_, g2), (gids, goff) in zip(parts, layer.ds41_gscales, tables):
+        for (_, _, w2, s2), (_, g2), (gids, goff) in zip(parts, gscales, tables):
             torch.ops._C.skinny_moe_qpn_sm70(act, w2, s2, g2, perm, gids, goff, top_k, y, True, num_tokens,
                                              layer.ds41_splitk2, 1, SKINNY_SCALE_MODE_MXFP4)
 
