@@ -17,7 +17,7 @@ import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.common.ple as ple_common
 import vllm.models.qwen4_exp.nvidia.ple_layer as ple_module
 from tests.utils import set_lazy_env
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.models.qwen4_exp.common.ple import (
@@ -884,6 +884,9 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     # to record the admission in.
     module._kernel_config = None
     module._disk_row_gather = True
+    module._disk_prefetch_window_bytes = (
+        KernelConfig().ple_disk_prefetch_window_kib << 10
+    )
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
