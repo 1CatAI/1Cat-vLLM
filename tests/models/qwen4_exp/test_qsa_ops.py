@@ -167,8 +167,11 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
     set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", rows)
     monkeypatch.setattr(
         qsa_ops.current_platform,
-        "is_device_capability",
+        "is_device_capability_family",
         lambda capability: capability == 70,
+    )
+    monkeypatch.setattr(
+        qsa_ops, "_flash_v100_page4_device_supported", lambda device_index: True
     )
 
     args = (
@@ -193,6 +196,49 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
     )
     set_qsa_option(monkeypatch, "qsa_xqa_page4", False)
     assert not qsa_ops._use_sm70_qsa_xqa_page4(query, *args)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    monkeypatch.setattr(
+        qsa_ops, "_flash_v100_page4_device_supported", lambda device_index: False
+    )
+    assert not qsa_ops._use_sm70_qsa_xqa_page4(query, *args)
+
+
+def _install_flash_v100(monkeypatch, flash_cuda) -> None:
+    flash_interface = ModuleType("flash_attn_v100.flash_attn_interface")
+    cast(Any, flash_interface).flash_attn_v100_cuda = flash_cuda
+    flash_package = ModuleType("flash_attn_v100")
+    cast(Any, flash_package).flash_attn_interface = flash_interface
+    monkeypatch.setitem(sys.modules, "flash_attn_v100", flash_package)
+    monkeypatch.setitem(
+        sys.modules, "flash_attn_v100.flash_attn_interface", flash_interface
+    )
+
+
+def test_flash_v100_page4_device_support_asks_the_build_per_device(monkeypatch):
+    calls = []
+
+    def device_supported(device_index):
+        calls.append(device_index)
+        return device_index == 1
+
+    supported = qsa_ops._flash_v100_page4_device_supported
+    _install_flash_v100(
+        monkeypatch,
+        SimpleNamespace(grouped_sparse_page4_device_supported=device_supported),
+    )
+    supported.cache_clear()
+    try:
+        assert supported(1)
+        assert not supported(0)
+        assert supported(1)
+        assert calls == [1, 0]
+
+        # A build without the query cannot vouch for any device.
+        _install_flash_v100(monkeypatch, SimpleNamespace())
+        supported.cache_clear()
+        assert not supported(1)
+    finally:
+        supported.cache_clear()
 
 
 def test_qsa_grouped_page4_modern_abi_forwards_quantized_kv_metadata():
@@ -271,8 +317,11 @@ def test_qsa_e4m3_page4_routes_large_mixed_batch_below_prefill_boundary(
     set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 4096)
     monkeypatch.setattr(
         qsa_ops.current_platform,
-        "is_device_capability",
+        "is_device_capability_family",
         lambda capability: capability == 70,
+    )
+    monkeypatch.setattr(
+        qsa_ops, "_flash_v100_page4_device_supported", lambda device_index: True
     )
 
     assert qsa_ops._use_sm70_qsa_xqa_page4(
@@ -303,16 +352,7 @@ def test_qsa_xqa_page4_splits_non_grouped_large_batch(
         grouped_sparse_page4_plan_fwd=lambda *args: None,
         grouped_sparse_page4_fwd=lambda *args: None,
     )
-    flash_interface = ModuleType("flash_attn_v100.flash_attn_interface")
-    cast(Any, flash_interface).flash_attn_v100_cuda = flash_cuda
-    flash_package = ModuleType("flash_attn_v100")
-    cast(Any, flash_package).flash_attn_interface = flash_interface
-    monkeypatch.setitem(sys.modules, "flash_attn_v100", flash_package)
-    monkeypatch.setitem(
-        sys.modules,
-        "flash_attn_v100.flash_attn_interface",
-        flash_interface,
-    )
+    _install_flash_v100(monkeypatch, flash_cuda)
     set_qsa_option(monkeypatch, "qsa_grouped_page4", True)
 
     calls = []

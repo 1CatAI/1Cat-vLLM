@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native page4 QSA for ranks with a multiple of six query heads (SM70).
+"""Native page4 QSA for ranks with a multiple of six query heads.
 
 A TP2 rank of Qwen3.8-Flash-Next carries 12 query heads, a single-rank stage 24.
 The native grouped/XQA page4 routes run them as consecutive 6-head pseudo-rows.
@@ -14,21 +14,12 @@ from unittest import mock
 import pytest
 import torch
 
+from tests.kernels.flash_v100_page4 import require_flash_v100_page4
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 
 PAGE_SIZE = 16
 HEAD_DIM = 256
 GROUPS = 512
-
-
-def _require_native_page4() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("native QSA page4 routes are SM70-only")
-    interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
-    if not hasattr(interface.flash_attn_v100_cuda, "grouped_sparse_page4_fwd"):
-        pytest.skip("Flash-V100 extension lacks grouped sparse page4")
 
 
 def _selection(positions: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
@@ -62,7 +53,7 @@ def _reference(query, key_cache, value_cache, indices, block_table) -> torch.Ten
 @pytest.mark.parametrize("rows", [64, 69])
 @torch.no_grad()  # inference tensors would leak into the cached page4 workspaces
 def test_sm70_qsa_page4_head_groups_match_triton(heads: int, rows: int) -> None:
-    _require_native_page4()
+    require_flash_v100_page4()
     torch.manual_seed(11)
     generator = torch.Generator().manual_seed(11)
     context = 6000

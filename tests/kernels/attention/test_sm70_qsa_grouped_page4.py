@@ -8,17 +8,7 @@ import math
 import pytest
 import torch
 
-
-def _require_grouped_page4():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("grouped QSA page4 is SM70-only")
-    interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
-    extension = interface.flash_attn_v100_cuda
-    if not hasattr(extension, "grouped_sparse_page4_fwd"):
-        pytest.skip("Flash-V100 extension lacks grouped sparse page4")
-    return extension
+from tests.kernels.flash_v100_page4 import require_flash_v100_page4
 
 
 def _grouped_page4_abi_version(extension) -> int:
@@ -32,7 +22,7 @@ def _grouped_page4_abi_version(extension) -> int:
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_e4m3"])
 @torch.inference_mode()
 def test_sm70_qsa_grouped_page4_calibrated_kv(kv_cache_dtype: str) -> None:
-    extension = _require_grouped_page4()
+    extension = require_flash_v100_page4()
     abi_version = _grouped_page4_abi_version(extension)
     if kv_cache_dtype == "fp8_e4m3" and abi_version < 2:
         pytest.skip("installed grouped page4 ABI does not support quantized K/V")

@@ -10,19 +10,15 @@ reduction order. This is not a cross-batch-shape invariance contract.
 import pytest
 import torch
 
+from tests.kernels.flash_v100_page4 import require_flash_v100_page4
+
 WIDTH = 2051
 OUTPUT_WIDTH = 4160
 
 
 @pytest.fixture
 def extension():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("requires a V100 / SM70 GPU")
-    # Import through the package like the QSA routes do. The top-level
-    # flash_attn_v100_cuda name may resolve to another tree's build, and loading
-    # both registers the extension's pybind types twice.
-    interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
-    return interface.flash_attn_v100_cuda
+    return require_flash_v100_page4()
 
 
 def make_case(kind="mixed", page_size=16, permute_selection=False):

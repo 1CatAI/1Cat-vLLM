@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 from itertools import pairwise
@@ -124,6 +125,36 @@ def _qsa_grouped_page4_supported(
     return abi_version >= 2 or (
         abi_version == 1 and kv_cache_dtype in ("auto", "float16")
     )
+
+
+@functools.cache
+def _flash_v100_page4_device_supported(device_index: int) -> bool:
+    """Whether the Flash-V100 build runs the page4 routes on this device."""
+    # Per-process scope: in a mixed pipeline the affected device is often not
+    # the first local rank, which the default scope would leave silent.
+    try:
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+    except ImportError:
+        logger.warning_once(
+            "SM70 QSA page4 routes are unavailable because Flash-V100 could "
+            "not be imported; using Triton sparse attention.",
+            scope="process",
+        )
+        return False
+    supported = getattr(
+        flash_attn_v100_cuda, "grouped_sparse_page4_device_supported", None
+    )
+    if callable(supported) and supported(device_index):
+        return True
+    logger.warning_once(
+        "SM70 QSA page4 routes are unavailable on CUDA device %d: the "
+        "Flash-V100 build has no kernel image or too little shared memory for "
+        "it (build with TORCH_CUDA_ARCH_LIST including this architecture); "
+        "using Triton sparse attention.",
+        device_index,
+        scope="process",
+    )
+    return False
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -1825,7 +1856,8 @@ def _use_sm70_qsa_xqa_page4(
     page4_rows = q.shape[0] * (q.shape[1] // _SM70_QSA_PAGE4_HEADS)
     return (
         sparse_policy().value("qsa_xqa_page4")
-        and current_platform.is_device_capability(70)
+        and current_platform.is_device_capability_family(70)
+        and _flash_v100_page4_device_supported(q.device.index)
         and (
             page4_rows >= sparse_policy().value("qsa_xqa_page4_min_rows")
             or (k_cache.dtype == torch.uint8 and page4_rows > 16)
@@ -2136,6 +2168,7 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
         "Using SM70 grouped QSA Flash-V100 page4 prefill route (rows=%d, groups=%d).",
         q.shape[0],
         q.shape[0] // _SM70_QSA_GROUPED_PAGE4_QUERIES,
+        scope="process",
     )
     return out
 
@@ -2200,6 +2233,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
         "Using SM70 QSA Flash-V100 XQA page4 prefill route (rows=%d, partitions=%d).",
         q.shape[0],
         num_partitions,
+        scope="process",
     )
     return out
 
