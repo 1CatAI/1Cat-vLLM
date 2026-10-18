@@ -416,7 +416,8 @@ def test_qsa_xqa_page4_splits_non_grouped_large_batch(
         fake_xqa_batch,
     )
 
-    cache = torch.empty(0)
+    # The route runs after the gate accepted a [blocks, page, kv_heads, 256] cache.
+    cache = torch.empty(1, 16, 1, 256, dtype=torch.float16)
     logical_indices = torch.empty(rows, 2051, dtype=torch.int32)
     block_table = torch.empty(4, 1, dtype=torch.int32)
     token_to_req = torch.empty(rows, dtype=torch.int32)

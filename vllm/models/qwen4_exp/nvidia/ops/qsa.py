@@ -1816,12 +1816,19 @@ def _qsa_xqa_page4_shape_supported(
         and q.stride(2) == 1
         and k_cache.ndim == 4
         and v_cache.shape == k_cache.shape
-        and k_cache.shape[2:] == (1, 256)
+        and k_cache.shape[3] == 256
+        # Every KV head serves its own block of query heads (see the route).
+        and q.shape[1] % (_SM70_QSA_PAGE4_HEADS * k_cache.shape[2]) == 0
         and k_cache.shape[1] % 4 == 0
         and k_cache.stride(3) == v_cache.stride(3) == 1
-        and k_cache.stride(1) == v_cache.stride(1) == 256
+        and (k_cache.shape[2] == 1 or k_cache.stride(2) == v_cache.stride(2) == 256)
+        and k_cache.stride(1) == v_cache.stride(1) == k_cache.shape[2] * 256
         and k_cache.stride(0) == v_cache.stride(0)
-        and k_cache.stride(0) in (k_cache.shape[1] * 256, 2 * k_cache.shape[1] * 256)
+        and k_cache.stride(0)
+        in (
+            k_cache.shape[1] * k_cache.stride(1),
+            2 * k_cache.shape[1] * k_cache.stride(1),
+        )
         and logical_indices.shape == (q.shape[0], 2051)
         and logical_indices.dtype == torch.int32
         and logical_indices.stride(1) == 1
@@ -1837,9 +1844,14 @@ def _qsa_xqa_page4_shape_supported(
         and sequence_lengths.shape == (block_table.shape[0],)
         and sequence_lengths.dtype == torch.int32
         and sequence_lengths.stride(0) == 1
-        and k_cache.shape[0] * (k_cache.stride(0) // (4 * 256))
+        and k_cache.shape[0] * _qsa_xqa_page4_page_stride(k_cache)
         < _SM70_QSA_XQA_PAGE4_MARKER
     )
+
+
+def _qsa_xqa_page4_page_stride(k_cache: torch.Tensor) -> int:
+    """Four-token microblock IDs per cache block, counted in token-row strides."""
+    return k_cache.stride(0) // (4 * k_cache.stride(1))
 
 
 def _use_sm70_qsa_xqa_page4(
@@ -2036,8 +2048,14 @@ def _qsa_xqa_page4_physical_kv(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    microblock_stride = 4 * q.shape[2]
-    if k_cache.stride(0) == k_cache.shape[1] * q.shape[2]:
+    # A cache with several KV heads arrives here as one head's slice: its token
+    # rows are num_kv_heads * head_size apart, not head_size.
+    token_stride = k_cache.stride(1)
+    microblock_stride = 4 * token_stride
+    if (
+        token_stride == q.shape[2]
+        and k_cache.stride(0) == k_cache.shape[1] * token_stride
+    ):
         microblocks_per_cache_block = k_cache.shape[1] // 4
         physical_k_cache = k_cache.view(
             k_cache.shape[0] * microblocks_per_cache_block,
@@ -2053,7 +2071,7 @@ def _qsa_xqa_page4_physical_kv(
         physical_shape = (k_cache.shape[0], 4, 1, q.shape[2])
         physical_strides = (
             microblock_stride,
-            q.shape[2],
+            token_stride,
             q.shape[2],
             1,
         )
@@ -2122,7 +2140,7 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     grouped_pages, token_masks, grouped_sequence_lengths, lse = (
         _qsa_grouped_page4_workspace(q)
     )
-    physical_page_stride = k_cache.stride(0) // (4 * q.shape[2])
+    physical_page_stride = _qsa_xqa_page4_page_stride(k_cache)
     flash_attn_v100_cuda.grouped_sparse_page4_plan_fwd(
         logical_indices,
         block_table,
@@ -2196,7 +2214,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
         sequence_lengths,
         k_cache.shape[0],
         k_cache.shape[1],
-        k_cache.stride(0) // (4 * q.shape[2]),
+        _qsa_xqa_page4_page_stride(k_cache),
     )
     # Generic E4M3 G6 XQA supports P256 for virtual page4 caches. Its P1024
     # specialization is restricted to the page1568 layout.
@@ -2252,6 +2270,39 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor | None:
+    kv_heads = k_cache.shape[2]
+    if kv_heads > 1:
+        # A rank with several KV heads (e.g. a TP1 stage: 24 query heads, 2 KV
+        # heads) runs each KV head's block of query heads against that head's
+        # slice of the cache; the native routes take one KV head per call.
+        group_heads = q.shape[1] // kv_heads
+        for kv_head in range(kv_heads):
+            heads = slice(kv_head * group_heads, (kv_head + 1) * group_heads)
+            group_out = torch.empty(
+                (q.shape[0], group_heads, q.shape[2]),
+                dtype=out.dtype,
+                device=out.device,
+            )
+            if (
+                _qsa_sparse_paged_attention_sm70_xqa_page4(
+                    q[:, heads].contiguous(),
+                    k_cache[:, :, kv_head : kv_head + 1],
+                    v_cache[:, :, kv_head : kv_head + 1],
+                    logical_indices,
+                    block_table,
+                    token_to_req,
+                    query_positions,
+                    sequence_lengths,
+                    group_out,
+                    kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                )
+                is None
+            ):
+                return None
+            out[:, heads].copy_(group_out)
+        return out
     head_rows = q.shape[1] // _SM70_QSA_PAGE4_HEADS
     if head_rows > 1:
         # All query heads of a QSA row share one latent KV head and one
