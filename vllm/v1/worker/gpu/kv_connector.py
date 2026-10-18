@@ -29,6 +29,14 @@ if TYPE_CHECKING:
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
 
+    def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
+        """Submit deferred stores and finish those whose source block is reused.
+
+        Called before the step zeroes new blocks, precopies Mamba state or
+        writes KV; pre_forward is too late for that.
+        """
+        pass
+
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         pass
 
@@ -57,6 +65,21 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
 
         self._disabled = False
+        # Metadata whose preemptions were already handled this step.
+        self._handled_metadata: object | None = None
+
+    def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
+        # Deferred stores read blocks written by the previous step. A block
+        # freed since then may be handed out again in this step; the
+        # connector lists those stores in jobs_to_flush, and they must
+        # complete before this step zeroes, precopies or overwrites the block,
+        # or the CPU copy holds zeros (MRv1 calls this before _update_states).
+        if self._disabled:
+            return
+        kv_connector_metadata = scheduler_output.kv_connector_metadata
+        assert kv_connector_metadata is not None
+        self.kv_connector.handle_preemptions(kv_connector_metadata)
+        self._handled_metadata = kv_connector_metadata
 
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         if self._disabled:
@@ -64,7 +87,9 @@ class ActiveKVConnector(KVConnector):
 
         kv_connector_metadata = scheduler_output.kv_connector_metadata
         assert kv_connector_metadata is not None
-        self.kv_connector.handle_preemptions(kv_connector_metadata)
+        if self._handled_metadata is not kv_connector_metadata:
+            self.kv_connector.handle_preemptions(kv_connector_metadata)
+        self._handled_metadata = None
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
         # TODO: sort out KV Connectors' use of forward_context
