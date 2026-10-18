@@ -932,6 +932,11 @@ class KernelConfig:
     ple_row_cache_mib: int = Field(default=1536, ge=0)
     """Packed-row cache (MiB) for CPU-owned GGUF PLE: the native fast lane's
     cache when it serves requests, otherwise the mapped row reader's."""
+    ple_disk_prefetch_window_kib: int = Field(default=4096, ge=0)
+    """Page-cache read-ahead (KiB) the mapped row reader keeps ahead of its
+    copy, which walks the rows in address order; 0 copies without read-ahead.
+    Advising a whole long request up front let reclaim drop the pages under
+    memory pressure before the copy reached them."""
 
     ple_pinned_decode: bool = True
     """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
@@ -1068,6 +1073,7 @@ class KernelConfig:
             "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
+            "ple_disk_prefetch_window_kib",  # Page-cache advice; same rows
             "ple_draft_prefetch",  # Page-cache readahead; results unchanged
             "ple_fast_lane",  # Same packed rows through a native owner thread
             "ple_disk_row_readers",

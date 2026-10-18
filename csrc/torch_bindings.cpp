@@ -197,12 +197,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def(
       "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
-      "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
+      "int num_rows, int row_bytes, Tensor(a!) out, "
+      "int prefetch_window_bytes) -> ()");
   ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
   ops.def(
       "ple_disk_cached_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
       "int num_rows, int row_bytes, Tensor(a!) out, Tensor(b!) cache_ids, "
-      "Tensor(c!) cache_rows) -> ()");
+      "Tensor(c!) cache_rows, int prefetch_window_bytes) -> ()");
   ops.impl("ple_disk_cached_gather_u8", torch::kCPU,
            &ple_disk_cached_gather_u8);
 
