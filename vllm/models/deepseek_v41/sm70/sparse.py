@@ -34,6 +34,7 @@ from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common.contracts import (
@@ -130,6 +131,9 @@ def _check_mla_block(block_size: int, compress_ratio: int) -> None:
 # =====================================================================================
 # metadata (built once per KV-cache group and step; read by every layer of the group)
 # =====================================================================================
+
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -268,6 +272,11 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
             n = self.vllm_config.scheduler_config.max_num_batched_tokens
             buf = torch.zeros((n, *tail), dtype=dtype, device=self.device)
             setattr(self, name, buf)
+            if ATTN_GRAPH:
+                from vllm.forward_context import get_forward_context, is_forward_context_available
+                dummy = is_forward_context_available() and bool(get_forward_context().is_dummy_run)
+                logger.info("DS41 builder %s id=%#x layer=%s allocates %s at %#x (dummy_ctx=%s)", type(self).__name__,
+                            id(self), self.layer_names[0] if self.layer_names else "?", name, buf.data_ptr(), dummy)
         return buf
 
     @property
