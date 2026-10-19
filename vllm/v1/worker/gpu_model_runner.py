@@ -12137,6 +12137,13 @@ class GPUModelRunner(
         )
         return cuda_graph_size
 
+    @staticmethod
+    def _ds41_outer_graph() -> bool:
+        """DeepSeek-V4.1 SM70 (VLLM_DS41_ATTN_OUTER_GRAPH): attention of non-indexer layers is captured inside the
+        breakable graph, so capture needs real-shaped attention metadata (the builders' static buffers)."""
+        return os.environ.get("VLLM_DS41_ATTN_GRAPH", "0") == "1" and os.environ.get(
+            "VLLM_DS41_ATTN_OUTER_GRAPH", "0") == "1"
+
     def _warmup_and_capture(
         self,
         desc: BatchDescriptor,
@@ -12148,7 +12155,7 @@ class GPUModelRunner(
     ):
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
-        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL or self._ds41_outer_graph()
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,

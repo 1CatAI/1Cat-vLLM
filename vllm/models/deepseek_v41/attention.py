@@ -67,7 +67,7 @@ from vllm.models.deepseek_v41.compressor import (
 from vllm.models.deepseek_v41.indexer import DeepseekV41Indexer, attn_impl
 from vllm.logger import init_logger
 from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
-from vllm.models.deepseek_v41.sm70.sparse_kernels import ATTN_GRAPH
+from vllm.models.deepseek_v41.sm70.sparse_kernels import ATTN_GRAPH, ATTN_OUTER_GRAPH
 from vllm.models.deepseek_v41.sm70.sparse import (
     DeepseekV41SM70SparseImpl,
     DS41CacheLayer,
@@ -380,9 +380,22 @@ def _capture_graph(fn, pool) -> torch.cuda.CUDAGraph:
     return g
 
 
-@eager_break_during_capture
-def deepseek_v41_attention(x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
+def _attention_op(x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
     forward_context: ForwardContext = get_forward_context()
     layer = forward_context.no_compile_layers[layer_name]
     layer.attention_impl(x, positions, out)
+
+
+_attention_eager_break = eager_break_during_capture(_attention_op)
+
+
+def deepseek_v41_attention(x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
+    """The attention op: an eager break of the outer breakable graph, except (ATTN_OUTER_GRAPH) for decode-sized
+    batches of layers without an indexer scan, which run inline and are captured with the rest of the layer."""
+    if ATTN_OUTER_GRAPH and x.shape[0] <= GRAPH_MAX_T:
+        layer = get_forward_context().no_compile_layers[layer_name]
+        if layer.indexer is None:
+            _attention_op(x, positions, out)
+            return
+    _attention_eager_break(x, positions, out, layer_name)
 

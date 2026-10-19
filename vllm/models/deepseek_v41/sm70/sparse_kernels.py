@@ -36,6 +36,11 @@ FUSED_DECODE = knobs.env_bool("VLLM_DS41_ATTN_FUSED_DECODE", False)   # fused_de
 # compressed group has exactly T latents (slot -1 = not stored), the compressor/indexer take no host decisions, and
 # attention.py captures the per-layer segments as CUDA graphs keyed by (T, buffer addresses).
 ATTN_GRAPH = knobs.env_bool("VLLM_DS41_ATTN_GRAPH", False)
+# With ATTN_GRAPH: layers whose attention takes no host decision (no indexer scan) are captured INSIDE the outer breakable
+# CUDA graph instead of being eager breaks; the runner then builds (dummy) attention metadata at capture time so the
+# captured kernels bind to the builders' static buffers. Indexer layers (2/8/14/20 full scan, 24-36 regime-dependent) and
+# Engram stay eager breaks.
+ATTN_OUTER_GRAPH = ATTN_GRAPH and knobs.env_bool("VLLM_DS41_ATTN_OUTER_GRAPH", False)
 
 
 # ----------------------------------------------------------------------------- compressor state rows
