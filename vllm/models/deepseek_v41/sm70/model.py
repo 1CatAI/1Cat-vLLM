@@ -482,6 +482,8 @@ def map_checkpoint_name(name: str) -> str:
 
 class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
     supports_eagle3 = True   # aux hidden states for the DSpark drafter (vllm SupportsEagle3 protocol)
+    has_own_lm_head = False  # SupportsEagleBase members (the runtime-checkable protocol needs every attribute)
+    has_own_embed_tokens = False
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model._set_aux_hidden_state_layers(layers)
