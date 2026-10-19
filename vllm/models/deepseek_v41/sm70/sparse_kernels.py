@@ -203,10 +203,32 @@ def ckv_rope_qat_store(latent: torch.Tensor, latent_pos: torch.Tensor, cos_sin_c
 
 
 # ----------------------------------------------------------------------------- index -> row translation
+@triton.jit
+def _logical_to_rows_kernel(idx_ptr, tok2req_ptr, bt_ptr, bt_stride, out_ptr, K, storage, BLOCK: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    req = tl.load(tok2req_ptr + t).to(tl.int64)
+    for k0 in range(0, K, BLOCK):
+        k = k0 + tl.arange(0, BLOCK)
+        m = k < K
+        j = tl.load(idx_ptr + t * K + k, mask=m, other=-1).to(tl.int64)
+        valid = j >= 0
+        jj = tl.where(valid, j, 0)
+        blk = tl.load(bt_ptr + req * bt_stride + jj // storage, mask=m, other=0).to(tl.int64)
+        tl.store(out_ptr + t * K + k, tl.where(valid, blk * storage + jj % storage, -1), mask=m)
+
+
 def logical_to_rows(idx: torch.Tensor, tok2req: torch.Tensor, block_table: torch.Tensor,
                     storage_block_size: int) -> torch.Tensor:
     """Compressed logical positions idx [T, K] (-1 pad) of each token's request -> cache rows [T, K] int64
-    through the SOURCE layer's block table (row = block * storage + j % storage)."""
+    through the SOURCE layer's block table (row = block * storage + j % storage). Graph mode: one kernel (the torch
+    formulation below is ~9 launches); same integer math, identical results."""
+    if ATTN_GRAPH and idx.is_cuda and idx.dim() == 2 and block_table.stride(1) == 1 and idx.shape[0] > 0:
+        T, K = idx.shape
+        out = torch.empty((T, K), dtype=torch.int64, device=idx.device)
+        if K > 0:
+            _logical_to_rows_kernel[(T,)](idx.contiguous(), tok2req, block_table, block_table.stride(0), out, K,
+                                          storage_block_size, BLOCK=min(1024, triton.next_power_of_2(K)), num_warps=4)
+        return out
     valid = idx >= 0
     j = idx.clamp(min=0).to(torch.int64)
     blk = block_table[tok2req.to(torch.long)[:, None].expand_as(j), j // storage_block_size].to(torch.int64)
