@@ -173,11 +173,12 @@ _KB = 16            # keys per block
 
 @triton.jit
 def _fused_attn_partial_kernel(q_ptr, part_ml_ptr, part_acc_ptr, scale, swa_ptr, widx_ptr, ckv_ptr, cidx_ptr,
+                               x_ptr, xidx_ptr,
                                H: tl.constexpr, D: tl.constexpr, NW: tl.constexpr, NC: tl.constexpr,
-                               KB: tl.constexpr):
+                               NX: tl.constexpr, KB: tl.constexpr):
     t = tl.program_id(0).to(tl.int64)
     blk = tl.program_id(1)
-    NSPLIT: tl.constexpr = (NW + NC) // KB
+    NSPLIT: tl.constexpr = (NW + NC + NX) // KB
     HALF: tl.constexpr = D // 2
     PACKED: tl.constexpr = D // 2 + D // 16
     i = tl.arange(0, HALF)
@@ -188,7 +189,7 @@ def _fused_attn_partial_kernel(q_ptr, part_ml_ptr, part_acc_ptr, scale, swa_ptr,
         r = tl.where(valid, row, 0).to(tl.int64)
         k_e = tl.load(swa_ptr + r[:, None] * D + 2 * i[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
         k_o = tl.load(swa_ptr + r[:, None] * D + 2 * i[None, :] + 1, mask=valid[:, None], other=0.0).to(tl.float32)
-    else:                                                    # compressed block: packed FP4 rows
+    elif blk * KB < NW + NC:                                 # compressed block: packed FP4 rows
         row = tl.load(cidx_ptr + t * NC + (blk * KB - NW) + kk)
         valid = row >= 0
         r = tl.where(valid, row, 0).to(tl.int64)
@@ -197,6 +198,12 @@ def _fused_attn_partial_kernel(q_ptr, part_ml_ptr, part_acc_ptr, scale, swa_ptr,
         sc = qat.e4m3_value(sb.to(tl.int32))
         k_e = qat.e2m1_value(byte & 0xF) * sc
         k_o = qat.e2m1_value((byte >> 4) & 0xF) * sc
+    else:                                                    # extra fp16 rows (e.g. the DSpark block K/V)
+        row = tl.load(xidx_ptr + t * NX + (blk * KB - NW - NC) + kk)
+        valid = row >= 0
+        r = tl.where(valid, row, 0).to(tl.int64)
+        k_e = tl.load(x_ptr + r[:, None] * D + 2 * i[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+        k_o = tl.load(x_ptr + r[:, None] * D + 2 * i[None, :] + 1, mask=valid[:, None], other=0.0).to(tl.float32)
     for h in tl.static_range(H):
         qbase = q_ptr + (t * H + h) * D
         q_e = tl.load(qbase + 2 * i).to(tl.float32) * scale
@@ -260,24 +267,27 @@ def fused_decode_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, to
     (swa_rows, widx), *rest = sources
     if swa_rows.dtype != torch.float16 or swa_rows.shape[-1] != D:
         raise ValueError("fused_decode_attention: window rows must be fp16 [*, D]")
-    if rest:
-        (ckv_rows, cidx), = rest
-        if ckv_rows.dtype != torch.uint8 or ckv_rows.shape[-1] != qat.CKV_PACKED_DIM or D != 512:
-            raise ValueError("fused_decode_attention: compressed rows must be packed uint8 [*, 288] with D = 512")
-        cidx = cidx.contiguous()
-        NC = cidx.shape[1]
     widx = widx.contiguous()
     NW = widx.shape[1]
-    if not rest:
-        ckv_rows, cidx, NC = swa_rows, widx, 0          # unused: no compressed block is ever selected
-    if NW % _KB or NC % _KB:
+    ckv_rows, cidx, NC = swa_rows, widx, 0           # unused unless given: no block of theirs is ever selected
+    x_rows, xidx, NX = swa_rows, widx, 0
+    for rows, idx in rest:                            # at most one packed (compressed) and one extra fp16 source
+        if rows.dtype == torch.uint8:
+            if rows.shape[-1] != qat.CKV_PACKED_DIM or D != 512 or NC:
+                raise ValueError("fused_decode_attention: one packed uint8 [*, 288] source with D = 512")
+            ckv_rows, cidx, NC = rows, idx.contiguous(), idx.shape[1]
+        elif rows.dtype == torch.float16 and rows.shape[-1] == D and not NX:
+            x_rows, xidx, NX = rows, idx.contiguous(), idx.shape[1]
+        else:
+            raise ValueError(f"fused_decode_attention: unsupported source {rows.dtype} {tuple(rows.shape)}")
+    if NW % _KB or NC % _KB or NX % _KB:
         raise ValueError(f"fused_decode_attention: key counts must be multiples of {_KB}")
-    if widx.dtype != torch.int64 or cidx.dtype != torch.int64:
+    if widx.dtype != torch.int64 or cidx.dtype != torch.int64 or xidx.dtype != torch.int64:
         raise TypeError("fused_decode_attention: index tensors must be int64 (as built by the metadata)")
-    nsplit = (NW + NC) // _KB
+    nsplit = (NW + NC + NX) // _KB
     part_ml, part_acc = _workspace(q.device, T, nsplit, H, D)
     _fused_attn_partial_kernel[(T, nsplit)](
-        q.contiguous(), part_ml, part_acc, float(scale), swa_rows, widx, ckv_rows, cidx,
-        H=H, D=D, NW=NW, NC=NC, KB=_KB, num_warps=4)
+        q.contiguous(), part_ml, part_acc, float(scale), swa_rows, widx, ckv_rows, cidx, x_rows, xidx,
+        H=H, D=D, NW=NW, NC=NC, NX=NX, KB=_KB, num_warps=4)
     _fused_attn_merge_kernel[(T, H)](part_ml, part_acc, sink.float().contiguous(), out, H=H, D=D, NSPLIT=nsplit,
                                      num_warps=2)
