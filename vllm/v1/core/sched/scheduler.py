@@ -664,6 +664,12 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if request.spec_token_ids and self.__dict__.setdefault("_ds41_spec_logs", 0) < 6:
+                self._ds41_spec_logs += 1
+                logger.info("DS41 sched: req %s num_tokens %d (prompt %d, output %d) spec %d placeholders %d computed %d "
+                            "-> num_new %d", request.request_id, request.num_tokens, request.num_prompt_tokens,
+                            request.num_output_tokens, len(request.spec_token_ids), request.num_output_placeholders,
+                            request.num_computed_tokens, num_new_tokens)
             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
                 request
             )
