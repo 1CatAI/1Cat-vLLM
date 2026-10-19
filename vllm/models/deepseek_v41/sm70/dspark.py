@@ -145,7 +145,10 @@ class DSparkV41Attention(nn.Module):
         from vllm.models.deepseek_v41.common.qat import fp8_block32_qdq
         from vllm.models.deepseek_v41.common.rope import apply_rope_torch
 
-        md_all = step_metadata(self.inner.layer_name)
+        from vllm.forward_context import get_forward_context
+        md_all = get_forward_context().attn_metadata
+        if not isinstance(md_all, dict):
+            md_all = None             # the proposer's own dummy / profile runs carry no metadata (and no dummy flag)
         o = torch.zeros((x.shape[0], self.n_local_heads, C.HEAD_DIM), dtype=torch.float16, device=x.device)
         if md_all is None:                                           # profile / dummy run
             self._qkv(x)
