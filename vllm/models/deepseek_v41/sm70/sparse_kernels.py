@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import torch
 
+from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common import qat
 from vllm.models.deepseek_v41.common.rope import apply_rope_torch
 from vllm.triton_utils import tl, triton
 
 RUNNING_MAX_FLOOR = -1e30
+FUSED_DECODE = knobs.env_bool("VLLM_DS41_ATTN_FUSED_DECODE", False)   # fused_decode_attention for small T (sm70 impl)
 
 
 # ----------------------------------------------------------------------------- compressed-KV store
@@ -128,6 +130,9 @@ def sparse_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Te
         if not (fp16 or packed) or idx.shape[0] != T:
             raise ValueError(f"bad source rows {tuple(rows.shape)} {rows.dtype} idx {tuple(idx.shape)}")
     sinkf = sink.float()[:H]
+    if impl == "sm70" and FUSED_DECODE and T <= FUSED_DECODE_MAX_T and D == 512:
+        fused_decode_attention(q, sources, sinkf, scale, out)
+        return
     for t0 in range(0, T, tile):
         t1 = min(T, t0 + tile)
         kv = torch.cat([_gather(rows, idx[t0:t1], impl) for rows, idx in sources], dim=1)  # [Q, K, D] fp16
@@ -149,3 +154,130 @@ def sparse_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Te
         else:
             o = torch.bmm(p.to(torch.float16), kv, out_dtype=torch.float32)
         out[t0:t1] = (o / denom[..., None]).to(out.dtype)
+
+
+# ----------------------------------------------------------------------------- fused decode attention (gpubox lane)
+# Split-K decode attention in two launches. Kernel 1: one program per (query token, 16-key block) gathers its rows
+# once -- window rows from the FP16 cache, compressed rows from the packed FP4 cache (unpacked in registers) -- and
+# computes, for every head, the block's softmax partials (max, sum, P.V accumulator). Kernel 2: one program per
+# (token, head) merges the partials in fixed order, adds the attention sink and normalises. Replaces the ~18 eager
+# launches of the tiled torch path per layer per decode step. Dims are handled as (even, odd) halves so a packed
+# nibble byte maps onto one (even, odd) pair; q and the output are split / merged the same way.
+# Numerics: FP32 throughout (the sm70 bmm path rounds p to FP16); within FP32 ulps of the torch oracle, not
+# bit-identical. Gated by tolerance tests and the KL panel.
+
+FUSED_DECODE_ENV = "VLLM_DS41_ATTN_FUSED_DECODE"
+FUSED_DECODE_MAX_T = 16
+_KB = 16            # keys per block
+
+
+@triton.jit
+def _fused_attn_partial_kernel(q_ptr, part_ml_ptr, part_acc_ptr, scale, swa_ptr, widx_ptr, ckv_ptr, cidx_ptr,
+                               H: tl.constexpr, D: tl.constexpr, NW: tl.constexpr, NC: tl.constexpr,
+                               KB: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    blk = tl.program_id(1)
+    NSPLIT: tl.constexpr = (NW + NC) // KB
+    HALF: tl.constexpr = D // 2
+    PACKED: tl.constexpr = D // 2 + D // 16
+    i = tl.arange(0, HALF)
+    kk = tl.arange(0, KB)
+    if blk * KB < NW:                                        # window block: fp16 rows
+        row = tl.load(widx_ptr + t * NW + blk * KB + kk)
+        valid = row >= 0
+        r = tl.where(valid, row, 0).to(tl.int64)
+        k_e = tl.load(swa_ptr + r[:, None] * D + 2 * i[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+        k_o = tl.load(swa_ptr + r[:, None] * D + 2 * i[None, :] + 1, mask=valid[:, None], other=0.0).to(tl.float32)
+    else:                                                    # compressed block: packed FP4 rows
+        row = tl.load(cidx_ptr + t * NC + (blk * KB - NW) + kk)
+        valid = row >= 0
+        r = tl.where(valid, row, 0).to(tl.int64)
+        byte = tl.load(ckv_ptr + r[:, None] * PACKED + i[None, :], mask=valid[:, None], other=0).to(tl.int32)
+        sb = tl.load(ckv_ptr + r[:, None] * PACKED + HALF + (i[None, :] // 8), mask=valid[:, None], other=0)
+        sc = qat.e4m3_value(sb.to(tl.int32))
+        k_e = qat.e2m1_value(byte & 0xF) * sc
+        k_o = qat.e2m1_value((byte >> 4) & 0xF) * sc
+    for h in tl.static_range(H):
+        qbase = q_ptr + (t * H + h) * D
+        q_e = tl.load(qbase + 2 * i).to(tl.float32) * scale
+        q_o = tl.load(qbase + 2 * i + 1).to(tl.float32) * scale
+        s = tl.sum(k_e * q_e[None, :], axis=1) + tl.sum(k_o * q_o[None, :], axis=1)      # [KB]
+        s = tl.where(valid, s, float("-inf"))
+        m = tl.maximum(tl.max(s, axis=0), -1e30)             # RUNNING_MAX_FLOOR: an all-invalid block gives p = 0
+        p = tl.exp(s - m)
+        l = tl.sum(p, axis=0)
+        pidx = (t * NSPLIT + blk) * H + h
+        tl.store(part_ml_ptr + pidx * 2, m)
+        tl.store(part_ml_ptr + pidx * 2 + 1, l)
+        tl.store(part_acc_ptr + pidx * D + i, tl.sum(p[:, None] * k_e, axis=0))
+        tl.store(part_acc_ptr + pidx * D + HALF + i, tl.sum(p[:, None] * k_o, axis=0))
+
+
+@triton.jit
+def _fused_attn_merge_kernel(part_ml_ptr, part_acc_ptr, sink_ptr, out_ptr, H: tl.constexpr, D: tl.constexpr,
+                             NSPLIT: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1)
+    HALF: tl.constexpr = D // 2
+    i = tl.arange(0, HALF)
+    m = tl.full((), -1e30, tl.float32)
+    for s in tl.static_range(NSPLIT):
+        m = tl.maximum(m, tl.load(part_ml_ptr + ((t * NSPLIT + s) * H + h) * 2))
+    l = tl.zeros((), dtype=tl.float32)
+    acc_e = tl.zeros((HALF,), dtype=tl.float32)
+    acc_o = tl.zeros((HALF,), dtype=tl.float32)
+    for s in tl.static_range(NSPLIT):
+        pidx = (t * NSPLIT + s) * H + h
+        alpha = tl.exp(tl.load(part_ml_ptr + pidx * 2) - m)
+        l += tl.load(part_ml_ptr + pidx * 2 + 1) * alpha
+        acc_e += tl.load(part_acc_ptr + pidx * D + i) * alpha
+        acc_o += tl.load(part_acc_ptr + pidx * D + HALF + i) * alpha
+    l = l + tl.exp(tl.load(sink_ptr + h) - m)
+    obase = out_ptr + (t * H + h) * D
+    tl.store(obase + 2 * i, (acc_e / l).to(tl.float16))
+    tl.store(obase + 2 * i + 1, (acc_o / l).to(tl.float16))
+
+
+_WS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _workspace(device: torch.device, T: int, nsplit: int, H: int, D: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-shape partial buffers, allocated once (attention runs outside the CUDA graphs: every allocation is a launch)."""
+    key = (str(device), T, nsplit, H, D)
+    ws = _WS.get(key)
+    if ws is None:
+        ws = (torch.empty((T, nsplit, H, 2), dtype=torch.float32, device=device),
+              torch.empty((T, nsplit, H, D), dtype=torch.float32, device=device))
+        _WS[key] = ws
+    return ws
+
+
+def fused_decode_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Tensor]], sink: torch.Tensor,
+                           scale: float, out: torch.Tensor) -> None:
+    """Decode-step sparse attention in two launches. ``sources`` = [(swa_rows fp16 [*, D], win_idx [T, 128]),
+    optionally (ckv_rows packed uint8 [*, 288], ckv_idx [T, 512])]; idx -1 = invalid."""
+    T, H, D = q.shape
+    (swa_rows, widx), *rest = sources
+    if swa_rows.dtype != torch.float16 or swa_rows.shape[-1] != D:
+        raise ValueError("fused_decode_attention: window rows must be fp16 [*, D]")
+    if rest:
+        (ckv_rows, cidx), = rest
+        if ckv_rows.dtype != torch.uint8 or ckv_rows.shape[-1] != qat.CKV_PACKED_DIM or D != 512:
+            raise ValueError("fused_decode_attention: compressed rows must be packed uint8 [*, 288] with D = 512")
+        cidx = cidx.contiguous()
+        NC = cidx.shape[1]
+    widx = widx.contiguous()
+    NW = widx.shape[1]
+    if not rest:
+        ckv_rows, cidx, NC = swa_rows, widx, 0          # unused: no compressed block is ever selected
+    if NW % _KB or NC % _KB:
+        raise ValueError(f"fused_decode_attention: key counts must be multiples of {_KB}")
+    if widx.dtype != torch.int64 or cidx.dtype != torch.int64:
+        raise TypeError("fused_decode_attention: index tensors must be int64 (as built by the metadata)")
+    nsplit = (NW + NC) // _KB
+    part_ml, part_acc = _workspace(q.device, T, nsplit, H, D)
+    _fused_attn_partial_kernel[(T, nsplit)](
+        q.contiguous(), part_ml, part_acc, float(scale), swa_rows, widx, ckv_rows, cidx,
+        H=H, D=D, NW=NW, NC=NC, KB=_KB, num_warps=4)
+    _fused_attn_merge_kernel[(T, H)](part_ml, part_acc, sink.float().contiguous(), out, H=H, D=D, NSPLIT=nsplit,
+                                     num_warps=2)
