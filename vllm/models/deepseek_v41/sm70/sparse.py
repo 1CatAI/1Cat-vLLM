@@ -53,7 +53,9 @@ from vllm.models.deepseek_v41.common.contracts import (
 )
 from vllm.models.deepseek_v41.sm70.sparse_kernels import (
     ATTN_GRAPH,
+    compressed_meta_kernel,
     logical_to_rows,
+    rows_of_positions_kernel,
     sparse_attention,
 )
 from vllm.v1.attention.backend import (
@@ -287,10 +289,14 @@ class DS41SWAMetadataBuilder(_DS41BuilderBase):
               fast_build: bool = False) -> DS41SWAMetadata:
         c = self._common(common_attn_metadata)
         T = c["num_actual_tokens"]
+        win = self._buf("_win", (WINDOW,))[:T]
+        if ATTN_GRAPH:          # one kernel into the static buffer
+            rows_of_positions_kernel(c["positions"], c["slot_mapping"], c["token_to_req_indices"], c["block_table"],
+                                     c["block_size"], win, mode=0)
+            return DS41SWAMetadata(**c, window_slots=win)
         pos = c["positions"][:, None] - (WINDOW - 1) + torch.arange(WINDOW, device=self.device)[None, :]
         real = (c["slot_mapping"] >= 0)[:, None]
         pos = torch.where(real, pos, torch.full_like(pos, -1))
-        win = self._buf("_win", (WINDOW,))[:T]
         win.copy_(rows_of_positions(c["block_table"], c["token_to_req_indices"], pos, c["block_size"]))
         return DS41SWAMetadata(**c, window_slots=win)
 
@@ -309,21 +315,20 @@ class DS41CompressedMetadataBuilder(_DS41BuilderBase):
             out=self._buf("_cslot"))
         pos_cpu = c["positions_cpu"]
         pos = c["positions"]
-        real = c["slot_mapping"] >= 0
         num_visible = self._buf("_nvis")[:T]
-        num_visible.copy_(torch.where(real, torch.div(pos + 1, r, rounding_mode="floor"), torch.zeros_like(pos)))
-        c["slot_mapping"] = slots
         if ATTN_GRAPH:
             # graph mode: every token is a latent (N = T, static shapes); tokens that do not complete a group get
-            # slot -1 (the store kernels skip them) and an in-range dummy position
+            # slot -1 (the store kernels skip them) and an in-range dummy position -- one kernel into static buffers
             n = T
             tok = self._arange(T)
-            completes = ((pos + 1) % r == 0) & real
             lpos = self._buf("_lpos")[:T]
-            lpos.copy_((pos - (r - 1)).clamp(min=0))
             lslots = self._buf("_lslot")[:T]
-            lslots.copy_(torch.where(completes, slots, torch.full_like(slots, -1)))
+            compressed_meta_kernel(pos, c["slot_mapping"], slots, r, num_visible, lpos, lslots)
+            c["slot_mapping"] = slots
         else:
+            real = c["slot_mapping"] >= 0
+            num_visible.copy_(torch.where(real, torch.div(pos + 1, r, rounding_mode="floor"), torch.zeros_like(pos)))
+            c["slot_mapping"] = slots
             # every real token of the step is in 0..T-1; a group completes at the token with (p + 1) % r == 0
             tok_cpu = np.flatnonzero((pos_cpu + 1) % r == 0).astype(np.int64)
             n = int(tok_cpu.shape[0])
@@ -349,9 +354,13 @@ class DS41StateMetadataBuilder(_DS41BuilderBase):
               fast_build: bool = False) -> DS41StateMetadata:
         c = self._common(common_attn_metadata)
         p = c["positions"]
+        prev_slot = self._buf("_prev")[:p.shape[0]]
+        if ATTN_GRAPH:
+            rows_of_positions_kernel(p, c["slot_mapping"], c["token_to_req_indices"], c["block_table"], c["block_size"],
+                                     prev_slot[:, None], mode=1)
+            return DS41StateMetadata(**c, prev_slot=prev_slot)
         completes = ((p + 1) % 2 == 0) & (c["slot_mapping"] >= 0)
         prev = torch.where(completes, p - 1, torch.full_like(p, -1))
-        prev_slot = self._buf("_prev")[:p.shape[0]]
         prev_slot.copy_(rows_of_positions(c["block_table"], c["token_to_req_indices"], prev[:, None],
                                           c["block_size"])[:, 0])
         return DS41StateMetadata(**c, prev_slot=prev_slot)

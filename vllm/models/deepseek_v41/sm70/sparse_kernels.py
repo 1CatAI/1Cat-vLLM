@@ -43,6 +43,63 @@ ATTN_GRAPH = knobs.env_bool("VLLM_DS41_ATTN_GRAPH", False)
 ATTN_OUTER_GRAPH = ATTN_GRAPH and knobs.env_bool("VLLM_DS41_ATTN_OUTER_GRAPH", False)
 
 
+# ----------------------------------------------------------------------------- metadata builders (graph mode)
+@triton.jit
+def _rows_kernel(pos_ptr, slot_ptr, tok2req_ptr, bt_ptr, bt_stride, out_ptr, bs, K: tl.constexpr, MODE: tl.constexpr):
+    """Rows of K positions per token through the token's block table. MODE 0: positions p-(K-1)..p (window), valid
+    when the token is real (slot >= 0) and the position >= 0. MODE 1 (K = 1): position p-1 when p completes a pair."""
+    t = tl.program_id(0).to(tl.int64)
+    p = tl.load(pos_ptr + t)
+    real = tl.load(slot_ptr + t) >= 0
+    j = tl.arange(0, K)
+    if MODE == 0:
+        q = p - (K - 1) + j
+        valid = (q >= 0) & real
+    else:
+        q = p - 1 + j * 0
+        valid = (q >= 0) & real & (((p + 1) % 2) == 0)
+    req = tl.load(tok2req_ptr + t).to(tl.int64)
+    qq = tl.where(valid, q, 0)
+    blk = tl.load(bt_ptr + req * bt_stride + qq // bs).to(tl.int64)
+    tl.store(out_ptr + t * K + j, tl.where(valid, blk * bs + qq % bs, -1))
+
+
+def rows_of_positions_kernel(positions: torch.Tensor, slot_mapping: torch.Tensor, tok2req: torch.Tensor,
+                             block_table: torch.Tensor, block_size: int, out: torch.Tensor, mode: int) -> None:
+    """out [T, K] int64 (K = 128 window rows, or 1 for the state's previous row)."""
+    T, K = out.shape
+    if T == 0:
+        return
+    if block_table.stride(1) != 1 or block_table.dtype != torch.int32:
+        raise ValueError("rows_of_positions_kernel: block table must be a row-major int32 tensor")
+    _rows_kernel[(T,)](positions, slot_mapping, tok2req, block_table, block_table.stride(0), out, block_size,
+                       K=K, MODE=mode, num_warps=1)
+
+
+@triton.jit
+def _cmeta_kernel(pos_ptr, slot_ptr, cslot_ptr, nvis_ptr, lpos_ptr, lslot_ptr, T, r, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = i < T
+    p = tl.load(pos_ptr + i, mask=m, other=0)
+    real = tl.load(slot_ptr + i, mask=m, other=-1) >= 0
+    cs = tl.load(cslot_ptr + i, mask=m, other=-1)
+    tl.store(nvis_ptr + i, tl.where(real, (p + 1) // r, 0), mask=m)
+    completes = (((p + 1) % r) == 0) & real
+    tl.store(lpos_ptr + i, tl.maximum(p - (r - 1), 0), mask=m)
+    tl.store(lslot_ptr + i, tl.where(completes, cs, -1), mask=m)
+
+
+def compressed_meta_kernel(positions: torch.Tensor, slot_mapping: torch.Tensor, cslots: torch.Tensor, ratio: int,
+                           num_visible: torch.Tensor, latent_pos: torch.Tensor, latent_slots: torch.Tensor) -> None:
+    """Graph-mode compressed metadata for T tokens: num_visible, latent_pos (clamped), latent_slots (-1 = no store)."""
+    T = positions.shape[0]
+    if T == 0:
+        return
+    BLOCK = 256
+    _cmeta_kernel[(triton.cdiv(T, BLOCK),)](positions, slot_mapping, cslots, num_visible, latent_pos, latent_slots, T,
+                                            ratio, BLOCK=BLOCK, num_warps=4)
+
+
 # ----------------------------------------------------------------------------- compressor state rows
 @triton.jit
 def _state_store_kernel(src_ptr, src_st, slot_ptr, rows_ptr, D: tl.constexpr):
