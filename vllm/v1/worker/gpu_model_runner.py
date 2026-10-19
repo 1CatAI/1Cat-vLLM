@@ -11933,6 +11933,13 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        self._ds41_cg_mem_profiling = True
+        try:
+            return self._profile_cudagraph_memory()
+        finally:
+            self._ds41_cg_mem_profiling = False
+
+    def _profile_cudagraph_memory(self) -> int:
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -12137,10 +12144,13 @@ class GPUModelRunner(
         )
         return cuda_graph_size
 
-    @staticmethod
-    def _ds41_outer_graph() -> bool:
+    def _ds41_outer_graph(self) -> bool:
         """DeepSeek-V4.1 SM70 (VLLM_DS41_ATTN_OUTER_GRAPH): attention of non-indexer layers is captured inside the
-        breakable graph, so capture needs real-shaped attention metadata (the builders' static buffers)."""
+        breakable graph, so capture needs real-shaped attention metadata (the builders' static buffers). Not during
+        the CUDA-graph memory profiling (profile_cudagraph_memory): its 2-block placeholder caches are not the ones
+        the real capture must bind, and the attention refuses them."""
+        if getattr(self, "_ds41_cg_mem_profiling", False):
+            return False
         return os.environ.get("VLLM_DS41_ATTN_GRAPH", "0") == "1" and os.environ.get(
             "VLLM_DS41_ATTN_OUTER_GRAPH", "0") == "1"
 
