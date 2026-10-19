@@ -12166,6 +12166,9 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL or self._ds41_outer_graph()
+        if self._ds41_outer_graph() or getattr(self, "_ds41_cg_mem_profiling", False):
+            logger.info("DS41 capture: desc=%s mode=%s force_attention=%s mem_profiling=%s", desc, cudagraph_runtime_mode,
+                        force_attention, getattr(self, "_ds41_cg_mem_profiling", False))
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,

@@ -196,7 +196,7 @@ class DeepseekV41Attention(nn.Module):
         w_qkv = _fp16_weight(self.fused_wqa_wkv, (Q_LORA + HEAD_DIM, HIDDEN), f"{self.prefix}.fused_wqa_wkv")
         w_qb = _fp16_weight(self.wq_b, (self.n_local_heads * HEAD_DIM, Q_LORA), f"{self.prefix}.wq_b")
         capturing = torch.cuda.is_current_stream_capturing()
-        if capturing and ATTN_OUTER_GRAPH and self.__dict__.get("_cap_logs", 0) < 3:
+        if capturing and ATTN_OUTER_GRAPH and self.__dict__.get("_cap_logs", 0) < 40:
             self._cap_logs = self.__dict__.get("_cap_logs", 0) + 1
             logger.info("%s: CAPTURE x=%d rows metadata=%s", self.layer_name, x.shape[0],
                         "none -> PROFILE PATH" if md_all is None else
