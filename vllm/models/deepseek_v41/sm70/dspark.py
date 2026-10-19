@@ -344,6 +344,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             return name
         layer = int(self.config.num_hidden_layers) + int(stage)
         name = map_checkpoint_name(f"layers.{layer}.{rest}")
+        # the drafter's ModuleList indexes its blocks 0..2 (the synthetic backbone id only steers the name mapping)
+        name = name.replace(f"layers.{layer}.", f"layers.{stage}.", 1)
         return name.replace(".attn.", ".attn.inner.", 1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
