@@ -219,12 +219,23 @@ class DSparkV41Block(nn.Module):
 
     def forward(self, stream: torch.Tensor, pre_in: torch.Tensor, positions: torch.Tensor, block_size: int
                 ) -> tuple[torch.Tensor, torch.Tensor]:
+        L = self.layer_id; on = dump_on()
+        if on:
+            dump_put(f"blk_stream_in_L{L}", stream); dump_put(f"blk_pre_in_L{L}", pre_in)
         attn_pre, attn_post, attn_comb = hc_mixes(stream, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = rmsnorm_to_act(hc_pre(stream, pre_in), self.attn_norm.weight)
-        stream = hc_post(self.attn(positions, x, block_size), stream, attn_post, attn_comb)
+        attn_out = self.attn(positions, x, block_size)
+        stream = hc_post(attn_out, stream, attn_post, attn_comb)
+        if on:
+            dump_put(f"blk_attn_pre_L{L}", attn_pre); dump_put(f"blk_attn_post_L{L}", attn_post); dump_put(f"blk_attn_comb_L{L}", attn_comb)
+            dump_put(f"blk_x_attn_L{L}", x); dump_put(f"blk_attn_out_L{L}", attn_out); dump_put(f"blk_stream_mid_L{L}", stream)
         ffn_pre, ffn_post, ffn_comb = hc_mixes(stream, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         x = rmsnorm_to_act(hc_pre(stream, attn_pre), self.ffn_norm.weight)
-        stream = hc_post(self.ffn(x), stream, ffn_post, ffn_comb)
+        ffn_out = self.ffn(x)
+        stream = hc_post(ffn_out, stream, ffn_post, ffn_comb)
+        if on:
+            dump_put(f"blk_ffn_pre_L{L}", ffn_pre); dump_put(f"blk_ffn_post_L{L}", ffn_post); dump_put(f"blk_ffn_comb_L{L}", ffn_comb)
+            dump_put(f"blk_x_ffn_L{L}", x); dump_put(f"blk_ffn_out_L{L}", ffn_out); dump_put(f"blk_stream_out_L{L}", stream)
         return stream, ffn_pre
 
 
@@ -362,6 +373,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             dump_put("inputs_embeds", inputs_embeds)
         out = self.model(input_ids, positions, inputs_embeds)
         dump_put("hidden_out", out)
+        if dump_on():
+            dump_put("hidden_normed", rmsnorm_to_act(out, self.model.norm.weight))
         return out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
