@@ -201,7 +201,7 @@ class DeepseekV41Attention(nn.Module):
         swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
         T = swa_md.num_actual_tokens
         make_plan = lambda st: self._plan(x, positions, out, md_all, swa_md, T, w_qkv, w_qb, st)
-        if (ATTN_GRAPH and 0 < T <= GRAPH_MAX_T and attn_impl() == "sm70"
+        if (ATTN_GRAPH and LAYER_GRAPHS and 0 < T <= GRAPH_MAX_T and attn_impl() == "sm70"
                 and not torch.cuda.is_current_stream_capturing()):
             self._graph_step(make_plan, x, positions, out, md_all, swa_md, T)
             return
@@ -336,6 +336,7 @@ logger = init_logger(__name__)
 
 
 GRAPH_MAX_T = 16                 # decode / spec-verify steps only; prefill chunks stay eager
+LAYER_GRAPHS = __import__("os").environ.get("VLLM_DS41_ATTN_LAYER_GRAPHS", "1") == "1"   # per-layer graphs of eager-break layers
 
 
 def _outer_layers() -> frozenset[int] | None:
