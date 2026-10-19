@@ -271,6 +271,27 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
             positions=positions, positions_cpu=pos_cpu, block_table=cm.block_table_tensor[:R],
             block_size=int(self.kv_cache_spec.block_size), slot_mapping=slot_mapping)
 
+    def _log_ptrs(self, md, tag: str) -> None:
+        """Debug (ATTN_GRAPH): the device addresses a captured graph binds vs. what real steps provide."""
+        n = self.__dict__.get("_ptr_logs", 0)
+        if n >= 4:
+            return
+        self._ptr_logs = n + 1
+        ptr = lambda t: f"{t.data_ptr():#x}" if isinstance(t, torch.Tensor) else str(t)
+        fields = {k: ptr(getattr(md, k)) for k in ("positions", "slot_mapping", "block_table", "token_to_req_indices",
+                                                    "window_slots", "latent_slots", "latent_pos", "num_visible", "prev_slot")
+                  if getattr(md, k, None) is not None}
+        logger.info("DS41 ptrs %s %s T=%d R=%d bt_shape=%s %s", tag, self.layer_names[0] if self.layer_names else "?",
+                    md.num_actual_tokens, md.num_reqs, tuple(md.block_table.shape), fields)
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        md = self.build(0, common_attn_metadata)
+        if ATTN_GRAPH:
+            self._ptr_logs = 0
+            self._log_ptrs(md, "CAPTURE")
+            self._ptr_logs = 0           # real steps after the capture log again
+        return md
+
     def _buf(self, name: str, tail: tuple[int, ...] = (), dtype: torch.dtype = torch.int64) -> torch.Tensor:
         """A per-builder device buffer [max_num_batched_tokens, *tail], allocated once."""
         buf = getattr(self, name, None)
@@ -308,7 +329,10 @@ class DS41SWAMetadataBuilder(_DS41BuilderBase):
         if ATTN_GRAPH:          # one kernel into the static buffer
             rows_of_positions_kernel(c["positions"], c["slot_mapping"], c["token_to_req_indices"], c["block_table"],
                                      c["block_size"], win, mode=0)
-            return DS41SWAMetadata(**c, window_slots=win)
+            md = DS41SWAMetadata(**c, window_slots=win)
+            if T <= 16:
+                self._log_ptrs(md, "REAL")
+            return md
         pos = c["positions"][:, None] - (WINDOW - 1) + torch.arange(WINDOW, device=self.device)[None, :]
         real = (c["slot_mapping"] >= 0)[:, None]
         pos = torch.where(real, pos, torch.full_like(pos, -1))
@@ -350,10 +374,13 @@ class DS41CompressedMetadataBuilder(_DS41BuilderBase):
             tok = torch.from_numpy(tok_cpu).to(self.device, non_blocking=True)
             lpos = torch.from_numpy(pos_cpu[tok_cpu] - (r - 1)).to(self.device, non_blocking=True)
             lslots = slots.index_select(0, tok)
-        return DS41CompressedMetadata(
+        md = DS41CompressedMetadata(
             **c, compress_ratio=r, storage_block_size=storage, num_latents=n, latent_token_idx=tok,
             latent_pos=lpos, latent_slots=lslots, num_visible=num_visible,
             max_visible=int(((pos_cpu + 1) // r).max()) if T else 0)
+        if ATTN_GRAPH and T <= 16:
+            self._log_ptrs(md, "REAL")
+        return md
 
     def _arange(self, T: int) -> torch.Tensor:
         buf = getattr(self, "_ar", None)
