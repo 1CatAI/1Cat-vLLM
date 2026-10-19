@@ -677,9 +677,31 @@ def exl3_moe_gemv_out(
     expert_ids: torch.Tensor,
     group_rows: torch.Tensor | None,
     colmajor: bool,
+    codebook: int = 0,
 ) -> None:
     torch.ops._C.exl3_moe_gemv_out(
-        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor
+        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor, codebook
+    )
+
+
+def exl3_moe_gemv_mixed_out(
+    y: torch.Tensor,
+    y2: torch.Tensor | None,
+    x: torch.Tensor,
+    x2: torch.Tensor | None,
+    trellis: torch.Tensor,
+    trellis2: torch.Tensor | None,
+    offsets: torch.Tensor,
+    kbits: torch.Tensor,
+    expert_ids: torch.Tensor,
+    group_rows: torch.Tensor | None,
+    colmajor: bool,
+    codebook: int,
+    n: int,
+) -> None:
+    torch.ops._C.exl3_moe_gemv_mixed_out(
+        y, y2, x, x2, trellis, trellis2, offsets, kbits, expert_ids, group_rows,
+        colmajor, codebook, n,
     )
 
 
@@ -691,8 +713,9 @@ def exl3_moe_mid_out(
     g_svh: torch.Tensor,
     u_svh: torch.Tensor,
     d_suh: torch.Tensor,
+    limit: float = 0.0,
 ) -> None:
-    torch.ops._C.exl3_moe_mid_out(out, yg, yu, topk_ids, g_svh, u_svh, d_suh)
+    torch.ops._C.exl3_moe_mid_out(out, yg, yu, topk_ids, g_svh, u_svh, d_suh, limit)
 
 
 def exl3_moe_post_out(
@@ -717,12 +740,21 @@ if hasattr(torch.ops._C, "exl3_moe_gemv_out"):
 
     @register_fake("_C::exl3_moe_gemv_out")
     def _exl3_moe_gemv_out_fake(
-        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor
+        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor, codebook=0
+    ) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_gemv_mixed_out")
+    def _exl3_moe_gemv_mixed_out_fake(
+        y, y2, x, x2, trellis, trellis2, offsets, kbits, expert_ids, group_rows,
+        colmajor, codebook, n,
     ) -> None:
         return None
 
     @register_fake("_C::exl3_moe_mid_out")
-    def _exl3_moe_mid_out_fake(out, yg, yu, topk_ids, g_svh, u_svh, d_suh) -> None:
+    def _exl3_moe_mid_out_fake(
+        out, yg, yu, topk_ids, g_svh, u_svh, d_suh, limit=0.0
+    ) -> None:
         return None
 
     @register_fake("_C::exl3_moe_post_out")

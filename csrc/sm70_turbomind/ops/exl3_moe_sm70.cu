@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// EXL3 (trellis-coded, mcg codebook, K = 2/3/4 bits) routed-expert MoE for
-// SM70. Weights are decoded on the fly from the trellis and multiplied with
-// mma.m8n8k4 (fp32 accumulate); nothing is dequantized to memory.
+// EXL3 (trellis-coded, mcg or mul1 codebook, K = 2/3/4 bits, and K = 5 in the
+// sm80 tile order) routed-expert MoE for SM70. Weights are decoded on the fly
+// from the trellis and multiplied with mma.m8n8k4 (fp32 accumulate); nothing is
+// dequantized to memory.
+//
+// Expert id -1 marks a slot this launch must skip (an expert owned by another
+// rank under expert parallelism, or held in another K bucket): gemv, pre and mid
+// blocks of such a slot exit, and post leaves it out of the sum.
 //
 // One slot = one (token, routed expert) assignment, s = t * topk + j.
 //   pre  : X'[s] = had128(x[t] * suh[e])                                fp16
@@ -69,8 +74,33 @@ __device__ __forceinline__ half2 mcg2(uint32_t s0, uint32_t s1) {
   return __hadd2(__lows2half2(h0, h1), __highs2half2(h0, h1));
 }
 
+// exllamav3's mul1 codebook (exllamav3_ext/quant/codebook.cuh,
+// decode_mul1_product_2): byte sum of state * 0x83DCD12D on top of 0x6400
+// (1024.0), then one fp16 fma with 1/147.7 and -10.39.
+__device__ __forceinline__ half2 mul1_2(uint32_t s0, uint32_t s1) {
+  uint32_t x0 = s0 * 0x83DCD12Du, x1 = s1 * 0x83DCD12Du;
+  uint32_t sum0 = __dp4a(x0, 0x01010101u, 0x6400u);
+  uint32_t sum1 = __dp4a(x1, 0x01010101u, 0x6400u);
+  half2 h = __halves2half2(__ushort_as_half(static_cast<uint16_t>(sum0)),
+                           __ushort_as_half(static_cast<uint16_t>(sum1)));
+  return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)),
+                 __half2half2(__ushort_as_half(0xc931)));
+}
+
+constexpr int kCodebookMcg = 0;
+constexpr int kCodebookMul1 = 1;
+
+template <int CB>
+__device__ __forceinline__ half2 decode2(uint32_t s0, uint32_t s1) {
+  if constexpr (CB == kCodebookMul1) {
+    return mul1_2(s0, s1);
+  } else {
+    return mcg2(s0, s1);
+  }
+}
+
 // N consecutive positions from the window starting at bit o of (wa, wb).
-template <int K, int N>
+template <int K, int N, int CB>
 __device__ __forceinline__ void decode_run(uint32_t wa, uint32_t wb, int o,
                                            uint32_t (&b)[N / 2]) {
   uint64_t v = (static_cast<uint64_t>(wa) << 32) | wb;
@@ -81,7 +111,7 @@ __device__ __forceinline__ void decode_run(uint32_t wa, uint32_t wb, int o,
   }
 #pragma unroll
   for (int j = 0; j < N / 2; ++j) {
-    half2 r = mcg2(st[2 * j], st[2 * j + 1]);
+    half2 r = decode2<CB>(st[2 * j], st[2 * j + 1]);
     b[j] = *reinterpret_cast<uint32_t*>(&r);
   }
 }
@@ -143,15 +173,15 @@ __device__ __forceinline__ const uint32_t* strip_block(
 
 // One 16-row k-tile of this lane's column. xr points at the tile's 16
 // activations (row 0 of the m8n8k4 A operand; other rows pass on = false).
-template <int K, bool kColMajor>
+template <int K, bool kColMajor, int CB>
 __device__ __forceinline__ void tile_mma(float (&d)[8],
                                          const LaneWords<K, kColMajor>& lw,
                                          const Window<K, kColMajor>& win,
                                          const half* __restrict__ xr, bool on) {
   if constexpr (kColMajor) {
     uint32_t bb[2][4];
-    decode_run<K, 8>(lw.w[0], lw.w[1], win.o[0], bb[0]);
-    decode_run<K, 8>(lw.w[2], lw.w[3], win.o[1], bb[1]);
+    decode_run<K, 8, CB>(lw.w[0], lw.w[1], win.o[0], bb[0]);
+    decode_run<K, 8, CB>(lw.w[2], lw.w[3], win.o[1], bb[1]);
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       uint32_t b0[2] = {bb[h][0], bb[h][1]}, b1[2] = {bb[h][2], bb[h][3]};
@@ -179,8 +209,8 @@ __device__ __forceinline__ void tile_mma(float (&d)[8],
       const int ou = o0 + ol;
       const bool carry = ou >= 32;
       uint32_t b[2];
-      decode_run<K, 4>(carry ? w[ml + 1] : w[ml], carry ? w[ml + 2] : w[ml + 1],
-                       ou & 31, b);
+      decode_run<K, 4, CB>(carry ? w[ml + 1] : w[ml],
+                           carry ? w[ml + 2] : w[ml + 1], ou & 31, b);
       uint32_t a[2] = {xw[u], xw[u + 4]};
       mma884(d, a, b);
     }
@@ -189,7 +219,7 @@ __device__ __forceinline__ void tile_mma(float (&d)[8],
 
 // grid (n / 32, S or 2S), block kWarps warps. Slot s multiplies expert eid[s].
 // M = 1: row 0 of the m8n8k4 tile carries the activation.
-template <int K, bool kColMajor>
+template <int K, bool kColMajor, int CB>
 __global__ void __launch_bounds__(kWarps * 32)
     exl3_gemv_kernel(const uint32_t* __restrict__ trellis,
                      const int* __restrict__ eid, const half* __restrict__ x,
@@ -205,6 +235,7 @@ __global__ void __launch_bounds__(kWarps * 32)
     x = x2;
     y = y2;
   }
+  if (eid[s] < 0) return;  // not this launch's expert (whole block)
   int n0 = blockIdx.x * 32;
   int q = (lane >> 2) & 3;
   int nw = 8 * q + (lane >> 4) * 4 + lane % 4;
@@ -232,7 +263,7 @@ __global__ void __launch_bounds__(kWarps * 32)
     for (int p = 0; p < kPrefetch; ++p) {
       if (it0 + p >= ktiles_per_warp) break;
       int tk = tk0 + it0 + p;
-      tile_mma<K, kColMajor>(d, lw[p], win, xr + tk * 16, row == 0);
+      tile_mma<K, kColMajor, CB>(d, lw[p], win, xr + tk * 16, row == 0);
     }
   }
 
@@ -258,7 +289,7 @@ __global__ void __launch_bounds__(kWarps * 32)
 // expert; its tiles are decoded once and multiplied against all 8 rows.
 // rows[g * 8 + m] = slot or -1. Launches are sized for the worst case; groups
 // with rows[g * 8] < 0 exit immediately.
-template <int K, bool kColMajor>
+template <int K, bool kColMajor, int CB>
 __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_grouped_kernel(
     const uint32_t* __restrict__ trellis, const int* __restrict__ gexp,
     const int* __restrict__ rows, const half* __restrict__ x,
@@ -274,7 +305,7 @@ __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_grouped_kernel(
     y = y2;
   }
   const int* gr = rows + static_cast<int64_t>(g) * 8;
-  if (gr[0] < 0) return;
+  if (gr[0] < 0 || gexp[g] < 0) return;
   int n0 = blockIdx.x * 32;
   int q = (lane >> 2) & 3;
   int nw = 8 * q + (lane >> 4) * 4 + lane % 4;
@@ -303,7 +334,7 @@ __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_grouped_kernel(
     for (int p = 0; p < kPrefetch; ++p) {
       if (it0 + p >= ktiles_per_warp) break;
       int tk = tk0 + it0 + p;
-      tile_mma<K, kColMajor>(d, lw[p], win, xr + tk * 16, slot >= 0);
+      tile_mma<K, kColMajor, CB>(d, lw[p], win, xr + tk * 16, slot >= 0);
     }
   }
 
@@ -324,6 +355,182 @@ __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_grouped_kernel(
     y[static_cast<int64_t>(so) * n + n0 + nn] = acc;
   }
 }
+
+// ---- mixed-K launches: per-expert bit widths in one launch ----
+// The experts of a launch live in one flat word buffer: expert e's strip-major
+// trellis starts at word offs[e] and has kbits[e] bits per weight. Every block
+// serves one slot (or group), so its K is block-uniform and the switch below
+// costs one branch; gate + up of an expert share offsets and K.
+
+// One block's share of one slot: columns n0 .. n0 + 31 of y = x @ T.
+template <int K, bool kColMajor, int CB>
+__device__ __forceinline__ void gemv_slot_body(const uint32_t* __restrict__ tr,
+                                               const half* __restrict__ xr,
+                                               float* __restrict__ yr, int n0,
+                                               int ktiles_per_warp) {
+  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  int q = (lane >> 2) & 3;
+  int nw = 8 * q + (lane >> 4) * 4 + lane % 4;
+  int t = nw >> 4, c = nw & 15;
+  int row = (lane >> 4) * 4 + lane % 4;
+  int tk0 = warp * ktiles_per_warp;
+  constexpr int kTW = 8 * K;
+  Window<K, kColMajor> win(t, c);
+  float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const int ktiles = ktiles_per_warp * kWarps;
+  for (int it0 = 0; it0 < ktiles_per_warp; it0 += kPrefetch) {
+    LaneWords<K, kColMajor> lw[kPrefetch];
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+      if (it0 + p < ktiles_per_warp) {
+        lw[p].load(strip_block(tr, n0, tk0 + it0 + p, ktiles, kTW), win);
+      } else {
+        lw[p].zero();
+      }
+    }
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+      if (it0 + p >= ktiles_per_warp) break;
+      int tk = tk0 + it0 + p;
+      tile_mma<K, kColMajor, CB>(d, lw[p], win, xr + tk * 16, row == 0);
+    }
+  }
+  __shared__ float red[kWarps][32];
+  if (lane < 16 && !(lane & 1)) {
+    red[warp][8 * q + (lane & 2)] = d[0];
+    red[warp][8 * q + (lane & 2) + 1] = d[1];
+    red[warp][8 * q + 4 + (lane & 2)] = d[4];
+    red[warp][8 * q + 4 + (lane & 2) + 1] = d[5];
+  }
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float acc = 0.f;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) acc += red[w][threadIdx.x];
+    yr[n0 + threadIdx.x] = acc;
+  }
+}
+
+// One block's share of one group (<= 8 slots of one expert, rows gr[0..7]).
+template <int K, bool kColMajor, int CB>
+__device__ __forceinline__ void gemv_group_body(const uint32_t* __restrict__ tr,
+                                                const int* __restrict__ gr,
+                                                const half* __restrict__ x,
+                                                float* __restrict__ y, int k,
+                                                int n, int n0,
+                                                int ktiles_per_warp) {
+  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  int q = (lane >> 2) & 3;
+  int nw = 8 * q + (lane >> 4) * 4 + lane % 4;
+  int t = nw >> 4, c = nw & 15;
+  int row = (lane >> 4) * 4 + lane % 4;
+  int slot = gr[row];
+  int tk0 = warp * ktiles_per_warp;
+  const half* xr = x + static_cast<int64_t>(slot < 0 ? 0 : slot) * k;
+  constexpr int kTW = 8 * K;
+  Window<K, kColMajor> win(t, c);
+  float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const int ktiles = ktiles_per_warp * kWarps;
+  for (int it0 = 0; it0 < ktiles_per_warp; it0 += kPrefetch) {
+    LaneWords<K, kColMajor> lw[kPrefetch];
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+      if (it0 + p < ktiles_per_warp) {
+        lw[p].load(strip_block(tr, n0, tk0 + it0 + p, ktiles, kTW), win);
+      } else {
+        lw[p].zero();
+      }
+    }
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+      if (it0 + p >= ktiles_per_warp) break;
+      int tk = tk0 + it0 + p;
+      tile_mma<K, kColMajor, CB>(d, lw[p], win, xr + tk * 16, slot >= 0);
+    }
+  }
+  __shared__ float red[kWarps][8][32];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    red[warp][(lane & 1) + ((i >> 1) & 1) * 2 + (lane >= 16 ? 4 : 0)]
+       [8 * q + ((i >> 2) & 1) * 4 + (lane & 2) + (i & 1)] = d[i];
+  }
+  __syncthreads();
+  for (int e = threadIdx.x; e < 256; e += kWarps * 32) {
+    int m = e >> 5, nn = e & 31;
+    int so = gr[m];
+    if (so < 0) continue;
+    float acc = 0.f;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) acc += red[w][m][nn];
+    y[static_cast<int64_t>(so) * n + n0 + nn] = acc;
+  }
+}
+
+#define EXL3_K_SWITCH(KB, CALL)          \
+  switch (KB) {                          \
+    case 2: CALL(2); break;              \
+    case 3: CALL(3); break;              \
+    case 4: CALL(4); break;              \
+    case 5:                              \
+      if constexpr (!kColMajor) CALL(5); \
+      break;                             \
+    default: break;                      \
+  }
+
+// grid (n / 32, S or 2S): slot s multiplies expert eid[s] (-1: skip).
+template <bool kColMajor, int CB>
+__global__ void __launch_bounds__(kWarps * 32) exl3_gemv_mixed_kernel(
+    const uint32_t* __restrict__ trellis, const int64_t* __restrict__ offs,
+    const int* __restrict__ kbits, const int* __restrict__ eid,
+    const half* __restrict__ x, float* __restrict__ y, int k, int n,
+    int ktiles_per_warp, int S, const uint32_t* __restrict__ trellis2,
+    const half* __restrict__ x2, float* __restrict__ y2) {
+  int s = blockIdx.y;
+  if (s >= S) {
+    s -= S;
+    trellis = trellis2;
+    x = x2;
+    y = y2;
+  }
+  const int e = eid[s];
+  if (e < 0) return;
+  const uint32_t* tr = trellis + offs[e];
+  const half* xr = x + static_cast<int64_t>(s) * k;
+  float* yr = y + static_cast<int64_t>(s) * n;
+  const int n0 = blockIdx.x * 32;
+#define EXL3_SLOT(KK) \
+  gemv_slot_body<KK, kColMajor, CB>(tr, xr, yr, n0, ktiles_per_warp)
+  EXL3_K_SWITCH(kbits[e], EXL3_SLOT)
+#undef EXL3_SLOT
+}
+
+// grid (n / 32, G or 2G): group g = slots rows[g * 8 ..] of expert gexp[g].
+template <bool kColMajor, int CB>
+__global__ void __launch_bounds__(kWarps * 32) exl3_gemv_mixed_grouped_kernel(
+    const uint32_t* __restrict__ trellis, const int64_t* __restrict__ offs,
+    const int* __restrict__ kbits, const int* __restrict__ gexp,
+    const int* __restrict__ rows, const half* __restrict__ x,
+    float* __restrict__ y, int k, int n, int ktiles_per_warp, int G,
+    const uint32_t* __restrict__ trellis2, const half* __restrict__ x2,
+    float* __restrict__ y2) {
+  int g = blockIdx.y;
+  if (g >= G) {
+    g -= G;
+    trellis = trellis2;
+    x = x2;
+    y = y2;
+  }
+  const int* gr = rows + static_cast<int64_t>(g) * 8;
+  const int e = gexp[g];
+  if (gr[0] < 0 || e < 0) return;
+  const uint32_t* tr = trellis + offs[e];
+  const int n0 = blockIdx.x * 32;
+#define EXL3_GROUP(KK) \
+  gemv_group_body<KK, kColMajor, CB>(tr, gr, x, y, k, n, n0, ktiles_per_warp)
+  EXL3_K_SWITCH(kbits[e], EXL3_GROUP)
+#undef EXL3_GROUP
+}
+#undef EXL3_K_SWITCH
 
 // 128-point Walsh-Hadamard (Sylvester order) in registers: one warp per
 // 128-chunk, lane l holds elements 4l .. 4l+3.
@@ -364,9 +571,16 @@ __device__ __forceinline__ void store4h(half* p, const float (&v)[4]) {
   *reinterpret_cast<uint2*>(p) = r;
 }
 
+// Element offset of this lane's 4 values; each warp owns one 128-chunk. Widths
+// are multiples of 128, so `offset >= width` is warp-uniform and a warp past the
+// end exits whole (no shuffle with missing lanes).
 __device__ __forceinline__ int glue_offset() {
   return (blockIdx.x * kGlueWarps + (threadIdx.x >> 5)) * 128 +
          (threadIdx.x & 31) * 4;
+}
+
+__host__ __device__ constexpr int glue_blocks(int width) {
+  return (width / 128 + kGlueWarps - 1) / kGlueWarps;
 }
 
 __global__ void exl3_pre_kernel(const half* __restrict__ x,
@@ -381,7 +595,9 @@ __global__ void exl3_pre_kernel(const half* __restrict__ x,
     suh = suh2;
     out = out2;
   }
+  if (eid[s] < 0) return;
   int o = glue_offset();
+  if (o >= k) return;
   float v[4], g[4];
   load4h(x + static_cast<int64_t>(s / topk) * k + o, v);
   load4h(suh + static_cast<int64_t>(eid[s]) * k + o, g);
@@ -397,9 +613,11 @@ __global__ void exl3_mid_kernel(const float* __restrict__ yg,
                                 const half* __restrict__ svh_g,
                                 const half* __restrict__ svh_u,
                                 const half* __restrict__ suh_d,
-                                half* __restrict__ out, int n) {
+                                half* __restrict__ out, int n, float limit) {
   int s = blockIdx.y;
+  if (eid[s] < 0) return;
   int o = glue_offset();
+  if (o >= n) return;
   int64_t e = static_cast<int64_t>(eid[s]) * n + o;
   float g[4], u[4], sg[4], su[4], sd[4];
   float4 a =
@@ -421,8 +639,12 @@ __global__ void exl3_mid_kernel(const float* __restrict__ yg,
   load4h(suh_d + e, sd);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    float gg = g[i] * sg[i];
-    g[i] = gg / (1.f + __expf(-gg)) * (u[i] * su[i]) * sd[i];
+    float gg = g[i] * sg[i], uu = u[i] * su[i];
+    if (limit > 0.f) {  // clamped SwiGLU (DeepSeek-V4.1: gate <= limit, |up| <= limit)
+      gg = fminf(gg, limit);
+      uu = fminf(fmaxf(uu, -limit), limit);
+    }
+    g[i] = gg / (1.f + __expf(-gg)) * uu * sd[i];
   }
   fwht128(g);
   store4h(out + static_cast<int64_t>(s) * n + o, g);
@@ -435,9 +657,11 @@ __global__ void exl3_post_kernel(const float* __restrict__ yd,
                                  float* __restrict__ out, int n, int topk) {
   int t = blockIdx.y;
   int o = glue_offset();
+  if (o >= n) return;
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
   for (int j = 0; j < topk; ++j) {
     int s = t * topk + j;
+    if (eid[s] < 0) continue;  // warp-uniform: every lane reads the same slot
     float v[4], sv[4];
     float4 a =
         *reinterpret_cast<const float4*>(yd + static_cast<int64_t>(s) * n + o);
@@ -470,7 +694,7 @@ std::tuple<int, int, int> trellis_dims(const torch::Tensor& trellis,
   check_cuda(trellis, "trellis", at::kShort, 4, ref);
   TORCH_CHECK(trellis.size(3) % 16 == 0, "trellis: last dim must be 16 * K");
   int K = static_cast<int>(trellis.size(3) / 16);
-  TORCH_CHECK(K == 2 || K == 3 || K == 4, "EXL3 MoE: K must be 2, 3 or 4");
+  TORCH_CHECK(K >= 2 && K <= 5, "EXL3 MoE: K must be 2, 3, 4 or 5");
   int k = static_cast<int>(trellis.size(1) * 16);
   int n = static_cast<int>(trellis.size(2) * 16);
   TORCH_CHECK((k / 16) % kWarps == 0 && n % 32 == 0,
@@ -478,28 +702,52 @@ std::tuple<int, int, int> trellis_dims(const torch::Tensor& trellis,
   return {k, n, K};
 }
 
-template <bool kColMajor>
+template <bool kColMajor, int CB>
 void launch_gemv(bool grouped, int K, dim3 grid, cudaStream_t stream,
                  const uint32_t* tr, const int* ids, const int* rows,
                  const half* x, float* y, int k, int n, int64_t ew, int count,
                  const uint32_t* tr2, const half* x2, float* y2) {
   const int kt = k / 16 / kWarps;
-#define EXL3_LAUNCH(KK)                                                        \
-  if (grouped) {                                                               \
-    exl3_gemv_grouped_kernel<KK, kColMajor><<<grid, kWarps * 32, 0, stream>>>( \
-        tr, ids, rows, x, y, k, n, kt, ew, count, tr2, x2, y2);                \
-  } else {                                                                     \
-    exl3_gemv_kernel<KK, kColMajor><<<grid, kWarps * 32, 0, stream>>>(         \
-        tr, ids, x, y, k, n, kt, ew, count, tr2, x2, y2);                      \
+#define EXL3_LAUNCH(KK)                                                  \
+  if (grouped) {                                                         \
+    exl3_gemv_grouped_kernel<KK, kColMajor, CB>                          \
+        <<<grid, kWarps * 32, 0, stream>>>(tr, ids, rows, x, y, k, n, kt, \
+                                           ew, count, tr2, x2, y2);      \
+  } else {                                                               \
+    exl3_gemv_kernel<KK, kColMajor, CB><<<grid, kWarps * 32, 0, stream>>>( \
+        tr, ids, x, y, k, n, kt, ew, count, tr2, x2, y2);                \
   }
   if (K == 2) {
     EXL3_LAUNCH(2)
   } else if (K == 3) {
     EXL3_LAUNCH(3)
-  } else {
+  } else if (K == 4) {
     EXL3_LAUNCH(4)
+  } else {
+    // K = 5: four positions of a run span 16 + 3 * 5 = 31 bits, which still fit
+    // the 64-bit window at any offset < 32; colmajor's 8-position runs do not.
+    if constexpr (!kColMajor) {
+      EXL3_LAUNCH(5)
+    }
   }
 #undef EXL3_LAUNCH
+}
+
+template <bool kColMajor>
+void launch_gemv_cb(int codebook, bool grouped, int K, dim3 grid,
+                    cudaStream_t stream, const uint32_t* tr, const int* ids,
+                    const int* rows, const half* x, float* y, int k, int n,
+                    int64_t ew, int count, const uint32_t* tr2, const half* x2,
+                    float* y2) {
+  if (codebook == kCodebookMul1) {
+    launch_gemv<kColMajor, kCodebookMul1>(grouped, K, grid, stream, tr, ids,
+                                          rows, x, y, k, n, ew, count, tr2, x2,
+                                          y2);
+  } else {
+    launch_gemv<kColMajor, kCodebookMcg>(grouped, K, grid, stream, tr, ids,
+                                         rows, x, y, k, n, ew, count, tr2, x2,
+                                         y2);
+  }
 }
 
 }  // namespace
@@ -518,8 +766,7 @@ void exl3_moe_pre_out(torch::Tensor out, std::optional<torch::Tensor> out2,
   const int topk = static_cast<int>(topk_ids.size(1));
   const int S = static_cast<int>(topk_ids.numel());
   TORCH_CHECK(topk_ids.size(0) == x.size(0), "topk_ids rows != tokens");
-  TORCH_CHECK(k % (kGlueWarps * 128) == 0,
-              "EXL3 MoE: k must be a multiple of 512");
+  TORCH_CHECK(k % 128 == 0, "EXL3 MoE: k must be a multiple of 128");
   TORCH_CHECK(out.size(0) >= S && out.size(1) == k && suh.size(1) == k,
               "pre: shape mismatch");
   const int fused = out2.has_value() ? 2 : 1;
@@ -533,7 +780,7 @@ void exl3_moe_pre_out(torch::Tensor out, std::optional<torch::Tensor> out2,
   TORCH_CHECK(fused * S <= kMaxGridY, "EXL3 MoE: too many slots per launch");
   const at::cuda::OptionalCUDAGuard guard(x.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  exl3_pre_kernel<<<dim3(k / (kGlueWarps * 128), fused * S), kGlueWarps * 32, 0,
+  exl3_pre_kernel<<<dim3(glue_blocks(k), fused * S), kGlueWarps * 32, 0,
                     stream>>>(
       reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
       topk_ids.data_ptr<int>(),
@@ -548,17 +795,21 @@ void exl3_moe_pre_out(torch::Tensor out, std::optional<torch::Tensor> out2,
 // y[s] = x[s] @ T[expert(s)] in the trellis basis. Plain: expert_ids [S] holds
 // each slot's expert. Grouped: expert_ids [G] holds each group's expert and
 // group_rows [G, 8] its slots (-1 = empty). With y2/x2/trellis2, the second
-// projection (up) runs in the same launch.
+// projection (up) runs in the same launch. codebook: 0 = mcg, 1 = mul1.
 void exl3_moe_gemv_out(torch::Tensor y, std::optional<torch::Tensor> y2,
                        torch::Tensor x, std::optional<torch::Tensor> x2,
                        torch::Tensor trellis,
                        std::optional<torch::Tensor> trellis2,
                        torch::Tensor expert_ids,
-                       std::optional<torch::Tensor> group_rows, bool colmajor) {
+                       std::optional<torch::Tensor> group_rows, bool colmajor,
+                       int64_t codebook) {
+  TORCH_CHECK(codebook == kCodebookMcg || codebook == kCodebookMul1,
+              "EXL3 MoE: codebook must be 0 (mcg) or 1 (mul1)");
   check_cuda(x, "x", at::kHalf, 2, x);
   check_cuda(y, "y", at::kFloat, 2, x);
   check_cuda(expert_ids, "expert_ids", at::kInt, 1, x);
   auto [k, n, K] = trellis_dims(trellis, x);
+  TORCH_CHECK(!(colmajor && K == 5), "EXL3 MoE: K = 5 needs the sm80 tile order");
   TORCH_CHECK(x.size(1) == k && y.size(1) == n && y.size(0) >= x.size(0),
               "gemv: shape mismatch");
   const bool fused = y2.has_value();
@@ -598,22 +849,106 @@ void exl3_moe_gemv_out(torch::Tensor y, std::optional<torch::Tensor> y2,
       fused ? reinterpret_cast<const half*>(x2->data_ptr<at::Half>()) : nullptr;
   float* y2p = fused ? y2->data_ptr<float>() : nullptr;
   const int* rows = grouped ? group_rows->data_ptr<int>() : nullptr;
+  const int cb = static_cast<int>(codebook);
   if (colmajor) {
-    launch_gemv<true>(grouped, K, grid, stream, tr, expert_ids.data_ptr<int>(),
-                      rows, xp, y.data_ptr<float>(), k, n, ew, count, tr2, x2p,
-                      y2p);
+    launch_gemv_cb<true>(cb, grouped, K, grid, stream, tr,
+                         expert_ids.data_ptr<int>(), rows, xp,
+                         y.data_ptr<float>(), k, n, ew, count, tr2, x2p, y2p);
   } else {
-    launch_gemv<false>(grouped, K, grid, stream, tr, expert_ids.data_ptr<int>(),
-                       rows, xp, y.data_ptr<float>(), k, n, ew, count, tr2, x2p,
-                       y2p);
+    launch_gemv_cb<false>(cb, grouped, K, grid, stream, tr,
+                          expert_ids.data_ptr<int>(), rows, xp,
+                          y.data_ptr<float>(), k, n, ew, count, tr2, x2p, y2p);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// out[s] = had128(silu(had128(yg) * g_svh) * had128(yu) * u_svh * d_suh)
+// Mixed-K variant of exl3_moe_gemv_out: trellis (and trellis2) are flat int16
+// buffers holding every expert's strip-major trellis; expert e starts at u32
+// word offsets[e] and has kbits[e] (2..5) bits per weight. n = out_features.
+void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
+                             torch::Tensor x, std::optional<torch::Tensor> x2,
+                             torch::Tensor trellis,
+                             std::optional<torch::Tensor> trellis2,
+                             torch::Tensor offsets, torch::Tensor kbits,
+                             torch::Tensor expert_ids,
+                             std::optional<torch::Tensor> group_rows,
+                             bool colmajor, int64_t codebook, int64_t n64) {
+  TORCH_CHECK(codebook == kCodebookMcg || codebook == kCodebookMul1,
+              "EXL3 MoE: codebook must be 0 (mcg) or 1 (mul1)");
+  check_cuda(x, "x", at::kHalf, 2, x);
+  check_cuda(y, "y", at::kFloat, 2, x);
+  check_cuda(trellis, "trellis", at::kShort, 1, x);
+  check_cuda(offsets, "offsets", at::kLong, 1, x);
+  check_cuda(kbits, "kbits", at::kInt, 1, x);
+  check_cuda(expert_ids, "expert_ids", at::kInt, 1, x);
+  TORCH_CHECK(offsets.size(0) == kbits.size(0), "offsets and kbits: one per expert");
+  const int k = static_cast<int>(x.size(1)), n = static_cast<int>(n64);
+  TORCH_CHECK((k / 16) % kWarps == 0 && k % 16 == 0 && n % 32 == 0,
+              "EXL3 MoE: k must be a multiple of 64 and n of 32");
+  TORCH_CHECK(y.size(1) == n && y.size(0) >= x.size(0), "gemv: shape mismatch");
+  const bool fused = y2.has_value();
+  TORCH_CHECK(fused == x2.has_value() && fused == trellis2.has_value(),
+              "y2, x2 and trellis2 go together");
+  if (fused) {
+    check_cuda(*y2, "y2", at::kFloat, 2, x);
+    check_cuda(*x2, "x2", at::kHalf, 2, x);
+    check_cuda(*trellis2, "trellis2", at::kShort, 1, x);
+    TORCH_CHECK(trellis2->numel() == trellis.numel() && x2->sizes() == x.sizes() &&
+                    y2->sizes() == y.sizes(),
+                "gemv: the fused projections must have the same shapes");
+  }
+  const bool grouped = group_rows.has_value();
+  const int count = static_cast<int>(expert_ids.size(0));
+  if (grouped) {
+    check_cuda(*group_rows, "group_rows", at::kInt, 2, x);
+    TORCH_CHECK(group_rows->size(0) == count && group_rows->size(1) == 8,
+                "group_rows must be [G, 8]");
+  } else {
+    TORCH_CHECK(count <= x.size(0), "expert_ids longer than x");
+  }
+  if (count == 0) return;
+  TORCH_CHECK((fused ? 2 : 1) * count <= kMaxGridY,
+              "EXL3 MoE: too many slots per launch");
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 grid(n / 32, (fused ? 2 : 1) * count);
+  const int kt = k / 16 / kWarps;
+  auto tr = reinterpret_cast<const uint32_t*>(trellis.data_ptr<int16_t>());
+  auto tr2 = fused
+                 ? reinterpret_cast<const uint32_t*>(trellis2->data_ptr<int16_t>())
+                 : nullptr;
+  auto xp = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
+  auto x2p = fused ? reinterpret_cast<const half*>(x2->data_ptr<at::Half>()) : nullptr;
+  float* y2p = fused ? y2->data_ptr<float>() : nullptr;
+  const int64_t* op = offsets.data_ptr<int64_t>();
+  const int* kp = kbits.data_ptr<int>();
+  const int* ids = expert_ids.data_ptr<int>();
+#define EXL3_MIXED(COL, CBV)                                                  \
+  if (grouped) {                                                              \
+    exl3_gemv_mixed_grouped_kernel<COL, CBV><<<grid, kWarps * 32, 0, stream>>>( \
+        tr, op, kp, ids, group_rows->data_ptr<int>(), xp, y.data_ptr<float>(), \
+        k, n, kt, count, tr2, x2p, y2p);                                      \
+  } else {                                                                    \
+    exl3_gemv_mixed_kernel<COL, CBV><<<grid, kWarps * 32, 0, stream>>>(       \
+        tr, op, kp, ids, xp, y.data_ptr<float>(), k, n, kt, count, tr2, x2p,  \
+        y2p);                                                                 \
+  }
+  if (colmajor) {
+    if (codebook == kCodebookMul1) { EXL3_MIXED(true, kCodebookMul1) }
+    else { EXL3_MIXED(true, kCodebookMcg) }
+  } else {
+    if (codebook == kCodebookMul1) { EXL3_MIXED(false, kCodebookMul1) }
+    else { EXL3_MIXED(false, kCodebookMcg) }
+  }
+#undef EXL3_MIXED
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// out[s] = had128(silu(had128(yg) * g_svh) * had128(yu) * u_svh * d_suh); with
+// limit > 0 the gate is clamped to <= limit and the up value to [-limit, limit].
 void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
                       torch::Tensor topk_ids, torch::Tensor g_svh,
-                      torch::Tensor u_svh, torch::Tensor d_suh) {
+                      torch::Tensor u_svh, torch::Tensor d_suh, double limit) {
   check_cuda(yg, "yg", at::kFloat, 2, yg);
   check_cuda(yu, "yu", at::kFloat, 2, yg);
   check_cuda(out, "out", at::kHalf, 2, yg);
@@ -623,8 +958,7 @@ void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
   check_cuda(d_suh, "d_suh", at::kHalf, 2, yg);
   const int n = static_cast<int>(yg.size(1));
   const int S = static_cast<int>(topk_ids.numel());
-  TORCH_CHECK(n % (kGlueWarps * 128) == 0,
-              "EXL3 MoE: n must be a multiple of 512");
+  TORCH_CHECK(n % 128 == 0, "EXL3 MoE: n must be a multiple of 128");
   TORCH_CHECK(yg.size(0) >= S && yu.sizes() == yg.sizes() && out.size(0) >= S &&
                   out.size(1) == n && g_svh.size(1) == n &&
                   u_svh.size(1) == n && d_suh.size(1) == n,
@@ -633,13 +967,13 @@ void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
   TORCH_CHECK(S <= kMaxGridY, "EXL3 MoE: too many slots per launch");
   const at::cuda::OptionalCUDAGuard guard(yg.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  exl3_mid_kernel<<<dim3(n / (kGlueWarps * 128), S), kGlueWarps * 32, 0,
-                    stream>>>(
+  exl3_mid_kernel<<<dim3(glue_blocks(n), S), kGlueWarps * 32, 0, stream>>>(
       yg.data_ptr<float>(), yu.data_ptr<float>(), topk_ids.data_ptr<int>(),
       reinterpret_cast<const half*>(g_svh.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(u_svh.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(d_suh.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(out.data_ptr<at::Half>()), n);
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()), n,
+      static_cast<float>(limit));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -655,8 +989,7 @@ void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
   const int k = static_cast<int>(yd.size(1));
   const int T = static_cast<int>(topk_ids.size(0));
   const int topk = static_cast<int>(topk_ids.size(1));
-  TORCH_CHECK(k % (kGlueWarps * 128) == 0,
-              "EXL3 MoE: k must be a multiple of 512");
+  TORCH_CHECK(k % 128 == 0, "EXL3 MoE: k must be a multiple of 128");
   TORCH_CHECK(topk_weights.sizes() == topk_ids.sizes() &&
                   yd.size(0) >= T * topk && out.size(0) >= T &&
                   out.size(1) == k && d_svh.size(1) == k,
@@ -665,8 +998,7 @@ void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
   TORCH_CHECK(T <= kMaxGridY, "EXL3 MoE: too many tokens per launch");
   const at::cuda::OptionalCUDAGuard guard(yd.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  exl3_post_kernel<<<dim3(k / (kGlueWarps * 128), T), kGlueWarps * 32, 0,
-                     stream>>>(
+  exl3_post_kernel<<<dim3(glue_blocks(k), T), kGlueWarps * 32, 0, stream>>>(
       yd.data_ptr<float>(), topk_ids.data_ptr<int>(),
       topk_weights.data_ptr<float>(),
       reinterpret_cast<const half*>(d_svh.data_ptr<at::Half>()),

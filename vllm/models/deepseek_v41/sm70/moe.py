@@ -52,6 +52,8 @@ from vllm.models.deepseek_v41.common import contracts as C
 
 from . import gemv as v41_gemv
 from . import moe_kernels as mk
+from .moe_exl3 import DeepseekV41Exl3MoEMethod, expert_layer_context, plan_path
+from .moe_exl3 import _LAYER as _EXL3_LAYER
 from .moe_method import DeepseekV41Mxfp4MoEMethod, ExpertSpillPlan, make_spill_plan
 
 __all__ = ["DeepseekV41MoE", "ExpertSpillPlan", "make_spill_plan", "make_v41_moe_method", "expert_spill_context"]
@@ -83,6 +85,14 @@ def _impl() -> str:
 
 def make_v41_moe_method(moe: FusedMoEConfig) -> FusedMoEMethodBase:
     """Factory used by DeepseekV41FP8Config for every FusedMoE of the model (backbone and DSpark)."""
+    exl3 = plan_path()
+    if exl3:   # routed experts from an EXL3 checkpoint (moe_exl3.py): whole experts in VRAM, no spill
+        if _SPILL.get() is not None:
+            raise ValueError("VLLM_DS41_MOE_EXL3_PLAN is set: EXL3 experts stay in VRAM, unset the expert spill")
+        layer_id = _EXL3_LAYER.get()
+        if layer_id is None:
+            raise RuntimeError("EXL3 experts need the decoder layer id (build FusedMoE inside expert_layer_context)")
+        return DeepseekV41Exl3MoEMethod(moe, layer_id, exl3)
     backend = "torch" if _impl() == "torch" else knobs.env_str(BACKEND_KNOB, "skinny",
                                                                  choices=("skinny", "turbomind"))
     return DeepseekV41Mxfp4MoEMethod(moe, backend=backend, spill=_SPILL.get())
@@ -173,14 +183,14 @@ class DeepseekV41MoE(nn.Module):
         self.route_hist = np.zeros((2, self.n_experts), dtype=np.int64)
         quant_config = vllm_config.quant_config
         self.gate = DeepseekV41Gate(self.n_experts, self.hidden)
-        with expert_spill_context(spill):
+        with expert_spill_context(spill), expert_layer_context(layer_id):
             self.experts = FusedMoE(
                 num_experts=self.n_experts, top_k=self.top_k, hidden_size=self.hidden,
                 intermediate_size=int(config.moe_intermediate_size), params_dtype=torch.float16, renormalize=True,
                 quant_config=quant_config, prefix=f"{prefix}.experts", scoring_func="sqrtsoftplus",
                 routed_scaling_factor=self.routed_scale, e_score_correction_bias=self.gate.e_score_correction_bias,
                 swiglu_limit=self.swiglu_limit, router_logits_dtype=torch.float32)
-        if not isinstance(self.experts.quant_method, DeepseekV41Mxfp4MoEMethod):
+        if not isinstance(self.experts.quant_method, (DeepseekV41Mxfp4MoEMethod, DeepseekV41Exl3MoEMethod)):
             raise TypeError(f"{prefix}.experts got {type(self.experts.quant_method).__name__}; the quant config must "
                             "route DeepSeek-V4.1 FusedMoE layers to make_v41_moe_method")
         self.shared_experts = DeepseekV41SharedExpert(self.hidden, int(config.moe_intermediate_size), quant_config,

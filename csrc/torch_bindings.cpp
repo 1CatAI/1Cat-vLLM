@@ -778,11 +778,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "exl3_moe_gemv_out(Tensor(a!) y, Tensor(b!)? y2, Tensor x, Tensor? x2, "
       "Tensor trellis, Tensor? trellis2, Tensor expert_ids, "
-      "Tensor? group_rows, bool colmajor) -> ()");
+      "Tensor? group_rows, bool colmajor, int codebook=0) -> ()");
   ops.impl("exl3_moe_gemv_out", torch::kCUDA, &exl3_moe_gemv_out);
   ops.def(
+      "exl3_moe_gemv_mixed_out(Tensor(a!) y, Tensor(b!)? y2, Tensor x, "
+      "Tensor? x2, Tensor trellis, Tensor? trellis2, Tensor offsets, "
+      "Tensor kbits, Tensor expert_ids, Tensor? group_rows, bool colmajor, "
+      "int codebook, int n) -> ()");
+  ops.impl("exl3_moe_gemv_mixed_out", torch::kCUDA, &exl3_moe_gemv_mixed_out);
+  ops.def(
       "exl3_moe_mid_out(Tensor(a!) out, Tensor yg, Tensor yu, "
-      "Tensor topk_ids, Tensor g_svh, Tensor u_svh, Tensor d_suh) -> ()");
+      "Tensor topk_ids, Tensor g_svh, Tensor u_svh, Tensor d_suh, "
+      "float limit=0.0) -> ()");
   ops.impl("exl3_moe_mid_out", torch::kCUDA, &exl3_moe_mid_out);
   ops.def(
       "exl3_moe_post_out(Tensor(a!) out, Tensor yd, Tensor topk_ids, "
