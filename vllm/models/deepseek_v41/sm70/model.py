@@ -438,6 +438,7 @@ for _param_frag, _ckpt_frag, _shard in _STACKED:
 _RENAMES = (("shared_experts.w2.", "shared_experts.down_proj."),)
 _EXPERT_SCALE_RE = re.compile(r"(\.experts\.\d+\.w[123])\.scale$")
 _EXPERT_KEY_RE = re.compile(r"experts\.\d+\.w[123]\.")
+_EXL3_SUFFIXES = (".trellis", ".suh", ".svh", ".mul1", ".mcg")
 
 
 def map_checkpoint_name(name: str) -> str:
@@ -467,6 +468,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
+        from .moe_exl3 import plan_path
+        self._exl3_experts = bool(plan_path())   # routed experts from an EXL3 checkpoint (hybrid model dir)
         self.model = DeepseekV41Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if self.model.pp_is_last:
             self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=maybe_prefix(prefix, "lm_head"))
@@ -512,6 +515,15 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
     def skip_checkpoint_weight(self, name: str) -> bool:
         if name.startswith(_SKIP_PREFIXES) or ".engram.embed." in name or name.endswith(".bias_vl"):
             return True
+        if self._exl3_experts:
+            # hybrid checkpoint (moe_exl3.py): routed experts from the EXL3 shards, everything else official. vLLM
+            # yields every tensor of every listed shard, so drop the official MXFP4 experts and the EXL3 shards'
+            # own dense trellis tensors (attention / shared expert / head stay official FP8 here).
+            routed = _EXPERT_KEY_RE.search(name) is not None
+            if routed and name.endswith((".weight", ".scale")):
+                return True
+            if not routed and name.endswith(_EXL3_SUFFIXES):
+                return True
         match = _LAYER_RE.match(name)
         if match is not None:
             return not self.model.owns_layer(int(match.group(1)))
@@ -554,9 +566,16 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         tp_rank, tp_size = get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
         loaded: set[str] = set()
         delegated: dict[str, list[tuple[str, torch.Tensor]]] = {}
+        seen_dense: set[str] = set()
         for ckpt_name, tensor in weights:
             if self.skip_checkpoint_weight(ckpt_name):
                 continue
+            if self._exl3_experts and ".ffn.experts." not in ckpt_name:
+                # the EXL3 shards repeat the official non-expert tensors (norms, router, embeddings, compressors);
+                # both copies are the 1017 originals, the first one wins
+                if ckpt_name in seen_dense:
+                    continue
+                seen_dense.add(ckpt_name)
             name = map_checkpoint_name(ckpt_name)
             delegate = self._delegate_for(name)
             if delegate is not None:
