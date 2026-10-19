@@ -38,7 +38,9 @@ from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common.contracts import (
     CAND_SOURCE,
     CAND_TOPK_BLOCKS,
+    CKV_PACKED_DIM,
     CKV_RECORD_DIM,
+    CKV_RECORD_DTYPE,
     IK_RECORD_DIM,
     KV_RECORD_DTYPE,
     SharedAttnBuffers,
@@ -78,11 +80,13 @@ def layers_prefix_of_stage(static_forward_context: dict[str, object]) -> str:
 
 
 def kv20_crc(ckv: torch.Tensor, ik: torch.Tensor) -> torch.Tensor:
-    """[T] int32: per-row sum of the int16 bit patterns of ckv [T,512] and ik [T,128] (|sum| <= 640 * 32768 < 2^31)."""
-    if ckv.dtype != KV_RECORD_DTYPE or ik.dtype != KV_RECORD_DTYPE or ckv.shape[0] != ik.shape[0]:
-        raise ValueError(f"kv20_crc needs fp16 rows of equal count, got {ckv.dtype} {tuple(ckv.shape)} / "
-                         f"{ik.dtype} {tuple(ik.shape)}")
-    return (ckv.view(torch.int16).sum(dim=-1, dtype=torch.int32)
+    """[T] int32: per-row sum of the packed ckv bytes [T,288] (<= 288 * 255) plus the int16 bit patterns of
+    ik [T,128] (|sum| <= 128 * 32768): well inside int32."""
+    if ckv.dtype != CKV_RECORD_DTYPE or ckv.shape[-1] != CKV_PACKED_DIM or ik.dtype != KV_RECORD_DTYPE \
+            or ckv.shape[0] != ik.shape[0]:
+        raise ValueError(f"kv20_crc needs packed uint8 ckv rows and fp16 ik rows of equal count, got {ckv.dtype} "
+                         f"{tuple(ckv.shape)} / {ik.dtype} {tuple(ik.shape)}")
+    return (ckv.to(torch.int32).sum(dim=-1, dtype=torch.int32)
             + ik.view(torch.int16).sum(dim=-1, dtype=torch.int32))
 
 
@@ -119,12 +123,12 @@ class DeepseekV41KVSourceMirror(nn.Module):
 
     def ingest(self, positions: torch.Tensor, ckv: torch.Tensor, ik: torch.Tensor, cand: torch.Tensor,
                crc: torch.Tensor | None = None) -> None:
-        """ckv [T,512] fp16, ik [T,128] fp16 (exact records as written by the source), cand [T,2048] int32, with
+        """ckv [T,288] uint8 (packed), ik [T,128] fp16 (exact records as written by the source), cand [T,2048] int32, with
         T == positions.shape[0] (the forward's token count). Scatter ckv/ik to the slots of
         attn_metadata[source prefix].slot_mapping; copy cand to shared.candidate_blocks[:T]. ``crc`` [T] int32
         (payload key kv20_crc) is required when VLLM_DS41_ATTN_MIRROR_CHECK=1. Eager-break op."""
-        if ckv.dtype != KV_RECORD_DTYPE or ckv.shape[-1] != CKV_RECORD_DIM:
-            raise ValueError(f"mirror ckv must be fp16 [T, {CKV_RECORD_DIM}], got {ckv.dtype} {tuple(ckv.shape)}")
+        if ckv.dtype != CKV_RECORD_DTYPE or ckv.shape[-1] != CKV_PACKED_DIM:
+            raise ValueError(f"mirror ckv must be packed uint8 [T, {CKV_PACKED_DIM}], got {ckv.dtype} {tuple(ckv.shape)}")
         if ik.dtype != KV_RECORD_DTYPE or ik.shape[-1] != IK_RECORD_DIM:
             raise ValueError(f"mirror ik must be fp16 [T, {IK_RECORD_DIM}], got {ik.dtype} {tuple(ik.shape)}")
         if cand.dtype != torch.int32 or cand.shape[-1] != CAND_TOPK_BLOCKS:

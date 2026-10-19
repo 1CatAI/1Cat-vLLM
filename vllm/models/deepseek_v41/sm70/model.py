@@ -348,7 +348,7 @@ class DeepseekV41Model(nn.Module):
             C.PP_KEY_PRE_MIX: ((num_tokens, C.HC), C.MIX_DTYPE),
         }
         if with_kv20:
-            schema[C.PP_KEY_KV20_CKV] = ((num_tokens, C.CKV_RECORD_DIM), C.KV_RECORD_DTYPE)
+            schema[C.PP_KEY_KV20_CKV] = ((num_tokens, C.CKV_PACKED_DIM), C.CKV_RECORD_DTYPE)
             schema[C.PP_KEY_KV20_IK] = ((num_tokens, C.IK_RECORD_DIM), C.KV_RECORD_DTYPE)
             schema[C.PP_KEY_CAND20] = ((num_tokens, C.CAND_TOPK_BLOCKS), torch.int32)
             if self.kv20_crc_check:

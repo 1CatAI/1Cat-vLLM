@@ -67,11 +67,11 @@ def test_ckv_store_and_export() -> None:
     slots = torch.randperm(600, device=DEV)[:N]
     out = {}
     for impl in ("sm70", "torch"):
-        rows = torch.zeros(600, 512, device=DEV).half()
-        exp = torch.zeros(N, 512, device=DEV).half()
+        rows = torch.zeros(600, 288, device=DEV, dtype=torch.uint8)      # packed FP4 records
+        exp = torch.zeros(N, 288, device=DEV, dtype=torch.uint8)
         sk.ckv_rope_qat_store(lat, lpos, cs, rows, slots, exp, impl=impl)
         assert torch.equal(rows[slots], exp)
-        out[impl] = exp
+        out[impl] = qat.unpack_ckv(exp, impl="torch")
     assert _flip_fraction(out["sm70"], out["torch"]) < 1e-4
     ref = qat.fp4_e4m3_qdq(apply_rope_torch(lat.float(), lpos, cs), out_dtype=torch.float16, impl="torch")
     assert _flip_fraction(out["torch"], ref) == 0.0

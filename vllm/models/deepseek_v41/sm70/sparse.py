@@ -16,11 +16,11 @@ name                                   spec                                     
 =====================================  ==============================================  ===========
 
 Block sizes: every block id of vLLM's single pool reserves one page in every tensor of the stage
-(``kv_cache_utils._deepseek_v41_tensor_plan``), so the windowed groups use the largest blocks whose
-page equals the ratio-2 compressed page (B/2 x 1 KiB = B/8 x 4 KiB = 128 KiB at B = 256): fewer
-block ids per prefill chunk and no extra tensor on stages holding ratio-2 sources. Sweep
-(``scratch/ds41/attn/kv_sweep.py``, 4096-token chunks, 256K context): PP3 pool 509 / 764 / 626 MiB per
-stage vs 928 / 1161 / 571 MiB with 64-token SWA and 8-token state blocks.
+(``kv_cache_utils._deepseek_v41_tensor_plan``). The compressed records are packed FP4 (288 B/latent, so a
+ratio-2 page is B/2 x 288 B = 36 KiB at B = 256), and the windowed groups use the blocks whose page equals
+the ratio-2 INDEX-KEY page (B/8 x 1 KiB = B/32 x 4 KiB = B/2 x 256 B = 32 KiB at B = 256) so the window and
+compressor-state tensors ride on the index-key tensors. gpubox, PP2 20/20, stage 1 (3 ratio-2 sources):
+204 KiB per block id vs 480 KiB with FP16 records and 128 KiB window/state pages.
 """
 
 from __future__ import annotations
@@ -38,7 +38,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common.contracts import (
     CKV_CACHE_DTYPE_STR,
+    CKV_PACKED_DIM,
     CKV_RECORD_DIM,
+    CKV_RECORD_DTYPE,
     HEAD_DIM,
     IDX_TOPK,
     IK_CACHE_DTYPE_STR,
@@ -75,12 +77,12 @@ PREFERRED_BLOCK_SIZE = 256     # MLA (compressed / index-K) tokens per block
 
 def swa_block_size(block_size: int) -> int:
     _check_block(block_size)
-    return block_size // 2
+    return block_size // 8
 
 
 def state_block_size(block_size: int) -> int:
     _check_block(block_size)
-    return block_size // 8
+    return block_size // 32
 
 
 def swa_cache_spec(block_size: int) -> SlidingWindowMLASpec:
@@ -92,7 +94,7 @@ def swa_cache_spec(block_size: int) -> SlidingWindowMLASpec:
 def compressed_cache_spec(block_size: int, compress_ratio: int) -> MLAAttentionSpec:
     _check_mla_block(block_size, compress_ratio)
     return MLAAttentionSpec(
-        block_size=block_size, num_kv_heads=1, head_size=CKV_RECORD_DIM, dtype=KV_RECORD_DTYPE,
+        block_size=block_size, num_kv_heads=1, head_size=CKV_PACKED_DIM, dtype=CKV_RECORD_DTYPE,
         compress_ratio=compress_ratio, cache_dtype_str=CKV_CACHE_DTYPE_STR, model_version=KV_MODEL_VERSION)
 
 
@@ -371,7 +373,7 @@ class DS41SWABackend(_DS41BackendBase):
 
 
 class DS41CompressedBackend(_DS41BackendBase):
-    HEAD_SIZES = (CKV_RECORD_DIM, IK_RECORD_DIM)
+    HEAD_SIZES = (CKV_PACKED_DIM, IK_RECORD_DIM)
 
     @staticmethod
     def get_name() -> str:
@@ -473,6 +475,7 @@ class DeepseekV41SM70SparseImpl:
         k = WINDOW + (IDX_TOPK if compressed else 0)
         h = out.shape[1] if out.dim() == 3 else N_HEADS
         bufs = [torch.empty((q_tile, k, HEAD_DIM), dtype=torch.float16, device=out.device),
+                torch.empty((q_tile, IDX_TOPK, CKV_PACKED_DIM), dtype=torch.uint8, device=out.device),  # packed gather
                 torch.empty((q_tile, h, k), dtype=torch.float32, device=out.device),
                 torch.empty((q_tile, h, k), dtype=torch.float32, device=out.device),
                 torch.empty((q_tile, h, HEAD_DIM), dtype=torch.float32, device=out.device)]

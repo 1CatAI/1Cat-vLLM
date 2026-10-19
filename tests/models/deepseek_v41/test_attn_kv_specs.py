@@ -118,11 +118,11 @@ def _v41_specs(layers: range, block: int = 256, mirror: bool = False) -> dict:
 
 
 def test_v41_page_sizes() -> None:
-    assert s70.swa_cache_spec(256).block_size == 128 and s70.state_cache_spec(256).block_size == 32
-    assert s70.swa_cache_spec(256).page_size_bytes == 128 * 1024
-    assert s70.state_cache_spec(256).page_size_bytes == 32 * 4096
-    assert s70.compressed_cache_spec(256, 2).page_size_bytes == 128 * 1024
-    assert s70.compressed_cache_spec(256, 1).page_size_bytes == 256 * 1024
+    assert s70.swa_cache_spec(256).block_size == 32 and s70.state_cache_spec(256).block_size == 8
+    assert s70.swa_cache_spec(256).page_size_bytes == 32 * 1024
+    assert s70.state_cache_spec(256).page_size_bytes == 8 * 4096
+    assert s70.compressed_cache_spec(256, 2).page_size_bytes == 128 * 288
+    assert s70.compressed_cache_spec(256, 1).page_size_bytes == 256 * 288
     assert s70.index_k_cache_spec(256, 2).page_size_bytes == 128 * 256
     assert s70.index_k_cache_spec(256, 1).page_size_bytes == 256 * 256
     for spec in (s70.swa_cache_spec(256), s70.state_cache_spec(256), s70.compressed_cache_spec(256, 2)):
@@ -133,17 +133,19 @@ def test_v41_page_sizes() -> None:
         s70.swa_cache_spec(60)
     with pytest.raises(ValueError):
         s70.index_k_cache_spec(256, 4)
-    bad = SlidingWindowMLASpec(block_size=8, num_kv_heads=1, head_size=512, dtype=torch.uint8, sliding_window=2,
+    bad = SlidingWindowMLASpec(block_size=8, num_kv_heads=1, head_size=512, dtype=torch.bfloat16, sliding_window=2,
                                model_version="deepseek_v41")
     with pytest.raises(ValueError):
         _ = bad.page_size_bytes
     # bytes per token of context per stage (PORT_DESIGN §6.2)
     def per_token(specs):
         return sum(sp.page_size_bytes / sp.block_size for sp in specs.values() if isinstance(sp, MLAAttentionSpec))
-    assert per_token(_v41_specs(range(0, 20))) == 1920
-    assert per_token(_v41_specs(range(20, 40))) == 1280
-    assert per_token(_v41_specs(range(14, 28))) == 1920
-    assert per_token(_v41_specs(range(28, 40), mirror=True)) == 1280
+    # packed FP4 compressed records (288 B/latent) + FP16 index keys (256 B/latent): ratio-2 source 272 B/token,
+    # ratio-1 source 544 B/token (was 640 / 1280 with FP16 compressed records)
+    assert per_token(_v41_specs(range(0, 20))) == 816
+    assert per_token(_v41_specs(range(20, 40))) == 544
+    assert per_token(_v41_specs(range(14, 28))) == 816
+    assert per_token(_v41_specs(range(28, 40), mirror=True)) == 544
 
 
 def _check_worker(specs: dict, cfg_out) -> None:
@@ -214,6 +216,9 @@ def test_v41_end_to_end_get_kv_cache_configs() -> None:
         _check_worker(w, c)
 
 
+POOL_MIB_256K = [451.5625, 677.34375, 429.84375]   # packed FP4 records + 32 KiB window/state pages (was 509/764/626 with FP16 records)
+
+
 def test_v41_pool_memory_at_256k() -> None:
     """Planning-time pool bytes per stage (every block id reserves a page in each tensor): the chosen
     windowed block sizes keep PP3 at 256K context / 4096-token chunks under 800 MiB per stage."""
@@ -226,7 +231,8 @@ def test_v41_pool_memory_at_256k() -> None:
     groups = ku.get_kv_cache_groups(cfg, merged)
     mib = [ku._max_memory_usage_bytes_from_groups(cfg, ku._project_kv_cache_groups_to_worker(groups, w)) / 2**20
            for w in workers]
-    assert mib == pytest.approx([509.0, 764.0, 626.0], abs=1.0)
+    print("POOL_MIB", mib)
+    assert mib == pytest.approx(POOL_MIB_256K, abs=1.0)
 
 
 def test_every_v41_backend_prefers_the_v41_block_size() -> None:

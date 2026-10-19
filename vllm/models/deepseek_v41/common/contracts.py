@@ -49,11 +49,13 @@ MIX_DTYPE = torch.float32            # pre / post / comb
 # ---- KV records: FP16 rows holding QAT values exactly (PORT_DESIGN A3) ----
 KV_RECORD_DTYPE = torch.float16
 SWA_RECORD_DIM = 512                 # window K=V: E4M3 x UE8M0/32 QAT over all 512 dims      -> 1024 B/token/layer
-CKV_RECORD_DIM = 512                 # compressed latent: E2M1 x E4M3/16 QAT, RoPE applied   -> 1024 B/latent
+CKV_RECORD_DIM = 512                 # compressed latent dims: E2M1 x E4M3/16 QAT, RoPE applied
+CKV_PACKED_DIM = CKV_RECORD_DIM // 2 + CKV_RECORD_DIM // 16   # stored packed: nibbles + E4M3 scale bytes -> 288 B/latent
+CKV_RECORD_DTYPE = torch.uint8       # (common/qat.py "packed FP4 compressed-KV records"; unpacks to the FP16 QAT values)
 IK_RECORD_DIM = 128                  # index key: E2M1 x UE8M0/32 QAT, RoPE applied          ->  256 B/latent
 KV_MODEL_VERSION = "deepseek_v41"
 SWA_CACHE_DTYPE_STR = "v41_fp16_qat_swa"
-CKV_CACHE_DTYPE_STR = "v41_fp16_qat_ckv"
+CKV_CACHE_DTYPE_STR = "v41_fp4_packed_ckv"
 IK_CACHE_DTYPE_STR = "v41_fp16_qat_ik"
 CAND_ALL = -2                        # cand row[0] sentinel: <= CAND_TOPK_BLOCKS blocks reachable, no masking
 
@@ -97,7 +99,7 @@ class SharedAttnBuffers:
                                          #   (ascending, -1 pad) published by the latest index source, read by Reuse layers
     candidate_blocks: torch.Tensor       # [max_num_batched_tokens, CAND_TOPK_BLOCKS] int32: block ids (ascending, -1 pad);
                                          #   row[0] == CAND_ALL => no mask. Written by layer 20 or the mirror.
-    export_ckv: torch.Tensor | None      # [max_num_batched_tokens, CKV_RECORD_DIM] fp16 (stage exporting source 20 only)
+    export_ckv: torch.Tensor | None      # [max_num_batched_tokens, CKV_PACKED_DIM] uint8 (stage exporting source 20 only)
     export_ik: torch.Tensor | None       # [max_num_batched_tokens, IK_RECORD_DIM] fp16 (stage exporting source 20 only)
 
 
@@ -107,7 +109,7 @@ def allocate_shared_attn_buffers(max_num_batched_tokens: int, stage: StagePlan,
     return SharedAttnBuffers(
         topk_indices=torch.full((max_num_batched_tokens, IDX_TOPK), -1, dtype=torch.int32, device=device),
         candidate_blocks=torch.full((max_num_batched_tokens, CAND_TOPK_BLOCKS), -1, dtype=torch.int32, device=device),
-        export_ckv=(torch.zeros((max_num_batched_tokens, CKV_RECORD_DIM), dtype=KV_RECORD_DTYPE, device=device)
+        export_ckv=(torch.zeros((max_num_batched_tokens, CKV_PACKED_DIM), dtype=CKV_RECORD_DTYPE, device=device)
                     if exports else None),
         export_ik=(torch.zeros((max_num_batched_tokens, IK_RECORD_DIM), dtype=KV_RECORD_DTYPE, device=device)
                    if exports else None),
@@ -117,7 +119,7 @@ def allocate_shared_attn_buffers(max_num_batched_tokens: int, stage: StagePlan,
 # ---- PP payload keys (IntermediateTensors) ----
 PP_KEY_HIDDEN = "hidden_states"      # [T, HC, HIDDEN] STREAM_DTYPE        every boundary
 PP_KEY_PRE_MIX = "pre_mix"           # [T, HC] float32                     every boundary
-PP_KEY_KV20_CKV = "kv20_ckv"         # [T, CKV_RECORD_DIM] float16         boundary into a stage mirroring 20
+PP_KEY_KV20_CKV = "kv20_ckv"         # [T, CKV_PACKED_DIM] uint8           boundary into a stage mirroring 20
 PP_KEY_KV20_IK = "kv20_ik"           # [T, IK_RECORD_DIM] float16          idem
 PP_KEY_CAND20 = "cand20"             # [T, CAND_TOPK_BLOCKS] int32         idem
 

@@ -324,12 +324,12 @@ DEEPSEEK_V41_MODEL_VERSION = "deepseek_v41"
 
 def _deepseek_v41_page_size_bytes(spec: MLAAttentionSpec | SlidingWindowMLASpec) -> int:
     """DeepSeek-V4.1 SM70 caches hold plain rows (PORT_DESIGN A3): FP16 records of the model's QAT
-    values (window KV 512, compressed KV 512, index-K 128) and FP32 compressor state rows (1024).
-    One page = ``storage_block_size`` rows of ``head_size`` elements."""
+    values (window KV 512, index-K 128), packed FP4 compressed-KV records (uint8, 288 bytes) and FP32
+    compressor state rows (1024). One page = ``storage_block_size`` rows of ``head_size`` elements."""
     if spec.num_kv_heads != 1:
         raise ValueError(f"DeepSeek-V4.1 caches are MQA (num_kv_heads=1), got {spec.num_kv_heads}")
-    if spec.dtype not in (torch.float16, torch.float32):
-        raise ValueError(f"DeepSeek-V4.1 cache rows are float16 or float32, got {spec.dtype}")
+    if spec.dtype not in (torch.float16, torch.float32, torch.uint8):
+        raise ValueError(f"DeepSeek-V4.1 cache rows are float16, float32 or packed uint8, got {spec.dtype}")
     if spec.block_size % spec.compress_ratio:
         raise ValueError(
             f"DeepSeek-V4.1 block_size {spec.block_size} is not a multiple of "

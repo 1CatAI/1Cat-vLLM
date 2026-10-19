@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gather kernels over FP16 KV records (PORT_DESIGN §1 "Sparse attention kernel" row; owner L-ATTN).
+"""Gather kernels over the KV records (PORT_DESIGN §1 "Sparse attention kernel" row; owner L-ATTN).
+
+Window rows are FP16; compressed rows are packed FP4 records (``qat.unpack_ckv``) and are unpacked to the same
+FP16 values right after the gather, so the attention math below is unchanged.
 
 Per query token t the reference (ref:k.py:310-403) attends over at most 128 window rows plus at most 512
 compressed rows (indices -1 = invalid), with a per-head ``attn_sink`` logit in the denominator only:
@@ -46,26 +49,35 @@ def _ckv_store_kernel(lat_ptr, lat_st, pos_ptr, cs_ptr, rows_ptr, slot_ptr, exp_
     re = tl.where(rot, e * c - o * s, e)
     ro = tl.where(rot, e * s + o * c, o)
     x = tl.reshape(tl.join(re, ro), (1, D // 16, 16))
-    y = tl.reshape(qat.fp4_e4m3_qdq_tile(x, 16), (D,)).to(rows_ptr.dtype.element_ty)
-    d = tl.arange(0, D)
-    slot = tl.load(slot_ptr + n)
+    codes, sbytes = qat.fp4_e4m3_quant_tile(x, 16)
+    lo, hi = tl.split(tl.reshape(codes, (D // 2, 2)))                 # dims 2i (low nibble), 2i + 1 (high)
+    nib = (lo | (hi << 4)).to(tl.uint8)
+    sb = tl.reshape(sbytes, (D // 16,)).to(tl.uint8)
+    j = tl.arange(0, D // 16)
+    PACKED: tl.constexpr = D // 2 + D // 16
+    slot = tl.load(slot_ptr + n).to(tl.int64)
     if slot >= 0:
-        tl.store(rows_ptr + slot * D + d, y)
+        tl.store(rows_ptr + slot * PACKED + i, nib)
+        tl.store(rows_ptr + slot * PACKED + D // 2 + j, sb)
     if EXPORT:
-        tl.store(exp_ptr + n.to(tl.int64) * D + d, y)
+        tl.store(exp_ptr + n.to(tl.int64) * PACKED + i, nib)
+        tl.store(exp_ptr + n.to(tl.int64) * PACKED + D // 2 + j, sb)
 
 
 def ckv_rope_qat_store(latent: torch.Tensor, latent_pos: torch.Tensor, cos_sin_cache: torch.Tensor,
                        rows: torch.Tensor, slots: torch.Tensor, export: torch.Tensor | None,
                        impl: str = "sm70") -> None:
     """Compressed-KV write (ref:m.py:751-761): RoPE on the last 64 dims at the group's first position,
-    E2M1 x E4M3/16 QAT, FP16 rows at ``slots`` [N] (-1: skip); ``export`` [N, 512] receives the same records."""
+    E2M1 x E4M3/16 QAT, packed FP4 records (uint8 [*, 288]) at ``slots`` [N] (-1: skip); ``export`` [N, 288]
+    receives the same records."""
     N, D = latent.shape
     if N == 0:
         return
+    if rows.dtype != torch.uint8 or rows.shape[-1] != D // 2 + D // 16:
+        raise TypeError(f"ckv_rope_qat_store: rows must be packed uint8 [*, {D // 2 + D // 16}], got {rows.dtype} "
+                        f"{tuple(rows.shape)}")
     if impl == "torch":
-        rec = qat.fp4_e4m3_qdq(apply_rope_torch(latent.float(), latent_pos, cos_sin_cache), out_dtype=rows.dtype,
-                               impl="torch")
+        rec = qat.fp4_e4m3_pack_torch(apply_rope_torch(latent.float(), latent_pos, cos_sin_cache))
         keep = slots >= 0
         rows.index_copy_(0, slots[keep], rec[keep])
         if export is not None:
@@ -90,11 +102,14 @@ def logical_to_rows(idx: torch.Tensor, tok2req: torch.Tensor, block_table: torch
 
 
 # ----------------------------------------------------------------------------- attention
-def _gather(rows: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """rows [N, D], idx [Q, K] int64 (-1 allowed) -> [Q, K, D]; invalid entries are ZERO rows (the reference
-    loads 0 for idx == -1): masking the score alone is not enough, since 0 * (inf or NaN garbage) in the PV
-    product is NaN."""
-    g = rows.index_select(0, idx.clamp(min=0).reshape(-1)).view(*idx.shape, rows.shape[-1])
+def _gather(rows: torch.Tensor, idx: torch.Tensor, impl: str = "sm70") -> torch.Tensor:
+    """rows [N, D] fp16 or packed FP4 [N, 288] uint8, idx [Q, K] int64 (-1 allowed) -> [Q, K, D] fp16; invalid
+    entries are ZERO rows (the reference loads 0 for idx == -1): masking the score alone is not enough, since
+    0 * (inf or NaN garbage) in the PV product is NaN."""
+    g = rows.index_select(0, idx.clamp(min=0).reshape(-1))
+    if rows.dtype == torch.uint8:
+        g = qat.unpack_ckv(g, impl="torch" if impl == "torch" else None)
+    g = g.view(*idx.shape, g.shape[-1])
     return g.masked_fill_((idx < 0)[..., None], 0)
 
 
@@ -108,12 +123,14 @@ def sparse_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Te
     if out.shape != q.shape:
         raise ValueError(f"out {tuple(out.shape)} != q {tuple(q.shape)}")
     for rows, idx in sources:
-        if rows.dtype != torch.float16 or rows.shape[-1] != D or idx.shape[0] != T:
+        fp16 = rows.dtype == torch.float16 and rows.shape[-1] == D
+        packed = rows.dtype == torch.uint8 and rows.shape[-1] == qat.CKV_PACKED_DIM and D == 512
+        if not (fp16 or packed) or idx.shape[0] != T:
             raise ValueError(f"bad source rows {tuple(rows.shape)} {rows.dtype} idx {tuple(idx.shape)}")
     sinkf = sink.float()[:H]
     for t0 in range(0, T, tile):
         t1 = min(T, t0 + tile)
-        kv = torch.cat([_gather(rows, idx[t0:t1]) for rows, idx in sources], dim=1)       # [Q, K, D] fp16
+        kv = torch.cat([_gather(rows, idx[t0:t1], impl) for rows, idx in sources], dim=1)  # [Q, K, D] fp16
         valid = torch.cat([idx[t0:t1] >= 0 for _, idx in sources], dim=1)                # [Q, K]
         qt = q[t0:t1]
         if impl == "torch":

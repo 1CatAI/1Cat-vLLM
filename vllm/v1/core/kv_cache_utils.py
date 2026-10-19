@@ -1507,6 +1507,15 @@ def _get_kv_cache_config_deepseek_v41(
         raise ValueError("DeepSeek-V4.1 KV cache plan is empty")
     num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    from collections import Counter
+    pages = Counter(ps for ps, _ in plan)
+    layers = Counter(name.split(".")[-1] if not name.split(".")[-1].isdigit() else "layer"
+                     for _, shared in plan for name in shared)
+    logger.info("DeepSeek-V4.1 KV plan: available %.3f GiB, %d tensors/block (page KiB x count: %s), "
+                "%.1f KiB per block, %d blocks; layers per cache kind: %s",
+                available_memory / 2**30, len(plan),
+                ", ".join(f"{ps // 1024}x{n}" for ps, n in sorted(pages.items())),
+                bytes_per_block / 1024, num_blocks, dict(layers))
     return num_blocks, [
         KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
         for ps, shared_by in plan

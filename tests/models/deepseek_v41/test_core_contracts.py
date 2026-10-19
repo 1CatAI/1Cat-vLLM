@@ -12,7 +12,8 @@ import torch
 
 # sha256 of common/contracts.py as written verbatim from PORT_DESIGN §3.1 in C0. Changing contracts.py
 # requires an orchestrator-approved design change (PORT_DESIGN §2.1 rule 1); update this hash in that commit.
-CONTRACTS_SHA256 = "47454e7899d9aeb075b27ac084e86aa78906bfe572d9e05bc6c886063520ddf8"
+# gpubox lane 2026-10-19: packed FP4 compressed-KV records (CKV_PACKED_DIM / CKV_RECORD_DTYPE), local decision.
+CONTRACTS_SHA256 = "98315cfc3cdfdaeb66c6b56c679f3d13f3334651a30fe5cd2727d4c323ed0565"
 
 
 def test_contracts_frozen(ds41_package_dir: Path) -> None:
@@ -35,7 +36,7 @@ def test_contracts_constants_consistent() -> None:
 
 def test_allocate_shared_attn_buffers_cpu() -> None:
     from vllm.models.deepseek_v41.common.contracts import (
-        CAND_TOPK_BLOCKS, CKV_RECORD_DIM, IDX_TOPK, IK_RECORD_DIM, StagePlan, allocate_shared_attn_buffers)
+        CAND_TOPK_BLOCKS, CKV_PACKED_DIM, IDX_TOPK, IK_RECORD_DIM, StagePlan, allocate_shared_attn_buffers)
 
     exporting = StagePlan(pp_rank=1, pp_size=3, first_layer=14, last_layer=27, mirrored_kv_sources=(),
                           exports_kv_sources=(20,), engram_layers=(14,))
@@ -43,7 +44,7 @@ def test_allocate_shared_attn_buffers_cpu() -> None:
     assert buf.topk_indices.shape == (16, IDX_TOPK) and buf.topk_indices.dtype == torch.int32
     assert bool((buf.topk_indices == -1).all()) and bool((buf.candidate_blocks == -1).all())
     assert buf.candidate_blocks.shape == (16, CAND_TOPK_BLOCKS)
-    assert buf.export_ckv is not None and buf.export_ckv.shape == (16, CKV_RECORD_DIM)
+    assert buf.export_ckv is not None and buf.export_ckv.shape == (16, CKV_PACKED_DIM)
     assert buf.export_ik is not None and buf.export_ik.shape == (16, IK_RECORD_DIM)
     plain = StagePlan(pp_rank=0, pp_size=1, first_layer=0, last_layer=39, mirrored_kv_sources=(),
                       exports_kv_sources=(), engram_layers=(1, 14))
