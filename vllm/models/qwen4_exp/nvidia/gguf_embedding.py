@@ -271,6 +271,7 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
                 enabled=policy.ple_disk_row_gather,
                 # The native fast lane keeps its own row cache.
                 cache_bytes=0 if policy.ple_fast_lane else self._row_cache_bytes,
+                prefetch_window_bytes=policy.ple_disk_prefetch_window_kib << 10,
             )
             policy.ple_disk_row_readers[self.layer_name] = admission
             # The parameter and reader retain the mmap owner, with no table copy.
