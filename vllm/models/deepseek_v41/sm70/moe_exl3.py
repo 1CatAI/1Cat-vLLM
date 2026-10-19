@@ -42,6 +42,7 @@ logger = init_logger(__name__)
 PLAN_KNOB = "VLLM_DS41_MOE_EXL3_PLAN"          # path of exl3_moe_plan.json; set = routed experts are EXL3
 BALANCE_KNOB = "VLLM_DS41_MOE_EXL3_BALANCE"    # dir of layer<L>.npy routing counts (VLLM_DS41_MOE_ROUTE_HIST)
 MUL1_MARKER = MUL1_MULT - (1 << 32)
+CHUNK_TOKENS = 512                             # prefill tokens per expert_slots pass (bounds the slot scratch)
 CODEBOOK_MUL1 = 1
 _PARAMS = ("trellis", "suh", "svh", "mul1")
 _LAYER: contextvars.ContextVar[int | None] = contextvars.ContextVar("ds41_moe_exl3_layer", default=None)
@@ -230,10 +231,22 @@ class DeepseekV41Exl3MoEMethod(FusedMoEMethodBase):
 
     # ---- compute ----
     def expert_slots(self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
-        """x [T, H] fp16, topk_ids [T, k] int32 -> y [T * k, H] fp16 (route order; zero for other ranks' experts)."""
+        """x [T, H] fp16, topk_ids [T, k] int32 -> y [T * k, H] fp16 (route order; zero for other ranks' experts).
+        Prefill runs in CHUNK_TOKENS pieces: the per-slot scratch is ~0.6 MB per token, which at a 4096-token chunk
+        (vLLM's memory-profiling pass) would cost more than the whole KV pool of a 256K context."""
         num_tokens, top_k = topk_ids.shape
         if x.dtype != torch.float16 or x.ndim != 2 or x.shape[0] != num_tokens or not x.is_contiguous():
             raise TypeError(f"expert_slots: x must be contiguous fp16 [{num_tokens}, H], got {x.dtype} {tuple(x.shape)}")
+        if num_tokens <= CHUNK_TOKENS:
+            return self._expert_slots(layer, x, topk_ids)
+        y = torch.empty((num_tokens * top_k, x.shape[1]), dtype=torch.float16, device=x.device)
+        for start in range(0, num_tokens, CHUNK_TOKENS):
+            end = min(num_tokens, start + CHUNK_TOKENS)
+            y[start * top_k:end * top_k] = self._expert_slots(layer, x[start:end], topk_ids[start:end].contiguous())
+        return y
+
+    def _expert_slots(self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+        num_tokens, top_k = topk_ids.shape
         H, inter = layer.exl3_H, layer.exl3_inter
         S = num_tokens * top_k
         f16 = dict(dtype=torch.float16, device=x.device)
