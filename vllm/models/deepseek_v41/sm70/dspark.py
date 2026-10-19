@@ -272,7 +272,10 @@ class DSparkDeepseekV41Model(nn.Module):
     def combine_hidden_states(self, aux: torch.Tensor) -> torch.Tensor:
         """aux [T, 3 x 5120] fp16 -> main_x [T, 5120] fp16 (main_proj + main_norm; power-of-two prescale)."""
         projected = self.main_proj((aux * MAIN_PROJ_INPUT_SCALE).to(torch.float16))
-        return rmsnorm_to_act(projected, self.main_norm.weight)
+        out = rmsnorm_to_act(projected, self.main_norm.weight)
+        if dump_on():
+            dump_put("aux_in", aux); dump_put("aux_projected", projected); dump_put("aux_main_x", out)
+        return out
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(self, main_x: torch.Tensor, positions: torch.Tensor,
@@ -288,9 +291,13 @@ class DSparkDeepseekV41Model(nn.Module):
         """input_ids / positions [B * block_size] (block-major: bonus token then block_size - 1 noise tokens per
         request) -> hidden [B * block_size, 5120] fp16 (pre-norm; ``compute_logits`` applies ``norm`` + lm_head)."""
         emb = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+        if dump_on():
+            dump_put("emb", emb)
         stream, pre = hc_expand(emb.to(torch.float16))
         for layer in self.layers:
             stream, pre = layer(stream, pre, positions, self.block_size)
+        if dump_on():
+            dump_put("final_stream", stream); dump_put("final_pre", pre)
         return hc_pre(stream, pre).to(torch.float16)
 
 
