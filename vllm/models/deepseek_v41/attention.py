@@ -195,6 +195,12 @@ class DeepseekV41Attention(nn.Module):
         md_all = step_metadata(self.layer_name)
         w_qkv = _fp16_weight(self.fused_wqa_wkv, (Q_LORA + HEAD_DIM, HIDDEN), f"{self.prefix}.fused_wqa_wkv")
         w_qb = _fp16_weight(self.wq_b, (self.n_local_heads * HEAD_DIM, Q_LORA), f"{self.prefix}.wq_b")
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and ATTN_OUTER_GRAPH and self.__dict__.get("_cap_logs", 0) < 3:
+            self._cap_logs = self.__dict__.get("_cap_logs", 0) + 1
+            logger.info("%s: CAPTURE x=%d rows metadata=%s", self.layer_name, x.shape[0],
+                        "none -> PROFILE PATH" if md_all is None else
+                        f"T={md_all[self.swa_cache.layer_name].num_actual_tokens} win={md_all[self.swa_cache.layer_name].window_slots.data_ptr():#x} slot={md_all[self.swa_cache.layer_name].slot_mapping.data_ptr():#x} pos={positions.data_ptr():#x} x={x.data_ptr():#x} out={out.data_ptr():#x}")
         if md_all is None:              # dummy/profile forward without metadata (ForwardContext.is_dummy_run)
             self._profile_run(x, positions, out, w_qkv, w_qb)
             return
