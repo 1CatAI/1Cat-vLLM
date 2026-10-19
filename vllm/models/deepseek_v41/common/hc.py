@@ -28,6 +28,10 @@ FUSED = knobs.env_bool("VLLM_DS41_HC_FUSED", False)
 # differs from cuBLAS's SGEMM, so pre/post/comb differ by ~1e-7 relative -- the only HC_FUSED piece that cannot be made
 # bit-exact; off, hc_mixes runs the torch GEMM (+ the exact fused Sinkhorn) while hc_pre/hc_post/rmsnorm stay fused.
 FUSED_MIXES = knobs.env_bool("VLLM_DS41_HC_FUSED_MIXES", False)
+# per-kernel switches for attribution (all default on under HC_FUSED): hc_pre, hc_post, rmsnorm_to_act
+FUSED_PRE = knobs.env_bool("VLLM_DS41_HC_FUSED_PRE", True)
+FUSED_POST = knobs.env_bool("VLLM_DS41_HC_FUSED_POST", True)
+FUSED_NORM = knobs.env_bool("VLLM_DS41_HC_FUSED_NORM", True)
 
 MIX_HC = (2 + HC) * HC  # 24 = pre(4) + post(4) + comb(16)
 _CHUNK = 1024
@@ -89,7 +93,7 @@ def hc_mixes(stream: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: 
 def hc_pre(stream: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
     """sum_c pre[:,c] * stream[:,c,:] in FP32, rounded to bf16 -> [T,5120] bf16 (ref:m.py:957-960)."""
     _check_stream(stream)
-    if FUSED and stream.is_cuda:
+    if FUSED and FUSED_PRE and stream.is_cuda:
         from ..sm70 import hc_kernels
         return hc_kernels.hc_pre_fused(stream.contiguous(), pre)
     out = torch.empty((stream.shape[0], HIDDEN), dtype=STREAM_DTYPE, device=stream.device)
@@ -105,7 +109,7 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
     _check_stream(residual)
     if x.shape != (residual.shape[0], HIDDEN):
         raise ValueError(f"sublayer output must be [T, {HIDDEN}], got {tuple(x.shape)}")
-    if FUSED and residual.is_cuda:
+    if FUSED and FUSED_POST and residual.is_cuda:
         from ..sm70 import hc_kernels
         return hc_kernels.hc_post_fused(x, residual.contiguous(), post, comb)
     out = torch.empty_like(residual)
@@ -119,7 +123,8 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
 
 def rmsnorm_to_act(x: torch.Tensor, weight: torch.Tensor, eps: float = NORM_EPS) -> torch.Tensor:
     """bf16/f32 in, FP32 variance + FP32 eps, * weight, -> fp16 [T,5120]. Zero rows -> zeros."""
-    if FUSED and x.is_cuda and x.ndim == 2 and x.shape[1] == HIDDEN and x.dtype in (torch.bfloat16, torch.float32):
+    if (FUSED and FUSED_NORM and x.is_cuda and x.ndim == 2 and x.shape[1] == HIDDEN
+            and x.dtype in (torch.bfloat16, torch.float32)):
         from ..sm70 import hc_kernels
         return hc_kernels.rmsnorm_to_act_fused(x.contiguous(), weight, eps)
     out = torch.empty(x.shape, dtype=torch.float16, device=x.device)
