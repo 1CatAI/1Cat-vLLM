@@ -2342,7 +2342,9 @@ def test_auto_fit_max_model_len_with_hybrid():
     _kv_cache_configs = get_kv_cache_configs(
         vllm_config, [kv_cache_specs], [available_memory]
     )
-    assert vllm_config.model_config.max_model_len == 1024
+    # The shared pool also reserves one null block. After the Mamba running
+    # state and speculative blocks, only 63 full-attention blocks remain.
+    assert vllm_config.model_config.max_model_len == 1008
 
 
 def test_auto_fit_max_model_len_not_triggered():
