@@ -4,14 +4,22 @@
 # Qualified Flash-Next GGUF TP4 settings: 256K total tokens, host KV and disk PLE.
 set -euo pipefail
 SOURCE_DIR=${SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-PYTHON_BIN=${PYTHON_BIN:-$SOURCE_DIR/.venv/bin/python}
+# An in-place build (setup.py build_ext --inplace) runs from SOURCE_DIR;
+# otherwise use the installed 1cat-vllm wheel.
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  PYTHON_BIN=$SOURCE_DIR/.venv/bin/python
+  [[ -x "$PYTHON_BIN" ]] || PYTHON_BIN=$(command -v python3)
+fi
+INPLACE_BUILD=false
+compgen -G "$SOURCE_DIR/vllm/_C*.so" >/dev/null && INPLACE_BUILD=true
 : "${MODEL_FILE:?Set MODEL_FILE to the first IQ3_S GGUF shard}"
 : "${MTP_DIR:?Set MTP_DIR to the matching stock MTP safetensors directory}"
 : "${CACHE_DIR:?Set CACHE_DIR to a dedicated runtime cache}"
 : "${VLLM_API_KEY:?Set VLLM_API_KEY for the public API}"
 PORT=${PORT:-8000}
-GPU_IDS=${GPU_IDS:-4,5,6,7}
-CPU_SET=${CPU_SET:-24-47,72-95}
+GPU_IDS=${GPU_IDS:-0,1,2,3}
+# Optional CPU pinning, e.g. the cores of the socket that owns the GPUs.
+CPU_SET=${CPU_SET:-}
 EXPERT_PROFILE=${EXPERT_PROFILE:-}
 QSA_HOST_INDEXER_HISTORY=${QSA_HOST_INDEXER_HISTORY:-false}
 # Concurrent requests. MTP4 verifies 5 rows per request: capture one CUDA
@@ -24,11 +32,14 @@ STATE_BLOCKS=$((1 + 28 * MAX_NUM_SEQS))
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 export PATH="$CUDA_HOME/bin:$(dirname "$PYTHON_BIN"):$PATH"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_IDS"
-export PYTHONPATH="$SOURCE_DIR"
+if [[ "$INPLACE_BUILD" == true ]]; then export PYTHONPATH="$SOURCE_DIR"; fi
 export TORCH_CUDA_ARCH_LIST=7.0
 export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:16:8}
 export NCCL_BUFFSIZE=${NCCL_BUFFSIZE:-4194304} NCCL_MAX_CTAS=${NCCL_MAX_CTAS:-6}
 export PYTORCH_ALLOC_CONF=expandable_segments:True OMP_NUM_THREADS=1 MALLOC_ARENA_MAX=2
+# Serve large transient host buffers (images, prefill staging) from mmap so
+# glibc returns them to the OS instead of growing the heap.
+export MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-4194304}
 export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
 export VLLM_EXPERT_CACHE_STACKS=1 VLLM_BALANCED_PREFILL_CHUNKS=1
 export VLLM_SM70_MTP_PROFILE=0 VLLM_NVTX_SCOPES_FOR_PROFILING=0
@@ -105,7 +116,7 @@ print(json.dumps({
 }))
 PY
 )
-cd "$SOURCE_DIR"
+if [[ "$INPLACE_BUILD" == true ]]; then cd "$SOURCE_DIR"; else cd "$CACHE_DIR"; fi
 MM_ARGS=(--language-model-only)
 if [[ -n "${VISION_DIR:-}" ]]; then
   test -f "$VISION_DIR/visual.safetensors"
@@ -121,7 +132,9 @@ PY
     --skip-mm-profiling --mm-encoder-tp-mode weights --mm-encoder-batch-size 1
     --mm-processor-cache-gb 0.25 --mm-processor-kwargs '{"max_pixels":4194304}')
 fi
-exec taskset -c "$CPU_SET" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" \
+PIN=()
+if [[ -n "$CPU_SET" ]]; then PIN=(taskset -c "$CPU_SET"); fi
+exec "${PIN[@]}" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" \
   --served-model-name flash-next-abliterated flash-next qwen3.8-flash-next \
   --host 127.0.0.1 --port "$PORT" --quantization gguf --tensor-parallel-size 4 \
   --dtype half --kv-cache-dtype float16 --mamba-ssm-cache-dtype float32 \
