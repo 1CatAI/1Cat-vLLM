@@ -271,7 +271,9 @@ def test_pp_schema_sender_equals_receiver(ds41_text_config, partition: list[int]
     payload = sum(torch.Size(shape).numel() * dtype.itemsize
                   for shape, dtype in DeepseekV41Model.pp_static_schema(stages[-1], 1).values())
     # §3.5 bytes/token; the mirror check adds 4 B/token (kv20_crc int32) on the kv-source-20 boundary only
-    assert payload == (50448 + 4 * crc_check if len(partition) == 3 else 40976)
+    # §3.5 bytes/token: hidden 40960 + pre_mix 16 (+ kv20: packed ckv 288 + ik 256 + cand 8192 = 8736 on the source-20 boundary;
+    # the FP16 ckv record was 1024 -> 50448)
+    assert payload == (49712 + 4 * crc_check if len(partition) == 3 else 40976)
     assert (KV20_CRC_KEY in DeepseekV41Model.pp_static_schema(stages[-1], 1)) == (crc_check and len(partition) == 3)
 
 
