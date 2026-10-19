@@ -405,15 +405,26 @@ class DeepseekV41Model(nn.Module):
                                    intermediate_tensors[C.PP_KEY_KV20_IK], intermediate_tensors[C.PP_KEY_CAND20],
                                    crc=intermediate_tensors[KV20_CRC_KEY] if self.kv20_crc_check else None)
         aux: list[torch.Tensor] = []
+        _dbg_pos = int(__import__("os").environ.get("DS41_DEBUG_POS", "-1"))
+        _dbg_row = -1
+        if _dbg_pos >= 0:
+            _hit = (positions == _dbg_pos).nonzero()
+            if _hit.numel():
+                _dbg_row = int(_hit[0, 0]); _dbg_norms = [("in", float(stream[_dbg_row].float().norm()))]
         for idx in range(self.start_layer, self.end_layer):
             layer = self.layers[idx]
             if isinstance(layer, PPMissingLayer):   # layer outside the configured subset
                 continue
             stream, pre = layer(stream, pre, positions)
+            if _dbg_row >= 0:
+                _dbg_norms.append((idx, float(stream[_dbg_row].float().norm())))
             if idx + 1 in self._aux_layers:
                 # DSpark target state: the HC stream entering layer idx + 1, averaged over the 4 streams (reference
                 # ``h.mean(dim=2)`` before ``layer(h)``); runner numbering = "output after layer idx" = idx + 1
                 aux.append(stream.float().mean(dim=1).to(torch.float16))
+        if _dbg_row >= 0:
+            logger.info("DS41 layer norms pos %d (row %d of T=%d): %s", _dbg_pos, _dbg_row, int(positions.shape[0]),
+                        " ".join(f"{k}:{v:.3f}" for k, v in _dbg_norms))
         if not self.pp_is_last:
             num_tokens = stream.shape[0]
             out = {C.PP_KEY_HIDDEN: stream, C.PP_KEY_PRE_MIX: pre}
