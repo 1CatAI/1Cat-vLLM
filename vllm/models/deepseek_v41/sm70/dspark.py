@@ -310,7 +310,7 @@ def dump_put(key: str, value) -> None:
 def dump_flush(model) -> None:
     if not _DUMP_DIR or _dump["round"] >= _DUMP_ROUNDS or not _dump["cur"]:
         return
-    if "attn_o_L40" not in _dump["cur"]:                # dummy / profile round (no attention metadata): discard
+    if not any(k.startswith("attn_o_L") for k in _dump["cur"]):   # dummy / profile round (no attention metadata): discard
         _dump["cur"] = {}
         return
     import os as _os, torch as _t
