@@ -958,8 +958,15 @@ class SpeculativeConfig:
 
                 if self.use_dspark():
                     draft_hf_config = self.draft_model_config.hf_config
-                    draft_hf_config.model_type = "deepseek_v4"
-                    draft_hf_config.architectures = ["DSparkDraftModel"]
+                    if getattr(self.target_model_config.hf_config, "model_type", "") in (
+                        "deepseek_v41", "deepseek_v41_text"
+                    ):
+                        # DeepSeek-V4.1 (SM70 port): its own drafter (vllm/models/deepseek_v41/sm70/dspark.py)
+                        draft_hf_config.model_type = "deepseek_v41"
+                        draft_hf_config.architectures = ["DSparkV41DraftModel"]
+                    else:
+                        draft_hf_config.model_type = "deepseek_v4"
+                        draft_hf_config.architectures = ["DSparkDraftModel"]
                     self.update_arch_()
 
                 if self.use_dflash_family() or self.use_dspark():

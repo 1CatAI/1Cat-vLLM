@@ -311,8 +311,79 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         return not name.startswith("mtp.")
 
     # ---- loading: mtp.N.* of the official checkpoint ----
+    _HEAD_TENSORS = ("main_proj.", "main_norm.", "norm.", "markov_head.", "confidence_head.")
+
+    def _map_name(self, ckpt: str) -> str | None:
+        """mtp.N.X -> parameter name, or None to skip. Block tensors reuse the target's checkpoint-name mapping
+        (``map_checkpoint_name``: .scale -> weight_scale(_inv), gate.bias -> e_score_correction_bias, shared w2 ->
+        down_proj) on a synthetic backbone name ``layers.{40 + N}.X``; the drafter's attention module lives one level
+        deeper (``attn.inner``)."""
+        if not ckpt.startswith("mtp."):
+            return None
+        _, stage, rest = ckpt.split(".", 2)
+        if rest.endswith(".bias_vl"):                  # drafts are text: no VL router bias
+            return None
+        if rest.startswith(self._HEAD_TENSORS):
+            name = "model." + rest
+            if name.endswith(".scale"):               # main_proj FP8 scale
+                name = name[: -len(".scale")] + ".weight_scale_inv"
+            return name
+        layer = int(self.config.num_hidden_layers) + int(stage)
+        name = map_checkpoint_name(f"layers.{layer}.{rest}")
+        return name.replace(".attn.", ".attn.inner.", 1)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """mtp.0.{main_proj,main_norm} -> model.*; mtp.N.X -> model.layers.N.X (via the target's name mapping for
-        attention / MoE / HC tensors); mtp.2.{norm,markov_head,confidence_head} -> model.*. The target embedding and
-        lm_head are shared by the proposer (not loaded here). WIP: expert tensors go through DeepseekV41MoE's mapping."""
-        raise NotImplementedError("DSparkDeepseekV41ForCausalLM.load_weights: WIP (see AGENT.md DSpark spec, item 2)")
+        """Loads the mtp.* tensors of the official checkpoint into the drafter (the target's embedding and lm_head
+        are shared by the proposer). Mirrors DeepseekV41ForCausalLM.load_weights: stacked attention / shared-expert
+        shards through their weight_loader(shard_id), routed experts through FusedMoE's expert mapping."""
+        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+        from vllm.models.deepseek_v41.sm70.moe import DeepseekV41MoE
+        from .model import _EXPERT_KEY_RE, _STACKED
+
+        params = dict(self.named_parameters())
+        n_experts = int(self.config.dspark_n_routed_experts)
+        expert_mapping = {weight_name: (param_name, expert_id, shard_id) for param_name, weight_name, expert_id, shard_id
+                          in DeepseekV41MoE.expert_params_mapping(n_experts)}
+        loaded: set[str] = set()
+        for ckpt_name, tensor in weights:
+            name = self._map_name(ckpt_name)
+            if name is None:
+                continue
+            if ".ffn.experts." in name:
+                if name.endswith(".weight_scale") and tensor.dtype == torch.float8_e8m0fnu:
+                    tensor = tensor.view(torch.uint8)
+                match = _EXPERT_KEY_RE.search(name)
+                param_name, expert_id, shard_id = expert_mapping[match.group(0)]
+                mapped = name.replace(match.group(0), param_name)
+                param = params[mapped]
+                param.weight_loader(param, tensor, mapped, shard_id=shard_id, expert_id=expert_id)
+                loaded.add(mapped)
+                continue
+            for param_frag, ckpt_frag, shard_id in _STACKED:
+                frag = ckpt_frag.replace("attn.", "attn.inner.", 1) if ckpt_frag.startswith("attn.") else ckpt_frag
+                pf = param_frag.replace("attn.", "attn.inner.", 1) if param_frag.startswith("attn.") else param_frag
+                if frag in name:
+                    stacked = name.replace(frag, pf)
+                    if stacked in params:
+                        param = params[stacked]
+                        param.weight_loader(param, tensor, shard_id)
+                        loaded.add(stacked)
+                        break
+            else:
+                if name not in params:
+                    raise KeyError(f"DSpark drafter: checkpoint tensor {ckpt_name!r} -> {name!r} has no parameter")
+                param = params[name]
+                loader = getattr(param, "weight_loader", None)
+                if loader is None and name.endswith(".attn_sink"):
+                    heads = C.N_HEADS // get_tensor_model_parallel_world_size()
+                    from vllm.distributed import get_tensor_model_parallel_rank
+                    tensor = tensor.narrow(0, heads * get_tensor_model_parallel_rank(), heads)
+                (loader or default_weight_loader)(param, tensor)
+                loaded.add(name)
+                if "confidence_head" in name:
+                    self._confidence_loaded = True
+        missing = sorted(n for n in params if n not in loaded and not n.startswith(("model.embed_tokens", "lm_head")))
+        if missing:
+            logger.warning("DSpark drafter: %d parameters not provided by mtp.* tensors (first: %s)", len(missing),
+                           missing[:5])
+        return loaded

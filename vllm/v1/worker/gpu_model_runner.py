@@ -10693,9 +10693,14 @@ class GPUModelRunner(
         if not layer_ids:
             dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
             if dspark_layer_ids:
-                # DSpark config uses zero-based decoder-layer IDs; the target
-                # model's capture interface numbers outputs after each layer.
-                layer_ids = [layer_id + 1 for layer_id in dspark_layer_ids]
+                if getattr(hf_config, "model_type", "") == "deepseek_v41":
+                    # DeepSeek-V4.1 feeds the drafter the attention INPUT of its target layers (the stream after
+                    # layer id - 1), which is exactly capture id "id" in the output-after-layer numbering.
+                    layer_ids = list(dspark_layer_ids)
+                else:
+                    # DSpark config uses zero-based decoder-layer IDs; the target
+                    # model's capture interface numbers outputs after each layer.
+                    layer_ids = [layer_id + 1 for layer_id in dspark_layer_ids]
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
