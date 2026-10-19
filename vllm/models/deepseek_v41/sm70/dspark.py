@@ -135,6 +135,7 @@ class DSparkV41Attention(nn.Module):
         from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
 
         _, kv = self._qkv(main_x)
+        dump_put(f"win_kv_L{self.layer_id}", kv); dump_put(f"win_main_x_L{self.layer_id}", main_x)
         q_dummy = torch.empty((main_x.shape[0], self.n_local_heads, C.HEAD_DIM), dtype=torch.float16,
                               device=main_x.device)
         q_rope_kv_insert(q_dummy, kv, positions, self.inner.rotary_emb.cos_sin_cache, self.swa_cache.rows(),
@@ -180,6 +181,11 @@ class DSparkV41Attention(nn.Module):
         brow = brow[:, None, :].expand(B, block_size, BLOCK_KEYS_PAD).reshape(T, BLOCK_KEYS_PAD)
         fused_decode_attention(q, [(self.swa_cache.rows(), win_rows), (block_kv, brow)], self.inner.attn_sink,
                                self.inner.scale, o[:T])
+        dump_put(f"attn_x_L{self.layer_id}", x); dump_put(f"attn_q_L{self.layer_id}", q)
+        dump_put(f"attn_block_kv_L{self.layer_id}", block_kv); dump_put(f"attn_win_rows_L{self.layer_id}", win_rows)
+        dump_put(f"attn_win_pos_L{self.layer_id}", win_pos)
+        dump_put(f"attn_win_kv_rows_L{self.layer_id}", self.swa_cache.rows()[win_rows[0].clamp(min=0)])
+        dump_put(f"attn_o_L{self.layer_id}", o[:T])
         return self.inner.output_projection(o, positions_all)
 
 
@@ -272,6 +278,34 @@ class DSparkDeepseekV41Model(nn.Module):
         return hc_pre(stream, pre).to(torch.float16)
 
 
+_DUMP_DIR = __import__("os").environ.get("VLLM_DS41_DSPARK_DUMP", "")
+_DUMP_ROUNDS = 4
+_dump: dict = {"round": 0, "cur": {}}
+
+
+def dump_put(key: str, value) -> None:
+    """VLLM_DS41_DSPARK_DUMP=<dir>: record per-round proposer tensors (first _DUMP_ROUNDS rounds, TP rank 0 of its stage)."""
+    if not _DUMP_DIR or _dump["round"] >= _DUMP_ROUNDS:
+        return
+    import torch as _t
+    v = value.detach().to("cpu", copy=True) if isinstance(value, _t.Tensor) else value
+    _dump["cur"].setdefault(key, []).append(v)
+
+
+def dump_flush(model) -> None:
+    if not _DUMP_DIR or _dump["round"] >= _DUMP_ROUNDS or not _dump["cur"]:
+        return
+    import os as _os, torch as _t
+    from vllm.distributed import get_tensor_model_parallel_rank
+    r = get_tensor_model_parallel_rank()
+    _os.makedirs(_DUMP_DIR, exist_ok=True)
+    if _dump["round"] == 0:
+        _t.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, f"{_DUMP_DIR}/drafter_state_tp{r}.pt")
+    _t.save(_dump["cur"], f"{_DUMP_DIR}/round{_dump['round']}_tp{r}.pt")
+    _dump["cur"] = {}
+    _dump["round"] += 1
+
+
 class DSparkDeepseekV41ForCausalLM(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
@@ -300,13 +334,25 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         return [layer.attn.swa_cache.prefix for layer in self.model.layers]
 
     def precompute_and_store_context_kv(self, context_states, context_positions, context_slot_mappings=None) -> None:
+        dump_put("ctx_states", context_states); dump_put("ctx_positions", context_positions)
+        dump_put("ctx_slots", None if context_slot_mappings is None else {k: v.detach().cpu() for k, v in context_slot_mappings.items()})
         self.model.precompute_and_store_context_kv(context_states, context_positions, context_slot_mappings)
 
     def forward(self, input_ids, positions, inputs_embeds=None) -> torch.Tensor:
-        return self.model(input_ids, positions, inputs_embeds)
+        dump_put("input_ids", input_ids); dump_put("positions", positions)
+        if inputs_embeds is not None:
+            dump_put("inputs_embeds", inputs_embeds)
+        out = self.model(input_ids, positions, inputs_embeds)
+        dump_put("hidden_out", out)
+        return out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor(self.lm_head, rmsnorm_to_act(hidden_states, self.model.norm.weight))
+        logits = self.logits_processor(self.lm_head, rmsnorm_to_act(hidden_states, self.model.norm.weight))
+        if logits is not None:
+            dump_put("logits_top5", torch.topk(logits.float(), 5, dim=-1).indices)
+            dump_put("logits_top5_val", torch.topk(logits.float(), 5, dim=-1).values)
+        dump_flush(self)
+        return logits
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.embed_tokens(token_ids)
