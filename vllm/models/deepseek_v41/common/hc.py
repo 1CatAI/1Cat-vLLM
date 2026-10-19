@@ -24,6 +24,10 @@ FUSED_SINKHORN = knobs.env_bool("VLLM_DS41_HC_FUSED_SINKHORN", False)
 # VLLM_DS41_HC_FUSED=1: single-kernel hc_pre / hc_post (bit-exact with the torch math below), and fused
 # rmsnorm_to_act / hc_mixes (blocked FP32 reductions instead of torch's: ~1 FP32 ulp, not bit-identical).
 FUSED = knobs.env_bool("VLLM_DS41_HC_FUSED", False)
+# VLLM_DS41_HC_FUSED_MIXES=1: also the fused hc_mixes (partial-sum GEMM + Sinkhorn in two kernels). Its summation order
+# differs from cuBLAS's SGEMM, so pre/post/comb differ by ~1e-7 relative -- the only HC_FUSED piece that cannot be made
+# bit-exact; off, hc_mixes runs the torch GEMM (+ the exact fused Sinkhorn) while hc_pre/hc_post/rmsnorm stay fused.
+FUSED_MIXES = knobs.env_bool("VLLM_DS41_HC_FUSED_MIXES", False)
 
 MIX_HC = (2 + HC) * HC  # 24 = pre(4) + post(4) + comb(16)
 _CHUNK = 1024
@@ -67,7 +71,7 @@ def hc_mixes(stream: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: 
     _check_stream(stream)
     if fn.dtype != torch.float32 or fn.shape != (MIX_HC, HC * HIDDEN):
         raise ValueError(f"hc fn must be float32 [{MIX_HC}, {HC * HIDDEN}], got {fn.dtype} {tuple(fn.shape)}")
-    if FUSED and stream.is_cuda:
+    if FUSED and FUSED_MIXES and stream.is_cuda:
         from ..sm70 import hc_kernels
         return hc_kernels.hc_mixes_fused(stream.contiguous(), fn, scale, base, NORM_EPS)
     num_tokens = stream.shape[0]
