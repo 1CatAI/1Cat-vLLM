@@ -135,6 +135,8 @@ def _check_mla_block(block_size: int, compress_ratio: int) -> None:
 
 logger = init_logger(__name__)
 
+GRAPH_OWN_BUFFERS_MAX_T = 16     # = attention.GRAPH_MAX_T: decode batches whose metadata graphs bind
+
 
 @dataclass
 class DS41BatchMetadata:
@@ -263,13 +265,28 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
         positions = self._buf("_pos")[:T]
         positions.copy_(torch.from_numpy(pos_cpu))
         slot_mapping = cm.slot_mapping[:T]
-        if slot_mapping.dtype != torch.int64:
+        block_table = cm.block_table_tensor[:R]
+        if ATTN_GRAPH and T <= GRAPH_OWN_BUFFERS_MAX_T:
+            # decode: the graphs captured against this metadata must bind THIS builder's buffers, not whichever tensors
+            # the runner handed the capture-time dummy build (which may be another group's slot mapping / block table)
+            slot_mapping = self._buf("_slot")[:T].copy_(slot_mapping)
+            bt = self._bt_buf(block_table.shape[1])
+            block_table = bt[:R].copy_(block_table)
+        elif slot_mapping.dtype != torch.int64:
             slot_mapping = self._buf("_slot")[:T].copy_(slot_mapping)
         return dict(
             num_reqs=R, num_actual_tokens=T, query_start_loc=cm.query_start_loc[: R + 1],
             query_start_loc_cpu=qsl_cpu, seq_lens_cpu=seq_cpu, token_to_req_indices=tok2req,
-            positions=positions, positions_cpu=pos_cpu, block_table=cm.block_table_tensor[:R],
+            positions=positions, positions_cpu=pos_cpu, block_table=block_table,
             block_size=int(self.kv_cache_spec.block_size), slot_mapping=slot_mapping)
+
+    def _bt_buf(self, max_blocks: int) -> torch.Tensor:
+        """Own copy of the batch's block-table rows for decode-sized batches: [GRAPH_OWN_BUFFERS_MAX_T, max_blocks] int32."""
+        buf = getattr(self, "_bt", None)
+        if buf is None or buf.shape[1] != max_blocks:
+            buf = torch.zeros((GRAPH_OWN_BUFFERS_MAX_T, max_blocks), dtype=torch.int32, device=self.device)
+            self._bt = buf
+        return buf
 
     def _log_ptrs(self, md, tag: str) -> None:
         """Debug (ATTN_GRAPH): the device addresses a captured graph binds vs. what real steps provide."""
