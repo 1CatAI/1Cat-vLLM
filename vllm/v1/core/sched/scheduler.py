@@ -659,6 +659,16 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                request.spec_token_ids
+                and request.num_output_placeholders == 0
+                and request.num_computed_tokens >= request.num_tokens
+            ):
+                # Pipeline-parallel batch queue: the drafter's tokens for a step can be attached before that step's
+                # sampled token has been processed. Scheduling now would verify the drafts without their anchor
+                # (the worker asserts scheduled >= drafts + 1 and the stages deadlock). Wait for the output.
+                req_index += 1
+                continue
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
