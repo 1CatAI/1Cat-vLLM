@@ -135,7 +135,8 @@ class DSparkV41Attention(nn.Module):
         from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
 
         _, kv = self._qkv(main_x)
-        dump_put(f"win_kv_L{self.layer_id}", kv); dump_put(f"win_main_x_L{self.layer_id}", main_x)
+        if dump_on():
+            dump_put(f"win_kv_L{self.layer_id}", kv); dump_put(f"win_main_x_L{self.layer_id}", main_x)
         q_dummy = torch.empty((main_x.shape[0], self.n_local_heads, C.HEAD_DIM), dtype=torch.float16,
                               device=main_x.device)
         q_rope_kv_insert(q_dummy, kv, positions, self.inner.rotary_emb.cos_sin_cache, self.swa_cache.rows(),
@@ -181,11 +182,15 @@ class DSparkV41Attention(nn.Module):
         brow = brow[:, None, :].expand(B, block_size, BLOCK_KEYS_PAD).reshape(T, BLOCK_KEYS_PAD)
         fused_decode_attention(q, [(self.swa_cache.rows(), win_rows), (block_kv, brow)], self.inner.attn_sink,
                                self.inner.scale, o[:T])
-        dump_put(f"attn_x_L{self.layer_id}", x); dump_put(f"attn_q_L{self.layer_id}", q)
-        dump_put(f"attn_block_kv_L{self.layer_id}", block_kv); dump_put(f"attn_win_rows_L{self.layer_id}", win_rows)
-        dump_put(f"attn_win_pos_L{self.layer_id}", win_pos)
-        dump_put(f"attn_win_kv_rows_L{self.layer_id}", self.swa_cache.rows()[win_rows[0].clamp(min=0)])
-        dump_put(f"attn_o_L{self.layer_id}", o[:T])
+        if dump_on():
+            dump_put(f"attn_x_L{self.layer_id}", x); dump_put(f"attn_q_L{self.layer_id}", q)
+            dump_put(f"attn_block_kv_L{self.layer_id}", block_kv); dump_put(f"attn_win_rows_L{self.layer_id}", win_rows)
+            dump_put(f"attn_win_pos_L{self.layer_id}", win_pos)
+            cache = self.swa_cache.rows(); r0 = win_rows[0]
+            ok = (r0 >= 0) & (r0 < cache.shape[0])
+            dump_put(f"attn_win_valid_L{self.layer_id}", ok)
+            dump_put(f"attn_win_kv_rows_L{self.layer_id}", cache[r0[ok]])
+            dump_put(f"attn_o_L{self.layer_id}", o[:T])
         return self.inner.output_projection(o, positions_all)
 
 
@@ -283,6 +288,14 @@ _DUMP_ROUNDS = 4
 _dump: dict = {"round": 0, "cur": {}}
 
 
+def dump_on() -> bool:
+    """True when a dump is active for this forward (dir set, rounds left, not inside a graph capture)."""
+    if not _DUMP_DIR or _dump["round"] >= _DUMP_ROUNDS:
+        return False
+    import torch as _t
+    return not _t.cuda.is_current_stream_capturing()
+
+
 def dump_put(key: str, value) -> None:
     """VLLM_DS41_DSPARK_DUMP=<dir>: record per-round proposer tensors (first _DUMP_ROUNDS rounds, TP rank 0 of its stage)."""
     if not _DUMP_DIR or _dump["round"] >= _DUMP_ROUNDS:
@@ -353,10 +366,11 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, rmsnorm_to_act(hidden_states, self.model.norm.weight))
-        if logits is not None:
+        if logits is not None and dump_on():
             dump_put("logits_top5", torch.topk(logits.float(), 5, dim=-1).indices)
             dump_put("logits_top5_val", torch.topk(logits.float(), 5, dim=-1).values)
-        dump_flush(self)
+        if dump_on():
+            dump_flush(self)
         return logits
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
