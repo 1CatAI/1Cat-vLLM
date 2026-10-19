@@ -252,7 +252,13 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
         if pos_cpu.shape[0] != T:
             raise RuntimeError(f"token count mismatch: query_start_loc covers {pos_cpu.shape[0]} tokens, "
                                f"num_actual_tokens={T}")
-        tok2req = cm.token_to_req_indices(self._tok2req_buf)[:T]
+        # CommonAttentionMetadata.token_to_req_indices caches the FIRST caller's buffer and hands it to every later builder
+        # that shares the metadata object, so the returned tensor is not necessarily this builder's own; copy it into
+        # this builder's static buffer so captured graphs always read a buffer this builder refills every step
+        shared = cm.token_to_req_indices(self._buf("_tok2req_scratch", dtype=torch.int32))[:T]
+        tok2req = self._tok2req_buf[:T]
+        if shared.data_ptr() != tok2req.data_ptr():
+            tok2req.copy_(shared)
         # static buffers (same address every step for a given T): the decode attention graphs read them in place
         positions = self._buf("_pos")[:T]
         positions.copy_(torch.from_numpy(pos_cpu))
