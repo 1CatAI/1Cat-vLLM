@@ -698,10 +698,11 @@ def exl3_moe_gemv_mixed_out(
     colmajor: bool,
     codebook: int,
     n: int,
+    ksplit: int = 1,
 ) -> None:
     torch.ops._C.exl3_moe_gemv_mixed_out(
         y, y2, x, x2, trellis, trellis2, offsets, kbits, expert_ids, group_rows,
-        colmajor, codebook, n,
+        colmajor, codebook, n, ksplit,
     )
 
 
@@ -714,8 +715,9 @@ def exl3_moe_mid_out(
     u_svh: torch.Tensor,
     d_suh: torch.Tensor,
     limit: float = 0.0,
+    ksplit: int = 1,
 ) -> None:
-    torch.ops._C.exl3_moe_mid_out(out, yg, yu, topk_ids, g_svh, u_svh, d_suh, limit)
+    torch.ops._C.exl3_moe_mid_out(out, yg, yu, topk_ids, g_svh, u_svh, d_suh, limit, ksplit)
 
 
 def exl3_moe_post_out(
@@ -724,8 +726,9 @@ def exl3_moe_post_out(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     d_svh: torch.Tensor,
+    ksplit: int = 1,
 ) -> None:
-    torch.ops._C.exl3_moe_post_out(out, yd, topk_ids, topk_weights, d_svh)
+    torch.ops._C.exl3_moe_post_out(out, yd, topk_ids, topk_weights, d_svh, ksplit)
 
 
 def exl3_moe_available() -> bool:
@@ -747,18 +750,18 @@ if hasattr(torch.ops._C, "exl3_moe_gemv_out"):
     @register_fake("_C::exl3_moe_gemv_mixed_out")
     def _exl3_moe_gemv_mixed_out_fake(
         y, y2, x, x2, trellis, trellis2, offsets, kbits, expert_ids, group_rows,
-        colmajor, codebook, n,
+        colmajor, codebook, n, ksplit=1,
     ) -> None:
         return None
 
     @register_fake("_C::exl3_moe_mid_out")
     def _exl3_moe_mid_out_fake(
-        out, yg, yu, topk_ids, g_svh, u_svh, d_suh, limit=0.0
+        out, yg, yu, topk_ids, g_svh, u_svh, d_suh, limit=0.0, ksplit=1
     ) -> None:
         return None
 
     @register_fake("_C::exl3_moe_post_out")
-    def _exl3_moe_post_out_fake(out, yd, topk_ids, topk_weights, d_svh) -> None:
+    def _exl3_moe_post_out_fake(out, yd, topk_ids, topk_weights, d_svh, ksplit=1) -> None:
         return None
 
 

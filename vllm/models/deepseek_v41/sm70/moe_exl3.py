@@ -43,6 +43,13 @@ PLAN_KNOB = "VLLM_DS41_MOE_EXL3_PLAN"          # path of exl3_moe_plan.json; set
 BALANCE_KNOB = "VLLM_DS41_MOE_EXL3_BALANCE"    # dir of layer<L>.npy routing counts (VLLM_DS41_MOE_ROUTE_HIST)
 MUL1_MARKER = MUL1_MULT - (1 << 32)
 CHUNK_TOKENS = 512                             # prefill tokens per expert_slots pass (bounds the slot scratch)
+KSPLIT_KNOB = "VLLM_DS41_MOE_EXL3_KSPLIT"      # max split-K of the decode GEMVs (more blocks in flight for few routes)
+
+
+def _ksplit(k_in: int, limit: int) -> int:
+    """Largest split <= limit that divides the per-warp k-tile count (k/16 tiles over 4 warps)."""
+    per_warp = k_in // 16 // 4
+    return max(d for d in range(1, limit + 1) if per_warp % d == 0)
 CODEBOOK_MUL1 = 1
 _PARAMS = ("trellis", "suh", "svh", "mul1")
 _LAYER: contextvars.ContextVar[int | None] = contextvars.ContextVar("ds41_moe_exl3_layer", default=None)
@@ -116,6 +123,7 @@ class DeepseekV41Exl3MoEMethod(FusedMoEMethodBase):
         self.owner = assign_experts(self.k_global, counts, self.tp_size)
         self.local = np.flatnonzero(self.owner == self.tp_rank)        # global ids owned here, ascending
         self.weight_dtype = "exl3"
+        self.ksplit_limit = knobs.env_int(KSPLIT_KNOB, 4, minimum=1, maximum=16)   # 4: -18% at 1 route, neutral above (decode is ALU-bound)
 
     # ---- FusedMoEMethodBase plumbing: driven by DeepseekV41MoE.expert_slots, never by FusedMoE.forward ----
     @property
@@ -253,20 +261,24 @@ class DeepseekV41Exl3MoEMethod(FusedMoEMethodBase):
         f32 = dict(dtype=torch.float32, device=x.device)
         loc = layer.exl3_glob2loc[topk_ids.long()].contiguous()            # [T, k], -1 = another rank's expert
         flat = loc.view(-1)
+        grouped = num_tokens >= GROUP_MIN_TOKENS
+        ks13 = 1 if grouped else _ksplit(H, self.ksplit_limit)              # split-K: decode only
+        ks2 = 1 if grouped else _ksplit(inter, self.ksplit_limit)
         xg, xu = torch.empty((S, H), **f16), torch.empty((S, H), **f16)
-        yg, yu = torch.empty((S, inter), **f32), torch.empty((S, inter), **f32)
-        hd, yd = torch.empty((S, inter), **f16), torch.empty((S, H), **f32)
+        yg, yu = torch.empty((ks13 * S, inter), **f32), torch.empty((ks13 * S, inter), **f32)
+        hd, yd = torch.empty((S, inter), **f16), torch.empty((ks2 * S, H), **f32)
         out = torch.empty((S, H), **f32)
         ops.exl3_moe_pre_out(xg, xu, x, loc, layer.w13_suh[0], layer.w13_suh[1])
-        if num_tokens >= GROUP_MIN_TOKENS:
+        if grouped:
             ids, rows = exl3_group_slots(loc, layer.exl3_kbits.shape[0] + 1)
             ids, rows = ids.contiguous(), rows.contiguous()
         else:
             ids, rows = flat, None
         ops.exl3_moe_gemv_mixed_out(yg, yu, xg, xu, layer.w13_trellis[0], layer.w13_trellis[1], layer.exl3_offs13,
-                                    layer.exl3_kbits, ids, rows, False, CODEBOOK_MUL1, inter)
-        ops.exl3_moe_mid_out(hd, yg, yu, loc, layer.w13_svh[0], layer.w13_svh[1], layer.w2_suh, layer.exl3_limit)
+                                    layer.exl3_kbits, ids, rows, False, CODEBOOK_MUL1, inter, ks13)
+        ops.exl3_moe_mid_out(hd, yg, yu, loc, layer.w13_svh[0], layer.w13_svh[1], layer.w2_suh, layer.exl3_limit,
+                             ks13)
         ops.exl3_moe_gemv_mixed_out(yd, None, hd, None, layer.w2_trellis, None, layer.exl3_offs2, layer.exl3_kbits,
-                                    ids, rows, False, CODEBOOK_MUL1, H)
-        ops.exl3_moe_post_out(out, yd, flat.view(S, 1), torch.ones((S, 1), **f32), layer.w2_svh)
+                                    ids, rows, False, CODEBOOK_MUL1, H, ks2)
+        ops.exl3_moe_post_out(out, yd, flat.view(S, 1), torch.ones((S, 1), **f32), layer.w2_svh, ks2)
         return out.to(torch.float16)

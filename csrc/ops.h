@@ -458,16 +458,17 @@ void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
                              torch::Tensor offsets, torch::Tensor kbits,
                              torch::Tensor expert_ids,
                              std::optional<torch::Tensor> group_rows,
-                             bool colmajor, int64_t codebook, int64_t n);
+                             bool colmajor, int64_t codebook, int64_t n,
+                             int64_t ksplit);
 
 void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
                       torch::Tensor topk_ids, torch::Tensor g_svh,
                       torch::Tensor u_svh, torch::Tensor d_suh,
-                      double limit);
+                      double limit, int64_t ksplit);
 
 void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
                        torch::Tensor topk_ids, torch::Tensor topk_weights,
-                       torch::Tensor d_svh);
+                       torch::Tensor d_svh, int64_t ksplit);
 
 void sm70_glm53_moe_permute_q8_out(torch::Tensor input, torch::Tensor topk_ids,
                                    torch::Tensor permuted_input,

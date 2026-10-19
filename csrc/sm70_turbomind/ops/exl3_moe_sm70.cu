@@ -363,21 +363,24 @@ __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_grouped_kernel(
 // costs one branch; gate + up of an expert share offsets and K.
 
 // One block's share of one slot: columns n0 .. n0 + 31 of y = x @ T.
+// With split-K the block covers k-tiles [tk_base, tk_base + kWarps * ktiles_per_warp) of the ktiles_total tiles
+// and writes its partial sum; the consumer (mid / post) adds the ksplit partials in fixed order.
 template <int K, bool kColMajor, int CB>
 __device__ __forceinline__ void gemv_slot_body(const uint32_t* __restrict__ tr,
                                                const half* __restrict__ xr,
                                                float* __restrict__ yr, int n0,
-                                               int ktiles_per_warp) {
+                                               int ktiles_per_warp, int tk_base,
+                                               int ktiles_total) {
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   int q = (lane >> 2) & 3;
   int nw = 8 * q + (lane >> 4) * 4 + lane % 4;
   int t = nw >> 4, c = nw & 15;
   int row = (lane >> 4) * 4 + lane % 4;
-  int tk0 = warp * ktiles_per_warp;
+  int tk0 = tk_base + warp * ktiles_per_warp;
   constexpr int kTW = 8 * K;
   Window<K, kColMajor> win(t, c);
   float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  const int ktiles = ktiles_per_warp * kWarps;
+  const int ktiles = ktiles_total;
   for (int it0 = 0; it0 < ktiles_per_warp; it0 += kPrefetch) {
     LaneWords<K, kColMajor> lw[kPrefetch];
 #pragma unroll
@@ -484,7 +487,7 @@ __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_mixed_kernel(
     const int* __restrict__ kbits, const int* __restrict__ eid,
     const half* __restrict__ x, float* __restrict__ y, int k, int n,
     int ktiles_per_warp, int S, const uint32_t* __restrict__ trellis2,
-    const half* __restrict__ x2, float* __restrict__ y2) {
+    const half* __restrict__ x2, float* __restrict__ y2, int64_t split_stride) {
   int s = blockIdx.y;
   if (s >= S) {
     s -= S;
@@ -494,12 +497,16 @@ __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_mixed_kernel(
   }
   const int e = eid[s];
   if (e < 0) return;
+  const int z = blockIdx.z;  // k-split: partial z lands at rows [z * split_rows, ...)
   const uint32_t* tr = trellis + offs[e];
   const half* xr = x + static_cast<int64_t>(s) * k;
-  float* yr = y + static_cast<int64_t>(s) * n;
+  float* yr = y + z * split_stride + static_cast<int64_t>(s) * n;
   const int n0 = blockIdx.x * 32;
-#define EXL3_SLOT(KK) \
-  gemv_slot_body<KK, kColMajor, CB>(tr, xr, yr, n0, ktiles_per_warp)
+  const int ktiles_total = k / 16;
+  const int tk_base = z * ktiles_per_warp * kWarps;
+#define EXL3_SLOT(KK)                                                        \
+  gemv_slot_body<KK, kColMajor, CB>(tr, xr, yr, n0, ktiles_per_warp, tk_base, \
+                                    ktiles_total)
   EXL3_K_SWITCH(kbits[e], EXL3_SLOT)
 #undef EXL3_SLOT
 }
@@ -613,25 +620,27 @@ __global__ void exl3_mid_kernel(const float* __restrict__ yg,
                                 const half* __restrict__ svh_g,
                                 const half* __restrict__ svh_u,
                                 const half* __restrict__ suh_d,
-                                half* __restrict__ out, int n, float limit) {
+                                half* __restrict__ out, int n, float limit,
+                                int ksplit, int split_rows) {
   int s = blockIdx.y;
   if (eid[s] < 0) return;
   int o = glue_offset();
   if (o >= n) return;
   int64_t e = static_cast<int64_t>(eid[s]) * n + o;
-  float g[4], u[4], sg[4], su[4], sd[4];
-  float4 a =
-      *reinterpret_cast<const float4*>(yg + static_cast<int64_t>(s) * n + o);
-  float4 b =
-      *reinterpret_cast<const float4*>(yu + static_cast<int64_t>(s) * n + o);
-  g[0] = a.x;
-  g[1] = a.y;
-  g[2] = a.z;
-  g[3] = a.w;
-  u[0] = b.x;
-  u[1] = b.y;
-  u[2] = b.z;
-  u[3] = b.w;
+  float g[4] = {0.f, 0.f, 0.f, 0.f}, u[4] = {0.f, 0.f, 0.f, 0.f}, sg[4], su[4], sd[4];
+  for (int z = 0; z < ksplit; ++z) {  // split-K partials, fixed order
+    const int64_t r = (static_cast<int64_t>(z) * split_rows + s) * n + o;
+    float4 a = *reinterpret_cast<const float4*>(yg + r);
+    float4 b = *reinterpret_cast<const float4*>(yu + r);
+    g[0] += a.x;
+    g[1] += a.y;
+    g[2] += a.z;
+    g[3] += a.w;
+    u[0] += b.x;
+    u[1] += b.y;
+    u[2] += b.z;
+    u[3] += b.w;
+  }
   fwht128(g);
   fwht128(u);
   load4h(svh_g + e, sg);
@@ -654,7 +663,8 @@ __global__ void exl3_post_kernel(const float* __restrict__ yd,
                                  const int* __restrict__ eid,
                                  const float* __restrict__ w,
                                  const half* __restrict__ svh_d,
-                                 float* __restrict__ out, int n, int topk) {
+                                 float* __restrict__ out, int n, int topk,
+                                 int ksplit, int split_rows) {
   int t = blockIdx.y;
   int o = glue_offset();
   if (o >= n) return;
@@ -662,13 +672,15 @@ __global__ void exl3_post_kernel(const float* __restrict__ yd,
   for (int j = 0; j < topk; ++j) {
     int s = t * topk + j;
     if (eid[s] < 0) continue;  // warp-uniform: every lane reads the same slot
-    float v[4], sv[4];
-    float4 a =
-        *reinterpret_cast<const float4*>(yd + static_cast<int64_t>(s) * n + o);
-    v[0] = a.x;
-    v[1] = a.y;
-    v[2] = a.z;
-    v[3] = a.w;
+    float v[4] = {0.f, 0.f, 0.f, 0.f}, sv[4];
+    for (int z = 0; z < ksplit; ++z) {  // split-K partials, fixed order
+      float4 a = *reinterpret_cast<const float4*>(
+          yd + (static_cast<int64_t>(z) * split_rows + s) * n + o);
+      v[0] += a.x;
+      v[1] += a.y;
+      v[2] += a.z;
+      v[3] += a.w;
+    }
     fwht128(v);
     load4h(svh_d + static_cast<int64_t>(eid[s]) * n + o, sv);
     float ww = w[s];
@@ -872,7 +884,8 @@ void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
                              torch::Tensor offsets, torch::Tensor kbits,
                              torch::Tensor expert_ids,
                              std::optional<torch::Tensor> group_rows,
-                             bool colmajor, int64_t codebook, int64_t n64) {
+                             bool colmajor, int64_t codebook, int64_t n64,
+                             int64_t ksplit) {
   TORCH_CHECK(codebook == kCodebookMcg || codebook == kCodebookMul1,
               "EXL3 MoE: codebook must be 0 (mcg) or 1 (mul1)");
   check_cuda(x, "x", at::kHalf, 2, x);
@@ -883,9 +896,11 @@ void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
   check_cuda(expert_ids, "expert_ids", at::kInt, 1, x);
   TORCH_CHECK(offsets.size(0) == kbits.size(0), "offsets and kbits: one per expert");
   const int k = static_cast<int>(x.size(1)), n = static_cast<int>(n64);
-  TORCH_CHECK((k / 16) % kWarps == 0 && k % 16 == 0 && n % 32 == 0,
-              "EXL3 MoE: k must be a multiple of 64 and n of 32");
-  TORCH_CHECK(y.size(1) == n && y.size(0) >= x.size(0), "gemv: shape mismatch");
+  TORCH_CHECK(ksplit >= 1 && k % 16 == 0 && (k / 16) % (kWarps * ksplit) == 0 && n % 32 == 0,
+              "EXL3 MoE: k must be a multiple of 64 * ksplit and n of 32");
+  TORCH_CHECK(y.size(1) == n && y.size(0) % ksplit == 0 && y.size(0) / ksplit >= x.size(0),
+              "gemv: y must hold ksplit x rows partials");
+  const int64_t split_stride = (y.size(0) / ksplit) * static_cast<int64_t>(n);
   const bool fused = y2.has_value();
   TORCH_CHECK(fused == x2.has_value() && fused == trellis2.has_value(),
               "y2, x2 and trellis2 go together");
@@ -903,6 +918,7 @@ void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
     check_cuda(*group_rows, "group_rows", at::kInt, 2, x);
     TORCH_CHECK(group_rows->size(0) == count && group_rows->size(1) == 8,
                 "group_rows must be [G, 8]");
+    TORCH_CHECK(ksplit == 1, "EXL3 MoE: the grouped (prefill) path has no split-K");
   } else {
     TORCH_CHECK(count <= x.size(0), "expert_ids longer than x");
   }
@@ -911,8 +927,8 @@ void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
               "EXL3 MoE: too many slots per launch");
   const at::cuda::OptionalCUDAGuard guard(x.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  dim3 grid(n / 32, (fused ? 2 : 1) * count);
-  const int kt = k / 16 / kWarps;
+  dim3 grid(n / 32, (fused ? 2 : 1) * count, static_cast<unsigned>(ksplit));
+  const int kt = k / 16 / kWarps / static_cast<int>(ksplit);
   auto tr = reinterpret_cast<const uint32_t*>(trellis.data_ptr<int16_t>());
   auto tr2 = fused
                  ? reinterpret_cast<const uint32_t*>(trellis2->data_ptr<int16_t>())
@@ -931,7 +947,7 @@ void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
   } else {                                                                    \
     exl3_gemv_mixed_kernel<COL, CBV><<<grid, kWarps * 32, 0, stream>>>(       \
         tr, op, kp, ids, xp, y.data_ptr<float>(), k, n, kt, count, tr2, x2p,  \
-        y2p);                                                                 \
+        y2p, split_stride);                                                   \
   }
   if (colmajor) {
     if (codebook == kCodebookMul1) { EXL3_MIXED(true, kCodebookMul1) }
@@ -948,7 +964,8 @@ void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
 // limit > 0 the gate is clamped to <= limit and the up value to [-limit, limit].
 void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
                       torch::Tensor topk_ids, torch::Tensor g_svh,
-                      torch::Tensor u_svh, torch::Tensor d_suh, double limit) {
+                      torch::Tensor u_svh, torch::Tensor d_suh, double limit,
+                      int64_t ksplit) {
   check_cuda(yg, "yg", at::kFloat, 2, yg);
   check_cuda(yu, "yu", at::kFloat, 2, yg);
   check_cuda(out, "out", at::kHalf, 2, yg);
@@ -959,7 +976,9 @@ void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
   const int n = static_cast<int>(yg.size(1));
   const int S = static_cast<int>(topk_ids.numel());
   TORCH_CHECK(n % 128 == 0, "EXL3 MoE: n must be a multiple of 128");
-  TORCH_CHECK(yg.size(0) >= S && yu.sizes() == yg.sizes() && out.size(0) >= S &&
+  TORCH_CHECK(ksplit >= 1 && yg.size(0) % ksplit == 0, "mid: yg rows must be ksplit x split_rows");
+  const int split_rows = static_cast<int>(yg.size(0) / ksplit);
+  TORCH_CHECK(split_rows >= S && yu.sizes() == yg.sizes() && out.size(0) >= S &&
                   out.size(1) == n && g_svh.size(1) == n &&
                   u_svh.size(1) == n && d_suh.size(1) == n,
               "mid: shape mismatch");
@@ -973,14 +992,14 @@ void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
       reinterpret_cast<const half*>(u_svh.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(d_suh.data_ptr<at::Half>()),
       reinterpret_cast<half*>(out.data_ptr<at::Half>()), n,
-      static_cast<float>(limit));
+      static_cast<float>(limit), static_cast<int>(ksplit), split_rows);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // out[t] = sum_j w[t, j] * had128(yd[t * topk + j]) * d_svh[e]   (fp32 [T, k])
 void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
                        torch::Tensor topk_ids, torch::Tensor topk_weights,
-                       torch::Tensor d_svh) {
+                       torch::Tensor d_svh, int64_t ksplit) {
   check_cuda(yd, "yd", at::kFloat, 2, yd);
   check_cuda(out, "out", at::kFloat, 2, yd);
   check_cuda(topk_ids, "topk_ids", at::kInt, 2, yd);
@@ -990,8 +1009,10 @@ void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
   const int T = static_cast<int>(topk_ids.size(0));
   const int topk = static_cast<int>(topk_ids.size(1));
   TORCH_CHECK(k % 128 == 0, "EXL3 MoE: k must be a multiple of 128");
+  TORCH_CHECK(ksplit >= 1 && yd.size(0) % ksplit == 0, "post: yd rows must be ksplit x split_rows");
+  const int split_rows = static_cast<int>(yd.size(0) / ksplit);
   TORCH_CHECK(topk_weights.sizes() == topk_ids.sizes() &&
-                  yd.size(0) >= T * topk && out.size(0) >= T &&
+                  split_rows >= T * topk && out.size(0) >= T &&
                   out.size(1) == k && d_svh.size(1) == k,
               "post: shape mismatch");
   if (T == 0) return;
@@ -1002,6 +1023,6 @@ void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
       yd.data_ptr<float>(), topk_ids.data_ptr<int>(),
       topk_weights.data_ptr<float>(),
       reinterpret_cast<const half*>(d_svh.data_ptr<at::Half>()),
-      out.data_ptr<float>(), k, topk);
+      out.data_ptr<float>(), k, topk, static_cast<int>(ksplit), split_rows);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
