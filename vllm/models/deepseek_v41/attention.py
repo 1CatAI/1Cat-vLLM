@@ -199,13 +199,12 @@ class DeepseekV41Attention(nn.Module):
             return
         swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
         T = swa_md.num_actual_tokens
-        st: dict = {}
-        plan = self._plan(x, positions, out, md_all, swa_md, T, w_qkv, w_qb, st)
+        make_plan = lambda st: self._plan(x, positions, out, md_all, swa_md, T, w_qkv, w_qb, st)
         if (ATTN_GRAPH and 0 < T <= GRAPH_MAX_T and attn_impl() == "sm70"
                 and not torch.cuda.is_current_stream_capturing()):
-            self._graph_step(plan, x, positions, out, md_all, swa_md, T)
+            self._graph_step(make_plan, x, positions, out, md_all, swa_md, T)
             return
-        for seg, _ in plan:
+        for seg, _ in make_plan({}):
             seg()
 
     # ---- the attention break in segments (every segment but the full indexer scan takes no host decisions) ----
@@ -268,7 +267,7 @@ class DeepseekV41Attention(nn.Module):
                         own.num_latents]
         return tuple(key)
 
-    def _graph_step(self, plan, x, positions, out, md_all, swa_md, T) -> None:
+    def _graph_step(self, make_plan, x, positions, out, md_all, swa_md, T) -> None:
         graphs = self.__dict__.setdefault("_decode_graphs", {})
         key = self._graph_key(x, positions, out, md_all, swa_md, T)
         entry = graphs.get(key)
@@ -278,17 +277,24 @@ class DeepseekV41Attention(nn.Module):
                     self._graph_overflow_logged = True
                     logger.warning("%s: more than %d decode-graph keys; running the attention break eagerly for "
                                    "new keys", self.layer_name, GRAPH_MAX_KEYS)
-                for seg, _ in plan:
+                for seg, _ in make_plan({}):
                     seg()
                 return
-            entry = graphs[key] = {"runs": 0, "graphs": None}
+            entry = graphs[key] = {"runs": 0, "graphs": None, "st": {}}
+        # the segment state (q, qr32) is the entry's: captured segments rewrite those tensors in place on replay, and
+        # the eager / replayed segments after them read the same objects
+        plan = make_plan(entry["st"])
         if entry["runs"] < GRAPH_WARMUP_STEPS:      # warm run: Triton JIT, workspaces, allocator state
             entry["runs"] += 1
             for seg, _ in plan:
                 seg()
             return
         if entry["graphs"] is None:                   # capture step: capture + replay each capturable segment
+            entry["st"].clear()
             pool = _graph_pool(key)
+            if not getattr(self, "_graph_capture_logged", False):
+                self._graph_capture_logged = True
+                logger.info("%s: capturing decode-graph segments for T=%d", self.layer_name, T)
             captured = []
             for seg, capturable in plan:
                 if capturable:
