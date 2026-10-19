@@ -395,7 +395,7 @@ def deepseek_v41_attention(x: torch.Tensor, positions: torch.Tensor, out: torch.
     if ATTN_OUTER_GRAPH and x.shape[0] <= GRAPH_MAX_T:
         layer = get_forward_context().no_compile_layers[layer_name]
         if layer.indexer is None:
-            _attention_op(x, positions, out)
+            _attention_op(x, positions, out, layer_name)
             return
     _attention_eager_break(x, positions, out, layer_name)
 
