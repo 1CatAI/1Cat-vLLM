@@ -255,8 +255,8 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
         if pos_cpu.shape[0] != T:
             raise RuntimeError(f"token count mismatch: query_start_loc covers {pos_cpu.shape[0]} tokens, "
                                f"num_actual_tokens={T}")
-        tok2req = self._tok2req_buf[:T]
-        positions = self._buf("_pos")[:T]
+        tok2req = self._view("_tok2req", T, dtype=torch.int32)
+        positions = self._view("_pos", T)
         if ATTN_GRAPH:
             # device-side from the runner's persistent query_start_loc / seq_lens: the host->device copy of positions was
             # a synchronous pageable memcpy per builder per step (17 CPU<->GPU serialization points per decode step)
@@ -268,14 +268,10 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
             positions.copy_(torch.from_numpy(pos_cpu))
         slot_mapping = cm.slot_mapping[:T]
         block_table = cm.block_table_tensor[:R]
-        if ATTN_GRAPH and T <= GRAPH_OWN_BUFFERS_MAX_T:
-            # decode: the graphs captured against this metadata must bind THIS builder's buffers, not whichever tensors
-            # the runner handed the capture-time dummy build (which may be another group's slot mapping / block table)
-            slot_mapping = self._buf("_slot")[:T].copy_(slot_mapping)
-            bt = self._bt_buf(block_table.shape[1])
-            block_table = bt[:R].copy_(block_table)
-        elif slot_mapping.dtype != torch.int64:
-            slot_mapping = self._buf("_slot")[:T].copy_(slot_mapping)
+        # (the runner's slot mapping / block table are the same persistent tensors for capture-time and real builds:
+        # verified by the address log; no private copies needed)
+        if slot_mapping.dtype != torch.int64:
+            slot_mapping = self._view("_slot", T).copy_(slot_mapping)
         return dict(
             num_reqs=R, num_actual_tokens=T, query_start_loc=cm.query_start_loc[: R + 1],
             query_start_loc_cpu=qsl_cpu, seq_lens_cpu=seq_cpu, token_to_req_indices=tok2req,
@@ -311,6 +307,16 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
             self._ptr_logs = 0           # real steps after the capture log again
         return md
 
+    def _view(self, name: str, T: int, tail: tuple[int, ...] = (), dtype: torch.dtype = torch.int64) -> torch.Tensor:
+        """``_buf(name, tail, dtype)[:T]`` with the view cached per T (re-slicing ~8 buffers x ~45 builders every step
+        cost ~400 aten::slice calls)."""
+        cache = self.__dict__.setdefault("_views", {})
+        key = (name, T)
+        v = cache.get(key)
+        if v is None:
+            v = cache[key] = self._buf(name, tail, dtype)[:T]
+        return v
+
     def _buf(self, name: str, tail: tuple[int, ...] = (), dtype: torch.dtype = torch.int64) -> torch.Tensor:
         """A per-builder device buffer [max_num_batched_tokens, *tail], allocated once."""
         buf = getattr(self, name, None)
@@ -344,7 +350,7 @@ class DS41SWAMetadataBuilder(_DS41BuilderBase):
               fast_build: bool = False) -> DS41SWAMetadata:
         c = self._common(common_attn_metadata)
         T = c["num_actual_tokens"]
-        win = self._buf("_win", (WINDOW,))[:T]
+        win = self._view("_win", T, (WINDOW,))
         if ATTN_GRAPH:          # one kernel into the static buffer
             rows_of_positions_kernel(c["positions"], c["slot_mapping"], c["token_to_req_indices"], c["block_table"],
                                      c["block_size"], win, mode=0)
@@ -373,14 +379,14 @@ class DS41CompressedMetadataBuilder(_DS41BuilderBase):
             out=self._buf("_cslot"))
         pos_cpu = c["positions_cpu"]
         pos = c["positions"]
-        num_visible = self._buf("_nvis")[:T]
+        num_visible = self._view("_nvis", T)
         if ATTN_GRAPH:
             # graph mode: every token is a latent (N = T, static shapes); tokens that do not complete a group get
             # slot -1 (the store kernels skip them) and an in-range dummy position -- one kernel into static buffers
             n = T
             tok = self._arange(T)
-            lpos = self._buf("_lpos")[:T]
-            lslots = self._buf("_lslot")[:T]
+            lpos = self._view("_lpos", T)
+            lslots = self._view("_lslot", T)
             compressed_meta_kernel(pos, c["slot_mapping"], slots, r, num_visible, lpos, lslots)
             c["slot_mapping"] = slots
         else:
@@ -415,7 +421,7 @@ class DS41StateMetadataBuilder(_DS41BuilderBase):
               fast_build: bool = False) -> DS41StateMetadata:
         c = self._common(common_attn_metadata)
         p = c["positions"]
-        prev_slot = self._buf("_prev")[:p.shape[0]]
+        prev_slot = self._view("_prev", p.shape[0])
         if ATTN_GRAPH:
             rows_of_positions_kernel(p, c["slot_mapping"], c["token_to_req_indices"], c["block_table"], c["block_size"],
                                      prev_slot[:, None], mode=1)
