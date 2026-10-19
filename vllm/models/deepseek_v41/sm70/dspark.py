@@ -288,12 +288,17 @@ def dump_put(key: str, value) -> None:
     if not _DUMP_DIR or _dump["round"] >= _DUMP_ROUNDS:
         return
     import torch as _t
+    if _t.cuda.is_current_stream_capturing():          # a D2H inside a graph capture invalidates the capture
+        return
     v = value.detach().to("cpu", copy=True) if isinstance(value, _t.Tensor) else value
     _dump["cur"].setdefault(key, []).append(v)
 
 
 def dump_flush(model) -> None:
     if not _DUMP_DIR or _dump["round"] >= _DUMP_ROUNDS or not _dump["cur"]:
+        return
+    if "attn_o_L40" not in _dump["cur"]:                # dummy / profile round (no attention metadata): discard
+        _dump["cur"] = {}
         return
     import os as _os, torch as _t
     from vllm.distributed import get_tensor_model_parallel_rank
