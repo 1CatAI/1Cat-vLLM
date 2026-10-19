@@ -83,9 +83,23 @@ def _impl() -> str:
     return knobs.env_str(IMPL_KNOB, "sm70", choices=("sm70", "torch"))
 
 
+_EXL3_ENABLED: contextvars.ContextVar[bool] = contextvars.ContextVar("ds41_moe_exl3_enabled", default=True)
+
+
+@contextmanager
+def exl3_context(enabled: bool) -> Iterator[None]:
+    """exl3=False builds the FusedMoE with the official MXFP4 experts even when the EXL3 plan is set (the DSpark
+    drafter's 128-expert blocks are not in the plan)."""
+    token = _EXL3_ENABLED.set(enabled)
+    try:
+        yield
+    finally:
+        _EXL3_ENABLED.reset(token)
+
+
 def make_v41_moe_method(moe: FusedMoEConfig) -> FusedMoEMethodBase:
     """Factory used by DeepseekV41FP8Config for every FusedMoE of the model (backbone and DSpark)."""
-    exl3 = plan_path()
+    exl3 = plan_path() if _EXL3_ENABLED.get() else ""
     if exl3:   # routed experts from an EXL3 checkpoint (moe_exl3.py): whole experts in VRAM, no spill
         if _SPILL.get() is not None:
             raise ValueError("VLLM_DS41_MOE_EXL3_PLAN is set: EXL3 experts stay in VRAM, unset the expert spill")
@@ -148,7 +162,7 @@ class DeepseekV41SharedExpert(nn.Module):
 
 class DeepseekV41MoE(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str, layer_id: int, *, n_routed_experts: int = 384,
-                 top_k: int = 6, spill: ExpertSpillPlan | None = None) -> None:
+                 top_k: int = 6, spill: ExpertSpillPlan | None = None, exl3: bool = True) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.layer_id = layer_id
@@ -183,7 +197,7 @@ class DeepseekV41MoE(nn.Module):
         self.route_hist = np.zeros((2, self.n_experts), dtype=np.int64)
         quant_config = vllm_config.quant_config
         self.gate = DeepseekV41Gate(self.n_experts, self.hidden)
-        with expert_spill_context(spill), expert_layer_context(layer_id):
+        with expert_spill_context(spill), expert_layer_context(layer_id), exl3_context(exl3):
             self.experts = FusedMoE(
                 num_experts=self.n_experts, top_k=self.top_k, hidden_size=self.hidden,
                 intermediate_size=int(config.moe_intermediate_size), params_dtype=torch.float16, renormalize=True,

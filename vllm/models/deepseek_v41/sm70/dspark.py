@@ -11,6 +11,12 @@ attends NON-causally over the window entries (positions <= p, the last accepted 
 (kv_norm(wkv(x)), ephemeral). Head: hc_pre(x, pre) -> norm -> the target's lm_head; the Markov head adds a bias per
 position from the previous sampled draft token; the confidence head is optional.
 
+The DSpark hyper-parameters are in the checkpoint's ``inference/config.json`` (not ``config.json``); serve with
+``--hf-overrides '{"dspark_block_size": 5, "dspark_noise_token_id": 128799, "dspark_target_layer_ids": [37, 38, 39],
+"dspark_markov_rank": 256, "dspark_n_routed_experts": 128, "dspark_n_activated_experts": 3, "n_mtp_layers": 3}'``
+and ``--speculative-config '{"method": "dspark", "num_speculative_tokens": 5}'`` (num_speculative_tokens = block size:
+the proposer's query rows per request are exactly the block).
+
 Proposer contract (vllm/v1/spec_decode/{dspark,dflash,llm_base_proposer}.py): embed_input_ids, combine_hidden_states,
 precompute_and_store_context_kv, forward(input_ids, positions, inputs_embeds) -> Tensor, compute_logits, markov_embed,
 markov_bias, confidence_logits, map_draft_to_target, get_draft_kv_cache_layer_names, skip_checkpoint_weight;
@@ -75,7 +81,7 @@ class DSparkConfidenceHead(nn.Module):
 
     def __init__(self, in_dim: int, prefix: str) -> None:
         super().__init__()
-        self.proj = nn.Linear(in_dim, 1, bias=True, dtype=torch.float32)
+        self.proj = nn.Linear(in_dim, 1, bias=False, dtype=torch.float32)
 
     def forward(self, hidden: torch.Tensor, markov: torch.Tensor) -> torch.Tensor:
         return self.proj(torch.cat((hidden.float(), markov.float()), dim=-1)).squeeze(-1)
@@ -139,16 +145,20 @@ class DSparkV41Attention(nn.Module):
         from vllm.models.deepseek_v41.common.qat import fp8_block32_qdq
         from vllm.models.deepseek_v41.common.rope import apply_rope_torch
 
-        T = x.shape[0]
-        B = T // block_size
         md_all = step_metadata(self.inner.layer_name)
-        q, kv = self._qkv(x)
-        cos_sin = self.inner.rotary_emb.cos_sin_cache
-        o = torch.empty((T, self.n_local_heads, C.HEAD_DIM), dtype=torch.float16, device=x.device)
+        o = torch.zeros((x.shape[0], self.n_local_heads, C.HEAD_DIM), dtype=torch.float16, device=x.device)
         if md_all is None:                                           # profile / dummy run
-            o.zero_()
+            self._qkv(x)
             return self.inner.output_projection(o, positions)
         swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
+        T = swa_md.num_actual_tokens                                 # real query rows (B blocks of block_size)
+        if T % block_size:
+            raise RuntimeError(f"DSpark drafter: {T} query rows is not a multiple of the block size {block_size}")
+        B = T // block_size
+        x, positions_all = x[:T], positions
+        positions = positions[:T]
+        q, kv = self._qkv(x)
+        cos_sin = self.inner.rotary_emb.cos_sin_cache
         # block K/V: rotated at the draft positions, window-KV QAT (FP8 block-32), kept in a [T, 512] fp16 buffer
         block_kv = fp8_block32_qdq(apply_rope_torch(kv.float(), positions, cos_sin), out_dtype=torch.float16)
         q = apply_rope_torch(q, positions, cos_sin).to(torch.float16).contiguous()
@@ -166,8 +176,8 @@ class DSparkV41Attention(nn.Module):
                            torch.full_like(brow, -1))
         brow = brow[:, None, :].expand(B, block_size, BLOCK_KEYS_PAD).reshape(T, BLOCK_KEYS_PAD)
         fused_decode_attention(q, [(self.swa_cache.rows(), win_rows), (block_kv, brow)], self.inner.attn_sink,
-                               self.inner.scale, o)
-        return self.inner.output_projection(o, positions)
+                               self.inner.scale, o[:T])
+        return self.inner.output_projection(o, positions_all)
 
 
 class DSparkV41Block(nn.Module):
@@ -182,7 +192,7 @@ class DSparkV41Block(nn.Module):
         self.attn = DSparkV41Attention(vllm_config, f"{prefix}.attn", layer_id)
         self.ffn = DeepseekV41MoE(vllm_config, f"{prefix}.ffn", layer_id,
                                   n_routed_experts=int(hf.dspark_n_routed_experts),
-                                  top_k=int(hf.dspark_n_activated_experts), spill=None)
+                                  top_k=int(hf.dspark_n_activated_experts), spill=None, exl3=False)
         self.attn_norm = DeepseekV41Norm(C.HIDDEN)
         self.ffn_norm = DeepseekV41Norm(C.HIDDEN)
         mix, hc_dim = (2 + C.HC) * C.HC, C.HC * C.HIDDEN
@@ -310,7 +320,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         return draft_ids
 
     def skip_checkpoint_weight(self, name: str) -> bool:
-        return not name.startswith("mtp.")
+        return self._map_name(name) is None
 
     # ---- loading: mtp.N.* of the official checkpoint ----
     _HEAD_TENSORS = ("main_proj.", "main_norm.", "norm.", "markov_head.", "confidence_head.")
@@ -320,6 +330,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         (``map_checkpoint_name``: .scale -> weight_scale(_inv), gate.bias -> e_score_correction_bias, shared w2 ->
         down_proj) on a synthetic backbone name ``layers.{40 + N}.X``; the drafter's attention module lives one level
         deeper (``attn.inner``)."""
+        if ckpt == "embed.weight":                     # own copy: under PP the target embedding is on stage 1
+            return "model.embed_tokens.weight"
         if not ckpt.startswith("mtp."):
             return None
         _, stage, rest = ckpt.split(".", 2)
@@ -384,7 +396,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
                 loaded.add(name)
                 if "confidence_head" in name:
                     self._confidence_loaded = True
-        missing = sorted(n for n in params if n not in loaded and not n.startswith(("model.embed_tokens", "lm_head")))
+        missing = sorted(n for n in params if n not in loaded and not n.startswith("lm_head"))
         if missing:
             logger.warning("DSpark drafter: %d parameters not provided by mtp.* tensors (first: %s)", len(missing),
                            missing[:5])
