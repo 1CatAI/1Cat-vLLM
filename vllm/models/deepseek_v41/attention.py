@@ -418,8 +418,12 @@ def deepseek_v41_attention(x: torch.Tensor, positions: torch.Tensor, out: torch.
     """The attention op: an eager break of the outer breakable graph, except (ATTN_OUTER_GRAPH) for decode-sized
     batches of layers without an indexer scan, which run inline and are captured with the rest of the layer."""
     if ATTN_OUTER_GRAPH and x.shape[0] <= GRAPH_MAX_T:
-        layer = get_forward_context().no_compile_layers[layer_name]
-        if layer.indexer is None and (_OUTER_LAYERS is None or layer.layer_id in _OUTER_LAYERS):
+        ctx = get_forward_context()
+        layer = ctx.no_compile_layers[layer_name]
+        # inline only when this forward carries attention metadata: a capture pass without it (the profile stub) must
+        # stay an eager break, or the graph would replay zero attention for this layer
+        if (layer.indexer is None and (_OUTER_LAYERS is None or layer.layer_id in _OUTER_LAYERS)
+                and isinstance(ctx.attn_metadata, dict)):
             _attention_op(x, positions, out, layer_name)
             return
     _attention_eager_break(x, positions, out, layer_name)
