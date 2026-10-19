@@ -8689,6 +8689,13 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if os.environ.get("DS41_DEBUG_INPUTS", "0") == "1" and num_tokens_unpadded <= 16:
+                torch.cuda.synchronize()
+                logger.info("DS41 inputs: T %d ids %s pos %s reqs %s computed %s", num_tokens_unpadded,
+                            self.input_ids.gpu[:num_tokens_unpadded].tolist(),
+                            self.positions.gpu[:num_tokens_unpadded].tolist() if hasattr(self.positions, "gpu") else "?",
+                            list(self.input_batch.req_ids[:num_reqs]),
+                            self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist())
             if trace_log:
                 trace_prepare_inputs_ms = (
                     time.perf_counter() - trace_prepare_inputs_t0
