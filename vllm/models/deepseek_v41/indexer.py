@@ -60,11 +60,42 @@ from vllm.models.deepseek_v41.sm70.sparse import (
 )
 from vllm.models.deepseek_v41.sm70.sparse_kernels import logical_to_rows
 
+CANDIDATE_SCORING_ENV = "VLLM_DS41_INDEXER_CANDIDATE_SCORING"
 SCORE_BUDGET_ENV = "VLLM_DS41_ATTN_INDEXER_SCORE_MIB"
 
 
 def attn_impl() -> str:
     return knobs.env_str("VLLM_DS41_ATTN_IMPL", "sm70", choices=("sm70", "torch"))
+
+
+def candidate_topk(q: torch.Tensor, w: torch.Tensor, cand: torch.Tensor, ends: torch.Tensor,
+                   keys_all: torch.Tensor, rows_of) -> torch.Tensor:
+    """Top-512 index positions over the candidate blocks only (reindex layers 24-36).
+
+    q [Q, 32, 128] fp16 (QAT'd, rotated), w [Q, 32] fp32, cand [Q, 2048] int32 candidate block ids (ascending, -1
+    pad; no CAND_ALL rows), ends [Q] visible count, keys_all [rows, 128] fp16, ``rows_of(pos [Q, K]) -> rows [Q, K]``
+    (-1 for pos -1). Returns [Q, 512] int32 logical positions ascending, -1 padding at the end -- the same contract as
+    the full-scan path (``apply_candidate_mask`` + ``topk_sorted``), whose scores it reproduces up to GEMM-kernel
+    rounding: the dot products are the same 128-term products, computed here as one bmm per token tile."""
+    Q = q.shape[0]
+    dev = q.device
+    pos = (cand.to(torch.int64)[:, :, None] * CAND_BLOCK + torch.arange(CAND_BLOCK, device=dev)[None, None, :]).view(Q, -1)
+    valid = (cand >= 0)[:, :, None].expand(-1, -1, CAND_BLOCK).reshape(Q, -1) & (pos < ends[:, None])
+    pos = torch.where(valid, pos, torch.full_like(pos, -1))
+    rows = rows_of(pos)                                                                  # [Q, K] int64, -1 invalid
+    keys = keys_all.index_select(0, rows.clamp(min=0).view(-1)).view(Q, -1, keys_all.shape[1])   # [Q, K, 128]
+    logits = torch.bmm(q, keys.transpose(1, 2), out_dtype=torch.float32)                # [Q, 32, K]
+    scores = (logits.relu_() * w.float()[:, :, None]).sum(dim=1)                         # [Q, K]
+    scores.masked_fill_(~valid, float("-inf"))
+    k = min(IDX_TOPK, scores.shape[1])
+    vals, idx = scores.topk(k, dim=-1, sorted=False)
+    picked = pos.gather(1, idx)
+    picked = torch.where(vals > float("-inf"), picked, torch.full_like(picked, torch.iinfo(torch.int64).max))
+    picked = picked.sort(dim=-1).values                                                  # ascending, invalid last
+    picked = torch.where(picked == torch.iinfo(torch.int64).max, torch.full_like(picked, -1), picked)
+    out = torch.full((Q, IDX_TOPK), -1, dtype=torch.int32, device=dev)
+    out[:, :k] = picked.to(torch.int32)
+    return out
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -99,6 +130,8 @@ class DeepseekV41Indexer(nn.Module):
         # shared with (and attached by) the attention layer; kept out of the module tree on purpose
         self.__dict__["rotary_emb"] = None
         self.score_budget = knobs.env_int(SCORE_BUDGET_ENV, 128, minimum=8) << 20
+        # reindex layers (24-36): score only the candidate blocks' keys instead of all n (gpubox lane)
+        self.candidate_scoring = knobs.env_bool(CANDIDATE_SCORING_ENV, False)
         self._static_ctx = vllm_config.compilation_config.static_forward_context
 
     # ---------------------------------------------------------------------------------- helpers
@@ -200,6 +233,18 @@ class DeepseekV41Indexer(nn.Module):
             ends = md.num_visible[t0:t1]
             q_tile = max(1, min(t1 - t0, self.score_budget // (4 * n)))
             key_tile = max(1024, self.score_budget // (4 * IDX_HEADS * q_tile))
+            if (self.candidate_scoring and self.topo.uses_candidates
+                    and not bool((cand_out[t0:t1, 0] == CAND_ALL).any())):
+                # every token of the request has a proper candidate list: score <= 2048 x 8 keys per token instead
+                # of all n (the full scan below is O(n) per token; at n = 1M it dominated prefill and decode)
+                ctile = max(1, self.score_budget // (CAND_TOPK_BLOCKS * CAND_BLOCK * 2 * IDX_DIM * 2))
+                for a in range(t0, t1, ctile):
+                    b = min(t1, a + ctile)
+                    topk_out[a:b] = candidate_topk(
+                        q[a:b], w[a:b], cand_out[a:b], ends[a - t0:b - t0], keys_all,
+                        lambda pos: logical_to_rows(pos, md.token_to_req_indices[a:b], md.block_table,
+                                                    md.storage_block_size))
+                continue
             for a in range(t0, t1, q_tile):
                 b = min(t1, a + q_tile)
                 scores = torch.empty((b - a, n), dtype=torch.float32, device=x.device)
