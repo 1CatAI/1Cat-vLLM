@@ -344,6 +344,8 @@ def _outer_layers() -> frozenset[int] | None:
     spec = os.environ.get("VLLM_DS41_ATTN_OUTER_LAYERS", "all").strip().lower()
     if spec in ("", "all"):
         return None
+    if spec == "none":
+        return frozenset()
     ids: set[int] = set()
     for part in spec.split(","):
         lo, _, hi = part.partition("-")
