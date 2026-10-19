@@ -21,6 +21,9 @@ from vllm.models.deepseek_v41 import knobs
 from .contracts import HC, HC_EPS, HC_SINKHORN_ITERS, HIDDEN, NORM_EPS, STREAM_DTYPE
 
 FUSED_SINKHORN = knobs.env_bool("VLLM_DS41_HC_FUSED_SINKHORN", False)
+# VLLM_DS41_HC_FUSED=1: single-kernel hc_pre / hc_post (bit-exact with the torch math below), and fused
+# rmsnorm_to_act / hc_mixes (blocked FP32 reductions instead of torch's: ~1 FP32 ulp, not bit-identical).
+FUSED = knobs.env_bool("VLLM_DS41_HC_FUSED", False)
 
 MIX_HC = (2 + HC) * HC  # 24 = pre(4) + post(4) + comb(16)
 _CHUNK = 1024
@@ -64,6 +67,9 @@ def hc_mixes(stream: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: 
     _check_stream(stream)
     if fn.dtype != torch.float32 or fn.shape != (MIX_HC, HC * HIDDEN):
         raise ValueError(f"hc fn must be float32 [{MIX_HC}, {HC * HIDDEN}], got {fn.dtype} {tuple(fn.shape)}")
+    if FUSED and stream.is_cuda:
+        from ..sm70 import hc_kernels
+        return hc_kernels.hc_mixes_fused(stream.contiguous(), fn, scale, base, NORM_EPS)
     num_tokens = stream.shape[0]
     mixes = torch.empty((num_tokens, MIX_HC), dtype=torch.float32, device=stream.device)
     for start, end in _chunks(num_tokens):
@@ -79,6 +85,9 @@ def hc_mixes(stream: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: 
 def hc_pre(stream: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
     """sum_c pre[:,c] * stream[:,c,:] in FP32, rounded to bf16 -> [T,5120] bf16 (ref:m.py:957-960)."""
     _check_stream(stream)
+    if FUSED and stream.is_cuda:
+        from ..sm70 import hc_kernels
+        return hc_kernels.hc_pre_fused(stream.contiguous(), pre)
     out = torch.empty((stream.shape[0], HIDDEN), dtype=STREAM_DTYPE, device=stream.device)
     for start, end in _chunks(stream.shape[0]):
         y = torch.sum(pre[start:end].unsqueeze(-1) * stream[start:end].float(), dim=1)
@@ -92,6 +101,9 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
     _check_stream(residual)
     if x.shape != (residual.shape[0], HIDDEN):
         raise ValueError(f"sublayer output must be [T, {HIDDEN}], got {tuple(x.shape)}")
+    if FUSED and residual.is_cuda:
+        from ..sm70 import hc_kernels
+        return hc_kernels.hc_post_fused(x, residual.contiguous(), post, comb)
     out = torch.empty_like(residual)
     for start, end in _chunks(residual.shape[0]):
         # [t, c, j] @ [t, j, d] -> [t, c, d]: comb transposed so the first comb index contracts
@@ -103,6 +115,9 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
 
 def rmsnorm_to_act(x: torch.Tensor, weight: torch.Tensor, eps: float = NORM_EPS) -> torch.Tensor:
     """bf16/f32 in, FP32 variance + FP32 eps, * weight, -> fp16 [T,5120]. Zero rows -> zeros."""
+    if FUSED and x.is_cuda and x.ndim == 2 and x.shape[1] == HIDDEN and x.dtype in (torch.bfloat16, torch.float32):
+        from ..sm70 import hc_kernels
+        return hc_kernels.rmsnorm_to_act_fused(x.contiguous(), weight, eps)
     out = torch.empty(x.shape, dtype=torch.float16, device=x.device)
     weight32 = weight.float()
     for start, end in _chunks(x.shape[0]):
