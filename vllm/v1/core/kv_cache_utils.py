@@ -2540,10 +2540,24 @@ def _select_deepseek_v4_tuple_width(
             for tuple_count, page_count in zip(tuple_counts, page_counts)
         )
 
-    return min(
+    best = min(
         range(min_width, max_width + 1),
         key=lambda width: (pool_pages(width), width),
     )
+    # DeepSeek-V4.1 SM70 (gpubox): the width is also the number of KV cache groups, i.e. block tables, slot-mapping
+    # kernels and metadata builds per step; memory-optimal widths put every layer in its own group (~45 builds per
+    # decode step). VLLM_DS41_KV_TUPLE_WIDTH overrides (clamped); the table logs the page cost of every width.
+    import os
+    table = ", ".join(f"{w}:{pool_pages(w)}" for w in range(min_width, max_width + 1))
+    logger.info("DeepSeek-V4 KV tuple width: min %d max %d, pool pages per width {%s}; memory-optimal %d",
+                min_width, max_width, table, best)
+    override = os.environ.get("VLLM_DS41_KV_TUPLE_WIDTH")
+    if override:
+        width = max(min_width, min(max_width, int(override)))
+        logger.info("DeepSeek-V4 KV tuple width override: %d (pool pages %d vs %d optimal)", width, pool_pages(width),
+                    pool_pages(best))
+        return width
+    return best
 
 
 def _get_kv_cache_groups_uniform_groups(
