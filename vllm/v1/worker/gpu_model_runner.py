@@ -12209,6 +12209,7 @@ class GPUModelRunner(
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
+            force_attention=force_attention,     # the warmups had it; the capture itself must build metadata too
             uniform_decode=desc.uniform,
             allow_microbatching=allow_microbatching,
             skip_eplb=True,
