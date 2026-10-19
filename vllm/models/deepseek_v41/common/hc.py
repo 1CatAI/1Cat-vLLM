@@ -32,6 +32,9 @@ FUSED_MIXES = knobs.env_bool("VLLM_DS41_HC_FUSED_MIXES", False)
 FUSED_PRE = knobs.env_bool("VLLM_DS41_HC_FUSED_PRE", True)
 FUSED_POST = knobs.env_bool("VLLM_DS41_HC_FUSED_POST", True)
 FUSED_NORM = knobs.env_bool("VLLM_DS41_HC_FUSED_NORM", True)
+# VLLM_DS41_HC_NORM_EXACT=1: the fused norm's variance is computed by torch (bit-identical to the torch path) and only the
+# normalize/weight/cast is a kernel; =final: only the final norm before lm_head (the layer norms stay fully fused)
+NORM_EXACT = knobs.env_str("VLLM_DS41_HC_NORM_EXACT", "0", choices=("0", "1", "final"))
 
 MIX_HC = (2 + HC) * HC  # 24 = pre(4) + post(4) + comb(16)
 _CHUNK = 1024
@@ -121,11 +124,13 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
     return out
 
 
-def rmsnorm_to_act(x: torch.Tensor, weight: torch.Tensor, eps: float = NORM_EPS) -> torch.Tensor:
+def rmsnorm_to_act(x: torch.Tensor, weight: torch.Tensor, eps: float = NORM_EPS, final: bool = False) -> torch.Tensor:
     """bf16/f32 in, FP32 variance + FP32 eps, * weight, -> fp16 [T,5120]. Zero rows -> zeros."""
     if (FUSED and FUSED_NORM and x.is_cuda and x.ndim == 2 and x.shape[1] == HIDDEN
             and x.dtype in (torch.bfloat16, torch.float32)):
         from ..sm70 import hc_kernels
+        if NORM_EXACT == "1" or (NORM_EXACT == "final" and final):
+            return hc_kernels.rmsnorm_to_act_exact(x.contiguous(), weight, eps)
         return hc_kernels.rmsnorm_to_act_fused(x.contiguous(), weight, eps)
     out = torch.empty(x.shape, dtype=torch.float16, device=x.device)
     weight32 = weight.float()

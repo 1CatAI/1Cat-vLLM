@@ -432,7 +432,7 @@ class DeepseekV41Model(nn.Module):
             hidden = hc_collapse(stream, pre, self.norm.weight)
             return (hidden, aux) if self._aux_layers else hidden
         collapsed = hc_pre(stream, pre)
-        hidden = rmsnorm_to_act(collapsed, self.norm.weight)
+        hidden = rmsnorm_to_act(collapsed, self.norm.weight, final=True)
         for name, t in (("final.stream_in", stream), ("final.hc", collapsed), ("final.h", hidden)):
             ds41_dump.dump(None, name, t)
         ds41_dump.end_forward()

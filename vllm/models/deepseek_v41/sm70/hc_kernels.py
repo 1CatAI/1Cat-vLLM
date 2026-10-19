@@ -243,6 +243,37 @@ def _rmsnorm_act_kernel(x_ptr, w_ptr, out_ptr, eps, X_BF16: tl.constexpr, BLOCK:
         tl.store(out_ptr + t * HIDDEN + d, (w * (x * r)).to(tl.float16))
 
 
+@triton.jit
+def _normalize_act_kernel(x_ptr, r_ptr, w_ptr, out_ptr, X_BF16: tl.constexpr, BLOCK: tl.constexpr):
+    """out[t] = (w * (x[t] * r[t])).to(fp16) with torch's two fp32 roundings (no FMA / fusion)."""
+    t = tl.program_id(0).to(tl.int64)
+    r = tl.load(r_ptr + t)
+    for h0 in tl.static_range(0, HIDDEN, BLOCK):
+        d = h0 + tl.arange(0, BLOCK)
+        if X_BF16:
+            x = _bf16_to_f32(tl.load(x_ptr + t * HIDDEN + d))
+        else:
+            x = tl.load(x_ptr + t * HIDDEN + d)
+        w = tl.load(w_ptr + d)
+        tl.store(out_ptr + t * HIDDEN + d, (w * (x * r)).to(tl.float16))
+
+
+def rmsnorm_to_act_exact(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Bit-identical to the torch rmsnorm_to_act: variance + rsqrt by torch (same reduction kernel, same rounding),
+    the normalize + weight + fp16 cast as one kernel (6 launches vs 8; the fully fused kernel's own variance sum
+    differs in the last bit, which flips fp16 outputs and shifts the KL panel by ~0.013)."""
+    T = x.shape[0]
+    out = torch.empty((T, HIDDEN), dtype=torch.float16, device=x.device)
+    if T:
+        x32 = x.float()
+        r = torch.rsqrt(x32.square().mean(-1) + eps)                          # [T] fp32, torch's exact values
+        bf16 = x.dtype == torch.bfloat16
+        xin = x.view(torch.int16) if bf16 else x32
+        _normalize_act_kernel[(T,)](xin.contiguous(), r.contiguous(), weight.float().contiguous(), out, X_BF16=bf16,
+                                    BLOCK=_BLOCK_H, num_warps=4, enable_fp_fusion=False)
+    return out
+
+
 def rmsnorm_to_act_fused(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     T = x.shape[0]
     out = torch.empty((T, HIDDEN), dtype=torch.float16, device=x.device)
