@@ -64,7 +64,9 @@ from vllm.models.deepseek_v41.compressor import (
     mm_fp32,
 )
 from vllm.models.deepseek_v41.indexer import DeepseekV41Indexer, attn_impl
+from vllm.logger import init_logger
 from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
+from vllm.models.deepseek_v41.sm70.sparse_kernels import ATTN_GRAPH
 from vllm.models.deepseek_v41.sm70.sparse import (
     DeepseekV41SM70SparseImpl,
     DS41CacheLayer,
@@ -197,6 +199,25 @@ class DeepseekV41Attention(nn.Module):
             return
         swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
         T = swa_md.num_actual_tokens
+        st: dict = {}
+        plan = self._plan(x, positions, out, md_all, swa_md, T, w_qkv, w_qb, st)
+        if (ATTN_GRAPH and 0 < T <= GRAPH_MAX_T and attn_impl() == "sm70"
+                and not torch.cuda.is_current_stream_capturing()):
+            self._graph_step(plan, x, positions, out, md_all, swa_md, T)
+            return
+        for seg, _ in plan:
+            seg()
+
+    # ---- the attention break in segments (every segment but the full indexer scan takes no host decisions) ----
+    def _plan(self, x, positions, out, md_all, swa_md, T, w_qkv, w_qb, st) -> list[tuple]:
+        """[(segment, capturable)]: project + store | indexer top-k | gather + attend."""
+        plan = [(lambda: self._seg_project_store(x, positions, md_all, swa_md, T, w_qkv, w_qb, st), True)]
+        if self.topo.compress_ratio > 0 and self.indexer is not None:
+            plan.append((lambda: self.indexer.forward(x[:T], st["qr32"], positions[:T]), self.indexer.graph_capable()))
+        plan.append((lambda: self._seg_attend(out, md_all, swa_md, T, st), True))
+        return plan
+
+    def _seg_project_store(self, x, positions, md_all, swa_md, T, w_qkv, w_qb, st) -> None:
         impl = attn_impl()
         pos = positions[:T]
         qr_kv = mm_fp32(x[:T], w_qkv)
@@ -206,31 +227,84 @@ class DeepseekV41Attention(nn.Module):
         q = torch.mm(qr, w_qb.t()).view(T, self.n_local_heads, HEAD_DIM)
         q_rope_kv_insert(q, kv, pos, self.rotary_emb.cos_sin_cache, self.swa_cache.rows(),
                          swa_md.slot_mapping, impl=impl)
+        st["q"], st["qr32"] = q, qr32
+        if self.topo.compress_ratio > 0 and self.compressor is not None:
+            latent, latent_pos = self.compressor(x[:T], pos)
+            assert self.indexer is not None and self.kv_cache_layer is not None
+            self.indexer.write_keys(latent, latent_pos)
+            src_md = cast(DS41CompressedMetadata, md_all[self.kv_cache_layer.layer_name])
+            export = None
+            if self.layer_id == CAND_SOURCE and self.shared.export_ckv is not None:
+                export = self.shared.export_ckv
+            ckv_rope_qat_store(latent, latent_pos, self.rotary_emb.cos_sin_cache, self.kv_cache_layer.rows(),
+                               src_md.latent_slots, export, impl=impl)
 
+    def _seg_attend(self, out, md_all, swa_md, T, st) -> None:
+        impl = attn_impl()
         ckv_rows = ckv_idx = None
         if self.topo.compress_ratio > 0:
-            if self.compressor is not None:
-                latent, latent_pos = self.compressor(x[:T], pos)
-                assert self.indexer is not None and self.kv_cache_layer is not None
-                self.indexer.write_keys(latent, latent_pos)
-                src_md = cast(DS41CompressedMetadata, md_all[self.kv_cache_layer.layer_name])
-                export = None
-                if self.layer_id == CAND_SOURCE and self.shared.export_ckv is not None:
-                    export = self.shared.export_ckv
-                ckv_rope_qat_store(latent, latent_pos, self.rotary_emb.cos_sin_cache, self.kv_cache_layer.rows(),
-                                   src_md.latent_slots, export, impl=impl)
-            if self.indexer is not None:
-                self.indexer.forward(x[:T], qr32, pos)
             src_md = cast(DS41CompressedMetadata, md_all[self.kv_source_name])
             src = self._static_ctx.get(self.kv_source_name)
             if src is None:
                 raise RuntimeError(f"kv source {self.kv_source_name} is not registered on this stage")
             ckv_rows = cast(DS41CacheLayer, src).rows()
             ckv_idx = DeepseekV41SM70SparseImpl.compressed_rows(self.shared.topk_indices[:T], src_md)
-        DeepseekV41SM70SparseImpl.forward(q, swa_md, self.swa_cache.rows(), ckv_rows, ckv_idx, self.attn_sink,
+        DeepseekV41SM70SparseImpl.forward(st["q"], swa_md, self.swa_cache.rows(), ckv_rows, ckv_idx, self.attn_sink,
                                           self.scale, out[:T], impl=impl)
         if out.shape[0] > T:
             out[T:].zero_()
+
+    # ---- per-layer CUDA graphs of the capturable segments (VLLM_DS41_ATTN_GRAPH) ----
+    def _graph_key(self, x, positions, out, md_all, swa_md, T) -> tuple:
+        key = [T, out.shape[0], x.data_ptr(), positions.data_ptr(), out.data_ptr(), swa_md.block_table.shape[0],
+               swa_md.block_table.data_ptr(), swa_md.window_slots.data_ptr(), swa_md.slot_mapping.data_ptr(),
+               swa_md.positions.data_ptr(), swa_md.token_to_req_indices.data_ptr()]
+        if self.topo.compress_ratio > 0:
+            src_md = cast(DS41CompressedMetadata, md_all[self.kv_source_name])
+            key += [src_md.block_table.data_ptr(), src_md.num_visible.data_ptr(), src_md.num_latents]
+            if self.kv_cache_layer is not None:
+                own = cast(DS41CompressedMetadata, md_all[self.kv_cache_layer.layer_name])
+                key += [own.latent_slots.data_ptr(), own.latent_pos.data_ptr(), own.slot_mapping.data_ptr(),
+                        own.num_latents]
+        return tuple(key)
+
+    def _graph_step(self, plan, x, positions, out, md_all, swa_md, T) -> None:
+        graphs = self.__dict__.setdefault("_decode_graphs", {})
+        key = self._graph_key(x, positions, out, md_all, swa_md, T)
+        entry = graphs.get(key)
+        if entry is None:
+            if len(graphs) >= GRAPH_MAX_KEYS:
+                if not getattr(self, "_graph_overflow_logged", False):
+                    self._graph_overflow_logged = True
+                    logger.warning("%s: more than %d decode-graph keys; running the attention break eagerly for "
+                                   "new keys", self.layer_name, GRAPH_MAX_KEYS)
+                for seg, _ in plan:
+                    seg()
+                return
+            entry = graphs[key] = {"runs": 0, "graphs": None}
+        if entry["runs"] < GRAPH_WARMUP_STEPS:      # warm run: Triton JIT, workspaces, allocator state
+            entry["runs"] += 1
+            for seg, _ in plan:
+                seg()
+            return
+        if entry["graphs"] is None:                   # capture step: capture + replay each capturable segment
+            pool = _graph_pool(key)
+            captured = []
+            for seg, capturable in plan:
+                if capturable:
+                    g = _capture_graph(seg, pool)
+                    g.replay()
+                    captured.append(g)
+                else:
+                    seg()
+                    captured.append(None)
+            entry["graphs"] = captured
+            return
+        for (seg, _), g in zip(plan, entry["graphs"]):
+            if g is None:
+                seg()
+            else:
+                g.replay()
 
     def _profile_run(self, x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor,
                      w_qkv: torch.Tensor, w_qb: torch.Tensor) -> None:
@@ -244,6 +318,44 @@ class DeepseekV41Attention(nn.Module):
             self.indexer.forward(x, qr, positions)
         DeepseekV41SM70SparseImpl.reserve_workspace(out, self.topo.compress_ratio > 0)
         out.zero_()
+
+
+logger = init_logger(__name__)
+
+
+GRAPH_MAX_T = 16                 # decode / spec-verify steps only; prefill chunks stay eager
+GRAPH_WARMUP_STEPS = 1
+GRAPH_MAX_KEYS = 32
+_GRAPH_POOLS: dict = {}
+_GRAPH_STREAM: list = []
+
+
+def _graph_pool(key: tuple):
+    """One private allocator pool per decode-graph key, shared by every layer's graphs of that key: the graphs
+    are captured and replayed in the same (layer, segment) order each step, which is what pool sharing needs."""
+    pool = _GRAPH_POOLS.get(key)
+    if pool is None:
+        pool = _GRAPH_POOLS[key] = torch.cuda.graph_pool_handle()
+    return pool
+
+
+def _capture_graph(fn, pool) -> torch.cuda.CUDAGraph:
+    """Capture ``fn`` into a CUDA graph on a side stream (no sync / gc / empty_cache, unlike torch.cuda.graph):
+    the current stream's work is ordered before the capture and the capture's completion before what follows."""
+    if not _GRAPH_STREAM:
+        _GRAPH_STREAM.append(torch.cuda.Stream())
+    side = _GRAPH_STREAM[0]
+    cur = torch.cuda.current_stream()
+    side.wait_stream(cur)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side):
+        g.capture_begin(pool=pool, capture_error_mode="thread_local")
+        try:
+            fn()
+        finally:
+            g.capture_end()
+    cur.wait_stream(side)
+    return g
 
 
 @eager_break_during_capture

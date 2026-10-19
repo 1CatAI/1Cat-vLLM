@@ -26,6 +26,7 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.models.deepseek_v41 import knobs
+from vllm.models.deepseek_v41.sm70.sparse_kernels import ATTN_GRAPH
 from vllm.models.deepseek_v41.common.candidate_blocks import (
     apply_candidate_mask,
     select_candidate_blocks,
@@ -183,6 +184,33 @@ class DeepseekV41Indexer(nn.Module):
                                impl=attn_impl())
 
     # ---------------------------------------------------------------------------------- top-k
+    def graph_capable(self) -> bool:
+        """True when ``forward`` takes no host decisions (reindex layers with candidate scoring in graph mode)."""
+        return ATTN_GRAPH and self.candidate_scoring and self.topo.uses_candidates
+
+    def _forward_candidates_device(self, x: torch.Tensor, qr: torch.Tensor, positions: torch.Tensor, md,
+                                   topk_out: torch.Tensor, cand_out: torch.Tensor) -> None:
+        """Reindex layers (24-36) without host decisions: the candidate list is the published blocks, or blocks
+        0..2047 when layer 20 published CAND_ALL (<= 16,384 visible entries, which 2048 x 8 covers exactly); then the
+        top-512 over the candidates' keys (``candidate_topk``). ``num_visible`` masks positions >= n, so a token
+        with nothing visible gets all -1."""
+        T = md.num_actual_tokens
+        impl = attn_impl()
+        q = mm_fp32_full(qr[:T], self._w(self.wq_b, (IDX_HEADS * IDX_DIM, Q_LORA)))
+        q = index_q_rope_qat(q.view(T, IDX_HEADS, IDX_DIM), positions[:T], self._rope(), impl=impl)
+        w = mm_fp32(x[:T], self._w(self.weights_proj, (IDX_HEADS, HIDDEN))) * (
+            self.softmax_scale * IDX_HEADS ** -0.5)
+        blocks = torch.arange(CAND_TOPK_BLOCKS, device=x.device, dtype=cand_out.dtype)[None, :]
+        cand = torch.where(cand_out[:, :1] == CAND_ALL, blocks, cand_out)
+        keys_all = self._key_rows()
+        ctile = max(1, self.score_budget // (CAND_TOPK_BLOCKS * CAND_BLOCK * 2 * IDX_DIM * 2))
+        for a in range(0, T, ctile):
+            b = min(T, a + ctile)
+            topk_out[a:b] = candidate_topk(
+                q[a:b], w[a:b], cand[a:b], md.num_visible[a:b], keys_all,
+                lambda pos: logical_to_rows(pos, md.token_to_req_indices[a:b], md.block_table,
+                                            md.storage_block_size))
+
     def forward(self, x: torch.Tensor, qr: torch.Tensor, positions: torch.Tensor) -> None:
         """x [T,5120] fp16; qr [T,1280] = q_norm(wq_a x), FP32 preferred (fp16 accepted: PORT_DESIGN §3.3 says fp16 --
         DESIGN-CHANGE REQUEST in L-ATTN.progress.md); positions [T] int64. Writes shared.topk_indices[:T] (and
@@ -195,6 +223,9 @@ class DeepseekV41Indexer(nn.Module):
         topk_out = self.shared.topk_indices[:T]
         cand_out = self.shared.candidate_blocks[:T]
         if T == 0:
+            return
+        if self.graph_capable():
+            self._forward_candidates_device(x, qr, positions, md, topk_out, cand_out)
             return
         if md.max_visible <= IDX_TOPK:
             # every visible entry is selected: [0, 1, ..., n_t - 1, -1, ...]

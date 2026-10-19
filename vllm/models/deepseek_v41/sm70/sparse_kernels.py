@@ -32,6 +32,31 @@ from vllm.triton_utils import tl, triton
 
 RUNNING_MAX_FLOOR = -1e30
 FUSED_DECODE = knobs.env_bool("VLLM_DS41_ATTN_FUSED_DECODE", False)   # fused_decode_attention for small T (sm70 impl)
+# Per-layer CUDA graphs of the decode attention break (gpubox lane): the metadata builders fill static buffers, every
+# compressed group has exactly T latents (slot -1 = not stored), the compressor/indexer take no host decisions, and
+# attention.py captures the per-layer segments as CUDA graphs keyed by (T, buffer addresses).
+ATTN_GRAPH = knobs.env_bool("VLLM_DS41_ATTN_GRAPH", False)
+
+
+# ----------------------------------------------------------------------------- compressor state rows
+@triton.jit
+def _state_store_kernel(src_ptr, src_st, slot_ptr, rows_ptr, D: tl.constexpr):
+    n = tl.program_id(0)
+    slot = tl.load(slot_ptr + n).to(tl.int64)
+    if slot >= 0:
+        d = tl.arange(0, D)
+        v = tl.load(src_ptr + n.to(tl.int64) * src_st + d)
+        tl.store(rows_ptr + slot * D + d, v)
+
+
+def state_rows_store(src: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
+    """rows[slots[t]] = src[t] for slots[t] >= 0 (no host sync; the eager path's ``index_copy_(slots[keep])``)."""
+    T, D = src.shape
+    if T == 0:
+        return
+    if rows.shape[-1] != D or src.dtype != rows.dtype or src.stride(-1) != 1:
+        raise ValueError(f"state_rows_store: src {tuple(src.shape)} {src.dtype} vs rows {tuple(rows.shape)} {rows.dtype}")
+    _state_store_kernel[(T,)](src, src.stride(0), slots, rows, D=D, num_warps=4)
 
 
 # ----------------------------------------------------------------------------- compressed-KV store

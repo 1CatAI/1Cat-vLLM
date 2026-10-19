@@ -34,6 +34,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.models.deepseek_v41.common.contracts import CKV_RECORD_DIM, HIDDEN, NORM_EPS
+from vllm.models.deepseek_v41.sm70.sparse_kernels import ATTN_GRAPH, state_rows_store
 from vllm.models.deepseek_v41.sm70.sparse import (
     STATE_ROW_DIM,
     DS41CacheLayer,
@@ -142,11 +143,15 @@ class DeepseekV41Compressor(nn.Module):
             kv_score = mm_fp32(x[:T], w)                                   # [T, 1024] = [kv | score]
             st = self._state_metadata()
             rows = self._state_rows()
-            keep = st.slot_mapping >= 0
-            rows.index_copy_(0, st.slot_mapping[keep], kv_score[keep])
-            prev = st.prev_slot.index_select(0, tok)
-            if n and bool((prev < 0).any()):
-                raise RuntimeError(f"{self.prefix}: a completing token has no state row for position p-1")
+            if ATTN_GRAPH:                      # no host decisions (CUDA-graph capturable)
+                state_rows_store(kv_score, st.slot_mapping, rows)
+                prev = st.prev_slot.index_select(0, tok)
+            else:
+                keep = st.slot_mapping >= 0
+                rows.index_copy_(0, st.slot_mapping[keep], kv_score[keep])
+                prev = st.prev_slot.index_select(0, tok)
+                if n and bool((prev < 0).any()):
+                    raise RuntimeError(f"{self.prefix}: a completing token has no state row for position p-1")
             pair = torch.stack([rows.index_select(0, prev.clamp(min=0)), kv_score.index_select(0, tok)], dim=1)
             kv_pair, score_pair = pair.split(CKV_RECORD_DIM, dim=-1)       # [N, 2, 512] each
             kv = (kv_pair * score_pair.softmax(dim=1)).sum(dim=1)          # FP32
