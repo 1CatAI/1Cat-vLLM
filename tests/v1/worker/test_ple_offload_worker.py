@@ -774,9 +774,12 @@ def test_offload_distributed_sets_config_only_for_model_parallel(
 
     # The Offload subprocess may inherit DP environment variables from a GPU
     # worker, but its isolated model-parallel world must always remain DP1.
-    monkeypatch.setattr(envs, "VLLM_DP_SIZE", 2)
-    monkeypatch.setattr(envs, "VLLM_DP_RANK", 1)
-    monkeypatch.setattr(envs, "VLLM_DP_RANK_LOCAL", 1)
+    # Through the environment, not as envs attributes: VLLM_DP_RANK_LOCAL
+    # defaults to VLLM_DP_RANK, so restoring it as an attribute would leave
+    # local DP rank 1 behind for the rest of the process.
+    set_lazy_env(monkeypatch, "VLLM_DP_SIZE", "2")
+    set_lazy_env(monkeypatch, "VLLM_DP_RANK", "1")
+    set_lazy_env(monkeypatch, "VLLM_DP_RANK_LOCAL", "1")
 
     monkeypatch.setattr(
         ple_offload_worker.dist,
