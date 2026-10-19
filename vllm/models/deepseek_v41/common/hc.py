@@ -8,14 +8,19 @@ All mixing math is FP32. V4.1 uses the *single-pass shift*: a sublayer's ``pre``
 input, so each decoder block returns its FFN ``pre`` and the final collapse is ``hc_pre(h, last ffn_pre)``.
 
 The torch implementation processes at most ``_CHUNK`` tokens at a time so the FP32 temporaries stay bounded
-(~84 MiB each at 1024 tokens) during 4K-token prefill chunks. A fused Triton kernel is a P5 item.
+(~84 MiB each at 1024 tokens) during 4K-token prefill chunks. With ``VLLM_DS41_HC_FUSED_SINKHORN=1`` the Sinkhorn split
+runs as one bit-exact Triton program per token (``sm70/hc_kernels.py``) instead of ~80 small torch kernels per call.
 """
 
 from __future__ import annotations
 
 import torch
 
+from vllm.models.deepseek_v41 import knobs
+
 from .contracts import HC, HC_EPS, HC_SINKHORN_ITERS, HIDDEN, NORM_EPS, STREAM_DTYPE
+
+FUSED_SINKHORN = knobs.env_bool("VLLM_DS41_HC_FUSED_SINKHORN", False)
 
 MIX_HC = (2 + HC) * HC  # 24 = pre(4) + post(4) + comb(16)
 _CHUNK = 1024
@@ -65,6 +70,9 @@ def hc_mixes(stream: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: 
         x = stream[start:end].flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + NORM_EPS)
         torch.mul(torch.nn.functional.linear(x, fn), rsqrt, out=mixes[start:end])
+    if FUSED_SINKHORN and mixes.is_cuda:
+        from ..sm70 import hc_kernels
+        return hc_kernels.sinkhorn_split(mixes, scale, base)
     return sinkhorn_split(mixes, scale.float(), base.float())
 
 
