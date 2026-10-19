@@ -48,6 +48,7 @@ from vllm.models.deepseek_v41.common.contracts import (
     CAND_SOURCE,
     HEAD_DIM,
     HIDDEN,
+    IDX_TOPK,
     N_HEADS,
     O_GROUPS,
     O_LORA,
@@ -260,7 +261,8 @@ class DeepseekV41Attention(nn.Module):
                swa_md.positions.data_ptr(), swa_md.token_to_req_indices.data_ptr()]
         if self.topo.compress_ratio > 0:
             src_md = cast(DS41CompressedMetadata, md_all[self.kv_source_name])
-            key += [src_md.block_table.data_ptr(), src_md.num_visible.data_ptr(), src_md.num_latents]
+            key += [src_md.block_table.data_ptr(), src_md.num_visible.data_ptr(), src_md.num_latents,
+                    src_md.max_visible <= IDX_TOPK]
             if self.kv_cache_layer is not None:
                 own = cast(DS41CompressedMetadata, md_all[self.kv_cache_layer.layer_name])
                 key += [own.latent_slots.data_ptr(), own.latent_pos.data_ptr(), own.slot_mapping.data_ptr(),
@@ -289,26 +291,30 @@ class DeepseekV41Attention(nn.Module):
             for seg, _ in plan:
                 seg()
             return
-        if entry["graphs"] is None:                   # capture step: capture + replay each capturable segment
+        groups = _group_segments(plan)                # adjacent capturable segments share one graph
+        if entry["graphs"] is None:                   # capture step: capture + replay each capturable group
             entry["st"].clear()
             pool = _graph_pool(key)
             if not getattr(self, "_graph_capture_logged", False):
                 self._graph_capture_logged = True
-                logger.info("%s: capturing decode-graph segments for T=%d", self.layer_name, T)
+                logger.info("%s: capturing %d decode-graph segment group(s) for T=%d", self.layer_name,
+                            sum(1 for _, c in groups if c), T)
             captured = []
-            for seg, capturable in plan:
+            for segs, capturable in groups:
                 if capturable:
-                    g = _capture_graph(seg, pool)
+                    g = _capture_graph(lambda: [s() for s in segs], pool)
                     g.replay()
                     captured.append(g)
                 else:
-                    seg()
+                    for s in segs:
+                        s()
                     captured.append(None)
             entry["graphs"] = captured
             return
-        for (seg, _), g in zip(plan, entry["graphs"]):
+        for (segs, _), g in zip(groups, entry["graphs"]):
             if g is None:
-                seg()
+                for s in segs:
+                    s()
             else:
                 g.replay()
 
@@ -334,6 +340,16 @@ GRAPH_WARMUP_STEPS = 1
 GRAPH_MAX_KEYS = 32
 _GRAPH_POOLS: dict = {}
 _GRAPH_STREAM: list = []
+
+
+def _group_segments(plan) -> list[tuple[list, bool]]:
+    groups: list[tuple[list, bool]] = []
+    for seg, capturable in plan:
+        if groups and groups[-1][1] == capturable:
+            groups[-1][0].append(seg)
+        else:
+            groups.append(([seg], capturable))
+    return groups
 
 
 def _graph_pool(key: tuple):

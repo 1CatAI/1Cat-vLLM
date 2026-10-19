@@ -224,16 +224,17 @@ class DeepseekV41Indexer(nn.Module):
         cand_out = self.shared.candidate_blocks[:T]
         if T == 0:
             return
-        if self.graph_capable():
-            self._forward_candidates_device(x, qr, positions, md, topk_out, cand_out)
-            return
         if md.max_visible <= IDX_TOPK:
-            # every visible entry is selected: [0, 1, ..., n_t - 1, -1, ...]
+            # every visible entry is selected: [0, 1, ..., n_t - 1, -1, ...]  (device-only; in graph mode this regime
+            # is part of the attention graph key, so a captured graph never crosses it)
             ar = torch.arange(IDX_TOPK, device=x.device, dtype=torch.int64)[None, :]
             topk_out.copy_(torch.where(ar < md.num_visible[:, None], ar, torch.full_like(ar, -1)).to(torch.int32))
             if self.topo.is_candidate_source:
                 cand_out.fill_(-1)
                 cand_out[:, 0] = CAND_ALL
+            return
+        if self.graph_capable():
+            self._forward_candidates_device(x, qr, positions, md, topk_out, cand_out)
             return
         impl = attn_impl()
         # qr arrives in FP32 and the GEMM output stays FP32, so the only rounding before the FP4 QAT is the QAT
