@@ -220,7 +220,11 @@ def run_and_compare(cfg, layer_ids, weights, S: int, seed: int, two_requests: bo
             ckv_port = topk_port = None
             if topo.compress_ratio:
                 src = f"model.layers.{topo.kv_source}.attn"
-                ckv_port = st.sim.rows_at(src, r, np.arange(S // topo.compress_ratio)).float()
+                ckv_port = st.sim.rows_at(src, r, np.arange(S // topo.compress_ratio))
+                if ckv_port.dtype == torch.uint8:            # packed FP4 x E4M3/16 records -> values
+                    from vllm.models.deepseek_v41.common.qat import unpack_ckv_torch
+                    ckv_port = unpack_ckv_torch(ckv_port)
+                ckv_port = ckv_port.float()
                 topk_port = _gather(st.rec[("topk", i, r)], S).long()
             o_g = ref_attend(rec["attn.q"], win_all, ckv_port, topk_port, weights[i]["attn.attn_sink"],
                              torch.arange(S, device=DEV))
