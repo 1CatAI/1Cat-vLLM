@@ -134,15 +134,25 @@ class DSparkProposer(DFlashProposer):
             [] if collect_confidence_logits else None
         )
         draft_probs: list[torch.Tensor] | None = None
+        from vllm.models.deepseek_v41.sm70.dspark import dump_on, dump_put
+        dumping = dump_on()
+        if dumping:
+            dump_put("prop_prev0", prev); dump_put("prop_base_logits_top5", torch.topk(base_logits.float(), 5, dim=-1).indices)
+            dump_put("prop_static_vocab", self._static_draft_vocab is not None)
         for step in range(self.num_speculative_tokens):
             markov_embed = self.model.markov_embed(prev)
             if markov_embeds is not None:
                 markov_embeds.append(markov_embed)
-            step_logits = base_logits[:, step] + self.model.markov_bias(markov_embed)
+            bias = self.model.markov_bias(markov_embed)
+            step_logits = base_logits[:, step] + bias
             sampled, step_probs = self._sample_from_logits(
                 step_logits,
                 sampling_metadata,
             )
+            if dumping:
+                dump_put(f"prop_step{step}_prev", prev); dump_put(f"prop_step{step}_embed", markov_embed)
+                dump_put(f"prop_step{step}_bias_top5", torch.topk(bias.float(), 5, dim=-1).indices); dump_put(f"prop_step{step}_bias_absmax", bias.float().abs().max())
+                dump_put(f"prop_step{step}_logits_top5", torch.topk(step_logits.float(), 5, dim=-1).indices); dump_put(f"prop_step{step}_sampled", sampled)
             prev = self.model.map_draft_to_target(sampled)
             draft_tokens.append(prev)
             if step_probs is not None:
