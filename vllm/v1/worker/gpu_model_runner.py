@@ -5255,6 +5255,13 @@ class GPUModelRunner(
                 # [cumulative_end - (draft_len + 1), cumulative_end). Fewer
                 # query rows than that would silently select the preceding
                 # request's hidden states.
+                if num_scheduled_tokens[req_idx] < draft_len + 1:
+                    logger.error("spec decode: req %s idx %d scheduled %d < draft_len %d + 1 (computed %d, prompt %d, "
+                                 "num_reqs %d, scheduled_spec keys %d, pp_rank %d)", req_id, req_idx,
+                                 int(num_scheduled_tokens[req_idx]), draft_len,
+                                 int(self.input_batch.num_computed_tokens_cpu[req_idx]),
+                                 int(self.input_batch.num_prompt_tokens[req_idx]), num_reqs,
+                                 len(scheduler_output.scheduled_spec_decode_tokens), get_pp_group().rank_in_group)
                 assert num_scheduled_tokens[req_idx] >= draft_len + 1
                 num_draft_tokens[req_idx] = draft_len
                 if (
