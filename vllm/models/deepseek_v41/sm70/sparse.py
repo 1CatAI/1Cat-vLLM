@@ -58,6 +58,7 @@ from vllm.models.deepseek_v41.sm70.sparse_kernels import (
     logical_to_rows,
     rows_of_positions_kernel,
     sparse_attention,
+    token_meta_kernel,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -254,16 +255,17 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
         if pos_cpu.shape[0] != T:
             raise RuntimeError(f"token count mismatch: query_start_loc covers {pos_cpu.shape[0]} tokens, "
                                f"num_actual_tokens={T}")
-        # CommonAttentionMetadata.token_to_req_indices caches the FIRST caller's buffer and hands it to every later builder
-        # that shares the metadata object, so the returned tensor is not necessarily this builder's own; copy it into
-        # this builder's static buffer so captured graphs always read a buffer this builder refills every step
-        shared = cm.token_to_req_indices(self._buf("_tok2req_scratch", dtype=torch.int32))[:T]
         tok2req = self._tok2req_buf[:T]
-        if shared.data_ptr() != tok2req.data_ptr():
-            tok2req.copy_(shared)
-        # static buffers (same address every step for a given T): the decode attention graphs read them in place
         positions = self._buf("_pos")[:T]
-        positions.copy_(torch.from_numpy(pos_cpu))
+        if ATTN_GRAPH:
+            # device-side from the runner's persistent query_start_loc / seq_lens: the host->device copy of positions was
+            # a synchronous pageable memcpy per builder per step (17 CPU<->GPU serialization points per decode step)
+            token_meta_kernel(cm.query_start_loc, cm.seq_lens, R, tok2req, positions)
+        else:
+            shared = cm.token_to_req_indices(self._buf("_tok2req_scratch", dtype=torch.int32))[:T]
+            if shared.data_ptr() != tok2req.data_ptr():
+                tok2req.copy_(shared)
+            positions.copy_(torch.from_numpy(pos_cpu))
         slot_mapping = cm.slot_mapping[:T]
         block_table = cm.block_table_tensor[:R]
         if ATTN_GRAPH and T <= GRAPH_OWN_BUFFERS_MAX_T:

@@ -100,6 +100,29 @@ def compressed_meta_kernel(positions: torch.Tensor, slot_mapping: torch.Tensor, 
                                             ratio, BLOCK=BLOCK, num_warps=4)
 
 
+@triton.jit
+def _tok_meta_kernel(qsl_ptr, seq_ptr, tok2req_ptr, pos_ptr, BLOCK: tl.constexpr):
+    """Per request r: tokens qsl[r]..qsl[r+1]-1 get tok2req = r and positions = seq_lens[r] - qsl[r+1] + t."""
+    r = tl.program_id(0)
+    a = tl.load(qsl_ptr + r)
+    b = tl.load(qsl_ptr + r + 1)
+    seq = tl.load(seq_ptr + r).to(tl.int64)
+    for t0 in range(a, b, BLOCK):
+        t = t0 + tl.arange(0, BLOCK)
+        m = t < b
+        tl.store(tok2req_ptr + t, tl.full((BLOCK,), 0, tl.int32) + r, mask=m)
+        tl.store(pos_ptr + t, seq - b.to(tl.int64) + t.to(tl.int64), mask=m)
+
+
+def token_meta_kernel(query_start_loc: torch.Tensor, seq_lens: torch.Tensor, num_reqs: int, tok2req: torch.Tensor,
+                      positions: torch.Tensor) -> None:
+    """Device-side token -> request ids (int32) and positions (int64) from the runner's persistent query_start_loc /
+    seq_lens: no host->device copy, no synchronous pageable memcpy per builder per step."""
+    if num_reqs == 0:
+        return
+    _tok_meta_kernel[(num_reqs,)](query_start_loc, seq_lens, tok2req, positions, BLOCK=256, num_warps=4)
+
+
 # ----------------------------------------------------------------------------- compressor state rows
 @triton.jit
 def _state_store_kernel(src_ptr, src_st, slot_ptr, rows_ptr, D: tl.constexpr):
