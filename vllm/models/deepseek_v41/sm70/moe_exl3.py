@@ -44,6 +44,7 @@ BALANCE_KNOB = "VLLM_DS41_MOE_EXL3_BALANCE"    # dir of layer<L>.npy routing cou
 MUL1_MARKER = MUL1_MULT - (1 << 32)
 CHUNK_TOKENS = 512                             # prefill tokens per expert_slots pass (bounds the slot scratch)
 KSPLIT_KNOB = "VLLM_DS41_MOE_EXL3_KSPLIT"      # max split-K of the decode GEMVs (more blocks in flight for few routes)
+GROUP_MIN_KNOB = "VLLM_DS41_MOE_EXL3_GROUP_MIN_TOKENS"   # from this many tokens, decode each expert once per <= 8 slots (grouped kernel)
 
 
 def _ksplit(k_in: int, limit: int) -> int:
@@ -124,6 +125,9 @@ class DeepseekV41Exl3MoEMethod(FusedMoEMethodBase):
         self.local = np.flatnonzero(self.owner == self.tp_rank)        # global ids owned here, ascending
         self.weight_dtype = "exl3"
         self.ksplit_limit = knobs.env_int(KSPLIT_KNOB, 4, minimum=1, maximum=16)   # 4: -18% at 1 route, neutral above (decode is ALU-bound)
+        # the trellis decode is ALU-bound per (slot, expert): with speculative verify steps (6 tokens x top-6) the grouped
+        # kernel's decode-once-per-expert wins; 65 keeps today's single-token decode on the plain path
+        self.group_min_tokens = knobs.env_int(GROUP_MIN_KNOB, GROUP_MIN_TOKENS, minimum=2)
 
     # ---- FusedMoEMethodBase plumbing: driven by DeepseekV41MoE.expert_slots, never by FusedMoE.forward ----
     @property
@@ -261,7 +265,7 @@ class DeepseekV41Exl3MoEMethod(FusedMoEMethodBase):
         f32 = dict(dtype=torch.float32, device=x.device)
         loc = layer.exl3_glob2loc[topk_ids.long()].contiguous()            # [T, k], -1 = another rank's expert
         flat = loc.view(-1)
-        grouped = num_tokens >= GROUP_MIN_TOKENS
+        grouped = num_tokens >= self.group_min_tokens
         ks13 = 1 if grouped else _ksplit(H, self.ksplit_limit)              # split-K: decode only
         ks2 = 1 if grouped else _ksplit(inter, self.ksplit_limit)
         xg, xu = torch.empty((S, H), **f16), torch.empty((S, H), **f16)

@@ -374,6 +374,27 @@ class DS41SWABackend(_DS41BackendBase):
         return DS41SWAMetadataBuilder
 
 
+class DS41DraftSWAMetadataBuilder(DS41SWAMetadataBuilder):
+    """The DSpark drafter's window layers: same metadata, flagged non-causal (the drafter computes its own window
+    rows from the bonus position; the proposer asserts ``causal is False`` on draft-layer metadata)."""
+
+    def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
+              fast_build: bool = False) -> DS41SWAMetadata:
+        md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        md.causal = False
+        return md
+
+
+class DS41DraftSWABackend(DS41SWABackend):
+    @staticmethod
+    def get_name() -> str:
+        return "DS41_SM70_DRAFT_SWA"
+
+    @staticmethod
+    def get_builder_cls() -> type[DS41DraftSWAMetadataBuilder]:
+        return DS41DraftSWAMetadataBuilder
+
+
 class DS41CompressedBackend(_DS41BackendBase):
     HEAD_SIZES = (CKV_PACKED_DIM, IK_RECORD_DIM)
 
