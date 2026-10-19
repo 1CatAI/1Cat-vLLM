@@ -41,6 +41,29 @@ ATTN_GRAPH = knobs.env_bool("VLLM_DS41_ATTN_GRAPH", False)
 # captured kernels bind to the builders' static buffers. Indexer layers (2/8/14/20 full scan, 24-36 regime-dependent) and
 # Engram stay eager breaks.
 ATTN_OUTER_GRAPH = ATTN_GRAPH and knobs.env_bool("VLLM_DS41_ATTN_OUTER_GRAPH", False)
+# Metadata builders replay their kernels (token meta, window rows, compressed slots/meta, state rows) from one CUDA graph
+# per builder and batch shape instead of ~90 Triton launches per decode step (each ~40 us of Python launch overhead).
+BUILDER_GRAPHS = ATTN_GRAPH and knobs.env_bool("VLLM_DS41_BUILDER_GRAPHS", False)
+_GRAPH_STREAM: list = []
+
+
+def capture_graph(fn, pool) -> torch.cuda.CUDAGraph:
+    """Capture ``fn`` on a side stream (ordered after the current stream's work; the current stream waits for the
+    capture); the caller replays. No sync / gc / empty_cache."""
+    if not _GRAPH_STREAM:
+        _GRAPH_STREAM.append(torch.cuda.Stream())
+    side = _GRAPH_STREAM[0]
+    cur = torch.cuda.current_stream()
+    side.wait_stream(cur)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side):
+        g.capture_begin(pool=pool, capture_error_mode="thread_local")
+        try:
+            fn()
+        finally:
+            g.capture_end()
+    cur.wait_stream(side)
+    return g
 
 
 # ----------------------------------------------------------------------------- metadata builders (graph mode)

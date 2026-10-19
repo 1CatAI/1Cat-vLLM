@@ -54,6 +54,8 @@ from vllm.models.deepseek_v41.common.contracts import (
 )
 from vllm.models.deepseek_v41.sm70.sparse_kernels import (
     ATTN_GRAPH,
+    BUILDER_GRAPHS,
+    capture_graph,
     compressed_meta_kernel,
     logical_to_rows,
     rows_of_positions_kernel,
@@ -259,8 +261,9 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
         positions = self._view("_pos", T)
         if ATTN_GRAPH:
             # device-side from the runner's persistent query_start_loc / seq_lens: the host->device copy of positions was
-            # a synchronous pageable memcpy per builder per step (17 CPU<->GPU serialization points per decode step)
-            token_meta_kernel(cm.query_start_loc, cm.seq_lens, R, tok2req, positions)
+            # a synchronous pageable memcpy per builder per step (17 CPU<->GPU serialization points per decode step).
+            # Launched by the builder's kernel fn (so it can be part of the builder's CUDA graph).
+            pass
         else:
             shared = cm.token_to_req_indices(self._buf("_tok2req_scratch", dtype=torch.int32))[:T]
             if shared.data_ptr() != tok2req.data_ptr():
@@ -307,6 +310,36 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
             self._ptr_logs = 0           # real steps after the capture log again
         return md
 
+    def _kernels(self, cm: CommonAttentionMetadata, c: dict, fn) -> None:
+        """Run the builder's kernels (token meta first, then ``fn``); with BUILDER_GRAPHS replay them from a CUDA graph
+        keyed by the batch shape and the runner tensors they read (all persistent); outputs are this builder's static
+        buffers. One warm eager run per key, then capture + replay."""
+        T, R = c["num_actual_tokens"], c["num_reqs"]
+
+        def run():
+            token_meta_kernel(cm.query_start_loc, cm.seq_lens, R, c["token_to_req_indices"], c["positions"])
+            fn()
+
+        if not BUILDER_GRAPHS or T == 0:
+            run()
+            return
+        key = (T, R, cm.query_start_loc.data_ptr(), cm.seq_lens.data_ptr(), cm.block_table_tensor.data_ptr(),
+               cm.slot_mapping.data_ptr(), c["slot_mapping"].data_ptr(), c["block_table"].data_ptr())
+        entries = self.__dict__.setdefault("_bgraphs", {})
+        e = entries.get(key)
+        if e is None:
+            if len(entries) >= 64:
+                run()
+                return
+            e = entries[key] = {"runs": 0, "graph": None}
+        if e["runs"] < 1:
+            e["runs"] += 1
+            run()
+            return
+        if e["graph"] is None:
+            e["graph"] = capture_graph(run, _builder_pool(key))
+        e["graph"].replay()
+
     def _view(self, name: str, T: int, tail: tuple[int, ...] = (), dtype: torch.dtype = torch.int64) -> torch.Tensor:
         """``_buf(name, tail, dtype)[:T]`` with the view cached per T (re-slicing ~8 buffers x ~45 builders every step
         cost ~400 aten::slice calls)."""
@@ -345,6 +378,18 @@ def rows_of_positions(block_table: torch.Tensor, tok2req: torch.Tensor, pos: tor
     return torch.where(valid, blk * block_size + p % block_size, torch.full_like(p, -1))
 
 
+_BUILDER_POOLS: dict = {}
+
+
+def _builder_pool(key: tuple):
+    """One allocator pool per batch-shape key, shared by all builders' graphs of that key (captured and replayed in the
+    same builder order every step)."""
+    pool = _BUILDER_POOLS.get(key)
+    if pool is None:
+        pool = _BUILDER_POOLS[key] = torch.cuda.graph_pool_handle()
+    return pool
+
+
 class DS41SWAMetadataBuilder(_DS41BuilderBase):
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> DS41SWAMetadata:
@@ -352,8 +397,9 @@ class DS41SWAMetadataBuilder(_DS41BuilderBase):
         T = c["num_actual_tokens"]
         win = self._view("_win", T, (WINDOW,))
         if ATTN_GRAPH:          # one kernel into the static buffer
-            rows_of_positions_kernel(c["positions"], c["slot_mapping"], c["token_to_req_indices"], c["block_table"],
-                                     c["block_size"], win, mode=0)
+            self._kernels(common_attn_metadata, c, lambda: rows_of_positions_kernel(
+                c["positions"], c["slot_mapping"], c["token_to_req_indices"], c["block_table"], c["block_size"], win,
+                mode=0))
             md = DS41SWAMetadata(**c, window_slots=win)
             if T <= 16:
                 self._log_ptrs(md, "REAL")
@@ -374,22 +420,30 @@ class DS41CompressedMetadataBuilder(_DS41BuilderBase):
         storage = int(spec.storage_block_size)
         T = c["num_actual_tokens"]
         cm = common_attn_metadata
-        slots = get_compressed_slot_mapping(
-            T, c["query_start_loc"], cm.seq_lens[: c["num_reqs"]], c["block_table"].clamp(min=0), storage, r,
-            out=self._buf("_cslot"))
         pos_cpu = c["positions_cpu"]
         pos = c["positions"]
         num_visible = self._view("_nvis", T)
         if ATTN_GRAPH:
             # graph mode: every token is a latent (N = T, static shapes); tokens that do not complete a group get
-            # slot -1 (the store kernels skip them) and an in-range dummy position -- one kernel into static buffers
+            # slot -1 (the store kernels skip them) and an in-range dummy position -- kernels into static buffers
             n = T
             tok = self._arange(T)
             lpos = self._view("_lpos", T)
             lslots = self._view("_lslot", T)
-            compressed_meta_kernel(pos, c["slot_mapping"], slots, r, num_visible, lpos, lslots)
+            slots = self._view("_cslot", T)
+            swa_slot = c["slot_mapping"]
+
+            def fn():
+                get_compressed_slot_mapping(T, c["query_start_loc"], cm.seq_lens[: c["num_reqs"]],
+                                            c["block_table"].clamp(min=0), storage, r, out=self._buf("_cslot"))
+                compressed_meta_kernel(pos, swa_slot, slots, r, num_visible, lpos, lslots)
+
+            self._kernels(cm, c, fn)
             c["slot_mapping"] = slots
         else:
+            slots = get_compressed_slot_mapping(
+                T, c["query_start_loc"], cm.seq_lens[: c["num_reqs"]], c["block_table"].clamp(min=0), storage, r,
+                out=self._buf("_cslot"))
             real = c["slot_mapping"] >= 0
             num_visible.copy_(torch.where(real, torch.div(pos + 1, r, rounding_mode="floor"), torch.zeros_like(pos)))
             c["slot_mapping"] = slots
@@ -423,8 +477,9 @@ class DS41StateMetadataBuilder(_DS41BuilderBase):
         p = c["positions"]
         prev_slot = self._view("_prev", p.shape[0])
         if ATTN_GRAPH:
-            rows_of_positions_kernel(p, c["slot_mapping"], c["token_to_req_indices"], c["block_table"], c["block_size"],
-                                     prev_slot[:, None], mode=1)
+            self._kernels(common_attn_metadata, c, lambda: rows_of_positions_kernel(
+                p, c["slot_mapping"], c["token_to_req_indices"], c["block_table"], c["block_size"], prev_slot[:, None],
+                mode=1))
             return DS41StateMetadata(**c, prev_slot=prev_slot)
         completes = ((p + 1) % 2 == 0) & (c["slot_mapping"] >= 0)
         prev = torch.where(completes, p - 1, torch.full_like(p, -1))
