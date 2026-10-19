@@ -86,7 +86,7 @@ def _impl() -> str:
 _EXL3_ENABLED: contextvars.ContextVar[bool] = contextvars.ContextVar("ds41_moe_exl3_enabled", default=True)
 
 
-@contextmanager
+@contextlib.contextmanager
 def exl3_context(enabled: bool) -> Iterator[None]:
     """exl3=False builds the FusedMoE with the official MXFP4 experts even when the EXL3 plan is set (the DSpark
     drafter's 128-expert blocks are not in the plan)."""
