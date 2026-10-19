@@ -37,6 +37,7 @@ from vllm.models.deepseek_v41.common.hc import hc_expand, hc_mixes, hc_post, hc_
 from vllm.models.deepseek_v41.common.topology import layer_topology
 from vllm.models.deepseek_v41.sm70.sparse import (
     DS41CacheLayer,
+    DS41DraftSWABackend,
     DS41SWABackend,
     DS41SWAMetadata,
     rows_of_positions,
@@ -99,6 +100,7 @@ class DSparkV41Attention(nn.Module):
         # reuse the target's attention module for its weights, norms, rotary cache and output projection; its
         # forward() is not used (the drafter's attention pattern differs)
         self.inner = DeepseekV41Attention(vllm_config, prefix, topo, stage, shared, aux_streams=None)
+        self.inner.swa_cache._backend = DS41DraftSWABackend      # metadata flagged non-causal for the proposer
         self.prefix = prefix
         self.layer_id = layer_id
         self.n_local_heads = self.inner.n_local_heads
