@@ -291,7 +291,7 @@ def test_kv20_crc_travels_exporter_to_mirror(crc_check: bool) -> None:
     from vllm.models.deepseek_v41.sm70.model import KV20_CRC_KEY
 
     T, gen = 3, torch.Generator().manual_seed(7)
-    shared = SimpleNamespace(export_ckv=torch.randn(8, C.CKV_RECORD_DIM, generator=gen).half(),
+    shared = SimpleNamespace(export_ckv=torch.randint(0, 256, (8, C.CKV_PACKED_DIM), generator=gen, dtype=torch.uint8),
                              export_ik=torch.randn(8, C.IK_RECORD_DIM, generator=gen).half(),
                              candidate_blocks=torch.randint(0, 9, (8, C.CAND_TOPK_BLOCKS), dtype=torch.int32))
     exporter = _pp_fake(dict(exports_kv_sources=(C.CAND_SOURCE,), mirrored_kv_sources=()), shared=shared,
@@ -306,7 +306,7 @@ def test_kv20_crc_travels_exporter_to_mirror(crc_check: bool) -> None:
                         kv20_crc_check=crc_check)
     receiver.forward(None, torch.arange(T), out)
     if crc_check:
-        want = (shared.export_ckv[:T].view(torch.int16).sum(-1, dtype=torch.int32)
+        want = (shared.export_ckv[:T].to(torch.int32).sum(-1, dtype=torch.int32)
                 + shared.export_ik[:T].view(torch.int16).sum(-1, dtype=torch.int32))
         assert out.tensors[KV20_CRC_KEY].dtype == torch.int32 and out.tensors[KV20_CRC_KEY].shape == (T,)
         assert torch.equal(mirror.crcs[-1], want)

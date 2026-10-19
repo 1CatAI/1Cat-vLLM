@@ -148,6 +148,7 @@ class DS41BatchMetadata:
 @dataclass
 class DS41SWAMetadata(DS41BatchMetadata):
     window_slots: torch.Tensor = None      # [T, WINDOW] int64: rows of positions p-127..p (ascending), -1 pad
+    causal: bool = True                    # the DSpark drafter's window (non-causal over window + block) sets False
 
 
 @dataclass
@@ -220,7 +221,8 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
                  device: torch.device) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         _require_exact_host_lengths(vllm_config)
-        self._init_reorder_batch_threshold(1)
+        # spec-as-decode: a verify step of 1 + num_spec query tokens per request is still a decode batch
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
     def _check_block_geometry(self) -> None:
         kbs = getattr(self, "kernel_block_size", None)

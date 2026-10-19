@@ -294,8 +294,8 @@ PP_KEY_KV20_CRC = "kv20_crc"
 
 
 def kv20_crc(ckv, ik):
-    """Same formula as ds41/attn kv_mirror.kv20_crc."""
-    return ckv.view(torch.int16).sum(dim=-1, dtype=torch.int32) + ik.view(torch.int16).sum(dim=-1, dtype=torch.int32)
+    """Same formula as ds41/attn kv_mirror.kv20_crc (packed uint8 ckv bytes + int16 ik bit patterns)."""
+    return ckv.to(torch.int32).sum(dim=-1, dtype=torch.int32) + ik.view(torch.int16).sum(dim=-1, dtype=torch.int32)
 
 
 _MODULES = {

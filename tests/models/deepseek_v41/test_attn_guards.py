@@ -39,7 +39,8 @@ def _real_metadata(st: Stage, n: int) -> tuple[dict, torch.Tensor]:
 
 def _payload(n: int, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device=DEV).manual_seed(seed)
-    ckv = torch.randn(n, 512, device=DEV, generator=g).half()
+    from vllm.models.deepseek_v41.common import qat
+    ckv = qat.fp4_e4m3_pack_torch(torch.randn(n, 512, device=DEV, generator=g))   # packed FP4 records
     ik = torch.randn(n, 128, device=DEV, generator=g).half()
     cand = torch.full((n, CAND_TOPK_BLOCKS), -1, dtype=torch.int32, device=DEV)
     return ckv, ik, cand

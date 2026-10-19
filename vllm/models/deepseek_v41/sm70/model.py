@@ -377,6 +377,16 @@ class DeepseekV41Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    _aux_layers: tuple[int, ...] = ()
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Runner (EAGLE-3) numbering: id L = the stream after layer L - 1. Only this stage's layers can be captured."""
+        bad = [l for l in layers if not (self.start_layer < l <= self.end_layer)]
+        if bad:
+            raise ValueError(f"aux hidden state layers {bad} are not produced on this stage (layers "
+                             f"{self.start_layer}..{self.end_layer - 1}); DSpark needs them on the last stage")
+        self._aux_layers = tuple(int(l) for l in layers)
+
     def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
                 intermediate_tensors: IntermediateTensors | None,
                 inputs_embeds: torch.Tensor | None = None) -> torch.Tensor | IntermediateTensors:
@@ -394,10 +404,16 @@ class DeepseekV41Model(nn.Module):
                 self.mirror.ingest(positions, intermediate_tensors[C.PP_KEY_KV20_CKV],
                                    intermediate_tensors[C.PP_KEY_KV20_IK], intermediate_tensors[C.PP_KEY_CAND20],
                                    crc=intermediate_tensors[KV20_CRC_KEY] if self.kv20_crc_check else None)
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        aux: list[torch.Tensor] = []
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
             if isinstance(layer, PPMissingLayer):   # layer outside the configured subset
                 continue
             stream, pre = layer(stream, pre, positions)
+            if idx + 1 in self._aux_layers:
+                # DSpark target state: the HC stream entering layer idx + 1, averaged over the 4 streams (reference
+                # ``h.mean(dim=2)`` before ``layer(h)``); runner numbering = "output after layer idx" = idx + 1
+                aux.append(stream.float().mean(dim=1).to(torch.float16))
         if not self.pp_is_last:
             num_tokens = stream.shape[0]
             out = {C.PP_KEY_HIDDEN: stream, C.PP_KEY_PRE_MIX: pre}
@@ -413,7 +429,8 @@ class DeepseekV41Model(nn.Module):
                 ds41_dump.end_forward()
             return IntermediateTensors(out)
         if not ds41_dump.ENABLED:
-            return hc_collapse(stream, pre, self.norm.weight)
+            hidden = hc_collapse(stream, pre, self.norm.weight)
+            return (hidden, aux) if self._aux_layers else hidden
         collapsed = hc_pre(stream, pre)
         hidden = rmsnorm_to_act(collapsed, self.norm.weight)
         for name, t in (("final.stream_in", stream), ("final.hc", collapsed), ("final.h", hidden)):
@@ -464,6 +481,18 @@ def map_checkpoint_name(name: str) -> str:
 
 
 class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
+    supports_eagle3 = True   # aux hidden states for the DSpark drafter (vllm SupportsEagle3 protocol)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model._set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # V4.1 reference (inference/model.py:1267-1270): the drafter reads the attention INPUT of layers 37-39, i.e.
+        # the stream after layers 36-38 = runner ids 37-39 as given. (V4 captures outputs: the runner adds +1 there;
+        # gpu_model_runner._get_eagle3_aux_layers_from_config must not add it for deepseek_v41.)
+        ids = getattr(self.config, "dspark_target_layer_ids", None) or ()
+        return tuple(int(i) for i in ids)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
