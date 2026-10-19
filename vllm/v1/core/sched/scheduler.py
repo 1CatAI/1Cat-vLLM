@@ -1792,6 +1792,12 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
+            if self.__dict__.setdefault("_ds41_out_logs", 0) < 6:
+                self._ds41_out_logs += 1
+                logger.info("DS41 output: req %s idx %d sampled %s (num_sampled rows %d) spec_scheduled %s computed %d",
+                            req_id, req_index, (sampled_token_ids[req_index] if sampled_token_ids else None),
+                            len(sampled_token_ids) if sampled_token_ids else -1,
+                            scheduler_output.scheduled_spec_decode_tokens.get(req_id), request.num_computed_tokens)
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
