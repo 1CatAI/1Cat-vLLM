@@ -336,6 +336,22 @@ logger = init_logger(__name__)
 
 
 GRAPH_MAX_T = 16                 # decode / spec-verify steps only; prefill chunks stay eager
+
+
+def _outer_layers() -> frozenset[int] | None:
+    """VLLM_DS41_ATTN_OUTER_LAYERS: ids/ranges of the layers captured inline (debug bisection); default all eligible."""
+    import os
+    spec = os.environ.get("VLLM_DS41_ATTN_OUTER_LAYERS", "all").strip().lower()
+    if spec in ("", "all"):
+        return None
+    ids: set[int] = set()
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        ids.update(range(int(lo), int(hi or lo) + 1))
+    return frozenset(ids)
+
+
+_OUTER_LAYERS = _outer_layers()
 GRAPH_WARMUP_STEPS = 1
 GRAPH_MAX_KEYS = 32
 _GRAPH_POOLS: dict = {}
@@ -394,7 +410,7 @@ def deepseek_v41_attention(x: torch.Tensor, positions: torch.Tensor, out: torch.
     batches of layers without an indexer scan, which run inline and are captured with the rest of the layer."""
     if ATTN_OUTER_GRAPH and x.shape[0] <= GRAPH_MAX_T:
         layer = get_forward_context().no_compile_layers[layer_name]
-        if layer.indexer is None:
+        if layer.indexer is None and (_OUTER_LAYERS is None or layer.layer_id in _OUTER_LAYERS):
             _attention_op(x, positions, out, layer_name)
             return
     _attention_eager_break(x, positions, out, layer_name)
