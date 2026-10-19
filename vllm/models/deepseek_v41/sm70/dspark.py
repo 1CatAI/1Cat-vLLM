@@ -337,6 +337,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         _, stage, rest = ckpt.split(".", 2)
         if rest.endswith(".bias_vl"):                  # drafts are text: no VL router bias
             return None
+        if rest.startswith("confidence_head.") and self.model.confidence_head is None:
+            return None                                # optional head, not instantiated (threshold 0)
         if rest.startswith(self._HEAD_TENSORS):
             name = "model." + rest
             if name.endswith(".scale"):               # main_proj FP8 scale
