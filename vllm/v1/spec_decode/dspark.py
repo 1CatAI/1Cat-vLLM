@@ -113,7 +113,10 @@ class DSparkProposer(DFlashProposer):
             # exist; during the memory-profiling pass they may not be -> no context, the drafter captures its zero path
             # there, and those profiling graphs are discarded anyway)
             ctx = None
+            profiling = bool(getattr(self._ds41_runner, "_ds41_cg_mem_profiling", False))
             try:
+                if profiling:            # memory-profiling pass: a stub KV cache; capture the zero path (discarded graphs)
+                    raise AttributeError("profiling pass")
                 groups = self._ds41_runner.attn_groups
                 ctx = {}
                 for gid in self._draft_kv_cache_group_ids():
