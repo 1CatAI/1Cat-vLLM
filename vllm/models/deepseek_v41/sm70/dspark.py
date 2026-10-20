@@ -370,8 +370,9 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         return [layer.attn.swa_cache.prefix for layer in self.model.layers]
 
     def precompute_and_store_context_kv(self, context_states, context_positions, context_slot_mappings=None) -> None:
-        dump_put("ctx_states", context_states); dump_put("ctx_positions", context_positions)
-        dump_put("ctx_slots", None if context_slot_mappings is None else {k: v.detach().cpu() for k, v in context_slot_mappings.items()})
+        if dump_on():
+            dump_put("ctx_states", context_states); dump_put("ctx_positions", context_positions)
+            dump_put("ctx_slots", None if context_slot_mappings is None else {k: v.detach().cpu() for k, v in context_slot_mappings.items()})
         self.model.precompute_and_store_context_kv(context_states, context_positions, context_slot_mappings)
 
     def forward(self, input_ids, positions, inputs_embeds=None) -> torch.Tensor:
