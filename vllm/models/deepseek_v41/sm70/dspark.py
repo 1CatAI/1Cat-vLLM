@@ -153,6 +153,9 @@ class DSparkV41Attention(nn.Module):
         if not isinstance(md_all, dict):
             md_all = None             # the proposer's own dummy / profile runs carry no metadata (and no dummy flag)
         o = torch.zeros((x.shape[0], self.n_local_heads, C.HEAD_DIM), dtype=torch.float16, device=x.device)
+        import os as _os
+        if md_all is not None and _os.environ.get("DS41_DRAFT_FORCE_STATIC") and STATIC_CAPTURE_CTX is not None:
+            md_all = None                                            # test: the static (capture) math on real eager steps
         if md_all is None:
             # No metadata: a profile/warmup run (zero attention), or the proposer's CUDA-graph CAPTURE. Under capture the
             # graph must contain the real attention, so it is built from STATIC inputs that the replay also sees: the
@@ -173,6 +176,12 @@ class DSparkV41Attention(nn.Module):
             T = (x.shape[0] // block_size) * block_size
             B = T // block_size
             tok2req = torch.arange(B, device=x.device, dtype=torch.int32)
+            if _os.environ.get("DS41_DRAFT_CAPTURE_LOG") and self.__dict__.get("_cap_logged", 0) < 3:
+                self._cap_logged = self.__dict__.get("_cap_logged", 0) + 1
+                logger.info("DSpark drafter L%d STATIC path: capturing=%s rows=%d T=%d B=%d bt=%#x %s bs=%d cache=%#x %s pos=%#x x=%#x",
+                            self.layer_id, torch.cuda.is_current_stream_capturing(), x.shape[0], T, B, block_table.data_ptr(),
+                            tuple(block_table.shape), cache_block_size, self.swa_cache.rows().data_ptr(),
+                            tuple(self.swa_cache.rows().shape), positions.data_ptr(), x.data_ptr())
         else:
             swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
             T = swa_md.num_actual_tokens                             # real query rows (B blocks of block_size)
@@ -181,6 +190,11 @@ class DSparkV41Attention(nn.Module):
             B = T // block_size
             block_table, cache_block_size = swa_md.block_table, swa_md.block_size
             tok2req = swa_md.token_to_req_indices.view(B, block_size)[:, 0]
+            if _os.environ.get("DS41_DRAFT_CAPTURE_LOG") and self.__dict__.get("_real_logged", 0) < 3:
+                self._real_logged = self.__dict__.get("_real_logged", 0) + 1
+                logger.info("DSpark drafter L%d REAL path: rows=%d T=%d B=%d bt=%#x %s bs=%d tok2req=%s cache=%#x pos=%#x x=%#x positions=%s",
+                            self.layer_id, x.shape[0], T, B, block_table.data_ptr(), tuple(block_table.shape), cache_block_size,
+                            tok2req.tolist(), self.swa_cache.rows().data_ptr(), positions.data_ptr(), x.data_ptr(), positions[:T].tolist())
         x, positions_all = x[:T], positions
         positions = positions[:T]
         q, kv = self._qkv(x)

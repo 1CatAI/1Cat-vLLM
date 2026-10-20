@@ -102,7 +102,7 @@ class DSparkProposer(DFlashProposer):
 
     @override
     def dummy_run(self, num_tokens: int, use_cudagraphs: bool = True, is_graph_capturing: bool = False, **kw) -> None:
-        if is_graph_capturing:
+        if True:   # always (also for the eager force-static test); harmless when not capturing
             # the SM70 drafter attention captures its real path from static inputs (see sm70/dspark.py)
             from vllm.models.deepseek_v41.sm70 import dspark as sm70_dspark
             gid = self._first_draft_kv_cache_group_id()
@@ -136,6 +136,16 @@ class DSparkProposer(DFlashProposer):
         # next_token_ids tensor is not guaranteed to retain a stable address or
         # contents across asynchronous scheduling and CUDA Graph replay.
         prev = self.input_ids[self._anchor_indices[:batch_size]].to(torch.long)
+        import os as _os
+        if _os.environ.get("DS41_DRAFT_CAPTURE_LOG") and getattr(self, "_ptr_logged", 0) < 3:
+            self._ptr_logged = getattr(self, "_ptr_logged", 0) + 1
+            gid = self._first_draft_kv_cache_group_id(); cad = (self._dflash_common_attn_metadata_by_gid or {}).get(gid)
+            from vllm.logger import init_logger
+            init_logger(__name__).info("DSpark proposer step: input_ids=%#x positions=%#x bt(meta)=%s bt(static)=%#x anchors=%s pos[:10]=%s",
+                                       self.input_ids.data_ptr(), self.positions.data_ptr(),
+                                       f"{cad.block_table_tensor.data_ptr():#x} {tuple(cad.block_table_tensor.shape)}" if cad is not None else None,
+                                       self._ds41_runner.input_batch.block_table[gid].block_table.gpu.data_ptr(),
+                                       prev.tolist(), self.positions[:10].tolist())
         draft_tokens: list[torch.Tensor] = []
         self._last_confidence_logits = None
         self._last_verification_lengths = None
