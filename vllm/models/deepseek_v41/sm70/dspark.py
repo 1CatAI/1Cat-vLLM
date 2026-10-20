@@ -163,7 +163,7 @@ class DSparkV41Attention(nn.Module):
             # the proposer's persistent positions buffer (``positions``) and the window cache. Padded rows compute
             # garbage that nothing reads. ``STATIC_CAPTURE_CTX`` is installed by the proposer before capture.
             st = STATIC_CAPTURE_CTX
-            bound = st is not None and torch.cuda.is_current_stream_capturing()
+            bound = st is not None and (torch.cuda.is_current_stream_capturing() or bool(_os.environ.get("DS41_DRAFT_FORCE_STATIC")))
             if bound:
                 try:                        # memory profiling captures with a stub cache: not the real capture
                     self.swa_cache.rows()
