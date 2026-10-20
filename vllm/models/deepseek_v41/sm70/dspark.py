@@ -179,7 +179,9 @@ class DSparkV41Attention(nn.Module):
             cache_block_size = int(self.swa_cache._spec.block_size)
             T = (x.shape[0] // block_size) * block_size
             B = T // block_size
-            tok2req = torch.arange(B, device=x.device, dtype=torch.int32)
+            # padded rows can form more blocks than there are requests (rows = graph size, not B x block_size):
+            # those blocks read the last real table row (their output is never consumed) instead of running off it
+            tok2req = torch.arange(B, device=x.device, dtype=torch.int32).clamp_(max=block_table.shape[0] - 1)
             if _os.environ.get("DS41_DRAFT_CAPTURE_LOG") and self.__dict__.get("_cap_logged", 0) < 3:
                 self._cap_logged = self.__dict__.get("_cap_logged", 0) + 1
                 logger.info("DSpark drafter L%d STATIC path: capturing=%s rows=%d T=%d B=%d bt=%#x %s bs=%d (ctx said %d) cache=%#x %s pos=%#x x=%#x",
@@ -240,7 +242,7 @@ class DSparkV41Attention(nn.Module):
             sT = (positions_all.shape[0] // block_size) * block_size; sB = sT // block_size
             s_first = positions_all[:sT].view(sB, block_size)[:, 0]; s_p = s_first - 1
             s_win_pos = s_p[:, None] - (C.WINDOW - 1) + torch.arange(C.WINDOW, device=x.device)[None, :]
-            s_rows = rows_of_positions(sbt, torch.arange(sB, device=x.device, dtype=torch.int32), s_win_pos, int(self.swa_cache._spec.block_size))
+            s_rows = rows_of_positions(sbt, torch.arange(sB, device=x.device, dtype=torch.int32).clamp_(max=sbt.shape[0] - 1), s_win_pos, int(self.swa_cache._spec.block_size))
             s_rows = s_rows[:, None, :].expand(sB, block_size, C.WINDOW).reshape(sT, C.WINDOW)
             o2 = torch.zeros_like(o)
             fused_decode_attention(q, [(self.swa_cache.rows(), s_rows), (block_kv, brow)], self.inner.attn_sink, self.inner.scale, o2[:T])
