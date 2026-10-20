@@ -117,40 +117,46 @@ __global__ __launch_bounds__(kThreads, MinBlocks) void fp8_qpn8_mma_sm75_kernel(
   const half* scale_source = group_scales + n0 / 32 + b_tile;
   const int tiles_n32 = n >> 5;
 
-  uint4 a_stage[ALoads];
-  uint4 b_stage;
+  // One K step held in registers on its way into shared memory. The scale is
+  // read together with the codes, so no global load sits between the MMAs and
+  // the shared-memory store. Two steps in flight measured slower for every
+  // tile height (more registers, fewer resident blocks).
+  struct Staged {
+    uint4 a[ALoads];
+    uint4 b;
+    half scale;
+  };
 
-  auto load_global = [&](int step) {
+  auto load_global = [&](int step, Staged& staged) {
     const int k0 = k_begin + step * kBlockK;
 #pragma unroll
     for (int i = 0; i < ALoads; ++i) {
       const int index = tid + i * kThreads;
-      a_stage[i] = make_uint4(0, 0, 0, 0);
+      staged.a[i] = make_uint4(0, 0, 0, 0);
       if (index < AChunks && m0 + index / kChunks < m) {
-        a_stage[i] = *reinterpret_cast<const uint4*>(
+        staged.a[i] = *reinterpret_cast<const uint4*>(
             input + static_cast<size_t>(m0 + index / kChunks) * k + k0 +
             (index % kChunks) * 8);
       }
     }
-    b_stage =
+    staged.b =
         __ldcs(b_source + static_cast<size_t>(step) * (kBlockK / 16) * 32);
+    staged.scale = scale_source[static_cast<size_t>(k0 / 128) * tiles_n32];
   };
 
-  auto store_shared = [&](int step, int stage) {
+  auto store_shared = [&](const Staged& staged, int stage) {
 #pragma unroll
     for (int i = 0; i < ALoads; ++i) {
       const int index = tid + i * kThreads;
       if (index < AChunks) {
         a_shared[stage][swizzled(index / kChunks, index % kChunks)] =
-            a_stage[i];
+            staged.a[i];
       }
     }
-    const int k0 = k_begin + step * kBlockK;
-    const half scale = scale_source[static_cast<size_t>(k0 / 128) * tiles_n32];
-    const half2 scale2 = __halves2half2(scale, scale);
+    const half2 scale2 = __halves2half2(staged.scale, staged.scale);
     half2 weights[8];
-    fp8x8_to_half2x4_fast(make_uint2(b_stage.x, b_stage.y), weights);
-    fp8x8_to_half2x4_fast(make_uint2(b_stage.z, b_stage.w), weights + 4);
+    fp8x8_to_half2x4_fast(make_uint2(staged.b.x, staged.b.y), weights);
+    fp8x8_to_half2x4_fast(make_uint2(staged.b.z, staged.b.w), weights + 4);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       weights[i] = __hmul2(weights[i], scale2);
@@ -172,14 +178,15 @@ __global__ __launch_bounds__(kThreads, MinBlocks) void fp8_qpn8_mma_sm75_kernel(
     }
   }
 
-  load_global(0);
-  store_shared(0, 0);
+  Staged next;
+  load_global(0, next);
+  store_shared(next, 0);
   __syncthreads();
 
   for (int step = 0; step < steps; ++step) {
     const int stage = step & 1;
     if (step + 1 < steps) {
-      load_global(step + 1);
+      load_global(step + 1, next);
     }
 #pragma unroll
     for (int half_k = 0; half_k < kBlockK / 16; ++half_k) {
@@ -214,7 +221,7 @@ __global__ __launch_bounds__(kThreads, MinBlocks) void fp8_qpn8_mma_sm75_kernel(
       }
     }
     if (step + 1 < steps) {
-      store_shared(step + 1, stage ^ 1);
+      store_shared(next, stage ^ 1);
     }
     __syncthreads();
   }
