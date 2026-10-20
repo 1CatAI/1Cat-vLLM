@@ -904,6 +904,9 @@ class KernelConfig:
     """Optional independent draft hot capacity; None preserves target capacity."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
     """Shared host-miss staging capacity; larger batches use bounded row chunks."""
+    qsa_host_kv_share_replicas: bool = True
+    """TP ranks holding the same replicated KV head share one host history pool
+    (shared memory) instead of keeping identical copies."""
     qsa_host_kv_prefill_stage_tokens: int = Field(default=0, ge=0)
     """Prefill with host KV: copy each request's whole history for a layer to
     one shared device buffer (DMA, once per layer and chunk) and read it there,
