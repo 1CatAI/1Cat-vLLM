@@ -56,6 +56,12 @@ _RELU_BLOCK_M = 32
 # is what keeps a long-context chunk from asking for gigabytes in one go.
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
+# The prefill epilogue reads eight keys per thread, 32 bytes of the fp32 tile.
+# Measured on the former fp16 tile (16-byte loads): at two keys per thread
+# (BLOCK_K 256 over 4 warps) it read the tile at 105 GB/s on RTX 8000 and
+# 184 GB/s on V100, against 562 and 782 GB/s with eight.
+_PREFILL_EPILOGUE_BLOCK_K = 512
+_PREFILL_EPILOGUE_WARPS = 2
 
 # At long context the paged Triton decode kernel rescans the same FP8 MQA keys
 # once for every verifier row and head. For a bounded one-request verifier
@@ -619,7 +625,9 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
         # pass fp16's 65504; an fp16 tile overflowed to inf, and to NaN where
         # mixed-sign head weights summed +inf and -inf in the epilogue.
         scores = torch.mm(q2, k_fp16[start:stop].t(), out_dtype=torch.float32)
-        _relu_weight_headsum_kernel[(num_q, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
+        _relu_weight_headsum_kernel[
+            (num_q, triton.cdiv(width, _PREFILL_EPILOGUE_BLOCK_K))
+        ](
             scores,
             weights,
             k_scales[start:stop],
@@ -630,9 +638,9 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
             out.stride(0),
             width,
             num_heads=num_heads,
-            BLOCK_K=_EPILOGUE_BLOCK_K,
+            BLOCK_K=_PREFILL_EPILOGUE_BLOCK_K,
             BLOCK_H=_EPILOGUE_BLOCK_H,
-            num_warps=4,
+            num_warps=_PREFILL_EPILOGUE_WARPS,
         )
     return out
 
