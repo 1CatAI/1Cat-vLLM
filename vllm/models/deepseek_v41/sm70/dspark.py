@@ -210,6 +210,18 @@ class DSparkV41Attention(nn.Module):
         p = first - 1
         win_pos = p[:, None] - (C.WINDOW - 1) + torch.arange(C.WINDOW, device=x.device)[None, :]      # [B, 128]
         win_rows = rows_of_positions(block_table, tok2req, win_pos, cache_block_size)                   # [B, 128]
+        if _os.environ.get("DS41_DRAFT_CAPTURE_LOG") and md_all is not None and STATIC_CAPTURE_CTX is not None \
+                and self.__dict__.get("_cmp_logged", 0) < 2:
+            # in-process comparison: what the STATIC branch would have computed from the same call
+            self._cmp_logged = self.__dict__.get("_cmp_logged", 0) + 1
+            sbt, _ = STATIC_CAPTURE_CTX
+            s_tok2req = torch.arange(B, device=x.device, dtype=torch.int32)
+            s_rows = rows_of_positions(sbt, s_tok2req, win_pos, int(self.swa_cache._spec.block_size))
+            logger.info("DSpark drafter L%d CMP: bt same storage %s; win_rows equal %s; real rows[0,-4:] %s static %s; "
+                        "tok2req real %s dtype %s; positions dtype %s contiguous %s; x contiguous %s", self.layer_id,
+                        sbt.data_ptr() == block_table.data_ptr(), bool(torch.equal(win_rows, s_rows)),
+                        win_rows[0, -4:].tolist(), s_rows[0, -4:].tolist(), tok2req.tolist(), tok2req.dtype,
+                        positions.dtype, positions.is_contiguous(), x.is_contiguous())
         win_rows = win_rows[:, None, :].expand(B, block_size, C.WINDOW).reshape(T, C.WINDOW)
         # block rows: query i of block b sees block rows b * block_size .. + block_size - 1 (non-causal)
         brow = (torch.arange(B, device=x.device)[:, None] * block_size
