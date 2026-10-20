@@ -414,7 +414,7 @@ class DeepseekV41Model(nn.Module):
                 _hit = (positions == _dbg_pos).nonzero()            # one sync, real steps only, never under capture
                 if _hit.numel():
                     _dbg_row = int(_hit[0, 0]); _dbg_norms = [("in", stream[_dbg_row].float().norm())]
-                    _dbg_dump = {"in": stream.to(torch.float16).cpu()} if __import__("os").environ.get("DS41_DUMP_LAYERS") else None
+                    _dbg_dump = {"in": stream.to(torch.float16).cpu()} if __import__('os').environ.get('DS41_DUMP_LAYERS') else None
         for idx in range(self.start_layer, self.end_layer):
             layer = self.layers[idx]
             if isinstance(layer, PPMissingLayer):   # layer outside the configured subset
@@ -430,7 +430,8 @@ class DeepseekV41Model(nn.Module):
                 aux.append(stream.float().mean(dim=1).to(torch.float16))
         if _dbg_row >= 0 and _dbg_dump is not None and positions.shape[0] > 1:
             _dbg_dump["positions"] = positions.cpu()
-            torch.save(_dbg_dump, f"{__import__(os).environ[DS41_DUMP_LAYERS]}_{self.stage.pp_rank if hasattr(self.stage, pp_rank) else self.start_layer}_{__import__(torch).distributed.get_rank()}.pt")
+            import os as _os, torch.distributed as _dist
+            torch.save(_dbg_dump, f"{_os.environ['DS41_DUMP_LAYERS']}_pp{self.start_layer}_rank{_dist.get_rank()}.pt")
         if _dbg_row >= 0:
             logger.info("DS41 layer norms pos %d (row %d of T=%d): %s", _dbg_pos, _dbg_row, int(positions.shape[0]),
                         " ".join(f"{k}:{float(v):.3f}" for k, v in _dbg_norms))
