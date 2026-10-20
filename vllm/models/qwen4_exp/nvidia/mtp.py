@@ -272,6 +272,35 @@ def _mtp_fp8_experts_supported(
     )
 
 
+def _match_target_rope_scaling(speculative_config) -> None:
+    """Rotate draft positions exactly like a window-extended target.
+
+    The stock MTP checkpoint ships its target's native RoPE. When the target
+    serves a longer window with scaled RoPE (YaRN), the draft attends over the
+    same positions and must use the same scaling and position range.
+    """
+    target = getattr(speculative_config, "target_model_config", None)
+    draft = getattr(speculative_config, "draft_model_config", None)
+    if target is None or draft is None:
+        return
+    target_text, draft_text = target.hf_text_config, draft.hf_text_config
+    target_rope = dict(getattr(target_text, "rope_parameters", None) or {})
+    draft_rope = dict(getattr(draft_text, "rope_parameters", None) or {})
+    if target_rope.get("rope_type", "default") == "default":
+        return
+    if draft_rope.get("rope_type", "default") != "default":
+        return
+    if target_rope.get("rope_theta") != draft_rope.get("rope_theta"):
+        return
+    draft_text.rope_parameters = target_rope
+    draft_text.max_position_embeddings = target_text.max_position_embeddings
+    logger.info(
+        "MTP draft RoPE follows the target's %s scaling over %d positions.",
+        target_rope.get("rope_type"),
+        target_text.max_position_embeddings,
+    )
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -313,6 +342,7 @@ def _make_draft_vllm_config(
         model_config=speculative_config.draft_model_config,
         is_speculative_draft=True,
     )
+    _match_target_rope_scaling(speculative_config)
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.
     from vllm.model_executor.layers.quantization.sm70_turbomind import (
