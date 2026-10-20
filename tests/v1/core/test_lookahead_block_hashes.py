@@ -374,10 +374,12 @@ def _speculative_config(
     [
         *(
             pytest.param({"method": method}, True, id=method)
-            for method in ("eagle", "eagle3", "mtp", "dspark")
+            for method in ("eagle", "eagle3", "mtp")
         ),
         # DFlash on the V2 runner keeps no trailing-block drop to begin with.
         pytest.param({"method": "dflash"}, False, id="dflash"),
+        # DSpark keeps the drop: with lookahead hashes it drafted worse on DSv4.
+        pytest.param({"method": "dspark"}, False, id="dspark"),
         pytest.param({"method": "ngram"}, False, id="not-eagle"),
         pytest.param({"enable_prefix_caching": False}, False, id="no-prefix-caching"),
         pytest.param({"num_mtp_layers": 2}, False, id="multi-module-mtp"),

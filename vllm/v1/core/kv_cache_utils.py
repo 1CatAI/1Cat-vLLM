@@ -629,6 +629,11 @@ def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
     # The hash covers only the next token; multi-module MTP reads further ahead.
     if speculative_config.use_multi_module_mtp():
         return False
+    # DSpark keeps the trailing-block drop: with lookahead hashes it drafted
+    # measurably worse on DSv4, also without a prefix hit (edit 5.69 -> 5.66
+    # to 5.67 accepted tokens per round), and gained no first-token time.
+    if speculative_config.use_dspark():
+        return False
     # KV connectors keep the legacy hashes.
     if vllm_config.kv_transfer_config is not None:
         return False
