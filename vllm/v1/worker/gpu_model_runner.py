@@ -10648,6 +10648,11 @@ class GPUModelRunner(
                     drafter.model = CUDAGraphWrapper(
                         drafter.model, self.vllm_config, runtime_mode=CUDAGraphMode.PIECEWISE
                     )
+                    if os.environ.get("DS41_DRAFT_OWN_POOL", "1") == "1":
+                        # The drafter's graphs get a pool of their own (DeepInfer passes the drafter runner its own
+                        # graph_memory_pool). With the global pool, the 2-seq drafter graph was replayed right after the
+                        # main model captured its next graph into the same pool and hit an illegal address.
+                        drafter.model.graph_pool = current_platform.graph_pool_handle()
                 else:
                     drafter.model = BreakableCUDAGraphWrapper(
                         drafter.model, self.vllm_config
