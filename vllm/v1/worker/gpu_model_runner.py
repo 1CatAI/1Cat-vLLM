@@ -10641,9 +10641,17 @@ class GPUModelRunner(
             self.model = BreakableCUDAGraphWrapper(self.model, self.vllm_config)
             drafter = getattr(self, "drafter", None)
             if drafter is not None and hasattr(drafter, "model"):
-                drafter.model = BreakableCUDAGraphWrapper(
-                    drafter.model, self.vllm_config
-                )
+                if os.environ.get("DS41_DRAFT_PLAIN_GRAPH", "1") == "1":
+                    # DeepInfer's drafter shape (worker/dflash_cuda_graph_runner.py): one plain CUDA graph per batch size
+                    # over static inputs, no eager breaks (the drafter has none). The breakable wrapper's 2-seq drafter
+                    # graph died at its first replay (2026-10-20, dspark-graph-b2h..b2-debug).
+                    drafter.model = CUDAGraphWrapper(
+                        drafter.model, self.vllm_config, runtime_mode=CUDAGraphMode.PIECEWISE
+                    )
+                else:
+                    drafter.model = BreakableCUDAGraphWrapper(
+                        drafter.model, self.vllm_config
+                    )
         elif (
             cudagraph_mode.has_full_cudagraphs()
             and not self.parallel_config.use_ubatching
