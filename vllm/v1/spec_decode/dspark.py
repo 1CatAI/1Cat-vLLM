@@ -11,6 +11,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer
 
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
+
 class DSparkProposer(DFlashProposer):
     def __init__(
         self,
@@ -105,13 +109,22 @@ class DSparkProposer(DFlashProposer):
         if True:   # always (also for the eager force-static test); harmless when not capturing
             # the SM70 drafter attention captures its real path from static inputs (see sm70/dspark.py)
             from vllm.models.deepseek_v41.sm70 import dspark as sm70_dspark
-            ctx = {}
-            groups = self._ds41_runner.kv_cache_config.kv_cache_groups
-            for gid in self._draft_kv_cache_group_ids():
-                bt = self._ds41_runner.input_batch.block_table[gid].block_table.gpu
-                bs = int(self._dflash_block_size_by_gid.get(gid, self.block_size))
-                for name in groups[gid].layer_names:
-                    ctx[name] = (bt, bs)
+            # layer names per KV-cache group from the runner's attention groups (present once the attention backends
+            # exist; during the memory-profiling pass they may not be -> no context, the drafter captures its zero path
+            # there, and those profiling graphs are discarded anyway)
+            ctx = None
+            try:
+                groups = self._ds41_runner.attn_groups
+                ctx = {}
+                for gid in self._draft_kv_cache_group_ids():
+                    bt = self._ds41_runner.input_batch.block_table[gid].block_table.gpu
+                    bs = int(self._dflash_block_size_by_gid.get(gid, self.block_size))
+                    for g in groups[gid]:
+                        for name in g.layer_names:
+                            ctx[name] = (bt, bs)
+            except (AttributeError, IndexError) as e:
+                logger.info("DSpark capture context unavailable (%s): zero-path capture (profiling?)", e)
+                ctx = None
             sm70_dspark.STATIC_CAPTURE_CTX = ctx
         return super().dummy_run(num_tokens, use_cudagraphs=use_cudagraphs, is_graph_capturing=is_graph_capturing, **kw)
 
