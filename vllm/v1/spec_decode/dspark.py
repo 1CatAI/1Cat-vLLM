@@ -203,6 +203,9 @@ class DSparkProposer(DFlashProposer):
                     self._last_confidence_logits
                 )
         flat_tokens = torch.stack(draft_tokens, dim=1).reshape(-1)
+        if dumping:                                  # graph mode: the drafter's in-graph dumps never run; flush the proposer's
+            from vllm.models.deepseek_v41.sm70.dspark import dump_flush
+            dump_flush(self.model)
         if draft_probs is None:
             return flat_tokens, None
         if len(draft_probs) != self.num_speculative_tokens:
