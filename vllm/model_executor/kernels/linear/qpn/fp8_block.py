@@ -37,6 +37,9 @@ from vllm.model_executor.kernels.linear.sm70_provider import (
     flatten_linear_input,
     restore_linear_output,
 )
+from vllm.model_executor.layers.quantization.sm70_turbomind import (
+    fp8_qpn8_occupancy_split_k,
+)
 from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
@@ -738,7 +741,14 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
                 "shared workspace when CUDA graphs capture such batches)."
             )
         layer._qpn8_out_features = n
-        layer._qpn8_cfg = _sm70_fp8_qpn8_config(k_dim, n_dim, False)
+        split_k, accumulator_chains, prefetch_codes = _sm70_fp8_qpn8_config(
+            k_dim, n_dim, False
+        )
+        layer._qpn8_cfg = (
+            fp8_qpn8_occupancy_split_k(k_dim, n_dim, split_k, codes.device),
+            accumulator_chains,
+            prefetch_codes,
+        )
         if (
             self._is_sm70_gated_silu_layer(layer)
             and bool(self.policy.gated_silu)
