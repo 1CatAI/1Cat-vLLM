@@ -17,6 +17,8 @@ compgen -G "$SOURCE_DIR/vllm/_C*.so" >/dev/null && INPLACE_BUILD=true
 : "${CACHE_DIR:?Set CACHE_DIR to a dedicated runtime cache}"
 : "${VLLM_API_KEY:?Set VLLM_API_KEY for the public API}"
 PORT=${PORT:-8000}
+# Bind address; 0.0.0.0 inside a container published with -p.
+HOST=${HOST:-127.0.0.1}
 GPU_IDS=${GPU_IDS:-0,1,2,3}
 # Optional CPU pinning, e.g. the cores of the socket that owns the GPUs.
 CPU_SET=${CPU_SET:-}
@@ -136,7 +138,7 @@ PIN=()
 if [[ -n "$CPU_SET" ]]; then PIN=(taskset -c "$CPU_SET"); fi
 exec "${PIN[@]}" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" \
   --served-model-name flash-next-abliterated flash-next qwen3.8-flash-next \
-  --host 127.0.0.1 --port "$PORT" --quantization gguf --tensor-parallel-size 4 \
+  --host "$HOST" --port "$PORT" --quantization gguf --tensor-parallel-size 4 \
   --dtype half --kv-cache-dtype float16 --mamba-ssm-cache-dtype float32 \
   --max-model-len 262144 --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.95 --enable-prefix-caching \
