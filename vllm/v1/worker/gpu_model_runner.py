@@ -2555,9 +2555,18 @@ class GPUModelRunner(
                     new_token_ids = req_data.new_token_ids[i]
                     # Add the sampled token(s) from the previous step (if any).
                     # This doesn't include "unverified" tokens like spec tokens.
-                    num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                    # The scheduler sends every token this stage lacks (accepted drafts
+                    # + bonus): the count of NEW output tokens is the gap between the
+                    # computed position plus this step's main tokens and the state.
+                    num_main = scheduler_output.num_scheduled_tokens.get(req_id, 0) - len(
+                        scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
                     )
+                    num_new_tokens = num_computed_tokens + num_main - req_state.num_tokens
+                    if num_new_tokens > len(new_token_ids):
+                        raise RuntimeError(
+                            f"PP: request {req_id} needs {num_new_tokens} new token ids but the "
+                            f"scheduler sent {len(new_token_ids)}"
+                        )
                     if num_new_tokens == 1:
                         # Avoid slicing list in most common case.
                         req_state.output_token_ids.append(new_token_ids[-1])

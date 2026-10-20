@@ -1503,9 +1503,15 @@ class Scheduler(SchedulerInterface):
                 num_tokens = num_scheduled_tokens[req_id] - len(
                     spec_decode_tokens.get(req_id, ())
                 )
-                token_ids = req.all_token_ids[
-                    req.num_computed_tokens : req.num_computed_tokens + num_tokens
-                ]
+                # Send every token the non-last stages do not hold yet: after a verify step that
+                # accepted k drafts the stage's non-spec history ends k tokens earlier than
+                # num_computed_tokens, so start from the last position sent (DS41 PP+spec fix).
+                end = req.num_computed_tokens + num_tokens
+                sent_upto = getattr(req, "pp_sent_upto", None)
+                if sent_upto is None or sent_upto > req.num_computed_tokens:
+                    sent_upto = req.num_computed_tokens
+                token_ids = req.all_token_ids[sent_upto:end]
+                req.pp_sent_upto = end
                 new_token_ids.append(token_ids)
             scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
             if idx >= num_running_reqs:
