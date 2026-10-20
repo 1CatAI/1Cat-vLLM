@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSpark proposer built on the existing non-causal DFlash execution path."""
 
+import os
 import torch
 from typing_extensions import override
 
@@ -129,6 +130,13 @@ class DSparkProposer(DFlashProposer):
                 logger.info("DSpark capture context unavailable (%s): zero-path capture (profiling?)", e)
                 ctx = None
             sm70_dspark.STATIC_CAPTURE_CTX = ctx
+            if profiling and use_cudagraphs and os.environ.get("DS41_DRAFT_PROFILE_EAGER", "1") == "1":
+                # The memory-profiling pass captured the drafter against the stub KV cache and REPLAYED it; at 2+
+                # sequences that replay died with an illegal address (dspark-graph-b2h, 2026-10-20) although the same
+                # rows run eagerly. Those graphs are discarded after profiling, so run the drafter eagerly there and let
+                # only the real capture (real caches, static context) build graphs. The memory estimate loses the
+                # drafter's small graph-pool share.
+                use_cudagraphs = False
         return super().dummy_run(num_tokens, use_cudagraphs=use_cudagraphs, is_graph_capturing=is_graph_capturing, **kw)
 
     @override
