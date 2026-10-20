@@ -54,6 +54,74 @@ def _stage_pages(
 
 
 @triton.jit
+def _merge_windows(
+    Acc,
+    AccState,
+    Part,
+    PartState,
+    Out,
+    Gate,
+    os0,
+    os1,
+    gs0,
+    gs1,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    FINAL: tl.constexpr,
+    GATED: tl.constexpr,
+):
+    """Fold one window's normalized rows and (max, sum) into the running
+    rows; FINAL also writes the gated FP16 output like rows_fp8."""
+    pid = tl.program_id(0)
+    row, head = pid // H, pid % H
+    m0 = tl.load(AccState + pid * 2)
+    s0 = tl.load(AccState + pid * 2 + 1)
+    m1 = tl.load(PartState + pid * 2)
+    s1 = tl.load(PartState + pid * 2 + 1)
+    m = tl.maximum(m0, m1)
+    w0 = s0 * tl.exp2(m0 - m)
+    w1 = s1 * tl.exp2(m1 - m)
+    total = w0 + w1
+    offs = tl.arange(0, D)
+    a = tl.load(Acc + pid * D + offs)
+    b = tl.load(Part + pid * D + offs)
+    value = tl.where(total > 0, (a * w0 + b * w1) / total, 0.0)
+    if FINAL:
+        if GATED:
+            value = value.to(tl.float16).to(tl.float32)
+            g = tl.load(Gate + row * gs0 + head * gs1 + offs).to(tl.float32)
+            value = value / (1.0 + tl.exp2(-g * 1.4426950408889634))
+        tl.store(Out + row * os0 + head * os1 + offs, value.to(tl.float16))
+    else:
+        tl.store(Acc + pid * D + offs, value)
+        tl.store(AccState + pid * 2, m)
+        tl.store(AccState + pid * 2 + 1, total)
+
+
+def merge_windows(acc, acc_state, part, part_state, out=None, gate=None):
+    rows, heads, dim = acc.shape
+    final = out is not None
+    gated = gate is not None
+    _merge_windows[(rows * heads,)](
+        acc,
+        acc_state,
+        part,
+        part_state,
+        out if final else acc,
+        gate if gated else acc,
+        out.stride(0) if final else 0,
+        out.stride(1) if final else 0,
+        gate.stride(0) if gated else 0,
+        gate.stride(1) if gated else 0,
+        H=heads,
+        D=dim,
+        FINAL=final,
+        GATED=gated,
+        num_warps=2,
+    )
+
+
+@triton.jit
 def _write(
     K,
     V,
@@ -697,13 +765,39 @@ class HostQSAKV:
         Depends only on the step's block table and lengths, so one plan
         (one host sync) serves every layer of a step with this geometry.
         """
-        page = self.page_size
         capacity = self._stage_capacity(capacity_tokens)
+        staged, sources, lengths_host = self._stage_layout(block_table, lengths)
+        if sources.size > capacity or not sources.size:
+            return None
+        return self._make_stage_plan(staged, sources, lengths_host)
+
+    def stage_window_plans(self, block_table, lengths, capacity_tokens):
+        """stage_plan for a history larger than the stage buffer: one plan
+        per buffer-sized window of the staged pages, or [] when the history
+        fits (or is empty). A window's table maps only its own pages (-1
+        elsewhere), so a row reader masks every other window's keys."""
+        capacity = self._stage_capacity(capacity_tokens)
+        staged, sources, lengths_host = self._stage_layout(block_table, lengths)
+        if sources.size <= capacity or not capacity:
+            return []
+        plans = []
+        for first in range(0, sources.size, capacity):
+            last = min(first + capacity, sources.size)
+            window = np.where(
+                (staged >= first) & (staged < last), staged - first, -1
+            ).astype(np.int32)
+            plans.append(
+                self._make_stage_plan(window, sources[first:last], lengths_host)
+            )
+        return plans
+
+    def _stage_layout(self, block_table, lengths):
+        """(staged table, source pages, lengths): every request's valid pages
+        in order, numbered consecutively across requests."""
+        page = self.page_size
         table = block_table.to("cpu", non_blocking=False).numpy()
         lengths_host = [int(n) for n in lengths.tolist()]
         sizes = [(n + page - 1) // page for n in lengths_host]
-        if sum(sizes) > capacity or not sum(sizes):
-            return None
         # Vectorized per request: valid pages keep their order and get
         # consecutive staged indices.
         staged = np.full(table.shape, -1, dtype=np.int32)
@@ -715,7 +809,15 @@ class HostQSAKV:
             staged[request, valid] = np.arange(k, k + valid.size, dtype=np.int32)
             sources.append(row[valid])
             k += valid.size
-        sources = np.concatenate(sources).astype(np.int32)
+        sources = (
+            np.concatenate(sources).astype(np.int32)
+            if sources
+            else np.zeros(0, dtype=np.int32)
+        )
+        return staged, sources, lengths_host
+
+    def _make_stage_plan(self, staged, sources, lengths_host):
+        k = int(sources.size)
         # Runs of consecutive source blocks (first block, first staged, count)
         # for the host-tensor copy path.
         breaks = np.flatnonzero(np.diff(sources) != 1) + 1

@@ -968,6 +968,48 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.host_kv.device_history_reason,
             )
 
+    def _windowed_rows(
+        self, windows, query, indices, table, requests, positions, lengths,
+        output, gate,
+    ) -> None:
+        from .ops.host_kv import merge_windows
+
+        state = self.host_kv
+        rows = query.shape[0]
+        acc = torch.empty((rows, 6, 256), dtype=torch.float32, device=query.device)
+        part = torch.empty_like(acc)
+        acc_state = torch.empty((rows, 6, 2), dtype=torch.float32, device=query.device)
+        part_state = torch.empty_like(acc_state)
+        gate_rows = gate.view_as(query) if gate is not None else None
+        for number, plan in enumerate(windows):
+            history, scales, staged_table = state.stage_history(
+                table, lengths, self.host_kv_prefill_stage_tokens, plan
+            )
+            first = number == 0
+            torch.ops.vllm_sm70_qsa_device.run_rows_window(
+                query,
+                history,
+                scales,
+                indices,
+                staged_table,
+                requests,
+                positions,
+                lengths,
+                acc if first else part,
+                acc_state if first else part_state,
+                12,
+            )
+            if not first:
+                last = number == len(windows) - 1
+                merge_windows(
+                    acc,
+                    acc_state,
+                    part,
+                    part_state,
+                    output if last else None,
+                    gate_rows if last else None,
+                )
+
     def host_kv_forward(
         self,
         query,
@@ -1112,6 +1154,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     self.host_kv_is_draft,
                 )
                 return
+            if plan is None and state.fp8 and query.shape[0] > 0:
+                # Longer than the stage buffer: stage it window by window and
+                # merge the windows' softmax states instead of falling back to
+                # per-row host reads.
+                window_key = plan_key + ("windows",)
+                if window_key not in plans:
+                    plans[window_key] = state.stage_window_plans(
+                        table, lengths, self.host_kv_prefill_stage_tokens
+                    )
+                windows = plans[window_key]
+                if windows:
+                    self._windowed_rows(
+                        windows, query, indices, table, requests, positions,
+                        lengths, output, gate,
+                    )
+                    logger.info_once(
+                        "QSA prefill stages host history in %d windows.",
+                        len(windows),
+                    )
+                    return
         if (
             state.device_history_workspace is not None
             and state.device_history_hot
