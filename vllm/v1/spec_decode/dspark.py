@@ -105,10 +105,14 @@ class DSparkProposer(DFlashProposer):
         if True:   # always (also for the eager force-static test); harmless when not capturing
             # the SM70 drafter attention captures its real path from static inputs (see sm70/dspark.py)
             from vllm.models.deepseek_v41.sm70 import dspark as sm70_dspark
-            gid = self._first_draft_kv_cache_group_id()
-            bt = self._ds41_runner.input_batch.block_table[gid].block_table.gpu
-            bs = self._dflash_block_size_by_gid.get(gid, self.block_size)
-            sm70_dspark.STATIC_CAPTURE_CTX = (bt, int(bs))
+            ctx = {}
+            groups = self._ds41_runner.kv_cache_config.kv_cache_groups
+            for gid in self._draft_kv_cache_group_ids():
+                bt = self._ds41_runner.input_batch.block_table[gid].block_table.gpu
+                bs = int(self._dflash_block_size_by_gid.get(gid, self.block_size))
+                for name in groups[gid].layer_names:
+                    ctx[name] = (bt, bs)
+            sm70_dspark.STATIC_CAPTURE_CTX = ctx
         return super().dummy_run(num_tokens, use_cudagraphs=use_cudagraphs, is_graph_capturing=is_graph_capturing, **kw)
 
     @override
@@ -144,7 +148,7 @@ class DSparkProposer(DFlashProposer):
             init_logger(__name__).info("DSpark proposer step: input_ids=%#x positions=%#x bt(meta)=%s bt(static)=%#x anchors=%s pos[:10]=%s",
                                        self.input_ids.data_ptr(), self.positions.data_ptr(),
                                        f"{cad.block_table_tensor.data_ptr():#x} {tuple(cad.block_table_tensor.shape)}" if cad is not None else None,
-                                       self._ds41_runner.input_batch.block_table[gid].block_table.gpu.data_ptr(),
+                                       0,
                                        prev.tolist(), self.positions[:10].tolist())
         draft_tokens: list[torch.Tensor] = []
         self._last_confidence_logits = None

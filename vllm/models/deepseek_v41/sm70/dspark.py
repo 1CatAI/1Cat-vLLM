@@ -57,7 +57,7 @@ from .model import DeepseekV41Norm, _fp32_param, map_checkpoint_name
 logger = init_logger(__name__)
 
 BLOCK_KEYS_PAD = 16          # block K/V rows per query, padded to the fused kernel's 16-key blocks
-STATIC_CAPTURE_CTX: tuple | None = None   # (draft block table [max_reqs, max_blocks] int32 on GPU, block size): proposer sets
+STATIC_CAPTURE_CTX: dict | None = None    # {cache layer name: (its KV group's block table [max_reqs, max_blocks] int32 on GPU, block size)}; proposer sets
 MAIN_PROJ_INPUT_SCALE = 2.0 ** -6   # exact FP16 scaling; main_norm removes it (V4 drafter does the same on SM70)
 
 
@@ -163,7 +163,7 @@ class DSparkV41Attention(nn.Module):
             # draft KV group's persistent block table (rows = request index, requests in batch order = block order),
             # the proposer's persistent positions buffer (``positions``) and the window cache. Padded rows compute
             # garbage that nothing reads. ``STATIC_CAPTURE_CTX`` is installed by the proposer before capture.
-            st = STATIC_CAPTURE_CTX
+            st = STATIC_CAPTURE_CTX.get(self.swa_cache.layer_name) if STATIC_CAPTURE_CTX else None   # EACH drafter layer has its own KV group / block table
             bound = st is not None and (torch.cuda.is_current_stream_capturing() or bool(_os.environ.get("DS41_DRAFT_FORCE_STATIC")))
             if bound:
                 try:                        # memory profiling captures with a stub cache: not the real capture
@@ -215,7 +215,7 @@ class DSparkV41Attention(nn.Module):
                 and self.__dict__.get("_cmp_logged", 0) < 2:
             # in-process comparison: what the STATIC branch would have computed from the same call
             self._cmp_logged = self.__dict__.get("_cmp_logged", 0) + 1
-            sbt, _ = STATIC_CAPTURE_CTX
+            sbt, _ = STATIC_CAPTURE_CTX[self.swa_cache.layer_name]
             s_tok2req = torch.arange(B, device=x.device, dtype=torch.int32)
             s_rows = rows_of_positions(sbt, s_tok2req, win_pos, int(self.swa_cache._spec.block_size))
             logger.info("DSpark drafter L%d CMP: bt same storage %s; win_rows equal %s; real rows[0,-4:] %s static %s; "
@@ -236,7 +236,7 @@ class DSparkV41Attention(nn.Module):
                 and self.__dict__.get("_cmp2_logged", 0) < 2:
             # same call, STATIC-derived inputs end to end -> attention output difference
             self._cmp2_logged = self.__dict__.get("_cmp2_logged", 0) + 1
-            sbt, _ = STATIC_CAPTURE_CTX
+            sbt, _ = STATIC_CAPTURE_CTX[self.swa_cache.layer_name]
             sT = (positions_all.shape[0] // block_size) * block_size; sB = sT // block_size
             s_first = positions_all[:sT].view(sB, block_size)[:, 0]; s_p = s_first - 1
             s_win_pos = s_p[:, None] - (C.WINDOW - 1) + torch.arange(C.WINDOW, device=x.device)[None, :]
