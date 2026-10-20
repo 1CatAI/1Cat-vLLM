@@ -29,8 +29,18 @@ QSA_HOST_INDEXER_HISTORY=${QSA_HOST_INDEXER_HISTORY:-false}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
 CAPTURE_SIZES=$(r=1; s=""; while [ "$r" -lt "$MAX_NUM_SEQS" ]; do
   s="$s$((5 * r)),"; r=$((r * 2)); done; echo "${s}$((5 * MAX_NUM_SEQS))")
-# Recurrent-state pool: 28 blocks cover one 256K-token request.
+# Context window. Beyond the native 262144 positions RoPE uses YaRN scaling
+# (factor = ceil(MAX_MODEL_LEN / 262144)); up to 262144 keeps the stock RoPE.
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}
+NATIVE_LEN=262144
+# Recurrent-state pool: 28 blocks per request (independent of the window).
 STATE_BLOCKS=$((1 + 28 * MAX_NUM_SEQS))
+# Windows past the native length hold a 4x larger indexer history on the GPU:
+# halve the prefill chunk (activation peak) and trim the hot cache to fit 16 GB.
+PREFILL_CHUNK=8192 HOT_TOKENS=32768 STAGE_TOKENS=525504 EXPERT_FRACTION=0.8
+if (( MAX_MODEL_LEN > NATIVE_LEN )); then
+  PREFILL_CHUNK=4096 HOT_TOKENS=16384 STAGE_TOKENS=525504 EXPERT_FRACTION=0.77
+fi
 # Save the recurrent state at the end of each prompt so the next chat turn
 # reuses the whole previous prompt from the prefix cache (one extra prefill
 # step per prompt). Set to 0 to skip it.
@@ -60,7 +70,7 @@ export TORCH_EXTENSIONS_DIR="$CACHE_DIR/torch_extensions"
 export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 unset LD_PRELOAD LD_AUDIT ONECAT_VLLM_EXTENSION_DIR
 mkdir -p "$CACHE_DIR"
-KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" "$STATE_BLOCKS" <<'PY'
+KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" "$STATE_BLOCKS" "$HOT_TOKENS" "$STAGE_TOKENS" "$EXPERT_FRACTION" <<'PY'
 import json
 import sys
 if sys.argv[2].lower() not in ("true", "false"):
@@ -72,7 +82,7 @@ config = {
         "small_m_dp4a": True, "q8_expert_intermediate": True,
         "small_m_hmma": True, "lut4_expert_dp4a": True,
         "device_transcode": True, "dequant_workspace_bytes": 33554432,
-        "expert_cache_fraction": 0.8, "expert_cache_host_slack": 0.0,
+        "expert_cache_fraction": float(sys.argv[6]), "expert_cache_host_slack": 0.0,
         "expert_cache_prefill": "turbomind", "expert_cache_prefill_tokens": 2048,
         "expert_load_prefetch_banks": 1,
     },
@@ -86,9 +96,9 @@ config = {
     "qsa_host_indexer_history": sys.argv[2].lower() == "true",
     "qsa_host_kv_dtype": "fp8_e4m3",
     "qsa_host_kv_draft_dtype": "float16", "qsa_host_kv_device_reference": False,
-    "qsa_host_kv_hot_tokens": 32768, "qsa_host_kv_hot_dtype": "fp8_e4m3",
+    "qsa_host_kv_hot_tokens": int(sys.argv[4]), "qsa_host_kv_hot_dtype": "fp8_e4m3",
     "qsa_host_kv_draft_hot_tokens": 16384, "qsa_host_kv_staging_rows": 8,
-    "qsa_host_kv_prefill_stage_tokens": 525504,
+    "qsa_host_kv_prefill_stage_tokens": int(sys.argv[5]),
     "qsa_host_kv_prefill_stage_slots": 1,
     "qsa_host_kv_trim_warmup_cache": True,
     "qsa_host_kv_allocator_headroom_mib": 192,
@@ -140,15 +150,33 @@ PY
     --skip-mm-profiling --mm-encoder-tp-mode weights --mm-encoder-batch-size 1
     --mm-processor-cache-gb 0.25 --mm-processor-kwargs '{"max_pixels":4194304}')
 fi
+LONG_ARGS=()
+if (( MAX_MODEL_LEN > NATIVE_LEN )); then
+  ROPE=$("$PYTHON_BIN" - "$MAX_MODEL_LEN" "$NATIVE_LEN" "${VISION_DIR:+nested}" <<'PY'
+import json
+import sys
+length, native, nested = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3] == "nested"
+rope = {
+    "mrope_interleaved": True, "mrope_section": [11, 11, 10],
+    "partial_rotary_factor": 0.25, "rope_theta": 10000000,
+    "rope_type": "yarn", "factor": float(-(-length // native)),
+    "original_max_position_embeddings": native,
+}
+text = {"rope_parameters": rope, "max_position_embeddings": length}
+print(json.dumps({"text_config": text} if nested else text))
+PY
+)
+  LONG_ARGS=(--hf-overrides "$ROPE")
+fi
 PIN=()
 if [[ -n "$CPU_SET" ]]; then PIN=(taskset -c "$CPU_SET"); fi
 exec "${PIN[@]}" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" \
   --served-model-name flash-next-abliterated flash-next qwen3.8-flash-next \
   --host "$HOST" --port "$PORT" --quantization gguf --tensor-parallel-size 4 \
   --dtype half --kv-cache-dtype float16 --mamba-ssm-cache-dtype float32 \
-  --max-model-len 262144 --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 8192 \
+  --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens "$PREFILL_CHUNK" \
   --gpu-memory-utilization 0.95 --enable-prefix-caching \
-  --mamba-cache-mode align "$TAIL_ARG" "${MM_ARGS[@]}" \
+  --mamba-cache-mode align "$TAIL_ARG" "${MM_ARGS[@]}" "${LONG_ARGS[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20}' \
