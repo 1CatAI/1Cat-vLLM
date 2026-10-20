@@ -1545,9 +1545,9 @@ setup(
             "soundfile",
             "mistral_common[audio]",
         ],  # Required for audio processing
-        "image": ["diffusers==0.40.0", "accelerate>=1.12", "nvidia-ml-py"],
+        "image": ["diffusers==0.41.0", "accelerate>=1.12", "nvidia-ml-py"],
         "video": [
-            "diffusers==0.40.0",
+            "diffusers==0.41.0",
             "av>=14",
             "imageio>=2.37.2",
             "imageio-ffmpeg>=0.6",
@@ -1563,7 +1563,7 @@ setup(
         # NOTE: When updating helion version, also update CI files:
         #   - .buildkite/test_areas/kernels.yaml
         #   - .buildkite/test-amd.yaml
-        "helion": ["helion==1.4.0"],
+        "helion": ["helion==1.5.1"],
         # Optional deps for gRPC server (vllm serve --grpc)
         "grpc": ["smg-grpc-servicer[vllm] >= 0.5.2"],
         # Optional deps for OpenTelemetry tracing
