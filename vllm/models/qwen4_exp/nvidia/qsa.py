@@ -168,6 +168,26 @@ def _qsa_rope_cache_length(config, model_config) -> int:
     return limit
 
 
+def _bound_scaled_rope_cache(rotary_emb, config, model_config) -> None:
+    """Trim a scaled (YaRN) RoPE table to the engine's position limit.
+
+    Scaled tables span original_max_position * factor rows, and MRoPE enlarges
+    that 4x for video time indices. Text and image positions stay below
+    max_model_len and each row depends only on its own position, so the
+    trimmed table is exact. Stock RoPE is already bounded at construction.
+    """
+    if config.rope_parameters.get("rope_type", "default") == "default":
+        return
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    if not (text_only or mm_config.get_limit_per_prompt("video") == 0):
+        return
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    limit = model_config.max_model_len
+    if cache is not None and cache.shape[0] > limit:
+        rotary_emb.cos_sin_cache = cache[:limit].clone()
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -674,6 +694,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             max_position=_qsa_rope_cache_length(config, model_config),
             rope_parameters=config.rope_parameters,
         )
+        _bound_scaled_rope_cache(self.rotary_emb, config, model_config)
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
