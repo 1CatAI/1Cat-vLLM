@@ -57,6 +57,7 @@ from .model import DeepseekV41Norm, _fp32_param, map_checkpoint_name
 logger = init_logger(__name__)
 
 BLOCK_KEYS_PAD = 16          # block K/V rows per query, padded to the fused kernel's 16-key blocks
+STATIC_CAPTURE_CTX: tuple | None = None   # (draft block table [max_reqs, max_blocks] int32 on GPU, block size): proposer sets
 MAIN_PROJ_INPUT_SCALE = 2.0 ** -6   # exact FP16 scaling; main_norm removes it (V4 drafter does the same on SM70)
 
 
@@ -152,14 +153,28 @@ class DSparkV41Attention(nn.Module):
         if not isinstance(md_all, dict):
             md_all = None             # the proposer's own dummy / profile runs carry no metadata (and no dummy flag)
         o = torch.zeros((x.shape[0], self.n_local_heads, C.HEAD_DIM), dtype=torch.float16, device=x.device)
-        if md_all is None:                                           # profile / dummy run
-            self._qkv(x)
-            return self.inner.output_projection(o, positions)
-        swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
-        T = swa_md.num_actual_tokens                                 # real query rows (B blocks of block_size)
-        if T % block_size:
-            raise RuntimeError(f"DSpark drafter: {T} query rows is not a multiple of the block size {block_size}")
-        B = T // block_size
+        if md_all is None:
+            # No metadata: a profile/warmup run (zero attention), or the proposer's CUDA-graph CAPTURE. Under capture the
+            # graph must contain the real attention, so it is built from STATIC inputs that the replay also sees: the
+            # draft KV group's persistent block table (rows = request index, requests in batch order = block order),
+            # the proposer's persistent positions buffer (``positions``) and the window cache. Padded rows compute
+            # garbage that nothing reads. ``STATIC_CAPTURE_CTX`` is installed by the proposer before capture.
+            st = STATIC_CAPTURE_CTX
+            if st is None or not torch.cuda.is_current_stream_capturing():
+                self._qkv(x)
+                return self.inner.output_projection(o, positions)
+            block_table, cache_block_size = st
+            T = (x.shape[0] // block_size) * block_size
+            B = T // block_size
+            tok2req = torch.arange(B, device=x.device, dtype=torch.int32)
+        else:
+            swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
+            T = swa_md.num_actual_tokens                             # real query rows (B blocks of block_size)
+            if T % block_size:
+                raise RuntimeError(f"DSpark drafter: {T} query rows is not a multiple of the block size {block_size}")
+            B = T // block_size
+            block_table, cache_block_size = swa_md.block_table, swa_md.block_size
+            tok2req = swa_md.token_to_req_indices.view(B, block_size)[:, 0]
         x, positions_all = x[:T], positions
         positions = positions[:T]
         q, kv = self._qkv(x)
@@ -171,8 +186,7 @@ class DSparkV41Attention(nn.Module):
         first = positions.view(B, block_size)[:, 0]                  # [B]
         p = first - 1
         win_pos = p[:, None] - (C.WINDOW - 1) + torch.arange(C.WINDOW, device=x.device)[None, :]      # [B, 128]
-        tok2req = swa_md.token_to_req_indices.view(B, block_size)[:, 0]
-        win_rows = rows_of_positions(swa_md.block_table, tok2req, win_pos, swa_md.block_size)            # [B, 128]
+        win_rows = rows_of_positions(block_table, tok2req, win_pos, cache_block_size)                   # [B, 128]
         win_rows = win_rows[:, None, :].expand(B, block_size, C.WINDOW).reshape(T, C.WINDOW)
         # block rows: query i of block b sees block rows b * block_size .. + block_size - 1 (non-causal)
         brow = (torch.arange(B, device=x.device)[:, None] * block_size

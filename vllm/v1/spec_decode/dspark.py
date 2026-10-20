@@ -100,6 +100,17 @@ class DSparkProposer(DFlashProposer):
         return confident_prefix.sum(dim=1).clamp_max_(cap).to(torch.int32)
 
     @override
+    def dummy_run(self, num_tokens: int, use_cudagraphs: bool = True, is_graph_capturing: bool = False, **kw) -> None:
+        if is_graph_capturing:
+            # the SM70 drafter attention captures its real path from static inputs (see sm70/dspark.py)
+            from vllm.models.deepseek_v41.sm70 import dspark as sm70_dspark
+            gid = self._first_draft_kv_cache_group_id()
+            bt = self.runner.input_batch.block_table[gid].block_table.gpu
+            bs = self._dflash_block_size_by_gid.get(gid, self.block_size)
+            sm70_dspark.STATIC_CAPTURE_CTX = (bt, int(bs))
+        return super().dummy_run(num_tokens, use_cudagraphs=use_cudagraphs, is_graph_capturing=is_graph_capturing, **kw)
+
+    @override
     def _sample_draft_tokens(
         self,
         hidden_states: torch.Tensor,
