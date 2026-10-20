@@ -172,15 +172,18 @@ class DSparkV41Attention(nn.Module):
             if not bound:
                 self._qkv(x)
                 return self.inner.output_projection(o, positions)
-            block_table, cache_block_size = st
+            block_table, ctx_block_size = st
+            # the window cache's row geometry is the cache layer's spec (what the SWA metadata builder uses), NOT the
+            # proposer's draft-group block size: with a mismatch every window row is wrong (counting acceptance 11%)
+            cache_block_size = int(self.swa_cache._spec.block_size)
             T = (x.shape[0] // block_size) * block_size
             B = T // block_size
             tok2req = torch.arange(B, device=x.device, dtype=torch.int32)
             if _os.environ.get("DS41_DRAFT_CAPTURE_LOG") and self.__dict__.get("_cap_logged", 0) < 3:
                 self._cap_logged = self.__dict__.get("_cap_logged", 0) + 1
-                logger.info("DSpark drafter L%d STATIC path: capturing=%s rows=%d T=%d B=%d bt=%#x %s bs=%d cache=%#x %s pos=%#x x=%#x",
+                logger.info("DSpark drafter L%d STATIC path: capturing=%s rows=%d T=%d B=%d bt=%#x %s bs=%d (ctx said %d) cache=%#x %s pos=%#x x=%#x",
                             self.layer_id, torch.cuda.is_current_stream_capturing(), x.shape[0], T, B, block_table.data_ptr(),
-                            tuple(block_table.shape), cache_block_size, self.swa_cache.rows().data_ptr(),
+                            tuple(block_table.shape), cache_block_size, ctx_block_size, self.swa_cache.rows().data_ptr(),
                             tuple(self.swa_cache.rows().shape), positions.data_ptr(), x.data_ptr())
         else:
             swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
