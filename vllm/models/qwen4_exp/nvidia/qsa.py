@@ -183,7 +183,12 @@ def _bound_scaled_rope_cache(rotary_emb, config, model_config) -> None:
     if not (text_only or mm_config.get_limit_per_prompt("video") == 0):
         return
     cache = getattr(rotary_emb, "cos_sin_cache", None)
-    limit = model_config.max_model_len
+    # A draft serves its target's window; the scaled config spans it.
+    limit = max(
+        int(model_config.max_model_len),
+        int(getattr(model_config, "spec_target_max_model_len", None) or 0),
+        int(config.max_position_embeddings),
+    )
     if cache is not None and cache.shape[0] > limit:
         rotary_emb.cos_sin_cache = cache[:limit].clone()
 

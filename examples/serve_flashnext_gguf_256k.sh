@@ -64,7 +64,11 @@ export VLLM_SM70_MTP_PROFILE=0 VLLM_NVTX_SCOPES_FOR_PROFILING=0
 export MAX_JOBS=2 TORCHINDUCTOR_COMPILE_THREADS=1
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export VLLM_CACHE_ROOT="$CACHE_DIR/vllm" TRITON_CACHE_DIR="$CACHE_DIR/triton"
+# Compiled graphs embed window-sized tables (scaled RoPE): keep one compile
+# cache per non-default window so switching windows never reuses stale code.
+VLLM_CACHE_SUBDIR=vllm
+(( MAX_MODEL_LEN != NATIVE_LEN )) && VLLM_CACHE_SUBDIR=vllm-$MAX_MODEL_LEN
+export VLLM_CACHE_ROOT="$CACHE_DIR/$VLLM_CACHE_SUBDIR" TRITON_CACHE_DIR="$CACHE_DIR/triton"
 export TORCHINDUCTOR_CACHE_DIR="$CACHE_DIR/inductor"
 export TORCH_EXTENSIONS_DIR="$CACHE_DIR/torch_extensions"
 export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
