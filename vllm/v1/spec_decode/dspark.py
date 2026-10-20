@@ -19,6 +19,7 @@ class DSparkProposer(DFlashProposer):
         runner=None,
     ) -> None:
         super().__init__(vllm_config, device, runner)
+        self._ds41_runner = runner        # the base proposer does not keep it; the SM70 capture context needs its block table
         if self.use_local_argmax_reduction:
             raise ValueError(
                 "DSpark cannot use local argmax reduction because its replicated "
@@ -105,7 +106,7 @@ class DSparkProposer(DFlashProposer):
             # the SM70 drafter attention captures its real path from static inputs (see sm70/dspark.py)
             from vllm.models.deepseek_v41.sm70 import dspark as sm70_dspark
             gid = self._first_draft_kv_cache_group_id()
-            bt = self.runner.input_batch.block_table[gid].block_table.gpu
+            bt = self._ds41_runner.input_batch.block_table[gid].block_table.gpu
             bs = self._dflash_block_size_by_gid.get(gid, self.block_size)
             sm70_dspark.STATIC_CAPTURE_CTX = (bt, int(bs))
         return super().dummy_run(num_tokens, use_cudagraphs=use_cudagraphs, is_graph_capturing=is_graph_capturing, **kw)
