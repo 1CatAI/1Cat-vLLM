@@ -154,7 +154,8 @@ class DSparkV41Attention(nn.Module):
             md_all = None             # the proposer's own dummy / profile runs carry no metadata (and no dummy flag)
         o = torch.zeros((x.shape[0], self.n_local_heads, C.HEAD_DIM), dtype=torch.float16, device=x.device)
         import os as _os
-        if md_all is not None and _os.environ.get("DS41_DRAFT_FORCE_STATIC") and STATIC_CAPTURE_CTX is not None:
+        if md_all is not None and _os.environ.get("DS41_DRAFT_FORCE_STATIC") and STATIC_CAPTURE_CTX is not None \
+                and _os.environ.get("DS41_DRAFT_FORCE_STATIC_LAYER", str(self.layer_id)) == str(self.layer_id):
             md_all = None                                            # test: the static (capture) math on real eager steps
         if md_all is None:
             # No metadata: a profile/warmup run (zero attention), or the proposer's CUDA-graph CAPTURE. Under capture the
@@ -231,6 +232,20 @@ class DSparkV41Attention(nn.Module):
         brow = brow[:, None, :].expand(B, block_size, BLOCK_KEYS_PAD).reshape(T, BLOCK_KEYS_PAD)
         fused_decode_attention(q, [(self.swa_cache.rows(), win_rows), (block_kv, brow)], self.inner.attn_sink,
                                self.inner.scale, o[:T])
+        if _os.environ.get("DS41_DRAFT_CAPTURE_LOG") and md_all is not None and STATIC_CAPTURE_CTX is not None \
+                and self.__dict__.get("_cmp2_logged", 0) < 2:
+            # same call, STATIC-derived inputs end to end -> attention output difference
+            self._cmp2_logged = self.__dict__.get("_cmp2_logged", 0) + 1
+            sbt, _ = STATIC_CAPTURE_CTX
+            sT = (positions_all.shape[0] // block_size) * block_size; sB = sT // block_size
+            s_first = positions_all[:sT].view(sB, block_size)[:, 0]; s_p = s_first - 1
+            s_win_pos = s_p[:, None] - (C.WINDOW - 1) + torch.arange(C.WINDOW, device=x.device)[None, :]
+            s_rows = rows_of_positions(sbt, torch.arange(sB, device=x.device, dtype=torch.int32), s_win_pos, int(self.swa_cache._spec.block_size))
+            s_rows = s_rows[:, None, :].expand(sB, block_size, C.WINDOW).reshape(sT, C.WINDOW)
+            o2 = torch.zeros_like(o)
+            fused_decode_attention(q, [(self.swa_cache.rows(), s_rows), (block_kv, brow)], self.inner.attn_sink, self.inner.scale, o2[:T])
+            logger.info("DSpark drafter L%d CMP2: sT %d T %d; max|o-o2| %.3e; |o| %.3e; rows equal %s", self.layer_id, sT, T,
+                        float((o[:T] - o2[:T]).abs().max()), float(o[:T].abs().max()), bool(torch.equal(win_rows, s_rows)))
         if dump_on():
             dump_put(f"attn_x_L{self.layer_id}", x); dump_put(f"attn_q_L{self.layer_id}", q)
             dump_put(f"attn_block_kv_L{self.layer_id}", block_kv); dump_put(f"attn_win_rows_L{self.layer_id}", win_rows)
