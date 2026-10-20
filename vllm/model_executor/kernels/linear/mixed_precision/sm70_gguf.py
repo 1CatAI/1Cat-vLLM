@@ -55,6 +55,17 @@ _AFFINE_BLAS_MIN_M = {
     (6, 16, 2560, 4096): 2048,
     (5, 32, 2560, 3328): 2048,
     (5, 32, 2560, 3072): 4096,
+    # Remaining Flash-Next layouts, measured with segment restoration and
+    # the bounded native NN algorithm window (query rows4096--8192).
+    (4, 32, 2560, 1536): 4096,
+    (4, 32, 1536, 2560): 4096,
+    (4, 32, 2560, 3072): 4096,
+    (4, 32, 2560, 4096): 4096,
+    (5, 32, 2560, 1536): 4096,
+    (5, 32, 1536, 2560): 4096,
+    # Q8 output projections: include restoration and DQ in paired timings.
+    (8, 32, 1536, 2560): 4096,
+    (8, 32, 160, 2560): 6144,
 }
 _affine_blas_workspaces: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
 _affine_blas_views: dict = {}

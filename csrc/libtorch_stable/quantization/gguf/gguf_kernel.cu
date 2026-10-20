@@ -1,3 +1,4 @@
+#include <climits>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -294,6 +295,9 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,  // input
                                   torch::stable::Tensor num_tokens_post_padded,
                                   int64_t type, int64_t row, int64_t top_k,
                                   int64_t tokens) {
+  STD_TORCH_CHECK(W.dim() == 3 && W.size(0) > 0 && W.size(0) <= INT_MAX,
+                  "GGUF MoE requires a positive int32 expert-bank capacity");
+  const int num_experts = static_cast<int>(W.size(0));
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
   const torch::stable::accelerator::DeviceGuard device_guard(

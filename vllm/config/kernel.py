@@ -554,6 +554,15 @@ class Sm70GgufConfig:
     One reduces startup transient reservation; runtime expert placement,
     weights and computation remain unchanged."""
 
+    expert_cache_prefill_prepare: Literal["all", "predict", "predict_resident"] = "all"
+    """TurboMind preparation: ``predict`` prefetches a previous pass's active
+    experts and completes all current-route misses from mapped host memory.
+    Eager SM70 batches of4096--8192 rows and at most512 experts qualify;
+    capture and other inputs retain complete-bank preparation. Expert bytes
+    and arithmetic are unchanged. ``predict_resident`` additionally admits
+    completed routing hints into the existing LRU slots through DMA, retaining
+    the configured GPU/host budget. Default ``all`` retains full DMA."""
+
     dense_storage: Literal["canonical", "original"] = "canonical"
     """Keep calibrated canonical projections or dispatch original packed rows."""
 
@@ -1156,6 +1165,12 @@ class KernelConfig:
                 entries.pop("legacy", None)
                 if family == "gguf":
                     entries.pop("expert_load_prefetch_banks", None)
+                if family == "gguf" and (
+                    self.sm70_gguf.expert_cache_fraction <= 0
+                    or self.sm70_gguf.expert_cache_prefill != "turbomind"
+                    or self.sm70_gguf.expert_cache_prefill_prepare == "all"
+                ):
+                    entries.pop("expert_cache_prefill_prepare", None)
                 for field, alias in getattr(
                     getattr(self, name), "loader_aliases", {}
                 ).items():

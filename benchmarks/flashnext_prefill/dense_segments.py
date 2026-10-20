@@ -35,6 +35,7 @@ def main():
     group.add_argument("--remaining-affine", action="store_true")
     parser.add_argument("--tokens", type=int, nargs="+", default=[7344, 5347])
     parser.add_argument("--select", nargs="+", help="Physical projection names to test")
+    parser.add_argument("--pad-rows", type=int, default=0)
     parser.add_argument(
         "--force-minimum",
         type=int,
@@ -78,7 +79,7 @@ def main():
                 print(json.dumps({"tensor": name, "admitted": False}), flush=True)
                 args.output.write_text(json.dumps(report, indent=2) + "\n")
                 continue
-            minimum = args.force_minimum or (4096 if name == "qsa23_q" else 2048)
+            minimum = args.force_minimum or actual[5][0]
             assert actual[3][0] == 3 and actual[5] == [minimum, -1]
             assert min(args.tokens) >= minimum, "restored BLAS timing needs admitted M"
             control = list(actual)
@@ -93,11 +94,21 @@ def main():
                     return torch.ops.vllm.prepared_gguf_mixed_projection(x, *control)
 
                 def blas(x=x, actual=actual):
-                    return torch.ops.vllm.prepared_gguf_mixed_projection(x, *actual)
+                    padding = (-x.shape[0]) % args.pad_rows if args.pad_rows else 0
+                    operand = (
+                        torch.nn.functional.pad(x, (0, 0, 0, padding)) if padding else x
+                    )
+                    return torch.ops.vllm.prepared_gguf_mixed_projection(
+                        operand, *actual
+                    )[: x.shape[0]]
 
                 old = fused()
                 with NativeDispatchTrace() as trace:
-                    observed = _prepared_gguf_mixed_projection(x, *actual)
+                    padding = (-m) % args.pad_rows if args.pad_rows else 0
+                    operand = (
+                        torch.nn.functional.pad(x, (0, 0, 0, padding)) if padding else x
+                    )
+                    observed = _prepared_gguf_mixed_projection(operand, *actual)[:m]
                 new = blas()
                 torch.testing.assert_close(new, observed, rtol=0, atol=0)
                 assert any(
@@ -115,6 +126,7 @@ def main():
                     "tensor": name,
                     "source_type": source,
                     "shape_mnk": [m, n, k],
+                    "blas_padded_rows": m + padding,
                     "runtime_blas_bands": runtime_bands,
                     "benchmark_blas_bands": actual[5],
                     "restore_fused": measure(fused, 5),

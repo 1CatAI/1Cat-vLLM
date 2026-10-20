@@ -5,7 +5,7 @@
 
 import os
 from dataclasses import fields
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import Field
 
@@ -66,6 +66,8 @@ class GdnConfig:
     """Keep separate prefill packing/gating as an explicit diagnostic algorithm."""
     original_prefill: bool | None = None
     """Use original TileLang FlashQLA prefill, including the historical alias."""
+    original_prefill_threads: Literal[128, 256] | None = None
+    """128 by default; 256 accelerates qualified long prefill tensors."""
     indexed_prefill: bool | None = None
     """Allow original prefill to address and update the resident state directly."""
     direct_prefill_output: bool | None = None
@@ -98,6 +100,11 @@ class GdnConfig:
     def resolve(self, *, additional_config=None, native_verify: bool = False) -> None:
         if self.resolved:
             return
+        if self.original_prefill_threads is None:
+            self.original_prefill_threads = 128
+            self.sources["original_prefill_threads"] = "default"
+        else:
+            self.sources["original_prefill_threads"] = "typed"
         from vllm import envs
 
         if self.prefill_backend is None:
@@ -206,9 +213,10 @@ class GdnConfig:
             if field.name
             not in {"resolved", "sources", "decode_warmup", "active_prefill_backend"}
         }
+        flashqla_backend = self.active_prefill_backend == "flashqla_sm70"
         if self.active_prefill_backend is not None:
             options["prefill_backend"] = self.active_prefill_backend
-            if self.active_prefill_backend != "flashqla_sm70":
+            if not flashqla_backend:
                 options.pop("original_prefill")
                 options.pop("indexed_prefill")
             # Only the native prefill and FlashQLA's dtype fallback can consume
@@ -219,9 +227,11 @@ class GdnConfig:
                     for name, value in self.schedule.graph_options().items()
                     if name.startswith(("recurrent_", "sigmoid_"))
                 }
-        if not self.flashqla_decode and (
-            self.active_prefill_backend != "flashqla_sm70" or self.original_prefill
+        if self.original_prefill is False or (
+            self.active_prefill_backend is not None and not flashqla_backend
         ):
+            options.pop("original_prefill_threads")
+        if not self.flashqla_decode and (not flashqla_backend or self.original_prefill):
             options.pop("flashqla_column_groups")
         return options
 

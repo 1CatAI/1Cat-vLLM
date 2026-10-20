@@ -88,6 +88,7 @@ def run_one(args, index):
     with request(args.base_url, "/reset_prefix_cache", {}) as response:
         response.read()
     before = metrics(args.base_url)
+    started_unix = time.time()
     start = time.perf_counter()
     first_choice = first_text = None
     usage, choices = None, []
@@ -115,6 +116,8 @@ def run_one(args, index):
         raise RuntimeError("Missing completion choice or final usage")
     return {
         "index": index,
+        "client_started_unix": started_unix,
+        "client_finished_unix": time.time(),
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "usage": usage,
         "first_choice_seconds": first_choice,
