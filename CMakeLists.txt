@@ -849,6 +849,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     ARCHITECTURES "70"
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
+  # Host-side expert-cache lane (C++ with the CUDA runtime); prebuilt so
+  # installed wheels do not need the source tree or a JIT toolchain.
+  define_extension_target(
+    _gguf_expert_cache_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/gguf_expert_cache.cpp"
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
   define_extension_target(
     _sm70_exact_reduce_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/exact_row_reduce.cu"

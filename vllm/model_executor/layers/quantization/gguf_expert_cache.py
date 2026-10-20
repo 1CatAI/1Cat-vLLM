@@ -20,6 +20,7 @@ experts) into one of two buffers, prefetching the next layer while this one
 computes, and the routed ids are remapped into that bank.
 """
 
+import importlib
 import os
 import threading
 import time
@@ -186,6 +187,12 @@ _NATIVE = None
 def _native():
     global _NATIVE
     if _NATIVE is None:
+        try:
+            _NATIVE = importlib.import_module("vllm._gguf_expert_cache_C")
+            return _NATIVE
+        except ImportError:
+            pass
+        # Source checkouts without the prebuilt module compile it on demand.
         from torch.utils.cpp_extension import load
 
         source = os.path.join(
