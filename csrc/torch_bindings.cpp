@@ -758,6 +758,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            vllm::sm70::with_policy(&fp8_qpn8_gemm_sm70_out));
 
   ops.def(
+      "fp8_qpn8_mma_sm75_out(Tensor(a!) out, Tensor input, Tensor codes, "
+      "Tensor group_scales, str? native_policy=None ) -> ()");
+  ops.impl("fp8_qpn8_mma_sm75_out", torch::kCUDA,
+           vllm::sm70::with_policy(&fp8_qpn8_mma_sm75_out));
+
+  ops.def(
       "fp8_qpn8_gemm_ba_split_sm70_out(Tensor(a!) qkv_out, Tensor(b!) "
       "z_out, Tensor(c!) b_out, Tensor(d!) a_out, Tensor input, Tensor codes, "
       "Tensor group_scales, Tensor ba_weight, str? native_policy=None ) -> "
