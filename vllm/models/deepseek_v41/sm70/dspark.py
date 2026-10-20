@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import cast
 
+import os as _os
 import torch
 from torch import nn
 
@@ -297,7 +298,10 @@ class DSparkV41Block(nn.Module):
             dump_put(f"blk_x_attn_L{L}", x); dump_put(f"blk_attn_out_L{L}", attn_out); dump_put(f"blk_stream_mid_L{L}", stream)
         ffn_pre, ffn_post, ffn_comb = hc_mixes(stream, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         x = rmsnorm_to_act(hc_pre(stream, attn_pre), self.ffn_norm.weight)
-        ffn_out = self.ffn(x)
+        if _os.environ.get("DS41_DRAFT_NO_MOE") == "1":
+            ffn_out = torch.zeros_like(x)        # diagnostic: bisect graph-only faults (drafter MoE off)
+        else:
+            ffn_out = self.ffn(x)
         stream = hc_post(ffn_out, stream, ffn_post, ffn_comb)
         if on:
             dump_put(f"blk_ffn_pre_L{L}", ffn_pre); dump_put(f"blk_ffn_post_L{L}", ffn_post); dump_put(f"blk_ffn_comb_L{L}", ffn_comb)
