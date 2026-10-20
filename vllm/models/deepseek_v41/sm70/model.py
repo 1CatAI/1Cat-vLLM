@@ -407,24 +407,27 @@ class DeepseekV41Model(nn.Module):
         aux: list[torch.Tensor] = []
         _dbg_pos = int(__import__("os").environ.get("DS41_DEBUG_POS", "-1"))
         _dbg_row = -1
-        if _dbg_pos >= 0:
-            _hit = (positions == _dbg_pos).nonzero()
-            if _hit.numel():
-                _dbg_row = int(_hit[0, 0]); _dbg_norms = [("in", float(stream[_dbg_row].float().norm()))]
+        if _dbg_pos >= 0 and not torch.cuda.is_current_stream_capturing() and positions.shape[0] <= 2048:
+            from vllm.forward_context import get_forward_context, is_forward_context_available
+            _dummy = is_forward_context_available() and bool(get_forward_context().is_dummy_run)
+            if not _dummy:
+                _hit = (positions == _dbg_pos).nonzero()            # one sync, real steps only, never under capture
+                if _hit.numel():
+                    _dbg_row = int(_hit[0, 0]); _dbg_norms = [("in", stream[_dbg_row].float().norm())]
         for idx in range(self.start_layer, self.end_layer):
             layer = self.layers[idx]
             if isinstance(layer, PPMissingLayer):   # layer outside the configured subset
                 continue
             stream, pre = layer(stream, pre, positions)
             if _dbg_row >= 0:
-                _dbg_norms.append((idx, float(stream[_dbg_row].float().norm())))
+                _dbg_norms.append((idx, stream[_dbg_row].float().norm()))
             if idx + 1 in self._aux_layers:
                 # DSpark target state: the HC stream entering layer idx + 1, averaged over the 4 streams (reference
                 # ``h.mean(dim=2)`` before ``layer(h)``); runner numbering = "output after layer idx" = idx + 1
                 aux.append(stream.float().mean(dim=1).to(torch.float16))
         if _dbg_row >= 0:
             logger.info("DS41 layer norms pos %d (row %d of T=%d): %s", _dbg_pos, _dbg_row, int(positions.shape[0]),
-                        " ".join(f"{k}:{v:.3f}" for k, v in _dbg_norms))
+                        " ".join(f"{k}:{float(v):.3f}" for k, v in _dbg_norms))
         if not self.pp_is_last:
             num_tokens = stream.shape[0]
             out = {C.PP_KEY_HIDDEN: stream, C.PP_KEY_PRE_MIX: pre}
