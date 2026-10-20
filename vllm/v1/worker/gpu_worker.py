@@ -1774,10 +1774,14 @@ class _EngramStepPlanner:
                     self._tokens[req_id] = prompt
                 if cached.new_token_ids:
                     main = np.asarray(cached.new_token_ids[i], dtype=np.int32)
-                    if len(main) != num_main:
+                    if len(main) < num_main:
                         raise ValueError(
                             f"request {req_id}: {len(main)} new_token_ids for {num_main} scheduled tokens"
                         )
+                    # PP + spec decode: the scheduler sends every token this stage lacks (accepted drafts +
+                    # bonus). The accepted drafts already sit in the Engram history at their positions with
+                    # these very values (written as drafts last step); this step's main tokens are the tail.
+                    main = main[-num_main:]
                 else:
                     known = self._tokens.get(req_id)
                     main = (
