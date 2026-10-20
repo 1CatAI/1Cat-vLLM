@@ -226,6 +226,9 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                             int64_t split_k, int64_t accumulator_chains,
                             bool fast_decoder, bool prefetch_codes);
 
+void fp8_qpn8_mma_sm75_out(torch::Tensor out, torch::Tensor input,
+                           torch::Tensor codes, torch::Tensor group_scales);
+
 void fp8_qpn8_gemm_ba_split_sm70_out(torch::Tensor qkv_out, torch::Tensor z_out,
                                      torch::Tensor b_out, torch::Tensor a_out,
                                      torch::Tensor input, torch::Tensor codes,
