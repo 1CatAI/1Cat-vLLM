@@ -226,6 +226,7 @@ def _gather(
     STAGE: tl.constexpr,
     HOT_FP8: tl.constexpr = False,
     HotScales=None,
+    HANDS: tl.constexpr = 1,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     lanes = tl.arange(0, 16)
@@ -335,13 +336,30 @@ def _gather(
     for _ in range(4):
         pending = claim & ~reserved
         if tl.sum(pending.to(tl.int32), 0) > 0:
+            # HANDS independent CLOCK hands, each sweeping its own slot range,
+            # so concurrent misses do not serialize on one counter.
+            lane_hand = (row * tl.cdiv(Width, 16) + tile) % HANDS
+            span: tl.constexpr = (Sets * 4) // HANDS
             hand = tl.atomic_add(
-                Hands + tl.zeros((4,), tl.int32), tl.where(pending, 16, 0)
+                Hands + lane_hand + tl.zeros((4,), tl.int32),
+                tl.where(pending, 16, 0),
             ).to(tl.uint32)
-            candidates = (hand[:, None] + probes[None, :]) % (Sets * 4)
+            base = (lane_hand * span).to(tl.uint32)
+            candidates = base + (hand[:, None] + probes[None, :]) % span
             stamps = tl.load(Stamps + candidates)
-            chosen = tl.min(tl.where(stamps != epoch, probes[None, :], 16), 1)
-            candidate = ((hand + tl.minimum(chosen, 15)) % (Sets * 4)).to(tl.int32)
+            # Evict the least recently selected probe (stamps hold the epoch of
+            # last use); pages selected in this epoch stay pinned.
+            age = tl.where(stamps != epoch, epoch - stamps, -1)
+            oldest = tl.max(age, 1)
+            chosen = tl.min(
+                tl.where(
+                    (age == oldest[:, None]) & (oldest[:, None] >= 0),
+                    probes[None, :],
+                    16,
+                ),
+                1,
+            )
+            candidate = (base + (hand + tl.minimum(chosen, 15)) % span).to(tl.int32)
             observed = tl.load(Stamps + candidate)
             attempt = pending & (chosen < 16) & (observed != epoch)
             won = attempt & (
@@ -549,7 +567,12 @@ class HostQSAKV:
         self.tags = torch.full((self.sets, 4), -1, dtype=torch.int32, device=device)
         self.stamps = torch.zeros_like(self.tags)
         self.epoch = torch.zeros(1, dtype=torch.int32, device=device)
-        self.hands = torch.zeros(1, dtype=torch.int32, device=device)
+        # Independent CLOCK hands; a power of two that divides the slot count
+        # and leaves each hand at least one probe window of slots.
+        self.num_hands = 1
+        while self.num_hands < 64 and (self.sets * 4) // (self.num_hands * 2) >= 16:
+            self.num_hands *= 2
+        self.hands = torch.zeros(self.num_hands, dtype=torch.int32, device=device)
         self.page_slots = torch.full(
             (blocks * page_size // 4,), -1, dtype=torch.int32, device=device
         )
@@ -938,6 +961,7 @@ class HostQSAKV:
                 stage,
                 HOT_FP8=self.hot_fp8,
                 HotScales=self.hot_scales,
+                HANDS=self.num_hands,
                 num_warps=4,
             )
 
