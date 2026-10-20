@@ -31,6 +31,12 @@ CAPTURE_SIZES=$(r=1; s=""; while [ "$r" -lt "$MAX_NUM_SEQS" ]; do
   s="$s$((5 * r)),"; r=$((r * 2)); done; echo "${s}$((5 * MAX_NUM_SEQS))")
 # Recurrent-state pool: 28 blocks cover one 256K-token request.
 STATE_BLOCKS=$((1 + 28 * MAX_NUM_SEQS))
+# Save the recurrent state at the end of each prompt so the next chat turn
+# reuses the whole previous prompt from the prefix cache (one extra prefill
+# step per prompt). Set to 0 to skip it.
+MAMBA_TAIL_CHECKPOINT=${MAMBA_TAIL_CHECKPOINT:-1}
+TAIL_ARG=--mamba-tail-checkpoint
+[[ "$MAMBA_TAIL_CHECKPOINT" == 0 ]] && TAIL_ARG=--no-mamba-tail-checkpoint
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 export PATH="$CUDA_HOME/bin:$(dirname "$PYTHON_BIN"):$PATH"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_IDS"
@@ -142,7 +148,7 @@ exec "${PIN[@]}" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" 
   --dtype half --kv-cache-dtype float16 --mamba-ssm-cache-dtype float32 \
   --max-model-len 262144 --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.95 --enable-prefix-caching \
-  --mamba-cache-mode align --no-mamba-tail-checkpoint "${MM_ARGS[@]}" \
+  --mamba-cache-mode align "$TAIL_ARG" "${MM_ARGS[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20}' \
