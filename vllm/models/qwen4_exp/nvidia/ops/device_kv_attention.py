@@ -88,6 +88,17 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
 PREFILL_ROWS = 32
 
 
+def host_history_stage_copy():
+    """Bind the native host-copy helper independently of decode admission."""
+    if not current_platform.is_device_capability(70):
+        return None
+    try:
+        importlib.import_module("vllm._sm70_qsa_device_C")
+    except ImportError:
+        return None
+    return getattr(torch.ops.vllm_sm70_qsa_device, "stage_host_run", None)
+
+
 def prefill_history_workspace(state):
     """Native reader workspace for staged prefill history (PREFILL_ROWS rows).
 

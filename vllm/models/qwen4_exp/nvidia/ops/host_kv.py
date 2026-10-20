@@ -587,8 +587,12 @@ class HostQSAKV:
         ) = _WORKSPACES[workspace_key]
         self.table = self.requests.view(-1, 1)
 
-        from .device_kv_attention import initialize_device_history_attention
+        from .device_kv_attention import (
+            host_history_stage_copy,
+            initialize_device_history_attention,
+        )
 
+        self._stage_host_run = host_history_stage_copy()
         self.device_history_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
         self.device_history_reason: str | None = None
         self.device_history_hot = False
@@ -739,6 +743,29 @@ class HostQSAKV:
         page = self.page_size
         source = self.host if self.host is not None else self.history
         if source.is_cuda:
+            # A few host runs can use DMA without occupying SMs. Count only
+            # runs intersecting this transfer: a fragmented full plan may
+            # still have a contiguous historical prefix. Bound submissions
+            # before copying; heavily fragmented plans retain the gather.
+            if (
+                self._stage_host_run is not None
+                and (last - first) * 2 * page * self.dim * source.element_size()
+                >= 512 * 1024
+            ):
+                copies = []
+                for source_block, target, count in runs:
+                    if target >= last:
+                        break
+                    lo, hi = max(target, first), min(target + count, last)
+                    if lo < hi:
+                        copies.append((source_block + lo - target, lo, hi - lo))
+                        if len(copies) > 4:
+                            break
+                if 0 < len(copies) <= 4 and all(
+                    self._stage_host_run(source, self.scales, history, scales, *run)
+                    for run in copies
+                ):
+                    return
             # Device-addressable history (the mapped serving pool): one
             # gather launch for the pages and their scales.
             words = 2 * page * self.dim * source.element_size() // 8

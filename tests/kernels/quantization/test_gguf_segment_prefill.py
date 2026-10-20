@@ -23,10 +23,19 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @pytest.mark.parametrize(
-    "source,k,n",
-    [(13, 2560, 2560), (14, 2560, 2560), (14, 2560, 1536), (14, 1536, 2560)],
+    "source,k,n,minimum",
+    [
+        (13, 2560, 2560, 2048),
+        (14, 2560, 2560, 2048),
+        (14, 2560, 1536, 2048),
+        (14, 1536, 2560, 2048),
+        (13, 2560, 4096, 2048),
+        (14, 2560, 4096, 2048),
+        (13, 2560, 3328, 2048),
+        (13, 2560, 3072, 4096),
+    ],
 )
-def test_segment_storage_prefill_and_decode(source, k, n):
+def test_segment_storage_prefill_and_decode(source, k, n, minimum):
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 required")
     torch._dynamo.reset()
@@ -45,17 +54,17 @@ def test_segment_storage_prefill_and_decode(source, k, n):
         projection = projections[0]
         assert hasattr(projection, "segment_format")
         serialized = prepared_projection_arguments(projections)
-        assert serialized[3][0] == 3 and serialized[5] == [2048, -1]
+        assert serialized[3][0] == 3 and serialized[5] == [minimum, -1]
 
         def run(x):
             return apply_prepared_gguf_projections(x, projections)
 
         compiled = torch.compile(run, backend="eager", fullgraph=True, dynamic=True)
-        for m in (2047, 2048, 2049, 4097, 8, 20, 33):
+        for m in (minimum - 1, minimum, minimum + 1, minimum * 2 + 1, 8, 20, 33):
             x = (torch.randn(m, k, device="cuda") * 0.125).half()
             operator = (
                 "gguf_affine_blas_sm70_out"
-                if m >= 2048
+                if m >= minimum
                 else "gguf_dense_segments_sm70_out"
                 if m in (8, 20)
                 else "gguf_affine_gemm_sm70_out"
@@ -77,7 +86,7 @@ def test_segment_storage_prefill_and_decode(source, k, n):
             check(out)
             check(compiled(x))
             check(projection(x))
-            if m == 2048:
+            if m == minimum:
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
@@ -91,17 +100,18 @@ def test_segment_storage_prefill_and_decode(source, k, n):
                 check(graph_out)
 
 
-def test_mixed_segment_output_views_and_unqualified_fallback():
+@pytest.mark.parametrize("segments", [((14, 1536), (12, 128)), ((13, 3328), (14, 256))])
+def test_mixed_segment_output_views_and_unqualified_fallback(segments):
     config = SimpleNamespace(
         kernel_config=KernelConfig(),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     with set_current_vllm_config(config):
-        # A calibrated Q6 projection plus an uncalibrated Q4 projection:
+        # A calibrated projection plus an uncalibrated projection:
         # only one segment uses BLAS, whose native API requires contiguous out.
         sources = [
             (torch.from_numpy(raw_weights(source, n, 2560)).cuda(), source)
-            for source, n in ((14, 1536), (12, 128))
+            for source, n in segments
         ]
         projections = prepare_gguf_projections(sources, torch.float16, True, 8)
         assert all(hasattr(p, "segment_format") for p in projections)
