@@ -129,6 +129,8 @@ class DSparkProposer(DFlashProposer):
             except (AttributeError, IndexError) as e:
                 logger.info("DSpark capture context unavailable (%s): zero-path capture (profiling?)", e)
                 ctx = None
+            if os.environ.get("DS41_DRAFT_NO_STATIC") == "1":
+                ctx = None            # diagnostic: capture the drafter attention's ZERO path (bisect graph-only faults)
             sm70_dspark.STATIC_CAPTURE_CTX = ctx
             if profiling and use_cudagraphs and os.environ.get("DS41_DRAFT_PROFILE_EAGER", "1") == "1":
                 # The memory-profiling pass captured the drafter against the stub KV cache and REPLAYED it; at 2+
