@@ -7,6 +7,8 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.config.diagnostic_dump import TensorDumpConfig
+from vllm.diagnostics import DiagnosticChannel
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
 from vllm.models.glm5next.nvidia.model import (
@@ -17,9 +19,17 @@ from vllm.models.glm5next.nvidia.model import (
 )
 
 
-def test_glm53_pp_intermediate_state_shapes():
+def _bare_glm_model() -> Glm5NextModel:
+    # Skips the constructor: the stages are assembled by hand. The forward pass
+    # still consults the PP boundary dump channel, so give it an inert one.
     model = Glm5NextModel.__new__(Glm5NextModel)
     nn.Module.__init__(model)
+    model._pp_aux_dump = DiagnosticChannel(TensorDumpConfig())
+    return model
+
+
+def test_glm53_pp_intermediate_state_shapes():
+    model = _bare_glm_model()
     model.config = SimpleNamespace(
         hidden_size=4096, mhc=True, mhc_num_residual_streams=4
     )
@@ -39,8 +49,7 @@ def test_glm53_pp_intermediate_state_shapes():
 
 
 def test_glm53_materialized_mhc_pp_schema_carries_completed_streams():
-    model = Glm5NextModel.__new__(Glm5NextModel)
-    nn.Module.__init__(model)
+    model = _bare_glm_model()
     model.config = SimpleNamespace(
         hidden_size=4096, mhc=True, mhc_num_residual_streams=4
     )
@@ -61,8 +70,7 @@ def test_glm53_materialized_mhc_pp_schema_carries_completed_streams():
 
 
 def test_glm53_dflash_mhc_capture_materializes_completed_layer_output():
-    model = Glm5NextModel.__new__(Glm5NextModel)
-    nn.Module.__init__(model)
+    model = _bare_glm_model()
     model.config = SimpleNamespace(mhc=True, mhc_num_residual_streams=4)
 
     hidden_states = torch.randn(3, 8)
@@ -156,8 +164,7 @@ def test_glm53_materialized_mhc_state_crosses_pp_boundary(monkeypatch):
     group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
     monkeypatch.setattr("vllm.models.glm5next.nvidia.model.get_pp_group", lambda: group)
 
-    stage0 = Glm5NextModel.__new__(Glm5NextModel)
-    nn.Module.__init__(stage0)
+    stage0 = _bare_glm_model()
     stage0.config = SimpleNamespace(hidden_size=8, mhc=True, mhc_num_residual_streams=2)
     stage0.end_layer = 24
     stage0.is_sequence_parallel = False
@@ -177,8 +184,7 @@ def test_glm53_materialized_mhc_state_crosses_pp_boundary(monkeypatch):
 
     group.is_first_rank = False
     group.is_last_rank = True
-    stage1 = Glm5NextModel.__new__(Glm5NextModel)
-    nn.Module.__init__(stage1)
+    stage1 = _bare_glm_model()
     stage1.config = SimpleNamespace(hidden_size=8, mhc=True, mhc_num_residual_streams=2)
     stage1.is_sequence_parallel = False
     stage1._materialize_pp_mhc_boundary = True
@@ -198,8 +204,7 @@ def test_glm53_dflash_aux_hidden_states_cross_pp_boundary(monkeypatch):
     group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
     monkeypatch.setattr("vllm.models.glm5next.nvidia.model.get_pp_group", lambda: group)
 
-    stage0 = Glm5NextModel.__new__(Glm5NextModel)
-    nn.Module.__init__(stage0)
+    stage0 = _bare_glm_model()
     stage0.config = SimpleNamespace(hidden_size=8, mhc=False)
     stage0.start_layer = 0
     stage0.end_layer = 24
@@ -225,8 +230,7 @@ def test_glm53_dflash_aux_hidden_states_cross_pp_boundary(monkeypatch):
 
     group.is_first_rank = False
     group.is_last_rank = True
-    stage1 = Glm5NextModel.__new__(Glm5NextModel)
-    nn.Module.__init__(stage1)
+    stage1 = _bare_glm_model()
     stage1.config = SimpleNamespace(hidden_size=8, mhc=False)
     stage1.start_layer = 24
     stage1.end_layer = 45
