@@ -10650,9 +10650,16 @@ class GPUModelRunner(
                     )
                     if os.environ.get("DS41_DRAFT_OWN_POOL", "1") == "1":
                         # The drafter's graphs get a pool of their own (DeepInfer passes the drafter runner its own
-                        # graph_memory_pool). With the global pool, the 2-seq drafter graph was replayed right after the
-                        # main model captured its next graph into the same pool and hit an illegal address.
+                        # graph_memory_pool).
                         drafter.model.graph_pool = current_platform.graph_pool_handle()
+                    if os.environ.get("DS41_DRAFT_NCCL_AR", "1") == "1":
+                        # 2026-10-21: the 2-sequence drafter graph died at its first replay with an illegal memory access
+                        # until the CUSTOM all-reduce was disabled (--disable-custom-all-reduce made B=2/B=4 exact): the
+                        # custom AR's graph mode works on IPC-registered buffers looked up by pointer, and the drafter graph
+                        # at a second batch size all-reduces a buffer that was not registered at capture. Disabling it
+                        # globally costs 4-7 % single-stream (every main-model layer's all-reduce), so the custom AR is
+                        # switched off only while the drafter runs: its all-reduces fall back to NCCL (graph-capturable).
+                        drafter.model = _DrafterNcclAllReduce(drafter.model)
                 else:
                     drafter.model = BreakableCUDAGraphWrapper(
                         drafter.model, self.vllm_config
@@ -13293,3 +13300,29 @@ class EncoderTimingStats:
             "encoder_forward_secs": self.encoder_forward_secs,
             "num_encoder_calls": self.num_encoder_calls,
         }
+
+
+class _DrafterNcclAllReduce:
+    """Callable wrapper around the drafter's graph wrapper: the TP group's custom all-reduce is disabled for the duration
+    of the call (its all-reduces take the NCCL path), attributes pass through to the wrapped object."""
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def __call__(self, *args, **kwargs):
+        from vllm.distributed.parallel_state import get_tp_group
+
+        ca = getattr(getattr(get_tp_group(), "device_communicator", None), "ca_comm", None)
+        if ca is None or ca.disabled:
+            return self._inner(*args, **kwargs)
+        ca.disabled = True
+        try:
+            return self._inner(*args, **kwargs)
+        finally:
+            ca.disabled = False
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_inner"), name, value)
