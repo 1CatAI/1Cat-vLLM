@@ -234,20 +234,28 @@ def test_backend_is_registered_for_automatic_selection():
     assert Mxfp4MoeBackend.SM70_SKINNY in _get_priority_backends()
 
 
-@pytest.mark.parametrize("reduces_hidden", [True, False])
 @pytest.mark.parametrize("order", list(QpnFragmentOrder))
 @pytest.mark.parametrize("k", [128, 256, 320, 512, 640, 1024, 2048, 4096, 5120])
-def test_grouped_launch_uses_actual_alignment(k, order, reduces_hidden):
-    split = grouped_splitk(k, order, reduces_hidden)
+def test_grouped_launch_uses_actual_alignment(k, order):
+    split = grouped_splitk(k, order)
     assert (k // 16) % split == 0
 
 
 def test_m16n8k8_split_keeps_sixteen_groups_per_warp_where_it_can():
     order = QpnFragmentOrder.M16N8K8
-    assert grouped_splitk(4096, order, True) == 8
-    assert grouped_splitk(2048, order, False) == 8
-    assert grouped_splitk(640, order, False) == 4
-    assert grouped_splitk(320, order, False) == 4
+    assert grouped_splitk(4096, order) == 8
+    assert grouped_splitk(2048, order) == 8
+    assert grouped_splitk(640, order) == 4
+    assert grouped_splitk(320, order) == 4
+
+
+def test_m8n8k4_split_prefers_eight_warps():
+    order = QpnFragmentOrder.M8N8K4
+    assert grouped_splitk(4096, order) == 8
+    assert grouped_splitk(2048, order) == 8
+    assert grouped_splitk(640, order) == 8
+    # K/16 = 20: 8 does not divide, 16 neither, 10 does
+    assert grouped_splitk(320, order) == 10
 
 
 @pytest.mark.parametrize(
@@ -258,7 +266,7 @@ def test_m16n8k8_split_keeps_sixteen_groups_per_warp_where_it_can():
 )
 def test_grouped_launch_rejects_unsupported_alignment(k, order):
     with pytest.raises(ValueError):
-        grouped_splitk(k, order, True)
+        grouped_splitk(k, order)
 
 
 @pytest.mark.parametrize("scale_mode", [0, 1])
@@ -468,8 +476,7 @@ def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device, order, cols, t
             out,
             False,
             tokens,
-            grouped_splitk(cols, order, True),
-            1,
+            grouped_splitk(cols, order),
             1,
             order,
         )

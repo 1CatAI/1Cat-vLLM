@@ -908,7 +908,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "skinny_moe_qpn_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
       "Tensor gscales, Tensor perm, Tensor gids, Tensor goff, int topk, "
       "Tensor(a!) y_slots, bool x_slot_major, int num_tokens, int splitk, "
-      "int nacc, int scale_mode, int fragment_order) -> ()");
+      "int scale_mode, int fragment_order) -> ()");
   ops.impl("skinny_moe_qpn_sm70", torch::kCUDA, &skinny_moe_qpn_sm70);
 
   ops.def(

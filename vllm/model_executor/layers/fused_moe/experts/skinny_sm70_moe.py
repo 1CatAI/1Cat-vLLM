@@ -61,17 +61,17 @@ def qpn_fragment_order(device_id: int) -> QpnFragmentOrder:
     return QpnFragmentOrder.M8N8K4
 
 
-def grouped_splitk(k: int, order: QpnFragmentOrder, reduces_hidden: bool) -> int:
+def grouped_splitk(k: int, order: QpnFragmentOrder) -> int:
     """Split-K warps per CTA for a GEMM that reduces over ``k``.
 
     Picks the most preferred specialization the native kernel instantiates
-    that divides the actual K groups. Volta's m8n8k4 kernel prefers 16 warps
-    on the hidden-size reduction (w13) and 8 on the intermediate one (w2);
-    Turing's m16n8k8 kernel prefers 8 while that leaves every warp at least 16
-    groups and 4 below (tuning sweep 21.10.2026).
+    that divides the actual K groups. Both kernels prefer 8 warps (tuning
+    sweeps 2026-10-21); Turing's m16n8k8 kernel takes 4 where 8 would leave a
+    warp fewer than 16 groups, Volta's m8n8k4 kernel 16 or 10 where 8 does
+    not divide K.
     """
     if order == QpnFragmentOrder.M8N8K4:
-        preference: tuple[int, ...] = (16, 8, 10) if reduces_hidden else (8, 16, 10)
+        preference: tuple[int, ...] = (8, 16, 10)
     else:
         preference = (8, 4) if k >= 2048 else (4, 8)
     for split in preference:
@@ -542,12 +542,12 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         if not kernel_config.sm70_skinny_moe:
             return False, "disabled by kernel_config.sm70_skinny_moe"
         order = qpn_fragment_order(torch.accelerator.current_device_index())
-        for name, k, reduces_hidden in (
-            ("hidden", moe_config.hidden_dim, True),
-            ("intermediate", moe_config.intermediate_size_per_partition, False),
+        for name, k in (
+            ("hidden", moe_config.hidden_dim),
+            ("intermediate", moe_config.intermediate_size_per_partition),
         ):
             try:
-                grouped_splitk(k, order, reduces_hidden)
+                grouped_splitk(k, order)
             except ValueError as exc:
                 return False, f"{name} dimension: {exc}"
         if moe_config.in_dtype != torch.float16:
@@ -713,8 +713,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y13,
             False,
             num_tokens,
-            grouped_splitk(hidden_states.size(1), self._fragment_order, True),
-            1,
+            grouped_splitk(hidden_states.size(1), self._fragment_order),
             self._scale_mode,
             self._fragment_order,
         )
@@ -733,8 +732,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y2,
             True,
             num_tokens,
-            grouped_splitk(inter_dim, self._fragment_order, False),
-            1,
+            grouped_splitk(inter_dim, self._fragment_order),
             self._scale_mode,
             self._fragment_order,
         )
