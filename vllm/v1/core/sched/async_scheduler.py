@@ -17,6 +17,9 @@ class AsyncScheduler(Scheduler):
         # mutate spec-token rows in later phases.
         self._spec_token_placeholders: tuple[int, ...] = (-1,) * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size
+        self.pp_feedback_depth = (
+            self.vllm_config.max_concurrent_batches if self.pp_size > 1 else 1
+        )
         speculative_config = self.vllm_config.speculative_config
         draft_model_config = (
             speculative_config.draft_model_config
@@ -56,7 +59,9 @@ class AsyncScheduler(Scheduler):
                 request.spec_token_ids = []
 
             if self.use_v2_model_runner:
-                request.next_decode_eligible_step = self.current_step + self.pp_size
+                request.next_decode_eligible_step = (
+                    self.current_step + self.pp_feedback_depth
+                )
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

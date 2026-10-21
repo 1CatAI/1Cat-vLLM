@@ -107,12 +107,24 @@ def scatter_draft_tokens(
 
 
 class PPHandler:
-    """Pipeline sampled/draft transport with a PP-depth deferred slot ring."""
+    """Sampled/draft transport delayed by the engine's in-flight batch depth."""
 
     def __init__(
-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+        self,
+        max_num_reqs: int,
+        num_speculative_steps: int,
+        device: torch.device,
+        feedback_depth: int | None = None,
     ) -> None:
         pp = get_pp_group()
+        if feedback_depth is None:
+            feedback_depth = pp.world_size
+        if not 1 <= feedback_depth <= pp.world_size:
+            raise ValueError(
+                "PP feedback depth must be positive and no larger than "
+                f"the physical pipeline size ({pp.world_size})."
+            )
+        self.feedback_depth = feedback_depth
         self.is_last_rank = pp.is_last_rank
         self.last_rank = pp.last_rank
         self.max_sample_len = num_speculative_steps + 1
@@ -123,7 +135,7 @@ class PPHandler:
         self.broadcast_stream = torch.cuda.Stream(device)
 
         self.queue: deque[PendingRecv | None] = (
-            deque() if self.is_last_rank else deque([None] * pp.world_size)
+            deque() if self.is_last_rank else deque([None] * self.feedback_depth)
         )
         self.req_idx_gen_np = np.zeros(max_num_reqs, dtype=np.int32)
         self.broadcast_group = pp.make_sibling_device_group(
@@ -134,7 +146,7 @@ class PPHandler:
         self.req_idx_gen_np[req_idx] += 1
 
     def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor | None] | None:
-        """Consume the receive from one full pipeline traversal earlier."""
+        """Consume feedback from the configured number of batch slots earlier."""
         if not self.queue:
             return None
         slot = self.queue.popleft()

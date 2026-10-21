@@ -184,6 +184,15 @@ class SchedulerConfig:
     avoid gaps in GPU utilization, leading to better latency and throughput.
     """
 
+    pp_async_queue_depth: int | None = Field(default=None, ge=2)
+    """Limit in-flight PP batches and their V2 feedback delay together.
+
+    None preserves the pipeline-parallel size. An explicit value must be
+    between two and the pipeline size and requires V2 async scheduling with
+    the multiprocessing executor. Smaller depths can combine more requests
+    per decode batch at the cost of pipeline overlap. Restart to change it.
+    """
+
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.
     A smaller value (1) makes streaming smoother by sending each token immediately,

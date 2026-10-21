@@ -137,7 +137,24 @@ class GGUFModelLoader(BaseModelLoader):
             local = self._prepare_weights(model_config)
             self._native_adapter = adapter
             self._native_tensors = gguf_tensor_index(gguf_shard_paths(local))
-            return adapter.build_name_map(self._native_tensors)
+            names = adapter.build_name_map(self._native_tensors)
+            self._native_vision_adapter = None
+            if (
+                text_config.model_type == "qwen4_exp_text"
+                and getattr(config, "vision_config", None) is not None
+            ):
+                from .gguf_adapters.qwen3_vision import Qwen3VisionGGUF
+
+                mmproj = detect_gguf_multimodal(local)
+                if mmproj is None:
+                    raise ValueError("Qwen4Exp multimodal GGUF requires mmproj")
+                self._native_vision_adapter = Qwen3VisionGGUF(
+                    config.vision_config, gguf_tensor_index([mmproj])
+                )
+                # The conditional model wraps the native language model. Keep
+                # these names consistent for quantization, PLE and PP loading.
+                names = {raw: "language_model." + name for raw, name in names.items()}
+            return names
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
         # Gemma3Config, this returns config.text_config. For text-only
@@ -379,6 +396,11 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = {}
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
+        native_vision = getattr(self, "_native_vision_adapter", None)
+        if native_vision is not None:
+            # The dense vision tower has its own inverse mapping. It must not
+            # pass through the text adapter's normalization/quantization rules.
+            return weight_type_map
         is_multimodal = hasattr(model_config.hf_config, "vision_config")
         if is_multimodal:
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
@@ -462,6 +484,24 @@ class GGUFModelLoader(BaseModelLoader):
         yield from self._get_weights_iterator(
             model_config, local_model_path, gguf_weights_map
         )
+        native_vision = getattr(self, "_native_vision_adapter", None)
+        if native_vision is not None:
+            from vllm.model_executor.models.utils import (
+                PPMissingLayer,
+                StageMissingLayer,
+            )
+
+            tower = getattr(model, "visual", None)
+            if isinstance(tower, (PPMissingLayer, StageMissingLayer)):
+                return
+            vision_names = native_vision.name_map
+            if skip_weight is not None:
+                vision_names = {
+                    raw: name
+                    for raw, name in vision_names.items()
+                    if not skip_weight(name)
+                }
+            yield from native_vision.weights(model_config.dtype, vision_names)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         model.load_weights(self.get_all_weights(model_config, model))
@@ -572,6 +612,11 @@ class GGUFModelLoader(BaseModelLoader):
         if TYPE_CHECKING:
             vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(unquant_names)
+        native_vision = getattr(self, "_native_vision_adapter", None)
+        if native_vision is not None:
+            vllm_config.quant_config.unquantized_modules.extend(
+                native_vision.unquantized_modules
+            )
 
         if adapter is not None:
             from vllm.model_executor.kernels.ple.gguf_pinned import (

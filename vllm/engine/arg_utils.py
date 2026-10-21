@@ -736,6 +736,8 @@ class EngineArgs:
 
     async_scheduling: bool | None = SchedulerConfig.async_scheduling
 
+    pp_async_queue_depth: int | None = SchedulerConfig.pp_async_queue_depth
+
     stream_interval: int = SchedulerConfig.stream_interval
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
@@ -1477,6 +1479,9 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--async-scheduling", **scheduler_kwargs["async_scheduling"]
+        )
+        scheduler_group.add_argument(
+            "--pp-async-queue-depth", **scheduler_kwargs["pp_async_queue_depth"]
         )
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
@@ -2316,6 +2321,7 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            pp_async_queue_depth=self.pp_async_queue_depth,
             stream_interval=self.stream_interval,
         )
 

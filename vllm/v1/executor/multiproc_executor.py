@@ -515,11 +515,9 @@ class MultiprocExecutor(Executor):
 
     @cached_property
     def max_concurrent_batches(self) -> int:
-        # PP requires PP-size concurrent batches to fill the pipeline.
-        pp_size = self.parallel_config.pipeline_parallel_size
-        if pp_size <= 1 and self.scheduler_config.async_scheduling:
-            return max(2, self.scheduler_config.sm70_queue_depth())
-        return pp_size
+        # Keep executor credits, V2 sampled-token feedback, PLE staging, and
+        # the KV in-flight bound on the same engine-owned depth.
+        return self.vllm_config.max_concurrent_batches
 
     def _get_output_rank(self) -> int:
         # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1

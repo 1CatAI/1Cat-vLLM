@@ -1470,13 +1470,21 @@ class Qwen4ExpForConditionalGeneration(
                 multimodal_config.is_multimodal_pruning_enabled()
             )
 
-            with self._mark_tower_model(vllm_config, {"image", "video"}):
-                self.visual = Qwen3_VisionTransformer(
-                    config.vision_config,
-                    norm_eps=config.text_config.rms_norm_eps,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "visual"),
-                )
+            # The V2 runner executes the encoder and merges its embeddings
+            # only on the first pipeline rank. Do not replicate the vision
+            # tower on downstream ranks, which consume intermediate tensors,
+            # or in the CPU offload worker, which loads only PLE weights.
+            if is_offload_process() or not get_pp_group().is_first_rank:
+                self.visual = StageMissingLayer("vision_tower")
+                self._tower_model_names = []
+            else:
+                with self._mark_tower_model(vllm_config, {"image", "video"}):
+                    self.visual = Qwen3_VisionTransformer(
+                        config.vision_config,
+                        norm_eps=config.text_config.rms_norm_eps,
+                        quant_config=quant_config,
+                        prefix=maybe_prefix(prefix, "visual"),
+                    )
 
         self.use_deepstack = (
             not self.language_model_only
@@ -1510,13 +1518,10 @@ class Qwen4ExpForConditionalGeneration(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
-        if not get_pp_group().is_first_rank and self.use_deepstack:
-            assert self.language_model.model.start_layer >= len(
+        if self.use_deepstack:
+            assert self.language_model.model.end_layer >= len(
                 config.vision_config.deepstack_visual_indexes
-            ), (
-                "start_layer should be greater than or equal to "
-                "len(deepstack_visual_indexes)"
-            )
+            ), "The first pipeline rank must contain all deepstack injection layers"
         self.set_moe_parameters(self.language_model.model.layers)
 
     def embed_input_ids(
@@ -1582,6 +1587,10 @@ class Qwen4ExpForConditionalGeneration(
             hidden_states, top_k
         )
 
+    def prepare_loaded_linear_weights(self) -> None:
+        """Forward checkpoint post-load preparation to the language model."""
+        self.language_model.prepare_loaded_linear_weights()
+
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Forward decode compiler setup to the wrapped language model."""
         return self.language_model.prepare_sm70_decode_graph_model()
@@ -1630,6 +1639,16 @@ class Qwen4ExpForConditionalGeneration(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if self.model_config.quantization == "gguf":
+            expected_visual = {
+                f"visual.{name}" for name, _ in self.visual.named_parameters()
+            }
+            missing_visual = expected_visual - loaded
+            if missing_visual:
+                raise ValueError(
+                    "GGUF checkpoint did not load vision parameters: "
+                    + ", ".join(sorted(missing_visual))
+                )
         _finalize_qsa_e4m3_scale_load(
             self,
             loaded,

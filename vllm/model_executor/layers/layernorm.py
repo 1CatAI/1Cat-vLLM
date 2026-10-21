@@ -20,8 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.kernels.norm import sm70 as _sm70_provider
 from vllm.model_executor.kernels.norm.sm70 import (
-    _sm70_gated_norm_device_supported,
-    _sm70_gated_norm_shape_supported,
+    maybe_gated_norm,
     maybe_gemma_norm,
     use_long_prefill_fused,
 )
@@ -404,19 +403,19 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
-        if (
-            self._sm70_rmsnorm_gated_exact
-            and not envs.VLLM_BATCH_INVARIANT
-            and x.is_cuda
-            and _sm70_gated_norm_device_supported(x.device.index)
-            and self.group_size is None
-            and self.norm_before_gate
-            and self.activation in ("sigmoid", "silu", "swish")
-            and _sm70_gated_norm_shape_supported(x, z, self.weight)
-        ):
-            return torch.ops.vllm.sm70_rmsnorm_gated_exact(
-                x, z, self.weight, self.eps, self.activation != "sigmoid"
-            )
+        output = maybe_gated_norm(
+            x,
+            z,
+            self.weight,
+            self.eps,
+            enabled=self._sm70_rmsnorm_gated_exact,
+            batch_invariant=envs.VLLM_BATCH_INVARIANT,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            activation=self.activation,
+        )
+        if output is not None:
+            return output
         return self.forward_static(
             x,
             z,
@@ -431,6 +430,22 @@ class RMSNormGated(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
+        output = maybe_gated_norm(
+            x,
+            z,
+            self.weight,
+            self.eps,
+            enabled=self._sm70_rmsnorm_gated_exact,
+            batch_invariant=envs.VLLM_BATCH_INVARIANT,
+            group_size=self.group_size,
+            bias=self.bias,
+            norm_before_gate=self.norm_before_gate,
+            activation=self.activation,
+            require_extension=True,
+        )
+        if output is not None:
+            return output
+
         from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
 
         return rmsnorm_fn(

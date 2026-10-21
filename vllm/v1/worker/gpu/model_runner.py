@@ -274,6 +274,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                feedback_depth=vllm_config.max_concurrent_batches,
             )
         # Prefix-anchored SWA: persistent GPU buffer for per-request prompt
         # lengths (stable device address across steps).
@@ -1013,6 +1014,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert sampled_tokens is not None
         assert num_sampled is not None
         assert num_rejected is not None
+        # PP_DELAYED_MAMBA_REQUEST_ROWS
+        # Align-state migration indexes the persistent input block tables by
+        # batch row. Deferred PP feedback refers to an older microbatch, while
+        # those tables currently contain the most recently executed microbatch.
+        # Rebuild its rows from the stable request-owned block tables before
+        # committing recurrent state. The next prepare_attn rebuilds current
+        # forward rows as usual.
+        if self.cache_config.mamba_cache_mode == "align":
+            # Freed/excluded requests use -1 and are skipped by postprocess.
+            # The gather kernel does not accept -1, so gather an unused safe row
+            # for those entries while retaining the original commit mask.
+            self.block_tables.gather_block_tables(
+                idx_mapping.clamp_min(0), num_reqs_padded=idx_mapping.shape[0]
+            )
         self.postprocess_sampled(
             idx_mapping,
             sampled_tokens,
