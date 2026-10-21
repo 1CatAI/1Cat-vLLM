@@ -40,10 +40,16 @@ STATE_BLOCKS=$((1 + 8 * MAX_NUM_SEQS + 4 * (MAX_NUM_SEQS < 2 ? MAX_NUM_SEQS : 2)
 # Windows past the native length hold a 4x larger indexer history on the GPU:
 # halve the prefill chunk (activation peak) and trim the hot cache to fit 16 GB.
 PREFILL_CHUNK=8192 HOT_TOKENS=32768 STAGE_TOKENS=525504 EXPERT_FRACTION=0.8
-# More than four concurrent requests hold more recurrent states and larger
-# verification graphs: halve the prefill chunk (activation peak) and stage
-# prefill history in smaller windows to fit.
-if (( MAX_NUM_SEQS > 4 )); then PREFILL_CHUNK=4096 STAGE_TOKENS=131072; fi
+# Concurrent requests hold more recurrent states and larger verification
+# graphs, and prefill shares steps with resident decodes: halve the prefill
+# chunk (activation peak) and stage prefill history in smaller windows to fit.
+if (( MAX_NUM_SEQS > 1 )); then PREFILL_CHUNK=4096 STAGE_TOKENS=131072; fi
+# Sparse attention touches most of each request's history within ~100 decode
+# steps, so the shared hot cache should cover every concurrent context:
+# misses cross PCIe. A smaller state pool leaves room for it on 16 GB cards
+# (two requests: 64K tokens per layer; three or four: 96K; more keep 32K).
+if (( MAX_NUM_SEQS == 2 )); then HOT_TOKENS=65536
+elif (( MAX_NUM_SEQS >= 3 && MAX_NUM_SEQS <= 4 )); then HOT_TOKENS=98304; fi
 # Prefill sharing a step with resident decodes keeps at least half a chunk:
 # the adaptive budget charges the decodes' fixed cost to the prefill tokens
 # and would otherwise shrink to a few tokens per step.
