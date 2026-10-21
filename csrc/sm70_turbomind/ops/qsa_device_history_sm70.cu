@@ -804,20 +804,17 @@ __global__ void merge(Args a) {
 }
 }  // namespace device_qsa
 
-void device_qsa_out(torch::Tensor q, torch::Tensor history,
-                    torch::Tensor scales, torch::Tensor indices,
-                    torch::Tensor table, torch::Tensor requests,
-                    torch::Tensor positions, torch::Tensor lengths,
-                    torch::Tensor out, std::optional<torch::Tensor> gate,
-                    torch::Tensor partial, torch::Tensor state,
-                    std::optional<torch::Tensor> hot = std::nullopt,
-                    std::optional<torch::Tensor> resolved = std::nullopt,
-                    int64_t tiles = 1, bool prefill = false,
-                    int64_t whole_rows = 0,
-                    std::optional<torch::Tensor> hot_scales = std::nullopt,
-                    bool window = false,
-                    std::optional<torch::Tensor> window_out = std::nullopt,
-                    std::optional<torch::Tensor> window_state = std::nullopt) {
+void device_qsa_out(
+    torch::Tensor q, torch::Tensor history, torch::Tensor scales,
+    torch::Tensor indices, torch::Tensor table, torch::Tensor requests,
+    torch::Tensor positions, torch::Tensor lengths, torch::Tensor out,
+    std::optional<torch::Tensor> gate, torch::Tensor partial,
+    torch::Tensor state, std::optional<torch::Tensor> hot = std::nullopt,
+    std::optional<torch::Tensor> resolved = std::nullopt, int64_t tiles = 1,
+    bool prefill = false, int64_t whole_rows = 0,
+    std::optional<torch::Tensor> hot_scales = std::nullopt, bool window = false,
+    std::optional<torch::Tensor> window_out = std::nullopt,
+    std::optional<torch::Tensor> window_state = std::nullopt) {
   const c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
               q.size(0) > 0 && (whole_rows || q.size(0) <= 64) &&
@@ -899,21 +896,23 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
   a.window = window ? 1 : 0;
   TORCH_CHECK(window_out.has_value() == window_state.has_value());
   if (window_out) {
-    TORCH_CHECK(!whole_rows && window_out->scalar_type() == at::kFloat &&
-                    window_state->scalar_type() == at::kFloat &&
-                    window_out->is_contiguous() && window_state->is_contiguous() &&
-                    window_out->numel() == q.size(0) * 6 * 256 &&
-                    window_state->numel() == q.size(0) * 6 * 2,
-                "QSA window merge needs FP32 [M, 6, 256] rows and [M, 6, 2] state");
+    TORCH_CHECK(
+        !whole_rows && window_out->scalar_type() == at::kFloat &&
+            window_state->scalar_type() == at::kFloat &&
+            window_out->is_contiguous() && window_state->is_contiguous() &&
+            window_out->numel() == q.size(0) * 6 * 256 &&
+            window_state->numel() == q.size(0) * 6 * 2,
+        "QSA window merge needs FP32 [M, 6, 256] rows and [M, 6, 2] state");
   }
   a.wout = window_out ? window_out->data_ptr<float>() : nullptr;
   a.wstate = window_state ? window_state->data_ptr<float>() : nullptr;
-  TORCH_CHECK(!window || (whole_rows && partial.scalar_type() == at::kFloat &&
-                          state.scalar_type() == at::kFloat &&
-                          partial.is_contiguous() && state.is_contiguous() &&
-                          partial.numel() >= q.size(0) * 6 * 256 &&
-                          state.numel() >= q.size(0) * 6 * 2),
-              "QSA window rows need FP32 [M, 6, 256] partial and [M, 6, 2] state");
+  TORCH_CHECK(
+      !window ||
+          (whole_rows && partial.scalar_type() == at::kFloat &&
+           state.scalar_type() == at::kFloat && partial.is_contiguous() &&
+           state.is_contiguous() && partial.numel() >= q.size(0) * 6 * 256 &&
+           state.numel() >= q.size(0) * 6 * 2),
+      "QSA window rows need FP32 [M, 6, 256] partial and [M, 6, 2] state");
   a.M = q.size(0);
   a.blocks = history.size(0);
   a.page = history.size(2);
@@ -1121,7 +1120,8 @@ TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
   // One window of a staged-in-parts history: window-normalized FP32 rows
   // and per-head (max, sum); qsa_merge_windows combines the windows.
   m.def(
-      "run_rows_window(Tensor q, Tensor history, Tensor scales, Tensor indices, "
+      "run_rows_window(Tensor q, Tensor history, Tensor scales, Tensor "
+      "indices, "
       "Tensor table, Tensor requests, Tensor positions, Tensor lengths, "
       "Tensor(a!) partial, Tensor(b!) state, int occupancy=12) -> ()");
   m.impl("run_rows_window", torch::kCUDA,
@@ -1131,9 +1131,9 @@ TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
             torch::Tensor partial, torch::Tensor state, int64_t occupancy) {
            // Window rows write only partial/state; `q` stands in for out.
            device_qsa_out(q, history, scales, indices, table, requests,
-                          positions, lengths, q, std::nullopt, partial,
-                          state, std::nullopt, std::nullopt, 1, true,
-                          occupancy, std::nullopt, true);
+                          positions, lengths, q, std::nullopt, partial, state,
+                          std::nullopt, std::nullopt, 1, true, occupancy,
+                          std::nullopt, true);
          });
   // run_tiled over one window of a staged-in-parts history (FP16 draft):
   // window-normalized FP32 rows and per-head (max, sum) for
@@ -1144,32 +1144,30 @@ TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
       "Tensor lengths, Tensor(a!) partial, Tensor(b!) state, "
       "Tensor(c!) window_out, Tensor(d!) window_state, int step, "
       "int tiles=1) -> ()");
-  m.impl("run_tiled_window", torch::kCUDA,
-         [](torch::Tensor q, torch::Tensor history, torch::Tensor scales,
-            torch::Tensor indices, torch::Tensor table, torch::Tensor requests,
-            torch::Tensor positions, torch::Tensor lengths,
-            torch::Tensor partial, torch::Tensor state,
-            torch::Tensor window_out, torch::Tensor window_state, int64_t step,
-            int64_t tiles) {
-           TORCH_CHECK(step > 0 && step <= 64);
-           const int64_t rows = q.size(0);
-           TORCH_CHECK(indices.size(0) == rows && requests.size(0) == rows &&
-                       positions.size(0) == rows &&
-                       window_out.size(0) == rows &&
-                       window_state.size(0) == rows);
-           for (int64_t start = 0; start < rows; start += step) {
-             const int64_t n = std::min(step, rows - start);
-             // Window rows write only window_out/state; `q` stands in for out.
-             device_qsa_out(q.narrow(0, start, n), history, scales,
-                            indices.narrow(0, start, n), table,
-                            requests.narrow(0, start, n),
-                            positions.narrow(0, start, n), lengths,
-                            q.narrow(0, start, n), std::nullopt, partial, state,
-                            std::nullopt, std::nullopt, tiles, true, 0,
-                            std::nullopt, false, window_out.narrow(0, start, n),
-                            window_state.narrow(0, start, n));
-           }
-         });
+  m.impl(
+      "run_tiled_window", torch::kCUDA,
+      [](torch::Tensor q, torch::Tensor history, torch::Tensor scales,
+         torch::Tensor indices, torch::Tensor table, torch::Tensor requests,
+         torch::Tensor positions, torch::Tensor lengths, torch::Tensor partial,
+         torch::Tensor state, torch::Tensor window_out,
+         torch::Tensor window_state, int64_t step, int64_t tiles) {
+        TORCH_CHECK(step > 0 && step <= 64);
+        const int64_t rows = q.size(0);
+        TORCH_CHECK(indices.size(0) == rows && requests.size(0) == rows &&
+                    positions.size(0) == rows && window_out.size(0) == rows &&
+                    window_state.size(0) == rows);
+        for (int64_t start = 0; start < rows; start += step) {
+          const int64_t n = std::min(step, rows - start);
+          // Window rows write only window_out/state; `q` stands in for out.
+          device_qsa_out(
+              q.narrow(0, start, n), history, scales,
+              indices.narrow(0, start, n), table, requests.narrow(0, start, n),
+              positions.narrow(0, start, n), lengths, q.narrow(0, start, n),
+              std::nullopt, partial, state, std::nullopt, std::nullopt, tiles,
+              true, 0, std::nullopt, false, window_out.narrow(0, start, n),
+              window_state.narrow(0, start, n));
+        }
+      });
   // Host-authoritative history with a protected device hot cache: resolved
   // tokens read the hot copy, the rest read mapped host history directly.
   m.def(

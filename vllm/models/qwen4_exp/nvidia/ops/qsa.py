@@ -1761,7 +1761,7 @@ def qsa_select_paged_tokens(
                 sparse_policy().qsa_decode_partition_topk
                 and q.shape[0] in (5, 10)
                 and page_table.shape[0] == 1
-                and 32768 <= score_columns <= 69632
+                and score_columns >= 32768
             ):
                 from .qsa_partition_topk import qsa_partition_topk
 

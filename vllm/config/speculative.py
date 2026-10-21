@@ -124,7 +124,6 @@ def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
     )
 
 
-
 def match_target_rope_scaling(target, draft) -> bool:
     """Rotate MTP draft positions exactly like a window-extended target.
 

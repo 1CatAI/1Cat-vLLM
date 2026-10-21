@@ -969,8 +969,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
 
     def _windowed_rows(
-        self, windows, query, indices, table, requests, positions, lengths,
-        output, gate, workspace,
+        self,
+        windows,
+        query,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        output,
+        gate,
+        workspace,
     ) -> None:
         from .ops.device_kv_attention import PREFILL_ROWS
         from .ops.host_kv import merge_windows
@@ -1183,8 +1192,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 windows = plans[window_key]
                 if windows:
                     self._windowed_rows(
-                        windows, query, indices, table, requests, positions,
-                        lengths, output, gate, workspace,
+                        windows,
+                        query,
+                        indices,
+                        table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate,
+                        workspace,
                     )
                     logger.info_once(
                         "QSA prefill stages host history in %d windows.",

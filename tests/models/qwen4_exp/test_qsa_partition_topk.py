@@ -9,7 +9,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa_partition_topk import qsa_partition_to
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("rows", [5, 10])
-@pytest.mark.parametrize("columns", [32768, 65600, 69632])
+@pytest.mark.parametrize("columns", [32768, 65600, 69632, 131072, 262144])
 def test_partition_preserves_exact_selection_guards_and_dynamic_replay(rows, columns):
     torch.manual_seed(20261015)
     logits = torch.randn(rows, columns + 19, device="cuda")[:, :columns]
