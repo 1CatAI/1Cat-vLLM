@@ -1262,8 +1262,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 ) in enumerate(expert_params_mapping):
                     if weight_name not in name:
                         continue
+                    # The mapping swallows the dot before `weight_scale`, so
+                    # the csf32 suffix is read off the checkpoint name.
+                    checkpoint_name = name
                     name = name.replace(weight_name, param_name)
-                    if _CSF_SCALE_PART in name:
+                    if _CSF_SCALE_PART in checkpoint_name:
                         experts_prefix = name.rsplit(param_name, 1)[0] + param_name
                         experts_prefix = experts_prefix.removesuffix(".w13_")
                         experts_prefix = experts_prefix.removesuffix(".w2_")
@@ -1275,7 +1278,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                             experts,
                             expert_id,
                             expert_shard_id,
-                            name.rsplit(_CSF_SCALE_PART, 1)[1],
+                            checkpoint_name.rsplit(_CSF_SCALE_PART, 1)[1],
                             loaded_weight,
                         )
                         break
