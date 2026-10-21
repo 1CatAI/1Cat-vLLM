@@ -497,6 +497,31 @@ def test_nvfp4_sm70_moe_owns_routing_without_generic_modular_wrapper():
     assert method.maybe_make_prepare_finalize() is None
 
 
+def test_nvfp4_sm70_moe_creates_uncompressed_expert_scales(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    method = ModelOptNvFp4SM70MoEMethod(
+        quant_config=ModelOptNvFp4Config(
+            quant_method="W4A16_NVFP4",
+            is_checkpoint_nvfp4_serialized=True,
+        ),
+        moe_config=_moe_contract(is_act_and_mul=True),
+    )
+    layer = torch.nn.Module()
+
+    method.create_weights(
+        layer, 8, 256, 128, torch.float16, weight_loader=None, global_num_experts=8
+    )
+
+    assert layer.w13_weight_scale.dtype == torch.float8_e4m3fn
+    assert layer.w2_weight_scale.shape == (8, 256, 128 // 16)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires an exact SM70 CUDA device",
