@@ -151,3 +151,53 @@ def test_prepare_weights_skips_filtering_without_index(tmp_path) -> None:
     *_, indexed_weights_by_file = _prepare(tmp_path, load_format="safetensors")
 
     assert indexed_weights_by_file is None
+
+
+def _write_subfolder_checkpoint(tmp_path) -> None:
+    """GLM-5.3-Flash-FP4-Local layout: one indexed shard lives in a subfolder."""
+    (tmp_path / "tensors").mkdir()
+    save_file({"main.weight": torch.tensor([1.0])}, tmp_path / "model.safetensors")
+    native = tmp_path / "tensors" / "native.safetensors"
+    save_file({"native.weight": torch.tensor([2.0])}, native)
+    _write_index(
+        tmp_path,
+        {
+            "main.weight": "model.safetensors",
+            "native.weight": "tensors/native.safetensors",
+        },
+    )
+
+
+@pytest.mark.parametrize("load_strategy", [None, "lazy", "eager"])
+def test_default_loader_reads_indexed_shards_in_subfolders(
+    tmp_path, load_strategy: str | None
+) -> None:
+    # A top-level glob misses the subfolder shard; without it the tensors it
+    # holds would stay unloaded without any error.
+    _write_subfolder_checkpoint(tmp_path)
+    loader = DefaultModelLoader(
+        LoadConfig(
+            load_format="safetensors",
+            safetensors_load_strategy=load_strategy,
+            use_tqdm_on_load=False,
+        )
+    )
+    source = DefaultModelLoader.Source(
+        model_or_path=str(tmp_path), revision=None, fall_back_to_pt=False
+    )
+
+    weights = dict(loader._get_weights_iterator(source))
+
+    assert sorted(weights) == ["main.weight", "native.weight"]
+    torch.testing.assert_close(weights["native.weight"], torch.tensor([2.0]))
+
+
+def test_prepare_weights_fails_when_an_indexed_shard_is_missing(tmp_path) -> None:
+    save_file({"main.weight": torch.tensor([1.0])}, tmp_path / "model.safetensors")
+    _write_index(
+        tmp_path,
+        {"main.weight": "model.safetensors", "gone.weight": "model-00002.safetensors"},
+    )
+
+    with pytest.raises(RuntimeError, match="would not be loaded"):
+        _prepare(tmp_path, load_format="safetensors")
