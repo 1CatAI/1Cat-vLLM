@@ -14,7 +14,6 @@ import torch
 
 from tests.quantization.utils import is_quant_method_supported
 from vllm.config.model import ModelConfig
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
@@ -110,7 +109,10 @@ def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
 
     method = config.get_quant_method(_mock_lm_head(), prefix="lm_head")
 
-    assert isinstance(method, UnquantizedLinearMethod)
+    # None: the head keeps its own UnquantizedEmbeddingMethod, as with
+    # compressed-tensors. The linear method's weight preparation reads the
+    # per-layer policies only LinearBase captures.
+    assert method is None
 
 
 def test_modelopt_mixed_precision_quantizes_parallel_lm_head():
