@@ -921,6 +921,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("paged_prefill_attention_sm75", torch::kCUDA,
            &paged_prefill_attention_sm75);
 
+  // Lightning-indexer prefill scores (scores, relu, head weights, head sum and
+  // key scales in one pass) on Turing's m16n8k8 tensor cores.
+  ops.def(
+      "indexer_prefill_scores_sm75(Tensor(a!) out, Tensor q, Tensor weights, "
+      "Tensor keys, Tensor key_scales) -> ()");
+  ops.impl("indexer_prefill_scores_sm75", torch::kCUDA,
+           &indexer_prefill_scores_sm75);
+
   ops.def(
       "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
