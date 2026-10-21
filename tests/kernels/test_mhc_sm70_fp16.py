@@ -24,7 +24,7 @@ class _FakeCudaPlatform:
     def is_cuda(self) -> bool:
         return True
 
-    def get_device_capability(self) -> DeviceCapability:
+    def get_device_capability(self, device_id: int | None = None) -> DeviceCapability:
         return DeviceCapability(8 if self.supports_bf16 else 7, 0)
 
 

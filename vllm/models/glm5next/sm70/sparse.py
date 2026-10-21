@@ -77,7 +77,7 @@ class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 7 and capability.minor in (0, 2)
+        return capability.major == 7
 
     @classmethod
     def supports_combination(

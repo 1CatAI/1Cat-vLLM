@@ -8,6 +8,9 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm.config import get_current_vllm_config
+from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+    Mxfp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.nvfp4.base import (
     NvFp4LinearKernel,
     NvFp4LinearLayerConfig,
@@ -24,15 +27,20 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-def _turing_supported(compute_capability=None):
-    if not current_platform.is_cuda():
-        return False, "requires CUDA"
+def _device_capability(compute_capability=None):
+    """The given capability, or that of this process's current device."""
     if compute_capability is None:
         capability = current_platform.get_device_capability(
             torch.accelerator.current_device_index()
         )
         compute_capability = capability.to_int() if capability else None
-    if compute_capability != 75:
+    return compute_capability
+
+
+def _turing_supported(compute_capability=None):
+    if not current_platform.is_cuda():
+        return False, "requires CUDA"
+    if _device_capability(compute_capability) != 75:
         return False, "requires Turing SM75; Volta retains its existing kernel"
     return True, None
 
@@ -93,6 +101,24 @@ class TuringQpn2NvFp4LinearKernel(NvFp4LinearKernel):
         return tm.apply_prepared_linear(layer, x, bias)
 
 
+_QPN8_FP8_OPERATORS = (
+    "fp8_qpn8_prepare_sm70",
+    "fp8_qpn8_dispatch_sm70_out",
+    "fp8_qpn8_prefill_sm70_out",
+)
+
+
+def _qpn8_fp8_available():
+    policy = get_current_vllm_config().kernel_config.sm70_fp8
+    policy.resolve()
+    if not policy.enabled or policy.force_marlin:
+        return False, "QPN8 disabled by KernelConfig or legacy backend override"
+    missing = [name for name in _QPN8_FP8_OPERATORS if not hasattr(torch.ops._C, name)]
+    if missing:
+        return False, f"missing native operators: {missing}"
+    return True, None
+
+
 class TuringQpn8Fp8LinearKernel(FP8ScaledMMLinearKernel):
     def __init__(self, c, layer_param_names):
         # Activations remain FP16; no hardware FP8 activation quantizer is used.
@@ -104,10 +130,9 @@ class TuringQpn8Fp8LinearKernel(FP8ScaledMMLinearKernel):
 
     @classmethod
     def can_implement(cls, c):
-        policy = get_current_vllm_config().kernel_config.sm70_fp8
-        policy.resolve()
-        if not policy.enabled or policy.force_marlin:
-            return False, "QPN8 disabled by KernelConfig or legacy backend override"
+        available, reason = _qpn8_fp8_available()
+        if not available:
+            return False, reason
         if c.input_dtype != torch.float16 or c.out_dtype != torch.float16:
             return False, "requires FP16 input and output"
         if c.weight_quant_key != kFp8StaticTensorSym:
@@ -117,17 +142,6 @@ class TuringQpn8Fp8LinearKernel(FP8ScaledMMLinearKernel):
         n, k = c.weight_shape
         if n <= 0 or k <= 0 or n % 32 or k % 128:
             return False, "requires positive N divisible by 32 and K divisible by 128"
-        missing = [
-            name
-            for name in (
-                "fp8_qpn8_prepare_sm70",
-                "fp8_qpn8_dispatch_sm70_out",
-                "fp8_qpn8_prefill_sm70_out",
-            )
-            if not hasattr(torch.ops._C, name)
-        ]
-        if missing:
-            return False, f"missing native operators: {missing}"
         return True, None
 
     def process_weights_after_loading(self, layer):
@@ -142,6 +156,36 @@ class TuringQpn8Fp8LinearKernel(FP8ScaledMMLinearKernel):
 
     def apply_scaled_mm(self, **kwargs):
         raise NotImplementedError("QPN8 consumes prepared weights and FP16 input")
+
+
+class Qpn8Mxfp8LinearKernel(Mxfp8LinearKernel):
+    """MXFP8 weights as 8-bit QPN8 codes with row-group scales.
+
+    Volta and Turing have no MXFP8 GEMM; TurboMind's FP8 kernel has no 1x32
+    E8M0 layout, so both architectures use the QPN8 GEMV for decode and its
+    dequantizing cuBLAS prefill."""
+
+    @classmethod
+    def is_supported(cls, compute_capability=None):
+        if not current_platform.is_cuda():
+            return False, "requires CUDA"
+        if _device_capability(compute_capability) not in (70, 75):
+            return False, "requires Volta SM70 or Turing SM75"
+        return True, None
+
+    @classmethod
+    def can_implement(cls, c):
+        return _qpn8_fp8_available()
+
+    def process_weights_after_loading(self, layer):
+        tm.prepare_mxfp8_qpn8_linear(layer, layer.weight, layer.weight_scale)
+        layer.weight = Parameter(layer.weight.new_empty(0), requires_grad=False)
+        layer.weight_scale = Parameter(
+            layer.weight_scale.new_empty(0), requires_grad=False
+        )
+
+    def apply_weights(self, layer, x, bias=None):
+        return tm.apply_prepared_fp8_qpn8_linear(layer, x, bias)
 
 
 def _turing_fp8_qpn8_linear(

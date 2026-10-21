@@ -737,9 +737,69 @@ def prepare_fp8_qpn8_dense_linear(
     so the scale is broadcast over the rows; the dequantization is then the
     same product the reference path computes.
     """
+    n = int(weight.shape[0])
+    prepare_fp8_qpn8_channel_linear(
+        layer,
+        weight,
+        weight_scale.to(torch.float32).reshape(1, 1).expand(n, 1).contiguous(),
+    )
+
+
+def prepare_fp8_qpn8_channel_linear(
+    layer: torch.nn.Module, weight: torch.Tensor, channel_scales: torch.Tensor
+) -> None:
+    """Prepare an fp8-e4m3fn ``[N, K]`` linear with FP32 ``[N, 1]`` row scales."""
+    n = int(weight.shape[0])
+    if channel_scales.shape != (n, 1) or channel_scales.dtype != torch.float32:
+        raise RuntimeError(
+            f"QPN8 needs FP32 channel scales of shape ({n}, 1), got "
+            f"{tuple(channel_scales.shape)} {channel_scales.dtype}."
+        )
+    _prepare_fp8_qpn8_linear(layer, weight, channel_scales)
+
+
+# QPN8 stores each scale times 256 in FP16; E8M0 exponents outside this range
+# would leave the normal FP16 range there and lose precision.
+MXFP8_QPN8_EXPONENT_RANGE = (127 - 14 - 8, 127 + 15 - 8)
+
+
+def prepare_mxfp8_qpn8_linear(
+    layer: torch.nn.Module, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> None:
+    """Prepare an MXFP8 linear: fp8-e4m3fn ``[N, K]`` codes with uint8 E8M0
+    ``[N, K/32]`` scales, one per row and 32-wide K group. The codes stay 8-bit;
+    the scales become QPN8 row-group scales, exact for powers of two."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        _upcast_e8m0_to_fp32,
+    )
+
+    n, k = (int(dim) for dim in weight.shape)
+    if weight_scale.shape != (n, k // 32) or weight_scale.dtype != torch.uint8:
+        raise RuntimeError(
+            f"MXFP8 QPN8 needs uint8 E8M0 scales of shape ({n}, {k // 32}), got "
+            f"{tuple(weight_scale.shape)} {weight_scale.dtype}."
+        )
+    low, high = MXFP8_QPN8_EXPONENT_RANGE
+    exponents = weight_scale.view(torch.uint8)
+    smallest, largest = int(exponents.min()), int(exponents.max())
+    if smallest < low or largest > high:
+        raise RuntimeError(
+            f"MXFP8 exponents {smallest}..{largest} leave the exact QPN8 range "
+            f"{low}..{high}."
+        )
+    _prepare_fp8_qpn8_linear(
+        layer, weight, _upcast_e8m0_to_fp32(exponents).contiguous()
+    )
+
+
+def _prepare_fp8_qpn8_linear(
+    layer: torch.nn.Module, weight: torch.Tensor, scales: torch.Tensor
+) -> None:
+    """Pack ``[N, K]`` fp8-e4m3fn codes with FP32 row ``[N, 1]`` or row-group
+    ``[N, K/32]`` scales and attach the QPN8 state to ``layer``."""
     if not hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
         raise RuntimeError(
-            "The Turing FP8 QPN8 path requires a build with CUDA arch 7.0 and "
+            "The FP8 QPN8 path requires a build with CUDA arch 7.0 and "
             "the SM70 TurboMind FP8 extension."
         )
     from vllm import _sm70_ops as sm70_ops
@@ -747,12 +807,7 @@ def prepare_fp8_qpn8_dense_linear(
     n, k = (int(dim) for dim in weight.shape)
     if n % 32 != 0 or k % 16 != 0:
         raise RuntimeError(f"QPN8 needs N % 32 == 0 and K % 16 == 0, got N={n}, K={k}.")
-    channel_scales = (
-        weight_scale.to(torch.float32).reshape(1, 1).expand(n, 1).contiguous()
-    )
-    codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(
-        weight.contiguous(), channel_scales
-    )
+    codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(weight.contiguous(), scales)
     layer.register_buffer("_sm70_turing_fp8_packed_codes", codes, persistent=False)
     layer.register_buffer(
         "_sm70_turing_fp8_packed_scales", group_scales, persistent=False
