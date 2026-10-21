@@ -897,7 +897,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            vllm::sm70::with_policy(&nvfp4_qpn2_gemm_sm70_out));
 
   // Skinny QPN GEMM and grouped NVFP4/MXFP4 MoE (SM70/SM75), weights
-  // prepacked in mma.m8n8k4 fragment order.
+  // prepacked in mma.m8n8k4 fragment order; the grouped MoE also runs on
+  // mma.m16n8k8 order (SM75 and later).
   ops.def(
       "skinny_qpn_gemm_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
       "float gscale, int n) -> Tensor");
@@ -907,7 +908,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "skinny_moe_qpn_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
       "Tensor gscales, Tensor perm, Tensor gids, Tensor goff, int topk, "
       "Tensor(a!) y_slots, bool x_slot_major, int num_tokens, int splitk, "
-      "int nacc, int scale_mode) -> ()");
+      "int nacc, int scale_mode, int fragment_order) -> ()");
   ops.impl("skinny_moe_qpn_sm70", torch::kCUDA, &skinny_moe_qpn_sm70);
 
   ops.def(

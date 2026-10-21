@@ -6,9 +6,10 @@
 // mode added by its contributors. See LICENSE.v100-skinny in this directory
 // for the retained MIT notice.
 //
-// Weights are prepacked once at load into mma.m8n8k4 fragment order
-// ([tile N/32][group K/16][lane 32] x 8B codes, one scale byte per lane and
-// scale group); the permutation lives in
+// Weights are prepacked once at load into the fragment order of the card's
+// tensor-core MMA ([tile N/32][group K/16][lane 32] x 8B codes plus 32 scale
+// bytes per tile and scale group): mma.m8n8k4 on SM70, mma.m16n8k8 from SM75
+// on (mma_fragments_sm70.cuh). The permutation lives in
 // vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py.
 
 #include <torch/all.h>
@@ -18,7 +19,16 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 
+#include "mma_fragments_sm70.cuh"
+
 namespace {
+
+using vllm::sm70::fp4x8_to_half2x4;
+using vllm::sm70::mma_m16n8k8;
+
+// Register order the expert weights were packed in (QpnFragmentOrder in
+// skinny_sm70_moe.py).
+enum FragmentOrder { ORDER_M8N8K4 = 0, ORDER_M16N8K8 = 1 };
 
 __device__ __forceinline__ half2 fp8e4m3_to_half2(unsigned char b) {
   const unsigned short hb =
@@ -63,25 +73,13 @@ __device__ __forceinline__ half2 group_scale(const uint8_t* sb, int g) {
   return decode_scale<MODE>(group_scale_byte<MODE>(sb, g));
 }
 
-// XOR swizzle on the low 3 bits of a k-pair index; conflict-free for the
-
-// Alternative e2m1 decoder derived from TurboMind's cvt_f16x8_e2m1
-// (Apache-2.0; 1Cat-vLLM csrc/sm70_turbomind/lmdeploy/src/turbomind/
-// kernels/attention/quantization.h). Shifts sign/EM bits into fp16
-// positions; the 2^14 exponent re-bias is folded into the caller's
-// scale, so no extra multiply. Output half2 pairing is INTERLEAVED:
-// out[i] holds codes (i, i+4) of the 8-code word.
+// Eight e2m1 codes times one scale (the 2^14 decoder re-bias is folded into
+// the caller's scale). out[i] holds codes (i, i+4) of the 8-code word.
 __device__ __forceinline__ void dequant8_tm(unsigned q, half2 sc2p,
                                             half2 out[4]) {
-  constexpr unsigned S = 0x80008000u, EM = 0x0E000E00u;
-  unsigned v0 = ((q << 12) & S) | ((q << 9) & EM);
-  unsigned v1 = ((q << 8) & S) | ((q << 5) & EM);
-  unsigned v2 = ((q << 4) & S) | ((q << 1) & EM);
-  unsigned v3 = (q & S) | ((q >> 3) & EM);
-  out[0] = __hmul2(*reinterpret_cast<half2*>(&v0), sc2p);
-  out[1] = __hmul2(*reinterpret_cast<half2*>(&v1), sc2p);
-  out[2] = __hmul2(*reinterpret_cast<half2*>(&v2), sc2p);
-  out[3] = __hmul2(*reinterpret_cast<half2*>(&v3), sc2p);
+  fp4x8_to_half2x4(q, out);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) out[i] = __hmul2(out[i], sc2p);
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +403,169 @@ __global__ void __launch_bounds__(32 * SPLITK)
   }
 }
 
+// ---------------------------------------------------------------------------
+// Grouped MoE kernel on m16n8k8 fragment-order weights (SM75 and later): the
+// routing, grid rows, split-K warps and output of skinny_nvfp4_moe_qpn, with
+// the weights as the 16-row A operand and the expert's rows as the 8-column B
+// operand (mma_fragments_sm70.cuh). A lane's activation fragment is 8 bytes
+// of its own row, so a warp reads each row slice exactly once and needs no
+// shared-memory stage. The next group's codes, scales and activations load
+// while the current group computes (deeper rings measured slower); RB tiles
+// of 8 rows share each weight decode, and NT adjacent 32-column tiles share
+// each activation load. The decoded weights equal the m8n8k4 path's bit for
+// bit; only the tensor core's summation order differs.
+// ---------------------------------------------------------------------------
+
+template <int SPLITK, int SCALE_MODE, int RB, int NT>
+__global__ void __launch_bounds__(32 * SPLITK) skinny_nvfp4_moe_m16n8k8(
+    const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
+    const float* __restrict__ gscales, const half* __restrict__ x,
+    half* __restrict__ y_slots, const int* __restrict__ perm,
+    const int* __restrict__ gids, const int* __restrict__ goff, int N, int K,
+    int topk, int x_slot_major) {
+  constexpr int ROWS = RB * 8;
+  // 36-float rows put the C fragment stores of a warp into 32 distinct banks.
+  constexpr int CS_ROW = 36;
+  __shared__ const half* xrows[ROWS];
+  __shared__ int slots[ROWS];
+  __shared__ float cs[SPLITK][NT][8 * CS_ROW];
+
+  const int grp = blockIdx.y;
+  const int beg = goff[grp];
+  const int cnt = goff[grp + 1] - beg;
+  if (cnt <= 0) return;  // block-uniform: padding group, no weight read
+  const int e = gids[grp];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile0 = blockIdx.x * NT;
+  const int row_group = lane >> 2;
+  const int k_offset = (lane & 3) * 4;
+  const int G = K >> 4, Gq = G / SPLITK;
+  const int g0 = warp * Gq, gend = g0 + Gq;
+  const size_t tile_index = (size_t)e * (N >> 5) + tile0;
+  const uint2* cb =
+      reinterpret_cast<const uint2*>(qcodes) + tile_index * G * 32 + lane;
+  // Four scale bytes per row group: columns row_group + 8j, j = 0..3.
+  const int SG = (SCALE_MODE == SCALE_MXFP4_E8M0_32) ? (G >> 1) : G;
+  const uint32_t* sb = reinterpret_cast<const uint32_t*>(qscales) +
+                       tile_index * SG * 8 + row_group;
+  const half2 gm2 = __float2half2_rn(gscales[e] * 16384.f);
+
+  for (int base = 0; base < cnt; base += ROWS) {
+    const int rows = min(ROWS, cnt - base);
+    const int blocks = (rows + 7) / 8;
+    __syncthreads();  // previous pass done with slots/xrows/cs
+    if (threadIdx.x < ROWS) {
+      const int m = threadIdx.x;
+      const int slot = m < rows ? perm[beg + base + m] : 0;
+      slots[m] = slot;
+      xrows[m] = m < rows ? x + (size_t)(x_slot_major ? slot : slot / topk) * K
+                          : nullptr;
+    }
+    __syncthreads();
+    const half* xr[RB];
+#pragma unroll
+    for (int bl = 0; bl < RB; bl++) xr[bl] = xrows[bl * 8 + row_group];
+
+    float c[NT][RB][2][4];
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+      for (int bl = 0; bl < RB; bl++)
+#pragma unroll
+        for (int t = 0; t < 2; t++)
+#pragma unroll
+          for (int i = 0; i < 4; i++) c[nt][bl][t][i] = 0.f;
+
+    uint2 q_next[NT], a_next[RB];
+    uint32_t s_next[NT];
+    auto load_group = [&](int g) {
+#pragma unroll
+      for (int nt = 0; nt < NT; nt++) {
+        q_next[nt] = __ldcs(cb + ((size_t)nt * G + g) * 32);
+        s_next[nt] =
+            __ldg(sb + ((size_t)nt * SG +
+                        (SCALE_MODE == SCALE_MXFP4_E8M0_32 ? g >> 1 : g)) *
+                           8);
+      }
+#pragma unroll
+      for (int bl = 0; bl < RB; bl++)
+        a_next[bl] =
+            xr[bl] ? *reinterpret_cast<const uint2*>(xr[bl] + g * 16 + k_offset)
+                   : make_uint2(0, 0);
+    };
+    load_group(g0);
+    for (int g = g0; g < gend; g++) {
+      uint2 q[NT], a[RB];
+      uint32_t s[NT];
+#pragma unroll
+      for (int nt = 0; nt < NT; nt++) {
+        q[nt] = q_next[nt];
+        s[nt] = s_next[nt];
+      }
+#pragma unroll
+      for (int bl = 0; bl < RB; bl++) a[bl] = a_next[bl];
+      if (g + 1 < gend) load_group(g + 1);
+
+#pragma unroll
+      for (int nt = 0; nt < NT; nt++) {
+        // Word t holds A tile t: columns 16t + row_group (scale byte 2t) and
+        // 16t + row_group + 8 (scale byte 2t + 1), interleaved per MMA step.
+#pragma unroll
+        for (int t = 0; t < 2; t++) {
+          const half2 s_lo = __hmul2(
+              decode_scale<SCALE_MODE>((uint8_t)(s[nt] >> (16 * t))), gm2);
+          const half2 s_hi = __hmul2(
+              decode_scale<SCALE_MODE>((uint8_t)(s[nt] >> (16 * t + 8))), gm2);
+          half2 v[4];
+          fp4x8_to_half2x4(t ? q[nt].y : q[nt].x, v);
+          v[0] = __hmul2(v[0], s_lo);
+          v[1] = __hmul2(v[1], s_hi);
+          v[2] = __hmul2(v[2], s_lo);
+          v[3] = __hmul2(v[3], s_hi);
+          const uint32_t* w = reinterpret_cast<const uint32_t*>(v);
+#pragma unroll
+          for (int bl = 0; bl < RB; bl++) {
+            if (bl > 0 && bl >= blocks) break;  // block-uniform
+            mma_m16n8k8(c[nt][bl][t], w[0], w[1], a[bl].x);
+            mma_m16n8k8(c[nt][bl][t], w[2], w[3], a[bl].y);
+          }
+        }
+      }
+    }
+
+#pragma unroll
+    for (int bl = 0; bl < RB; bl++) {
+      if (bl > 0 && bl >= blocks) break;  // block-uniform: barriers match
+      if (bl > 0) __syncthreads();        // previous block done reading cs
+      // C of A tile t: column 16t + row_group (+8 for i >= 2), row
+      // (lane & 3) * 2 + (i & 1) of this 8-row block.
+#pragma unroll
+      for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+        for (int t = 0; t < 2; t++)
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            const int col = 16 * t + row_group + ((i & 2) ? 8 : 0);
+            const int row = (lane & 3) * 2 + (i & 1);
+            cs[warp][nt][row * CS_ROW + col] = c[nt][bl][t][i];
+          }
+      __syncthreads();
+      for (int idx = threadIdx.x; idx < NT * 256; idx += blockDim.x) {
+        const int nt = idx >> 8, row = (idx >> 5) & 7, col = idx & 31;
+        float v = 0.f;
+#pragma unroll
+        for (int split = 0; split < SPLITK; split++)
+          v += cs[split][nt][row * CS_ROW + col];
+        const int out_row = bl * 8 + row;
+        if (out_row < rows)
+          y_slots[(size_t)slots[out_row] * N + (size_t)(tile0 + nt) * 32 +
+                  col] = __float2half(v);
+      }
+    }
+  }
+}
+
 // y_slots[S, N] (S = tokens*topk, slot-major) = x[row(slot)] @ W[expert(slot)]
 // with W in per-expert QPN fragment order (see qpn_prepack).
 
@@ -450,9 +611,17 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
                          torch::Tensor goff, int64_t topk,
                          torch::Tensor y_slots, bool x_slot_major,
                          int64_t num_tokens, int64_t splitk, int64_t nacc,
-                         int64_t scale_mode) {
+                         int64_t scale_mode, int64_t fragment_order) {
   TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
   const c10::cuda::CUDAGuard device_guard(x.device());
+  TORCH_CHECK(fragment_order == ORDER_M8N8K4 || fragment_order == ORDER_M16N8K8,
+              "fragment_order 0 (m8n8k4) or 1 (m16n8k8)");
+  if (fragment_order == ORDER_M16N8K8) {
+    const cudaDeviceProp* props = at::cuda::getDeviceProperties(x.get_device());
+    TORCH_CHECK(props->major * 10 + props->minor >= 75,
+                "m16n8k8 fragment order needs SM75 or later");
+    TORCH_CHECK(nacc == 1, "the m16n8k8 kernel keeps one accumulator set");
+  }
   TORCH_CHECK(x.dim() == 2 && y_slots.dim() == 2,
               "x and output must be matrices");
   for (const auto& tensor :
@@ -463,10 +632,6 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(num_tokens > 0 && topk > 0 && topk <= 65535,
               "positive token count and supported routing width are required");
   TORCH_CHECK(num_tokens <= 65535 / topk, "routing slots exceed CUDA grid-y");
-  TORCH_CHECK(splitk == 8 || splitk == 10 || splitk == 16,
-              "unsupported split-K specialization");
-  TORCH_CHECK(nacc == 1 || (nacc == 2 && splitk != 10),
-              "unsupported accumulator specialization");
   TORCH_CHECK(gscales.dim() == 1 && gscales.numel() > 0,
               "expert scales must be nonempty");
   TORCH_CHECK(qcodes.is_cuda() && qcodes.dtype() == torch::kUInt8 &&
@@ -502,13 +667,72 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(K % 64 == 0 && (K / 16) % splitk == 0,
               "K/16 must split into splitk equal slices");
   TORCH_CHECK(N % 32 == 0, "N % 32");
-  const dim3 grid((unsigned)(N / 32), (unsigned)std::min(S, E));
   auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t mean_rows = (S + E - 1) / E;
+
+  if (fragment_order == ORDER_M16N8K8) {
+    // Tuning sweep 21.10.2026 on the RTX 8000 (DSv4, GLM-5.3 and Flash-Next
+    // expert shapes): two 32-column tiles per CTA sharing each activation
+    // load, and four 8-row tiles per weight decode once experts average more
+    // than 8 rows, cut the prefill GEMMs to 0.59-0.68 of the m8n8k4 kernel
+    // on the same card; decode (one row tile) stays at parity. Four column
+    // tiles gained at most 4 % in prefill and lost 3-5 % in decode; deeper
+    // load rings measured slower.
+    constexpr int kColumnTiles = 2;
+    TORCH_CHECK(N % (32 * kColumnTiles) == 0, "m16n8k8 MoE needs N % 64");
+    const dim3 grid((unsigned)(N / (32 * kColumnTiles)),
+                    (unsigned)std::min(S, E));
+    const bool prefill = mean_rows > 8;
+#define LAUNCH_MOE_M16N8K8_R(SPv, SMv, RBv)                                 \
+  skinny_nvfp4_moe_m16n8k8<SPv, SMv, RBv, kColumnTiles>                     \
+      <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),          \
+          gscales.data_ptr<float>(),                                        \
+          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
+          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
+          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
+          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
+
+#define LAUNCH_MOE_M16N8K8_S(SPv, SMv)   \
+  do {                                   \
+    if (prefill)                         \
+      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 4); \
+    else                                 \
+      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 1); \
+  } while (0)
+
+#define LAUNCH_MOE_M16N8K8(SPv)                       \
+  do {                                                \
+    if (scale_mode == SCALE_MXFP4_E8M0_32)            \
+      LAUNCH_MOE_M16N8K8_S(SPv, SCALE_MXFP4_E8M0_32); \
+    else                                              \
+      LAUNCH_MOE_M16N8K8_S(SPv, SCALE_NVFP4_FP8_16);  \
+  } while (0)
+
+    switch (splitk) {
+      // 4 serves short reductions (K < 2048), whose warps would otherwise get
+      // fewer than 16 groups (grouped_splitk in skinny_sm70_moe.py).
+      case 4:
+        LAUNCH_MOE_M16N8K8(4);
+        break;
+      case 8:
+        LAUNCH_MOE_M16N8K8(8);
+        break;
+      default:
+        TORCH_CHECK(false, "m16n8k8 MoE splitk in {4, 8}");
+    }
+#undef LAUNCH_MOE_M16N8K8
+#undef LAUNCH_MOE_M16N8K8_S
+#undef LAUNCH_MOE_M16N8K8_R
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+
+  const dim3 grid((unsigned)(N / 32), (unsigned)std::min(S, E));
   // Row blocks per weight load, from the mean rows per expert: one block
   // while experts see at most 8 rows (decode), two for prefill chunks. Four
   // need ~80 registers (halving the resident blocks per SM) and more shared
   // memory than the static 48 KiB for SPLITK 16.
-  const int64_t mean_rows = (S + E - 1) / E;
   const int rb = mean_rows > 8 ? 2 : 1;
 
 #define LAUNCH_MOE_QPN_R(SPv, NAv, SMv, RBv)                                \
