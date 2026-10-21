@@ -60,6 +60,7 @@ from vllm.models.deepseek_v41.sm70.sparse import (
     step_metadata,
 )
 from vllm.models.deepseek_v41.sm70.sparse_kernels import logical_to_rows
+from vllm.models.deepseek_v41.sm70 import fixed_m
 
 CANDIDATE_SCORING_ENV = "VLLM_DS41_INDEXER_CANDIDATE_SCORING"
 SCORE_BUDGET_ENV = "VLLM_DS41_ATTN_INDEXER_SCORE_MIB"
@@ -176,7 +177,7 @@ class DeepseekV41Indexer(nn.Module):
             raise RuntimeError(f"{self.prefix}: {n} latents but metadata expects {md.num_latents}")
         # [N, 512] x [512, 128] in FP32 (negligible cost): no FP16 rounding of the latent before the FP4 QAT,
         # which otherwise flips ~0.7 % of index-K records vs the v100-semantic reference
-        k = self.k_norm(torch.mm(latent.float(), wk.float().t()))
+        k = self.k_norm(fixed_m.mm(latent.float(), wk.float().t()))
         export = None
         if self.layer_id == CAND_SOURCE and self.shared.export_ik is not None:
             export = self.shared.export_ik

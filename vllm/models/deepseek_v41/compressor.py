@@ -44,6 +44,7 @@ from vllm.models.deepseek_v41.sm70.sparse import (
     state_cache_spec,
     step_metadata,
 )
+from vllm.models.deepseek_v41.sm70 import fixed_m
 
 
 def rmsnorm_fp32(x: torch.Tensor, weight: torch.Tensor, eps: float = NORM_EPS) -> torch.Tensor:
@@ -70,7 +71,7 @@ def mm_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """x [N, K] fp16 @ weight [M, K]^T -> [N, M] fp32 (FP32 accumulate and output)."""
     if weight.dtype != torch.float16 or x.dtype != torch.float16:
         raise TypeError(f"mm_fp32 wants FP16 operands, got x {x.dtype} weight {weight.dtype}")
-    return torch.mm(x, weight.t(), out_dtype=torch.float32)
+    return fixed_m.mm(x, weight.t(), out_dtype=torch.float32)
 
 
 def mm_fp32_full(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -81,7 +82,7 @@ def mm_fp32_full(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     path (exact products, FP32 accumulate)."""
     if x.dtype == torch.float16:
         return mm_fp32(x, weight)
-    return torch.mm(x.float(), weight.float().t())
+    return fixed_m.mm(x.float(), weight.float().t())
 
 
 def compressed_metadata(name: str) -> DS41CompressedMetadata | None:

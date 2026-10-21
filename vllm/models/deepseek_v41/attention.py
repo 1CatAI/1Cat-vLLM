@@ -80,6 +80,7 @@ from vllm.models.deepseek_v41.sm70.sparse import (
     swa_cache_spec,
 )
 from vllm.models.deepseek_v41.sm70.sparse_kernels import ckv_rope_qat_store
+from vllm.models.deepseek_v41.sm70 import fixed_m
 
 ROPE_MARGIN = 1024          # positions past max_model_len that speculative tokens may reach
 
@@ -230,7 +231,7 @@ class DeepseekV41Attention(nn.Module):
         qr32 = self.q_norm(qr_kv[:, :Q_LORA])           # FP32; the indexer's q GEMM consumes it un-rounded
         qr = qr32.to(torch.float16)
         kv = self.kv_norm(qr_kv[:, Q_LORA:])
-        q = torch.mm(qr, w_qb.t()).view(T, self.n_local_heads, HEAD_DIM)
+        q = fixed_m.mm(qr, w_qb.t()).view(T, self.n_local_heads, HEAD_DIM)
         q_rope_kv_insert(q, kv, pos, self.rotary_emb.cos_sin_cache, self.swa_cache.rows(),
                          swa_md.slot_mapping, impl=impl)
         st["q"], st["qr32"] = q, qr32

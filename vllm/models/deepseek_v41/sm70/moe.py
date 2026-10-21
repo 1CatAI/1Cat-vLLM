@@ -49,6 +49,7 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear, RowPar
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common import contracts as C
+from vllm.models.deepseek_v41.sm70 import fixed_m
 
 from . import gemv as v41_gemv
 from . import moe_kernels as mk
@@ -228,7 +229,7 @@ class DeepseekV41MoE(nn.Module):
             return x.float() @ self.gate.true_weight_fp32().t()
         if self.decode_gemv and x.shape[0] <= v41_gemv.MAX_GEMV_ROWS:
             return v41_gemv.gemv(x, self.gate.weight, alpha=alpha)
-        return torch.mm(x, self.gate.weight.t(), out_dtype=torch.float32).mul_(alpha)
+        return fixed_m.mm(x, self.gate.weight.t(), out_dtype=torch.float32).mul_(alpha)
 
     def route(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """FP32 logits [T, E] -> (weights [T, k] f32, ids [T, k] int32)."""
@@ -257,8 +258,8 @@ class DeepseekV41MoE(nn.Module):
         if self.decode_gemv and x.shape[0] <= v41_gemv.MAX_GEMV_ROWS:
             act = v41_gemv.gate_up_swiglu(x, w13, self.swiglu_limit)
             return v41_gemv.down_combine(act, w2, y_slots, topk_w)
-        h = torch.mm(x, w13.t(), out_dtype=torch.float32).half()
-        shared = torch.mm(mk.swiglu_fp32(h, self.swiglu_limit), w2.t(), out_dtype=torch.float32)
+        h = fixed_m.mm(x, w13.t(), out_dtype=torch.float32).half()
+        shared = fixed_m.mm(mk.swiglu_fp32(h, self.swiglu_limit), w2.t(), out_dtype=torch.float32)
         return mk.combine_fp32(y_slots, topk_w, shared)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

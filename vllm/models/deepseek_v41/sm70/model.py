@@ -36,6 +36,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import PPMissingLayer, extract_layer_index, make_layers, maybe_prefix
 from vllm.sequence import IntermediateTensors
+from vllm.models.deepseek_v41.sm70 import fixed_m
 
 from .. import knobs
 from ..common import contracts as C
@@ -552,9 +553,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         """[T,5120] fp16 -> [T,129280] f32: FP16 operands, FP32 accumulate AND FP32 output (§4.1)."""
         weight = self.lm_head.weight
         if hidden_states.is_cuda:
-            local = torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+            local = fixed_m.mm(hidden_states, weight.t(), out_dtype=torch.float32)
         else:   # CPU (unit tests): same math -- FP16 values are exact in FP32
-            local = torch.mm(hidden_states.float(), weight.float().t())
+            local = fixed_m.mm(hidden_states.float(), weight.float().t())
         if get_tensor_model_parallel_world_size() > 1:
             local = tensor_model_parallel_all_gather(local, dim=-1)
         logits = local[:, : self.config.vocab_size]

@@ -52,6 +52,7 @@ from vllm.models.deepseek_v41.sm70.sparse import (
     swa_cache_spec,
 )
 from vllm.models.deepseek_v41.sm70.sparse_kernels import fused_decode_attention
+from vllm.models.deepseek_v41.sm70 import fixed_m
 
 from .model import DeepseekV41Norm, _fp32_param, map_checkpoint_name
 
@@ -129,7 +130,7 @@ class DSparkV41Attention(nn.Module):
         qr_kv = mm_fp32(x, w_qkv)
         qr = inner.q_norm(qr_kv[:, :Q_LORA]).to(torch.float16)
         kv = inner.kv_norm(qr_kv[:, Q_LORA:])
-        q = torch.mm(qr, w_qb.t()).view(x.shape[0], self.n_local_heads, HEAD_DIM)
+        q = fixed_m.mm(qr, w_qb.t()).view(x.shape[0], self.n_local_heads, HEAD_DIM)
         return q, kv
 
     def store_context_kv(self, main_x: torch.Tensor, positions: torch.Tensor, slot_mapping: torch.Tensor) -> None:
