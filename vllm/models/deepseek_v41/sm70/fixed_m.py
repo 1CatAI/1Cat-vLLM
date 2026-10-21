@@ -14,9 +14,11 @@ This module pads the ROW count of a GEMM to a fixed bucket (<= 16 rows -> 16, on
 otherwise the next multiple of 64) and returns an OWNING tensor of the real rows (``clone``, never a slice view: the
 earlier global torch.mm wrapper returned views and made lone prefills history-dependent). It is applied at the port's own
 GEMM call sites only — compressor.mm_fp32 / mm_fp32_full (attention q/kv, indexer, compressor, DSpark drafter), the
-wq_b projections, the MoE gate and shared expert, the LM head — not to torch globally. Skipped under CUDA-graph capture
-(decode graphs are captured at fixed row counts already). Prefill chunks above 64 rows can still change bucket between
-alone and batched; the residual there measured quantisation-noise sized (KL 0.027 at 47 tokens).
+wq_b projections, the MoE gate and shared expert, the LM head — not to torch globally. It pads under CUDA-graph capture
+too: steps of <= 16 tokens go through the per-layer attention graphs, captured on first use and replayed afterwards, so a
+capture-time skip made the FIRST request (eager, padded) differ from every later one (replay, unpadded) — the
+"alone-vs-alone" effect of 2026-10-20. Prefill chunks above 64 rows can still change bucket between alone and batched; the
+residual there measured quantisation-noise sized (KL 0.027 at 47 tokens).
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ def mm(a: torch.Tensor, b: torch.Tensor, *, out_dtype: torch.dtype | None = None
     """``torch.mm(a, b[, out_dtype])`` with a's row count padded to the bucket; returns an owning [m, N] tensor.
     With the knob off (or under graph capture, or for non-CUDA / non-2-D inputs) it is plain torch.mm."""
     kw = {} if out_dtype is None else {"out_dtype": out_dtype}
-    if not ENABLED or a.dim() != 2 or not a.is_cuda or torch.cuda.is_current_stream_capturing():
+    if not ENABLED or a.dim() != 2 or not a.is_cuda:
         return torch.mm(a, b, **kw)
     m = a.shape[0]
     t = target_rows(m)
