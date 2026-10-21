@@ -183,7 +183,7 @@ __global__ void skinny_nvfp4_qpn(const uint8_t* __restrict__ qcodes,
 // offsets on the device, inactive experts exit before touching their
 // weights, CUDA-graph safe) around the QPN tensor-core dataflow (mma.m8n8k4
 // on fragment-order prepacked weights, SPLITK warps splitting K on one N=32
-// tile, NACC independent accumulator fragments). Weights are prepacked per
+// tile). Weights are prepacked per
 // expert by qpn_prepack: [E][tile N/32][group K/16][lane 32] x 8B codes plus
 // the scale bytes. A rows come through the slot indirection (token-major x
 // for w13, slot-major for w2).
@@ -197,10 +197,11 @@ __global__ void skinny_nvfp4_qpn(const uint8_t* __restrict__ qcodes,
 // ---------------------------------------------------------------------------
 // RB row blocks share one weight load: each group's codes are fetched and
 // dequantized once and feed the MMAs of up to RB x 8 rows, instead of one
-// re-read per 8-row pass. Every row keeps its own accumulators and the same
-// K order, so the result does not depend on RB.
+// re-read per 8-row pass. NT adjacent 32-column tiles share each staged
+// activation fragment. Every row keeps its own accumulators and the same K
+// order, so the result depends on neither RB nor NT.
 
-template <int SPLITK, int NACC, int SCALE_MODE = SCALE_NVFP4_FP8_16, int RB = 1>
+template <int SPLITK, int SCALE_MODE, int RB, int NT>
 __global__ void __launch_bounds__(32 * SPLITK)
     skinny_nvfp4_moe_qpn(const uint8_t* __restrict__ qcodes,
                          const uint8_t* __restrict__ qscales,
@@ -225,11 +226,11 @@ __global__ void __launch_bounds__(32 * SPLITK)
   // share one allocation, which keeps two 512-thread blocks resident on a
   // 64 KiB-shared Turing SM.
   constexpr int XS_BYTES = (RB == 1 ? 1 : SPLITK) * RB * MMAX * XROW * 2;
-  constexpr int CS_BYTES = SPLITK * 256 * 4;
+  constexpr int CS_BYTES = SPLITK * NT * 256 * 4;
   __shared__ __align__(
       16) unsigned char smem[XS_BYTES > CS_BYTES ? XS_BYTES : CS_BYTES];
   auto xs = reinterpret_cast<half(*)[RB][MMAX][XROW]>(smem);
-  auto cs = reinterpret_cast<float (*)[256]>(smem);
+  auto cs = reinterpret_cast<float (*)[NT][256]>(smem);
 
   const int grp = blockIdx.y;
   const int beg = goff[grp];
@@ -238,16 +239,17 @@ __global__ void __launch_bounds__(32 * SPLITK)
   const int e = gids[grp];
 
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int tile = blockIdx.x;
+  const int tile0 = blockIdx.x * NT;
   const int qp = (lane >> 2) & 3;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int G = K >> 4, Gq = G / SPLITK;
   const int g0 = warp * Gq;
+  // Tile nt of the CTA starts nt * G * 32 codes / nt * SG * 32 scales on.
   const uint2* cb = reinterpret_cast<const uint2*>(qcodes) +
-                    ((size_t)e * (N >> 5) + tile) * G * 32 + lane;
+                    ((size_t)e * (N >> 5) + tile0) * G * 32 + lane;
   // MXFP4 keeps one scale per 32 codes, so its table is half as long.
   const int SG = (SCALE_MODE == SCALE_MXFP4_E8M0_32) ? (G >> 1) : G;
-  const uint8_t* sb = qscales + ((size_t)e * (N >> 5) + tile) * SG * 32 + lane;
+  const uint8_t* sb = qscales + ((size_t)e * (N >> 5) + tile0) * SG * 32 + lane;
   const half2 gm2 = __float2half2_rn(gscales[e] * 16384.f);
 
   // An expert with more than ROWS slots (hash routing at decode, large
@@ -264,13 +266,13 @@ __global__ void __launch_bounds__(32 * SPLITK)
       xrows[m] = x + (size_t)(x_slot_major ? slot : slot / topk) * K;
     }
     __syncthreads();
-    float c[RB][NACC][8];
+    float c[NT][RB][8];
 #pragma unroll
-    for (int bl = 0; bl < RB; bl++)
+    for (int nt = 0; nt < NT; nt++)
 #pragma unroll
-      for (int a = 0; a < NACC; a++)
+      for (int bl = 0; bl < RB; bl++)
 #pragma unroll
-        for (int i = 0; i < 8; i++) c[bl][a][i] = 0.f;
+        for (int i = 0; i < 8; i++) c[nt][bl][i] = 0.f;
 
     if constexpr (RB == 1) {
       // Decode (at most 8 rows per expert): staging costs more than the
@@ -278,12 +280,18 @@ __global__ void __launch_bounds__(32 * SPLITK)
       const half* xr = r < rows ? xrows[r] : nullptr;
 #pragma unroll 4
       for (int g = g0; g < g0 + Gq; g++) {
-        const uint2 q2 = __ldcs(cb + (size_t)g * 32);
-        const half2 sc2 = __hmul2(group_scale<SCALE_MODE>(sb, g), gm2);
-        half2 bq[8];
-        dequant8_tm(q2.x, sc2, bq + 0);
-        dequant8_tm(q2.y, sc2, bq + 4);
-        const unsigned* B = reinterpret_cast<const unsigned*>(bq);
+        // Weights first, then the activation row: this order keeps the
+        // unrolled iterations' code loads ahead of their use (the reverse
+        // measured 18 % slower at decode on V100).
+        half2 bq[NT][8];
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+          const uint2 q2 = __ldcs(cb + ((size_t)nt * G + g) * 32);
+          const half2 sc2 = __hmul2(
+              group_scale<SCALE_MODE>(sb + (size_t)nt * SG * 32, g), gm2);
+          dequant8_tm(q2.x, sc2, bq[nt] + 0);
+          dequant8_tm(q2.y, sc2, bq[nt] + 4);
+        }
         uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
         if (xr) {
           a01 = *reinterpret_cast<const uint4*>(xr + g * 16);
@@ -291,10 +299,14 @@ __global__ void __launch_bounds__(32 * SPLITK)
         }
         const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
         const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
-        SKINNY_MMA_8N8K4(c[0][0], A0[0], A0[1], B[0], B[1]);
-        SKINNY_MMA_8N8K4(c[0][1 % NACC], A0[2], A0[3], B[2], B[3]);
-        SKINNY_MMA_8N8K4(c[0][2 % NACC], A1[0], A1[1], B[4], B[5]);
-        SKINNY_MMA_8N8K4(c[0][3 % NACC], A1[2], A1[3], B[6], B[7]);
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+          const unsigned* B = reinterpret_cast<const unsigned*>(bq[nt]);
+          SKINNY_MMA_8N8K4(c[nt][0], A0[0], A0[1], B[0], B[1]);
+          SKINNY_MMA_8N8K4(c[nt][0], A0[2], A0[3], B[2], B[3]);
+          SKINNY_MMA_8N8K4(c[nt][0], A1[0], A1[1], B[4], B[5]);
+          SKINNY_MMA_8N8K4(c[nt][0], A1[2], A1[3], B[6], B[7]);
+        }
       }
     } else {
       // Lane l stages 16 B of row (l >> 2) of each row block per chunk. The
@@ -307,14 +319,18 @@ __global__ void __launch_bounds__(32 * SPLITK)
       // A warp's slice may end on an odd group (K/16 = splitk, for instance),
       // so every read of a chunk's second group is bounded by gend. The guards
       // are uniform across the warp and fall away when Gq is even.
-      uint2 qv[XCH];
-      uint8_t sv[XCH];
+      uint2 qv[XCH][NT];
+      uint8_t sv[XCH][NT];
       auto load_weights = [&](int gc) {
 #pragma unroll
         for (int gi = 0; gi < XCH; gi++) {
           if (gi > 0 && gc + gi >= gend) break;
-          qv[gi] = __ldcs(cb + (size_t)(gc + gi) * 32);
-          sv[gi] = group_scale_byte<SCALE_MODE>(sb, gc + gi);
+#pragma unroll
+          for (int nt = 0; nt < NT; nt++) {
+            qv[gi][nt] = __ldcs(cb + ((size_t)nt * G + gc + gi) * 32);
+            sv[gi][nt] = group_scale_byte<SCALE_MODE>(sb + (size_t)nt * SG * 32,
+                                                      gc + gi);
+          }
         }
       };
       load_weights(g0);
@@ -331,41 +347,47 @@ __global__ void __launch_bounds__(32 * SPLITK)
             v = *reinterpret_cast<const uint4*>(xrows[row] + gc * 16 + scol);
           *reinterpret_cast<uint4*>(&xs[warp][bl][srow][scol]) = v;
         }
-        uint2 q[XCH];
-        uint8_t s[XCH];
+        uint2 q[XCH][NT];
+        uint8_t s[XCH][NT];
 #pragma unroll
         for (int gi = 0; gi < XCH; gi++) {
           if (gi > 0 && gi >= gcnt) break;
-          q[gi] = qv[gi];
-          s[gi] = sv[gi];
+#pragma unroll
+          for (int nt = 0; nt < NT; nt++) {
+            q[gi][nt] = qv[gi][nt];
+            s[gi][nt] = sv[gi][nt];
+          }
         }
         __syncwarp();
         if (gc + XCH < gend) load_weights(gc + XCH);
 #pragma unroll
         for (int gi = 0; gi < XCH; gi++) {
           if (gi > 0 && gi >= gcnt) break;
-          const uint2 q2 = q[gi];
-          const half2 sc2 = __hmul2(decode_scale<SCALE_MODE>(s[gi]), gm2);
-          half2 bq[8];
-          dequant8_tm(q2.x, sc2, bq + 0);
-          dequant8_tm(q2.y, sc2, bq + 4);
-          const unsigned* B = reinterpret_cast<const unsigned*>(bq);
 #pragma unroll
-          for (int bl = 0; bl < RB; bl++) {
-            // Block 0 always has rows; only later blocks can be empty (block-
-            // uniform), and keeping block 0 unguarded leaves RB = 1
-            // branch-free.
-            if (bl > 0 && bl >= blocks) break;
-            const uint4 a01 =
-                *reinterpret_cast<const uint4*>(&xs[warp][bl][r][gi * 16]);
-            const uint4 a23 =
-                *reinterpret_cast<const uint4*>(&xs[warp][bl][r][gi * 16 + 8]);
-            const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
-            const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
-            SKINNY_MMA_8N8K4(c[bl][0], A0[0], A0[1], B[0], B[1]);
-            SKINNY_MMA_8N8K4(c[bl][1 % NACC], A0[2], A0[3], B[2], B[3]);
-            SKINNY_MMA_8N8K4(c[bl][2 % NACC], A1[0], A1[1], B[4], B[5]);
-            SKINNY_MMA_8N8K4(c[bl][3 % NACC], A1[2], A1[3], B[6], B[7]);
+          for (int nt = 0; nt < NT; nt++) {
+            const uint2 q2 = q[gi][nt];
+            const half2 sc2 = __hmul2(decode_scale<SCALE_MODE>(s[gi][nt]), gm2);
+            half2 bq[8];
+            dequant8_tm(q2.x, sc2, bq + 0);
+            dequant8_tm(q2.y, sc2, bq + 4);
+            const unsigned* B = reinterpret_cast<const unsigned*>(bq);
+#pragma unroll
+            for (int bl = 0; bl < RB; bl++) {
+              // Block 0 always has rows; only later blocks can be empty
+              // (block-uniform), and keeping block 0 unguarded leaves RB = 1
+              // branch-free.
+              if (bl > 0 && bl >= blocks) break;
+              const uint4 a01 =
+                  *reinterpret_cast<const uint4*>(&xs[warp][bl][r][gi * 16]);
+              const uint4 a23 = *reinterpret_cast<const uint4*>(
+                  &xs[warp][bl][r][gi * 16 + 8]);
+              const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+              const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+              SKINNY_MMA_8N8K4(c[nt][bl], A0[0], A0[1], B[0], B[1]);
+              SKINNY_MMA_8N8K4(c[nt][bl], A0[2], A0[3], B[2], B[3]);
+              SKINNY_MMA_8N8K4(c[nt][bl], A1[0], A1[1], B[4], B[5]);
+              SKINNY_MMA_8N8K4(c[nt][bl], A1[2], A1[3], B[6], B[7]);
+            }
           }
         }
         __syncwarp();  // chunk consumed before the next one overwrites xs
@@ -378,25 +400,24 @@ __global__ void __launch_bounds__(32 * SPLITK)
 #pragma unroll
     for (int bl = 0; bl < RB; bl++) {
       if (bl > 0 && bl >= blocks) break;  // block-uniform: barriers match
+      if (bl > 0) __syncthreads();        // previous block done reading cs
 #pragma unroll
-      for (int a = 1; a < NACC; a++)
+      for (int nt = 0; nt < NT; nt++)
 #pragma unroll
-        for (int i = 0; i < 8; i++) c[bl][0][i] += c[bl][a][i];
-      if (bl > 0) __syncthreads();  // previous block done reading cs
-#pragma unroll
-      for (int i = 0; i < 8; i++) {
-        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-        const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-        cs[warp][row * 32 + qp * 8 + col] = c[bl][0][i];
-      }
+        for (int i = 0; i < 8; i++) {
+          const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+          const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+          cs[warp][nt][row * 32 + qp * 8 + col] = c[nt][bl][i];
+        }
       __syncthreads();
-      for (int t = threadIdx.x; t < 256; t += blockDim.x) {
+      for (int t = threadIdx.x; t < NT * 256; t += blockDim.x) {
+        const int nt = t >> 8, e2 = t & 255;
         float v = 0.f;
 #pragma unroll
-        for (int w = 0; w < SPLITK; w++) v += cs[w][t];
-        const int row = bl * MMAX + (t >> 5), col = t & 31;
+        for (int w = 0; w < SPLITK; w++) v += cs[w][nt][e2];
+        const int row = bl * MMAX + (e2 >> 5), col = e2 & 31;
         if (row < rows)
-          y_slots[(size_t)slots[row] * N + (size_t)tile * 32 + col] =
+          y_slots[(size_t)slots[row] * N + (size_t)(tile0 + nt) * 32 + col] =
               __float2half(v);
       }
     }
@@ -610,8 +631,8 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
                          torch::Tensor perm, torch::Tensor gids,
                          torch::Tensor goff, int64_t topk,
                          torch::Tensor y_slots, bool x_slot_major,
-                         int64_t num_tokens, int64_t splitk, int64_t nacc,
-                         int64_t scale_mode, int64_t fragment_order) {
+                         int64_t num_tokens, int64_t splitk, int64_t scale_mode,
+                         int64_t fragment_order) {
   TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
   const c10::cuda::CUDAGuard device_guard(x.device());
   TORCH_CHECK(fragment_order == ORDER_M8N8K4 || fragment_order == ORDER_M16N8K8,
@@ -620,7 +641,6 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
     const cudaDeviceProp* props = at::cuda::getDeviceProperties(x.get_device());
     TORCH_CHECK(props->major * 10 + props->minor >= 75,
                 "m16n8k8 fragment order needs SM75 or later");
-    TORCH_CHECK(nacc == 1, "the m16n8k8 kernel keeps one accumulator set");
   }
   TORCH_CHECK(x.dim() == 2 && y_slots.dim() == 2,
               "x and output must be matrices");
@@ -666,23 +686,22 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
               " exceeds the CUDA grid y limit");
   TORCH_CHECK(K % 64 == 0 && (K / 16) % splitk == 0,
               "K/16 must split into splitk equal slices");
-  TORCH_CHECK(N % 32 == 0, "N % 32");
+  // Both kernels give a CTA two 32-column tiles that share each activation
+  // load (tuning sweeps 2026-10-21: RTX 8000 and V100, DSv4, GLM-5.3 and
+  // Flash-Next expert shapes); four tiles gained at most 4 % in prefill and
+  // lost 3-5 % in decode.
+  constexpr int kColumnTiles = 2;
+  TORCH_CHECK(N % (32 * kColumnTiles) == 0, "skinny MoE needs N % 64");
+  const dim3 grid((unsigned)(N / (32 * kColumnTiles)),
+                  (unsigned)std::min(S, E));
   auto stream = at::cuda::getCurrentCUDAStream();
-  const int64_t mean_rows = (S + E - 1) / E;
+  // Experts average more than one 8-row tile in prefill chunks.
+  const bool prefill = (S + E - 1) / E > 8;
 
   if (fragment_order == ORDER_M16N8K8) {
-    // Tuning sweep 21.10.2026 on the RTX 8000 (DSv4, GLM-5.3 and Flash-Next
-    // expert shapes): two 32-column tiles per CTA sharing each activation
-    // load, and four 8-row tiles per weight decode once experts average more
-    // than 8 rows, cut the prefill GEMMs to 0.59-0.68 of the m8n8k4 kernel
-    // on the same card; decode (one row tile) stays at parity. Four column
-    // tiles gained at most 4 % in prefill and lost 3-5 % in decode; deeper
-    // load rings measured slower.
-    constexpr int kColumnTiles = 2;
-    TORCH_CHECK(N % (32 * kColumnTiles) == 0, "m16n8k8 MoE needs N % 64");
-    const dim3 grid((unsigned)(N / (32 * kColumnTiles)),
-                    (unsigned)std::min(S, E));
-    const bool prefill = mean_rows > 8;
+    // RTX 8000: four 8-row tiles per weight decode in prefill cut the GEMMs
+    // to 0.59-0.68 of the m8n8k4 kernel on the same card; decode (one row
+    // tile) stays at parity. Deeper load rings measured slower.
 #define LAUNCH_MOE_M16N8K8_R(SPv, SMv, RBv)                                 \
   skinny_nvfp4_moe_m16n8k8<SPv, SMv, RBv, kColumnTiles>                     \
       <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
@@ -728,15 +747,11 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
     return;
   }
 
-  const dim3 grid((unsigned)(N / 32), (unsigned)std::min(S, E));
-  // Row blocks per weight load, from the mean rows per expert: one block
-  // while experts see at most 8 rows (decode), two for prefill chunks. Four
-  // need ~80 registers (halving the resident blocks per SM) and more shared
-  // memory than the static 48 KiB for SPLITK 16.
-  const int rb = mean_rows > 8 ? 2 : 1;
-
-#define LAUNCH_MOE_QPN_R(SPv, NAv, SMv, RBv)                                \
-  skinny_nvfp4_moe_qpn<SPv, NAv, SMv, RBv>                                  \
+  // V100: two 8-row blocks per weight load in prefill (four helped DSv4 by 1 %
+  // and slowed GLM-5.3 by 6 %), with two column tiles 0.87-0.98 of the
+  // one-tile kernel in prefill and 0.80-0.97 in decode.
+#define LAUNCH_MOE_QPN_R(SPv, SMv, RBv)                                     \
+  skinny_nvfp4_moe_qpn<SPv, SMv, RBv, kColumnTiles>                         \
       <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
           qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),          \
           gscales.data_ptr<float>(),                                        \
@@ -745,48 +760,39 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
           perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
 
-#define LAUNCH_MOE_QPN_S(SPv, NAv, SMv)   \
-  do {                                    \
-    if (rb == 2)                          \
-      LAUNCH_MOE_QPN_R(SPv, NAv, SMv, 2); \
-    else                                  \
-      LAUNCH_MOE_QPN_R(SPv, NAv, SMv, 1); \
+#define LAUNCH_MOE_QPN_S(SPv, SMv)   \
+  do {                               \
+    if (prefill)                     \
+      LAUNCH_MOE_QPN_R(SPv, SMv, 2); \
+    else                             \
+      LAUNCH_MOE_QPN_R(SPv, SMv, 1); \
   } while (0)
 
-#define LAUNCH_MOE_QPN(SPv, NAv)                       \
-  do {                                                 \
-    if (scale_mode == SCALE_MXFP4_E8M0_32)             \
-      LAUNCH_MOE_QPN_S(SPv, NAv, SCALE_MXFP4_E8M0_32); \
-    else                                               \
-      LAUNCH_MOE_QPN_S(SPv, NAv, SCALE_NVFP4_FP8_16);  \
+#define LAUNCH_MOE_QPN(SPv)                       \
+  do {                                            \
+    if (scale_mode == SCALE_MXFP4_E8M0_32)        \
+      LAUNCH_MOE_QPN_S(SPv, SCALE_MXFP4_E8M0_32); \
+    else                                          \
+      LAUNCH_MOE_QPN_S(SPv, SCALE_NVFP4_FP8_16);  \
   } while (0)
 
-  const int key = (int)(splitk * 10 + nacc);
-  switch (key) {
-    case 81:
-      LAUNCH_MOE_QPN(8, 1);
-      break;
-    case 82:
-      LAUNCH_MOE_QPN(8, 2);
+  switch (splitk) {
+    case 8:
+      LAUNCH_MOE_QPN(8);
       break;
     // SPLITK 10 serves K = 320 (K/16 = 20 = 10 slices of one 2-group chunk),
     // e.g. a 640-wide expert intermediate split over TP2, which 8 and 16
     // cannot divide.
-    case 101:
-      LAUNCH_MOE_QPN(10, 1);
+    case 10:
+      LAUNCH_MOE_QPN(10);
       break;
-    case 161:
-      LAUNCH_MOE_QPN(16, 1);
-      break;
-    case 162:
-      LAUNCH_MOE_QPN(16, 2);
+    case 16:
+      LAUNCH_MOE_QPN(16);
       break;
     // SPLITK 32 would need more than the 48 KiB of static shared memory for
     // the per-warp activation stage plus the split-K reduction.
     default:
-      TORCH_CHECK(
-          false,
-          "moe_qpn (splitk, nacc) in {(8,1), (8,2), (10,1), (16,1), (16,2)}");
+      TORCH_CHECK(false, "m8n8k4 MoE splitk in {8, 10, 16}");
   }
 #undef LAUNCH_MOE_QPN
 #undef LAUNCH_MOE_QPN_S
