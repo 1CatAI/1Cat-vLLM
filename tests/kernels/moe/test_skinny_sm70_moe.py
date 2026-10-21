@@ -520,6 +520,7 @@ def _skinny_experts(device, order, w13, s13, w2, s2, g1, g2):
     experts._triton_tensor_cores = False
     experts._w1_block_scales = s13
     experts._w2_block_scales = s2
+    experts._csf_planes = None
     experts._scale_caches = _ScaleCaches(
         g1=g1.tolist(),
         g2=g2.tolist(),

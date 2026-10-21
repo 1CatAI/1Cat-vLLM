@@ -142,6 +142,7 @@ from vllm.model_executor.kernels.linear.qpn.nvfp4 import (
     TurboMindNvFp4LinearKernel,
 )
 from vllm.model_executor.kernels.linear.qpn.pre_ampere import (
+    Qpn8Mxfp8LinearKernel,
     TuringNvFp4LinearLayerConfig,
     TuringQpn2NvFp4LinearKernel,
     TuringQpn8Fp8LinearKernel,
@@ -216,6 +217,7 @@ def _get_linear_backend() -> str:
 # an error is raised to respect the user's explicit intent.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "turbomind": {
+        Qpn8Mxfp8LinearKernel,
         TuringQpn2NvFp4LinearKernel,
         TuringQpn8Fp8LinearKernel,
         QPN8Fp8BlockScaledMMLinearKernel,
@@ -414,6 +416,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 # in priority/performance order (when available)
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        Qpn8Mxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
         EmulationMxfp8LinearKernel,
@@ -1303,6 +1306,7 @@ __all__ = [
     "MarlinMxFp4LinearKernel",
     "FlashInferCutlassMxfp8LinearKernel",
     "MarlinMxfp8LinearKernel",
+    "Qpn8Mxfp8LinearKernel",
     "XPUMxFp8LinearKernel",
     "EmulationMxfp8LinearKernel",
     "CutlassNvFp4LinearKernel",

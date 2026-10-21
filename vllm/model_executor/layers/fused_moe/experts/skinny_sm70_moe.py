@@ -34,6 +34,10 @@ from vllm.model_executor.layers.fused_moe.experts.skinny_moe_triton import (
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.sm70.reduction import _mtp_weighted_reduce
+from vllm.model_executor.layers.quantization.utils.csf32_expand import (
+    CsfExpertScales,
+    expand_csf32_experts,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
@@ -129,10 +133,10 @@ def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
 
 def qpn_prepack(
     codes: torch.Tensor,
-    scales: torch.Tensor,
+    scales: torch.Tensor | None,
     scale_group: int,
     order: QpnFragmentOrder,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Permute one weight matrix into the fragment order the QPN kernels read.
 
     Codes become [tile N/32][group K/16][lane 32] x 8 bytes, with the nibbles
@@ -143,7 +147,8 @@ def qpn_prepack(
 
     Args:
         codes: [N, K/2] uint8, two e2m1 codes per byte, low nibble first.
-        scales: [N, K/scale_group] uint8 scale bytes.
+        scales: [N, K/scale_group] uint8 scale bytes, or None to permute only
+            the codes (compressed scales are expanded into this order later).
         scale_group: codes per scale, 16 for NVFP4 (fp8-e4m3) and 32 for
             MXFP4 (E8M0). The code layout is the same for both: a 32-code
             MXFP4 block is two adjacent 16-code groups sharing one scale.
@@ -167,7 +172,11 @@ def qpn_prepack(
     cg = torch.arange(cgroups, device=dev)
     kidx = cg.view(cgroups, 1, 1) * 16 + code_k.view(1, 32, 16)
     qc = torch.empty(tiles, cgroups, 32, 8, dtype=torch.uint8, device=dev)
-    qs = torch.empty(tiles, groups, 32, dtype=torch.uint8, device=dev)
+    qs = (
+        None
+        if scales is None
+        else torch.empty(tiles, groups, 32, dtype=torch.uint8, device=dev)
+    )
     # Chunk the gather: the int64 index intermediates are 16x the payload,
     # so cap the transients at ~300 MB.
     chunk = max(1, 36864 // max(groups, cgroups))
@@ -181,13 +190,14 @@ def qpn_prepack(
             kidx.view(1, cgroups, 32, 16).expand(tt, cgroups, 32, 16),
         ]
         qc[t0:t1] = nb[..., 0::2] | (nb[..., 1::2] << 4)
-        scol = tile_col.view(tt, 1) + scale_col.view(1, 32)
-        qs[t0:t1] = scales[
-            scol.view(tt, 1, 32).expand(tt, groups, 32),
-            g.view(1, groups, 1).expand(tt, groups, 32),
-        ]
+        if qs is not None and scales is not None:
+            scol = tile_col.view(tt, 1) + scale_col.view(1, 32)
+            qs[t0:t1] = scales[
+                scol.view(tt, 1, 32).expand(tt, groups, 32),
+                g.view(1, groups, 1).expand(tt, groups, 32),
+            ]
     del nib
-    return qc.view(-1).contiguous(), qs.view(-1).contiguous()
+    return qc.view(-1).contiguous(), None if qs is None else qs.view(-1).contiguous()
 
 
 def _expert_gemm(
@@ -381,6 +391,13 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         self.quantization_emulation = False
         # Built on first apply (weights live on the GPU then).
         self._scale_caches: _ScaleCaches | None = None
+        # csf_32x2_v1 planes (w13, w2): the block scales above are then shared
+        # rasters that each grouped call fills for its routed experts.
+        self._csf_planes: tuple[CsfExpertScales, CsfExpertScales] | None = None
+
+    def attach_csf_scales(self, w13: CsfExpertScales, w2: CsfExpertScales) -> None:
+        """Serve compressed expert scales; call before process_weights_after_loading."""
+        self._csf_planes = (w13, w2)
 
     @property
     def quant_dtype(self) -> torch.dtype | str | None:
@@ -470,6 +487,17 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                     f"(N % 32, K % 64); got {name} N={w.size(1)} "
                     f"K={w.size(2) * 2}"
                 )
+        if self._csf_planes is not None:
+            # The shared rasters already take expanded scales in QPN order.
+            for e in range(w13.size(0)):
+                w13[e].view(-1).copy_(qpn_prepack(w13[e], None)[0])
+                w2[e].view(-1).copy_(qpn_prepack(w2[e], None)[0])
+            logger.info_once(
+                "Skinny MoE: expert codes re-permuted to QPN fragment order; "
+                "csf_32x2_v1 scales stay compressed (%d experts)",
+                w13.size(0),
+            )
+            return
         s13, s2, sg = self._scale_rasters(layer)
         order = self._fragment_order
         for e in range(w13.size(0)):
@@ -708,6 +736,14 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         gids = torch.zeros(num_slots, dtype=torch.int64, device=device)
         gids.scatter_(0, gidx, sorted_e)
         gids32, goff32 = gids.to(torch.int32), goff.to(torch.int32)
+        if self._csf_planes is not None:
+            w13_planes, w2_planes = self._csf_planes
+            expand_csf32_experts(
+                scales.w1_scales_u8.view(w1.size(0), -1), w13_planes, gids32, goff32
+            )
+            expand_csf32_experts(
+                scales.w2_scales_u8.view(w2.size(0), -1), w2_planes, gids32, goff32
+            )
         y13 = torch.empty(
             (num_slots, w1.size(1)), dtype=hidden_states.dtype, device=device
         )

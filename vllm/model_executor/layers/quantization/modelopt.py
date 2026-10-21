@@ -62,6 +62,12 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.utils.csf32_expand import (
+    CSF32_SCALE_ENCODING,
+    CsfExpertScaleLoader,
+    CsfScaleConsumer,
+    shared_scale_raster,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
 )
@@ -833,8 +839,7 @@ class ModelOptFp8PbWoLinearMethod(LinearMethodBase):
 
         layer.weight_scale = Parameter(scale.contiguous(), requires_grad=False)
 
-        if hasattr(self, "fp8_linear"):
-            self.fp8_linear.process_weights_after_loading(layer)
+        self.w8a8_block_fp8_linear.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -1612,9 +1617,17 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         moe_config: FusedMoEConfig,
         *,
         allow_skinny: bool = True,
+        scale_encoding: str | None = None,
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
+        if scale_encoding not in (None, CSF32_SCALE_ENCODING):
+            raise ValueError(
+                f"Unsupported NVFP4 weight_scale_encoding {scale_encoding!r}"
+            )
+        # csf_32x2_v1: block scales stay compressed on the GPU and the skinny
+        # experts expand the routed ones before each grouped call.
+        self.csf_scales = scale_encoding == CSF32_SCALE_ENCODING
         # W4A16 mode fires for W4A16_NVFP4 on-disk checkpoints. With
         # activation_key=None every W4A4 backend's _supports_quant_scheme
         # rejects itself (they all require (kNvfp4Static, kNvfp4Dynamic)
@@ -1632,6 +1645,14 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
         )
+        if self.csf_scales and not (
+            self.experts_cls is not None
+            and issubclass(self.experts_cls, CsfScaleConsumer)
+        ):
+            raise ValueError(
+                f"{CSF32_SCALE_ENCODING} expert scales need MoE experts that serve "
+                f"compressed scales; backend {self.nvfp4_backend.value} does not."
+            )
 
     def maybe_make_prepare_finalize(
         self,
@@ -1697,33 +1718,38 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight", w2_weight)
 
-        w13_weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                num_experts,
-                w13_num_shards * intermediate_size_per_partition,
-                # 2 fp4 items are packed in the input dimension
-                hidden_size // self.quant_config.group_size,
-                dtype=weight_scale_dtype,
-            ),
-            input_dim=1,
-            output_dim=2,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        if self.csf_scales:
+            self._create_csf_scales(
+                layer, num_experts, hidden_size, intermediate_size_per_partition
+            )
+        else:
+            w13_weight_scale = ModelWeightParameter(
+                data=torch.empty(
+                    num_experts,
+                    w13_num_shards * intermediate_size_per_partition,
+                    # 2 fp4 items are packed in the input dimension
+                    hidden_size // self.quant_config.group_size,
+                    dtype=weight_scale_dtype,
+                ),
+                input_dim=1,
+                output_dim=2,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        w2_weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                num_experts,
-                hidden_size,
-                # 2 fp4 items are packed in the input dimension
-                intermediate_size_per_partition // self.quant_config.group_size,
-                dtype=weight_scale_dtype,
-            ),
-            input_dim=1,
-            output_dim=2,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            w2_weight_scale = ModelWeightParameter(
+                data=torch.empty(
+                    num_experts,
+                    hidden_size,
+                    # 2 fp4 items are packed in the input dimension
+                    intermediate_size_per_partition // self.quant_config.group_size,
+                    dtype=weight_scale_dtype,
+                ),
+                input_dim=1,
+                output_dim=2,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
@@ -1764,6 +1790,66 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+    def _create_csf_scales(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+    ) -> None:
+        """Compressed-plane loaders and the shared rasters the experts expand into.
+
+        The rasters are plain attributes, not parameters: the checkpoint holds
+        no such tensors, and every layer of a shape shares one per device.
+        """
+        if not self.moe.is_act_and_mul:
+            raise ValueError(f"{CSF32_SCALE_ENCODING} expert scales need gated experts")
+        if self.moe.tp_size != 1:
+            # TP slices cut CSF blocks and pages; the checkpoint layout is
+            # read only whole.
+            raise NotImplementedError(
+                f"{CSF32_SCALE_ENCODING} expert scales support TP1 (use PP), got "
+                f"TP{self.moe.tp_size}."
+            )
+        group = self.quant_config.group_size
+        device = layer.w13_weight.device
+        layer.csf_w13_scales = CsfExpertScaleLoader(
+            num_experts, 2, intermediate_size, hidden_size // group, device
+        )
+        layer.csf_w2_scales = CsfExpertScaleLoader(
+            num_experts, 1, hidden_size, intermediate_size // group, device
+        )
+        layer.csf_w13_raster = shared_scale_raster(
+            device, num_experts, 2 * intermediate_size, hidden_size // group
+        )
+        layer.csf_w2_raster = shared_scale_raster(
+            device, num_experts, hidden_size, intermediate_size // group
+        )
+
+    def load_csf_scale_part(
+        self,
+        layer: RoutedExperts,
+        expert_id: int,
+        shard_id: str,
+        part: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        """Store one csf32 part (bases, codes, page_bases, offsets, exceptions).
+
+        ``shard_id`` is the expert mapping's w1 (gate), w3 (up) or w2 (down).
+        """
+        loader, projection = {
+            "w1": (layer.csf_w13_scales, 0),
+            "w3": (layer.csf_w13_scales, 1),
+            "w2": (layer.csf_w2_scales, 0),
+        }[shard_id]
+        loader.load(expert_id, projection, part, tensor)
+
+    def _block_scales(self, layer: RoutedExperts) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.csf_scales:
+            return layer.csf_w13_raster, layer.csf_w2_raster
+        return layer.w13_weight_scale, layer.w2_weight_scale
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
@@ -1778,7 +1864,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 layer.w13_weight_scale_2, layer.w2_weight_scale_2
             )
             if reason is not None:
-                if self.moe.moe_backend != "auto":
+                if self.moe.moe_backend != "auto" or self.csf_scales:
                     raise ValueError(reason)
                 fallback: FusedMoEMethodBase
                 if sm70_tm.is_exact_sm70_cuda_platform():
@@ -1814,6 +1900,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 "Accuracy may be affected."
             )
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
+        block_w13_scale, block_w2_scale = self._block_scales(layer)
 
         (
             w13,
@@ -1828,24 +1915,25 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             nvfp4_backend=self.nvfp4_backend,
             layer=layer,
             w13=layer.w13_weight,
-            w13_scale=layer.w13_weight_scale,
+            w13_scale=block_w13_scale,
             w13_scale_2=w13_weight_scale_2,
             a13_scale=layer.w13_input_scale,
             w2=layer.w2_weight,
-            w2_scale=layer.w2_weight_scale,
+            w2_scale=block_w2_scale,
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
         )
 
         replace_parameter(layer, "w13_weight", w13)
-        replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
         replace_parameter(layer, "w13_input_scale", a13_scale)
         replace_parameter(layer, "w2_weight", w2)
-        replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale", a2_scale)
+        if not self.csf_scales:
+            replace_parameter(layer, "w13_weight_scale", w13_scale)
+            replace_parameter(layer, "w2_weight_scale", w2_scale)
 
         # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
@@ -1856,13 +1944,21 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        if self.csf_scales:
+            experts = self.moe_kernel.fused_experts
+            assert isinstance(experts, CsfScaleConsumer)  # checked in __init__
+            experts.attach_csf_scales(
+                layer.csf_w13_scales.finish(), layer.csf_w2_scales.finish()
+            )
+            del layer.csf_w13_scales, layer.csf_w2_scales
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+        w13_scale, w2_scale = self._block_scales(layer)
         return make_nvfp4_moe_quant_config(
             backend=self.nvfp4_backend,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
             w13_scale_2=layer.w13_weight_scale_2,
             w2_scale_2=layer.w2_weight_scale_2,
             a13_scale=layer.w13_input_scale,
@@ -2643,6 +2739,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         return None
 
+    def _resolve_scale_encoding(self, prefix: str) -> str | None:
+        """The `weight_scale_encoding` a layer's recipe names, e.g. csf_32x2_v1."""
+        for candidate in self._quantized_layer_prefix_candidates(prefix):
+            info = self.quantized_layers.get(candidate)
+            if info is not None:
+                return info.get("weight_scale_encoding")
+        return None
+
     @staticmethod
     def _quantized_layer_prefix_candidates(prefix: str) -> tuple[str, ...]:
         candidates = [prefix]
@@ -2684,12 +2788,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo == "FP8_PB_WO":
+                return ModelOptFp8PbWoLinearMethod(self.fp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
-            # Layers not in quantized_layers stay unquantized. An LM head
-            # keeps its own UnquantizedEmbeddingMethod.
+            # Layers not in quantized_layers stay unquantized. So do MXFP8
+            # layers: no kernel serves E8M0-per-32 weights before SM80, so
+            # the model loader dequantizes them (see dequantize_mxfp8_pairs).
+            # An LM head keeps its own UnquantizedEmbeddingMethod.
             return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
 
         if isinstance(layer, RoutedExperts):
@@ -2699,6 +2807,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptFp8MoEMethod(
                     quant_config=self.fp8_config,
                     moe_config=layer.moe_config,
+                )
+            if quant_algo == "NVFP4" and (
+                scale_encoding := self._resolve_scale_encoding(prefix)
+            ):
+                return ModelOptNvFp4FusedMoE(
+                    quant_config=self.nvfp4_config,
+                    moe_config=layer.moe_config,
+                    scale_encoding=scale_encoding,
                 )
             if quant_algo == "NVFP4":
                 if sm70_tm.is_exact_sm70_cuda_platform() and not (

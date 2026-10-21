@@ -15,6 +15,9 @@ from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.quantization.sm70_turbomind import (
+    is_pre_ampere_cuda_platform,
+)
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     expand_pools_and_append_tail,
     expand_pools_to_tokens,
@@ -51,10 +54,6 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
-
-
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
 
 
 # kpool write helper: form pools from the current token batch and compress them
@@ -341,7 +340,7 @@ def sparse_attn_indexer_kpool(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
-    sm70_fp16_indexer = _is_exact_sm70_cuda()
+    sm70_fp16_indexer = is_pre_ampere_cuda_platform()
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -971,7 +970,7 @@ class SparseAttnIndexerKpool(CustomOp):
         self.use_fp4_cache = use_fp4_cache
         if (
             current_platform.is_cuda()
-            and not _is_exact_sm70_cuda()
+            and not is_pre_ampere_cuda_platform()
             and not has_deep_gemm()
         ):
             raise RuntimeError(

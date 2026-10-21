@@ -48,6 +48,9 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     arm_dflash_nvfp4_trace,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    dequantize_mxfp8_weight_pairs,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
@@ -1260,6 +1263,22 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    if _CSF_SCALE_PART in name:
+                        experts_prefix = name.rsplit(param_name, 1)[0] + param_name
+                        experts_prefix = experts_prefix.removesuffix(".w13_")
+                        experts_prefix = experts_prefix.removesuffix(".w2_")
+                        w13_name = experts_prefix + ".w13_weight"
+                        if is_pp_missing_parameter(w13_name, self):
+                            break
+                        experts = self.get_submodule(experts_prefix)
+                        experts.quant_method.load_csf_scale_part(
+                            experts,
+                            expert_id,
+                            expert_shard_id,
+                            name.rsplit(_CSF_SCALE_PART, 1)[1],
+                            loaded_weight,
+                        )
+                        break
                     if is_pp_missing_parameter(name, self):
                         continue
                     param = params_dict[name]
@@ -1436,7 +1455,9 @@ class Glm5NextForCausalLM(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        # ModelOpt MXFP8 modules (KDA q/k/v/o, dense MLPs, lm_head) are held
+        # unquantized: no kernel serves E8M0-per-32 weights before SM80.
+        return loader.load_weights(dequantize_mxfp8_weight_pairs(weights))
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1447,6 +1468,15 @@ class Glm5NextForCausalLM(
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid, SupportsEagle3
 ):
+    # Fused language-model modules and their checkpoint shards (the vision
+    # tower stores gate_up_proj fused and matches it directly).
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wk_weights_proj": ["wk", "weights_proj"],
+    }
+
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
@@ -1555,13 +1585,33 @@ def get_spec_layer_idx_from_weight_name(
     return None
 
 
+# ModelOpt csf_32x2_v1 routed-expert scales: `<expert proj>.weight_scale.csf32_<part>`.
+_CSF_SCALE_PART = ".weight_scale.csf32_"
+
+
+def _is_block_fp8_scale(name: str, tensor: torch.Tensor) -> bool:
+    """A block-FP8 dequant scale: DeepSeek ``weight_scale_inv`` or ModelOpt
+    FP8_PB_WO ``weight_scale`` (float32 [N/128, 1, K/128, 1])."""
+    return name.endswith(".weight_scale_inv") or (
+        name.endswith(".weight_scale")
+        and tensor.dtype == torch.float32
+        and tensor.dim() == 4
+    )
+
+
+def _block_fp8_scale_2d(scale: torch.Tensor) -> torch.Tensor:
+    return scale.squeeze(3).squeeze(1) if scale.dim() == 4 else scale
+
+
 def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if "indexer.wk." not in name or "wk_weights" in name:
         return False
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
+    is_scale = _is_block_fp8_scale(name, tensor)
     if not is_weight and not is_scale:
         return False
+    if is_scale:
+        tensor = _block_fp8_scale_2d(tensor)
     layer_prefix = name.rsplit(".wk.", 1)[0]
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
@@ -1648,17 +1698,21 @@ def _try_load_fp8_attn_proj(
         return False
     suffix, (key, target_base, shard_id, is_kva) = matched
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
+    is_scale = _is_block_fp8_scale(name, tensor)
     if not is_weight and not is_scale:
         return False
 
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
-    target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
     # If the model actually kept this projection in FP8, let the normal path
-    # handle it (it has a weight_scale_inv param).
-    if target_s in params_dict:
+    # handle it (it has a scale param).
+    if any(
+        f"{layer_prefix}.{target_base}.{scale}" in params_dict
+        for scale in ("weight_scale_inv", "weight_scale")
+    ):
         return False
+    if is_scale:
+        tensor = _block_fp8_scale_2d(tensor)
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
     entry["weight" if is_weight else "scale"] = tensor
