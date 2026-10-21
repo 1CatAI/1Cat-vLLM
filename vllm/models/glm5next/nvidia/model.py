@@ -1198,6 +1198,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with
             # weights_proj into wk_weights_proj.
             if _try_load_fp8_indexer_wk(
+                self,
                 name,
                 loaded_weight,
                 _pending_wk_fp8,
@@ -1209,6 +1210,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # FP8 checkpoint: dequantize BF16-kept MLA projections
             # (q_a_proj / kv_a_proj_with_mqa / o_proj) to BF16.
             if _try_load_fp8_attn_proj(
+                self,
                 name,
                 loaded_weight,
                 _pending_wk_fp8,
@@ -1316,6 +1318,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        # Weights and scales arrive next to each other (see
+        # dequantize_mxfp8_weight_pairs); a half left over here would leave its
+        # projection unloaded.
+        unpaired = sorted(prefix for prefix, entry in _pending_wk_fp8.items() if entry)
+        if unpaired:
+            raise ValueError(
+                f"Block-FP8 weights or scales without their partner: {unpaired[:4]}"
+            )
         if self._replicate_dflash_embedding and "embed_tokens.weight" in loaded_params:
             # AutoWeightsLoader groups consecutive tensors by top-level prefix,
             # so a checkpoint whose shard order interleaves language-model
@@ -1572,6 +1582,12 @@ class Glm5NextForConditionalGeneration(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.language_model.get_topk_tokens_and_logits(hidden_states, top_k)
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Pair weights with their scales over the whole stream: the loader
+        # below calls the language model once per run of its prefix, and the
+        # shards interleave those runs with visual tensors.
+        return super().load_weights(dequantize_mxfp8_weight_pairs(weights))
+
 
 def get_spec_layer_idx_from_weight_name(
     config: Glm5NextConfig, weight_name: str
@@ -1606,16 +1622,19 @@ def _block_fp8_scale_2d(scale: torch.Tensor) -> torch.Tensor:
     return scale.squeeze(3).squeeze(1) if scale.dim() == 4 else scale
 
 
-def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+def _try_load_fp8_indexer_wk(model, name, tensor, buf, params_dict, loaded_params):
     if "indexer.wk." not in name or "wk_weights" in name:
         return False
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
     is_scale = _is_block_fp8_scale(name, tensor)
     if not is_weight and not is_scale:
         return False
+    layer_prefix = name.rsplit(".wk.", 1)[0]
+    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+    if is_pp_missing_parameter(fused_name, model):
+        return True
     if is_scale:
         tensor = _block_fp8_scale_2d(tensor)
-    layer_prefix = name.rsplit(".wk.", 1)[0]
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1631,7 +1650,6 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
         out_dtype=torch.bfloat16,
     )
 
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
     param = params_dict[fused_name]
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
@@ -1676,6 +1694,7 @@ _FP8_ATTN_PROJS = {
 
 
 def _try_load_fp8_attn_proj(
+    model,
     name,
     tensor,
     buf,
@@ -1707,6 +1726,8 @@ def _try_load_fp8_attn_proj(
 
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
+    if is_pp_missing_parameter(target_w, model):
+        return True
     # If the model actually kept this projection in FP8, let the normal path
     # handle it (it has a scale param).
     if any(
