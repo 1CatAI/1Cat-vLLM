@@ -48,6 +48,7 @@ from vllm.distributed.weight_transfer import (
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
+from vllm.model_executor.models.pp_decode_transfer import StaticPPDecodeTransfer
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -1285,6 +1286,19 @@ class Worker(WorkerBase):
                 handle.wait()
             self._pp_send_work = []
 
+        if not getattr(self, "_decode_static_transfer_initialized", False):
+            self._decode_static_transfer = StaticPPDecodeTransfer.create(
+                self.vllm_config,
+                self.model_runner,
+                get_pp_group(),
+                use_v2=self.use_v2_model_runner,
+            )
+            self._decode_static_transfer_initialized = True
+        decode_transfer = self._decode_static_transfer
+        static_decode = decode_transfer is not None and decode_transfer.matches(
+            scheduler_output
+        )
+        decode_received = False
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1327,20 +1341,28 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
-            if tensor_dict is not None:
-                comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
-                comm_postprocess: list[Callable[[], None]] = []
-                logger.info_once(
-                    "Default SM70 metadata-free PP hidden transfer enabled."
+            tensor_dict: dict[str, torch.Tensor] | None
+            comm_postprocess: list[Callable[[], None]] = []
+            if static_decode:
+                assert decode_transfer is not None
+                tensor_dict, comm_handles = decode_transfer.receive(
+                    num_scheduled_tokens
                 )
+                decode_received = True
             else:
-                tensor_dict, comm_handles, comm_postprocess = (
-                    get_pp_group().irecv_tensor_dict(
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
+                tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
+                if tensor_dict is not None:
+                    comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
+                    logger.info_once(
+                        "Default SM70 metadata-free PP hidden transfer enabled."
                     )
-                )
+                else:
+                    tensor_dict, comm_handles, comm_postprocess = (
+                        get_pp_group().irecv_tensor_dict(
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors,
+                        )
+                    )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -1352,6 +1374,9 @@ class Worker(WorkerBase):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            if decode_received:
+                assert decode_transfer is not None
+                decode_transfer.mark_consumed()
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -1372,7 +1397,12 @@ class Worker(WorkerBase):
 
         # The exact SM70 B1 path sends the replicated tensor directly into
         # the next stage's persistent graph-input buffer without CPU metadata.
-        if self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens):
+        if static_decode:
+            assert decode_transfer is not None
+            self._pp_send_work = decode_transfer.send(
+                output.tensors, num_scheduled_tokens
+            )
+        elif self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens):
             if not self._is_static_pp_hidden_tensor_dict(
                 output.tensors, num_scheduled_tokens
             ):

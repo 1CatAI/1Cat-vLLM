@@ -98,6 +98,15 @@ class GGUFModelLoader(BaseModelLoader):
 
         return [str(path) for path in gguf_shard_paths(model_path)]
 
+    @staticmethod
+    def _requires_vision_weights(model_config: ModelConfig) -> bool:
+        # A text-only run retains the multimodal HF wrapper and its language
+        # weight prefixes, but must not discover or open a vision checkpoint.
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        has_vision = getattr(model_config.hf_config, "vision_config", None) is not None
+        language_model_only = getattr(multimodal_config, "language_model_only", False)
+        return has_vision and not language_model_only
+
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
@@ -145,12 +154,13 @@ class GGUFModelLoader(BaseModelLoader):
             ):
                 from .gguf_adapters.qwen3_vision import Qwen3VisionGGUF
 
-                mmproj = detect_gguf_multimodal(local)
-                if mmproj is None:
-                    raise ValueError("Qwen4Exp multimodal GGUF requires mmproj")
-                self._native_vision_adapter = Qwen3VisionGGUF(
-                    config.vision_config, gguf_tensor_index([mmproj])
-                )
+                if self._requires_vision_weights(model_config):
+                    mmproj = detect_gguf_multimodal(local)
+                    if mmproj is None:
+                        raise ValueError("Qwen4Exp multimodal GGUF requires mmproj")
+                    self._native_vision_adapter = Qwen3VisionGGUF(
+                        config.vision_config, gguf_tensor_index([mmproj])
+                    )
                 # The conditional model wraps the native language model. Keep
                 # these names consistent for quantization, PLE and PP loading.
                 names = {raw: "language_model." + name for raw, name in names.items()}
@@ -401,8 +411,7 @@ class GGUFModelLoader(BaseModelLoader):
             # The dense vision tower has its own inverse mapping. It must not
             # pass through the text adapter's normalization/quantization rules.
             return weight_type_map
-        is_multimodal = hasattr(model_config.hf_config, "vision_config")
-        if is_multimodal:
+        if self._requires_vision_weights(model_config):
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
@@ -436,10 +445,7 @@ class GGUFModelLoader(BaseModelLoader):
                 self._native_tensors, gguf_to_hf_name_map, model_config.dtype
             )
             return
-        hf_config = model_config.hf_config
-        is_multimodal = hasattr(hf_config, "vision_config")
-
-        if is_multimodal:
+        if self._requires_vision_weights(model_config):
             # Load mm_proj (mm_encoder + projector) for multimodal weights
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (

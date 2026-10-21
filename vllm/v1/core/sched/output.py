@@ -257,6 +257,10 @@ class SchedulerOutput:
     # Scheduler-local; cleared after connector metadata is built.
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]] | None = None
 
+    # Monotonic scheduler step for discarding pre-reset asynchronous results.
+    # Zero denotes hand-built/profile outputs outside the scheduler protocol.
+    scheduled_step: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

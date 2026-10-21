@@ -1418,6 +1418,7 @@ class Scheduler(SchedulerInterface):
         self.waiting.prepend_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        scheduler_output.scheduled_step = self.current_step
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -1831,6 +1832,18 @@ class Scheduler(SchedulerInterface):
                 # cache transfer in KV connector), the aborted request will not
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
+                continue
+
+            if (
+                0
+                < scheduler_output.scheduled_step
+                <= request.last_prefix_cache_reset_step
+            ):
+                # The in-flight token charge above belongs to this old frame,
+                # but its speculative rejections, encoder releases and sampled
+                # tokens must never mutate a request resumed after force-reset.
+                # Frame identity is independent of its emitted token count;
+                # empty prefill and partially accepted MTP frames are stale too.
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -2490,13 +2503,11 @@ class Scheduler(SchedulerInterface):
             while self.running:
                 request = self.running.pop()
                 self._preempt_request(request, timestamp)
-                # For async scheduling, any output frames already in flight at
-                # preemption time are now stale and must be discarded when they
-                # return. num_output_placeholders is exactly that count: 0 if
-                # the engine has drained (e.g. pause_generation(keep) waited
-                # for idle), 1 for vanilla async mid-step, or 1 + spec/PP frames
-                # otherwise.
-                request.async_tokens_to_discard = request.num_output_placeholders
+                # All frames scheduled before this reset are stale, regardless
+                # of the number of output placeholders or accepted draft tokens.
+                # An inclusive step watermark also handles repeated resets while
+                # older frames are still in flight, without counting them twice.
+                request.last_prefix_cache_reset_step = self.current_step
                 request.num_output_placeholders = 0
 
             # Clear scheduled request ids cache. Since we are forcing preemption

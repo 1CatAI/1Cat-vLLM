@@ -270,11 +270,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
         )
         if self.use_pp:
+            additional_config = vllm_config.additional_config
+            packed_feedback = (
+                additional_config.get("pp_packed_feedback", False)
+                if isinstance(additional_config, dict)
+                else False
+            )
+            if not isinstance(packed_feedback, bool):
+                raise ValueError("pp_packed_feedback must be a boolean")
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
                 feedback_depth=vllm_config.max_concurrent_batches,
+                packed_feedback=packed_feedback,
             )
         # Prefix-anchored SWA: persistent GPU buffer for per-request prompt
         # lengths (stable device address across steps).

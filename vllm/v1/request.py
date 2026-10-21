@@ -139,7 +139,9 @@ class Request:
 
         # Used in async scheduling.
         self.num_output_placeholders = 0
-        self.async_tokens_to_discard = 0
+        # A force-reset invalidates whole scheduled frames through this step,
+        # including chunked prefill and rejected speculative proposals.
+        self.last_prefix_cache_reset_step = 0
 
         # V2 PP async decode must wait for the sampled-token broadcast slot
         # from the prior pipeline pass before scheduling this request again.
