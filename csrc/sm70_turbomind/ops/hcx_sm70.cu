@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // HCX: one-launch TP4 "all-reduce -> HC combine+RMSNorm -> HC down -> HC up"
-// for Qwen3.8 Flash-Next on SM70 (M <= 8). Replaces cube_allreduce +
+// for Qwen3.8 Flash-Next on SM70 (M <= 40, in 8-row groups). Replaces
+// cube_allreduce +
 // _hc_combine_norm + down3 + up3.
 //
 // Each rank runs 80 CTAs; CTA i owns hidden columns [32i, 32i+32) of every HC
@@ -39,6 +40,9 @@ namespace hcx {
 using dmvns::body6;
 using dmvns::Seg;
 constexpr int HD = 2560, KD = 10240, NC = 80, LW = 336;
+// Exchange words per 8-row group: all-reduce slots, lora rows, hidden rows.
+constexpr int AR_WORDS = 4 * NC * 256, LORA_WORDS = 8 * LW, HB_WORDS = 8 * HD / 2;
+constexpr int MAX_M = 40;
 
 struct Args {
   const half* p0;
@@ -208,10 +212,40 @@ template <bool FULL, int OF, bool LOCAL_SCHEDULE = false>
 __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   TS(0);
   const int i = blockIdx.x, t = threadIdx.x, warp = t >> 5, lane = t & 31;
-  const int M = a.M, rk = a.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
+  const int MT = a.M, rk = a.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
   const unsigned ep = ldv(a.seq), tag = ep + 1;
   const unsigned base = LOCAL_SCHEDULE ? ldv(a.bar + 3) : 0;
   const int r8 = (lane & 3) + ((lane & 16) ? 4 : 0), quad = (lane >> 2) & 3;
+  // Rows are processed in groups of eight (the MMA row tile). Each group has
+  // its own exchange slots and scratch, and the weights stay in registers.
+  const int groups = (MT + 7) / 8;
+  const unsigned gbar = (OF >= 0 && a.gz) ? NC : 0;
+  uint4 dlo[4], dhi[4], ulo[4], uhi[4];
+  for (int grp = 0; grp < groups; ++grp) {
+  const int M = min(8, MT - grp * 8), r0 = grp * 8;
+  const unsigned bb = grp * (gbar + 2 * NC);
+  const half* const p0 = a.p0 + r0 * HD;
+  const half* const pp1 = a.p1 ? a.p1 + r0 * HD : nullptr;
+  const half* const res = a.res + r0 * KD;
+  half* const res_out = a.res_out + r0 * KD;
+  const half* const inj = a.inj + r0 * 4;
+  half* const inj_out = a.inj_out + r0 * 4;
+  half* const xn = a.xn + r0 * KD;
+  half* const blk_out = a.blk_out + r0 * HD;
+  float* const sq = a.sq + grp * NC * 8 * 4;
+  float* const dpart = a.dpart + grp * NC * 8 * 96 * 4;
+  uint2* ar[4];
+  uint2* lora[4];
+  uint2* hb[4];
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    ar[q] = a.ar[q] + grp * AR_WORDS;
+    lora[q] = a.lora[q] + grp * LORA_WORDS;
+    hb[q] = a.hb[q] + grp * HB_WORDS;
+  }
+  const half* const ox = a.ox ? a.ox + r0 * a.oldx : nullptr;
+  const half* const gz = a.gz ? a.gz + r0 * a.ldz : nullptr;
+  half* const gscr = a.gscr ? a.gscr + r0 * a.oG * 128 : nullptr;
   // ---- 1. all-reduce of the block output for columns [32i, 32i + 32). The
   // partial is loaded and pushed before the weight prefetch is issued, so the
   // cross-GPU stores are not queued behind it.
@@ -230,7 +264,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     extern __shared__ uint4 dsm[];
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     const int Kp = a.oG * 128;
-    if (a.gz) {
+    if (gz) {
       // rmsnorm_gated_exact (SiLU gate): (token, head) rows of 128 spread over
       // all CTAs, one warp per row, arithmetic identical to the production
       // kernel; published to a global scratch.
@@ -239,9 +273,9 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       for (int rr = i * 8 + warp; rr < nrows; rr += NC * 8) {
         const int tok = rr / heads, hd = rr % heads;
         const uint2 xv = __ldg(reinterpret_cast<const uint2*>(
-            a.ox + tok * a.oldx + hd * 128 + lane * 4));
+            ox + tok * a.oldx + hd * 128 + lane * 4));
         const uint2 zv = __ldg(reinterpret_cast<const uint2*>(
-            a.gz + tok * a.ldz + hd * 128 + lane * 4));
+            gz + tok * a.ldz + hd * 128 + lane * 4));
         const half* xh = reinterpret_cast<const half*>(&xv);
         const half* zh = reinterpret_cast<const half*>(&zv);
         const half* wh = reinterpret_cast<const half*>(&wv);
@@ -268,13 +302,13 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
               __float2half_rn(__fmul_rn(normalized, gates[q] / denominator));
         }
         __stcg(
-            reinterpret_cast<uint2*>(a.gscr + tok * Kp + hd * 128 + lane * 4),
+            reinterpret_cast<uint2*>(gscr + tok * Kp + hd * 128 + lane * 4),
             *reinterpret_cast<uint2*>(outv));
       }
-      grid_bar(a.bar, NC);
+      grid_bar(a.bar, bb + NC);
     }
     body6<OF, 8, 1>(a.oseg, i, true, warp, 0, 0, a.oG, 4 * a.oG, a.oG,
-                    a.gz ? a.gscr : a.ox, a.gz ? Kp : a.oldx, M, dsm, nullptr,
+                    gz ? gscr : ox, gz ? Kp : a.oldx, M, dsm, nullptr,
                     acc, nullptr);
     __syncthreads();
     float* red = reinterpret_cast<float*>(dsm);
@@ -296,16 +330,16 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     if (act) v = red[row * 32 + lane];
   }
   if (act) {
-    if constexpr (OF < 0) v = __half2float(a.p0[row * HD + col]);
-    if (a.p1) v += __half2float(a.p1[row * HD + col]);
+    if constexpr (OF < 0) v = __half2float(p0[row * HD + col]);
+    if (pp1) v += __half2float(pp1[row * HD + col]);
     if (FULL) {
       const int mine = (rk * NC + i) * 256 +
                        t;  // slot of source rank s: (s * NC + i) * 256 + t
-      st2(a.ar[p1] + mine, __float_as_uint(v), tag);
-      st2(a.ar[p2] + mine, __float_as_uint(v), tag);
-      st2(a.ar[p3] + mine, __float_as_uint(v), tag);
+      st2(ar[p1] + mine, __float_as_uint(v), tag);
+      st2(ar[p2] + mine, __float_as_uint(v), tag);
+      st2(ar[p3] + mine, __float_as_uint(v), tag);
     } else {
-      st2(a.ar[p1] + i * 256 + t, __float_as_uint(v), tag);
+      st2(ar[p1] + i * 256 + t, __float_as_uint(v), tag);
     }
   }
   // Small operands of the combine are loaded before the weight prefetch as
@@ -315,9 +349,9 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   if (act) {
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
-      resv[b] = a.res[row * KD + b * HD + col];
+      resv[b] = res[row * KD + b * HD + col];
       nwv[b] = a.nw[a.nw_full ? b * HD + col : col];
-      g[b] = __half2float(a.inj[row * 4 + b]);
+      g[b] = __half2float(inj[row * 4 + b]);
     }
     asm volatile("" ::"h"(__half_as_ushort(resv[0])),
                  "h"(__half_as_ushort(resv[1])), "h"(__half_as_ushort(resv[2])),
@@ -327,8 +361,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     for (int b = 0; b < 4; ++b) g[b] = 2.0f * sigm(g[b] / 4.0f);
   }
   // ---- weight prefetch (independent of every exchange)
-  uint4 dlo[4], dhi[4], ulo[4], uhi[4];
-  if (warp < 6) {
+  if (grp == 0 && warp < 6) {
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       const uint4* p = a.wd + ((i * 6 + warp) * 4 + s) * 64;
@@ -351,13 +384,13 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       do {
         asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
                      : "=r"(u1), "=r"(e1)
-                     : "l"(a.ar[rk] + (p1 * NC + i) * 256 + t));
+                     : "l"(ar[rk] + (p1 * NC + i) * 256 + t));
         asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
                      : "=r"(u2), "=r"(e2)
-                     : "l"(a.ar[rk] + (p2 * NC + i) * 256 + t));
+                     : "l"(ar[rk] + (p2 * NC + i) * 256 + t));
         asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
                      : "=r"(u3), "=r"(e3)
-                     : "l"(a.ar[rk] + (p3 * NC + i) * 256 + t));
+                     : "l"(ar[rk] + (p3 * NC + i) * 256 + t));
         if (clock64() - start > 4000000000LL) __trap();
       } while (e1 != tag || e2 != tag || e3 != tag);
       const float x1 = __uint_as_float(u1), x2 = __uint_as_float(u2),
@@ -372,13 +405,13 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       for (int s = 0; s < 4; ++s)
         x[s] = s == rk ? v
                        : __uint_as_float(
-                             poll2(a.ar[rk] + (s * NC + i) * 256 + t, tag));
+                             poll2(ar[rk] + (s * NC + i) * 256 + t, tag));
       v = (x[0] + x[1]) + (x[2] + x[3]);
     } else {
-      v = v + __uint_as_float(poll2(a.ar[rk] + i * 256 + t, tag));
+      v = v + __uint_as_float(poll2(ar[rk] + i * 256 + t, tag));
       const int slot = (NC + i) * 256 + t;
-      st2(a.ar[p2] + slot, __float_as_uint(v), tag);
-      v = v + __uint_as_float(poll2(a.ar[rk] + slot, tag));
+      st2(ar[p2] + slot, __float_as_uint(v), tag);
+      v = v + __uint_as_float(poll2(ar[rk] + slot, tag));
     }
   }
   __shared__ __align__(16) half xs[8][128 + 8];
@@ -397,7 +430,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     for (int b = 0; b < 4; ++b) {
       const half h = __float2half_rn(__half2float(resv[b]) + B * g[b]);
       o[b] = __half2float(h);
-      if (act) a.res_out[row * KD + b * HD + col] = h;
+      if (act) res_out[row * KD + b * HD + col] = h;
       xs[row][b * 32 + lane] =
           act ? __float2half_rn(o[b] + o[b] * __half2float(nwv[b]))
               : __float2half_rn(0.f);
@@ -407,7 +440,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       } else {
 #pragma unroll
         for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
-        if (lane == 0 && act) a.sq[(i * 8 + row) * 4 + b] = q;
+        if (lane == 0 && act) sq[(i * 8 + row) * 4 + b] = q;
       }
     }
     if constexpr (LOCAL_SCHEDULE) {
@@ -419,7 +452,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
           sums[b] += __shfl_xor_sync(0xffffffff, sums[b], s);
       }
       if (lane == 0 && act)
-        *reinterpret_cast<float4*>(a.sq + (i * 8 + row) * 4) =
+        *reinterpret_cast<float4*>(sq + (i * 8 + row) * 4) =
             make_float4(sums[0], sums[1], sums[2], sums[3]);
     }
   }
@@ -453,17 +486,17 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       const int n = tile * 32 + quad * 8 +
                     ((e & 1) | (((lane >> 1) & 1) << 1) | ((e >> 2) << 2));
       if (rw < M) {
-        *reinterpret_cast<float2*>(a.dpart + ((i * 8 + rw) * 96 + n) * 4 +
+        *reinterpret_cast<float2*>(dpart + ((i * 8 + rw) * 96 + n) * 4 +
                                    2 * kh) = make_float2(acc0[e], acc1[e]);
       }
     }
   }
   TS(3);
-  const unsigned gb = (OF >= 0 && a.gz) ? NC : 0;
+  const unsigned gb = (OF >= 0 && gz) ? NC : 0;
   if constexpr (LOCAL_SCHEDULE)
-    grid_bar_epoch(a.bar + 2, base + NC);
+    grid_bar_epoch(a.bar + 2, base + grp * 2 * NC + NC);
   else
-    grid_bar(a.bar, gb + NC);
+    grid_bar(a.bar, bb + gb + NC);
   TS(4);
   // The split-K partials of this warp's first output do not depend on rrms:
   // load them now so the two L2 round trips (sq for rrms, dpart for the
@@ -475,7 +508,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
 #pragma unroll
   for (int j = 0; j < 3; ++j)
     pre[j] = has0 && lane + 32 * j < NC
-                 ? ldcg4(reinterpret_cast<const float4*>(a.dpart) +
+                 ? ldcg4(reinterpret_cast<const float4*>(dpart) +
                          ((lane + 32 * j) * 8 + oi0 / 96) * 96 + oi0 % 96)
                  : make_float4(0.f, 0.f, 0.f, 0.f);
   // ---- 4. rrms; xn for the up mix; split-K + stream reduction lora = sum_b
@@ -485,7 +518,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
 #pragma unroll
     for (int j = 0; j < 3; ++j)
       qs[j] = lane + 32 * j < NC
-                  ? __ldcg(reinterpret_cast<const float4*>(a.sq) +
+                  ? __ldcg(reinterpret_cast<const float4*>(sq) +
                            (lane + 32 * j) * 8 + row)
                   : make_float4(0.f, 0.f, 0.f, 0.f);
     float sums[4];
@@ -518,7 +551,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       if (lane == 0) rr[row][b] = rrms;
       float y = o[b] * rrms;
       y += y * __half2float(nwv[b]);
-      a.xn[row * KD + b * HD + col] = __float2half_rn(y);
+      xn[row * KD + b * HD + col] = __float2half_rn(y);
     }
   }
   __syncthreads();
@@ -533,7 +566,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       if (lane + 32 * j < NC) {
         const float4 pv =
             oi == oi0 ? pre[j]
-                      : __ldcg(reinterpret_cast<const float4*>(a.dpart) +
+                      : __ldcg(reinterpret_cast<const float4*>(dpart) +
                                ((lane + 32 * j) * 8 + rw) * 96 + n);
         pb[0] += pv.x;
         pb[1] += pv.y;
@@ -556,13 +589,13 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     if (oi == oi0) TS(10);
     const int pos = rw * LW + gcol(rk, n);
     const unsigned w = __half_as_ushort(hv);
-    if (lane == 0) st2(a.lora[rk] + pos, w, tag);
-    if (lane == 1) st2(a.lora[p1] + pos, w, tag);
-    if (lane == 2) st2(a.lora[p2] + pos, w, tag);
-    if (FULL && lane == 3) st2(a.lora[p3] + pos, w, tag);
+    if (lane == 0) st2(lora[rk] + pos, w, tag);
+    if (lane == 1) st2(lora[p1] + pos, w, tag);
+    if (lane == 2) st2(lora[p2] + pos, w, tag);
+    if (FULL && lane == 3) st2(lora[p3] + pos, w, tag);
   }
   TS(5);
-  if (warp >= 3) {
+  if (grp == 0 && warp >= 3) {
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       const uint4* p = a.wu + ((i * 5 + warp - 3) * 4 + s) * 64;
@@ -577,24 +610,24 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   // r^1's columns to r^2 (r^2's diagonal).
   for (int idx = i * 256 + t; idx < M * 324; idx += NC * 256) {
     const int pos = (idx / 324) * LW + idx % 324, c = idx % 324;
-    const unsigned w = poll2(a.lora[rk] + pos, tag);
+    const unsigned w = poll2(lora[rk] + pos, tag);
     if (!FULL && ((c >= 80 * p1 && c < 80 * p1 + 80) || (p1 == 3 && c >= 320)))
-      st2(a.lora[p2] + pos, w, tag);
+      st2(lora[p2] + pos, w, tag);
   }
   if constexpr (LOCAL_SCHEDULE)
-    grid_bar_epoch(a.bar + 2, base + 2 * NC);
+    grid_bar_epoch(a.bar + 2, base + grp * 2 * NC + 2 * NC);
   else
-    grid_bar(a.bar, gb + 2 * NC);
+    grid_bar(a.bar, bb + gb + 2 * NC);
   for (int idx = t; idx < M * 320; idx += 256) {
     const int rw = idx / 320, c = idx % 320;
     ls[rw][c] = __ushort_as_half(
-        static_cast<unsigned short>(__ldcg(a.lora[rk] + rw * LW + c).x));
+        static_cast<unsigned short>(__ldcg(lora[rk] + rw * LW + c).x));
   }
   for (int idx = t; idx < (8 - M) * 320; idx += 256)
     ls[M + idx / 320][idx % 320] = __float2half_rn(0.f);
   if (i == 0 && t < M * 4)
-    a.inj_out[t] = __ushort_as_half(static_cast<unsigned short>(
-        __ldcg(a.lora[rk] + (t >> 2) * LW + 320 + (t & 3)).x));
+    inj_out[t] = __ushort_as_half(static_cast<unsigned short>(
+        __ldcg(lora[rk] + (t >> 2) * LW + 320 + (t & 3)).x));
   __syncthreads();
   TS(6);
   if (warp >= 3) {
@@ -634,7 +667,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       for (int q = 1; q < 5; ++q) acc += red[q][warp][lane];
       const int h = 640 * rk + 8 * i + hh;
       const float sg = sigm(__half2float(__float2half_rn(acc)));
-      const float xv = __half2float(__ldcg(a.xn + warp * KD + stream * HD + h));
+      const float xv = __half2float(__ldcg(xn + warp * KD + stream * HD + h));
       float mixed = 0.f;
 #pragma unroll
       for (int b = 0; b < 4; ++b)
@@ -646,10 +679,10 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
           bits | (__shfl_down_sync(0xffffffff, bits, 1) << 16);
       const unsigned upper = __shfl_down_sync(0xffffffff, packed, 2);
       if (lane < 8 && !(lane & 3)) {
-        st4(a.hb[p1] + (warp * HD + h) / 2, packed, upper, tag);
-        st4(a.hb[p2] + (warp * HD + h) / 2, packed, upper, tag);
-        st4(a.hb[p3] + (warp * HD + h) / 2, packed, upper, tag);
-        *reinterpret_cast<uint2*>(a.blk_out + warp * HD + h) =
+        st4(hb[p1] + (warp * HD + h) / 2, packed, upper, tag);
+        st4(hb[p2] + (warp * HD + h) / 2, packed, upper, tag);
+        st4(hb[p3] + (warp * HD + h) / 2, packed, upper, tag);
+        *reinterpret_cast<uint2*>(blk_out + warp * HD + h) =
             make_uint2(packed, upper);
       }
     }
@@ -666,7 +699,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
         const int h = 640 * rk + 8 * i + hh;
         const float sg = sigm(__half2float(__float2half_rn(acc)));
         const float xv =
-            rw < M ? __half2float(__ldcg(a.xn + rw * KD + quad * HD + h)) : 0.f;
+            rw < M ? __half2float(__ldcg(xn + rw * KD + quad * HD + h)) : 0.f;
         float mixed = 0.f;
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
@@ -684,10 +717,10 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     if (t < 2 * M) {
       const int rw = t >> 1, h4 = (t & 1) * 4, h = 640 * rk + 8 * i + h4;
       const uint2 d = *reinterpret_cast<const uint2*>(&tout[rw][h4]);
-      st4(a.hb[p1] + (rw * HD + h) / 2, d.x, d.y, tag);
-      st4(a.hb[p2] + (rw * HD + h) / 2, d.x, d.y, tag);
-      if (FULL) st4(a.hb[p3] + (rw * HD + h) / 2, d.x, d.y, tag);
-      *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
+      st4(hb[p1] + (rw * HD + h) / 2, d.x, d.y, tag);
+      st4(hb[p2] + (rw * HD + h) / 2, d.x, d.y, tag);
+      if (FULL) st4(hb[p3] + (rw * HD + h) / 2, d.x, d.y, tag);
+      *reinterpret_cast<uint2*>(blk_out + rw * HD + h) = d;
     }
   }
   if (FULL) {
@@ -698,24 +731,26 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
                                : p3,
                 rw = (u / 3) >> 1;
       const int h = 640 * src + 8 * i + ((u / 3) & 1) * 4;
-      const uint2 d = poll4(a.hb[rk] + (rw * HD + h) / 2, tag);
-      *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
+      const uint2 d = poll4(hb[rk] + (rw * HD + h) / 2, tag);
+      *reinterpret_cast<uint2*>(blk_out + rw * HD + h) = d;
     }
   } else {
     if (t >= 32 && t < 32 + 2 * M) {  // forward r^1's slice to r^2
       const int u = t - 32, rw = u >> 1, h = 640 * p1 + 8 * i + (u & 1) * 4;
-      const uint2 d = poll4(a.hb[rk] + (rw * HD + h) / 2, tag);
-      st4(a.hb[p2] + (rw * HD + h) / 2, d.x, d.y, tag);
-      *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
+      const uint2 d = poll4(hb[rk] + (rw * HD + h) / 2, tag);
+      st4(hb[p2] + (rw * HD + h) / 2, d.x, d.y, tag);
+      *reinterpret_cast<uint2*>(blk_out + rw * HD + h) = d;
     }
     if (t >= 64 && t < 64 + 4 * M) {  // collect r^2 and r^3 slices
       const int u = t - 64, src = (u & 2) ? p3 : p2, rw = u >> 2,
                 h = 640 * src + 8 * i + (u & 1) * 4;
-      const uint2 d = poll4(a.hb[rk] + (rw * HD + h) / 2, tag);
-      *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
+      const uint2 d = poll4(hb[rk] + (rw * HD + h) / 2, tag);
+      *reinterpret_cast<uint2*>(blk_out + rw * HD + h) = d;
     }
   }
-  if constexpr (!LOCAL_SCHEDULE) __syncthreads();
+  // Shared staging is reused by the next group.
+  __syncthreads();
+  }  // row group
   TS(8);
   if constexpr (LOCAL_SCHEDULE) {
     // All CTAs read ep/base before the first grid barrier completes. The next
@@ -723,7 +758,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     // publish the next epoch without an arrival counter or final CTA join.
     // Separate counter words keep interleaved legacy/local calls valid.
     if (i == 0 && t == 0) {
-      a.bar[3] = base + 2 * NC;
+      a.bar[3] = base + 2 * NC * groups;
       a.seq[0] = tag;
     }
   } else if (t == 0) {
@@ -779,7 +814,7 @@ void sm70_hcx_out(
   a.dbg = dbg ? reinterpret_cast<unsigned long long*>(dbg->data_ptr<int64_t>())
               : nullptr;
   a.M = static_cast<int>(p0.size(0));
-  TORCH_CHECK(a.M >= 1 && a.M <= 8, "HCX: M1..8");
+  TORCH_CHECK(a.M >= 1 && a.M <= hcx::MAX_M, "HCX: M1..40");
   auto st = at::cuda::getCurrentCUDAStream();
   if (ox) {
     a.ox = reinterpret_cast<const half*>(ox->data_ptr());

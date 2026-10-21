@@ -117,9 +117,26 @@ def apply_segments(
     rows, codes, scales, high, formats, ns, output, views, *, blas_bands=()
 ):
     k = rows.shape[1]
+    if 40 < rows.shape[0] <= 64:
+        # Concurrent verification batches: 20-row slices keep the
+        # weight-major schedule (one weight pass per three token tiles).
+        for start in range(0, rows.shape[0], 20):
+            stop = min(start + 20, rows.shape[0])
+            apply_segments(
+                rows[start:stop],
+                codes,
+                scales,
+                high,
+                formats,
+                ns,
+                output[start:stop],
+                [view[start:stop] for view in views],
+                blas_bands=blas_bands,
+            )
+        return output
     shared = k == 160 or sum(ns) <= 320
     scratch = workspace(rows.device, shared)
-    if 1 <= rows.shape[0] <= 8 or rows.shape[0] == 20:
+    if 1 <= rows.shape[0] <= 40:
         warps = 4 if k == 2560 and sum(ns) > 320 else 8
         if k == 1536:
             warps = 8
@@ -246,7 +263,34 @@ def _shared_expert(
     from .gguf_turbomind import _prepared_gguf_mixed_projection
 
     rows = x.reshape(-1, x.shape[-1]).contiguous()
-    if rows.shape[0] > 8 and rows.shape[0] != 20:
+    if 32 < rows.shape[0] <= 64:
+        # Concurrent verification batches: the fused kernel on 20-row slices.
+        out = torch.empty((rows.shape[0], 2560), device=x.device, dtype=x.dtype)
+        for start in range(0, rows.shape[0], 20):
+            stop = min(start + 20, rows.shape[0])
+            out[start:stop] = _shared_expert(
+                rows[start:stop],
+                gate_codes,
+                gate_high,
+                gate_scale,
+                up_codes,
+                up_high,
+                up_scale,
+                down_codes,
+                down_high,
+                down_scale,
+                weight_gate,
+                formats,
+                gu_codes,
+                gu_stats,
+                gu_caches,
+                gu_specs,
+                gu_cache_bands,
+                gu_blas_bands,
+                down_specs,
+            )
+        return out.reshape(*x.shape[:-1], 2560)
+    if rows.shape[0] > 32:
         gu = _prepared_gguf_mixed_projection(
             rows, gu_codes, gu_stats, gu_caches, gu_specs, gu_cache_bands, gu_blas_bands
         )

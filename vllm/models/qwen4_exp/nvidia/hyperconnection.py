@@ -386,7 +386,8 @@ def _hcx_combine_and_mix(
     oproj = getattr(module, "_hcx_oproj", None)
     block_output, secondary = module._partial_pair(block_output)
     rows = block_output.shape[0]
-    if runtime is not None and 0 < rows <= HCX_MAX_M:
+    if runtime is not None and 0 < rows <= HCX_BATCH_M:
+        # One launch; the kernel walks 8-row groups for concurrent batches.
         diagnostic = (
             {"snapshot_name": name} if getattr(runtime, "diagnostic", False) else {}
         )
@@ -402,25 +403,6 @@ def _hcx_combine_and_mix(
             secondary=secondary,
             **diagnostic,
         )
-    if runtime is not None and rows <= HCX_BATCH_M:
-        # Concurrent verification: HCX on independent row slices.
-        pieces = [
-            runtime.run(
-                block_output[start : start + HCX_MAX_M],
-                hidden_states[start : start + HCX_MAX_M],
-                injection[start : start + HCX_MAX_M],
-                module.hc_norm.weight,
-                module.config.rms_norm_eps,
-                module._hcx_down,
-                module._hcx_up,
-                None if oproj is None else oproj[1:],
-                secondary=None
-                if secondary is None
-                else secondary[start : start + HCX_MAX_M],
-            )
-            for start in range(0, rows, HCX_MAX_M)
-        ]
-        return tuple(torch.cat(parts) for parts in zip(*pieces))
     from vllm.distributed import tensor_model_parallel_all_reduce
 
     if oproj is not None and block_output.shape[0] <= HCX_BATCH_M:

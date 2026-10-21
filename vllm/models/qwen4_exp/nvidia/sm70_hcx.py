@@ -51,9 +51,11 @@ def hc_prefill_sequence_parallel_active() -> bool:
     return _PREFILL_SEQUENCE_PARALLEL.get()
 
 
-AR_BYTES = 4 * 80 * 256 * 8
-LORA_BYTES = 8 * 336 * 8
-HB_BYTES = 8 * HD * 4
+# One exchange region per 8-row group (HCX_BATCH_M rows per launch).
+HCX_GROUPS = 5
+AR_BYTES = HCX_GROUPS * 4 * 80 * 256 * 8
+LORA_BYTES = HCX_GROUPS * 8 * 336 * 8
+HB_BYTES = HCX_GROUPS * 8 * HD * 4
 TOP1_ROWS = 32
 TOP1_BYTES = 2 * 2 * TOP1_ROWS * 16
 _LANE_R = [(L & 3) + (4 if L & 16 else 0) for L in range(32)]
@@ -308,10 +310,14 @@ class Sm70HcxRuntime:
                 p + AR_BYTES + LORA_BYTES + HB_BYTES if p else 0 for p in base
             ]
             self.top1_seq = torch.zeros(1, device=device, dtype=torch.int32)
-            self.xn = torch.zeros(HCX_MAX_M, KD, device=device, dtype=torch.float16)
-            self.sq = torch.zeros(80 * 8 * 4, device=device, dtype=torch.float32)
+            self.xn = torch.zeros(
+                HCX_BATCH_M, KD, device=device, dtype=torch.float16
+            )
+            self.sq = torch.zeros(
+                HCX_GROUPS * 80 * 8 * 4, device=device, dtype=torch.float32
+            )
             self.dpart = torch.zeros(
-                80 * 8 * 96 * 4, device=device, dtype=torch.float32
+                HCX_GROUPS * 80 * 8 * 96 * 4, device=device, dtype=torch.float32
             )
             # Legacy arrival/reset counters and separate local-schedule
             # cumulative counter/base permit alternating graph policies.
@@ -355,6 +361,7 @@ class Sm70HcxRuntime:
         oproj=None,
         secondary=None,
         snapshot_name=None,
+        outputs=None,
     ):
         m = partial.shape[0]
         ox = ocodes = ohigh = oscale = None
@@ -363,9 +370,13 @@ class Sm70HcxRuntime:
             k, ocodes, ohigh, oscale, ofmt = oproj
             # hcxo computes the producer GEMV itself and never reads p0.
             ox = partial[:, :k]
-        hidden_out = torch.empty_like(hidden)
-        block = partial.new_empty((m, HD))
-        injection_out = partial.new_empty((m, INJ))
+        if outputs is None:
+            hidden_out = torch.empty_like(hidden)
+            block = partial.new_empty((m, HD))
+            injection_out = partial.new_empty((m, INJ))
+        else:
+            # Row slices of the caller's contiguous outputs.
+            hidden_out, block, injection_out = outputs
         snapshot = None
         if self.diagnostic and m == 5 and snapshot_name is not None:
             if oproj is not None:

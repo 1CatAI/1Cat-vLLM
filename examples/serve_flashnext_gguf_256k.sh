@@ -48,6 +48,9 @@ if (( MAX_NUM_SEQS > 4 )); then PREFILL_CHUNK=4096 STAGE_TOKENS=131072; fi
 # the adaptive budget charges the decodes' fixed cost to the prefill tokens
 # and would otherwise shrink to a few tokens per step.
 MIXED_ARGS=()
+# The draft hot cache is one layer; concurrent requests share it.
+DRAFT_HOT_TOKENS=16384
+(( MAX_NUM_SEQS > 1 )) && DRAFT_HOT_TOKENS=32768
 if (( MAX_NUM_SEQS > 1 )); then
   MIXED_ARGS=(--mixed-prefill-min-tokens "$((PREFILL_CHUNK / 2))")
 fi
@@ -87,7 +90,7 @@ export TORCH_EXTENSIONS_DIR="$CACHE_DIR/torch_extensions"
 export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 unset LD_PRELOAD LD_AUDIT ONECAT_VLLM_EXTENSION_DIR
 mkdir -p "$CACHE_DIR"
-KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" "$STATE_BLOCKS" "$HOT_TOKENS" "$STAGE_TOKENS" "$EXPERT_FRACTION" <<'PY'
+KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" "$STATE_BLOCKS" "$HOT_TOKENS" "$STAGE_TOKENS" "$EXPERT_FRACTION" "$DRAFT_HOT_TOKENS" <<'PY'
 import json
 import sys
 if sys.argv[2].lower() not in ("true", "false"):
@@ -114,7 +117,7 @@ config = {
     "qsa_host_kv_dtype": "fp8_e4m3",
     "qsa_host_kv_draft_dtype": "float16", "qsa_host_kv_device_reference": False,
     "qsa_host_kv_hot_tokens": int(sys.argv[4]), "qsa_host_kv_hot_dtype": "fp8_e4m3",
-    "qsa_host_kv_draft_hot_tokens": 16384, "qsa_host_kv_staging_rows": 8,
+    "qsa_host_kv_draft_hot_tokens": int(sys.argv[7]), "qsa_host_kv_staging_rows": 8,
     "qsa_host_kv_prefill_stage_tokens": int(sys.argv[5]),
     "qsa_host_kv_prefill_stage_slots": 1,
     "qsa_host_kv_trim_warmup_cache": True,

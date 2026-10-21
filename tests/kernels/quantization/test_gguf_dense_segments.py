@@ -38,7 +38,9 @@ def test_codec_official_reference(source):
 
 
 @pytest.mark.parametrize("source", [8, 12, 13, 14, 20, 23])
-@pytest.mark.parametrize("m,split", [(1, 1), (5, 2), (8, 4), (20, 2)])
+@pytest.mark.parametrize(
+    "m,split", [(1, 1), (5, 2), (8, 4), (10, 1), (15, 2), (20, 2), (32, 1), (40, 1)]
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_projection_official_and_graph(source, m, split):
     if torch.cuda.get_device_capability() != (7, 0):
