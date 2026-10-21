@@ -38,7 +38,7 @@ RUN chmod +x /app/*.sh
 ENV MODEL_DIR=/models CACHE_DIR=/cache PORT=8000 HOST=0.0.0.0
 # Concurrent requests served by default; the launcher sizes its memory pools
 # for it (docker build --build-arg MAX_NUM_SEQS=4, or docker run -e).
-ARG MAX_NUM_SEQS=1
+ARG MAX_NUM_SEQS=4
 ENV MAX_NUM_SEQS=${MAX_NUM_SEQS}
 VOLUME ["/cache"]
 EXPOSE 8000

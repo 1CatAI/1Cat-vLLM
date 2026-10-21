@@ -26,7 +26,7 @@ EXPERT_PROFILE=${EXPERT_PROFILE:-}
 QSA_HOST_INDEXER_HISTORY=${QSA_HOST_INDEXER_HISTORY:-false}
 # Concurrent requests. MTP4 verifies 5 rows per request: capture one CUDA
 # graph per 5 * {1, 2, 4, ...} up to the limit (uncaptured batches run eager).
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
 CAPTURE_SIZES=$(r=1; s=""; while [ "$r" -lt "$MAX_NUM_SEQS" ]; do
   s="$s$((5 * r)),"; r=$((r * 2)); done; echo "${s}$((5 * MAX_NUM_SEQS))")
 # Context window. Beyond the native 262144 positions RoPE uses YaRN scaling
