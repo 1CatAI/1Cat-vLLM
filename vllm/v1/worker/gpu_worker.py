@@ -844,6 +844,16 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if self.vllm_config.kernel_config.topology_all_reduce.enabled and not getattr(
+            self, "_topology_all_reduce_installed", False
+        ):
+            from vllm.distributed.device_communicators.topology_all_reduce import (
+                startup,
+            )
+
+            self._topology_all_reduce_routes = startup.install(self)
+            self._topology_all_reduce_installed = True
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
