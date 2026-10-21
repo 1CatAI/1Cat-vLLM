@@ -1396,9 +1396,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         model_config = vllm_config.model_config
 
         chunked_prefill_workspace_size = min(
-            # Try for 8 full length request or at least 4 pages per-request
+            # Try for 8 full length requests, never more than the scheduler can
+            # hold at once, or at least 4 pages per request. A single-sequence
+            # engine keeps one request's context per chunk; the profile run
+            # sizes the kv_b_proj output by this (GLM-5.3-Flash: 64 heads x 512
+            # x 64k tokens = 4 GiB on every pipeline stage).
             max(
-                8 * model_config.max_model_len,
+                min(8, scheduler_config.max_num_seqs) * model_config.max_model_len,
                 4 * scheduler_config.max_num_seqs * cache_config.block_size,
             ),
             # For long-context models try not to over-allocate limiting
