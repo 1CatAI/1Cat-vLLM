@@ -608,8 +608,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         # Compact device-side routing (all fixed shapes, CUDA-graph safe):
         # slots sorted by expert; consecutive equal experts form a group.
         # gids[g] = group's expert, goff[g]..goff[g+1] = its slot range;
-        # unused group slots stay empty (goff = S) and the kernel skips
-        # them -- the launch never scales with the expert count.
+        # unused group slots stay empty (goff = S); the kernel launches
+        # min(S, experts) group rows and skips the empty ones.
         flat = topk_ids.reshape(-1).to(torch.int64)
         num_slots = flat.numel()
         perm = torch.argsort(flat, stable=True).to(torch.int32)
