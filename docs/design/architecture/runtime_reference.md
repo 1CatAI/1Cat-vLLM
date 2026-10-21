@@ -11,7 +11,7 @@ identify initialization/hash code; they do not evaluate its semantics.
 
 | Type | Owner paths | Lifecycle / hash methods | Source |
 | --- | --- | --- | --- |
-| `vllm.config.attention.AttentionConfig` | attention_config | compute_hash: [vllm/config/attention.py](../../../vllm/config/attention.py#L121) | [vllm/config/attention.py](../../../vllm/config/attention.py#L33) |
+| `vllm.config.attention.AttentionConfig` | attention_config | compute_hash: [vllm/config/attention.py](../../../vllm/config/attention.py#L131) | [vllm/config/attention.py](../../../vllm/config/attention.py#L33) |
 | `vllm.config.attention.V41IndexTiledPolicy` | attention_config.v41_index_tiled | resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L29); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/attention.py](../../../vllm/config/attention.py#L17) |
 | `vllm.config.cache.CacheConfig` | cache_config | compute_hash: [vllm/config/cache.py](../../../vllm/config/cache.py#L275) | [vllm/config/cache.py](../../../vllm/config/cache.py#L108) |
 | `vllm.config.cache.KVRetentionConfig` | cache_config.retention | __post_init__: [vllm/config/cache.py](../../../vllm/config/cache.py#L84) | [vllm/config/cache.py](../../../vllm/config/cache.py#L45) |
