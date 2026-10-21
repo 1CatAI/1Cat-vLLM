@@ -194,41 +194,69 @@ def dequantize_mxfp8_weight_pairs(
     An MXFP8 pair is an fp8-e4m3 ``<module>.weight`` and a uint8 E8M0
     ``<module>.weight_scale`` of shape [N, K/32]; it becomes one
     ``<module>.weight`` in ``out_dtype``. Other fp8 weights, e.g. block FP8
-    with float32 scales, and every other tensor pass through unchanged, so a
-    model can keep those quantized. Items keep any extra fields after
-    (name, tensor). For hardware without MXFP8 kernels (before SM80).
+    with float32 scales, pass through unchanged, so a model can keep those
+    quantized, and every other tensor passes through too. Items keep any extra
+    fields after (name, tensor). For hardware without MXFP8 kernels (before
+    SM80).
+
+    Every scale is handed on directly after its weight, whatever order the
+    shards store them in: model loaders pair the two inside one
+    ``load_weights`` call, and a split stream (``AutoWeightsLoader`` calls a
+    module once per run of its prefix) would otherwise part them. Apply it to
+    the whole stream, before any split.
     """
     pending_weights: dict[str, tuple] = {}
     pending_scales: dict[str, tuple] = {}
+    # Modules whose unquantized weight already went by: a later scale of
+    # theirs has nothing to wait for.
+    passed: set[str] = set()
     for item in weights:
         name, tensor = item[0], item[1]
-        if name.endswith(".weight") and tensor.dtype == MXFP8_VALUE_DTYPE:
+        if name.endswith(".weight"):
             module = name.removesuffix(".weight")
             scale = pending_scales.pop(module, None)
-            if scale is None:
+            if tensor.dtype != MXFP8_VALUE_DTYPE:
+                passed.add(module)
+                yield item
+                if scale is not None:
+                    yield scale
+            elif scale is None:
                 pending_weights[module] = item
-            else:
+            elif scale[1].dtype == MXFP8_SCALE_DTYPE:
                 yield _dequantized_pair(item, scale[1], out_dtype)
-        elif name.endswith(".weight_scale") and tensor.dtype == MXFP8_SCALE_DTYPE:
-            module = name.removesuffix(".weight_scale")
-            weight = pending_weights.pop(module, None)
-            if weight is None:
-                pending_scales[module] = item
             else:
-                yield _dequantized_pair(weight, tensor, out_dtype)
+                yield item
+                yield scale
+            continue
+        module = _scale_module(name, tensor)
+        if module is None or module in passed:
+            yield item
+            continue
+        weight = pending_weights.pop(module, None)
+        if weight is None:
+            pending_scales[module] = item
+        elif tensor.dtype == MXFP8_SCALE_DTYPE:
+            yield _dequantized_pair(weight, tensor, out_dtype)
         else:
-            if name.endswith(".weight_scale"):
-                # A non-MXFP8 scale settles its weight: hand both on as stored.
-                weight = pending_weights.pop(name.removesuffix(".weight_scale"), None)
-                if weight is not None:
-                    yield weight
+            yield weight
             yield item
     if pending_scales:
         raise ValueError(
-            "MXFP8 weight scales without their fp8 weights: "
-            f"{sorted(pending_scales)[:4]}"
+            f"Weight scales without their weights: {sorted(pending_scales)[:4]}"
         )
     yield from pending_weights.values()
+
+
+def _scale_module(name: str, tensor: torch.Tensor) -> str | None:
+    """The module of a scale that belongs next to its weight: an MXFP8 E8M0
+    scale or a float32 (block or per-tensor) FP8 scale. NVFP4's E4M3 block
+    scales and every other tensor are not held."""
+    if tensor.dtype not in (MXFP8_SCALE_DTYPE, torch.float32):
+        return None
+    for suffix in (".weight_scale", ".weight_scale_inv"):
+        if name.endswith(suffix):
+            return name.removesuffix(suffix)
+    return None
 
 
 def _dequantized_pair(weight_item: tuple, scale: torch.Tensor, out_dtype) -> tuple:
