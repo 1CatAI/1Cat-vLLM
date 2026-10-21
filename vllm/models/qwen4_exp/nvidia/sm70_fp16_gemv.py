@@ -287,12 +287,21 @@ def _router_batch_storage(weight: torch.Tensor, storage: str) -> torch.Tensor:
     return _pack_router_batch_weight(weight)
 
 
+def _verify_rows(rows: int) -> bool:
+    """MTP4 verification batches of one to eight requests (five rows each).
+
+    The router and shared-expert batch kernels compute rows independently, so
+    one launch covers every request with per-row results unchanged.
+    """
+    return rows % 5 == 0 and 5 <= rows <= 40
+
+
 def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     return bool(
         mtp_batch_enabled("shared_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and x.shape[0] in (5, 10)
+        and _verify_rows(x.shape[0])
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -327,7 +336,7 @@ def _batch_piecewise(x: torch.Tensor) -> bool:
 def _qwen38_sm70_shared_up(
     x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
 ) -> torch.Tensor:
-    if packed is not None and _batch_piecewise(x):
+    if packed is not None and _batch_piecewise(x) and x.shape[0] > 40:
         return _in_pieces(
             x, 160, lambda piece: _qwen38_sm70_shared_up(piece, weight, packed)
         )
@@ -400,7 +409,7 @@ def _router_batch_runtime_ok(x, packed) -> bool:
         mtp_batch_enabled("router_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and x.shape[0] in (5, 10)
+        and _verify_rows(x.shape[0])
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -434,6 +443,7 @@ def _qwen38_sm70_fp16_gemv(
         role.endswith(_ROUTER_SUFFIX)
         and packed_router is not None
         and _batch_piecewise(x)
+        and x.shape[0] > 40
     ):
         return _in_pieces(
             x,

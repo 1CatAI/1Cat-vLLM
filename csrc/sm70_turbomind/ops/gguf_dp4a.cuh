@@ -128,6 +128,54 @@ struct LatticeDot {
 };
 using IQ3SDot = LatticeDot<21>;
 
+// One IQ3_S weight group decoded for several activations. apply() repeats
+// dot()'s integer dot and float boundary exactly, so a route's result does
+// not depend on how many routes share the decoded words.
+template <bool BankAware>
+struct IQ3SGroup {
+  using Dot = LatticeDot<21, BankAware>;
+  int w[8];
+  float d;
+  int mult;
+
+  __device__ IQ3SGroup(const uint8_t* row, int group, const uint32_t* book,
+                       const uint32_t* masks) {
+    const uint8_t* b = row + (group / 8) * Dot::kBlockBytes;
+    const int sub = group % 8;
+    const uint32_t low = load_u32_2(b + 2 + sub * 8);
+    const uint32_t high = load_u32_2(b + 6 + sub * 8);
+    const uint32_t signs = load_u32_2(b + 74 + sub * 4);
+    const int qh = b[66 + sub];
+#pragma unroll
+    for (int octet = 0; octet < 4; ++octet) {
+      const uint32_t codes = octet < 2 ? low : high;
+      const int shift = (octet % 2) * 16;
+      const int first =
+          ((codes >> shift) & 255) | (((qh >> (2 * octet)) & 1) << 8);
+      const int second =
+          ((codes >> (shift + 8)) & 255) | (((qh >> (2 * octet + 1)) & 1) << 8);
+      const int sign = (signs >> (8 * octet)) & 255;
+      const uint32_t s0 =
+          BankAware ? Dot::sign_mask(sign & 15) : masks[sign & 15];
+      const uint32_t s1 =
+          BankAware ? Dot::sign_mask(sign >> 4) : masks[sign >> 4];
+      w[2 * octet] = __vsub4(Dot::word(book, first) ^ s0, s0);
+      w[2 * octet + 1] = __vsub4(Dot::word(book, second) ^ s1, s1);
+    }
+    d = __half2float(*reinterpret_cast<const half*>(b));
+    mult = 1 + 2 * ((b[106 + sub / 2] >> (4 * (sub % 2))) & 15);
+  }
+
+  __device__ float apply(const Q8_1& x) const {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int sum0 = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sum0 = __dp4a(w[i], activation[i], sum0);
+    const float scale = d * __low2float(x.ds);
+    return scale * float(sum0 * mult);
+  }
+};
+
 // Original blocks are also the authoritative storage for constrained-memory
 // models. Keep the same integer dot and FP16 coefficient boundary as the
 // canonical reader, without expanding a second expert bank at load time.
@@ -175,6 +223,54 @@ struct OriginalIntegerDot {
       }
       sum = __dp4a(static_cast<int>(values), activation[packet], sum);
     }
+    return float(sum) * (scale * __low2float(x.ds));
+  }
+};
+
+// IQ4_NL / IQ4_XS counterpart of IQ3SGroup: OriginalIntegerDot's words and
+// coefficient, decoded once and applied to several activations.
+template <int Type>
+struct Lut4Group {
+  static_assert(Type == 20 || Type == 23);
+  uint32_t values[8];
+  float scale;
+
+  __device__ Lut4Group(const uint8_t* row, int group, const uint32_t*,
+                       const uint32_t*) {
+    const uint8_t* b;
+    const uint8_t* codes;
+    if constexpr (Type == 23) {
+      b = row + (group / 8) * 136;
+      const int sub = group % 8;
+      const uint16_t high = *reinterpret_cast<const uint16_t*>(b + 2);
+      const int subscale = ((b[4 + sub / 2] >> (4 * (sub % 2))) & 15) |
+                           (((high >> (2 * sub)) & 3) << 4);
+      scale = __half2float(__float2half_rn(
+          __half2float(*reinterpret_cast<const half*>(b)) * (subscale - 32)));
+      codes = b + 8 + sub * 16;
+    } else {
+      b = row + group * 18;
+      scale = __half2float(*reinterpret_cast<const half*>(b));
+      codes = b + 2;
+    }
+#pragma unroll
+    for (int packet = 0; packet < 8; ++packet) {
+      const uint32_t bytes =
+          load_u32_2(codes + (packet % 4) * 4) >> ((packet / 4) * 4);
+      const uint32_t nibbles = (bytes & 15) | ((bytes >> 4) & 0xf0) |
+                               ((bytes >> 8) & 0xf00) |
+                               ((bytes >> 12) & 0xf000);
+      using Lut = turbomind::gemm::Transform_HMMA_SM70_Lut4<0>;
+      values[packet] = Lut::iq_values(nibbles) ^ 0x80808080U;
+    }
+  }
+
+  __device__ float apply(const Q8_1& x) const {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int sum = 0;
+#pragma unroll
+    for (int packet = 0; packet < 8; ++packet)
+      sum = __dp4a(static_cast<int>(values[packet]), activation[packet], sum);
     return float(sum) * (scale * __low2float(x.ds));
   }
 };

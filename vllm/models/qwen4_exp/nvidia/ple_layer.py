@@ -2812,11 +2812,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         hidden_size = x_spec.size(-1)
         if (
             layer_policy().value("ple_spec_conv")
-            and num_reqs == 1
+            and 1 <= num_reqs <= 8
             and spec_query_len == 5
             and self.conv_state_len == 9
             and self.short_conv_dilation == 3
-            and x_spec.shape in ((5, 10240), (10, 10240))
+            and 1 <= x_spec.shape[0] <= 40
+            and x_spec.shape[1] == 10240
             and x_spec.is_cuda
             and x_spec.dtype == torch.float16
             and x_spec.is_contiguous()

@@ -439,6 +439,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_dp4a_gate_up_sm70_out", torch::kCUDA,
            &gguf_dp4a_gate_up_sm70_out);
   ops.def(
+      "gguf_dp4a_gate_up_grouped_sm70_out(Tensor(a!) out, Tensor activation, "
+      "Tensor ids, Tensor gate, Tensor up, int source_type, "
+      "bool bank_aware=False, int per_cta=8) -> ()");
+  ops.impl("gguf_dp4a_gate_up_grouped_sm70_out", torch::kCUDA,
+           &gguf_dp4a_gate_up_grouped_sm70_out);
+  ops.def(
       "gguf_dp4a_lut4_gate_up_sm70_out(Tensor(a!) out, Tensor activation, "
       "Tensor ids, Tensor gate, Tensor gate_stats, Tensor up, Tensor up_stats, "
       "int num_experts, int lanes_per_row=16) -> ()");

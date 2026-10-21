@@ -1447,8 +1447,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         num_tokens = hidden_states.shape[0]
         side = getattr(self, "sm70_side_projection", None)
         indexer_input = hidden_states
-        if side is not None and 1 <= num_tokens <= 8:
+        if side is not None:
             # The indexer receives its projected q/k instead of hidden states.
+            # The opaque op fuses both projections for small batches; a
+            # Python bound here would be frozen for the whole compiled range.
             qkv, indexer_input = side(hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)

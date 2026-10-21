@@ -85,6 +85,9 @@ class Dmv13Projection:
     def __init__(self, layer, extra=None):
         self.ready = False
         self.name = getattr(layer, "prefix", "") or str(id(layer))
+        # Larger batches run the original projections inside the same opaque
+        # op, so a compiled range spanning both sizes picks per call.
+        self.layer, self.extra_layer = layer, extra
         shards = _raw_shards(layer)
         if not shards or len(shards) > MAX_SEGMENTS:
             return
@@ -169,7 +172,14 @@ class Dmv13Projection:
 
 
 def _side_projection(x: torch.Tensor, name: str) -> tuple[torch.Tensor, torch.Tensor]:
-    return _PROJECTIONS[name].run(x)
+    projection = _PROJECTIONS[name]
+    if 1 <= x.shape[0] <= MAX_M:
+        return projection.run(x)
+    out, _ = projection.layer(x)
+    if projection.extra_layer is None:
+        return out, x.new_empty((x.shape[0], 0))
+    extra_out, _ = projection.extra_layer(x)
+    return out, extra_out
 
 
 def _side_projection_fake(x: torch.Tensor, name: str):
@@ -193,8 +203,14 @@ def _shard_key(raw, qtype):
 
 
 # GGUF type -> (block bytes, elements per block) for the native packer.
-_BLOCKS = {8: (34, 32), 12: (144, 256), 13: (176, 256), 14: (210, 256),
-           20: (18, 32), 23: (136, 256)}
+_BLOCKS = {
+    8: (34, 32),
+    12: (144, 256),
+    13: (176, 256),
+    14: (210, 256),
+    20: (18, 32),
+    23: (136, 256),
+}
 
 
 def _native_packer():
@@ -217,8 +233,14 @@ def _decode_pack(raw, qtype, threads: int = 1):
         codes, high, scale = native(host, qtype, threads)
         block_bytes, block_elems = _BLOCKS[qtype]
         cols = host.shape[1] // block_bytes * block_elems
-        return (_DENSE_FORMATS[qtype], host.shape[0], cols, codes.numpy(),
-                high.numpy(), scale.numpy())
+        return (
+            _DENSE_FORMATS[qtype],
+            host.shape[0],
+            cols,
+            codes.numpy(),
+            high.numpy(),
+            scale.numpy(),
+        )
     fmt, q, s, m, gs = dense.decode(raw.detach().cpu().numpy(), qtype)
     codes, high, scale = dense.pack(fmt, q, s, m, gs)
     if fmt == dense.LUT4:

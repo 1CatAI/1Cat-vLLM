@@ -983,8 +983,8 @@ int64_t ple_fast_lane_start(
 torch::Tensor ple_fast_lane_stats(int64_t handle);
 
 std::vector<torch::Tensor> gguf_dmv13_decode_pack(torch::Tensor raw,
-                                                   int64_t gtype,
-                                                   int64_t num_threads);
+                                                  int64_t gtype,
+                                                  int64_t num_threads);
 void ple_fast_lane_stop(int64_t handle);
 
 void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
@@ -1049,6 +1049,11 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor up, int64_t source_type,
                                 bool activated, int64_t lanes_per_row,
                                 bool bank_aware);
+void gguf_dp4a_gate_up_grouped_sm70_out(torch::Tensor out,
+                                        torch::Tensor activation,
+                                        torch::Tensor ids, torch::Tensor gate,
+                                        torch::Tensor up, int64_t source_type,
+                                        bool bank_aware, int64_t per_cta);
 void gguf_dp4a_lut4_gate_up_sm70_out(
     torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
     torch::Tensor gate, torch::Tensor gate_stats, torch::Tensor up,

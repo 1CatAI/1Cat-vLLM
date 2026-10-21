@@ -351,8 +351,8 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
 }
 void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 &&
-                  x.size(0) <= 16 && x.size(1) == 2560,
-              "SM70 batch router requires M2..16, K2560");
+                  x.size(0) <= 40 && x.size(1) == 2560,
+              "SM70 batch router requires M2..40, K2560");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -378,9 +378,9 @@ void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
 
 void shared_up_batch(torch::Tensor output, torch::Tensor partial,
                      torch::Tensor x, torch::Tensor packed) {
-  TORCH_CHECK(x.is_cuda() && x.dim() == 2 &&
-                  (x.size(0) == 5 || x.size(0) == 10) && x.size(1) == 2560,
-              "Shared expert batch projection requires M5/M10, K2560");
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) % 5 == 0 &&
+                  x.size(0) >= 5 && x.size(0) <= 40 && x.size(1) == 2560,
+              "Shared expert batch projection requires M5..40 (x5), K2560");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -429,9 +429,9 @@ void shared_up_batch_fp32(torch::Tensor output, torch::Tensor partial,
 void shared_gate_mul(torch::Tensor output, torch::Tensor logits,
                      torch::Tensor source) {
   TORCH_CHECK(source.is_cuda() && source.dim() == 2 &&
-                  (source.size(0) == 5 || source.size(0) == 10) &&
-                  source.size(1) == 2560,
-              "Shared gate epilogue requires M5/M10, N2560");
+                  source.size(0) % 5 == 0 && source.size(0) >= 5 &&
+                  source.size(0) <= 40 && source.size(1) == 2560,
+              "Shared gate epilogue requires M5..40 (x5), N2560");
   const c10::cuda::CUDAGuard guard(source.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");

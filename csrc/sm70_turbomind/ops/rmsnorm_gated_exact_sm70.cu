@@ -50,8 +50,8 @@ __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
 void rmsnorm_gated_exact(torch::Tensor out, torch::Tensor x, torch::Tensor z,
                          torch::Tensor weight, double eps, bool silu) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 128 &&
-                  x.size(0) >= 1 && x.size(0) <= 192,
-              "SM70 exact gated RMSNorm requires CUDA [1..192, 128]");
+                  x.size(0) >= 1 && x.size(0) <= 768,
+              "SM70 exact gated RMSNorm requires CUDA [1..768, 128]");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,

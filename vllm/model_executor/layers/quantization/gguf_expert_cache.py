@@ -24,7 +24,7 @@ import importlib
 import os
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
@@ -32,6 +32,9 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+if TYPE_CHECKING:
+    from .gguf_prefill_prepare import PredictivePrefillPreparation
 
 logger = init_logger(__name__)
 
@@ -75,10 +78,17 @@ def _lookup_publish(
     tl.store(entry + 2, count.to(tl.int32))
     tl.store(entry + 3, miss.to(tl.int32))
     tl.debug_barrier()
-    tl.atomic_xchg(entry, seq.to(tl.int32), sem="release", scope="sys")
-    tl.atomic_xchg(published, seq + 1, sem="release", scope="sys")
-    tl.store(counter, seq + 1)
     ops = 0
+    if miss > 0:
+        tl.atomic_xchg(entry, seq.to(tl.int32), sem="release", scope="sys")
+        tl.atomic_xchg(published, seq + 1, sem="release", scope="sys")
+    else:
+        # Nothing waits on a hit: publish without system-scope fences. The
+        # complemented tag tells the lane there is nothing to plan, so a late
+        # body only affects recency. A later miss's release orders it.
+        tl.atomic_xchg(entry, ~seq.to(tl.int32), sem="relaxed", scope="sys")
+        tl.atomic_xchg(published, seq + 1, sem="relaxed", scope="sys")
+    tl.store(counter, seq + 1)
     if miss > 0:
         # The lane answers with this request's sequence number.
         # A failed lane answers every request with no copies.
@@ -832,7 +842,7 @@ class TurboMindPrefill:
 
     def __init__(self, cache: "ExpertCache"):
         self.cache = cache
-        self.preparation = None
+        self.preparation: PredictivePrefillPreparation | None = None
         self.prediction_step = False
         experts, device = cache.experts, cache.device
         self.layer = {}
@@ -940,6 +950,11 @@ class TurboMindPrefill:
         split = self.cache.experts * spec[3]
         return buffer[:split], buffer[split : split + self.cache.experts * spec[4]]
 
+    def _prepared(self) -> "PredictivePrefillPreparation":
+        # Only prediction steps reach the preparation hooks.
+        assert self.preparation is not None
+        return self.preparation
+
     def storage_bytes(self) -> int:
         return (
             sum(t.numel() for ts in self.storage.values() for t in ts)
@@ -1015,7 +1030,7 @@ class TurboMindPrefill:
                 BLOCK=triton.next_power_of_2(experts),
             )
             if self.prediction_step:
-                self.preparation.filter(i)
+                self._prepared().filter(i)
 
     def _issue(self, key: str, i: int):
         """Queue layer i's transcode into the `key` bank."""
@@ -1056,7 +1071,7 @@ class TurboMindPrefill:
             cold.wait_event(self.fresh)
             for s in (0, 1) if key == "gu" else (2,):
                 if self.prediction_step:
-                    self.preparation.stage(i, s, self.stage_at[s], cold.cuda_stream)
+                    self._prepared().stage(i, s, self.stage_at[s], cold.cuda_stream)
                 else:
                     cache.lane.stage_cold(i, s, self.stage_at[s], cold.cuda_stream)
         cold.wait_stream(stream)
@@ -1153,12 +1168,12 @@ class TurboMindPrefill:
         if route is None:
             route = self._route(ids, 0, experts)
         if self.prediction_step:
-            self.preparation.complete("gu", i, route[0])
+            self._prepared().complete("gu", i, route[0])
         hidden = self._gate_up(info, tables, x, route, False)
         self._release("gu", i)
         self._acquire("dn", i)
         if self.prediction_step:
-            self.preparation.complete("dn", i, route[0])
+            self._prepared().complete("dn", i, route[0])
         # Down's output is wide: token sub-batches, each reading its routes'
         # gate|up rows from the chunk-wide order.
         if tokens <= step:
@@ -1170,7 +1185,7 @@ class TurboMindPrefill:
                 self._down(info, tables, hidden, sub, weights[t0:t1], out[t0:t1], False)
         self._release("dn", i)
         if self.prediction_step:
-            self.preparation.finish(i)
+            self._prepared().finish(i)
         return out
 
     def _route(self, ids, t0, experts, outer=None):

@@ -448,6 +448,203 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+namespace {
+// Concurrent and speculative rows route many tokens to the same expert. The
+// routes of each expert are taken `per_cta` at a time (in route order): the
+// CTA of the first route of each batch decodes the expert's groups once and
+// applies them to every route of its batch; the other CTAs exit. Fewer routes
+// per CTA trade decode reuse for parallelism. Per-route arithmetic,
+// reductions and the Q8_1 output are those of gate_up<Type, true, Index,
+// Lanes, true> (IQ3_S: 16 lanes per row; IQ4_NL/IQ4_XS: 4).
+constexpr int kGroupedChunk = 8;
+
+template <int Type, class Index, int Lanes, bool BankAware>
+__global__ __launch_bounds__(32 * Lanes) void gate_up_grouped(
+    Q8_1* output, const Q8_1* activation, const Index* ids, const uint8_t* gate,
+    const uint8_t* up, int n, int k, int stride, int top_k, int routes,
+    int per_cta) {
+  using Dot = LatticeDot<Type, BankAware>;
+  using Group =
+      std::conditional_t<Type == 21, vllm::sm70_gguf::IQ3SGroup<BankAware>,
+                         vllm::sm70_gguf::Lut4Group<Type>>;
+  constexpr int Chunk = kGroupedChunk, Warps = Lanes;
+  __shared__ uint32_t book[Dot::kBookWords];
+  __shared__ uint32_t masks[16];
+  __shared__ half intermediate[Chunk][32];
+  __shared__ int members[512];
+  __shared__ int member_count, rank;
+  extern __shared__ Q8_1 shared_x[];
+  const int leader = blockIdx.y, groups = k / 32;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const Index expert = ids[leader];
+  // This route's rank among the expert's routes.
+  int earlier = 0;
+  for (int r = threadIdx.x; r < leader; r += blockDim.x)
+    earlier += ids[r] == expert;
+  if (threadIdx.x == 0) rank = 0;
+  __syncthreads();
+  if (earlier) atomicAdd(&rank, earlier);
+  __syncthreads();
+  if (rank % per_cta) return;
+  if (warp == 0) {
+    int count = 0;
+    for (int base = leader; base < routes && count < per_cta; base += 32) {
+      const int r = base + lane;
+      const bool match = r < routes && ids[r] == expert;
+      const unsigned ballot = __ballot_sync(0xffffffffU, match);
+      const int index = count + __popc(ballot & ((1U << lane) - 1));
+      if (match && index < per_cta) members[index] = r;
+      count += __popc(ballot);
+    }
+    if (lane == 0) member_count = min(count, per_cta);
+  }
+  Dot::initialize(book, masks);
+  const int count = member_count;
+  const int local_row = warp * (32 / Lanes) + lane / Lanes;
+  const int row = blockIdx.x * 32 + local_row;
+  const int64_t expert_row = int64_t(expert) * n + row;
+  const uint8_t* g = gate + expert_row * stride;
+  const uint8_t* u = up + expert_row * stride;
+  for (int first = 0; first < count; first += Chunk) {
+    const int chunk = min(Chunk, count - first);
+    for (int i = threadIdx.x; i < chunk * groups * 9; i += blockDim.x) {
+      const int j = i / (groups * 9), w = i % (groups * 9);
+      const Q8_1* x = activation + (members[first + j] / top_k) * groups;
+      reinterpret_cast<uint32_t*>(shared_x)[i] =
+          reinterpret_cast<const uint32_t*>(x)[w];
+    }
+    __syncthreads();
+    float gs[Chunk], us[Chunk];
+#pragma unroll
+    for (int j = 0; j < Chunk; ++j) gs[j] = us[j] = 0.f;
+    for (int group = lane % Lanes; group < groups; group += Lanes) {
+      const Group dg(g, group, book, masks), du(u, group, book, masks);
+#pragma unroll
+      for (int j = 0; j < Chunk; ++j)
+        if (j < chunk) {
+          gs[j] += dg.apply(shared_x[j * groups + group]);
+          us[j] += du.apply(shared_x[j * groups + group]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < Chunk; ++j) {
+#pragma unroll
+      for (int offset = Lanes / 2; offset; offset >>= 1) {
+        gs[j] += __shfl_down_sync(0xffffffffU, gs[j], offset, Lanes);
+        us[j] += __shfl_down_sync(0xffffffffU, us[j], offset, Lanes);
+      }
+      if (j < chunk && lane % Lanes == 0) {
+        const float g16 = __half2float(__float2half_rn(gs[j]));
+        const float u16 = __half2float(__float2half_rn(us[j]));
+        const half silu = __float2half_rn(g16 / (1.f + expf(-g16)));
+        intermediate[j][local_row] = __hmul(silu, __float2half_rn(u16));
+      }
+    }
+    __syncthreads();
+    for (int j = warp; j < chunk; j += Warps)
+      vllm::sm70_gguf::quantize_q8_1_warp(
+          output + int64_t{members[first + j]} * (n / 32) + blockIdx.x,
+          __half2float(intermediate[j][lane]));
+    __syncthreads();
+  }
+}
+
+template <int Type, class Index, int Lanes>
+void launch_gate_up_grouped(torch::Tensor out, torch::Tensor activation,
+                            torch::Tensor ids, torch::Tensor gate,
+                            torch::Tensor up, bool bank_aware, int per_cta) {
+  const int n = gate.size(1), k = activation.size(1) * 32;
+  const int routes = ids.numel();
+  const dim3 grid(n / 32, routes);
+  const size_t shared = kGroupedChunk * activation.size(1) * sizeof(Q8_1);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  auto* o = reinterpret_cast<Q8_1*>(out.data_ptr());
+  const auto* x = reinterpret_cast<const Q8_1*>(activation.data_ptr());
+  if (Type == 21 && bank_aware)
+    gate_up_grouped<Type, Index, Lanes, true>
+        <<<grid, 32 * Lanes, shared, stream>>>(
+            o, x, ids.data_ptr<Index>(), gate.data_ptr<uint8_t>(),
+            up.data_ptr<uint8_t>(), n, k, gate.size(2), ids.size(1), routes,
+            per_cta);
+  else
+    gate_up_grouped<Type, Index, Lanes, false>
+        <<<grid, 32 * Lanes, shared, stream>>>(
+            o, x, ids.data_ptr<Index>(), gate.data_ptr<uint8_t>(),
+            up.data_ptr<uint8_t>(), n, k, gate.size(2), ids.size(1), routes,
+            per_cta);
+}
+
+template <class Index>
+void dispatch_gate_up_grouped(torch::Tensor out, torch::Tensor activation,
+                              torch::Tensor ids, torch::Tensor gate,
+                              torch::Tensor up, int source_type,
+                              bool bank_aware, int per_cta) {
+  if (source_type == 21)
+    launch_gate_up_grouped<21, Index, 16>(out, activation, ids, gate, up,
+                                          bank_aware, per_cta);
+  else if (source_type == 20)
+    launch_gate_up_grouped<20, Index, 4>(out, activation, ids, gate, up,
+                                         bank_aware, per_cta);
+  else
+    launch_gate_up_grouped<23, Index, 4>(out, activation, ids, gate, up,
+                                         bank_aware, per_cta);
+}
+}  // namespace
+
+// Routed gate/up with SiLU and Q8_1 output, decoding each routed expert once
+// per `per_cta` of its routes. Results equal gguf_dp4a_gate_up_sm70_out(...,
+// activated=True, lanes_per_row=16 for IQ3_S or 4 for IQ4_NL/IQ4_XS) bit for
+// bit.
+void gguf_dp4a_gate_up_grouped_sm70_out(torch::Tensor out,
+                                        torch::Tensor activation,
+                                        torch::Tensor ids, torch::Tensor gate,
+                                        torch::Tensor up, int64_t source_type,
+                                        bool bank_aware, int64_t per_cta) {
+  TORCH_CHECK(source_type == 20 || source_type == 21 || source_type == 23,
+              "Grouped gate/up supports IQ4_NL, IQ3_S and IQ4_XS");
+  TORCH_CHECK(per_cta >= 1 && per_cta <= 512, "Invalid routes per CTA");
+  TORCH_CHECK(activation.is_cuda() &&
+                  activation.scalar_type() == torch::kUInt8 &&
+                  activation.dim() == 3 && activation.size(2) == sizeof(Q8_1) &&
+                  activation.is_contiguous() && activation.size(0) > 0,
+              "Expected Q8_1 activation blocks");
+  const int m = activation.size(0), k = activation.size(1) * 32;
+  TORCH_CHECK(ids.device() == activation.device() &&
+                  (ids.scalar_type() == torch::kInt32 ||
+                   ids.scalar_type() == torch::kInt64) &&
+                  ids.is_contiguous() && ids.dim() == 2 && ids.size(0) == m &&
+                  ids.size(1) > 0 && ids.numel() <= 512,
+              "Grouped gate/up takes at most 512 routes");
+  const int block_bytes = source_type == 21 ? 110 : 136;
+  TORCH_CHECK(
+      gate.device() == activation.device() &&
+          up.device() == activation.device() &&
+          gate.scalar_type() == torch::kUInt8 &&
+          up.scalar_type() == torch::kUInt8 && gate.is_contiguous() &&
+          up.is_contiguous() && gate.dim() == 3 && gate.sizes() == up.sizes() &&
+          gate.size(1) % 32 == 0 && k % 256 == 0 &&
+          (source_type == 20
+               ? gate.size(2) == k / 32 * 18
+               : (gate.size(2) == k / 256 * block_bytes ||
+                  gate.size(2) == ((k / 256 * block_bytes + 7) / 8 * 8))),
+      "Expected aligned original GGUF expert rows");
+  const int n = gate.size(1);
+  TORCH_CHECK(out.device() == activation.device() && out.is_contiguous() &&
+                  out.scalar_type() == torch::kUInt8 && out.dim() == 4 &&
+                  out.size(0) == m && out.size(1) == ids.size(1) &&
+                  out.size(2) == n / 32 && out.size(3) == sizeof(Q8_1),
+              "Invalid grouped gate/up output");
+  const c10::cuda::CUDAGuard guard(activation.device());
+  require_sm70();
+  if (ids.scalar_type() == torch::kInt32)
+    dispatch_gate_up_grouped<int32_t>(out, activation, ids, gate, up,
+                                      source_type, bank_aware, per_cta);
+  else
+    dispatch_gate_up_grouped<int64_t>(out, activation, ids, gate, up,
+                                      source_type, bank_aware, per_cta);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void gguf_dp4a_lut4_gate_up_sm70_out(
     torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
     torch::Tensor gate, torch::Tensor gate_stats, torch::Tensor up,

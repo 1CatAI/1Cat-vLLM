@@ -848,6 +848,12 @@ class KernelConfig:
     sm70_gdn_verify and mamba_cache_mode='align'. Results are identical to
     per-position state storage."""
 
+    @property
+    def gdn_spec_replay(self) -> bool:
+        """Platform-neutral view of ``sm70_gdn_spec_replay`` for generic GDN
+        and Mamba layers."""
+        return self.sm70_gdn_spec_replay
+
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""

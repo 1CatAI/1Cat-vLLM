@@ -250,7 +250,8 @@ def _postprocess_mamba_align_kernel(
         tl.store(num_accepted_out_ptr + req_idx, 1)
     if src_col == dst_col and token_bias == 0:
         return
-    if TEMPORAL_REPLAY:
+    # Constexpr guard first: the load only exists in replay specializations.
+    if TEMPORAL_REPLAY:  # noqa: SIM102
         if tl.load(state_conv_widths_ptr + state_meta_idx) == 0:
             return
 
@@ -304,7 +305,7 @@ def run_mamba_align_precopy(
         num_reqs,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
-        TEMPORAL_REPLAY=getattr(ctx, "temporal_replay", False),
+        TEMPORAL_REPLAY=ctx.temporal_replay,
     )
 
 
@@ -341,5 +342,5 @@ def run_mamba_align_postprocess(
         MAMBA_BLOCK_SIZE=ctx.block_size,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
-        TEMPORAL_REPLAY=getattr(ctx, "temporal_replay", False),
+        TEMPORAL_REPLAY=ctx.temporal_replay,
     )

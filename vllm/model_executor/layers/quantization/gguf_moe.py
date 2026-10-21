@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF experts with independent gate/up/down storage and aligned TP slices."""
 
+import functools
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 
 
+@functools.cache
+def _grouped_gate_up() -> bool:
+    return hasattr(torch.ops._C, "gguf_dp4a_gate_up_grouped_sm70_out")
+
+
 def _original_expert_dp4a(
     x,
     ids,
@@ -60,17 +66,31 @@ def _original_expert_dp4a(
     )
     output = torch.empty_like(x)
     torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
-    torch.ops._C.gguf_dp4a_gate_up_sm70_out(
-        hidden,
-        q8,
-        ids,
-        gate,
-        up,
-        source_type,
-        True,
-        4 if quantized_hidden and source_type in (20, 23) else 16,
-        bank_aware,
-    )
+    if (
+        quantized_hidden
+        and source_type in (20, 21, 23)
+        and m >= 10
+        and _grouped_gate_up()
+    ):
+        # Concurrent verification rows share routed experts: decode each
+        # expert once per few of its routes (measured on V100). Bitwise equal
+        # to the per-route kernel, which stays faster for a single request.
+        per_cta = 4 if source_type == 21 else (2 if m <= 10 else 8)
+        torch.ops._C.gguf_dp4a_gate_up_grouped_sm70_out(
+            hidden, q8, ids, gate, up, source_type, bank_aware, per_cta
+        )
+    else:
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            hidden,
+            q8,
+            ids,
+            gate,
+            up,
+            source_type,
+            True,
+            4 if quantized_hidden and source_type in (20, 23) else 16,
+            bank_aware,
+        )
     torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
         output,
         hidden,

@@ -557,16 +557,26 @@ class ExpertCacheLane {
     const int32_t* entry = ring_ + (seq % ring_entries_) * entry_ints_;
     // The entry's tag is released after its body; wait for it rather than
     // dropping a request the model stream is blocked on.
+    // A hit is tagged ~seq and published without fences: its body may still
+    // be in flight, which only affects recency, and it never needs a plan.
+    const int32_t want = static_cast<int32_t>(seq), hit = ~want;
     int32_t tag = __atomic_load_n(entry, __ATOMIC_ACQUIRE);
     for (int64_t deadline = now_ns() + 1'000'000'000;
-         tag != static_cast<int32_t>(seq) && now_ns() < deadline;) {
+         tag != want && tag != hit && now_ns() < deadline;) {
       cpu_relax();
       tag = __atomic_load_n(entry, __ATOMIC_ACQUIRE);
     }
     int32_t layer = __atomic_load_n(entry + 1, __ATOMIC_ACQUIRE);
     int32_t count = __atomic_load_n(entry + 2, __ATOMIC_ACQUIRE);
-    int32_t miss = __atomic_load_n(entry + 3, __ATOMIC_ACQUIRE);
-    if (tag != static_cast<int32_t>(seq) || layer < 0 || layer >= layers_ ||
+    const int32_t miss =
+        tag == want ? __atomic_load_n(entry + 3, __ATOMIC_ACQUIRE) : 0;
+    if (tag == hit) {
+      // Only recency uses a hit's body; ignore a stale header.
+      if (layer < 0 || layer >= layers_) return;
+      count = std::max<int32_t>(
+          0, std::min<int32_t>(count, entry_ints_ - kEntryHeader));
+    }
+    if ((tag != want && tag != hit) || layer < 0 || layer >= layers_ ||
         count < 0 || count > entry_ints_ - kEntryHeader) {
       char what[96];
       snprintf(what, sizeof(what), "bad entry (tag %d layer %d count %d)", tag,

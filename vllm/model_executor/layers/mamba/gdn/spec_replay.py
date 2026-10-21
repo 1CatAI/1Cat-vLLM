@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Deferred commit of speculative GDN recurrent state on SM70.
+"""Deferred commit of speculative GDN recurrent state.
 
 Stock MTP verification stores the recurrent state after every verified
 position in num_speculative_tokens extra state blocks per request, and the
@@ -25,7 +25,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-TMAX = 8  # sm70_gdn_verify_out's per-sequence token capacity
+TMAX = 8  # the native verifier's per-sequence token capacity
 HEAD_DIM = 128
 
 _STATE: SpecReplayState | None = None
@@ -37,7 +37,7 @@ def spec_replay_enabled(vllm_config) -> bool:
     spec = getattr(vllm_config, "speculative_config", None)
     return bool(
         kernel is not None
-        and getattr(kernel, "sm70_gdn_spec_replay", False)
+        and getattr(kernel, "gdn_spec_replay", False)
         and spec is not None
         and spec.method == "mtp"
         and 0 < spec.num_speculative_state_tokens() < TMAX
@@ -194,7 +194,9 @@ def _prepare_replay_rows_kernel(
         tl.store(side_ptr + req, side, mask=live)
         tl.store(verified_ptr + req, 1, mask=live)
         tl.store(spec_replay_ptr + offsets, replay, mask=in_table)
-        tl.store(spec_map_ptr + offsets, tl.where(live, 2 * req + side, 0), mask=in_table)
+        tl.store(
+            spec_map_ptr + offsets, tl.where(live, 2 * req + side, 0), mask=in_table
+        )
         # The in-round position (if any) that completes a Mamba block.
         computed = tl.load(num_computed_ptr + req, mask=live, other=0)
         start = tl.load(query_start_loc_ptr + rows, mask=live, other=0)
@@ -226,5 +228,7 @@ def _prepare_replay_rows_kernel(
         tl.store(plain_replay_ptr + offsets, replay, mask=in_table)
         # No current tokens: replay the side the last verification wrote.
         tl.store(
-            plain_map_ptr + offsets, tl.where(live, 2 * req + (side ^ 1), 0), mask=in_table
+            plain_map_ptr + offsets,
+            tl.where(live, 2 * req + (side ^ 1), 0),
+            mask=in_table,
         )

@@ -94,3 +94,47 @@ def verify_bound(
         cks,
     )
     return verify_out, state
+
+
+def commit_replayed(
+    contract: GdnHeadContract,
+    A_log,
+    dt_bias,
+    state,
+    starts,
+    state_indices,
+    replay_buffer,
+    replay_counts,
+    replay_map,
+    stride,
+):
+    """Commit the previous verification of rows that verify no drafts this
+    step: replay their accepted tokens into the committed state (T = 0)."""
+    k_heads, v_heads = contract.local_k_heads, contract.local_v_heads
+    width = 2 * k_heads * contract.head_k_dim + v_heads * contract.head_v_dim
+    empty = state.new_empty((0, width), dtype=torch.float16)
+    gates = state.new_empty((0, v_heads), dtype=torch.float16)
+    out = state.new_empty((0, v_heads, contract.head_v_dim), dtype=torch.float16)
+    torch.ops._C.sm70_gdn_verify_out(
+        empty,
+        gates,
+        gates,
+        A_log,
+        dt_bias,
+        state,
+        out,
+        starts,
+        state_indices,
+        None,
+        k_heads,
+        v_heads,
+        contract.head_k_dim**-0.5,
+        1,
+        replay_buffer,
+        replay_counts,
+        None,
+        stride,
+        replay_map,
+        None,
+        None,
+    )

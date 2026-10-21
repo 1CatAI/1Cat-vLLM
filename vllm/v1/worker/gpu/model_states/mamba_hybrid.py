@@ -170,7 +170,7 @@ class MambaHybridModelState(DefaultModelState):
         )
         self._dflash2_grouped_smallq_metadata_logged = False
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
-        from vllm.model_executor.layers.mamba.gdn.sm70_spec_replay import (
+        from vllm.model_executor.layers.mamba.gdn.spec_replay import (
             SpecReplayState,
             set_spec_replay_state,
             spec_replay_enabled,
@@ -180,7 +180,7 @@ class MambaHybridModelState(DefaultModelState):
         if spec_replay_enabled(vllm_config):
             if not self._align_mode:
                 raise ValueError(
-                    "sm70_gdn_spec_replay requires mamba_cache_mode='align'."
+                    "GDN speculative replay requires mamba_cache_mode='align'."
                 )
             # Up to 8 Mamba KV groups; the layers' group map is bound once the
             # KV cache layout is known.
@@ -568,9 +568,7 @@ class MambaHybridModelState(DefaultModelState):
                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
                 )
         if self._spec_replay is not None:
-            self._spec_replay.record_accepted(
-                idx_mapping, self.num_accepted_tokens_gpu
-            )
+            self._spec_replay.record_accepted(idx_mapping, self.num_accepted_tokens_gpu)
         if (
             self._align_mode
             and num_computed_tokens is not None
