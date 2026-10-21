@@ -22,6 +22,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.sm70_turbomind import (
+    is_pre_ampere_cuda_platform,
+)
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.layers.sparse_attn_indexer_kpool import SparseAttnIndexerKpool
 from vllm.model_executor.models.deepseek_v2 import (
@@ -275,6 +278,10 @@ class Indexer(nn.Module):
 
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
+        # Volta and Turing have no FP8 MQA-logits kernel: the query stays FP16 and
+        # the indexer op reads it through the SM70 logits path. Producer and
+        # consumer must agree on the card, so both use the same predicate.
+        self.fp16_query = is_pre_ampere_cuda_platform()
         self.topk_indices_buffer = topk_indices_buffer
 
         # NOTE: (zyongye) we use fp8 naive cache,
@@ -368,10 +375,7 @@ class Indexer(nn.Module):
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        sm70_fp16_indexer = current_platform.is_cuda() and (
-            current_platform.is_device_capability((7, 0))
-        )
-        if sm70_fp16_indexer:
+        if self.fp16_query:
             assert q.dtype == torch.float16
             q_index = fwht128(q).view(-1, self.n_head, self.head_dim)
             weights = _fused_indexer_weight_only_scale(
