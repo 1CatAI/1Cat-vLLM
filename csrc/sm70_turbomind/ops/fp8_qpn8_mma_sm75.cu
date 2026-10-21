@@ -20,11 +20,15 @@
 #include <algorithm>
 
 #include "fp8_qpn8_codes_sm70.cuh"
+#include "mma_fragments_sm70.cuh"
 
 namespace {
 
 using vllm::sm70::fp8x8_to_half2x4_fast;
+using vllm::sm70::ldmatrix_x4;
+using vllm::sm70::mma_m16n8k8;
 using vllm::sm70::qpn8_col_from_lane;
+using vllm::sm70::shared_address;
 
 constexpr int kBlockN = 128;
 constexpr int kBlockK = 32;
@@ -39,30 +43,6 @@ constexpr int kGroupRowTiles = 16;
 // phase reads land in distinct bank quads.
 __device__ __forceinline__ int swizzled(int row, int chunk) {
   return row * kChunks + (chunk ^ ((row >> 1) & 3));
-}
-
-__device__ __forceinline__ uint32_t shared_address(const void* pointer) {
-  return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
-}
-
-__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4],
-                                            uint32_t address) {
-#if __CUDA_ARCH__ >= 750
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(address));
-#endif
-}
-
-__device__ __forceinline__ void mma_m16n8k8(float (&d)[4], uint32_t a0,
-                                            uint32_t a1, uint32_t b0) {
-#if __CUDA_ARCH__ >= 750
-  asm volatile(
-      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a0), "r"(a1), "r"(b0));
-#endif
 }
 
 template <int BlockM, int WarpsM, int MinBlocks>

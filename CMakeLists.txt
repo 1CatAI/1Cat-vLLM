@@ -458,6 +458,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       SRCS "${VLLM_SM75_TURBOMIND_SRCS}"
       CUDA_ARCHS "7.5")
     list(APPEND VLLM_SM70_TURBOMIND_SRCS "${VLLM_SM75_TURBOMIND_SRCS}")
+    # The grouped skinny MoE runs m16n8k8 fragments on SM75; its sm_75 image
+    # comes next to the sm_70 one (the flags append).
+    set_gencode_flags_for_srcs(
+      SRCS "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
+      CUDA_ARCHS "7.5")
     set_source_files_properties(
       csrc/torch_bindings.cpp
       PROPERTIES COMPILE_DEFINITIONS ENABLE_SM70_TURBOMIND=1)
