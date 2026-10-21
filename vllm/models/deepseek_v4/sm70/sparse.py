@@ -270,7 +270,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 q, layer.swa_cache_layer.kv_cache, compressed_cache
             )
         if bmm_reason is None:
-            keys, scores, logits, probs = current_workspace_manager().get_simultaneous(
+            keys, scores, probs = current_workspace_manager().get_simultaneous(
                 *sparse_decode_bmm_workspace_specs(
                     num_decode_tokens,
                     q.shape[1],
@@ -294,7 +294,6 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 output,
                 keys,
                 scores,
-                logits,
                 probs,
             )
             return
