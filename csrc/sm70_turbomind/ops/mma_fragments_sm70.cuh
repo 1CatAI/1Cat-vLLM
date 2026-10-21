@@ -53,6 +53,19 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4],
 #endif
 }
 
+// The transposing variant: lane l receives rows 2 * (l % 4) and 2 * (l % 4) + 1
+// of column l / 4 of each matrix, which is the B fragment of a row-major
+// [k][n] tile.
+__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4],
+                                                  uint32_t address) {
+#if __CUDA_ARCH__ >= 750
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+      : "r"(address));
+#endif
+}
+
 // D (16x8, fp32) += A (16x8, row) * B (8x8, col). Lane l holds A rows l / 4
 // and l / 4 + 8 at k (l % 4) * 2 + {0, 1} in a0 / a1, B column l / 4 at the
 // same k in b0, and D rows l / 4 (d[0], d[1]) and l / 4 + 8 (d[2], d[3]) at

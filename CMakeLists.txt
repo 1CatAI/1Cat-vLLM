@@ -453,7 +453,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # the m16n8k8 MMA, which Volta lacks, ship sm_75 code even in a 7.0-only
     # build; the dispatch reaches them only on SM75 devices.
     set(VLLM_SM75_TURBOMIND_SRCS
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_mma_sm75.cu")
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_mma_sm75.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/paged_prefill_attention_sm75.cu")
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM75_TURBOMIND_SRCS}"
       CUDA_ARCHS "7.5")

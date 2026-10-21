@@ -319,6 +319,13 @@ torch::Tensor skinny_qpn_gemm_sm70(torch::Tensor x, torch::Tensor qcodes,
                                    torch::Tensor qscales, double gscale,
                                    int64_t n);
 
+void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
+                                  torch::Tensor k_cache, torch::Tensor v_cache,
+                                  torch::Tensor cu_seqlens_q,
+                                  torch::Tensor seqused_k,
+                                  torch::Tensor block_table,
+                                  int64_t max_seqlen_q, double softmax_scale);
+
 void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
                          torch::Tensor qscales, torch::Tensor gscales,
                          torch::Tensor perm, torch::Tensor gids,
