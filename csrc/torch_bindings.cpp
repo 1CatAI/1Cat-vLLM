@@ -123,7 +123,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "sm70_gdn_verify_out(Tensor qkv, Tensor a, Tensor b, Tensor A_log, "
       "Tensor dt_bias, Tensor(a!) state, Tensor(b!) o, Tensor cu, Tensor idx, "
       "Tensor? nacc, int H, int HV, float scale, int cfg, Tensor? rbuf, "
-      "Tensor? rn, Tensor? ctr, int tmax) -> ()");
+      "Tensor? rn, Tensor? ctr, int tmax, Tensor? rmap=None, "
+      "Tensor? ckt=None, Tensor? cks=None) -> ()");
   ops.impl("sm70_gdn_verify_out", torch::kCUDA, &sm70_gdn_verify_out);
   ops.def(
       "qsa_dense_decode_sm70_out(Tensor(a!) out, Tensor query, Tensor "

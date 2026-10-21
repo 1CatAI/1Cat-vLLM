@@ -1361,6 +1361,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.gdn_heads,
             enabled=self.gdn_policy.native_verify,
         )
+        from vllm.model_executor.layers.mamba.gdn.sm70_spec_replay import (
+            spec_replay_enabled,
+        )
+
+        self._spec_replay = spec_replay_enabled(vllm_config)
+        if self._spec_replay and self.verification_update is None:
+            raise ValueError(
+                "sm70_gdn_spec_replay requires the native SM70 GDN verifier "
+                "(kernel_config.sm70_gdn_verify)."
+            )
         self.enable_sm70_gdn_rmsnorm_onepass = (
             _sm70_gdn_rmsnorm_onepass_enabled(self.gdn_policy.projection)
             and current_platform.is_device_capability(70)
@@ -3702,6 +3712,68 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         return out.transpose(0, 1)
 
+    def _spec_replay_args(self):
+        from vllm.model_executor.layers.mamba.gdn.sm70_spec_replay import (
+            get_spec_replay_state,
+        )
+
+        state = get_spec_replay_state()
+        assert state is not None, "GDN speculative replay state is not set"
+        group = state.group_of[self.prefix]
+        return (
+            state.layer_buffer(
+                self.prefix,
+                self.num_k_heads // self.tp_size,
+                self.num_v_heads // self.tp_size,
+                self.A_log.device,
+            ),
+            state.spec_replay,
+            state.spec_map,
+            state.spec_ckpt_token,
+            state.spec_ckpt_slot[group],
+            self._sm70_spec_cache_stride,
+        )
+
+    def _commit_replayed_decodes(self, ssm_state, attn_metadata) -> None:
+        """Commit the previous verification of requests decoding without
+        drafts this step (their rows read the committed state directly)."""
+        from vllm.model_executor.layers.mamba.gdn.sm70_spec_replay import (
+            get_spec_replay_state,
+        )
+
+        state = get_spec_replay_state()
+        assert state is not None, "GDN speculative replay state is not set"
+        rows = attn_metadata.num_decodes
+        k_heads = self.num_k_heads // self.tp_size
+        v_heads = self.num_v_heads // self.tp_size
+        width = 2 * k_heads * self.head_k_dim + v_heads * self.head_v_dim
+        empty = ssm_state.new_empty((0, width), dtype=torch.float16)
+        gates = ssm_state.new_empty((0, v_heads), dtype=torch.float16)
+        out = ssm_state.new_empty((0, v_heads, self.head_v_dim), dtype=torch.float16)
+        torch.ops._C.sm70_gdn_verify_out(
+            empty,
+            gates,
+            gates,
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            out,
+            state.empty_starts[: rows + 1],
+            attn_metadata.non_spec_state_indices_tensor[:rows],
+            None,
+            k_heads,
+            v_heads,
+            self.head_k_dim**-0.5,
+            1,
+            state.layer_buffer(self.prefix, k_heads, v_heads, self.A_log.device),
+            state.plain_replay,
+            None,
+            self._sm70_spec_cache_stride,
+            state.plain_map,
+            None,
+            None,
+        )
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -3728,6 +3800,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata_raw, dict)
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if self._spec_replay and attn_metadata.num_decodes > 0:
+            self._commit_replayed_decodes(kv_cache[1], attn_metadata)
 
         mixed_qkv_decode_requested = (
             self.enable_sm70_fused_sigmoid_mixed_qkv
@@ -3737,7 +3811,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv.is_contiguous()
                 or (
                     attn_metadata.spec_sequence_masks is not None
-                    and mixed_qkv.shape[0] in (5, 20)
+                    and (mixed_qkv.shape[0] in (5, 20) or self._spec_replay)
                     and mixed_qkv.stride(1) == 1
                     and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
                 )
@@ -4117,13 +4191,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and (
                 mixed_qkv_spec.is_contiguous()
                 or (
-                    mixed_qkv_spec.shape[0] in (5, 20)
+                    (mixed_qkv_spec.shape[0] in (5, 20) or self._spec_replay)
                     and mixed_qkv_spec.stride(1) == 1
                     and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
                 )
             )
-            and (1 < mixed_qkv_spec.shape[0] <= 16 or mixed_qkv_spec.shape[0] == 20)
+            and (
+                1 < mixed_qkv_spec.shape[0] <= 16
+                or mixed_qkv_spec.shape[0] == 20
+                or (self._spec_replay and mixed_qkv_spec.stride(1) == 1)
+            )
         )
+        if (
+            self._spec_replay
+            and attn_metadata.num_spec_decodes > 0
+            and not use_sm70_mixed_qkv_verify
+        ):
+            raise RuntimeError(
+                "GDN speculative replay requires the SM70 mixed-QKV verifier."
+            )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
         else:
@@ -4288,7 +4374,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 direct_verify_out = bool(
                     spec_rows_are_batch
                     and num_actual_tokens == mixed_qkv_spec.shape[0]
-                    and num_actual_tokens in (5, 20)
+                    and (num_actual_tokens in (5, 20) or self._spec_replay)
                     and core_attn_out.is_contiguous()
                     and core_attn_out.dtype == mixed_qkv_spec.dtype
                 )
@@ -4307,10 +4393,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         spec_query_start_loc,
                         spec_state_indices_tensor,
                         spec_state_slot_selectors,
+                        replay=self._spec_replay_args()
+                        if self._spec_replay
+                        else None,
                     )
                     if self.verification_update is not None
                     else None
                 )
+                if verified is None and self._spec_replay:
+                    raise RuntimeError(
+                        "GDN speculative replay: the CUDA verifier rejected "
+                        f"{mixed_qkv_spec.shape[0]} rows (requests="
+                        f"{attn_metadata.num_spec_decodes}, indices="
+                        f"{tuple(spec_state_indices_tensor.shape)}, dtype="
+                        f"{mixed_qkv_spec.dtype}, strides={mixed_qkv_spec.stride()}, "
+                        f"state={ssm_state.dtype})."
+                    )
                 if verified is not None:
                     core_attn_out_spec, _last_recurrent_state = verified
                 else:

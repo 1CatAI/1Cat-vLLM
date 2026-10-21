@@ -432,6 +432,16 @@ def _qwen38_sm70_fp16_fused_hc(
         if model_parallel_is_initialized()
         else None
     )
+    if x.ndim == 2 and x.shape[0] > 8:
+        logger.warning_once(
+            "FNXDBG HC M=%d concurrent=%s ll=%s down=%s up=%s contiguous=%s",
+            x.shape[0],
+            concurrent_batch,
+            None if hc_ll is None else hc_ll.status.get("enabled"),
+            None if packed_down is None else tuple(packed_down.shape),
+            None if packed_up is None else tuple(packed_up.shape),
+            x.is_contiguous(),
+        )
     if (
         hc_ll is not None
         and hc_ll.status["enabled"]

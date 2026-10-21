@@ -1142,7 +1142,10 @@ void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
                          int64_t H, int64_t HV, double scale, int64_t cfg,
                          std::optional<torch::Tensor> rbuf,
                          std::optional<torch::Tensor> rn,
-                         std::optional<torch::Tensor> ctr, int64_t tmax);
+                         std::optional<torch::Tensor> ctr, int64_t tmax,
+                         std::optional<torch::Tensor> rmap,
+                         std::optional<torch::Tensor> ckt,
+                         std::optional<torch::Tensor> cks);
 
 void qsa_dense_decode_sm70_out(
     torch::Tensor out, torch::Tensor query, torch::Tensor key_cache,

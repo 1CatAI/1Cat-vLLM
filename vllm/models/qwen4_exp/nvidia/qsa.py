@@ -749,6 +749,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
         self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
         self.host_kv_staging_rows = vllm_config.kernel_config.qsa_host_kv_staging_rows
+        # Verification batches (every concurrent request with its drafts)
+        # stay on the graph-capturable decode reader.
+        spec = vllm_config.speculative_config
+        self.host_kv_decode_rows = vllm_config.scheduler_config.max_num_seqs * (
+            1 + ((spec.num_speculative_tokens or 0) if spec is not None else 0)
+        )
         self.host_kv_prefill_stage_tokens = (
             vllm_config.kernel_config.qsa_host_kv_prefill_stage_tokens
         )
@@ -1054,7 +1060,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         workspace = None
         if (
             self.host_kv_prefill_stage_tokens
-            and query.shape[0] > state.resolve_rows
+            and query.shape[0] > max(state.resolve_rows, self.host_kv_decode_rows)
             and query.shape[1:] == (6, 256)
             and indices.shape[1] <= state.width
         ):

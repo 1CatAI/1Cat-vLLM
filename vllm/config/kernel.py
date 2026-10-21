@@ -839,6 +839,14 @@ class KernelConfig:
     sm70_gdn_verify: bool = False
     """Run single-request MTP GDN verification with the SM70 sequential CUDA
     recurrence instead of the Triton fused kernel."""
+    sm70_gdn_spec_replay: bool = False
+    """Commit speculative GDN states by replay (MTP on SM70).
+
+    The native verifier reads each request's committed recurrent state,
+    replays the previous round's accepted tokens and stores no per-position
+    states, so requests hold no speculative state blocks. Requires
+    sm70_gdn_verify and mamba_cache_mode='align'. Results are identical to
+    per-position state storage."""
 
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,

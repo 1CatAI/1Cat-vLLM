@@ -26,6 +26,10 @@ logger = init_logger(__name__)
 
 HD, KD, LORA, INJ = 2560, 10240, 320, 4
 HCX_MAX_M = 8
+# Concurrent verification batches (up to 8 requests x 5 rows) keep the HCX
+# contract: producers hand over TP partials and the combine runs HCX on row
+# slices of at most HCX_MAX_M (rows are independent).
+HCX_BATCH_M = 40
 _OUTPUT_PROJECTIONS: dict[str, tuple] = {}
 _MOE_RUNNERS: dict[str, Any] = {}
 _PREFILL_SEQUENCE_PARALLEL: ContextVar[bool] = ContextVar(
@@ -68,10 +72,10 @@ def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
     # Resolve actual M inside the opaque op, rather than freezing a decode
     # choice while compiling a range that also includes C4 and prefill.
     layer, defer = _OUTPUT_PROJECTIONS[name]
-    if 0 < x.shape[0] <= HCX_MAX_M and defer:
+    if 0 < x.shape[0] <= HCX_BATCH_M and defer:
         return torch.nn.functional.pad(x, (0, layer.output_size - x.shape[1]))
     projected, _ = layer(x)
-    if x.shape[0] > HCX_MAX_M and not hc_prefill_sequence_parallel_active():
+    if x.shape[0] > HCX_BATCH_M and not hc_prefill_sequence_parallel_active():
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         projected = tensor_model_parallel_all_reduce(projected)
@@ -87,7 +91,7 @@ def _moe_output(
     shared: torch.Tensor | None, fused: torch.Tensor, name: str, trunc_size: int
 ) -> torch.Tensor:
     rows = fused.shape[0]
-    if 0 < rows <= HCX_MAX_M:
+    if 0 < rows <= HCX_BATCH_M:
         # An owned payload makes both contributions explicit to the compiler
         # and graph allocator. Hidden references to producer temporaries are
         # unsafe: the memory planner cannot see those additional consumers.

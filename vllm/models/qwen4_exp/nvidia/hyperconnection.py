@@ -50,6 +50,7 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
+from .sm70_hcx import HCX_BATCH_M, HCX_MAX_M
 from .sm70_fp16_hc import (
     maybe_apply_qwen38_sm70_fp16_fused_hc,
     sharded_hc_project,
@@ -298,7 +299,7 @@ class GatedResidual(nn.Module):
         if not getattr(self, "_partial_inputs", False):
             return block_output
         first, second = self._partial_pair(block_output)
-        if first.shape[0] > 8:
+        if first.shape[0] > HCX_BATCH_M:
             return first
         if second is not None:
             from vllm.distributed import tensor_model_parallel_all_reduce_sum2
@@ -384,7 +385,8 @@ def _hcx_combine_and_mix(
     runtime = getattr(module, "_hcx", None)
     oproj = getattr(module, "_hcx_oproj", None)
     block_output, secondary = module._partial_pair(block_output)
-    if runtime is not None and 0 < block_output.shape[0] <= 8:
+    rows = block_output.shape[0]
+    if runtime is not None and 0 < rows <= HCX_MAX_M:
         diagnostic = (
             {"snapshot_name": name} if getattr(runtime, "diagnostic", False) else {}
         )
@@ -400,14 +402,33 @@ def _hcx_combine_and_mix(
             secondary=secondary,
             **diagnostic,
         )
+    if runtime is not None and rows <= HCX_BATCH_M:
+        # Concurrent verification: HCX on independent row slices.
+        pieces = [
+            runtime.run(
+                block_output[start : start + HCX_MAX_M],
+                hidden_states[start : start + HCX_MAX_M],
+                injection[start : start + HCX_MAX_M],
+                module.hc_norm.weight,
+                module.config.rms_norm_eps,
+                module._hcx_down,
+                module._hcx_up,
+                None if oproj is None else oproj[1:],
+                secondary=None
+                if secondary is None
+                else secondary[start : start + HCX_MAX_M],
+            )
+            for start in range(0, rows, HCX_MAX_M)
+        ]
+        return tuple(torch.cat(parts) for parts in zip(*pieces))
     from vllm.distributed import tensor_model_parallel_all_reduce
 
-    if oproj is not None and block_output.shape[0] <= 8:
+    if oproj is not None and block_output.shape[0] <= HCX_BATCH_M:
         # Deferred projection: the block output carries the o-proj input.
         layer, k = oproj[0], oproj[1]
         block_output, _ = layer(block_output[:, :k].contiguous())
     reduced = block_output
-    if block_output.shape[0] <= 8:
+    if block_output.shape[0] <= HCX_BATCH_M:
         if secondary is not None:
             from vllm.distributed import tensor_model_parallel_all_reduce_sum2
 

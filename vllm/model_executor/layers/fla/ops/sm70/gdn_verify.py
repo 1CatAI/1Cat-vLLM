@@ -35,25 +35,41 @@ def verify_bound(
     query_start,
     state_indices,
     slot_selectors,
+    replay=None,
 ):
+    """Native verification over ``requests`` sequences of at most
+    ``state_indices.shape[1]`` tokens each; ``replay`` commits by replay."""
+    tokens = mixed_qkv.shape[0]
+    if replay is not None:
+        # Replay reads only the committed column; the index width does not
+        # bound the round length.
+        *replay, per_request = replay
+    else:
+        per_request = state_indices.shape[1] if state_indices.dim() == 2 else 1
     if not (
-        requests == 1
+        requests >= 1
+        and per_request <= 8
+        and tokens <= requests * per_request
         and mixed_qkv.dtype == torch.float16
         and mixed_qkv.stride(1) == 1
-        and mixed_qkv.shape[0] <= 8
         and state.dtype == torch.float32
         and contract.head_k_dim == 128
         and contract.head_v_dim == 128
     ):
         return None
-    logger.info_once("SM70 CUDA GDN single-request verification route hit.")
-    tokens = mixed_qkv.shape[0]
+    if replay is None:
+        logger.info_once("SM70 CUDA GDN verification route hit.")
+    else:
+        logger.info_once("SM70 CUDA GDN verification with deferred state commit.")
     heads = contract.local_v_heads
     verify_out = (
         out[:num_actual_tokens].unsqueeze(0)
         if direct_out
         else mixed_qkv.new_empty((1, tokens, heads, 128))
     )
+    rbuf = rn = rmap = ckt = cks = None
+    if replay is not None:
+        rbuf, rn, rmap, ckt, cks = replay
     torch.ops._C.sm70_gdn_verify_out(
         mixed_qkv,
         a,
@@ -64,14 +80,17 @@ def verify_bound(
         verify_out.view(-1, heads, 128),
         query_start[: requests + 1],
         state_indices,
-        slot_selectors,
+        None if replay is not None else slot_selectors,
         contract.local_k_heads,
         heads,
         contract.head_k_dim**-0.5,
         1,
+        rbuf,
+        rn,
         None,
-        None,
-        None,
-        tokens,
+        per_request if requests > 1 or replay is not None else tokens,
+        rmap,
+        ckt,
+        cks,
     )
     return verify_out, state

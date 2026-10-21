@@ -33,11 +33,24 @@ CAPTURE_SIZES=$(r=1; s=""; while [ "$r" -lt "$MAX_NUM_SEQS" ]; do
 # (factor = ceil(MAX_MODEL_LEN / 262144)); up to 262144 keeps the stock RoPE.
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}
 NATIVE_LEN=262144
-# Recurrent-state pool: 28 blocks per request (independent of the window).
-STATE_BLOCKS=$((1 + 28 * MAX_NUM_SEQS))
+# Recurrent-state pool: 8 blocks per request (4 GDN groups x running state
+# and aligned checkpoint; speculative states are committed by replay), plus
+# 4 shared blocks for each of up to two requests entering a new block.
+STATE_BLOCKS=$((1 + 8 * MAX_NUM_SEQS + 4 * (MAX_NUM_SEQS < 2 ? MAX_NUM_SEQS : 2)))
 # Windows past the native length hold a 4x larger indexer history on the GPU:
 # halve the prefill chunk (activation peak) and trim the hot cache to fit 16 GB.
 PREFILL_CHUNK=8192 HOT_TOKENS=32768 STAGE_TOKENS=525504 EXPERT_FRACTION=0.8
+# More than four concurrent requests hold more recurrent states and larger
+# verification graphs: halve the prefill chunk (activation peak) and stage
+# prefill history in smaller windows to fit.
+if (( MAX_NUM_SEQS > 4 )); then PREFILL_CHUNK=4096 STAGE_TOKENS=131072; fi
+# Prefill sharing a step with resident decodes keeps at least half a chunk:
+# the adaptive budget charges the decodes' fixed cost to the prefill tokens
+# and would otherwise shrink to a few tokens per step.
+MIXED_ARGS=()
+if (( MAX_NUM_SEQS > 1 )); then
+  MIXED_ARGS=(--mixed-prefill-min-tokens "$((PREFILL_CHUNK / 2))")
+fi
 if (( MAX_MODEL_LEN > NATIVE_LEN )); then
   PREFILL_CHUNK=4096 HOT_TOKENS=16384 STAGE_TOKENS=525504 EXPERT_FRACTION=0.77
 fi
@@ -115,7 +128,7 @@ config = {
         "hc_mtp_prefill_sequence_parallel": True, "hc_prefill_peer_norm": True,
     },
     "qsa_host_kv_state_blocks": int(sys.argv[3]),
-    "qsa_auto_e4m3": False, "ple_row_cache_mib": 512,
+    "qsa_auto_e4m3": False, "sm70_gdn_verify": True, "sm70_gdn_spec_replay": True, "ple_row_cache_mib": 512,
     "ple_input_prepare": True, "ple_pinned_decode": False,
     "ple_fast_lane": True, "ple_draft_prefetch": True,
     "sm70_greedy_verify": True, "sm70_sparse_target_sampling": True,
@@ -178,7 +191,7 @@ exec "${PIN[@]}" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" 
   --served-model-name flash-next-abliterated flash-next qwen3.8-flash-next \
   --host "$HOST" --port "$PORT" --quantization gguf --tensor-parallel-size 4 \
   --dtype half --kv-cache-dtype float16 --mamba-ssm-cache-dtype float32 \
-  --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens "$PREFILL_CHUNK" \
+  --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens "$PREFILL_CHUNK" "${MIXED_ARGS[@]}" \
   --gpu-memory-utilization 0.95 --enable-prefix-caching \
   --mamba-cache-mode align "$TAIL_ARG" "${MM_ARGS[@]}" "${LONG_ARGS[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \

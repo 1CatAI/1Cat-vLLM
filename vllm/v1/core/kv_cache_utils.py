@@ -1817,14 +1817,26 @@ def _get_kv_cache_config_csa_linear(
                 + 1
             )
 
-        active_states = 1 + requests * sum(
-            demand(group)
-            for i, group in enumerate(kv_cache_groups)
-            if i in state_groups
+        # Each request holds its state pages; entering a new aligned block
+        # transiently needs one more page per state group while the previous
+        # checkpoint is still referenced. Those transients are shared: at most
+        # two requests cross a boundary in the same step without preemption.
+        active_states = (
+            1
+            + requests
+            * sum(
+                demand(group) - 1
+                for i, group in enumerate(kv_cache_groups)
+                if i in state_groups
+            )
+            + min(requests, 2) * len(state_groups)
         )
         if state_blocks < active_states:
             raise ValueError(f"State pool needs at least {active_states} blocks")
-        history_blocks = requests * sum(
+        # Concurrent requests share one full-window history budget: the
+        # scheduler admits them while their total length fits, as with a
+        # shared KV pool. Each request keeps its own recurrent states.
+        history_blocks = sum(
             demand(group)
             for i, group in enumerate(kv_cache_groups)
             if i not in state_groups
@@ -1836,6 +1848,16 @@ def _get_kv_cache_config_csa_linear(
         history_page = layout.device_compressed_page_bytes
         num_blocks = state_blocks + history_blocks
         required = state_bytes + history_page * num_blocks
+        logger.info_once(
+            "Host-KV fixed pools: %d state blocks x %d B, %d history blocks, "
+            "history page %d B, %d active states; total %s GiB",
+            state_blocks,
+            sum(layout.owner_page_size(i) for i in range(len(layout.main_kv_owners))),
+            history_blocks,
+            history_page,
+            active_states,
+            format_gib(required),
+        )
         if required > available_memory:
             raise ValueError(
                 f"Host-KV fixed pools need {format_gib(required)} GiB device "

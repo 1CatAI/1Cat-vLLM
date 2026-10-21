@@ -376,25 +376,35 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         w1, w3, w2 = layer.gguf_w1, layer.gguf_w3, layer.gguf_w2
         if (
             self.dp4a_admitted
-            and 1 <= tokens <= 20
+            and 1 <= tokens <= 64
             and layer.expert_map is None
             and topk_weights.dtype == torch.float32
         ):
-            if cache is not None:
-                ids = cache.resolve(self.cache_layer, ids)
-            return torch.ops.vllm.gguf_original_expert_dp4a(
-                x.contiguous(),
-                ids,
-                topk_weights.contiguous(),
-                w1,
-                w3,
-                w2,
-                self.weight_types["w1"],
-                self.weight_types["w2"],
-                self.input_padding.get("w2", (0, 0))[0],
-                self.q8_intermediate,
-                self.weight_types["w1"] == 21,
-            )
+            # Concurrent MTP verification batches (up to 8 x 5 rows) stay on
+            # the graph-capturable decode path in pieces of at most 20 rows,
+            # which bounds the routed ids one cache resolution admits.
+            pieces = []
+            for start in range(0, tokens, 20):
+                stop = min(start + 20, tokens)
+                piece_ids = ids[start:stop]
+                if cache is not None:
+                    piece_ids = cache.resolve(self.cache_layer, piece_ids)
+                pieces.append(
+                    torch.ops.vllm.gguf_original_expert_dp4a(
+                        x[start:stop].contiguous(),
+                        piece_ids,
+                        topk_weights[start:stop].contiguous(),
+                        w1,
+                        w3,
+                        w2,
+                        self.weight_types["w1"],
+                        self.weight_types["w2"],
+                        self.input_padding.get("w2", (0, 0))[0],
+                        self.q8_intermediate,
+                        self.weight_types["w1"] == 21,
+                    )
+                )
+            return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
         if cache is not None and cache.tm is not None:
             return cache.prefill_moe(
                 self.cache_layer, x.contiguous(), ids, topk_weights
