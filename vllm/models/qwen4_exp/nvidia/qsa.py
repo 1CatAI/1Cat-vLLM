@@ -970,8 +970,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
     def _windowed_rows(
         self, windows, query, indices, table, requests, positions, lengths,
-        output, gate,
+        output, gate, workspace,
     ) -> None:
+        from .ops.device_kv_attention import PREFILL_ROWS
         from .ops.host_kv import merge_windows
 
         state = self.host_kv
@@ -986,19 +987,35 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 table, lengths, self.host_kv_prefill_stage_tokens, plan
             )
             first = number == 0
-            torch.ops.vllm_sm70_qsa_device.run_rows_window(
-                query,
-                history,
-                scales,
-                indices,
-                staged_table,
-                requests,
-                positions,
-                lengths,
-                acc if first else part,
-                acc_state if first else part_state,
-                12,
-            )
+            if history.dtype == torch.uint8:
+                torch.ops.vllm_sm70_qsa_device.run_rows_window(
+                    query,
+                    history,
+                    scales,
+                    indices,
+                    staged_table,
+                    requests,
+                    positions,
+                    lengths,
+                    acc if first else part,
+                    acc_state if first else part_state,
+                    12,
+                )
+            else:
+                torch.ops.vllm_sm70_qsa_device.run_tiled_window(
+                    query,
+                    history,
+                    scales,
+                    indices,
+                    staged_table,
+                    requests,
+                    positions,
+                    lengths,
+                    *workspace,
+                    acc if first else part,
+                    acc_state if first else part_state,
+                    PREFILL_ROWS,
+                )
             if not first:
                 last = number == len(windows) - 1
                 merge_windows(
@@ -1154,7 +1171,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     self.host_kv_is_draft,
                 )
                 return
-            if plan is None and state.fp8 and query.shape[0] > 0:
+            if plan is None and query.shape[0] > 0:
                 # Longer than the stage buffer: stage it window by window and
                 # merge the windows' softmax states instead of falling back to
                 # per-row host reads.
@@ -1167,7 +1184,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 if windows:
                     self._windowed_rows(
                         windows, query, indices, table, requests, positions,
-                        lengths, output, gate,
+                        lengths, output, gate, workspace,
                     )
                     logger.info_once(
                         "QSA prefill stages host history in %d windows.",

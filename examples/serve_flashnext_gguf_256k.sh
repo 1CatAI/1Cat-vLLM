@@ -38,12 +38,8 @@ STATE_BLOCKS=$((1 + 28 * MAX_NUM_SEQS))
 # Windows past the native length hold a 4x larger indexer history on the GPU:
 # halve the prefill chunk (activation peak) and trim the hot cache to fit 16 GB.
 PREFILL_CHUNK=8192 HOT_TOKENS=32768 STAGE_TOKENS=525504 EXPERT_FRACTION=0.8
-DRAFT_KV=float16
 if (( MAX_MODEL_LEN > NATIVE_LEN )); then
   PREFILL_CHUNK=4096 HOT_TOKENS=16384 STAGE_TOKENS=525504 EXPERT_FRACTION=0.77
-  # The stage buffer holds half as many FP16 tokens; E4M3 draft history
-  # stages in windows past it like the target.
-  DRAFT_KV=fp8_e4m3
 fi
 # Save the recurrent state at the end of each prompt so the next chat turn
 # reuses the whole previous prompt from the prefix cache (one extra prefill
@@ -78,7 +74,7 @@ export TORCH_EXTENSIONS_DIR="$CACHE_DIR/torch_extensions"
 export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 unset LD_PRELOAD LD_AUDIT ONECAT_VLLM_EXTENSION_DIR
 mkdir -p "$CACHE_DIR"
-KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" "$STATE_BLOCKS" "$HOT_TOKENS" "$STAGE_TOKENS" "$EXPERT_FRACTION" "$DRAFT_KV" <<'PY'
+KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" "$STATE_BLOCKS" "$HOT_TOKENS" "$STAGE_TOKENS" "$EXPERT_FRACTION" <<'PY'
 import json
 import sys
 if sys.argv[2].lower() not in ("true", "false"):
@@ -103,7 +99,7 @@ config = {
     "sm70_qsa_host_native": True, "qsa_host_kv": True,
     "qsa_host_indexer_history": sys.argv[2].lower() == "true",
     "qsa_host_kv_dtype": "fp8_e4m3",
-    "qsa_host_kv_draft_dtype": sys.argv[7], "qsa_host_kv_device_reference": False,
+    "qsa_host_kv_draft_dtype": "float16", "qsa_host_kv_device_reference": False,
     "qsa_host_kv_hot_tokens": int(sys.argv[4]), "qsa_host_kv_hot_dtype": "fp8_e4m3",
     "qsa_host_kv_draft_hot_tokens": 16384, "qsa_host_kv_staging_rows": 8,
     "qsa_host_kv_prefill_stage_tokens": int(sys.argv[5]),

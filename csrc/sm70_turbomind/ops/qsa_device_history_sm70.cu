@@ -33,6 +33,10 @@ struct Args {
   // rows_fp8 over one window of a history staged in parts: write the
   // window-normalized FP32 rows to `partial` and (max, sum) to `state`.
   int window;
+  // merge over one window (FP16 history): window-normalized FP32 rows
+  // and per-head (max, sum) instead of the gated output.
+  float* wout;
+  float* wstate;
   int64_t qs0, qs1, is0, ts0, os0, os1, gs0, gs1, rs0;
 };
 
@@ -392,6 +396,14 @@ __device__ __forceinline__ void merge_head(const Args& a, int row, int head,
                           numerator);
   const float denominator = scalars[1];
   float result = denominator > 0 ? __fdiv_rn(numerator, denominator) : 0.f;
+  if (a.wout) {
+    a.wout[int64_t(row * H + head) * D + t] = result;
+    if (!t) {
+      a.wstate[int64_t(row * H + head) * 2] = scalars[0];
+      a.wstate[int64_t(row * H + head) * 2 + 1] = denominator;
+    }
+    return;
+  }
   if (a.gate) {
     result = __half2float(__float2half_rn(result));
     const float gate = __half2float(a.gate[row * a.gs0 + head * a.gs1 + t]);
@@ -803,7 +815,9 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
                     int64_t tiles = 1, bool prefill = false,
                     int64_t whole_rows = 0,
                     std::optional<torch::Tensor> hot_scales = std::nullopt,
-                    bool window = false) {
+                    bool window = false,
+                    std::optional<torch::Tensor> window_out = std::nullopt,
+                    std::optional<torch::Tensor> window_state = std::nullopt) {
   const c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
               q.size(0) > 0 && (whole_rows || q.size(0) <= 64) &&
@@ -883,6 +897,17 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
   a.partial = partial.data_ptr<float>();
   a.state = state.data_ptr<float>();
   a.window = window ? 1 : 0;
+  TORCH_CHECK(window_out.has_value() == window_state.has_value());
+  if (window_out) {
+    TORCH_CHECK(!whole_rows && window_out->scalar_type() == at::kFloat &&
+                    window_state->scalar_type() == at::kFloat &&
+                    window_out->is_contiguous() && window_state->is_contiguous() &&
+                    window_out->numel() == q.size(0) * 6 * 256 &&
+                    window_state->numel() == q.size(0) * 6 * 2,
+                "QSA window merge needs FP32 [M, 6, 256] rows and [M, 6, 2] state");
+  }
+  a.wout = window_out ? window_out->data_ptr<float>() : nullptr;
+  a.wstate = window_state ? window_state->data_ptr<float>() : nullptr;
   TORCH_CHECK(!window || (whole_rows && partial.scalar_type() == at::kFloat &&
                           state.scalar_type() == at::kFloat &&
                           partial.is_contiguous() && state.is_contiguous() &&
@@ -1109,6 +1134,41 @@ TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
                           positions, lengths, q, std::nullopt, partial,
                           state, std::nullopt, std::nullopt, 1, true,
                           occupancy, std::nullopt, true);
+         });
+  // run_tiled over one window of a staged-in-parts history (FP16 draft):
+  // window-normalized FP32 rows and per-head (max, sum) for
+  // qsa_merge_windows instead of the gated output.
+  m.def(
+      "run_tiled_window(Tensor q, Tensor history, Tensor scales, "
+      "Tensor indices, Tensor table, Tensor requests, Tensor positions, "
+      "Tensor lengths, Tensor(a!) partial, Tensor(b!) state, "
+      "Tensor(c!) window_out, Tensor(d!) window_state, int step, "
+      "int tiles=1) -> ()");
+  m.impl("run_tiled_window", torch::kCUDA,
+         [](torch::Tensor q, torch::Tensor history, torch::Tensor scales,
+            torch::Tensor indices, torch::Tensor table, torch::Tensor requests,
+            torch::Tensor positions, torch::Tensor lengths,
+            torch::Tensor partial, torch::Tensor state,
+            torch::Tensor window_out, torch::Tensor window_state, int64_t step,
+            int64_t tiles) {
+           TORCH_CHECK(step > 0 && step <= 64);
+           const int64_t rows = q.size(0);
+           TORCH_CHECK(indices.size(0) == rows && requests.size(0) == rows &&
+                       positions.size(0) == rows &&
+                       window_out.size(0) == rows &&
+                       window_state.size(0) == rows);
+           for (int64_t start = 0; start < rows; start += step) {
+             const int64_t n = std::min(step, rows - start);
+             // Window rows write only window_out/state; `q` stands in for out.
+             device_qsa_out(q.narrow(0, start, n), history, scales,
+                            indices.narrow(0, start, n), table,
+                            requests.narrow(0, start, n),
+                            positions.narrow(0, start, n), lengths,
+                            q.narrow(0, start, n), std::nullopt, partial, state,
+                            std::nullopt, std::nullopt, tiles, true, 0,
+                            std::nullopt, false, window_out.narrow(0, start, n),
+                            window_state.narrow(0, start, n));
+           }
          });
   // Host-authoritative history with a protected device hot cache: resolved
   // tokens read the hot copy, the rest read mapped host history directly.
