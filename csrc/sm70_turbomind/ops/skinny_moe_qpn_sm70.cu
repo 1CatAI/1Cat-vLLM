@@ -189,13 +189,13 @@ __global__ void skinny_nvfp4_qpn(const uint8_t* __restrict__ qcodes,
 // expert by qpn_prepack: [E][tile N/32][group K/16][lane 32] x 8B codes plus
 // the scale bytes. A rows come through the slot indirection (token-major x
 // for w13, slot-major for w2).
-// Routing arrives COMPACT: grid.y spans slot-count-many group slots (a
-// static bound, so it captures into CUDA graphs), `gids[grp]` names the
-// group's expert and `goff[grp]..goff[grp+1]` its slot range; padding
-// groups carry an empty range and exit. This keeps the launch independent
-// of the expert count -- with a per-expert grid, many-expert models
-// (E=512, top-k 10, T=1) schedule thousands of empty blocks that cost
-// more than the actual work.
+// Routing arrives COMPACT: grid.y spans min(slots, experts) group slots (a
+// static bound, so it captures into CUDA graphs; no batch has more groups),
+// `gids[grp]` names the group's expert and `goff[grp]..goff[grp+1]` its slot
+// range; padding groups carry an empty range and exit. Either bound alone
+// schedules a flood of empty blocks: per expert at decode with many experts
+// (E=512, top-k 10, T=1), per slot in prefill (T=512, top-k 6: 3072 rows for
+// at most 256 groups, 8-47 % of the GEMM time on V100 and Turing).
 // ---------------------------------------------------------------------------
 // RB row blocks share one weight load: each group's codes are fetched and
 // dequantized once and feed the MMAs of up to RB x 8 rows, instead of one
@@ -502,7 +502,7 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(K % 64 == 0 && (K / 16) % splitk == 0,
               "K/16 must split into splitk equal slices");
   TORCH_CHECK(N % 32 == 0, "N % 32");
-  const dim3 grid((unsigned)(N / 32), (unsigned)S);
+  const dim3 grid((unsigned)(N / 32), (unsigned)std::min(S, E));
   auto stream = at::cuda::getCurrentCUDAStream();
   // Row blocks per weight load, from the mean rows per expert: one block
   // while experts see at most 8 rows (decode), two for prefill chunks. Four
