@@ -455,3 +455,33 @@ def test_glm53_sm70_fused_q_kv_rmsnorm_matches_reference():
 
     torch.testing.assert_close(q_actual, q_ref, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(kv_actual, kv_ref, rtol=2e-3, atol=2e-3)
+
+
+def test_glm53_indexer_query_and_op_share_the_fp16_predicate():
+    # The query producer chose FP8 on Turing while the indexer op expected FP16
+    # (assert in graph capture on an RTX pipeline stage): both must ask the same
+    # question about the same card.
+    from vllm.model_executor.layers import sparse_attn_indexer_kpool
+    from vllm.models.glm5next.nvidia import attention
+
+    assert (
+        attention.is_pre_ampere_cuda_platform
+        is sparse_attn_indexer_kpool.is_pre_ampere_cuda_platform
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+def test_glm53_fp16_indexer_predicate_follows_each_card():
+    from vllm.model_executor.layers.quantization.sm70_turbomind import (
+        is_pre_ampere_cuda_platform,
+    )
+
+    previous = torch.accelerator.current_device_index()
+    try:
+        for device in range(torch.accelerator.device_count()):
+            torch.accelerator.set_device_index(device)
+            capability = torch.cuda.get_device_capability(device)
+            expected = (7, 0) <= capability < (8, 0)
+            assert is_pre_ampere_cuda_platform() is expected, (device, capability)
+    finally:
+        torch.accelerator.set_device_index(previous)
