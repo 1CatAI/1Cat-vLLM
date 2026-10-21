@@ -919,7 +919,7 @@ def flash_v100_dense_prefill(
 
 
 def flash_v100_dense_prefill_lse_available() -> bool:
-    return _ops.get_flash_dense_forward() is not None
+    return _ops.flash_dense_forward_available()
 
 
 def flash_v100_dense_prefill_lse(
