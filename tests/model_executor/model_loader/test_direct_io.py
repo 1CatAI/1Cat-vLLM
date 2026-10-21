@@ -28,6 +28,13 @@ def _checkpoint(path) -> dict[str, torch.Tensor]:
         "model.language_model.layers.0.w": torch.randn(33, 17),
         "model.language_model.layers.1.w": torch.randn(64, 64).half(),
         "model.language_model.layers.2.w": torch.randn(5, 7).bfloat16(),
+        # csf_32x2_v1 page bases and offsets (GLM-5.3-Flash-FP4-Local)
+        "model.language_model.layers.1.page_bases": torch.arange(
+            -7, 9, dtype=torch.int32
+        ).view(torch.uint32),
+        "model.language_model.layers.2.offsets": torch.arange(
+            -5, 13, dtype=torch.int16
+        ).view(torch.uint16),
         "layers.3.ffn.w": torch.randn(9, 11).to(torch.float8_e4m3fn),
         "layers.3.ffn.scale": torch.randn(3, 4).to(torch.float8_e8m0fnu),
         "mtp.layers.0.w": torch.randint(0, 255, (129,), dtype=torch.uint8),
