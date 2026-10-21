@@ -911,6 +911,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int scale_mode, int fragment_order) -> ()");
   ops.impl("skinny_moe_qpn_sm70", torch::kCUDA, &skinny_moe_qpn_sm70);
 
+  // Causal prefill attention, head dim 256, over a paged fp16 KV cache on
+  // Turing's m16n8k8 tensor cores (SM75 and later).
+  ops.def(
+      "paged_prefill_attention_sm75(Tensor(a!) out, Tensor q, Tensor k_cache, "
+      "Tensor v_cache, Tensor cu_seqlens_q, Tensor seqused_k, "
+      "Tensor block_table, int max_seqlen_q, float softmax_scale) -> ()");
+  ops.impl("paged_prefill_attention_sm75", torch::kCUDA,
+           &paged_prefill_attention_sm75);
+
   ops.def(
       "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
