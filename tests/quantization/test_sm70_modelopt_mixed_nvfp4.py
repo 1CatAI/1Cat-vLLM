@@ -3,7 +3,7 @@
 """Narrow SM70 admission and shape gates for ModelOpt mixed NVFP4."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -40,6 +40,7 @@ from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _validate_weight_layout,
     validate_nvfp4_sm70_moe_contract,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 
 def test_qwen38_qpn_batch_uses_screened_splits():
@@ -65,7 +66,7 @@ def test_nvfp4_compact_work_limit_is_routed_rows(top_k, compact_tokens, dense_to
     assert not _use_compact_grouped(dense_tokens, top_k)
 
 
-def _mixed_config() -> ModelOptMixedPrecisionConfig:
+def _mixed_config(exclude_modules=()) -> ModelOptMixedPrecisionConfig:
     fp8 = ModelOptFp8Config("FP8", True, None, [])
     nvfp4 = ModelOptNvFp4Config(
         quant_method="NVFP4",
@@ -77,12 +78,23 @@ def _mixed_config() -> ModelOptMixedPrecisionConfig:
     )
     return ModelOptMixedPrecisionConfig(
         kv_cache_quant_method=None,
-        exclude_modules=[],
+        exclude_modules=list(exclude_modules),
         quantized_layers={"model.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4"}},
         fp8_config=fp8,
         nvfp4_config=nvfp4,
         w4a16_nvfp4_config=w4a16,
     )
+
+
+@pytest.mark.parametrize("exclude_modules", [(), ("lm_head",)])
+def test_full_precision_lm_head_keeps_its_embedding_method(exclude_modules):
+    # GLM-5.3-Flash-FP4-Local leaves lm_head out of quantized_layers. None lets
+    # ParallelLMHead keep its UnquantizedEmbeddingMethod; the linear method's
+    # weight preparation reads LinearBase's per-layer policies.
+    lm_head = Mock(spec=ParallelLMHead)
+    lm_head.__class__ = ParallelLMHead
+    config = _mixed_config(exclude_modules)
+    assert config.get_quant_method(lm_head, "lm_head") is None
 
 
 def _moe_contract(**overrides):

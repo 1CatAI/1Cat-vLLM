@@ -209,9 +209,11 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         if isinstance(layer, (Attention, MLAAttention)):
             return self.KVCacheMethodCls(self)
 
-        # handle exclusion
+        # handle exclusion; an excluded LM head gets None and keeps its own
+        # UnquantizedEmbeddingMethod (the linear method's weight preparation
+        # expects LinearBase's per-layer policies)
         if self.is_layer_excluded(prefix):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
             return None
 
@@ -2669,9 +2671,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptKVCacheMethod(self)
             return None
 
-        # Excluded layers
+        # Excluded layers; an LM head keeps its own UnquantizedEmbeddingMethod
+        # (the linear method's weight preparation expects LinearBase's
+        # per-layer policies)
         if self.is_layer_excluded(prefix):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
             return None
 
@@ -2689,8 +2693,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     f"Unsupported quant_algo {quant_algo!r} for layer {prefix!r} "
                     "in ModelOpt mixed precision config."
                 )
-            # Layer not in quantized_layers — leave unquantized
-            return UnquantizedLinearMethod()
+            # Layers not in quantized_layers stay unquantized. An LM head
+            # keeps its own UnquantizedEmbeddingMethod.
+            return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
 
         if isinstance(layer, RoutedExperts):
             if quant_algo in _BLOCK_FP8_MOE_ALGOS:
