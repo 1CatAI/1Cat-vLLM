@@ -18,8 +18,8 @@ from vllm.models.deepseek_v4.sm70.sparse_kernels import (
 from vllm.models.glm5next.sm70.fp8_kv import (
     GLM5_FP8_KV_SLOT_BYTES,
     sm70_glm5_fp8_kv_insert,
-    sm70_glm5_sparse_attention_paged_fp8,
     sm70_glm5_sparse_attention_paged_fp8_batched_gemm,
+    sm70_glm5_sparse_attention_paged_fp8_blocked,
     sm70_glm5_sparse_attention_paged_fp8_gemm,
 )
 from vllm.platforms.interface import DeviceCapability
@@ -39,6 +39,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _FP8_GEMM_MAX_TOKENS = 8
+# Prefill runs the same tensor-core route in blocks of this many tokens; the
+# gather workspace grows with it (16 x 2176 keys x 512 dims = 34 MiB).
+_FP8_PREFILL_BLOCK_TOKENS = 16
 
 
 class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
@@ -158,6 +161,8 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             raise RuntimeError("GLM-5.3 SM70 sparse MLA requires VllmConfig.")
         max_tokens = config.scheduler_config.max_num_batched_tokens
         self.fp8_gemm_max_tokens = min(max_tokens, _FP8_GEMM_MAX_TOKENS)
+        self.fp8_prefill_block = min(max_tokens, _FP8_PREFILL_BLOCK_TOKENS)
+        fp8_rows = max(self.fp8_gemm_max_tokens, self.fp8_prefill_block)
         workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_tokens, num_heads, self.kv_lora_rank), torch.float16),
         ]
@@ -165,21 +170,11 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             workspace_specs.extend(
                 (
                     (
-                        (
-                            self.fp8_gemm_max_tokens,
-                            self.index_width,
-                            self.kv_lora_rank,
-                        ),
+                        (fp8_rows, self.index_width, self.kv_lora_rank),
                         torch.float16,
                     ),
-                    (
-                        (self.fp8_gemm_max_tokens, num_heads, self.index_width),
-                        torch.float16,
-                    ),
-                    (
-                        (self.fp8_gemm_max_tokens, num_heads, self.index_width),
-                        torch.float16,
-                    ),
+                    ((fp8_rows, num_heads, self.index_width), torch.float16),
+                    ((fp8_rows, num_heads, self.index_width), torch.float16),
                 )
             )
         current_workspace_manager().get_simultaneous(*workspace_specs)
@@ -187,7 +182,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             "GLM-5.3-Flash route: SM70 FP16 sparse MLA with %s KV%s.",
             "packed E4M3FN" if self.use_fp8_cache else "FP16",
             (
-                " and B1/M2-M8 dequant + tensor-core GEMM decode"
+                " and dequant + tensor-core GEMM decode and prefill blocks"
                 if self.use_fp8_cache
                 else ""
             ),
@@ -337,19 +332,26 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     probs,
                 )
             else:
-                (out,) = workspace_manager.get_simultaneous(
+                block = self.fp8_prefill_block
+                out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(
                     (
                         (num_tokens, self.num_heads, self.kv_lora_rank),
                         torch.float16,
                     ),
+                    ((block, self.index_width, self.kv_lora_rank), torch.float16),
+                    ((block, self.num_heads, self.index_width), torch.float16),
+                    ((block, self.num_heads, self.index_width), torch.float16),
                 )
-                sm70_glm5_sparse_attention_paged_fp8(
+                sm70_glm5_sparse_attention_paged_fp8_blocked(
                     q,
                     kv_c_and_k_pe_cache.view(torch.uint8),
                     global_indices,
                     valid_counts,
                     self.softmax_scale,
                     out,
+                    gathered_kv,
+                    scores,
+                    probs,
                 )
         else:
             if kv_c_and_k_pe_cache.dtype != torch.float16:
