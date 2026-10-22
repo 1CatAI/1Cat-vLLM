@@ -761,7 +761,8 @@ class KernelConfig:
     triton_sm7x_tensor_cores: bool = False
     """The installed Triton lowers ``tl.dot`` to tensor cores on Volta
     (mma.m8n8k4) and Turing (mma.m16n8k8), so SM70-family routes run their
-    Triton kernels instead of cuBLAS or hand-written ones. Stock Triton lowers
+    Triton kernels instead of cuBLAS or hand-written ones (Turing keeps its
+    fused indexer prefill scorer, which is faster there). Stock Triton lowers
     ``tl.dot`` to FMA before SM80; each architecture is verified against the
     installed compiler on first use and a mismatch stops the engine."""
 

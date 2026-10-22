@@ -9,7 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
 from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context
@@ -261,6 +261,7 @@ def sparse_attn_indexer_kpool(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
+    triton_tensor_cores: bool,
     use_fp4_cache: bool = False,
     # kpool params (Plan-A: gate is consumed at write time and read back at
     # topk time to softmax-weight the pool).
@@ -507,6 +508,7 @@ def sparse_attn_indexer_kpool(
                     k_quant,
                     k_scale,
                     weights[chunk.token_start : chunk.token_end],
+                    triton_tensor_cores=triton_tensor_cores,
                 )
             else:
                 logits = fp8_fp4_mqa_logits(
@@ -899,6 +901,7 @@ def sparse_attn_indexer_kpool_fake(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
+    triton_tensor_cores: bool,
     use_fp4_cache: bool = False,
     gate_score: torch.Tensor | None = None,
     compress_ape: torch.Tensor | None = None,
@@ -962,6 +965,9 @@ class SparseAttnIndexerKpool(CustomOp):
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
+        self.triton_tensor_cores = (
+            get_current_vllm_config().kernel_config.use_triton_sm7x_tensor_cores()
+        )
         self.use_fp4_cache = use_fp4_cache
         if (
             current_platform.is_cuda()
@@ -1037,6 +1043,7 @@ class SparseAttnIndexerKpool(CustomOp):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
+            self.triton_tensor_cores,
             self.use_fp4_cache,
             gate_score,
             compress_ape,

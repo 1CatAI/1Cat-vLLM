@@ -11,6 +11,7 @@ from vllm.models.deepseek_v4.sm70.indexer import (
     sm70_indexer_decode_logits,
     sm70_indexer_prefill_logits,
 )
+from vllm.triton_utils.mma_probe import lowers_dot_to_mma
 from vllm.utils.torch_utils import current_stream
 
 
@@ -23,6 +24,21 @@ def indexer_engine_config():
 requires_sm70 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7,
     reason="requires a Volta or Turing GPU (SM70/SM75)",
+)
+
+
+def _tensor_core_triton() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7:
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return lowers_dot_to_mma(major * 10 + minor)
+
+
+# The tensor-core route's precondition (checked by `triton_sm7x_tensor_cores`):
+# with stock Triton its tiles take the FMA layout, which does not fit Turing.
+requires_tensor_core_triton = pytest.mark.skipif(
+    not _tensor_core_triton(),
+    reason="requires a Triton that lowers tl.dot to tensor cores on this GPU",
 )
 
 _HEAD_DIM = 128
@@ -119,8 +135,17 @@ def _make_queries(rows: int, num_heads: int):
 
 
 @requires_sm70
-@pytest.mark.parametrize("use_cublas", [True, False])
-def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas):
+@pytest.mark.parametrize(
+    ("use_cublas", "triton_tensor_cores"),
+    [
+        (True, False),
+        (False, False),
+        pytest.param(True, True, marks=requires_tensor_core_triton),
+    ],
+)
+def test_prefill_matches_the_reference_scoring_function(
+    monkeypatch, use_cublas, triton_tensor_cores
+):
     torch.manual_seed(20260819)
     generator = torch.Generator().manual_seed(20260819)
     num_queries, num_heads, num_keys = 5, 8, 37
@@ -132,7 +157,11 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
     k = values * scales[:, None]
 
     actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
+        q,
+        bits.view(torch.float8_e4m3fn),
+        scales,
+        weights,
+        triton_tensor_cores=triton_tensor_cores,
     )
     expected = _reference_index_logits(q, weights, k)
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
@@ -144,12 +173,19 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
 
 
 @requires_sm70
+@pytest.mark.parametrize(
+    "triton_tensor_cores",
+    [False, pytest.param(True, marks=requires_tensor_core_triton)],
+)
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("num_heads", [32, 64])
-def test_prefill_model_head_counts_match_the_reference(num_heads, weight_dtype):
+def test_prefill_model_head_counts_match_the_reference(
+    num_heads, weight_dtype, triton_tensor_cores
+):
     """32 and 64 heads are the model head counts (16-head indexers pad to 32);
-    on Turing they take the fused tensor-core scorer. 37 queries and 1100 keys
-    leave a partial token group, a partial key tile and a second key range.
+    without tensor-core Triton, Turing takes the fused native scorer. 37
+    queries and 1100 keys leave a partial token group, a partial key tile and a
+    second key range.
     """
     torch.manual_seed(20261021)
     generator = torch.Generator().manual_seed(20261021)
@@ -161,7 +197,11 @@ def test_prefill_model_head_counts_match_the_reference(num_heads, weight_dtype):
     scales = torch.linspace(0.5, 2.0, num_keys, device="cuda", dtype=torch.float32)
 
     actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
+        q,
+        bits.view(torch.float8_e4m3fn),
+        scales,
+        weights,
+        triton_tensor_cores=triton_tensor_cores,
     )
     _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
 
@@ -181,7 +221,47 @@ def test_turing_prefill_takes_the_fused_scorer(monkeypatch):
     scales = torch.linspace(0.5, 2.0, 300, device="cuda", dtype=torch.float32)
 
     actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
+        q, bits.view(torch.float8_e4m3fn), scales, weights, triton_tensor_cores=False
+    )
+    _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
+
+
+@requires_tensor_core_triton
+@pytest.mark.parametrize("num_heads", [8, 32, 64])
+def test_tensor_core_triton_keeps_the_fused_turing_scorer(monkeypatch, num_heads):
+    """With tensor-core Triton the Triton kernel replaces the cuBLAS route; Turing
+    keeps its fused native scorer for 32 and 64 heads, the faster one there, and
+    takes the Triton kernel for other head counts. Eight heads need two tokens
+    per MMA; 1100 keys cross the per-program key range.
+    """
+
+    def forbidden(route):
+        def call(*args, **kwargs):
+            raise AssertionError(f"tensor-core Triton must not take {route} here")
+
+        return call
+
+    monkeypatch.setattr(
+        sm70_indexer, "_prefill_logits_cublas", forbidden("the cuBLAS route")
+    )
+    if torch.cuda.get_device_capability() == (7, 5) and num_heads in (32, 64):
+        monkeypatch.setattr(
+            sm70_indexer, "_prefill_scores_triton", forbidden("the Triton kernel")
+        )
+    else:
+        monkeypatch.setattr(
+            torch.ops._C,
+            "indexer_prefill_scores_sm75",
+            forbidden("the fused SM75 scorer"),
+            raising=False,
+        )
+    generator = torch.Generator().manual_seed(20261022)
+    q, weights = _make_queries(37, num_heads)
+    bits, values = _random_fp8_keys(1100, generator)
+    scales = torch.linspace(0.5, 2.0, 1100, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights, triton_tensor_cores=True
     )
     _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
 
@@ -199,7 +279,7 @@ def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
     scales = torch.linspace(0.5, 2.0, num_keys, device="cuda", dtype=torch.float32)
 
     actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
+        q, bits.view(torch.float8_e4m3fn), scales, weights, triton_tensor_cores=False
     )
     expected = _reference_factored_logits(q, weights, values * scales[:, None])
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
