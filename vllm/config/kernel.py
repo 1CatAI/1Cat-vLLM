@@ -758,6 +758,41 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    triton_sm7x_tensor_cores: bool = False
+    """The installed Triton lowers ``tl.dot`` to tensor cores on Volta
+    (mma.m8n8k4) and Turing (mma.m16n8k8), so SM70-family routes run their
+    Triton kernels instead of cuBLAS or hand-written ones. Stock Triton lowers
+    ``tl.dot`` to FMA before SM80; each architecture is verified against the
+    installed compiler on first use and a mismatch stops the engine."""
+
+    def use_triton_sm7x_tensor_cores(self, device_index: int | None = None) -> bool:
+        """Whether the SM70-family routes on a device take their Triton kernels.
+
+        ``device_index`` defaults to the current device; layers decide this once
+        when they are built. With the setting on, a Triton that lowers ``tl.dot``
+        to FMA on this architecture stops the engine instead of running slowly.
+        """
+        if not self.triton_sm7x_tensor_cores:
+            return False
+        import torch
+
+        from vllm.platforms import current_platform
+        from vllm.triton_utils import mma_probe, triton
+
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        capability = current_platform.get_device_capability(device_index)
+        if capability is None or capability.major != 7:
+            return False
+        if not mma_probe.lowers_dot_to_mma(capability.to_int()):
+            raise RuntimeError(
+                "kernel_config.triton_sm7x_tensor_cores is set, but Triton "
+                f"{triton.__version__} ({triton.__file__}) lowers tl.dot to FMA on "
+                f"sm_{capability.to_int()}. Install the sm7x Triton or leave the "
+                "setting off."
+            )
+        return True
+
     sm70_packed_topk_gather: bool = True
     """Gather SM70 TP2/TP4 compact candidates in one lossless message."""
 
