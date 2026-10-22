@@ -14,22 +14,32 @@ import sys
 c = sqlite3.connect(sys.argv[1])
 dev = int(sys.argv[2])
 names = dict(c.execute("select id, value from StringIds").fetchall())
-api = dict(
-    c.execute("select correlationId, end from CUPTI_ACTIVITY_KIND_RUNTIME").fetchall()
-)
+# CUDA correlation ids are process-local. Nsight packs the process id above
+# the low 24 thread-id bits; joining only correlationId mixes TP workers.
+api = {
+    (tid >> 24, cid): end
+    for tid, cid, end in c.execute(
+        "select globalTid, correlationId, end from CUPTI_ACTIVITY_KIND_RUNTIME"
+    )
+}
 ks = c.execute(
-    "select start,end,streamId,correlationId,demangledName,gridX,gridY "
+    "select start,end,streamId,correlationId,demangledName,gridX,gridY,globalPid "
     "from CUPTI_ACTIVITY_KIND_KERNEL where deviceId=?",
     (dev,),
 ).fetchall()
 ms = c.execute(
-    "select start,end,streamId,correlationId,NULL,0,0 "
+    "select start,end,streamId,correlationId,NULL,0,0,globalPid "
     "from CUPTI_ACTIVITY_KIND_MEMCPY where deviceId=?",
     (dev,),
 ).fetchall()
-st = collections.Counter(r[2] for r in ks)
+zs = c.execute(
+    "select start,end,streamId,correlationId,-1,0,0,globalPid "
+    "from CUPTI_ACTIVITY_KIND_MEMSET where deviceId=?",
+    (dev,),
+).fetchall()
+st = collections.Counter((r[-1], r[2]) for r in ks)
 main = st.most_common(1)[0][0]
-m = sorted(r for r in ks + ms if r[2] == main)
+m = sorted(r for r in ks + ms + zs if (r[-1], r[2]) == main)
 phase = "gu"
 
 
@@ -37,6 +47,8 @@ def seg(n, gx, gy):
     global phase
     if n is None:
         return "memcpy"
+    if n == "MEMSET":
+        return "memset"
     if "_sub_bounds" in n or "_sub_fill" in n:
         phase = "dn"
     if "_route_rows" in n:
@@ -128,11 +140,12 @@ n = collections.Counter()
 wait = collections.defaultdict(float)
 host = 0
 end = m[0][0]
-for s, e, _, cid, nm, gx, gy in m:
-    name = names.get(nm) if nm is not None else None
+for s, e, _, cid, nm, gx, gy, pid in m:
+    name = "MEMSET" if nm == -1 else names.get(nm) if nm is not None else None
     g = seg(name, gx, gy)
     if s > end:
-        if api.get(cid) is not None and api[cid] <= end:
+        submitted = api.get((pid >> 24, cid))
+        if submitted is not None and submitted <= end:
             wait[g] += s - end
         else:
             host += s - end
@@ -151,9 +164,9 @@ for g in sorted(busy, key=lambda g: -busy[g]):
         f"wait-before {wait[g] / 1e6:5.0f}  n={n[g]}"
     )
 side = collections.defaultdict(float)
-for s, e, sid, cid, nm, gx, gy in ks:
-    if sid != main:
-        side[(sid, (names.get(nm) or "")[:40])] += e - s
+for s, e, sid, cid, nm, gx, gy, pid in ks:
+    if (pid, sid) != main:
+        side[(pid >> 24, sid, (names.get(nm) or "")[:40])] += e - s
 print(
     "side streams:",
     [(k, round(v / 1e6)) for k, v in sorted(side.items(), key=lambda x: -x[1])[:5]],

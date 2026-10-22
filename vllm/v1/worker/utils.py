@@ -39,6 +39,85 @@ from vllm.v1.worker.block_table import get_block_table_width
 logger = init_logger(__name__)
 
 
+# Shared host pools stay mapped and registered for the worker's lifetime.
+_SHARED_HOST_POOLS: list[Any] = []
+
+
+def _shared_replica_host_pool(pool_size: int, device: torch.device):
+    """One host KV pool per replicated KV head instead of one per TP rank.
+
+    With fewer KV heads than TP ranks, consecutive ranks hold the same KV head
+    and write identical history. Those ranks map one shared-memory pool and
+    register it with CUDA, which divides host KV memory by the replication.
+    Returns None (private pool) when the layout does not replicate heads or
+    the ranks cannot share host memory.
+    """
+    import mmap
+    import os
+    import uuid
+
+    import torch.distributed as dist
+
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.distributed.parallel_state import get_tp_group
+
+    config = get_current_vllm_config_or_none()
+    if config is None or not getattr(
+        config.kernel_config, "qsa_host_kv_share_replicas", True
+    ):
+        return None
+    parallel = config.parallel_config
+    tp = parallel.tensor_parallel_size
+    if parallel.pipeline_parallel_size != 1 or parallel.data_parallel_size != 1:
+        return None
+    try:
+        kv_heads = config.model_config.get_total_num_kv_heads()
+    except Exception:  # noqa: BLE001 - models without a KV head count
+        return None
+    if tp <= 1 or kv_heads >= tp or tp % kv_heads:
+        return None
+    group = get_tp_group()
+    replicas = tp // kv_heads
+    rank = group.rank_in_group
+    leader = rank % replicas == 0
+    tokens = [uuid.uuid4().hex if rank == 0 else None]
+    dist.broadcast_object_list(tokens, src=group.ranks[0], group=group.cpu_group)
+    path = f"/dev/shm/vllm-host-kv-{tokens[0]}-{rank // replicas}"
+    try:
+        if leader:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.ftruncate(fd, pool_size)
+            os.close(fd)
+        ok = True
+    except OSError:
+        ok = False
+    flags = [None] * group.world_size
+    dist.all_gather_object(flags, ok, group=group.cpu_group)
+    if not all(flags):
+        if leader and ok:
+            os.unlink(path)
+        return None
+    fd = os.open(path, os.O_RDWR)
+    shared = mmap.mmap(fd, pool_size, mmap.MAP_SHARED)
+    os.close(fd)
+    dist.barrier(group=group.cpu_group)
+    if leader:
+        os.unlink(path)
+    from vllm.model_executor.layers.quantization.gguf_expert_cache import _native
+
+    host = torch.frombuffer(shared, dtype=torch.int8)
+    native = _native()
+    native.host_register(host.data_ptr(), pool_size)
+    view = native.mapped_view(host, device.index)
+    _SHARED_HOST_POOLS.append((shared, host, view))
+    logger.info(
+        "Host KV pool shared by %d TP ranks per KV head (%s per pool).",
+        replicas,
+        format_gib(pool_size),
+    )
+    return view
+
+
 def allocate_host_kv_cache_pool(
     kv_cache_config: KVCacheConfig, device: torch.device
 ) -> dict[str, torch.Tensor]:
@@ -61,15 +140,18 @@ def allocate_host_kv_cache_pool(
         pool_size,
         len(banks),
     )
-    with torch.accelerator.device_index(device.index):
-        # A pageable source makes the view helper cudaHostAlloc exactly
-        # pool_size bytes. The caching pinned allocator would round this one
-        # allocation up to a power of two (2.3 GB -> 4 GiB per worker). The
-        # untouched source pages are never resident; zero the pool on device.
-        host = torch.empty(pool_size, dtype=torch.int8, device="cpu")
-        pool = get_accelerator_view_from_cpu_tensor(host)
-        del host
-        pool.zero_()
+    pool = _shared_replica_host_pool(pool_size, device)
+    if pool is None:
+        with torch.accelerator.device_index(device.index):
+            # A pageable source makes the view helper cudaHostAlloc exactly
+            # pool_size bytes. The caching pinned allocator would round this
+            # one allocation up to a power of two (2.3 GB -> 4 GiB per worker).
+            # The untouched source pages are never resident; zero the pool on
+            # device.
+            host = torch.empty(pool_size, dtype=torch.int8, device="cpu")
+            pool = get_accelerator_view_from_cpu_tensor(host)
+            del host
+            pool.zero_()
     tensors: dict[str, torch.Tensor] = {}
     offset = 0
     for bank, aligned_size in zip(banks, aligned_sizes):
@@ -204,6 +286,38 @@ def _zero_kv_blocks_kernel(
     )
 
 
+@triton.jit
+def _copy_kv_blocks_kernel(
+    seg_addrs_ptr,
+    seg_block_strides_ptr,
+    seg_page_sizes_ptr,
+    seg_num_blocks_ptr,
+    src_ids_ptr,
+    dst_ids_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy whole KV cache blocks across all segments (see the zero kernel)."""
+    pair_index = tl.program_id(0)
+    seg_index = tl.program_id(1)
+    chunk_index = tl.program_id(2)
+    page_size_el = tl.load(seg_page_sizes_ptr + seg_index)
+    chunk_offset = chunk_index.to(tl.int64) * BLOCK_SIZE
+    if chunk_offset >= page_size_el:
+        return
+    src_id = tl.load(src_ids_ptr + pair_index)
+    dst_id = tl.load(dst_ids_ptr + pair_index)
+    num_blocks = tl.load(seg_num_blocks_ptr + seg_index)
+    if src_id < 0 or src_id >= num_blocks or dst_id < 0 or dst_id >= num_blocks:
+        return
+    seg_addr = tl.load(seg_addrs_ptr + seg_index)
+    block_stride_el = tl.load(seg_block_strides_ptr + seg_index).to(tl.int64)
+    ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
+    cols = chunk_offset + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    mask = cols < page_size_el
+    values = tl.load(ptr + src_id.to(tl.int64) * block_stride_el + cols, mask=mask)
+    tl.store(ptr + dst_id.to(tl.int64) * block_stride_el + cols, values, mask=mask)
+
+
 class KVBlockZeroer:
     """Manages efficient zeroing of KV cache blocks via a Triton kernel.
 
@@ -292,9 +406,16 @@ class KVBlockZeroer:
                         spec.head_size,
                         cache_dtype_str=cache_dtype,
                     )
-                    dp = kv.data_ptr()
-
                     el = kv.element_size()
+                    # Packed DCP pages (attn_utils) expose each member as a
+                    # view offset by whole kernel blocks inside one physical
+                    # page, with a block stride that spans every member. Zero
+                    # from the page base: starting at member j's own offset
+                    # runs j kernel blocks past the page into the next block.
+                    # The members then share one segment that covers the page.
+                    page_offset_el = kv.storage_offset() % kv.stride(block_dim)
+                    dp = kv.data_ptr() - page_offset_el * el
+
                     cur_bytes = kv.stride(block_dim) * el
                     assert cur_bytes % 4 == 0
                     kernel_block_el = cur_bytes // 4
@@ -371,6 +492,43 @@ class KVBlockZeroer:
             (max_page_size_el + blk_size - 1) // blk_size,
             blk_size,
             n_segs,
+        )
+
+    def copy_block_ids(self, pairs: list[tuple[int, int]]) -> None:
+        """Copy whole KV cache blocks (source, destination) in one launch."""
+        if not pairs:
+            return
+        if self._meta is None:
+            raise RuntimeError("KV block copies need initialized block metadata")
+        (
+            seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
+            seg_num_blocks,
+            max_chunks,
+            blk_size,
+            n_segs,
+        ) = self._meta
+        src = async_tensor_h2d(
+            [p[0] for p in pairs],
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        dst = async_tensor_h2d(
+            [p[1] for p in pairs],
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        _copy_kv_blocks_kernel[(len(pairs), n_segs, max_chunks)](
+            seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
+            seg_num_blocks,
+            src,
+            dst,
+            BLOCK_SIZE=blk_size,
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:

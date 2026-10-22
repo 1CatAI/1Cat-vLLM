@@ -1109,8 +1109,41 @@ def _compact_sm70_hybrid_sliding_window_pages(
             type(spec) is not SlidingWindowSpec
             or spec.page_size_padded is not None
             or spec.page_size_bytes <= target_page
-            or spec.page_size_bytes % target_page
         ):
+            continue
+        if spec.page_size_bytes % target_page:
+            # Scale bytes can make the physical ratio non-integral. Preserve
+            # the existing prefix/checkpoint grid by using a divisor of the
+            # logical block and padding its physical page to the common size.
+            grid = math.gcd(
+                *(
+                    other.block_size
+                    for other in specs.values()
+                    if isinstance(other, (AttentionSpec, MambaSpec))
+                )
+            )
+            divisors: set[int] = set()
+            for factor in range(1, math.isqrt(grid) + 1):
+                if grid % factor == 0:
+                    divisors.update((factor, grid // factor))
+            for block_size in sorted(divisors, reverse=True):
+                if block_size >= spec.block_size or block_size % 16:
+                    continue
+                compact = replace(spec, block_size=block_size)
+                page = compact.page_size_bytes
+                if page > target_page:
+                    continue
+                # A divisor that merely fits pads away most of the block, and
+                # the padded page is charged per block: 1648 tokens/1664-page
+                # has grid 16, so block=16 fits at 1.9% utilization and costs
+                # 212992 B/token instead of 4096. Fall through to the round-up
+                # path below unless this divisor also fills the page.
+                if page * 2 >= target_page:
+                    result[name] = replace(compact, page_size_padded=target_page)
+                # Divisors descend, so this is the largest that fits; a poorer
+                # one cannot fill the page either. Leave the spec untouched so
+                # the round-up path below can size it from the byte budget.
+                break
             continue
         ratio = spec.page_size_bytes // target_page
         if spec.block_size % (16 * ratio):
@@ -1154,8 +1187,10 @@ def unify_kv_cache_spec_page_size(
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
     are the same, return the original KVCacheSpec. If not same, unify the page
-    size by increasing the block size of layers with smaller page size. Raise
-    NotImplementedError if failed to unify the page size.
+    size by increasing the block size of layers with smaller page size. When
+    page sizes are not integer multiples, use the spec's physical padding
+    contract without changing its logical block size. Raise NotImplementedError
+    for specs that cannot represent the common physical page.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1179,9 +1214,18 @@ def unify_kv_cache_spec_page_size(
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
+                # Payload, scale and state regions need not have an integral
+                # size ratio. Their logical token/checkpoint grids still agree
+                # with the scheduler; padding belongs to the physical page.
+                if isinstance(layer_spec, (AttentionSpec, MambaSpec)):
+                    padded_spec = replace(layer_spec, page_size_padded=max_page_size)
+                    if padded_spec.page_size_bytes == max_page_size:
+                        new_kv_cache_spec[layer_name] = padded_spec
+                        continue
                 raise NotImplementedError(
                     "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+                    "maximum page size and its spec cannot represent padding. "
+                    "Cannot unify the physical pages."
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
@@ -1817,14 +1861,26 @@ def _get_kv_cache_config_csa_linear(
                 + 1
             )
 
-        active_states = 1 + requests * sum(
-            demand(group)
-            for i, group in enumerate(kv_cache_groups)
-            if i in state_groups
+        # Each request holds its state pages; entering a new aligned block
+        # transiently needs one more page per state group while the previous
+        # checkpoint is still referenced. Those transients are shared: at most
+        # two requests cross a boundary in the same step without preemption.
+        active_states = (
+            1
+            + requests
+            * sum(
+                demand(group) - 1
+                for i, group in enumerate(kv_cache_groups)
+                if i in state_groups
+            )
+            + min(requests, 2) * len(state_groups)
         )
         if state_blocks < active_states:
             raise ValueError(f"State pool needs at least {active_states} blocks")
-        history_blocks = requests * sum(
+        # Concurrent requests share one full-window history budget: the
+        # scheduler admits them while their total length fits, as with a
+        # shared KV pool. Each request keeps its own recurrent states.
+        history_blocks = sum(
             demand(group)
             for i, group in enumerate(kv_cache_groups)
             if i not in state_groups
@@ -1836,6 +1892,16 @@ def _get_kv_cache_config_csa_linear(
         history_page = layout.device_compressed_page_bytes
         num_blocks = state_blocks + history_blocks
         required = state_bytes + history_page * num_blocks
+        logger.info_once(
+            "Host-KV fixed pools: %d state blocks x %d B, %d history blocks, "
+            "history page %d B, %d active states; total %s GiB",
+            state_blocks,
+            sum(layout.owner_page_size(i) for i in range(len(layout.main_kv_owners))),
+            history_blocks,
+            history_page,
+            active_states,
+            format_gib(required),
+        )
         if required > available_memory:
             raise ValueError(
                 f"Host-KV fixed pools need {format_gib(required)} GiB device "
@@ -3036,6 +3102,22 @@ def _max_memory_usage_bytes_from_groups(
     return group_size * page_size * blocks_needed
 
 
+def _kv_cache_memory_needed(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    """Include the shared pool's permanent null block in startup admission.
+
+    BlockPool removes one physical block before any request can allocate.
+    Request memory alone can therefore fit while scheduling can never finish.
+    Use the allocator's byte stride, including hybrid padding and DCP packing.
+    """
+    if not kv_cache_groups:
+        return 0
+    return _max_memory_usage_bytes_from_groups(
+        vllm_config, kv_cache_groups
+    ) + _pool_bytes_per_block(kv_cache_groups)
+
+
 def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -3049,10 +3131,7 @@ def _estimate_max_model_len_from_groups(
 
     def fits(model_len: int) -> bool:
         vllm_config.model_config.max_model_len = model_len
-        return (
-            _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
-            <= available_memory
-        )
+        return _kv_cache_memory_needed(vllm_config, kv_cache_groups) <= available_memory
 
     try:
         left, right = 1, original_max
@@ -3290,13 +3369,13 @@ def get_kv_cache_configs(
                 "pool_block_bytes=%d groups=[%s]",
                 worker_index,
                 format_gib(avail_mem),
-                format_gib(_max_memory_usage_bytes_from_groups(vllm_config, groups)),
+                format_gib(_kv_cache_memory_needed(vllm_config, groups)),
                 _pool_bytes_per_block(groups),
                 ", ".join(group_ledger),
             )
         _check_enough_kv_cache_memory(
             avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+            partial(_kv_cache_memory_needed, vllm_config, groups),
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )

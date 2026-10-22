@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF experts with independent gate/up/down storage and aligned TP slices."""
 
+import functools
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 
 
+@functools.cache
+def _grouped_gate_up() -> bool:
+    return hasattr(torch.ops._C, "gguf_dp4a_gate_up_grouped_sm70_out")
+
+
 def _original_expert_dp4a(
     x,
     ids,
@@ -60,17 +66,31 @@ def _original_expert_dp4a(
     )
     output = torch.empty_like(x)
     torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
-    torch.ops._C.gguf_dp4a_gate_up_sm70_out(
-        hidden,
-        q8,
-        ids,
-        gate,
-        up,
-        source_type,
-        True,
-        4 if quantized_hidden and source_type in (20, 23) else 16,
-        bank_aware,
-    )
+    if (
+        quantized_hidden
+        and source_type in (20, 21, 23)
+        and m >= 10
+        and _grouped_gate_up()
+    ):
+        # Concurrent verification rows share routed experts: decode each
+        # expert once per few of its routes (measured on V100). Bitwise equal
+        # to the per-route kernel, which stays faster for a single request.
+        per_cta = 4 if source_type == 21 else (2 if m <= 10 else 8)
+        torch.ops._C.gguf_dp4a_gate_up_grouped_sm70_out(
+            hidden, q8, ids, gate, up, source_type, bank_aware, per_cta
+        )
+    else:
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            hidden,
+            q8,
+            ids,
+            gate,
+            up,
+            source_type,
+            True,
+            4 if quantized_hidden and source_type in (20, 23) else 16,
+            bank_aware,
+        )
     torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
         output,
         hidden,
@@ -134,6 +154,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             config.kernel_config.sm70_gguf.enabled if config is not None else True
         )
         self.small_m_dp4a = bool(config and config.kernel_config.sm70_gguf.small_m_dp4a)
+        self.fp16_workspace_bytes = (
+            config.kernel_config.sm70_gguf.dequant_workspace_bytes
+            if config is not None
+            else 32 * 1024**2
+        )
         self.lut4_expert_dp4a = bool(
             config and config.kernel_config.sm70_gguf.lut4_expert_dp4a
         )
@@ -148,6 +173,16 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             if config and config.model_config
             else 0
         )
+        text_config = (
+            config.model_config.hf_text_config
+            if config and config.model_config
+            else None
+        )
+        self.is_v41 = getattr(text_config, "model_type", None) in (
+            "deepseek_v41",
+            "deepseek_v41_text",
+        )
+        self.swiglu_limit = getattr(text_config, "swiglu_limit", 0.0)
         self.weight_types: dict[str, int] = {}
         self.guarded_shards: set[str] = set()
         self.input_padding: dict[str, tuple[int, int]] = {}
@@ -331,16 +366,39 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             and self.weight_types["w2"] in (20, 42)
             and hasattr(torch.ops._C, "gguf_dp4a_raw_down_unroute_sm70_out")
         )
+        if self.is_v41:
+            from .gguf_v41_moe import v41_dp4a_available
+
+            self.dp4a_admitted = bool(
+                self.small_m_dp4a
+                and current_platform.is_device_capability(70)
+                and self.params_dtype == torch.float16
+                and (self.num_experts, self.hidden_size, self.intermediate_size)
+                == (384, 5120, 576)
+                and self.swiglu_limit == 10.0
+                and self.weight_types["w1"] == self.weight_types["w3"]
+                and self.weight_types["w1"] in (16, 17, 29)
+                and self.weight_types["w2"] in (16, 17, 29)
+                and v41_dp4a_available()
+            )
         self.native_admission["small_m_dp4a"] = {
             "enabled": self.dp4a_admitted,
             "reason": None
             if self.dp4a_admitted
             else "original_dp4a_shape_or_operator_unavailable",
             "min_m": 1,
-            "max_m": 20,
+            "max_m": 6 if self.is_v41 else 20,
             "storage": "original",
             "accumulation": "FP32",
         }
+        if self.is_v41:
+            self.native_admission["small_m_dp4a"]["batches"] = list(range(1, 7))
+            self.native_admission["tail_fp16"] = {
+                "operator": "bounded_fp16_blas",
+                "batches": [] if self.dp4a_admitted else list(range(1, 7)),
+                "workspace_limit_bytes": self.fp16_workspace_bytes,
+                "host_matrix_compute": False,
+            }
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -376,31 +434,79 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         w1, w3, w2 = layer.gguf_w1, layer.gguf_w3, layer.gguf_w2
         if (
             self.dp4a_admitted
-            and 1 <= tokens <= 20
+            and (1 <= tokens <= 6 if self.is_v41 else 1 <= tokens <= 64)
             and layer.expert_map is None
             and topk_weights.dtype == torch.float32
         ):
-            if cache is not None:
-                ids = cache.resolve(self.cache_layer, ids)
-            return torch.ops.vllm.gguf_original_expert_dp4a(
-                x.contiguous(),
+            # Concurrent MTP verification batches (up to 8 x 5 rows) stay on
+            # the graph-capturable decode path in pieces of at most 20 rows,
+            # which bounds the routed ids one cache resolution admits.
+            pieces = []
+            for start in range(0, tokens, 20):
+                stop = min(start + 20, tokens)
+                piece_ids = ids[start:stop]
+                if cache is not None:
+                    piece_ids = cache.resolve(
+                        self.cache_layer, piece_ids, topk_weights[start:stop]
+                    )
+                if self.is_v41:
+                    pieces.append(
+                        torch.ops.vllm.gguf_v41_original_expert_dp4a(
+                            x[start:stop].contiguous(),
+                            piece_ids,
+                            topk_weights[start:stop].contiguous(),
+                            w1,
+                            w3,
+                            w2,
+                            self.weight_types["w1"],
+                            self.weight_types["w2"],
+                            self.input_padding.get("w2", (0, 0))[0],
+                            self.swiglu_limit,
+                        )
+                    )
+                    continue
+                pieces.append(
+                    torch.ops.vllm.gguf_original_expert_dp4a(
+                        x[start:stop].contiguous(),
+                        piece_ids,
+                        topk_weights[start:stop].contiguous(),
+                        w1,
+                        w3,
+                        w2,
+                        self.weight_types["w1"],
+                        self.weight_types["w2"],
+                        self.input_padding.get("w2", (0, 0))[0],
+                        self.q8_intermediate,
+                        self.weight_types["w1"] == 21,
+                    )
+                )
+            return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+        decode_cache = cache is not None and self.is_v41 and 1 <= tokens <= 6
+        if decode_cache:
+            assert cache is not None
+            ids = cache.resolve(self.cache_layer, ids, topk_weights)
+        elif cache is not None and cache.tm is not None:
+            return cache.prefill_moe(
+                self.cache_layer, x.contiguous(), ids, topk_weights
+            )
+        elif cache is not None:
+            w1, w3, w2, ids = cache.prefill(self.cache_layer, ids)
+        if self.is_v41 and 1 <= tokens <= 6:
+            from .gguf_v41_moe import v41_fp16_experts
+
+            return v41_fp16_experts(
+                x,
                 ids,
-                topk_weights.contiguous(),
+                topk_weights,
                 w1,
                 w3,
                 w2,
                 self.weight_types["w1"],
                 self.weight_types["w2"],
                 self.input_padding.get("w2", (0, 0))[0],
-                self.q8_intermediate,
-                self.weight_types["w1"] == 21,
+                self.swiglu_limit,
+                self.fp16_workspace_bytes,
             )
-        if cache is not None and cache.tm is not None:
-            return cache.prefill_moe(
-                self.cache_layer, x.contiguous(), ids, topk_weights
-            )
-        if cache is not None:
-            w1, w3, w2, ids = cache.prefill(self.cache_layer, ids)
         native = torch.ops._C_gguf
 
         def projection(shard):
@@ -429,7 +535,14 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             top_k,
             tokens,
         )
-        hidden = torch.nn.functional.silu(gate) * up
+        if self.is_v41:
+            hidden = (
+                torch.nn.functional.silu(gate.float().clamp(max=self.swiglu_limit))
+                * up.float().clamp(-self.swiglu_limit, self.swiglu_limit)
+                * topk_weights.reshape(-1, 1)
+            ).to(x.dtype)
+        else:
+            hidden = torch.nn.functional.silu(gate) * up
         left, physical_k = self.input_padding.get("w2", (0, self.intermediate_size))
         if left or physical_k != self.intermediate_size:
             hidden = torch.nn.functional.pad(
@@ -445,11 +558,13 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             1,
             tokens * top_k,
         )
-        if cache is not None:
+        if cache is not None and not decode_cache:
             cache.prefill_done(self.cache_layer)
         down = down.view(tokens, top_k, self.hidden_size)
         if mask is not None:
             down = torch.where(mask[..., None], down, 0)
+        if self.is_v41:
+            topk_weights = torch.ones_like(topk_weights)
         if down.is_cuda:
             # Reuse the existing FP32 weighted reduction without materializing
             # two [tokens, top_k, hidden] FP32 checkpoint-sized temporaries.

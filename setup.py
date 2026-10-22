@@ -949,8 +949,8 @@ class precompiled_wheel_utils:
                     r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
                 )
                 sm70_ext_regex = re.compile(
-                    r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention|qsa_device)_C"
-                    r"(?:\.[^/]+)?\.so$"
+                    r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention|qsa_device"
+                    r"|qsa_indexer|router)_C(?:\.[^/]+)?\.so$"
                 )
                 h3_ext_regex = re.compile(
                     r"vllm/_h3_(?:w8a16|flashinfer|flashattn)_C(?:\.[^/]+)?\.so$"
@@ -1350,6 +1350,9 @@ if _is_cuda():
         )
         ext_modules.append(
             CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._gguf_expert_cache_C", py_limited_api=False)
         )
         ext_modules.append(
             CMakeExtension(name="vllm._h3_w8a16_C", py_limited_api=False)

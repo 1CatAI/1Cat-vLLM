@@ -47,6 +47,14 @@ struct P {
                   // count), per sequence
   unsigned* ctr;  // [round, finished CTAs]
   int nmax;
+  // Per-sequence replay slot and buffer side: rmap[n] = 2 * slot + side.
+  // The round writes side `side` and replays side `side ^ 1`. Null: the
+  // shared round counter `ctr` selects the side and slot = n.
+  const int* rmap;
+  // Current-round token index whose state is also stored to state slot
+  // cks[n] (an aligned prefix checkpoint inside the round), -1 for none.
+  const int* ckt;
+  const int* cks;
 };
 __device__ __forceinline__ long long seq_floats(int H, int HV) {
   return (long long)TMAX * (H * KD + HV * KD + HV * 2);
@@ -73,14 +81,16 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
   const int n = blockIdx.y / p.HV, hv = blockIdx.y % p.HV,
             h = hv / (p.HV / p.H);
   const int bos = p.cu[n], T = p.cu[n + 1] - bos;
-  if (T <= 0) {
-    if (REPLAY) round_done(p);
+  // Replay mode commits the previous round even without current tokens.
+  const int R0 = REPLAY ? p.rn[n] : 0;
+  if (T <= 0 && R0 <= 0) {
+    if (REPLAY && !p.rmap) round_done(p);
     return;
   }
   const int slot0 =
       p.idx[n * p.s_idx + (REPLAY ? 0 : (p.nacc ? p.nacc[n] - 1 : 0))];
   if (slot0 < 0) {
-    if (REPLAY) round_done(p);
+    if (REPLAY && !p.rmap) round_done(p);
     return;
   }
   const int row0 = blockIdx.x * (WARPS * ROWS) + warp * ROWS;
@@ -97,15 +107,19 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
         lane);
   // Replay: committed state + the previous round's first rn tokens = the
   // round's initial state.
-  const unsigned side = REPLAY ? (__ldcg(p.ctr) & 1u) : 0u;
+  const unsigned side =
+      !REPLAY ? 0u
+              : (p.rmap ? (unsigned)(p.rmap[n] & 1) : (__ldcg(p.ctr) & 1u));
   const long long SEQ = seq_floats(p.H, p.HV);
-  float* cur = REPLAY ? p.rbuf + ((long long)side * p.nmax + n) * SEQ : nullptr;
+  const int rs = REPLAY && p.rmap ? (p.rmap[n] >> 1) : n;
+  float* cur =
+      REPLAY ? p.rbuf + ((long long)side * p.nmax + rs) * SEQ : nullptr;
   int R = 0;
   float4 rkv[TT];
   float rvv[TT][ROWS], rdc[TT], rbt[TT];
   if (REPLAY) {
-    const float* prv = p.rbuf + ((long long)(side ^ 1u) * p.nmax + n) * SEQ;
-    R = p.rn[n];
+    const float* prv = p.rbuf + ((long long)(side ^ 1u) * p.nmax + rs) * SEQ;
+    R = R0;
 #pragma unroll
     for (int t = 0; t < TT; ++t) {
       if (t < R) {
@@ -258,7 +272,8 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
       p.o[((long long)(bos + t) * p.HV + hv) * KD + row0 + lane] =
           __float2half_rn(mine);
     }
-    const int sl = REPLAY ? -1 : p.idx[n * p.s_idx + t];
+    const int sl = REPLAY ? (p.ckt && p.ckt[n] == t ? p.cks[n] : -1)
+                          : p.idx[n * p.s_idx + t];
     if (sl >= 0) {
 #pragma unroll
       for (int j = 0; j < ROWS; ++j)
@@ -268,7 +283,7 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
                make_float4(hs[j][0], hs[j][1], hs[j][2], hs[j][3]));
     }
   }
-  if (REPLAY) round_done(p);
+  if (REPLAY && !p.rmap) round_done(p);
 }
 }  // namespace
 
@@ -279,7 +294,10 @@ void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
                          int64_t H, int64_t HV, double scale, int64_t cfg,
                          std::optional<torch::Tensor> rbuf,
                          std::optional<torch::Tensor> rn,
-                         std::optional<torch::Tensor> ctr, int64_t tmax) {
+                         std::optional<torch::Tensor> ctr, int64_t tmax,
+                         std::optional<torch::Tensor> rmap,
+                         std::optional<torch::Tensor> ckt,
+                         std::optional<torch::Tensor> cks) {
   const c10::cuda::CUDAGuard guard(qkv.device());
   TORCH_CHECK(tmax >= 1 && tmax <= TMAX);
   TORCH_CHECK(state.dtype() == torch::kFloat32 && state.size(-1) == KD &&
@@ -308,13 +326,25 @@ void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
               "a/b must be unit-stride in the head dim");
   const bool replay = rbuf.has_value();
   if (replay) {
-    TORCH_CHECK(rn && ctr && rbuf->dtype() == torch::kFloat32);
+    TORCH_CHECK(rn && (ctr || rmap) && rbuf->dtype() == torch::kFloat32);
     p.rbuf = rbuf->data_ptr<float>();
     p.rn = rn->data_ptr<int>();
-    p.ctr = reinterpret_cast<unsigned*>(ctr->data_ptr<int>());
+    p.ctr = ctr ? reinterpret_cast<unsigned*>(ctr->data_ptr<int>()) : nullptr;
     const long long seq = (long long)TMAX * (H * KD + HV * KD + HV * 2);
     p.nmax = static_cast<int>(rbuf->numel() / (2 * seq));
-    TORCH_CHECK(p.nmax >= N, "replay buffer too small");
+    TORCH_CHECK(rmap || p.nmax >= N, "replay buffer too small");
+    if (rmap) {
+      TORCH_CHECK(rmap->dtype() == torch::kInt32 && rmap->numel() >= N);
+      p.rmap = rmap->data_ptr<int>();
+    }
+    TORCH_CHECK(ckt.has_value() == cks.has_value());
+    if (ckt) {
+      TORCH_CHECK(ckt->dtype() == torch::kInt32 &&
+                  cks->dtype() == torch::kInt32 && ckt->numel() >= N &&
+                  cks->numel() >= N);
+      p.ckt = ckt->data_ptr<int>();
+      p.cks = cks->data_ptr<int>();
+    }
   }
   auto stream = at::cuda::getCurrentCUDAStream();
   auto go3 = [&](auto wr, auto rp, auto tt) {

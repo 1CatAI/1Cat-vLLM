@@ -3,9 +3,11 @@
 
 """Initialized GDN computation policy and legacy input provenance."""
 
+import importlib.metadata
 import os
+import shutil
 from dataclasses import fields
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import Field
 
@@ -13,6 +15,9 @@ from vllm.config.gdn_projection import GdnProjectionConfig
 from vllm.config.gdn_schedule import GdnScheduleConfig
 from vllm.config.gdn_state import GdnStateConfig
 from vllm.config.utils import config, hash_factors
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 GDN_LEGACY_FIELDS = {
     "packed_recurrent_decode": "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE",
@@ -34,6 +39,28 @@ GDN_NATIVE_ALIASES = {
 GDN_FALLBACK_ALIASES = {
     "original_prefill": "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG",
 }
+
+
+def _tilelang_nvcc_available() -> bool:
+    """Whether TileLang's JIT will find an ``nvcc`` to compile with.
+
+    Follows ``tilelang.env._find_cuda_home``: ``CUDA_HOME``/``CUDA_PATH``, then
+    ``nvcc`` on ``PATH``, then the ``nvidia-cuda-nvcc`` wheel, then
+    ``/usr/local/cuda``. A runtime-only CUDA install has the directory but no
+    compiler, so the chosen home must contain ``bin/nvcc``.
+    """
+    home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if home:
+        return os.path.isfile(os.path.join(home, "bin", "nvcc"))
+    if shutil.which("nvcc"):
+        return True
+    try:
+        files = importlib.metadata.files("nvidia-cuda-nvcc") or []
+    except importlib.metadata.PackageNotFoundError:
+        files = []
+    if any(file.name == "nvcc" for file in files):
+        return True
+    return os.path.isfile("/usr/local/cuda/bin/nvcc")
 
 
 @config
@@ -66,6 +93,8 @@ class GdnConfig:
     """Keep separate prefill packing/gating as an explicit diagnostic algorithm."""
     original_prefill: bool | None = None
     """Use original TileLang FlashQLA prefill, including the historical alias."""
+    original_prefill_threads: Literal[128, 256] | None = None
+    """128 by default; 256 accelerates qualified long prefill tensors."""
     indexed_prefill: bool | None = None
     """Allow original prefill to address and update the resident state directly."""
     direct_prefill_output: bool | None = None
@@ -98,6 +127,11 @@ class GdnConfig:
     def resolve(self, *, additional_config=None, native_verify: bool = False) -> None:
         if self.resolved:
             return
+        if self.original_prefill_threads is None:
+            self.original_prefill_threads = 128
+            self.sources["original_prefill_threads"] = "default"
+        else:
+            self.sources["original_prefill_threads"] = "typed"
         from vllm import envs
 
         if self.prefill_backend is None:
@@ -138,6 +172,21 @@ class GdnConfig:
                 if raw is None
                 else raw.strip().lower() not in ("0", "false", "no", "off", "")
             )
+            if (
+                field == "original_prefill"
+                and raw is None
+                and value
+                and not _tilelang_nvcc_available()
+            ):
+                # The original prefill JIT-compiles with nvcc on first use. A
+                # bare wheel install has none; the prebuilt prefill needs none.
+                logger.warning_once(
+                    "No CUDA toolkit (nvcc) found for TileLang; GDN prefill "
+                    "uses the prebuilt kernel. Set CUDA_HOME to a toolkit to "
+                    "use the original TileLang prefill."
+                )
+                value = False
+                source = "default:no_nvcc"
             setattr(self, field, value)
             self.sources[field] = source
         if self.native_verify is None:
@@ -206,9 +255,10 @@ class GdnConfig:
             if field.name
             not in {"resolved", "sources", "decode_warmup", "active_prefill_backend"}
         }
+        flashqla_backend = self.active_prefill_backend == "flashqla_sm70"
         if self.active_prefill_backend is not None:
             options["prefill_backend"] = self.active_prefill_backend
-            if self.active_prefill_backend != "flashqla_sm70":
+            if not flashqla_backend:
                 options.pop("original_prefill")
                 options.pop("indexed_prefill")
             # Only the native prefill and FlashQLA's dtype fallback can consume
@@ -219,9 +269,11 @@ class GdnConfig:
                     for name, value in self.schedule.graph_options().items()
                     if name.startswith(("recurrent_", "sigmoid_"))
                 }
-        if not self.flashqla_decode and (
-            self.active_prefill_backend != "flashqla_sm70" or self.original_prefill
+        if self.original_prefill is False or (
+            self.active_prefill_backend is not None and not flashqla_backend
         ):
+            options.pop("original_prefill_threads")
+        if not self.flashqla_decode and (not flashqla_backend or self.original_prefill):
             options.pop("flashqla_column_groups")
         return options
 

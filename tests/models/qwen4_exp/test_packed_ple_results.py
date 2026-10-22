@@ -437,8 +437,9 @@ def test_mapped_packet_consumer_decodes_before_releasing_result(m):
 
 
 @pytest.mark.parametrize("m", [1, 5, 20])
+@pytest.mark.parametrize("local_dependency", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_cuda_packet_wait_decodes_into_fp16_result_buffer(m):
+def test_cuda_packet_wait_decodes_into_fp16_result_buffer(m, local_dependency):
     """The graph sees one opaque wait that fills an FP16 buffer, as for CPU
     decoded results, so the compiled consumer kernels are unchanged."""
     if torch.cuda.get_device_capability() != (7, 0):
@@ -456,7 +457,8 @@ def test_cuda_packet_wait_decodes_into_fp16_result_buffer(m):
     )
     semaphore = CpuGpuSemaphore(device)
     module.setup_cross_process_offload(packet, semaphore)
-    hidden = torch.empty((m, 2560), dtype=torch.float16, device=device)
+    hidden_rows = (m + 3) // 4 if local_dependency else m
+    hidden = torch.empty((hidden_rows, 2560), dtype=torch.float16, device=device)
     producer = torch.cuda.Stream()
     # Warm the decoder before capture; the captured wait needs no signal.
     torch.ops.vllm.ple_decode_iq4nl_result(packet, module._packed_result_codebook, 160)

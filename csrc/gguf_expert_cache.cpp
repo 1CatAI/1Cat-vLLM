@@ -23,16 +23,23 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "gguf_shared_expert_dma.h"
+#include "gguf_shared_expert_lane.h"
+#include "gguf_shared_expert_jobs.h"
+#include "gguf_shared_engram.h"
 
 #if defined(__x86_64__) || defined(__i386__)
   #include <immintrin.h>
@@ -41,6 +48,7 @@
 namespace {
 
 constexpr int kShards = 3;
+constexpr int kPrefillSwapBatch = 8;
 constexpr int kEntryHeader = 8;  // seq, layer, count, miss, reserved...
 constexpr int kReplyHeader = 8;  // seq, ops, failed, reserved...
 constexpr int kOpInts = 5;       // slot, load host slot, writeback host slot,
@@ -80,6 +88,56 @@ void check(cudaError_t status, const char* what) {
                              cudaGetErrorString(status));
   }
 }
+
+// Only independent copies belong in one batch. Callers separate incoming
+// saves, victim write-backs and GPU commits to preserve host-slot aliases.
+class PrefillCopies {
+ public:
+  static constexpr int kCapacity = kPrefillSwapBatch * kShards;
+
+  void add(void* destination, const void* source, size_t bytes,
+           cudaMemcpyKind kind) {
+    TORCH_CHECK(count_ < kCapacity, "expert cache: copy batch is full");
+    destinations_[count_] = destination;
+    sources_[count_] = const_cast<void*>(source);
+    bytes_[count_] = bytes;
+    kinds_[count_++] = kind;
+  }
+
+  void submit(cudaStream_t stream) {
+#if CUDART_VERSION >= 12080
+    // Legacy default streams and captured preparation retain the established
+    // individual-copy route. The serving prefill streams are explicit.
+    if (count_ > 1 && stream != nullptr) {
+      cudaStreamCaptureStatus capture;
+      check(cudaStreamIsCapturing(stream, &capture), "query copy capture");
+      if (capture == cudaStreamCaptureStatusNone) {
+        cudaMemcpyAttributes attributes{};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t first = 0, failed = 0;
+        auto status = cudaMemcpyBatchAsync(
+            destinations_.data(), sources_.data(), bytes_.data(), count_,
+            &attributes, &first, 1, &failed, stream);
+        if (status == cudaSuccess) return;
+        if (status != cudaErrorNotSupported)
+          check(status, "batch prefill copies");
+      }
+    }
+#endif
+    for (int i = 0; i < count_; ++i)
+      check(cudaMemcpyAsync(destinations_[i], sources_[i], bytes_[i], kinds_[i],
+                            stream),
+            "copy prefill bytes");
+  }
+
+  bool full() const { return count_ == kCapacity; }
+
+ private:
+  std::array<void*, kCapacity> destinations_{}, sources_{};
+  std::array<size_t, kCapacity> bytes_{};
+  std::array<cudaMemcpyKind, kCapacity> kinds_{};
+  int count_ = 0;
+};
 
 class ExpertCacheLane {
  public:
@@ -257,7 +315,191 @@ class ExpertCacheLane {
     return extent;
   }
 
+  // Stage only host slots used by the most recent residency snapshot. Keep
+  // their offsets unchanged: the GPU source map still addresses those slots.
+  // The caller orders the copy after decode write-backs and the preceding
+  // cold transcode, exactly as for a full-arena copy.
+  void stage_cold(int64_t layer, int64_t shard, int64_t destination,
+                  int64_t stream_ptr) {
+    stage_cold_impl(layer, shard, destination, stream_ptr, nullptr);
+  }
+
+  void stage_cold_selected(int64_t layer, int64_t shard, int64_t destination,
+                           int64_t stream_ptr, torch::Tensor selected) {
+    TORCH_CHECK(
+        selected.device().is_cpu() && selected.scalar_type() == torch::kBool &&
+            selected.is_contiguous() && selected.dim() == 1 &&
+            selected.numel() == experts_,
+        "expert cache: selected experts must be contiguous CPU bool[E]");
+    stage_cold_impl(layer, shard, destination, stream_ptr,
+                    selected.data_ptr<bool>());
+  }
+
+  // Eager prefill only: prior decode requests and this layer's raw readers
+  // must have completed. The caller owns pinned plans until their stream
+  // completes, then uses the ordinary GPU remap to commit the copied plan.
+  // This is called by the owner, never by the GPU-polled decode lane.
+  int64_t admit_prefill(int64_t layer, torch::Tensor ids,
+                        torch::Tensor host_plan, torch::Tensor device_plan,
+                        torch::Tensor temporary, int64_t stream_ptr) {
+    TORCH_CHECK(layer >= 0 && layer < layers_, "expert cache: bad layer");
+    TORCH_CHECK(ids.device().is_cpu() && ids.scalar_type() == torch::kInt32 &&
+                    ids.dim() == 1 && ids.is_contiguous() &&
+                    ids.numel() <= slots_ - spare_,
+                "expert cache: prefill ids must fit resident CPU int32 rows");
+    const int64_t plan_size = kReplyHeader + kOpInts * max_ops_;
+    TORCH_CHECK(host_plan.device().is_cpu() && host_plan.is_pinned() &&
+                    host_plan.scalar_type() == torch::kInt32 &&
+                    host_plan.is_contiguous() && host_plan.numel() >= plan_size,
+                "expert cache: prefill plan must be pinned CPU int32");
+    TORCH_CHECK(
+        device_plan.is_cuda() && device_plan.device().index() == device_ &&
+            device_plan.scalar_type() == torch::kInt32 &&
+            device_plan.is_contiguous() && device_plan.numel() >= plan_size,
+        "expert cache: prefill device plan has wrong storage");
+    int64_t required = 0;
+    for (int s = 0; s < kShards; ++s)
+      required = std::max(required, bytes(layer, s));
+    TORCH_CHECK(temporary.is_cuda() && temporary.device().index() == device_ &&
+                    temporary.scalar_type() == torch::kUInt8 &&
+                    temporary.is_contiguous() && temporary.numel() >= required,
+                "expert cache: prefill swap temporary is too small");
+    const int32_t* requested = ids.data_ptr<int32_t>();
+    for (int64_t i = 0; i < ids.numel(); ++i)
+      TORCH_CHECK(requested[i] >= 0 && requested[i] < experts_,
+                  "expert cache: invalid prefill expert id");
+    const int64_t published = __atomic_load_n(published_, __ATOMIC_ACQUIRE);
+    while (consumed_seen_.load(std::memory_order_acquire) < published) {
+      TORCH_CHECK(
+          !stop_.load() && !__atomic_load_n(reply_ + 2, __ATOMIC_ACQUIRE),
+          "expert cache: prefill admission on a stopped/failed lane");
+      cpu_relax();
+    }
+    auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    std::lock_guard<std::mutex> guard(mutex_);
+    TORCH_CHECK(!stop_.load() && !__atomic_load_n(reply_ + 2, __ATOMIC_ACQUIRE),
+                "expert cache: prefill admission on a stopped/failed lane");
+    check(cudaSetDevice(static_cast<int>(device_)), "set device");
+    const uint64_t now = ++clock_[layer];
+    uint64_t* last = last_use_.data() + layer * experts_;
+    for (int64_t i = 0; i < ids.numel(); ++i) last[requested[i]] = now;
+    plan_layer(layer, requested, ids.numel(), now);
+    const int64_t n = ops_.size() / kOpInts;
+    TORCH_CHECK(n <= max_ops_, "expert cache: plan exceeds reply capacity");
+    int32_t* plan = host_plan.data_ptr<int32_t>();
+    std::fill(plan, plan + kReplyHeader, 0);
+    plan[0] = static_cast<int32_t>(n);
+    std::copy(ops_.begin(), ops_.end(), plan + kReplyHeader);
+    int64_t expert_bytes = 0;
+    for (int s = 0; s < kShards; ++s) expert_bytes += bytes(layer, s);
+    if (temporary.numel() >= expert_bytes) {
+      const int64_t batch_size = std::min<int64_t>(
+          kPrefillSwapBatch, temporary.numel() / expert_bytes);
+      for (int64_t first = 0; first < n; first += batch_size) {
+        PrefillCopies save, writeback, admit;
+        int64_t offset = 0;
+        for (int64_t op = first; op < std::min(n, first + batch_size); ++op) {
+          const int32_t slot = ops_[op * kOpInts];
+          const int32_t load = ops_[op * kOpInts + 1];
+          const int32_t back = ops_[op * kOpInts + 2];
+          for (int s = 0; s < kShards; ++s) {
+            const int64_t size = bytes(layer, s);
+            auto* device = static_cast<uint8_t*>(bank(layer, s)) + slot * size;
+            auto* scratch = temporary.data_ptr<uint8_t>() + offset;
+            if (load >= 0 && back >= 0)
+              save.add(scratch, host(layer, s, load), size,
+                       cudaMemcpyHostToDevice);
+            if (back >= 0)
+              writeback.add(host(layer, s, back), device, size,
+                            cudaMemcpyDeviceToHost);
+            if (load >= 0)
+              admit.add(device, back >= 0 ? scratch : host(layer, s, load),
+                        size,
+                        back >= 0 ? cudaMemcpyDeviceToDevice
+                                  : cudaMemcpyHostToDevice);
+            offset += size;
+          }
+        }
+        save.submit(stream);
+        writeback.submit(stream);
+        admit.submit(stream);
+      }
+    } else {
+      for (int64_t op = 0; op < n; ++op) {
+        const int32_t slot = ops_[op * kOpInts];
+        const int32_t load = ops_[op * kOpInts + 1];
+        const int32_t back = ops_[op * kOpInts + 2];
+        for (int s = 0; s < kShards; ++s) {
+          const int64_t size = bytes(layer, s);
+          auto* device = static_cast<uint8_t*>(bank(layer, s)) + slot * size;
+          // Incoming host data may share its host slot with the write-back.
+          // Save it before overwriting that slot, exactly as _apply_plan does.
+          if (load >= 0 && back >= 0)
+            check(cudaMemcpyAsync(temporary.data_ptr(), host(layer, s, load),
+                                  size, cudaMemcpyHostToDevice, stream),
+                  "save incoming");
+          if (back >= 0)
+            check(cudaMemcpyAsync(host(layer, s, back), device, size,
+                                  cudaMemcpyDeviceToHost, stream),
+                  "write back");
+          if (load >= 0)
+            check(cudaMemcpyAsync(
+                      device,
+                      back >= 0 ? temporary.data_ptr() : host(layer, s, load),
+                      size,
+                      back >= 0 ? cudaMemcpyDeviceToDevice
+                                : cudaMemcpyHostToDevice,
+                      stream),
+                  "admit expert");
+        }
+      }
+    }
+    check(cudaMemcpyAsync(device_plan.data_ptr(), plan,
+                          (kReplyHeader + n * kOpInts) * sizeof(int32_t),
+                          cudaMemcpyHostToDevice, stream),
+          "copy prefill plan");
+    return n;
+  }
+
  private:
+  void stage_cold_impl(int64_t layer, int64_t shard, int64_t destination,
+                       int64_t stream_ptr, const bool* selected) {
+    TORCH_CHECK(layer >= 0 && layer < layers_ && shard >= 0 && shard < kShards,
+                "expert cache: bad cold stage bank");
+    auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    std::lock_guard<std::mutex> guard(mutex_);
+    const int32_t* map = residency_maps_ + 2 * layer * experts_;
+    std::vector<uint8_t> occupied(host_slots_, 0);
+    for (int64_t e = 0; e < experts_; ++e) {
+      if (selected != nullptr && !selected[e]) continue;
+      if (map[e] >= 0) continue;
+      const int32_t h = map[experts_ + e];
+      TORCH_CHECK(h >= 0 && h < host_slots_,
+                  "expert cache: non-resident expert has no host slot");
+      occupied[h] = 1;
+    }
+    check(cudaSetDevice(static_cast<int>(device_)), "set device");
+    const int64_t stride = bytes(layer, shard);
+    PrefillCopies copies;
+    for (int64_t begin = 0; begin < host_slots_;) {
+      if (!occupied[begin]) {
+        ++begin;
+        continue;
+      }
+      int64_t end = begin + 1;
+      while (end < host_slots_ && occupied[end]) ++end;
+      copies.add(reinterpret_cast<uint8_t*>(destination) + begin * stride,
+                 host(layer, shard, begin), (end - begin) * stride,
+                 cudaMemcpyHostToDevice);
+      if (copies.full()) {
+        copies.submit(stream);
+        copies = PrefillCopies{};
+      }
+      begin = end;
+    }
+    copies.submit(stream);
+  }
+
   int64_t bytes(int64_t layer, int shard) const {
     return slot_bytes_[layer * kShards + shard];
   }
@@ -321,16 +563,26 @@ class ExpertCacheLane {
     const int32_t* entry = ring_ + (seq % ring_entries_) * entry_ints_;
     // The entry's tag is released after its body; wait for it rather than
     // dropping a request the model stream is blocked on.
+    // A hit is tagged ~seq and published without fences: its body may still
+    // be in flight, which only affects recency, and it never needs a plan.
+    const int32_t want = static_cast<int32_t>(seq), hit = ~want;
     int32_t tag = __atomic_load_n(entry, __ATOMIC_ACQUIRE);
     for (int64_t deadline = now_ns() + 1'000'000'000;
-         tag != static_cast<int32_t>(seq) && now_ns() < deadline;) {
+         tag != want && tag != hit && now_ns() < deadline;) {
       cpu_relax();
       tag = __atomic_load_n(entry, __ATOMIC_ACQUIRE);
     }
     int32_t layer = __atomic_load_n(entry + 1, __ATOMIC_ACQUIRE);
     int32_t count = __atomic_load_n(entry + 2, __ATOMIC_ACQUIRE);
-    int32_t miss = __atomic_load_n(entry + 3, __ATOMIC_ACQUIRE);
-    if (tag != static_cast<int32_t>(seq) || layer < 0 || layer >= layers_ ||
+    const int32_t miss =
+        tag == want ? __atomic_load_n(entry + 3, __ATOMIC_ACQUIRE) : 0;
+    if (tag == hit) {
+      // Only recency uses a hit's body; ignore a stale header.
+      if (layer < 0 || layer >= layers_) return;
+      count = std::max<int32_t>(
+          0, std::min<int32_t>(count, entry_ints_ - kEntryHeader));
+    }
+    if ((tag != want && tag != hit) || layer < 0 || layer >= layers_ ||
         count < 0 || count > entry_ints_ - kEntryHeader) {
       char what[96];
       snprintf(what, sizeof(what), "bad entry (tag %d layer %d count %d)", tag,
@@ -339,6 +591,7 @@ class ExpertCacheLane {
     }
     const int32_t* ids = entry + kEntryHeader;
     stats_[kEntries]++;
+    std::lock_guard<std::mutex> guard(mutex_);
     uint64_t now = ++clock_[layer];
     uint64_t* last = last_use_.data() + layer * experts_;
     for (int32_t i = 0; i < count; ++i) {
@@ -349,7 +602,21 @@ class ExpertCacheLane {
     if (__atomic_load_n(reply_ + 2, __ATOMIC_ACQUIRE))
       throw std::runtime_error("lane already failed");
     int64_t start = now_ns();
-    std::lock_guard<std::mutex> guard(mutex_);
+    plan_layer(layer, ids, count, now);
+    int64_t n = static_cast<int64_t>(ops_.size()) / kOpInts;
+    TORCH_CHECK(n <= max_ops_, "expert cache: plan exceeds reply capacity");
+    std::memcpy(reply_ + kReplyHeader, ops_.data(),
+                ops_.size() * sizeof(int32_t));
+    __atomic_store_n(reply_ + 1, static_cast<int32_t>(n), __ATOMIC_RELEASE);
+    __atomic_store_n(reply_, static_cast<int32_t>(seq), __ATOMIC_RELEASE);
+    stats_[kRequests]++;
+    int64_t served = now_ns() - start;
+    stats_[kServeNs] += served;
+    if (served > stats_[kMaxServeNs].load()) stats_[kMaxServeNs].store(served);
+  }
+
+  void plan_layer(int32_t layer, const int32_t* ids, int64_t count,
+                  uint64_t now) {
     int32_t* slot_of = slot_of_ + layer * experts_;
     ops_.clear();
     for (int32_t i = 0; i < count; ++i) {
@@ -379,16 +646,6 @@ class ExpertCacheLane {
       ops_.insert(ops_.end(), {s, -1, writeback, -1, victim});
       free_slots_[layer].push_back(s);
     }
-    int64_t n = static_cast<int64_t>(ops_.size()) / kOpInts;
-    TORCH_CHECK(n <= max_ops_, "expert cache: plan exceeds reply capacity");
-    std::memcpy(reply_ + kReplyHeader, ops_.data(),
-                ops_.size() * sizeof(int32_t));
-    __atomic_store_n(reply_ + 1, static_cast<int32_t>(n), __ATOMIC_RELEASE);
-    __atomic_store_n(reply_, static_cast<int32_t>(seq), __ATOMIC_RELEASE);
-    stats_[kRequests]++;
-    int64_t served = now_ns() - start;
-    stats_[kServeNs] += served;
-    if (served > stats_[kMaxServeNs].load()) stats_[kMaxServeNs].store(served);
   }
 
   // Evict the least recently used expert not routed by the current entry and
@@ -518,9 +775,135 @@ void copy_h2d(int64_t dst, int64_t src, int64_t bytes, int64_t stream_ptr) {
         "copy host to device");
 }
 
+// Batched strided host->device copies (one Python call per prefill tile).
+void copy_h2d_2d(const std::vector<int64_t>& dst,
+                 const std::vector<int64_t>& src,
+                 const std::vector<int64_t>& dpitch,
+                 const std::vector<int64_t>& spitch,
+                 const std::vector<int64_t>& width,
+                 const std::vector<int64_t>& height, int64_t stream_ptr) {
+  const size_t n = dst.size();
+  if (src.size() != n || dpitch.size() != n || spitch.size() != n ||
+      width.size() != n || height.size() != n)
+    throw std::invalid_argument("copy_h2d_2d: mismatched descriptor lists");
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  for (size_t i = 0; i < n; ++i)
+    check(
+        cudaMemcpy2DAsync(reinterpret_cast<void*>(dst[i]), dpitch[i],
+                          reinterpret_cast<const void*>(src[i]), spitch[i],
+                          width[i], height[i], cudaMemcpyHostToDevice, stream),
+        "copy host to device 2d");
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  using namespace vllm::gguf;
+  m.def("shared_engram_control_layout", [](uint64_t maximum) {
+    return std::vector<uint64_t>{SharedEngramReader::control_words(maximum),
+                                 SharedEngramReader::channel_words(maximum),
+                                 SharedEngramReader::rank_words(maximum)};
+  });
+  pybind11::class_<SharedEngramTable>(m, "SharedEngramTable")
+      .def(pybind11::init([](int fd, uint64_t offset, uint64_t rows) {
+        return SharedEngramTable{fd, offset, rows};
+      }));
+  pybind11::class_<SharedEngramReader>(m, "SharedEngramReader")
+      .def(pybind11::init([](uint64_t data, uint64_t bytes, uint64_t control,
+                             uint64_t maximum, uint64_t row_bytes,
+                             std::vector<SharedEngramTable> tables,
+                             uint64_t timeout_ns) {
+        return std::make_unique<SharedEngramReader>(
+            reinterpret_cast<uint8_t*>(data), bytes,
+            reinterpret_cast<uint64_t*>(control), maximum, row_bytes,
+            std::move(tables), timeout_ns);
+      }))
+      .def("stop", &SharedEngramReader::stop,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("error", &SharedEngramReader::error);
+  pybind11::class_<SharedExpertDmaLane>(m, "SharedExpertDmaLane")
+      .def(pybind11::init<uint64_t, uint64_t, uint64_t, int, unsigned, unsigned,
+                          std::vector<std::vector<int64_t>>, uint64_t, unsigned,
+                          unsigned, unsigned, unsigned, unsigned, uint64_t>())
+      .def("stop", &SharedExpertDmaLane::stop,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("error", &SharedExpertDmaLane::error)
+      .def("completed", &SharedExpertDmaLane::completed);
+  pybind11::class_<SharedExpertJobLane>(m, "SharedExpertJobLane")
+      .def(pybind11::init<uint64_t, uint64_t, int, unsigned,
+                          std::vector<std::vector<int64_t>>,
+                          std::vector<std::vector<int64_t>>, uint64_t>())
+      .def("stop", &SharedExpertJobLane::stop,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("error", &SharedExpertJobLane::error)
+      .def("completed", &SharedExpertJobLane::completed);
+  m.def("shared_expert_hint_layout", [] {
+    return std::vector<uint64_t>{kSharedHintStart,   kSharedHintHeader,
+                                 kSharedHintEntries, kSharedHintWords,
+                                 kSharedHintTokens,  kSharedHintCands};
+  });
+  m.def("shared_expert_job_layout", [] {
+    return std::vector<uint64_t>{kSharedJobStart, kSharedJobHeader,
+                                 kSharedJobEntries, kSharedJobWords};
+  });
+  m.def("shared_expert_control_layout", [] {
+    return std::vector<uint64_t>{kSharedControlWords, kSharedRankStart,
+                                 kSharedRankWords,    kSharedOpStart,
+                                 kSharedOpWords,      kSharedMaxCopies};
+  });
+  m.def("shared_expert_hit_layout", [] {
+    return std::vector<uint64_t>{kSharedHitStart, kSharedHitHeader,
+                                 kSharedHitEntries, kSharedHitWords,
+                                 kSharedTotalWords};
+  });
+  pybind11::class_<SharedExpertLayer>(m, "SharedExpertLayer")
+      .def(
+          pybind11::init([](uint64_t bytes, int32_t experts, int32_t resident) {
+            return SharedExpertLayer{bytes, experts, resident};
+          }));
+  pybind11::class_<SharedExpertCopy>(m, "SharedExpertCopy")
+      .def_readonly("slot", &SharedExpertCopy::slot)
+      .def_readonly("incoming", &SharedExpertCopy::incoming)
+      .def_readonly("victim", &SharedExpertCopy::victim)
+      .def_readonly("load_offset", &SharedExpertCopy::load_offset)
+      .def_readonly("save_offset", &SharedExpertCopy::save_offset);
+  pybind11::class_<SharedExpertPlanner>(m, "SharedExpertPlanner")
+      .def(
+          pybind11::init([](uint64_t pointer, uint64_t bytes,
+                            std::vector<SharedExpertLayer> layers,
+                            unsigned ranks, unsigned routes, uint64_t reserve) {
+            return std::make_unique<SharedExpertPlanner>(
+                reinterpret_cast<uint8_t*>(pointer), bytes, std::move(layers),
+                ranks, routes, reserve);
+          }))
+      .def("plan", &SharedExpertPlanner::plan,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("acknowledge", &SharedExpertPlanner::acknowledge)
+      .def("ready", &SharedExpertPlanner::ready)
+      .def("finish", &SharedExpertPlanner::finish,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("slot", &SharedExpertPlanner::slot)
+      .def("cold_offset", &SharedExpertPlanner::cold_offset)
+      .def("acquire", &SharedExpertPlanner::acquire)
+      .def("release", &SharedExpertPlanner::release)
+      .def("stop", &SharedExpertPlanner::stop);
+  pybind11::class_<SharedExpertCoordinator>(m, "SharedExpertCoordinator")
+      .def(pybind11::init([](uint64_t arena, uint64_t bytes, uint64_t control,
+                             std::vector<SharedExpertLayer> layers,
+                             unsigned ranks, unsigned routes, uint64_t reserve,
+                             uint64_t timeout) {
+        return std::make_unique<SharedExpertCoordinator>(
+            reinterpret_cast<uint8_t*>(arena), bytes,
+            reinterpret_cast<uint64_t*>(control), std::move(layers), ranks,
+            routes, reserve, timeout);
+      }))
+      .def("stop", &SharedExpertCoordinator::stop,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("error", &SharedExpertCoordinator::error)
+      .def("slot", &SharedExpertCoordinator::slot)
+      .def("cold_offset", &SharedExpertCoordinator::cold_offset)
+      .def("acquire", &SharedExpertCoordinator::acquire)
+      .def("release", &SharedExpertCoordinator::release);
   pybind11::class_<ExpertCacheLane>(m, "ExpertCacheLane")
       .def(pybind11::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                           std::vector<int64_t>, std::vector<int64_t>,
@@ -533,9 +916,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("prefill", &ExpertCacheLane::prefill,
            pybind11::call_guard<pybind11::gil_scoped_release>())
       .def("residency", &ExpertCacheLane::residency,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("stage_cold", &ExpertCacheLane::stage_cold,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("stage_cold_selected", &ExpertCacheLane::stage_cold_selected,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("admit_prefill", &ExpertCacheLane::admit_prefill,
            pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("host_register", &host_register);
   m.def("host_unregister", &host_unregister);
   m.def("mapped_view", &mapped_view);
   m.def("copy_h2d", &copy_h2d);
+  m.def("copy_h2d_2d", &copy_h2d_2d,
+        pybind11::call_guard<pybind11::gil_scoped_release>());
 }

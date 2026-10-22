@@ -128,6 +128,227 @@ struct LatticeDot {
 };
 using IQ3SDot = LatticeDot<21>;
 
+// V4.1's IQ1_M/IQ2 rows consume one Q8_1 group (32 activations) per call.
+// IQ1's eighth-step delta is folded into signed integer codebook values, so
+// both local scale groups remain exact integer dots before the shared scale.
+template <int Type, bool BankAware>
+struct V41LatticeDot {
+  static_assert(Type == 16 || Type == 17 || Type == 29);
+  using Book = turbomind::gemm::LatticeCodebook<Type>;
+  static constexpr int kBookWords = Book::kBytes / 4;
+  static constexpr int kBlockBytes = Type == 16 ? 66 : Type == 17 ? 74 : 56;
+
+  __device__ static void initialize(uint32_t* book, uint32_t* masks) {
+    for (int i = threadIdx.x; i < kBookWords; i += blockDim.x) {
+      uint32_t word = Book::word(i) ^ 0x80808080U;
+      if constexpr (Type == 29) {
+        // IQ1's eighth-step grid is shared by every dot in this CTA.
+        word = __vadd4(word, word);
+        word = __vadd4(word, word);
+        word = __vadd4(word, word);
+      }
+      book[i] = word;
+    }
+    if (threadIdx.x < 16)
+      masks[threadIdx.x] = LatticeDot<22>::sign_mask(threadIdx.x);
+    __syncthreads();
+  }
+
+  __device__ static float dot(const uint8_t* row, int group, const Q8_1& x,
+                              const uint32_t* book, const uint32_t* masks) {
+    const uint8_t* b = row + (group / 8) * kBlockBytes;
+    const int sub = group % 8;
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int sums[2] = {0, 0};
+    const uint32_t meta = Type == 16 ? load_u32_2(b + 6 + sub * 8) : 0;
+#pragma unroll
+    for (int octet = 0; octet < 4; ++octet) {
+      int index, signs = 0, delta = 0;
+      if constexpr (Type == 16) {
+        index = b[2 + sub * 8 + octet];
+        signs = (meta >> (7 * octet)) & 127;
+      } else if constexpr (Type == 17) {
+        const uint16_t code =
+            *reinterpret_cast<const uint16_t*>(b + 2 + (sub * 4 + octet) * 2);
+        index = code & 511;
+        signs = code >> 9;
+      } else {
+        const int t = sub * 4 + octet;
+        const int high = (b[32 + t / 2] >> (4 * (t % 2))) & 15;
+        index = b[t] | ((high & 7) << 8);
+        delta = high >> 3;
+      }
+      uint32_t w0 = book[index * 2], w1 = book[index * 2 + 1];
+      if constexpr (Type == 29) {
+        const uint32_t bias = delta ? 0xffffffffU : 0x01010101U;
+        w0 = __vadd4(w0, bias);
+        w1 = __vadd4(w1, bias);
+      } else {
+        signs |= (__popc(signs) & 1) << 7;
+        const auto s0 = masks[signs & 15], s1 = masks[signs >> 4];
+        w0 = __vsub4(w0 ^ s0, s0);
+        w1 = __vsub4(w1 ^ s1, s1);
+      }
+      sums[octet / 2] = __dp4a(int(w0), activation[2 * octet], sums[octet / 2]);
+      sums[octet / 2] =
+          __dp4a(int(w1), activation[2 * octet + 1], sums[octet / 2]);
+    }
+    float d;
+    int mult0, mult1;
+    if constexpr (Type == 29) {
+      const auto* scales = reinterpret_cast<const uint16_t*>(b + 48);
+      const uint16_t bits = (scales[0] >> 12) | ((scales[1] >> 8) & 0xf0) |
+                            ((scales[2] >> 4) & 0xf00) | (scales[3] & 0xf000);
+      d = __half2float(__ushort_as_half(bits));
+      const int first = sub * 2, second = first + 1;
+      mult0 = 2 * ((scales[first / 4] >> (3 * (first % 4))) & 7) + 1;
+      mult1 = 2 * ((scales[second / 4] >> (3 * (second % 4))) & 7) + 1;
+    } else {
+      d = __half2float(*reinterpret_cast<const half*>(b));
+      if constexpr (Type == 16)
+        mult0 = mult1 = 1 + 2 * (meta >> 28);
+      else {
+        mult0 = 1 + 2 * (b[66 + sub] & 15);
+        mult1 = 1 + 2 * (b[66 + sub] >> 4);
+      }
+    }
+    const float scale = __fmul_rn(d, __low2float(x.ds));
+    return __fmul_rn(__fmul_rn(scale, float(sums[0] * mult0 + sums[1] * mult1)),
+                     0.125f);
+  }
+};
+
+template <bool BankAware>
+struct LatticeDot<16, BankAware> : V41LatticeDot<16, BankAware> {};
+template <bool BankAware>
+struct LatticeDot<17, BankAware> : V41LatticeDot<17, BankAware> {};
+template <bool BankAware>
+struct LatticeDot<29, BankAware> : V41LatticeDot<29, BankAware> {};
+
+// The routed rows can share one expert. Decode the original integer words
+// once, then apply each token's Q8_1 scale and exactly the original dot order.
+template <int Type>
+struct V41IntegerGroup {
+  uint32_t words[8];
+  float d;
+  int mult0, mult1;
+
+  __device__ V41IntegerGroup(const uint8_t* row, int group,
+                             const uint32_t* book, const uint32_t* masks) {
+    constexpr int bytes = V41LatticeDot<Type, false>::kBlockBytes;
+    const uint8_t* b = row + (group / 8) * bytes;
+    const int sub = group % 8;
+    const uint32_t meta = Type == 16 ? load_u32_2(b + 6 + sub * 8) : 0;
+#pragma unroll
+    for (int octet = 0; octet < 4; ++octet) {
+      int index, signs = 0, delta = 0;
+      if constexpr (Type == 16) {
+        index = b[2 + sub * 8 + octet];
+        signs = (meta >> (7 * octet)) & 127;
+      } else if constexpr (Type == 17) {
+        const auto code =
+            *reinterpret_cast<const uint16_t*>(b + 2 + (sub * 4 + octet) * 2);
+        index = code & 511;
+        signs = code >> 9;
+      } else {
+        const int t = sub * 4 + octet;
+        const int high = (b[32 + t / 2] >> (4 * (t % 2))) & 15;
+        index = b[t] | ((high & 7) << 8);
+        delta = high >> 3;
+      }
+      uint32_t first = book[index * 2], second = book[index * 2 + 1];
+      if constexpr (Type == 29) {
+        const uint32_t bias = delta ? 0xffffffffU : 0x01010101U;
+        first = __vadd4(first, bias);
+        second = __vadd4(second, bias);
+      } else {
+        signs |= (__popc(signs) & 1) << 7;
+        const auto low = masks[signs & 15], high = masks[signs >> 4];
+        first = __vsub4(first ^ low, low);
+        second = __vsub4(second ^ high, high);
+      }
+      words[2 * octet] = first;
+      words[2 * octet + 1] = second;
+    }
+    if constexpr (Type == 29) {
+      const auto* scales = reinterpret_cast<const uint16_t*>(b + 48);
+      const uint16_t bits = (scales[0] >> 12) | ((scales[1] >> 8) & 0xf0) |
+                            ((scales[2] >> 4) & 0xf00) | (scales[3] & 0xf000);
+      d = __half2float(__ushort_as_half(bits));
+      const int first = sub * 2, second = first + 1;
+      mult0 = 2 * ((scales[first / 4] >> (3 * (first % 4))) & 7) + 1;
+      mult1 = 2 * ((scales[second / 4] >> (3 * (second % 4))) & 7) + 1;
+    } else {
+      d = __half2float(*reinterpret_cast<const half*>(b));
+      if constexpr (Type == 16)
+        mult0 = mult1 = 1 + 2 * (meta >> 28);
+      else {
+        mult0 = 1 + 2 * (b[66 + sub] & 15);
+        mult1 = 1 + 2 * (b[66 + sub] >> 4);
+      }
+    }
+  }
+
+  __device__ float apply(const Q8_1& x) const {
+    const auto* a = reinterpret_cast<const int*>(x.qs);
+    int sums[2] = {0, 0};
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      sums[i / 4] = __dp4a(int(words[i]), a[i], sums[i / 4]);
+    const float scale = __fmul_rn(d, __low2float(x.ds));
+    return __fmul_rn(__fmul_rn(scale, float(sums[0] * mult0 + sums[1] * mult1)),
+                     0.125f);
+  }
+};
+
+// One IQ3_S weight group decoded for several activations. apply() repeats
+// dot()'s integer dot and float boundary exactly, so a route's result does
+// not depend on how many routes share the decoded words.
+template <bool BankAware>
+struct IQ3SGroup {
+  using Dot = LatticeDot<21, BankAware>;
+  int w[8];
+  float d;
+  int mult;
+
+  __device__ IQ3SGroup(const uint8_t* row, int group, const uint32_t* book,
+                       const uint32_t* masks) {
+    const uint8_t* b = row + (group / 8) * Dot::kBlockBytes;
+    const int sub = group % 8;
+    const uint32_t low = load_u32_2(b + 2 + sub * 8);
+    const uint32_t high = load_u32_2(b + 6 + sub * 8);
+    const uint32_t signs = load_u32_2(b + 74 + sub * 4);
+    const int qh = b[66 + sub];
+#pragma unroll
+    for (int octet = 0; octet < 4; ++octet) {
+      const uint32_t codes = octet < 2 ? low : high;
+      const int shift = (octet % 2) * 16;
+      const int first =
+          ((codes >> shift) & 255) | (((qh >> (2 * octet)) & 1) << 8);
+      const int second =
+          ((codes >> (shift + 8)) & 255) | (((qh >> (2 * octet + 1)) & 1) << 8);
+      const int sign = (signs >> (8 * octet)) & 255;
+      const uint32_t s0 =
+          BankAware ? Dot::sign_mask(sign & 15) : masks[sign & 15];
+      const uint32_t s1 =
+          BankAware ? Dot::sign_mask(sign >> 4) : masks[sign >> 4];
+      w[2 * octet] = __vsub4(Dot::word(book, first) ^ s0, s0);
+      w[2 * octet + 1] = __vsub4(Dot::word(book, second) ^ s1, s1);
+    }
+    d = __half2float(*reinterpret_cast<const half*>(b));
+    mult = 1 + 2 * ((b[106 + sub / 2] >> (4 * (sub % 2))) & 15);
+  }
+
+  __device__ float apply(const Q8_1& x) const {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int sum0 = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sum0 = __dp4a(w[i], activation[i], sum0);
+    const float scale = d * __low2float(x.ds);
+    return scale * float(sum0 * mult);
+  }
+};
+
 // Original blocks are also the authoritative storage for constrained-memory
 // models. Keep the same integer dot and FP16 coefficient boundary as the
 // canonical reader, without expanding a second expert bank at load time.
@@ -175,6 +396,54 @@ struct OriginalIntegerDot {
       }
       sum = __dp4a(static_cast<int>(values), activation[packet], sum);
     }
+    return float(sum) * (scale * __low2float(x.ds));
+  }
+};
+
+// IQ4_NL / IQ4_XS counterpart of IQ3SGroup: OriginalIntegerDot's words and
+// coefficient, decoded once and applied to several activations.
+template <int Type>
+struct Lut4Group {
+  static_assert(Type == 20 || Type == 23);
+  uint32_t values[8];
+  float scale;
+
+  __device__ Lut4Group(const uint8_t* row, int group, const uint32_t*,
+                       const uint32_t*) {
+    const uint8_t* b;
+    const uint8_t* codes;
+    if constexpr (Type == 23) {
+      b = row + (group / 8) * 136;
+      const int sub = group % 8;
+      const uint16_t high = *reinterpret_cast<const uint16_t*>(b + 2);
+      const int subscale = ((b[4 + sub / 2] >> (4 * (sub % 2))) & 15) |
+                           (((high >> (2 * sub)) & 3) << 4);
+      scale = __half2float(__float2half_rn(
+          __half2float(*reinterpret_cast<const half*>(b)) * (subscale - 32)));
+      codes = b + 8 + sub * 16;
+    } else {
+      b = row + group * 18;
+      scale = __half2float(*reinterpret_cast<const half*>(b));
+      codes = b + 2;
+    }
+#pragma unroll
+    for (int packet = 0; packet < 8; ++packet) {
+      const uint32_t bytes =
+          load_u32_2(codes + (packet % 4) * 4) >> ((packet / 4) * 4);
+      const uint32_t nibbles = (bytes & 15) | ((bytes >> 4) & 0xf0) |
+                               ((bytes >> 8) & 0xf00) |
+                               ((bytes >> 12) & 0xf000);
+      using Lut = turbomind::gemm::Transform_HMMA_SM70_Lut4<0>;
+      values[packet] = Lut::iq_values(nibbles) ^ 0x80808080U;
+    }
+  }
+
+  __device__ float apply(const Q8_1& x) const {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int sum = 0;
+#pragma unroll
+    for (int packet = 0; packet < 8; ++packet)
+      sum = __dp4a(static_cast<int>(values[packet]), activation[packet], sum);
     return float(sum) * (scale * __low2float(x.ds));
   }
 };

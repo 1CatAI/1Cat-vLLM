@@ -756,9 +756,9 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         # identical. Batched requests retain their qualified geometry.
         BV = 2
     if (
-        4 <= N <= 32
+        2 <= N <= 32
         and (T, H, HV, K, V) == (N * 8, 4, 12, 128, 128)
-        and (BV, num_warps) == (32, 1)
+        and (BV, num_warps) == ((16, 1) if N < 4 else (32, 1))
         and match_recurrent_schedule
         and match_recurrent_numerics
         and use_precomputed_gating
@@ -778,7 +778,8 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         # retain BV32, where the extra CTAs no longer help. BV8 keeps the
         # same K reduction and recurrence while exposing more independent
         # V tiles; output and every stored state remain bitwise identical.
-        BV = 8
+        # Two or three requests fill the GPU only with BV4 tiles.
+        BV = 4 if N < 4 else 8
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 

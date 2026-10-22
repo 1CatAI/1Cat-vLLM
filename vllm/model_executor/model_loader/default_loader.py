@@ -28,12 +28,15 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     get_quant_config,
     get_safetensors_index_weights_by_file,
+    indexed_shards_in_subfolders,
+    indexed_shards_not_selected,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    raise_on_missing_safetensors_shards,
     safetensors_weights_iterator,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal
@@ -230,6 +233,9 @@ class DefaultModelLoader(BaseModelLoader):
             if len(hf_weights_files) > 0:
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True
+                    hf_weights_files += indexed_shards_in_subfolders(
+                        hf_folder, index_file, pattern
+                    )
                 break
 
         if use_safetensors:
@@ -249,6 +255,29 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
             )
+            # An incomplete download or copy fails here, naming the missing
+            # files, instead of leaving parameters unloaded. A model's own
+            # allow patterns may load a deliberate subset of an index.
+            raise_on_missing_safetensors_shards(
+                hf_folder,
+                index_file,
+                hf_weights_files,
+                ignore_patterns=self.load_config.ignore_patterns,
+                check_index=allow_patterns_overrides is None,
+            )
+            # A shard the index names but the loader would skip leaves its
+            # parameters unloaded without any error; only a model's own
+            # allow patterns may leave shards out on purpose.
+            unread = (
+                indexed_shards_not_selected(hf_folder, index_file, hf_weights_files)
+                if allow_patterns_overrides is None
+                else []
+            )
+            if unread:
+                raise RuntimeError(
+                    f"The checkpoint index of {model_name_or_path} names shards "
+                    f"that would not be loaded: {unread[:4]}"
+                )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 

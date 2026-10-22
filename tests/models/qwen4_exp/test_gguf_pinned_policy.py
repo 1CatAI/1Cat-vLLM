@@ -84,7 +84,7 @@ def test_pinned_layer_uses_local_rows_only_during_decode(monkeypatch, decode):
         forward_impl=local,
         wait_offloaded_output=remote,
     )
-    monkeypatch.setattr(module.envs, "VLLM_SM70_QWEN38_HYBRID_PLE", False)
+    monkeypatch.delenv("VLLM_SM70_QWEN38_HYBRID_PLE", raising=False)
     monkeypatch.setattr(module, "use_sm70_decode_graph_semantics", lambda: decode)
     result = module.PleOffloadLayer.forward(layer, None, SimpleNamespace(shape=(512,)))
     assert result is marker
@@ -104,9 +104,9 @@ def test_connector_only_skips_requests_for_owned_local_decode(
     calls = []
     connector = SimpleNamespace(
         _all_pinned_decode=pinned,
+        _ple_policy=SimpleNamespace(hybrid=False),
         _launch=lambda *a: calls.append(a),
     )
-    monkeypatch.setattr(module.envs, "VLLM_SM70_QWEN38_HYBRID_PLE", False)
     module.PleOffloadConnector.prepare_forward(
         connector, 4, 20, dummy_run=False, use_local_model=local_model
     )

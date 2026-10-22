@@ -1156,7 +1156,7 @@ The same release includes a separate Flash-Next launcher:
 serve_flash_next_nvfp4_v100.sh /models/Qwen3.8-Flash-Next-NVFP4
 ```
 
-Its defaults are **TP4, FP16 compute/KV, MTP4, 131072 context, 8192-token prefill, one sequence, memory utilization 0.90, prefix caching and synchronous scheduling**. It targets four peer-connected V100-SXM2-32GB GPUs and automatically selects compatible FP16 acceleration and hybrid PLE placement.
+Its defaults are **TP4, FP16 compute/KV, MTP4, 262144 context with FP8 KV history in pinned host memory, 4096-token prefill, up to 8 sequences, memory utilization 0.89 and prefix caching** (the 1.5.2 release configuration). Pass `--draft /models/Qwen3.8-Flash-Next-mtp` to use a separate MTP checkpoint; without it, the MTP layers inside the model are used. It targets four peer-connected V100-SXM2-32GB GPUs with 64 GB or more host RAM.
 
 The release test machine had ample host RAM: Flash-Next PLE tables alone total approximately **47.68 GiB**, before model mappings, caches and process memory. Low-RAM operation was not qualified by that release test. Later main includes capability-based device/pinned-host/disk PLE placement and packed GGUF lookup; these have their own storage and model-validation conditions ([#806](https://github.com/1CatAI/1Cat-vLLM/pull/806), [#877](https://github.com/1CatAI/1Cat-vLLM/pull/877), [#885](https://github.com/1CatAI/1Cat-vLLM/pull/885)).
 

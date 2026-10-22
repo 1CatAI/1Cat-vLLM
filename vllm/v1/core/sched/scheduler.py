@@ -283,6 +283,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
+            partial_prefix_cache=self.cache_config.partial_prefix_cache,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -563,6 +564,11 @@ class Scheduler(SchedulerInterface):
                     getattr(request, "shared_prefix_boundary", 0)
                     // block_size
                     * block_size,
+                    *(
+                        self.kv_cache_manager.partial_prefix_stops(request, start, end)
+                        if getattr(self.kv_cache_manager, "partial_cache", None)
+                        else ()
+                    ),
                 )
                 if start < stop < end
             ),
@@ -1045,6 +1051,8 @@ class Scheduler(SchedulerInterface):
                                 request, num_new_local_computed_tokens
                             )
                         )
+                        if request.skip_reading_prefix_cache:
+                            ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -1380,6 +1388,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            kv_block_copies=self.kv_cache_manager.take_block_copies() or None,
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),
@@ -1560,7 +1569,13 @@ class Scheduler(SchedulerInterface):
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            # Only the V1 runner reads this history: it drops a request that skipped a
+            # step from its persistent batch and rebuilds the outputs from it. The V2
+            # runner keeps every request's tokens on the GPU and gets a resumed
+            # request as a new one, so under PP (a request is scheduled every
+            # pp_size-th step) the copy and its serialization would cost the whole
+            # context length per decode step: about 4 ms at 287k tokens.
+            if not scheduled_in_prev_step and not self.use_v2_model_runner:
                 all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)

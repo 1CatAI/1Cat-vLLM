@@ -16,13 +16,17 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sam
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("requests", [1, 3])
 @pytest.mark.parametrize("use_fp64", [False, True])
 @torch.inference_mode()
-def test_graph_matches_existing_rejection_with_live_slots(monkeypatch, use_fp64):
+def test_graph_matches_existing_rejection_with_live_slots(
+    monkeypatch, use_fp64, requests
+):
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 graph sampling")
     torch.manual_seed(20261004)
-    rows, vocab, slots, steps = 8, 248320, 8, 7
+    width, vocab, slots, steps = 8, 248320, 8, 7
+    rows = requests * width
     target = torch.full((rows, vocab), -20.0, device="cuda")
     hidden = torch.empty(rows, 4, device="cuda", dtype=torch.float16)
     inputs = torch.arange(rows, device="cuda", dtype=torch.int32)
@@ -44,7 +48,7 @@ def test_graph_matches_existing_rejection_with_live_slots(monkeypatch, use_fp64)
         apply_temperature(result, mapping, temperatures)
         return apply_top_k_top_p(
             result,
-            torch.full((rows,), 20, device="cuda", dtype=torch.int32),
+            torch.full((len(logits),), 20, device="cuda", dtype=torch.int32),
             top_ps[mapping],
         )
 
@@ -66,6 +70,7 @@ def test_graph_matches_existing_rejection_with_live_slots(monkeypatch, use_fp64)
 
     class Speculator:
         draft_logits = draft_dense
+        _trace = SimpleNamespace(value=lambda name: False)
 
         def get_sparse_draft_logits(self):
             return draft_ids, draft_values
@@ -91,7 +96,6 @@ def test_graph_matches_existing_rejection_with_live_slots(monkeypatch, use_fp64)
     monkeypatch.setattr(
         sparse_rejection, "_supports_sparse_sampling_contract", lambda *a: True
     )
-    monkeypatch.setattr(sparse_rejection.envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
     monkeypatch.setattr(sampler_graph, "_all_ranks_support", lambda status: status == 0)
     original_graph_try = sampler_graph.try_graph_rejection
     previous = None
@@ -106,23 +110,24 @@ def test_graph_matches_existing_rejection_with_live_slots(monkeypatch, use_fp64)
         draft_dense = torch.full_like(draft_dense, -float("inf"))
         draft_dense.scatter_(2, draft_ids, draft_values)
         speculator.draft_logits = draft_dense
-        slot = [7, 2, 5][iteration % 3]
-        mapping_np = np.array([slot], dtype=np.int32)
+        mapping_np = np.roll(np.array([7, 2, 5], dtype=np.int32), iteration)[:requests]
         mapping = torch.tensor(mapping_np, device="cuda")
-        local = torch.arange(rows, dtype=torch.int32, device="cuda")
+        local = torch.arange(width, dtype=torch.int32, device="cuda").repeat(requests)
+        cu_num_logits_np = np.arange(requests + 1, dtype=np.int32) * width
         batch = SimpleNamespace(
-            num_reqs=1,
+            num_reqs=requests,
             num_tokens=rows,
-            req_ids=[f"request-{iteration // 10}"],
+            req_ids=[f"request-{iteration // 10}-{r}" for r in range(requests)],
             has_structured_output_reqs=False,
             idx_mapping_np=mapping_np,
             idx_mapping=mapping,
-            expanded_idx_mapping=mapping.expand(rows).contiguous(),
+            expanded_idx_mapping=mapping.repeat_interleave(width),
             expanded_local_pos=local,
             input_ids=inputs,
             positions=positions,
-            cu_num_logits_np=np.array([0, rows], dtype=np.int32),
-            cu_num_logits=torch.tensor([0, rows], dtype=torch.int32, device="cuda"),
+            logits_indices=torch.arange(rows, device="cuda"),
+            cu_num_logits_np=cu_num_logits_np,
+            cu_num_logits=torch.tensor(cu_num_logits_np, device="cuda"),
         )
         target.fill_(-20)
         target[:, :21] = torch.arange(21, 0, -1, device="cuda") / 8
@@ -162,7 +167,7 @@ def test_graph_matches_existing_rejection_with_live_slots(monkeypatch, use_fp64)
         else:
             tokens, count = expected.sampled_token_ids, expected.num_sampled
         assert torch.equal(actual.num_sampled, count)
-        valid = torch.arange(rows, device="cuda")[None] < count[:, None]
+        valid = torch.arange(width, device="cuda")[None] < count[:, None]
         assert torch.equal(actual.sampled_token_ids[valid], tokens[valid])
         if previous is not None:
             output, saved = previous

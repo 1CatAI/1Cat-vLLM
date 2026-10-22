@@ -15,7 +15,7 @@ from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-from .sm70_gguf import _get_affine_blas_workspace
+from .sm70_gguf import _bind_affine_blas_workspace
 
 # Matched Flash-Next and 27B TP4 sweeps; unmeasured descriptors retain fused MMA.
 # The narrow expert crossover is nonmonotonic, so it has two intervals.
@@ -89,12 +89,8 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
             reason = "operator_missing:gguf_lattice_blas_sm70_out"
         elif bands is None:
             reason = "local_shape_has_no_prefill_calibration"
-        else:
-            workspace = _get_affine_blas_workspace(weight)
-            if workspace is None:
-                reason = "prefill_workspace_allocation_failed"
-            else:
-                layer.gguf_tm_blas_workspace = workspace[: k * n].view(k, n)
+        elif not _bind_affine_blas_workspace(layer, weight, k, n):
+            reason = "prefill_workspace_allocation_failed"
         self.prefill_capabilities = tuple(
             GGUFOperatorCapability(
                 GGUFDecoderFamily.LATTICE,

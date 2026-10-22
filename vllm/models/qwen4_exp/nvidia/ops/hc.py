@@ -362,7 +362,8 @@ def _hc_packet_silu_kernel(
     src_ptr,
     lora_ptr,
     inj_ptr,
-    rows,
+    stride_row,
+    stride_rank,
     R0: tl.constexpr,
     R1: tl.constexpr,
     R2: tl.constexpr,
@@ -380,7 +381,7 @@ def _hc_packet_silu_kernel(
     j = tl.program_id(1)
     rank = tl.where(j == 0, R0, tl.where(j == 1, R1, tl.where(j == 2, R2, R3)))
     offs = tl.arange(0, BLOCK)
-    base = src_ptr + (rank.to(tl.int64) * rows + row) * WIDTH
+    base = src_ptr + rank.to(tl.int64) * stride_rank + row * stride_row
     x = tl.load(base + offs, offs < LORA).to(tl.float32) / HC
     y = x * tl.sigmoid(x)
     tl.store(lora_ptr + row.to(tl.int64) * 4 * LORA + j * LORA + offs, y, offs < LORA)
@@ -395,18 +396,28 @@ def hc_packet_silu(
     hc_count: int,
     lora_width: int = 80,
     inj_width: int = 4,
+    rank_columns: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(hc_silu(lora), injection) from the row-gathered HC down packet."""
     ranks = len(order)
     assert ranks == 4 and gathered.is_contiguous()
-    rows, width = gathered.shape[0] // ranks, gathered.shape[1]
+    if rank_columns:
+        assert gathered.shape[1] % ranks == 0
+        rows, width = gathered.shape[0], gathered.shape[1] // ranks
+        stride_row, stride_rank = gathered.stride(0), width
+    else:
+        assert gathered.shape[0] % ranks == 0
+        rows, width = gathered.shape[0] // ranks, gathered.shape[1]
+        stride_row, stride_rank = gathered.stride(0), rows * gathered.stride(0)
+    assert width >= lora_width + inj_width
     lora = gathered.new_empty(rows, ranks * lora_width)
     inj = gathered.new_empty(rows, inj_width)
     _hc_packet_silu_kernel[(rows, ranks)](
         gathered,
         lora,
         inj,
-        rows,
+        stride_row,
+        stride_rank,
         *order,
         width,
         lora_width,

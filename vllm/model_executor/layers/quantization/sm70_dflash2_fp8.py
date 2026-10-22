@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Channel-FP8 M8 projection route for the SM70 DFlash2 decoder.
 
-Only the four large decoder projections are quantized. The existing FP16
-matrices remain available for context preparation and other batch sizes. The
-FP8 layout replaces the FP16 M8 packing. Norms and the LM head are outside this
-route.
+Only the four large decoder projections are quantized. The decoder sees eight
+query rows per drafting request, so batches of up to four requests (M=8..32 in
+steps of eight) use the same FP8 weights a single request does. The existing
+FP16 matrices remain available for context preparation and other row counts.
+The FP8 layout replaces the FP16 M8 packing. Norms and the LM head are outside
+this route.
 """
 
 import torch
@@ -26,6 +28,10 @@ _SHAPES = {
 }
 
 
+def _fp8_rows(rows: int) -> bool:
+    return 0 < rows <= 32 and rows % 8 == 0
+
+
 def _dispatch(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -34,7 +40,10 @@ def _dispatch(
     split: int,
 ) -> torch.Tensor:
     output = x.new_empty((x.shape[0], weight.shape[0]))
-    if x.shape[0] == 8:
+    if _fp8_rows(x.shape[0]):
+        # The M=17..32 kernels take split 12 or 16.
+        if x.shape[0] > 16 and split < 12:
+            split = 16
         ops.fp8_qpn8_gemm_sm70_out(output, x, codes, scales, split, 2, True, False)
     else:
         # This is the same mm_out used by the old FP16 M8 dispatch fallback.
@@ -113,7 +122,7 @@ def apply_dflash2_fp8_m8(
         or not x.is_contiguous()
     ):
         return None
-    if not torch.compiler.is_compiling() and x.shape[0] != 8:
+    if not torch.compiler.is_compiling() and not _fp8_rows(x.shape[0]):
         return None
     return torch.ops.vllm.sm70_dflash2_fp8_m8_dispatch(
         x,

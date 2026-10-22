@@ -22,7 +22,10 @@ def test_rope_cache_limit_preserves_multimodal_and_dynamic_contract(
     )
     model_config = SimpleNamespace(
         max_model_len=2048,
-        multimodal_config=SimpleNamespace(language_model_only=text_only),
+        multimodal_config=SimpleNamespace(
+            language_model_only=text_only,
+            get_limit_per_prompt=lambda modality: 0 if text_only else 999,
+        ),
     )
     expected = 2048 if text_only and rope_type == "default" else 262144
     assert _qsa_rope_cache_length(config, model_config) == expected

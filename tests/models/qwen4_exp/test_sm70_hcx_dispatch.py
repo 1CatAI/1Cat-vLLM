@@ -17,6 +17,84 @@ def isolate_registries(monkeypatch):
     monkeypatch.setattr(hc, "_PARTIAL_MODULES", {})
 
 
+def test_sequence_prefill_context_is_nested_thread_local_and_restored():
+    from concurrent.futures import ThreadPoolExecutor
+
+    assert not hcx.hc_prefill_sequence_parallel_active()
+    with pytest.raises(RuntimeError), hcx.hc_prefill_sequence_parallel_context(True):
+        assert hcx.hc_prefill_sequence_parallel_active()
+        with hcx.hc_prefill_sequence_parallel_context(False):
+            assert not hcx.hc_prefill_sequence_parallel_active()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert not executor.submit(hcx.hc_prefill_sequence_parallel_active).result()
+        assert hcx.hc_prefill_sequence_parallel_active()
+        raise RuntimeError("abort one forward")
+    assert not hcx.hc_prefill_sequence_parallel_active()
+
+
+def test_sequence_prefill_projection_defers_only_its_call(monkeypatch):
+    from vllm import distributed
+
+    calls = []
+
+    class Projection:
+        output_size = 4
+
+        def __call__(self, x):
+            return x * 2, None
+
+    hcx.register_output_projection("sequence", Projection(), defer=False)
+
+    def reduce(x):
+        calls.append("reduce")
+        return x * 4
+
+    monkeypatch.setattr(
+        distributed,
+        "tensor_model_parallel_all_reduce",
+        reduce,
+    )
+    x = torch.ones(4096, 4)
+    with hcx.hc_prefill_sequence_parallel_context(True):
+        assert torch.equal(hcx._output_projection(x, "sequence"), x * 2)
+    assert calls == []
+    assert torch.equal(hcx._output_projection(x, "sequence"), x * 8)
+    assert calls == ["reduce"]
+
+
+def test_sequence_prefill_preserves_unrounded_moe_contributions(monkeypatch):
+    from vllm import distributed
+
+    fused = torch.full((4096, 4), 40000, dtype=torch.float16)
+    shared = torch.full_like(fused, 40000)
+    hcx.register_moe_runner("sequence", SimpleNamespace())
+    with hcx.hc_prefill_sequence_parallel_context(True):
+        payload = hcx._moe_output(shared, fused, "sequence", 4)
+    assert torch.equal(payload[:4096], fused)
+    assert torch.equal(payload[4096:], shared)
+    seen = []
+
+    def reduce_scatter(x, dim):
+        seen.append(x)
+        assert dim == 0 and x.dtype == torch.float32
+        # Other ranks' opposite contributions cancel after, rather than
+        # before, this rank's FP32 sum reaches the owner.
+        return torch.zeros(1024, 4, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(reduce_scatter=reduce_scatter),
+    )
+    module = hc.GatedResidual.__new__(hc.GatedResidual)
+    torch.nn.Module.__init__(module)
+    module._partial_inputs = True
+    module._hcx_moe_payload = True
+    got = module._sequence_parallel_block(payload)
+    assert bool(torch.isfinite(got).all()) and torch.all(got == 0)
+    assert torch.all(seen[0] == 80000)
+
+
 @pytest.mark.parametrize("rows", [5, 8, 9, 20, 512])
 def test_projection_dispatch_retains_large_batch_reduction(rows, monkeypatch):
     from vllm import distributed

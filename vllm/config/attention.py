@@ -38,6 +38,14 @@ class AttentionConfig:
     flash_attn_max_num_splits_for_cuda_graph: int = 32
     """Flash Attention max number splits for cuda graph decode."""
 
+    flash_attn_pack_gqa_max_query_len: int = Field(default=16, ge=0)
+    """FA2 packs the query heads that share a KV head only for one query token
+    per request, so a uniform multi-token decode batch (speculative decoding
+    verification) reads the KV cache once per query head. For such batches up
+    to this many tokens per request, split the attention into the request
+    context (query heads x tokens packed per KV head, no mask) and the new
+    tokens (causal), merged by their log-sum-exp. 0 disables the split."""
+
     tq_max_kv_splits_for_cuda_graph: int = 32
     """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
     Fixes the split count so grid dimensions are constant across captures,

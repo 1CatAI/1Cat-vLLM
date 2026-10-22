@@ -101,7 +101,6 @@ def test_mtp_mapped_result_transport_admission(monkeypatch, method, expected):
     monkeypatch.setattr(
         module.torch, "empty", lambda *a, **kw: allocate(*a, **{**kw, "device": "cpu"})
     )
-    monkeypatch.setattr(module.envs, "VLLM_SM70_QWEN38_HYBRID_PLE", False)
     monkeypatch.setattr(
         module.HostResultRegion,
         "create",
@@ -120,6 +119,7 @@ def test_mtp_mapped_result_transport_admission(monkeypatch, method, expected):
             ple_result_transport="auto", ple_result_transports={}
         ),
         speculative_config=None if method is None else SimpleNamespace(method=method),
+        offload_config=SimpleNamespace(ple=SimpleNamespace(hybrid=False)),
     )
     connector = module.PleOffloadConnector.__new__(module.PleOffloadConnector)
     connector.device = torch.device("cpu")

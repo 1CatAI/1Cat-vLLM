@@ -9,6 +9,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops.gdn_profiling import GdnPrefillProfiler
 from vllm.model_executor.layers.fla.ops.gdn_stages import normalize_qk
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -39,6 +40,36 @@ def bind_flashqla_native_policy(config, policy, *, needed):
     return resources["flashqla_native_policy"]
 
 
+def select_original_prefill_threads(
+    q, v, state, indices, requested, g, beta, cu_seqlens=None
+):
+    """Qualified launch tuning only; other tensors keep the 128-thread core."""
+    return (
+        256
+        if requested == 256
+        and (
+            (indices is not None and indices.numel() == 1)
+            or (
+                indices is None
+                and state.shape[0] == 1
+                and cu_seqlens is not None
+                and cu_seqlens.numel() == 2
+            )
+        )
+        and q.is_cuda
+        and q.dtype == torch.float16
+        and state.dtype == torch.float32
+        and g.dtype == torch.float32
+        and beta.dtype == torch.float32
+        and q.shape[0] == 1
+        and 4096 <= q.shape[1] <= 8192
+        and q.shape[2:] == (4, 128)
+        and v.shape[2:] == (12, 128)
+        and current_platform.is_device_capability(70)
+        else 128
+    )
+
+
 def flashqla_sm70_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -60,6 +91,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
     use_original_tilelang: bool,
     profiler: GdnPrefillProfiler,
     native_policy=None,
+    original_prefill_threads: int = 128,
 ):
     if use_original_tilelang:
         from flash_qla.ops.gated_delta_rule.chunk import (
@@ -130,6 +162,24 @@ def flashqla_sm70_chunk_gated_delta_rule(
 
     profile_start = profiler.start()
     if use_original_tilelang:
+        threads = select_original_prefill_threads(
+            q_arg,
+            v_arg,
+            state_arg,
+            state_indices,
+            original_prefill_threads,
+            g_arg,
+            beta_arg,
+            cu_arg,
+        )
+        if original_prefill_threads != 128:
+            log_runtime_route_once(
+                "SM70 original GDN prefill uses %d threads for H%d/HV%d M%d.",
+                threads,
+                q_arg.shape[2],
+                v_arg.shape[2],
+                q_arg.shape[1],
+            )
         if gate_is_exp:
             logger.warning_once(
                 "SM70 original TileLang FlashQLA prefill received exp(g); "
@@ -156,6 +206,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
             state_layout_vlk=True,
             output=output,
             inplace_final_state=inplace_final_state,
+            sm70_threads=threads,
         )
     else:
         out, final_state = chunk_gated_delta_rule_fwd_sm70_vlk_varlen(

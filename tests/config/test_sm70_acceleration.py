@@ -42,6 +42,7 @@ def config(monkeypatch):
                 "page_supported",
                 "scalar",
                 "q8000",
+                "q4096",
             ),
             True,
         ),
@@ -168,8 +169,22 @@ def test_five_speculative_tokens_reason(config):
 
 
 def test_budget_reason(config):
-    config.scheduler_config.max_num_batched_tokens = 4096
+    config.scheduler_config.max_num_batched_tokens = 6000
     assert acc.build_report(config)["paths"]["q8000_prefill"]["reason"] == "budget<8000"
+
+
+def test_q4096_budget_takes_the_q4096_specialization(config, monkeypatch):
+    config.scheduler_config.max_num_batched_tokens = 4096
+    assert acc.build_report(config)["paths"]["q8000_prefill"]["reason"] is None
+    native = acc._native_capabilities
+    monkeypatch.setattr(
+        acc,
+        "_native_capabilities",
+        lambda page, policy: native(page, policy) | {"q4096": False},
+    )
+    assert acc.build_report(config)["paths"]["q8000_prefill"]["reason"] == (
+        "operator_missing:sm70_d256_gqa_architecture_q4096_fwd"
+    )
 
 
 def test_missing_operator_reason(config, monkeypatch):

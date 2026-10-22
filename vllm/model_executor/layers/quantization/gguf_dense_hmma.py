@@ -7,6 +7,9 @@ import torch
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.kernels.gguf import GGUFOperatorCapability, decoder_family
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
+    _get_affine_blas_workspace,
+)
 from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import (
     pack_device,
 )
@@ -14,6 +17,10 @@ from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _FORMATS = {12: 0, 13: 1, 14: 2, 20: 3, 23: 3, 8: 4}
+# Models may register further measured (k, n) shapes (e.g. DeepSeek-V4.1).
+EXTRA_SEGMENT_SHAPES: set[tuple[int, int]] = set()
+# Larger registered shapes may need a larger restore workspace.
+MIN_WORKSPACE_BYTES = {"weight": 0, "stats": 0}
 # The two streams may overlap shared and routed work. Keep shared scratch
 # separate from ordinary dense projections; layers within each stream are ordered.
 _workspaces = {}
@@ -28,12 +35,17 @@ def workspace(device, shared=False):
         # K2560, or K160/N2560. Keep independent banks for overlapping streams.
         weight_bytes = (1 if shared else 10) * 1024**2
         stats_bytes = (1 if shared else 5) * 1024**2
+        if not shared:
+            weight_bytes = max(weight_bytes, MIN_WORKSPACE_BYTES["weight"])
+            stats_bytes = max(stats_bytes, MIN_WORKSPACE_BYTES["stats"])
         partial_elements = 128 * 1024 if shared else 1024 * 1024
         _workspaces[key] = dict(
             weight=torch.empty(weight_bytes, device=device, dtype=torch.uint8),
             stats=torch.empty(stats_bytes, device=device, dtype=torch.uint8),
             partial=torch.empty(partial_elements, device=device, dtype=torch.float32),
-            counters=torch.zeros(1024, device=device, dtype=torch.int32),
+            # tiles(N/32) x ceil(M/8) for M <= 40 and every admitted N (1024 overflowed
+            # for short 33-40 token prefills of wide projections)
+            counters=torch.zeros(8192, device=device, dtype=torch.int32),
             h=torch.empty((32, 160), device=device, dtype=torch.float16),
             gate=torch.empty(32, device=device, dtype=torch.float16),
         )
@@ -55,6 +67,7 @@ def prepare_segment_bank(projection, canonical, device):
             for width in (128, 160, 256, 320, 512, 1536, 2560, 3072, 3328, 3584, 4096)
         }
         | {(160, 2560), (1536, 2560)}
+        | EXTRA_SEGMENT_SHAPES
     ):
         reason = "segment_shape_has_no_calibration"
     elif projection.output_padding:
@@ -110,11 +123,30 @@ def prepare_segment_bank(projection, canonical, device):
     return True
 
 
-def apply_segments(rows, codes, scales, high, formats, ns, output, views):
+def apply_segments(
+    rows, codes, scales, high, formats, ns, output, views, *, blas_bands=()
+):
     k = rows.shape[1]
+    if 40 < rows.shape[0] <= 64:
+        # Concurrent verification batches: 20-row slices keep the
+        # weight-major schedule (one weight pass per three token tiles).
+        for start in range(0, rows.shape[0], 20):
+            stop = min(start + 20, rows.shape[0])
+            apply_segments(
+                rows[start:stop],
+                codes,
+                scales,
+                high,
+                formats,
+                ns,
+                output[start:stop],
+                [view[start:stop] for view in views],
+                blas_bands=blas_bands,
+            )
+        return output
     shared = k == 160 or sum(ns) <= 320
     scratch = workspace(rows.device, shared)
-    if 1 <= rows.shape[0] <= 8 or rows.shape[0] == 20:
+    if 1 <= rows.shape[0] <= 40:
         warps = 4 if k == 2560 and sum(ns) > 320 else 8
         if k == 1536:
             warps = 8
@@ -135,12 +167,27 @@ def apply_segments(rows, codes, scales, high, formats, ns, output, views):
             None,
         )
         return output
-    for c, s, h, fmt, n, destination in zip(codes, scales, high, formats, ns, views):
-        restore_and_apply(rows, c, s, h, fmt, n, destination)
+    for i, (c, s, h, fmt, n, destination) in enumerate(
+        zip(codes, scales, high, formats, ns, views)
+    ):
+        restore_and_apply(
+            rows,
+            c,
+            s,
+            h,
+            fmt,
+            n,
+            destination,
+            blas_bands=blas_bands[i] if blas_bands else (),
+        )
     return output
 
 
-def restore_and_apply(rows, codes, scale, high, fmt, n, output, k_ld=None, q_ld=None):
+def restore_and_apply(
+    rows, codes, scale, high, fmt, n, output, k_ld=None, q_ld=None, *, blas_bands=()
+):
+    from .gguf_turbomind import _supports_band
+
     k = rows.shape[1]
     scratch = workspace(rows.device, k == 160 or n <= 320)
     bits = (4, 5, 6, 4, 8)[fmt]
@@ -163,7 +210,25 @@ def restore_and_apply(rows, codes, scale, high, fmt, n, output, k_ld=None, q_ld=
     # is replaced. Defaults are supplied only by the multi-segment wrapper.
     if k_ld is None:
         k_ld, q_ld = descriptor(k, n, fmt)
-    if fmt == 3:
+    if fmt != 3 and _supports_band(rows.shape[0], blas_bands):
+        # Segment storage changes the resident layout, not the admitted
+        # large-M compute policy. Reuse its prepared, engine-owned scratch.
+        blas_workspace = _get_affine_blas_workspace(codes)
+        if blas_workspace is None:
+            raise RuntimeError("Admitted GGUF BLAS workspace is unavailable")
+        destination = output if output.is_contiguous() else rows.new_empty(output.shape)
+        torch.ops._C.gguf_affine_blas_sm70_out(
+            destination,
+            rows,
+            weight,
+            stats,
+            bits,
+            blas_workspace[: k * n].view(k, n),
+            group,
+        )
+        if destination is not output:
+            output.copy_(destination)
+    elif fmt == 3:
         torch.ops._C.gguf_lut4_gemm_sm70_out(
             output, rows, weight, stats, 0, k_ld, q_ld, group
         )
@@ -208,7 +273,34 @@ def _shared_expert(
     from .gguf_turbomind import _prepared_gguf_mixed_projection
 
     rows = x.reshape(-1, x.shape[-1]).contiguous()
-    if rows.shape[0] > 8 and rows.shape[0] != 20:
+    if 32 < rows.shape[0] <= 64:
+        # Concurrent verification batches: the fused kernel on 20-row slices.
+        out = torch.empty((rows.shape[0], 2560), device=x.device, dtype=x.dtype)
+        for start in range(0, rows.shape[0], 20):
+            stop = min(start + 20, rows.shape[0])
+            out[start:stop] = _shared_expert(
+                rows[start:stop],
+                gate_codes,
+                gate_high,
+                gate_scale,
+                up_codes,
+                up_high,
+                up_scale,
+                down_codes,
+                down_high,
+                down_scale,
+                weight_gate,
+                formats,
+                gu_codes,
+                gu_stats,
+                gu_caches,
+                gu_specs,
+                gu_cache_bands,
+                gu_blas_bands,
+                down_specs,
+            )
+        return out.reshape(*x.shape[:-1], 2560)
+    if rows.shape[0] > 32:
         gu = _prepared_gguf_mixed_projection(
             rows, gu_codes, gu_stats, gu_caches, gu_specs, gu_cache_bands, gu_blas_bands
         )

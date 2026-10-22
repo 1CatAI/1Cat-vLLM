@@ -43,7 +43,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.config.execution_policy import graph_policy
-from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.config.sm70_runtime import RuntimeTraceConfig, capture_runtime_trace
 from vllm.diagnostics import bind_diagnostics, diagnostic_channel, flush_runner_graphs
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -347,6 +347,44 @@ def _dflash_ddtree_trace_event(
         logger.exception("Failed to write DDTree trace event to %s", trace_path)
 
 
+def _clip_stateful_sample_limits(
+    output_token_ids, req_ids, requests, output_budget=None
+):
+    """Keep stop/length clipping on device before a private-state commit.
+
+    The normal CPU output processor also applies these limits. Models with
+    prefix snapshots need the same boundary before an asynchronous next step
+    consumes the sampled-count selector. Other models retain their old path.
+    """
+    for row, req_id in enumerate(req_ids[: output_token_ids.shape[0]]):
+        request = requests.get(req_id)
+        params = None if request is None else request.sampling_params
+        if params is None:
+            continue
+        if params.max_tokens is not None:
+            if output_budget is not None:
+                positions = torch.arange(
+                    output_token_ids.shape[1], device=output_token_ids.device
+                )
+                output_token_ids[row].masked_fill_(positions >= output_budget[row], -1)
+            else:
+                remaining = max(0, params.max_tokens - len(request.output_token_ids))
+                output_token_ids[row, remaining:].fill_(-1)
+        if output_token_ids.shape[1] <= 1:
+            continue
+        stops = set(params.stop_token_ids or ())
+        if not params.ignore_eos and params.eos_token_id is not None:
+            stops.add(params.eos_token_id)
+        if stops:
+            values = output_token_ids[row]
+            stop = torch.zeros_like(values, dtype=torch.bool)
+            for token_id in stops:
+                stop |= values == token_id
+            # Include the first stop itself, excluding every later candidate.
+            after = stop.to(torch.int32).cumsum(0) - stop.to(torch.int32) > 0
+            values.masked_fill_(after, -1)
+
+
 def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
     valid_token_mask = output_token_ids != -1
     token_offsets = torch.arange(
@@ -405,13 +443,13 @@ def _dflash_ddtree_metadata_profile_enabled() -> bool:
     return os.getenv("VLLM_DFLASH_DDTREE_METADATA_PROFILE", "0") == "1"
 
 
-def _dflash_ddtree_target_forward_nvtx_enabled() -> bool:
-    return capture_runtime_trace().spec_target_nvtx
+def _dflash_ddtree_target_forward_nvtx_enabled(trace: RuntimeTraceConfig) -> bool:
+    return trace.value("spec_target_nvtx")
 
 
-def _dflash_ddtree_target_forward_profiler_step() -> int:
+def _dflash_ddtree_target_forward_profiler_step(trace: RuntimeTraceConfig) -> int:
     # Compatibility name; initialized engines borrow their diagnostic policy.
-    return capture_runtime_trace().spec_target_profiler_step
+    return trace.value("spec_target_profiler_step")
 
 
 def _maybe_dump_sm70_mtp_step(
@@ -1042,6 +1080,10 @@ def _non_greedy_rows_carry_drafts(
     return any(n > 0 and not greedy for n, greedy in zip(num_draft_tokens, is_greedy))
 
 
+_V41_TRUNC_CUTOFF = int(envs.VLLM_V41_TRUNC_CUTOFF)
+_V41_TRUNC = envs.VLLM_V41_TRUNC == "1"
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -1066,8 +1108,12 @@ class GPUModelRunner(
             yield
             return
 
-        nvtx_enabled = _dflash_ddtree_target_forward_nvtx_enabled()
-        profiler_step = _dflash_ddtree_target_forward_profiler_step()
+        # The scope opens before the forward context, so the module-level
+        # lookup would rebuild a standalone trace config on every step; the
+        # runner borrows its engine's own diagnostic owner instead.
+        trace = self.vllm_config.observability_config.runtime_trace
+        nvtx_enabled = _dflash_ddtree_target_forward_nvtx_enabled(trace)
+        profiler_step = _dflash_ddtree_target_forward_profiler_step(trace)
         if not nvtx_enabled and profiler_step <= 0:
             yield
             return
@@ -1112,6 +1158,9 @@ class GPUModelRunner(
         self.vllm_config = vllm_config
         self._diagnostics = bind_diagnostics(vllm_config)
         self.model_config = vllm_config.model_config
+        self.mm_encoder_batch_size = getattr(
+            self.model_config.multimodal_config, "mm_encoder_batch_size", 0
+        )
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
         self.compilation_config = vllm_config.compilation_config
@@ -2148,6 +2197,8 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.kv_block_copies:
+            self._kv_block_zeroer.copy_block_ids(scheduler_output.kv_block_copies)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -2231,6 +2282,12 @@ class GPUModelRunner(
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
+            if new_req_data.num_computed_tokens > 0:
+                restore = getattr(self.get_model(), "restore_prefix", None)
+                if restore is not None:
+                    restore(
+                        new_req_data.num_computed_tokens, new_req_data.prompt_token_ids
+                    )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -2517,6 +2574,31 @@ class GPUModelRunner(
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
         """
+        commit_state = getattr(
+            getattr(self, "model", None), "commit_speculative_state", None
+        )
+        if commit_state is not None:
+            # V4.1 keeps bounded Engram/C2 candidates rather than Mamba blocks.
+            # Reuse the same contiguous accepted-count convention. The model
+            # selects its full input length for a prefill chunk, including
+            # chunks whose sampler output is intentionally discarded.
+            batch = getattr(self, "input_batch", None)
+            if batch is not None:
+                budget = None
+                get_budget = getattr(self.model, "stateful_output_budget", None)
+                if get_budget is not None:
+                    if output_token_ids.shape[0] != 1:
+                        raise ValueError("Private V4.1 state requires one request")
+                    request = self.requests[batch.req_ids[0]]
+                    params = request.sampling_params
+                    if params is not None and params.max_tokens is not None:
+                        budget = get_budget(
+                            params.max_tokens, request.num_prompt_tokens
+                        )
+                _clip_stateful_sample_limits(
+                    output_token_ids, batch.req_ids, self.requests, budget
+                )
+            commit_state(_count_contiguous_spec_tokens(output_token_ids))
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
@@ -6098,6 +6180,7 @@ class GPUModelRunner(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,
+            max_batch_size=getattr(self, "mm_encoder_batch_size", 0),
         ):
             batch_outputs: MultiModalEmbeddings
 
@@ -7481,6 +7564,18 @@ class GPUModelRunner(
                 "silently fall back to an invalid no-draft-probability "
                 "acceptance path and can corrupt output quality."
             )
+        if _V41_TRUNC and len(spec_decode_metadata.num_draft_tokens) == 1:
+            from vllm.model_executor.layers.quantization import gguf_shared_runtime
+
+            trunc = gguf_shared_runtime.current_trunc(self.device)
+            if trunc is not None:
+                # Draft i is verify position i + 1; positions >= trunc were not
+                # fully computed, so they can never be accepted.
+                drafts = spec_decode_metadata.draft_token_ids
+                index = torch.arange(drafts.numel(), device=drafts.device)
+                spec_decode_metadata.draft_token_ids = torch.where(
+                    index + 1 >= trunc, torch.full_like(drafts, -1), drafts
+                )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
@@ -8259,6 +8354,15 @@ class GPUModelRunner(
 
         if self.device.type == "cuda":
             self.mixed_prefill_timer.begin(scheduler_output)
+        if _V41_TRUNC_CUTOFF:
+            from vllm.model_executor.layers.quantization import gguf_shared_runtime
+
+            # Exact only for greedy rows of a single request (positions = rows).
+            single = self.input_batch.num_reqs == 1
+            greedy = bool(getattr(self.input_batch, "all_greedy", False))
+            gguf_shared_runtime.set_trunc_cutoff(
+                _V41_TRUNC_CUTOFF if single and greedy else 0
+            )
 
         trace_enabled = (
             bool(self._runtime_trace.async_cpu and self.use_async_scheduling)
@@ -8591,6 +8695,8 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            self.mixed_prefill_timer.mark_cuda_graph()
         _sync_sm70_before_compile_graph_forward(
             cudagraph_mode, diagnostics=self._diagnostics
         )
@@ -12187,10 +12293,21 @@ class GPUModelRunner(
                 if cg_support.value < min_cg_support.value:
                     min_cg_support = cg_support
                     min_cg_attn_backend = attn_backend.__name__
+        graph_query_len = self.uniform_decode_query_len
+        if (
+            self.model_config.hf_text_config.model_type == "deepseek_v41_text"
+            and self.max_num_reqs == 1
+            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+            and not self.compilation_config.pass_config.enable_sp
+        ):
+            # Exact single-request M1..6 graphs need no uniform-batch padding.
+            # Rounding their capture sizes to six would also pad the native
+            # M5 draft query, whose own graph reads five noncausal positions.
+            graph_query_len = 1
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             min_cg_support,
             min_cg_attn_backend,
-            self.uniform_decode_query_len,
+            graph_query_len,
             self.parallel_config.tensor_parallel_size,
             self.kv_cache_config,
             self.max_num_reqs,
@@ -12199,7 +12316,7 @@ class GPUModelRunner(
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, graph_query_len
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
@@ -12438,7 +12555,17 @@ class GPUModelRunner(
                     # Compressed MLA is split into physical pool pages instead
                     # of the scheduler's attention-kernel blocks.
                     if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = compressed_kernel_block_size(kv_cache_spec)
+                        # QSA side caches consume physical block tables; paged
+                        # MQA indexers consume smaller virtual pages. Match the
+                        # metadata builder and the V2 cache layout in each case.
+                        uses_physical_block_table = (
+                            attn_backend.get_builder_cls().uses_physical_block_table
+                        )
+                        shape_block_size = (
+                            kv_cache_spec.storage_block_size
+                            if uses_physical_block_table
+                            else compressed_kernel_block_size(kv_cache_spec)
+                        )
                         kernel_num_blocks = num_blocks * (
                             kv_cache_spec.storage_block_size // shape_block_size
                         )
@@ -12454,7 +12581,9 @@ class GPUModelRunner(
                         shape_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
+                        cache_dtype_str=kv_cache_spec.layout_cache_dtype(
+                            self.cache_config.cache_dtype
+                        ),
                     )
                     dtype = kv_cache_spec.dtype
                     try:
@@ -12552,7 +12681,9 @@ class GPUModelRunner(
                 kernel_block_sizes[group.kv_cache_group_id],
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
+                cache_dtype_str=kv_cache_spec.layout_cache_dtype(
+                    self.cache_config.cache_dtype
+                ),
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:

@@ -238,6 +238,8 @@ class MixedPrefillTiming:
     decode_tokens: int
     budget_tokens: int
     elapsed_ms: float
+    # The step replayed a CUDA graph instead of running eagerly.
+    cuda_graph: bool = False
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.

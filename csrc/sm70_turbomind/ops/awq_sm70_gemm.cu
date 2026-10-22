@@ -9539,9 +9539,18 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       input.size(0) == num_experts && num_experts >= 12 && num_experts <= 48 &&
       num_experts % 6 == 0 &&
       ((k == 4096 && n == 512) || (k == 256 && n == 4096));
+  // Any small one-row-per-route batch (e.g. the V4.1 DSpark draft, M5 x
+  // top-3 = 15 rows) runs as one grouped launch instead of a launch per row.
+  static const bool grouped_any = [] {
+    const char* v = std::getenv("VLLM_SM70_MXFP4_GROUPED_ANY");
+    return v != nullptr && v[0] == '1';
+  }();
+  const bool grouped_any_shape = grouped_any && input.size(0) == num_experts &&
+                                 num_experts >= 2 && num_experts <= 48;
   if ((vllm::awq_sm70::mxfp4_moe_grouped_m8_enabled() && grouped_m8_shape) ||
       (vllm::awq_sm70::mxfp4_moe_grouped_verifier_enabled() &&
-       grouped_verifier_shape)) {
+       grouped_verifier_shape) ||
+      grouped_any_shape) {
     // Keep every routed slot as an independent one-row group. Repeated experts
     // reuse the same weight pointer row, while the scheduler retains the exact
     // arithmetic contract already accepted for compact B1 decode.

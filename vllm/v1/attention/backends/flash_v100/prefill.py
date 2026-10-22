@@ -70,6 +70,9 @@ def _flash_v100_prefill(
     )
 
 
+_BRIDGE_SHORT_QUERY_MIN_KV = 8192
+
+
 def _should_use_fp8_prefill_bridge(
     self: PrefillExecutor,
     *,
@@ -79,6 +82,7 @@ def _should_use_fp8_prefill_bridge(
     value_cache: torch.Tensor,
     causal: bool,
     window_size: tuple[int, int],
+    seq_len: int | None = None,
 ) -> bool:
     # Eight-byte input loads and 16-byte output stores. Keep layouts
     # outside the native bridge contract on their existing fallback.
@@ -97,7 +101,16 @@ def _should_use_fp8_prefill_bridge(
         and self.kv_codec.stores(key_cache, value_cache)
         and key_cache.shape == value_cache.shape
         and head_dim == 256
-        and q_len >= 32
+        and (
+            q_len >= 32
+            # Shorter chunks are padded to one query tile, which split-KV
+            # spreads over a long prefix.
+            or (
+                q_len >= 1
+                and seq_len is not None
+                and seq_len >= _BRIDGE_SHORT_QUERY_MIN_KV
+            )
+        )
         and causal
         and window_size == (-1, -1)
     )
@@ -161,26 +174,48 @@ def _run_fp8_prefill_bridge(
     exact_query = query
     exact_out = out
     tail_prefix = 0
-    if q_len % 64 != 0 and seq_len % 32 == 0:
-        padded_q_len = _masks.cdiv_int(q_len, 64) * 64
-        if padded_q_len <= seq_len:
+    # The exact kernels take 64-row query and 32-row key tiles. Leading zero
+    # queries keep the causal offset of every real query. Below the 79T range
+    # an unaligned sequence is also padded at the end: the trailing zero keys
+    # lie past every real query, so causal masking hides them, and the rows
+    # querying them are dropped.
+    kv_pad = 0
+    if (
+        q_len < _dense_prefill._SM70_79T_Q4096_MIN_QUERY_LEN
+        and seq_len + 31 <= key_out.shape[0] * key_out.shape[1]
+        and key_out.is_contiguous()
+        and value_out.is_contiguous()
+    ):
+        kv_pad = -seq_len % 32
+    if (q_len + kv_pad) % 64 != 0 or kv_pad:
+        padded_q_len = _masks.cdiv_int(q_len + kv_pad, 64) * 64
+        if padded_q_len <= seq_len + kv_pad:
             tail_workspace = _dense_prefill.get_fp8_prefill_bridge_tail_workspace(
                 query,
                 padded_q_len,
             )
             if tail_workspace is not None:
                 exact_query, exact_out = tail_workspace
-                tail_prefix = padded_q_len - q_len
+                tail_prefix = padded_q_len - q_len - kv_pad
                 exact_query[:, :tail_prefix].zero_()
-                exact_query[:, tail_prefix:].copy_(query)
+                exact_query[:, tail_prefix : tail_prefix + q_len].copy_(query)
+                if kv_pad:
+                    exact_query[:, tail_prefix + q_len :].zero_()
+                    key_out.flatten(0, 1)[seq_len : seq_len + kv_pad].zero_()
+                    value_out.flatten(0, 1)[seq_len : seq_len + kv_pad].zero_()
+            else:
+                kv_pad = 0
+        else:
+            kv_pad = 0
+    padded_seq_len = seq_len + kv_pad
     cu_q, cu_k = _dense_prefill.uniform_cu_seqlens(
         exact_query,
         batch_size=1,
         query_len=int(exact_query.shape[1]),
-        kv_len=seq_len,
+        kv_len=padded_seq_len,
     )
-    key_dense = key_out.flatten(0, 1)[:seq_len].unsqueeze(0)
-    value_dense = value_out.flatten(0, 1)[:seq_len].unsqueeze(0)
+    key_dense = key_out.flatten(0, 1)[:padded_seq_len].unsqueeze(0)
+    value_dense = value_out.flatten(0, 1)[:padded_seq_len].unsqueeze(0)
     exact_result = _dense_prefill.try_sm70_fa2_d256_prefill(
         exact_query,
         key_dense,
@@ -188,15 +223,15 @@ def _run_fp8_prefill_bridge(
         cu_seqlens_q=cu_q,
         cu_seqlens_k=cu_k,
         max_seqlen_q=int(exact_query.shape[1]),
-        max_seqlen_k=seq_len,
+        max_seqlen_k=padded_seq_len,
         softmax_scale=self.scale,
         causal=causal,
         window_size=window_size,
         out=exact_out,
     )
     if exact_result is not None:
-        if tail_prefix:
-            out.copy_(exact_result[:, tail_prefix:])
+        if tail_prefix or kv_pad:
+            out.copy_(exact_result[:, tail_prefix : tail_prefix + q_len])
             _routing.record_route(
                 _routing.ROUTE_SPECS[
                     "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad"
@@ -207,6 +242,9 @@ def _run_fp8_prefill_bridge(
             _routing.ROUTE_SPECS["prefill_prefix_fp8_bridge_exact_dense_d256"].name
         )
         return exact_result, True
+    if kv_pad:
+        # The paged kernel reads the real sequence lengths.
+        exact_query, exact_out, tail_prefix = query, out, 0
     exact_result = _dense_prefill.try_sm70_fa2_d256_prefill(
         exact_query,
         key_out,

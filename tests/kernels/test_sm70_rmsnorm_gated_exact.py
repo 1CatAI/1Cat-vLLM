@@ -11,11 +11,11 @@ from vllm.model_executor.layers.layernorm import (
 from vllm.platforms import current_platform
 
 
-@pytest.mark.parametrize("rows", [1, 12, 60, 120, 192, 193])
+@pytest.mark.parametrize("rows", [1, 12, 60, 120, 192, 240, 480, 768, 769])
 def test_shape_admission(rows):
     x = torch.empty(rows, 128, dtype=torch.float16)
     w = torch.empty(128, dtype=torch.float16)
-    assert _sm70_gated_norm_shape_supported(x, x, w) == (rows <= 192)
+    assert _sm70_gated_norm_shape_supported(x, x, w) == (rows <= 768)
     assert not _sm70_gated_norm_shape_supported(x, None, w)
     assert not _sm70_gated_norm_shape_supported(x.float(), x, w)
     assert not _sm70_gated_norm_shape_supported(x[:, :127], x[:, :127], w[:127])
@@ -43,7 +43,7 @@ def assert_bits(actual, expected):
     )
 
 
-@pytest.mark.parametrize("rows", [1, 12, 24, 48, 60, 96, 120, 192])
+@pytest.mark.parametrize("rows", [1, 12, 24, 48, 60, 96, 120, 192, 240, 480, 768])
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
 def test_changed_graph_inputs_and_canaries(
     rows, activation, monkeypatch, default_vllm_config

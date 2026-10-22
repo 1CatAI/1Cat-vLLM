@@ -131,6 +131,7 @@ def test_mamba_neutral_pp_update_accepts_int32_slot_indices(monkeypatch) -> None
     state = object.__new__(mamba_hybrid.MambaHybridModelState)
     state.num_accepted_tokens_gpu = torch.zeros(2, dtype=torch.int32)
     state._align_mode = False
+    state._spec_replay = None
     idx_mapping = torch.tensor([0, -1], dtype=torch.int32)
 
     state.postprocess_state(idx_mapping, 0)

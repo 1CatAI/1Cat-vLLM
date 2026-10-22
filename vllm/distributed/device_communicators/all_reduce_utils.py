@@ -309,6 +309,43 @@ def can_actually_p2p(
 _gpu_p2p_access_cache: dict[str, bool] | None = None
 
 
+def run_p2p_access_test(
+    batch_src: Sequence[int], batch_tgt: Sequence[int]
+) -> Sequence[bool]:
+    """Run `can_actually_p2p` for the given device pairs in a fresh interpreter.
+
+    The devices are indices in this process's CUDA_VISIBLE_DEVICES, which the
+    test processes inherit.
+    """
+    # NOTE: we use `subprocess` rather than `multiprocessing` here
+    # because the caller might not have `if __name__ == "__main__":`,
+    # in that case we cannot use spawn method in multiprocessing.
+    # However, `can_actually_p2p` requires spawn method.
+    # The fix is, we use `subprocess` to call the function,
+    # where we have `if __name__ == "__main__":` in this file.
+
+    # use a temporary file to store the result
+    # we don't use the output of the subprocess directly,
+    # because the subprocess might produce logging output
+    with tempfile.NamedTemporaryFile() as output_file:
+        input_bytes = pickle.dumps((batch_src, batch_tgt, output_file.name))
+        returned = subprocess.run(
+            [sys.executable, __file__], input=input_bytes, capture_output=True
+        )
+        # check if the subprocess is successful
+        try:
+            returned.check_returncode()
+        except Exception as e:
+            # wrap raised exception to provide more information
+            raise RuntimeError(
+                f"Error happened when batch testing "
+                f"peer-to-peer access from {batch_src} to {batch_tgt}:\n"
+                f"{returned.stderr.decode()}"
+            ) from e
+        with open(output_file.name, "rb") as f:
+            return pickle.load(f)
+
+
 def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     """Check if GPU src can access GPU tgt."""
 
@@ -341,33 +378,7 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         ids = list(range(num_dev))
         # batch of all pairs of GPUs
         batch_src, batch_tgt = zip(*list(product(ids, ids)))
-        # NOTE: we use `subprocess` rather than `multiprocessing` here
-        # because the caller might not have `if __name__ == "__main__":`,
-        # in that case we cannot use spawn method in multiprocessing.
-        # However, `can_actually_p2p` requires spawn method.
-        # The fix is, we use `subprocess` to call the function,
-        # where we have `if __name__ == "__main__":` in this file.
-
-        # use a temporary file to store the result
-        # we don't use the output of the subprocess directly,
-        # because the subprocess might produce logging output
-        with tempfile.NamedTemporaryFile() as output_file:
-            input_bytes = pickle.dumps((batch_src, batch_tgt, output_file.name))
-            returned = subprocess.run(
-                [sys.executable, __file__], input=input_bytes, capture_output=True
-            )
-            # check if the subprocess is successful
-            try:
-                returned.check_returncode()
-            except Exception as e:
-                # wrap raised exception to provide more information
-                raise RuntimeError(
-                    f"Error happened when batch testing "
-                    f"peer-to-peer access from {batch_src} to {batch_tgt}:\n"
-                    f"{returned.stderr.decode()}"
-                ) from e
-            with open(output_file.name, "rb") as f:
-                result = pickle.load(f)
+        result = run_p2p_access_test(batch_src, batch_tgt)
         for _i, _j, r in zip(batch_src, batch_tgt, result):
             cache[f"{_i}->{_j}"] = r
         with open(path, "w") as f:
@@ -381,7 +392,7 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     return _gpu_p2p_access_cache[f"{src}->{tgt}"]
 
 
-__all__ = ["gpu_p2p_access_check"]
+__all__ = ["gpu_p2p_access_check", "run_p2p_access_test"]
 
 if __name__ == "__main__":
     batch_src, batch_tgt, output_file = pickle.loads(sys.stdin.buffer.read())

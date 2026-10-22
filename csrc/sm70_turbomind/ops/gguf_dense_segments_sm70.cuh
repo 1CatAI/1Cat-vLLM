@@ -374,12 +374,19 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
   int total_n = 0;
   for (int i = 0; i < segs.nseg; ++i) total_n += segs.s[i].n;
   if constexpr (W == 4 || W == 8) {
-    if (M == 20 && split == 1 &&
+    // Verification batches of 9..40 rows (2..8 requests) share one weight
+    // load and decode across their eight-row tiles.
+    if (M > 8 && M <= 40 && split == 1 &&
         ((K == 2560 && (total_n == 4096 || total_n == 3584)) ||
          (K == 1536 && total_n == 2560))) {
-      dense_weight_major<W, 3>
-          <<<dim3(tiles, split), 32 * W, 3 * W * 256 * 4, st>>>(
-              segs, x, ldx, M, K, S, G, split, ws, cnt);
+      if (M <= 24)
+        dense_weight_major<W, 3>
+            <<<dim3(tiles, split), 32 * W, 3 * W * 256 * 4, st>>>(
+                segs, x, ldx, M, K, S, G, split, ws, cnt);
+      else
+        dense_weight_major<W, 5>
+            <<<dim3(tiles, split), 32 * W, 5 * W * 256 * 4, st>>>(
+                segs, x, ldx, M, K, S, G, split, ws, cnt);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }
@@ -417,8 +424,8 @@ void gguf_dense_segments_sm70_out(
     std::vector<int64_t> n, int64_t K, int64_t split, int64_t warps,
     torch::Tensor ws, torch::Tensor cnt, std::optional<torch::Tensor> sgate) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
-                  x.stride(1) == 1 && x.size(0) > 0 && x.size(0) <= 32,
-              "input must be CUDA FP16 [1..32, K] with contiguous rows");
+                  x.stride(1) == 1 && x.size(0) > 0 && x.size(0) <= 40,
+              "input must be CUDA FP16 [1..40, K] with contiguous rows");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
@@ -492,7 +499,7 @@ void gguf_dense_segments_sm70_out(
           cnt.numel() >= tiles * ((x.size(0) + 7) / 8),
       "split workspace or counter storage is too small");
   const int M = static_cast<int>(x.size(0));
-  TORCH_CHECK(M <= 32);
+  TORCH_CHECK(M <= 40);
   const int S = static_cast<int>((K + 31) / 32);
   const int G = (S + 3) / 4;
   auto st = at::cuda::getCurrentCUDAStream();

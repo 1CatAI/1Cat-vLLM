@@ -435,7 +435,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     torch.accelerator.memory_allocated(),
                     torch.accelerator.memory_reserved(),
                 )
-                logger.info(
+                logger.debug(
                     "Target CUDA storage before speculative loading: %s",
                     loaded_cuda_model_storage({"target": self.model}),
                 )
@@ -1504,8 +1504,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            # Finish offload stores whose source blocks this step reuses before
+            # zeroing them below; see ActiveKVConnector.handle_preemptions.
+            self.kv_connector.handle_preemptions(scheduler_output)
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            if scheduler_output.kv_block_copies:
+                self._kv_block_zeroer.copy_block_ids(scheduler_output.kv_block_copies)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1549,6 +1554,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
         )
+        if not dummy_run and batch_desc.cg_mode != CUDAGraphMode.NONE:
+            self.mixed_prefill_timer.mark_cuda_graph()
 
         note_runner_dispatch(
             self,

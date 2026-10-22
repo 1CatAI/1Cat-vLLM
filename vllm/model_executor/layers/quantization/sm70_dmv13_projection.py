@@ -85,6 +85,9 @@ class Dmv13Projection:
     def __init__(self, layer, extra=None):
         self.ready = False
         self.name = getattr(layer, "prefix", "") or str(id(layer))
+        # Larger batches run the original projections inside the same opaque
+        # op, so a compiled range spanning both sizes picks per call.
+        self.layer, self.extra_layer = layer, extra
         shards = _raw_shards(layer)
         if not shards or len(shards) > MAX_SEGMENTS:
             return
@@ -169,7 +172,14 @@ class Dmv13Projection:
 
 
 def _side_projection(x: torch.Tensor, name: str) -> tuple[torch.Tensor, torch.Tensor]:
-    return _PROJECTIONS[name].run(x)
+    projection = _PROJECTIONS[name]
+    if 1 <= x.shape[0] <= MAX_M:
+        return projection.run(x)
+    out, _ = projection.layer(x)
+    if projection.extra_layer is None:
+        return out, x.new_empty((x.shape[0], 0))
+    extra_out, _ = projection.extra_layer(x)
+    return out, extra_out
 
 
 def _side_projection_fake(x: torch.Tensor, name: str):
@@ -192,8 +202,45 @@ def _shard_key(raw, qtype):
     return raw.data_ptr(), tuple(raw.shape), int(qtype)
 
 
-def _decode_pack(raw, qtype):
+# GGUF type -> (block bytes, elements per block) for the native packer.
+_BLOCKS = {
+    8: (34, 32),
+    12: (144, 256),
+    13: (176, 256),
+    14: (210, 256),
+    20: (18, 32),
+    23: (136, 256),
+}
+
+
+def _native_packer():
+    try:
+        return torch.ops._C.gguf_dmv13_decode_pack
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _pack_threads() -> int:
+    return max(1, min(8, (os.cpu_count() or 1) // 4))
+
+
+def _decode_pack(raw, qtype, threads: int = 1):
     """(format, rows, cols, codes, high, scale) of one raw GGUF shard."""
+    native = _native_packer()
+    if native is not None and qtype in _BLOCKS:
+        # Byte-identical to dense.pack(*dense.decode(...)) below.
+        host = raw.detach().cpu().contiguous()
+        codes, high, scale = native(host, qtype, threads)
+        block_bytes, block_elems = _BLOCKS[qtype]
+        cols = host.shape[1] // block_bytes * block_elems
+        return (
+            _DENSE_FORMATS[qtype],
+            host.shape[0],
+            cols,
+            codes.numpy(),
+            high.numpy(),
+            scale.numpy(),
+        )
     fmt, q, s, m, gs = dense.decode(raw.detach().cpu().numpy(), qtype)
     codes, high, scale = dense.pack(fmt, q, s, m, gs)
     if fmt == dense.LUT4:
@@ -217,9 +264,13 @@ def prepack(layers) -> None:
             shards.extend(found)
     if not shards:
         return
-    workers = max(1, min(8, (os.cpu_count() or 1) // 4))
-    with ThreadPoolExecutor(workers) as pool:
-        results = list(pool.map(lambda shard: _decode_pack(*shard), shards))
+    workers = _pack_threads()
+    if _native_packer() is not None:
+        # The native packer parallelizes tiles itself.
+        results = [_decode_pack(*shard, threads=workers) for shard in shards]
+    else:
+        with ThreadPoolExecutor(workers) as pool:
+            results = list(pool.map(lambda shard: _decode_pack(*shard), shards))
     for (raw, qtype), result in zip(shards, results):
         _PREPACKED[_shard_key(raw, qtype)] = result
 

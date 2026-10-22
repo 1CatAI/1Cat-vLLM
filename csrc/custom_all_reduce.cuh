@@ -187,11 +187,32 @@ constexpr size_t kSm70PushNormPacketOffset =
     kSm70PushNormOffset + kSm70PushNormMetaBytes +
     kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
         kSm70Tp4PushAllreduceM8Bytes;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+// Batched verifier rows (2-4 requests of eight) use their own packets so
+// their epochs never alternate with the eight-row route.
+constexpr int kSm70PushNormBatchRows = 32;
+struct alignas(8) Sm70PushNormBatchMeta {
+  uint32_t generation[kSm70PushNormBatchRows];
+  uint64_t partial[kSm70PushNormBatchRows][kSm70PushNormParts];
+};
+constexpr size_t kSm70PushNormBatchMetaBytes = 2048;
+static_assert(sizeof(Sm70PushNormBatchMeta) <= kSm70PushNormBatchMetaBytes);
+constexpr size_t kSm70PushNormBatchOffset =
     kSm70PushNormPacketOffset + kSm70PushNormMetaBytes;
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70PushNormBatchOffset + kSm70PushNormBatchMetaBytes +
+    kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
+        kSm70Tp4PushAllreduceM32Bytes;
 
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
+
+// Concurrent MTP4 verification batches of Qwen4Exp/Flash-Next (H2560): two or
+// more requests of five rows each, up to the persistent buffer capacity.
+inline bool sm70_qwen4exp_verify_batch_bytes(size_t bytes) {
+  constexpr size_t request_bytes = 5 * 2560 * sizeof(half);
+  return bytes % request_bytes == 0 && bytes >= 2 * request_bytes &&
+         bytes <= kSm70Tp4PushAllreduceMaxBytes;
+}
 
 inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
                                           size_t bytes,
@@ -244,6 +265,14 @@ inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
       }
     }
     return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
+  }
+  if (batch_enabled && sm70_qwen4exp_verify_batch_bytes(bytes)) {
+    // The push kernels stride over the payload, so larger batches reuse the
+    // persistent per-block epochs.
+    return static_cast<int>(
+        std::min<size_t>(kSm70Tp4PushAllreduceBlocks,
+                         (bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
+                             (kSm70Tp4PushAllreduceThreads * 16)));
   }
   const char* mtp5 =
       policy.raw(CollectivePolicyField::sm70_tp4_push_allreduce_mtp5);
@@ -1931,6 +1960,200 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
   }
 }
 
+// The same 40 CTAs as the eight-row kernel, each owning Rows / 8 rows, so
+// residency (and with it the spin waits) is unchanged. Every row keeps its
+// own generation, so rows alternate epochs independently.
+template <typename WeightT, int Rows>
+__global__
+__launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm_batch(
+    vllm::RankData buffers, const half* input, const float* residual,
+    const WeightT* weight, half* output, half* k16_output, float* residual_out,
+    int rank, const void* local_buffer, float epsilon) {
+  constexpr int Threads = 128, Parts = kSm70PushNormParts;
+  constexpr int Width = kSm70GemmaRmsNormHiddenSize;
+  constexpr int Groups = kSm70PushNormRows;
+  constexpr int RowsPerCta = Rows / Groups;
+  static_assert(Rows % Groups == 0 && Rows <= kSm70PushNormBatchRows);
+  using P = typename vllm::packed_t<half>::P;
+  using A = typename vllm::packed_t<half>::A;
+  constexpr int Stride = kSm70PushNormBatchRows * Width / P::size;
+  constexpr int PacksPerPart = Width / Parts / P::size;
+  static_assert(PacksPerPart <= Threads);
+  const int group = blockIdx.x / Parts, part = blockIdx.x % Parts;
+  const int tid = threadIdx.x;
+  char* local = const_cast<char*>(reinterpret_cast<const char*>(local_buffer)) +
+                kSm70PushNormBatchOffset;
+  auto* meta = reinterpret_cast<volatile Sm70PushNormBatchMeta*>(local);
+  char* data = local + kSm70PushNormBatchMetaBytes;
+  uint32_t generation[RowsPerCta];
+  int epoch_offset[RowsPerCta], pack[RowsPerCta];
+#pragma unroll
+  for (int j = 0; j < RowsPerCta; ++j) {
+    const int row = group + j * Groups;
+    generation[j] = meta->generation[row] + 1;
+    epoch_offset[j] = (generation[j] & 1) * 4 * Stride;
+    pack[j] = row * (Width / P::size) + part * PacksPerPart + tid;
+  }
+  float values[RowsPerCta][P::size] = {};
+  float variance[RowsPerCta] = {};
+  if (tid < PacksPerPart) {
+    // Push every row before polling any, overlapping the peer round trips.
+#pragma unroll
+    for (int j = 0; j < RowsPerCta; ++j) {
+      P value = reinterpret_cast<const P*>(input)[pack[j]];
+#pragma unroll
+      for (int i = 0; i < P::size; ++i)
+        vllm::sm70_push_escape_sentinel(value.data[i]);
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        auto* base = const_cast<char*>(
+                         reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+                     kSm70PushNormBatchOffset + kSm70PushNormBatchMetaBytes;
+        vllm::sm70_push_store_volatile_16b(
+            value, base + (epoch_offset[j] + rank * Stride) * sizeof(P),
+            pack[j]);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < RowsPerCta; ++j) {
+      P peers[4];
+      while (true) {
+        bool missing = false;
+#pragma unroll
+        for (int peer = 0; peer < 4; ++peer) {
+          vllm::sm70_push_load_volatile_16b(
+              peers[peer], data + (epoch_offset[j] + peer * Stride) * sizeof(P),
+              pack[j]);
+#pragma unroll
+          for (int i = 0; i < P::size; ++i)
+            missing |= vllm::sm70_push_is_sentinel(peers[peer].data[i]);
+        }
+        if (!missing) break;
+      }
+      const P sum = vllm::sm70_push_reduce<P, 4, A>(peers);
+      const float4 residual_a =
+          reinterpret_cast<const float4*>(residual)[pack[j] * 2];
+      const float4 residual_b =
+          reinterpret_cast<const float4*>(residual)[pack[j] * 2 + 1];
+      const float residual_values[8] = {
+          residual_a.x, residual_a.y, residual_a.z, residual_a.w,
+          residual_b.x, residual_b.y, residual_b.z, residual_b.w};
+#pragma unroll
+      for (int i = 0; i < P::size; ++i) {
+        values[j][i] = __half2float(sum.data[i]) + residual_values[i];
+        variance[j] += values[j][i] * values[j][i];
+      }
+      reinterpret_cast<float4*>(residual_out)[pack[j] * 2] =
+          make_float4(values[j][0], values[j][1], values[j][2], values[j][3]);
+      reinterpret_cast<float4*>(residual_out)[pack[j] * 2 + 1] =
+          make_float4(values[j][4], values[j][5], values[j][6], values[j][7]);
+      P empty;
+#pragma unroll
+      for (int i = 0; i < P::size; ++i)
+        *reinterpret_cast<uint16_t*>(&empty.data[i]) =
+            vllm::kSm70Tp4PushAllreduceSentinel;
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer)
+        vllm::sm70_push_store_volatile_16b(
+            empty, data + (epoch_offset[j] + peer * Stride) * sizeof(P),
+            pack[j]);
+    }
+  }
+  using Reduce = cub::BlockReduce<float, Threads>;
+  __shared__ typename Reduce::TempStorage storage;
+  __shared__ float inverse[RowsPerCta];
+#pragma unroll
+  for (int j = 0; j < RowsPerCta; ++j) {
+    const float total =
+        Reduce(storage).Reduce(variance[j], CubAddOp{}, Threads);
+    __syncthreads();
+    if (tid == 0) {
+      const uint64_t packet =
+          (uint64_t(generation[j]) << 32) | __float_as_uint(total);
+      asm volatile("st.volatile.global.u64 [%0], %1;" ::"l"(
+                       &meta->partial[group + j * Groups][part]),
+                   "l"(packet)
+                   : "memory");
+    }
+  }
+  __syncwarp();
+  if (tid < 32) {
+#pragma unroll
+    for (int j = 0; j < RowsPerCta; ++j) {
+      const int row = group + j * Groups;
+      float own_partial = 0;
+      if (tid < Parts) {
+        uint64_t packet;
+        do {
+          asm volatile("ld.volatile.global.u64 %0, [%1];"
+                       : "=l"(packet)
+                       : "l"(&meta->partial[row][tid])
+                       : "memory");
+        } while (uint32_t(packet >> 32) != generation[j]);
+        own_partial = __uint_as_float(uint32_t(packet));
+      }
+      __syncwarp();
+      float total = 0;
+#pragma unroll
+      for (int p = 0; p < Parts; ++p)
+        total += __shfl_sync(0xffffffff, own_partial, p);
+      if (tid == 0) {
+        inverse[j] = rsqrtf(total / Width + epsilon);
+        // All producers read generation before their packets are observed.
+        if (part == 0) meta->generation[row] = generation[j];
+      }
+    }
+  }
+  __syncthreads();
+  if (tid < PacksPerPart) {
+    const int column = (part * PacksPerPart + tid) * P::size;
+    float weights[8];
+    if constexpr (std::is_same_v<WeightT, float>) {
+      const float4 a = reinterpret_cast<const float4*>(weight + column)[0];
+      const float4 b = reinterpret_cast<const float4*>(weight + column)[1];
+      weights[0] = a.x;
+      weights[1] = a.y;
+      weights[2] = a.z;
+      weights[3] = a.w;
+      weights[4] = b.x;
+      weights[5] = b.y;
+      weights[6] = b.z;
+      weights[7] = b.w;
+    } else {
+      const P packed_weight =
+          reinterpret_cast<const P*>(weight)[column / P::size];
+#pragma unroll
+      for (int i = 0; i < P::size; ++i)
+        weights[i] = __half2float(packed_weight.data[i]);
+    }
+#pragma unroll
+    for (int j = 0; j < RowsPerCta; ++j) {
+      P normalized;
+#pragma unroll
+      for (int i = 0; i < P::size; ++i)
+        normalized.data[i] =
+            __float2half_rn(values[j][i] * inverse[j] * (weights[i] + 1.f));
+      const auto* words = reinterpret_cast<const uint32_t*>(&normalized);
+      asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                   :
+                   : "l"(reinterpret_cast<P*>(output) + pack[j]), "r"(words[0]),
+                     "r"(words[1]), "r"(words[2]), "r"(words[3])
+                   : "memory");
+      if (k16_output != nullptr) {
+        const int row = group + j * Groups, slice = column / P::size;
+        asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                     :
+                     : "l"(reinterpret_cast<P*>(k16_output) +
+                           (static_cast<size_t>(slice >> 1) * Rows + row) * 2 +
+                           (slice & 1)),
+                       "r"(words[0]), "r"(words[1]), "r"(words[2]),
+                       "r"(words[3])
+                     : "memory");
+      }
+    }
+  }
+}
+
 class CustomAllreduce {
  public:
   const CollectivePolicy policy_;
@@ -2096,6 +2319,13 @@ class CustomAllreduce {
                          kSm70Tp4PushAllreduceSentinelByte,
                          kSm70PushNormPacketOffset - kSm70PushNormOffset -
                              kSm70PushNormMetaBytes));
+    // Batch packets start at generation 1 (the region above zeroed them).
+    auto* batch_data = static_cast<char*>(ptrs[rank_]) +
+                       kSm70PushNormBatchOffset + kSm70PushNormBatchMetaBytes;
+    CUDACHECK(cudaMemset(batch_data, kSm70Tp4PushAllreduceSentinelByte,
+                         kSm70Tp4PushAllreduceBufferBytes -
+                             kSm70PushNormBatchOffset -
+                             kSm70PushNormBatchMetaBytes));
     sm70_tp4_push_buffers_registered_ = true;
   }
 
@@ -2370,6 +2600,12 @@ class CustomAllreduce {
 #undef KL
   }
 
+  // Whether sm70_allreduce_gemma_rms_norm will write k16_out for these rows.
+  bool sm70_push_norm_batch_ready(int num_tokens) const {
+    return (num_tokens == 16 || num_tokens == 24 || num_tokens == 32) &&
+           fully_connected_ && sm70_tp4_push_buffers_registered_;
+  }
+
   template <int ngpus, typename ResidualT, typename WeightT>
   void sm70_allreduce_gemma_rms_norm(cudaStream_t stream, half* input,
                                      const ResidualT* residual,
@@ -2377,7 +2613,8 @@ class CustomAllreduce {
                                      half* normalized_out, float* residual_out,
                                      int num_tokens, int hidden_size,
                                      float epsilon,
-                                     bool benchmark_reference = false) {
+                                     bool benchmark_reference = false,
+                                     half* k16_out = nullptr) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2409,6 +2646,25 @@ class CustomAllreduce {
               sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
               residual_out, rank_, sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
         }
+        return;
+      }
+      if ((num_tokens == 16 || num_tokens == 24 || num_tokens == 32) &&
+          !benchmark_reference && fully_connected_ &&
+          sm70_tp4_push_buffers_registered_) {
+#define VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(ROWS)                              \
+  sm70_push_allreduce_gemma_rms_norm_batch<WeightT, ROWS>                   \
+      <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,     \
+                               weight, normalized_out, k16_out,             \
+                               residual_out, rank_,                         \
+                               sm70_tp4_push_buffers_.ptrs[rank_], epsilon)
+        if (num_tokens == 16) {
+          VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(16);
+        } else if (num_tokens == 24) {
+          VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(24);
+        } else {
+          VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(32);
+        }
+#undef VLLM_LAUNCH_SM70_PUSH_NORM_BATCH
         return;
       }
     }
@@ -2543,7 +2799,8 @@ class CustomAllreduce {
           (batch == nullptr || std::strcmp(batch, "1") == 0) &&
           (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
-           bytes == kSm70Tp4PushAllreduceBytes);
+           bytes == kSm70Tp4PushAllreduceBytes ||
+           sm70_qwen4exp_verify_batch_bytes(bytes));
       const char* batch_fastpath =
           policy_.raw(CollectivePolicyField::sm70_qwen38_batch_fastpath);
       const bool qwen38_m2 = bytes == kSm70Tp4PushAllreduceQwen38M2Bytes &&

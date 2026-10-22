@@ -96,7 +96,10 @@ class LatticeGGUFProjection:
             metadata |= np.bitwise_or.reduce(high << high_shifts, axis=-1)
         # Invert Converter<uint16_t,uint2_t>'s adjacent-half pairing so it
         # preserves the packet verbatim after operand packing.
-        shifts = np.array([0, 8, 2, 10, 4, 12, 6, 14], dtype=np.uint64)
+        # Every carrier is exactly 16 bits; widening the eight-way expansion
+        # to uint64 needlessly quadruples its temporary memory traffic.
+        shifts = np.array([0, 8, 2, 10, 4, 12, 6, 14], dtype=np.uint16)
+        packets = packets.astype(np.uint16)
         codes = ((packets[..., None] >> shifts) & 3).astype(np.uint8).reshape(n, k)
         return np.ascontiguousarray(codes), np.ascontiguousarray(metadata)
 

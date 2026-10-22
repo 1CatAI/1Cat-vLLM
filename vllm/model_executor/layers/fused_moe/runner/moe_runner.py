@@ -342,6 +342,19 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> FusedMoE layer lookup in custom ops.
         self.layer_name = layer_name
 
+        from vllm.config import get_current_vllm_config_or_none
+
+        cost_config = get_current_vllm_config_or_none()
+        if (
+            cost_config is not None
+            and cost_config.kernel_config.sm70_round_cost_diagnostics
+        ):
+            from vllm.sm70_round_cost import attach_route_recorder
+
+            parameter = next(gate.parameters(), None) if gate is not None else None
+            if parameter is not None and parameter.device.type == "cuda":
+                attach_route_recorder(self.router, layer_name, parameter.device)
+
         self._forward_entry = self._select_forward()
 
     def _select_forward(self) -> Callable:
@@ -746,12 +759,12 @@ class MoERunner(MoERunnerInterface):
             result = result + zero_expert_output
         return result
 
-    def forward(
+    def _forward_outputs(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor | None, torch.Tensor, int]:
         """Invoke the fused moe layer.
 
         Input:
@@ -759,7 +772,7 @@ class MoERunner(MoERunnerInterface):
         - router_logits
 
         Output:
-        - The new hidden_states.
+        - Shared and routed contributions, plus the original hidden dimension.
 
         Calling sequence
         - forward
@@ -847,6 +860,37 @@ class MoERunner(MoERunnerInterface):
             self.layer_name,
         )
 
+        return shared_output, fused_output, og_hidden_dim
+
+    def forward_partials(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Expose both dependencies without allocating a concatenated payload.
+
+        The consumer owns the final TP reduction and shared/routed addition.
+        Already reduced kernels and zero-expert routing need the normal path.
+        """
+        if self._fused_output_is_reduced or isinstance(self.router, ZeroExpertRouter):
+            raise NotImplementedError("MoE partial outputs require unreduced experts")
+        shared, routed, hidden_dim = self._forward_outputs(
+            hidden_states, router_logits, input_ids
+        )
+        return routed[..., :hidden_dim], (
+            None if shared is None else shared[..., :hidden_dim]
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        shared_output, fused_output, og_hidden_dim = self._forward_outputs(
+            hidden_states, router_logits, input_ids
+        )
         output_transform = getattr(self, "output_transform", None)
         if output_transform is not None:
             result = output_transform(shared_output, fused_output, og_hidden_dim)

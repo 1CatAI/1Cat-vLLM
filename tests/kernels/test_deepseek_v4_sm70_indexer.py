@@ -411,3 +411,103 @@ def test_sm70_indexer_decode_valid_logits_do_not_depend_on_workspace_width() -> 
     assert narrow.shape == (num_queries, 16)
     assert wide.shape == (num_queries, 64)
     torch.testing.assert_close(narrow[:, :num_keys], wide[:, :num_keys], rtol=0, atol=0)
+
+
+class _RecordingWorkspace:
+    """Allocates every requested buffer and records the requests."""
+
+    def __init__(self):
+        self.requests = []
+
+    def get_simultaneous(self, *specs):
+        self.requests.append(specs)
+        return tuple(
+            torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in specs
+        )
+
+
+@requires_sm70
+def test_decode_cublas_score_tiles_match_one_tile(monkeypatch):
+    """Above the budget for whole FP32 scores the cuBLAS decode route scores
+    key tiles. Each row keeps its top-k keys and its logits within FP32
+    rounding (cuBLAS may pick another GEMM for the narrower tiles), also when
+    the tiled route is captured and replayed as a CUDA graph."""
+    torch.manual_seed(20261016)
+    generator = torch.Generator().manual_seed(20261016)
+    num_heads = 64
+    rows = 6
+    graph_width = 6144
+    live_seq_len = 5000
+    blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+
+    bits, _ = _random_fp8_keys(blocks * _BLOCK_SIZE, generator)
+    value_bits = bits.reshape(blocks, _BLOCK_SIZE, _HEAD_DIM)
+    scales = torch.rand((blocks, _BLOCK_SIZE), generator=generator).cuda() + 0.5
+    cache = _build_paged_index_cache(value_bits, scales)
+    table = torch.full(
+        (1, graph_width // _BLOCK_SIZE), -1, dtype=torch.int32, device="cuda"
+    )
+    table[0, :blocks] = torch.randperm(blocks, generator=generator).to(
+        device="cuda", dtype=torch.int32
+    )
+    # The flattened speculative layout DeepSeek-V4 decodes with.
+    block_table = table.repeat(rows, 1).contiguous()
+    seq_lens = torch.arange(
+        live_seq_len - rows + 1, live_seq_len + 1, dtype=torch.int32, device="cuda"
+    ).view(rows, 1)
+    q, weights = _make_queries(rows, num_heads)
+
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_cublas_enabled", True)
+    workspace = _RecordingWorkspace()
+    monkeypatch.setattr(sm70_indexer, "current_workspace_manager", lambda: workspace)
+
+    def decode():
+        return sm70_indexer_decode_logits(
+            q,
+            cache,
+            weights,
+            seq_lens,
+            block_table,
+            graph_width,
+            rows,
+            indexer_decode_cublas=True,
+        )
+
+    single = decode()
+    assert workspace.requests[-1][2][0] == (rows * num_heads, graph_width)
+
+    # Gathered keys (1.5 MiB) plus a 1.5 MiB score tile: six tiles of 1024 keys.
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_tile_mb", 3)
+    tiled = decode()
+    assert workspace.requests[-1][2][0] == (rows * num_heads, 1024)
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            decode()
+    capture_stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        replayed = decode()
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    for candidate in (tiled, replayed):
+        for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
+            torch.testing.assert_close(
+                candidate[row, :row_len], single[row, :row_len], rtol=1e-4, atol=1e-5
+            )
+            expected = torch.topk(single[row, :row_len], 512).indices.sort().values
+            actual = torch.topk(candidate[row, :row_len], 512).indices.sort().values
+            assert torch.equal(actual, expected)
+
+    # Not even one 256-key tile next to the gathered keys: the paged kernel.
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_tile_mb", 1)
+    requests_before = len(workspace.requests)
+    paged = decode()
+    assert len(workspace.requests) == requests_before
+    for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
+        expected = torch.topk(single[row, :row_len], 512).indices.sort().values
+        actual = torch.topk(paged[row, :row_len], 512).indices.sort().values
+        assert torch.equal(actual, expected)

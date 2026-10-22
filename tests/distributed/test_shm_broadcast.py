@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch.distributed as dist
 
+from vllm.distributed.device_communicators import shm_broadcast
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.utils.network_utils import get_open_port
@@ -392,3 +393,60 @@ def test_warning_logs(caplog_vllm):
         # Clean up when done
         writer.shutdown()
         reader.shutdown()
+
+
+@pytest.mark.cpu_test
+def test_busy_reader_consumes_write_notifications():
+    """A reader that never goes idle must still service its notify socket,
+    otherwise libzmq queues a command per notification and memory grows with
+    every message read (upstream vLLM #63165).
+    """
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    notify_socket = reader._spin_condition.local_notify_socket
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+
+        writer.enqueue("payload")
+        assert notify_socket.poll(timeout=5000)
+        with mock.patch.object(
+            shm_broadcast, "SHM_NOTIFY_POLL_INTERVAL_S", 0, create=True
+        ):
+            assert reader.dequeue(timeout=5) == "payload"
+        assert not notify_socket.poll(timeout=0)
+
+        reader.shutdown()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            reader.dequeue(timeout=1)
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+        # Explicit cleanup also prevents a failing assertion from retaining
+        # live sockets in its traceback and blocking context destruction.
+        writer.local_socket.context.destroy(linger=0)
+        reader.local_socket.context.destroy(linger=0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("pending_notification", [False, True])
+def test_busy_reader_poll_interval(pending_notification):
+    condition = shm_broadcast.SpinCondition.__new__(shm_broadcast.SpinCondition)
+    condition.last_read = condition.last_notify_poll = 10.0
+    condition.local_notify_socket = mock.Mock()
+    condition.local_notify_socket.poll.return_value = pending_notification
+    with mock.patch.object(
+        shm_broadcast.time, "monotonic", side_effect=[11.9, 12.0, 12.1, 14.0]
+    ):
+        for expected_polls in [0, 1, 1, 2]:
+            condition.record_read()
+            assert condition.local_notify_socket.poll.call_count == expected_polls
+    assert condition.last_read == condition.last_notify_poll == 14.0
+    assert condition.local_notify_socket.recv.call_count == (
+        2 if pending_notification else 0
+    )

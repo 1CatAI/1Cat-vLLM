@@ -13,6 +13,7 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
     multi stream [T, hc_count*H] (fed to the next draft step).
 """
 
+import copy
 from collections.abc import Iterable
 
 import regex as re
@@ -21,13 +22,22 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
-from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    SpeculativeConfig,
+    VllmConfig,
+    replace,
+    set_current_vllm_config,
+)
+from vllm.config.compilation import DynamicShapesType
 from vllm.config.execution_policy import graph_policy
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, get_tp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -43,6 +53,7 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -69,12 +80,86 @@ from .model import (
     _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
+    _hc_sequence_rows,
     _make_qwen38_decode_compile_config,
+    cublas_fp16_accumulation,
 )
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
 
 logger = init_logger(__name__)
+
+
+_MTP_TOKEN_AXES = {
+    "input_ids": 0,
+    "positions": -1,
+    "hidden_states": 0,
+    "inputs_embeds": 0,
+}
+
+
+def _hc_mtp_prefill_sequence_qualified(vllm_config, config):
+    parallel = vllm_config.parallel_config
+    return bool(
+        vllm_config.kernel_config.layer_execution.hc_mtp_prefill_sequence_parallel
+        and vllm_config.kernel_config.sm70_mtp_q8_0_experts
+        and not is_offload_process()
+        and current_platform.is_device_capability(70)
+        and vllm_config.model_config.dtype == torch.float16
+        and (config.hc_count, config.hidden_size, config.hc_lowrank) == (4, 2560, 320)
+        and vllm_config.kernel_config.hc_weight_storage == "sharded"
+        and not vllm_config.kernel_config.sm70_hcx_diagnostics
+        and vllm_config.lora_config is None
+        and vllm_config.scheduler_config.max_num_seqs == 1
+        and vllm_config.compilation_config.dynamic_shapes_config.type
+        == DynamicShapesType.BACKED
+        and (
+            parallel.tensor_parallel_size,
+            parallel.pipeline_parallel_size,
+            parallel.decode_context_parallel_size,
+            parallel.prefill_context_parallel_size,
+        )
+        == (4, 1, 1, 1)
+    )
+
+
+def _make_mtp_prefill_fallback_config(vllm_config, *, qualified):
+    if not qualified:
+        return vllm_config
+    # The row view handles the large startup batch, so the fallback can first
+    # compile at M1. BACKED tracing specializes that singleton. Keep this one
+    # owner's token axes unbacked; decode views retain their original config.
+    config = copy.copy(vllm_config)
+    config.compilation_config = copy.copy(vllm_config.compilation_config)
+    config.compilation_config.dynamic_shapes_config = copy.copy(
+        vllm_config.compilation_config.dynamic_shapes_config
+    )
+    config.compilation_config.dynamic_shapes_config.type = DynamicShapesType.UNBACKED
+    config.compilation_config.cache_dir = ""
+    config.compilation_config.local_cache_dir = ""
+    config.compilation_config.traced_files = set()
+    return config
+
+
+def _mtp_token_shape_invariants(
+    self,
+    input_ids,
+    positions,
+    hidden_states=None,
+    intermediate_tensors=None,
+    inputs_embeds=None,
+    spec_step_idx=0,
+    hc_sequence_parallel=False,
+):
+    # A fallback can first compile on a singleton after the row-owned prefill
+    # view handles startup's large batch. Keep that singleton dynamic; guards
+    # are removed from the loaded AOT callable.
+    if hidden_states is not None:
+        torch._check(positions.size(-1) == hidden_states.size(0))
+        if input_ids is not None:
+            torch._check(input_ids.size(0) == hidden_states.size(0))
+        if inputs_embeds is not None:
+            torch._check(inputs_embeds.size(0) == hidden_states.size(0))
 
 
 def _remap_ignored_layers(
@@ -301,7 +386,7 @@ def _make_draft_vllm_config(
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
         "hidden_states": 0,
-    }
+    },
 )
 class Qwen4ExpMultiTokenPredictor(nn.Module):
     hf_to_vllm_mapper = _QWEN3_5_WEIGHTS_MAPPER | _HC_WEIGHTS_MAPPER
@@ -429,6 +514,28 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             selected = buffer.index_select(0, row_indices)
             buffer[:num_rows].copy_(selected)
 
+    def adopt_target_topk_indices(self, target: torch.Tensor) -> int:
+        """Use the target's QSA top-k workspace instead of a private one.
+
+        MTP step 0 always selects its own indices and later steps only reuse
+        them within the same proposal, never across a target forward, so the
+        target's serially reused [max_tokens, width] buffer can be shared.
+        Returns the bytes released.
+        """
+        released = 0
+        for attention in self._iter_qsa_attentions():
+            own = attention.topk_indices_buffer
+            if (
+                own is not target
+                and own.dtype == target.dtype
+                and own.device == target.device
+                and own.shape[1] == target.shape[1]
+                and own.shape[0] <= target.shape[0]
+            ):
+                released += own.numel() * own.element_size()
+                attention.topk_indices_buffer = target
+        return released
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -440,7 +547,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        hc_sequence_parallel: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        if torch.compiler.is_compiling():
+            _mtp_token_shape_invariants(
+                self, input_ids, positions, hidden_states, inputs_embeds=inputs_embeds
+            )
         hc_count = self.hc_count
         hidden_size = self.hidden_size
 
@@ -458,9 +570,14 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
-        from .sm70_mtp_fc import maybe_combine_fc
+        from .sm70_mtp_fc import maybe_combine_fc, maybe_sequence_rows_fc
 
-        combined = maybe_combine_fc(self, inputs_embeds, hidden_states)
+        combined = (
+            maybe_sequence_rows_fc(self, inputs_embeds, hidden_states)
+            if hc_sequence_parallel
+            else maybe_combine_fc(self, inputs_embeds, hidden_states)
+        )
+        fc_sequence_rows = hc_sequence_parallel and combined is not None
         if combined is not None:
             hidden_states = combined
         else:
@@ -485,6 +602,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
+        if hc_sequence_parallel and not fc_sequence_rows:
+            hidden_states = _hc_sequence_rows(hidden_states)
         hidden_states, block_output, injection = layer(
             hidden_states=hidden_states,
             prev_block_output=None,
@@ -493,16 +612,27 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             input_ids=None,
             query_start_loc=None,
             ngram_context=None,
+            hc_sequence_parallel=hc_sequence_parallel,
         )
         # Last PP rank finalize. Keep both:
         #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
         #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
         #       for the next draft step (zero extra compute, just kept).
-        multi_hidden, sample_hidden_states, _ = (
-            self.hyper_connection_mixer.combine_and_mix(
-                hidden_states, block_output, injection
-            )
+        final_mix = (
+            self.hyper_connection_mixer.sequence_parallel_combine_and_mix
+            if hc_sequence_parallel
+            else self.hyper_connection_mixer.combine_and_mix
         )
+        multi_hidden, sample_hidden_states, _ = final_mix(
+            hidden_states, block_output, injection
+        )
+        if hc_sequence_parallel:
+            # The proposer owns full-row outputs. Keep padded rows internal;
+            # neither output aliases the target's hidden-state buffer.
+            sample_hidden_states = sample_hidden_states[: positions.shape[-1]]
+            multi_hidden = get_tp_group().all_gather(multi_hidden, dim=0)[
+                : positions.shape[-1]
+            ]
         return sample_hidden_states, multi_hidden
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -557,6 +687,42 @@ class _Qwen4ExpMTPDecodeGraphModel(nn.Module):
             intermediate_tensors,
             inputs_embeds,
             spec_step_idx,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "hidden_states": 0,
+    }
+)
+class _Qwen4ExpMTPPrefillSequenceModel(nn.Module):
+    """Borrow the drafter's weights/state for a separate row-owned prefill."""
+
+    def __init__(self, *, target_model, vllm_config: VllmConfig):
+        super().__init__()
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        return self._target_model.forward(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
+            hc_sequence_parallel=True,
         )
 
 
@@ -617,11 +783,20 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             and speculative.method == "mtp"
             and get_pp_group().world_size == 1
         )
-        self.model = Qwen4ExpMultiTokenPredictor(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "mtp"),
-            share_target_embed_tokens=self.share_target_io_weights,
+        self._hc_prefill_sequence_qualified = _hc_mtp_prefill_sequence_qualified(
+            vllm_config, config
         )
+        predictor_config = _make_mtp_prefill_fallback_config(
+            vllm_config, qualified=self._hc_prefill_sequence_qualified
+        )
+        # The compiler wrapper also binds the current configuration during
+        # construction. Keep that binding equivalent to the explicit input.
+        with set_current_vllm_config(predictor_config):
+            self.model = Qwen4ExpMultiTokenPredictor(
+                vllm_config=predictor_config,
+                prefix=maybe_prefix(prefix, "mtp"),
+                share_target_embed_tokens=self.share_target_io_weights,
+            )
 
         if get_pp_group().is_last_rank:
             if self.share_target_io_weights:
@@ -647,6 +822,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
         enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+        object.__setattr__(self, "_hc_prefill_sequence_model", None)
         self._sm70_draft_head = None
 
     def prepare_loaded_linear_weights(self) -> None:
@@ -690,6 +866,19 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def _use_hc_prefill_sequence_rows(self, positions, hidden_states, intermediate):
+        return bool(
+            getattr(self, "_hc_prefill_sequence_qualified", False)
+            and 4096 <= positions.shape[-1] <= 16384
+            and hidden_states is not None
+            and hidden_states.dtype == torch.float16
+            and hidden_states.shape == (positions.shape[-1], 10240)
+            and intermediate is None
+            and not cublas_fp16_accumulation()
+            and is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+        )
+
     def forward(  # type: ignore[override]
         self,
         input_ids: torch.Tensor | None,
@@ -711,14 +900,38 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 # full 304-MiB TP vocabulary shard during graph startup. The
                 # outer CUDA graph still captures lookup and its TP reduction.
                 inputs_embeds = self.model.embed_input_ids(input_ids)
-        return backbone(
-            input_ids,
-            positions,
-            hidden_states,
-            intermediate_tensors,
-            inputs_embeds,
-            spec_step_idx=spec_step_idx,
-        )
+        if self._use_hc_prefill_sequence_rows(
+            positions, hidden_states, intermediate_tensors
+        ):
+            logger.info_once(
+                "Using qualified TP4 Q8_0 MTP HC prefill row owners; "
+                "attention/expert reductions and decode are unchanged."
+            )
+            if self._hc_prefill_sequence_model is None:
+                config = copy.copy(self.vllm_config)
+                config.compilation_config = copy.copy(config.compilation_config)
+                config.compilation_config.cache_dir = ""
+                config.compilation_config.local_cache_dir = ""
+                config.compilation_config.traced_files = set()
+                with set_current_vllm_config(config):
+                    view = _Qwen4ExpMTPPrefillSequenceModel(
+                        target_model=self.model, vllm_config=config
+                    )
+                object.__setattr__(self, "_hc_prefill_sequence_model", view)
+            backbone = self._hc_prefill_sequence_model
+        # Draft row stages keep the original replicated producer reductions;
+        # they must not inherit the target's partial-producer context.
+        from .sm70_hcx import hc_prefill_sequence_parallel_context
+
+        with hc_prefill_sequence_parallel_context(False):
+            return backbone(
+                input_ids,
+                positions,
+                hidden_states,
+                intermediate_tensors,
+                inputs_embeds,
+                spec_step_idx=spec_step_idx,
+            )
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
@@ -745,6 +958,52 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             getattr(self, "share_target_io_weights", False)
             and remapped.startswith(("model.embed_tokens.", "lm_head."))
         )
+
+    def adopt_target_buffers(self, target_model: nn.Module) -> None:
+        """Share serially reused target workspaces after both are built."""
+        target = next(
+            (
+                buffer
+                for module in target_model.modules()
+                if isinstance(
+                    buffer := getattr(module, "topk_indices_buffer", None),
+                    torch.Tensor,
+                )
+            ),
+            None,
+        )
+        if target is not None and hasattr(self.model, "adopt_target_topk_indices"):
+            released = self.model.adopt_target_topk_indices(target)
+            if released:
+                logger.info(
+                    "MTP shares the target QSA top-k workspace (%.1f MiB).",
+                    released / 2**20,
+                )
+        # Identical RoPE tables (the draft's text RoPE and the target's
+        # interleaved MRoPE share theta and length) are kept once.
+        target_tables = [
+            module.cos_sin_cache
+            for module in target_model.modules()
+            if isinstance(getattr(module, "cos_sin_cache", None), torch.Tensor)
+        ]
+        shared = 0
+        for module in self.modules():
+            own = getattr(module, "cos_sin_cache", None)
+            if not isinstance(own, torch.Tensor):
+                continue
+            for table in target_tables:
+                if (
+                    table is not own
+                    and table.shape == own.shape
+                    and table.dtype == own.dtype
+                    and table.device == own.device
+                    and torch.equal(table, own)
+                ):
+                    module.cos_sin_cache = table
+                    shared += own.numel() * own.element_size()
+                    break
+        if shared:
+            logger.info("MTP shares %.1f MiB of target RoPE tables.", shared / 2**20)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

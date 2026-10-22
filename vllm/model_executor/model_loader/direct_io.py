@@ -52,6 +52,10 @@ _DTYPES = {
     "I16": torch.int16,
     "I8": torch.int8,
     "U8": torch.uint8,
+    # Unsigned index tables, e.g. GLM-5.3's csf_32x2_v1 scale pages; mapped
+    # like safetensors maps them.
+    "U16": torch.uint16,
+    "U32": torch.uint32,
     "BOOL": torch.bool,
 }
 

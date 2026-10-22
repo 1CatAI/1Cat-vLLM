@@ -71,7 +71,26 @@ def get_rope(
             raise ValueError(f"{partial_rotary_factor=} must be between 0.0 and 1.0")
         rotary_dim = int(head_size * partial_rotary_factor)
 
-    key = (
+    mrope_cache_positions = None
+    if (
+        dual_chunk_attention_config is None
+        and scaling_type == "default"
+        and "mrope_section" in rope_parameters
+    ):
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is not None and config.model_config is not None:
+            model_config = config.model_config
+            mm_config = model_config.multimodal_config
+            if mm_config is None or mm_config.get_limit_per_prompt("video") == 0:
+                # Text/image positions fit the token window; video's temporal
+                # coordinates can require the existing four-times envelope.
+                mrope_cache_positions = min(
+                    4 * max_position, max(max_position, model_config.max_model_len)
+                )
+
+    key: tuple[Any, ...] = (
         head_size,
         rotary_dim,
         max_position,
@@ -80,6 +99,9 @@ def get_rope(
         dual_chunk_attention_args,
         dtype,
     )
+    if mrope_cache_positions is not None:
+        # A video-enabled engine must never inherit a smaller cached table.
+        key += (mrope_cache_positions,)
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
 
@@ -109,6 +131,7 @@ def get_rope(
                 dtype,
                 mrope_section=rope_parameters["mrope_section"],
                 mrope_interleaved=rope_parameters.get("mrope_interleaved", False),
+                cache_max_position_num=mrope_cache_positions,
             )
         elif "use_fope" in rope_parameters and rope_parameters["use_fope"]:
             extra_kwargs = {

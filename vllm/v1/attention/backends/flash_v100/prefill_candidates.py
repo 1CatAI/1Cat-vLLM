@@ -143,6 +143,7 @@ class PrefillExecutor:
             value_cache=request.value_cache,
             causal=request.causal,
             window_size=request.window_size,
+            seq_len=request.seq_len,
         )
 
 

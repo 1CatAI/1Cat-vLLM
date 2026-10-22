@@ -102,6 +102,8 @@ def host_qsa_attention(
         HOST_INDICES=resolved,
         HOST_VALID_COUNTS=state.lengths,
         HOST_CACHE=True,
+        HOT_SCALES=state.hot_scales,
+        HOST_CACHE_E4M3=state.hot_fp8,
         num_warps=warps,
         num_stages=2,
     )

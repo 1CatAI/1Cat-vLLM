@@ -246,6 +246,18 @@ def test_sparse_keeps_both_replay_boundaries(eagle, length):
     assert len(ends) <= length // 8000 + 3
 
 
+@pytest.mark.parametrize("eagle", [False, True])
+@pytest.mark.parametrize(
+    "length", [50, MAMBA_BLOCK_SIZE - 1, 2 * MAMBA_BLOCK_SIZE + 30]
+)
+def test_sparse_does_not_split_at_unaligned_last_token(eagle, length):
+    # A state ending at the unaligned position length - 1 is never cacheable;
+    # stopping there only adds a step and changes the prefill chunking.
+    ends = _chunk_ends(length, eagle=eagle)
+    assert length - 1 not in ends
+    assert all(end == length or end % MAMBA_BLOCK_SIZE == 0 for end in ends), ends
+
+
 def test_sparse_keeps_detected_shared_prefix_boundary():
     assert 4896 in _chunk_ends(32768, eagle=True, shared=4896)
 

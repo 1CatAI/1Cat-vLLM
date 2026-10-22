@@ -19,11 +19,12 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
 
-# Tokens per draft MoE call during prefill (bounds its temporaries).
+# Keep the calibrated large-M throughput after removing duplicate persistent
+# workspaces. Smaller chunks save transient bytes but cost ~2 ms per 8K call.
 _PREFILL_CHUNK = 2048
 
 GGML_Q8_0 = 8
@@ -131,6 +132,16 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer):
         if any(e != set(range(self.num_experts)) for e in self.loaded.values()):
             raise ValueError("Incomplete Q8_0 MTP expert checkpoint")
+        from vllm.model_executor.layers.quantization.gguf_native import pad_weight_tail
+
+        # The common GGUF reader can fetch a final padded K tile. Preserve the
+        # logical Q8 bytes and give its last row the same zero storage tail as
+        # other original expert banks, including K160 TP shards.
+        for name in ("w13_weight", "w2_weight"):
+            weight = getattr(layer, name)
+            guarded = pad_weight_tail(weight, GGML_Q8_0)
+            if guarded is not weight:
+                replace_parameter(layer, name, guarded)
         stored = layer.w13_weight.numel() + layer.w2_weight.numel()
         fp16 = 2 * self.num_experts * 3 * self.local * self.hidden
         logger.info(

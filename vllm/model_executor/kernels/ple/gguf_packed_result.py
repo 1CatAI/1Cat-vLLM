@@ -204,7 +204,9 @@ def wait_decode_iq4nl_result(
     _ple_offload_wait_impl(
         sem_flag_tensor, packet_buffer, hidden_states, cpu_output_buffer, num_tokens
     )
-    rows = hidden_states.shape[0]
+    # The tensor is an execution dependency, not necessarily the full HC
+    # carrier. Row-owned prefill supplies its complete query length explicitly.
+    rows = num_tokens if num_tokens else hidden_states.shape[0]
     if rows > min(packet_buffer.shape[0], decoded.shape[0]):
         raise ValueError("Packed PLE result exceeds decoded workspace capacity")
     decode_iq4nl_result_out(packet_buffer[:rows], codebook, row_width, decoded[:rows])

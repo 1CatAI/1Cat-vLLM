@@ -27,6 +27,39 @@ def test_budget_adapts_to_gpu_cost_and_ignores_short_boundaries():
     assert 2400 <= budget.tokens <= 2512
 
 
+def test_fixed_step_cost_just_below_target_does_not_collapse_the_budget():
+    # 240 ms of fixed cost leaves 10 ms of a 250 ms target; chunks of 40
+    # tokens would spend 96% of every mixed step on overhead.
+    budget = MixedPrefillBudget(4064, 250)
+    budget.tokens = 512
+    assert 896 <= _converge(budget, 240, 0.25) <= 960
+
+
+def test_graph_steps_let_a_small_budget_recover():
+    budget = MixedPrefillBudget(4064, 250)
+    for n in (512, 640, 768):
+        budget.tokens = n
+        budget.update(MixedPrefillTiming(n, 24, n, 150 + 0.15 * n))
+    budget.tokens = 80
+    for _ in range(8):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 24, n, 60, cuda_graph=True))
+    assert budget.tokens == 992
+
+
+def test_graph_replayed_steps_do_not_teach_the_eager_cost():
+    budget = MixedPrefillBudget(4064, 250)
+    for _ in range(20):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 24, n, 300 + 0.2 * n))
+    eager = budget.tokens
+    # A short prompt in a piecewise graph is much cheaper than an eager step
+    # of the same size. It must not shrink the budget for eager chunks.
+    for _ in range(20):
+        budget.update(MixedPrefillTiming(96, 24, 96, 60, cuda_graph=True))
+    assert budget.tokens == eager
+
+
 def test_floor_holds_on_slow_steps_and_growth_starts_from_it():
     budget = MixedPrefillBudget(8192, 250, min_tokens=1632)
     assert budget.tokens == 1632
@@ -38,6 +71,29 @@ def test_floor_holds_on_slow_steps_and_growth_starts_from_it():
         n = budget.tokens
         budget.update(MixedPrefillTiming(n, 16, n, n * 0.05))
     assert budget.tokens > 1632
+
+
+def _converge(budget, fixed_ms, ms_per_token, steps=40):
+    for _ in range(steps):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 32, n, fixed_ms + ms_per_token * n))
+    return budget.tokens
+
+
+def test_fixed_step_cost_below_target_is_not_charged_to_prefill():
+    # 60 ms of decode/launch cost plus 0.25 ms per prefill token: 250 ms
+    # leaves room for (250 - 60) / 0.25 = 760 prefill tokens.
+    budget = MixedPrefillBudget(4064, 250)
+    assert 736 <= _converge(budget, 60, 0.25) <= 768
+
+
+def test_fixed_step_cost_above_target_does_not_collapse_the_budget():
+    # Eager mixed steps can cost more than the target before any prefill.
+    # Splitting the prompt finer only multiplies those steps, so the budget
+    # must settle near fixed / per_token instead of the 16-token quantum.
+    budget = MixedPrefillBudget(4064, 250, min_tokens=0)
+    budget.tokens = 32
+    assert 1100 <= _converge(budget, 300, 0.25, steps=60) <= 1216
 
 
 @pytest.mark.parametrize("elapsed", [0, -1, float("nan"), float("inf")])
@@ -80,6 +136,12 @@ def test_timer_never_waits_and_keeps_delayed_sample_token_counts():
         sample = timer.finish()
         assert sample == MixedPrefillTiming(512, 16, 512, 300)
         assert len(events) == 2  # No events for pure decode.
+        timer.begin(output)
+        timer.mark_cuda_graph()
+        assert timer.finish() is None
+        events[-1].ready = True
+        timer.begin(SchedulerOutput.make_empty())
+        assert timer.finish() == MixedPrefillTiming(512, 16, 512, 300, True)
 
 
 def _resident(scheduler):

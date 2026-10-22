@@ -43,10 +43,8 @@ def shared_key_reason(q, cache, table, requests, positions, lengths):
         return "requires_SM70"
     if q.dtype != torch.float16 or cache.dtype != torch.float16:
         return "requires_FP16_query_and_indexer_cache"
-    if not (2 <= q.shape[0] <= 8 and q.shape[1:] == (4, 128)):
-        return "requires_M2_8_H4_D128"
-    if table.shape[0] != 1:
-        return "multiple_requests"
+    if not (2 <= q.shape[0] <= 64 and q.shape[1:] == (4, 128)):
+        return "requires_M2_64_H4_D128"
     if not all(x.dtype == torch.int32 for x in (table, requests, lengths)):
         return "requires_int32_request_metadata"
     if positions.dtype not in (torch.int32, torch.int64):

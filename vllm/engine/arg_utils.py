@@ -540,6 +540,7 @@ class EngineArgs:
         CacheConfig.prefix_cache_retention_interval
     )
     mamba_tail_checkpoint: bool = CacheConfig.mamba_tail_checkpoint
+    partial_prefix_cache: bool = CacheConfig.partial_prefix_cache
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -603,6 +604,7 @@ class EngineArgs:
     )
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
+    mm_encoder_batch_size: int = MultiModalConfig.mm_encoder_batch_size
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
     )
@@ -1192,6 +1194,9 @@ class EngineArgs:
             "--mamba-tail-checkpoint", **cache_kwargs["mamba_tail_checkpoint"]
         )
         cache_group.add_argument(
+            "--partial-prefix-cache", **cache_kwargs["partial_prefix_cache"]
+        )
+        cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
         )
         cache_group.add_argument(
@@ -1286,6 +1291,9 @@ class EngineArgs:
         )
         multimodal_group.add_argument(
             "--mm-encoder-tp-mode", **multimodal_kwargs["mm_encoder_tp_mode"]
+        )
+        multimodal_group.add_argument(
+            "--mm-encoder-batch-size", **multimodal_kwargs["mm_encoder_batch_size"]
         )
         multimodal_group.add_argument(
             "--mm-encoder-attn-backend",
@@ -1670,6 +1678,7 @@ class EngineArgs:
             mm_shm_cache_max_object_size_mb=self.mm_shm_cache_max_object_size_mb,
             mm_encoder_only=self.mm_encoder_only,
             mm_encoder_tp_mode=self.mm_encoder_tp_mode,
+            mm_encoder_batch_size=self.mm_encoder_batch_size,
             mm_encoder_attn_backend=self.mm_encoder_attn_backend,
             mm_encoder_attn_dtype=self.mm_encoder_attn_dtype,
             mm_encoder_fp8_scale_path=self.mm_encoder_fp8_scale_path,
@@ -1935,8 +1944,11 @@ class EngineArgs:
                 self.compilation_config.cudagraph_capture_sizes = (
                     cudagraph_capture_sizes
                 )
+                max_tokens = self.max_num_batched_tokens
                 self.compilation_config.max_cudagraph_capture_size = max(
-                    cudagraph_capture_sizes
+                    size
+                    for size in cudagraph_capture_sizes
+                    if max_tokens is None or size <= max_tokens
                 )
                 profile_updates.append(
                     "cudagraph_capture_sizes="
@@ -2026,6 +2038,7 @@ class EngineArgs:
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             mamba_tail_checkpoint=self.mamba_tail_checkpoint,
+            partial_prefix_cache=self.partial_prefix_cache,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,

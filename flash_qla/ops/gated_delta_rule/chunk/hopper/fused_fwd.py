@@ -565,6 +565,7 @@ def tilelang_fused_chunk_gdr_fwd_sm70(
     state_layout_vlk,
     indexed_state=False,
     block_DV=128,
+    threads=128,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
@@ -614,7 +615,9 @@ def tilelang_fused_chunk_gdr_fwd_sm70(
         h: T.Tensor(h_shape, dtype=h_dtype),
         ht: T.Tensor(ht_shape, dtype=ht_dtype),
     ):
-        with T.Kernel(T.ceildiv(DV, block_DV) * batch_size * H, threads=128) as (bbhv,):
+        with T.Kernel(
+            T.ceildiv(DV, block_DV) * batch_size * H, threads=threads
+        ) as (bbhv,):
             bbh, bv = bbhv // T.ceildiv(DV, block_DV), bbhv % T.ceildiv(DV, block_DV)
             bb, bh = bbh // H, bbh % H
             bhg = bh // (H // Hg)
@@ -916,7 +919,10 @@ def fused_gdr_fwd(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     inplace_final_state: bool = False,
+    sm70_threads: int = 128,
 ):
+    if sm70_threads not in (128, 256):
+        raise ValueError("SM70 original prefill threads must be128 or256")
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H, V = v.shape
     scale = scale or K ** (-0.5)
@@ -1088,7 +1094,10 @@ def fused_gdr_fwd(
         is_varlen=is_varlen,
         is_cp=is_cp,
         state_layout_vlk=state_layout_vlk,
-        **({"indexed_state": indexed_state} if use_sm70_original_fused else {}),
+        **(
+            {"indexed_state": indexed_state, "threads": sm70_threads}
+            if use_sm70_original_fused else {}
+        ),
         block_DV=block_DV,
     )
     if use_sm70_original_fused:

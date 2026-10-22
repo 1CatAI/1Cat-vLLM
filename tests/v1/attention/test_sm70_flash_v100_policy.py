@@ -1965,8 +1965,17 @@ def test_sm70_speculative_cudagraph_shapes_are_tp_independent_and_bounded():
         15,
         18,
         20,
+        64,
+        96,
+        128,
+        160,
+        192,
+        256,
     ]
-    assert _sm70_speculative_cudagraph_capture_sizes(256, 5)[-1] == 160
+    # Verifier shapes stop at 32 requests; larger sizes are the mixed-step set.
+    assert _sm70_speculative_cudagraph_capture_sizes(256, 5)[-1] == 256
+    assert 32 * 5 in _sm70_speculative_cudagraph_capture_sizes(256, 5)
+    assert 64 * 5 not in _sm70_speculative_cudagraph_capture_sizes(256, 5)
     for concurrency in (2, 4, 8, 16, 32):
         assert concurrency * 8 in _sm70_speculative_cudagraph_capture_sizes(32, 8)
 

@@ -287,12 +287,21 @@ def _router_batch_storage(weight: torch.Tensor, storage: str) -> torch.Tensor:
     return _pack_router_batch_weight(weight)
 
 
+def _verify_rows(rows: int) -> bool:
+    """MTP4 verification batches of one to eight requests (five rows each).
+
+    The router and shared-expert batch kernels compute rows independently, so
+    one launch covers every request with per-row results unchanged.
+    """
+    return rows % 5 == 0 and 5 <= rows <= 40
+
+
 def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     return bool(
         mtp_batch_enabled("shared_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and x.shape[0] in (5, 10)
+        and _verify_rows(x.shape[0])
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -302,9 +311,39 @@ def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     )
 
 
+_BATCH_PIECE = 10  # verification rows per batch-kernel launch (2 requests)
+# The batched GDN input kernel wins up to 16 rows (26-29 us vs cuBLAS 40 us);
+# beyond that cuBLAS streams the weights once (42/67/83 us at 20/40/80 rows)
+# while 10-row pieces re-read all 21 MB per piece (55/110/221 us).
+_GDN_BATCH_ROWS = 16
+
+
+def _in_pieces(x: torch.Tensor, width: int, fn) -> torch.Tensor:
+    """Apply a 2..16-row batch kernel to concurrent verification batches
+    in 10-row pieces (rows are independent)."""
+    out = x.new_empty((x.shape[0], width))
+    for start in range(0, x.shape[0], _BATCH_PIECE):
+        stop = min(start + _BATCH_PIECE, x.shape[0])
+        out[start:stop] = fn(x[start:stop])
+    return out
+
+
+def _batch_piecewise(x: torch.Tensor) -> bool:
+    return bool(
+        x.ndim == 2
+        and 10 < x.shape[0] <= 64
+        and x.shape[0] % 5 == 0
+        and x.is_contiguous()
+    )
+
+
 def _qwen38_sm70_shared_up(
     x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
 ) -> torch.Tensor:
+    if packed is not None and _batch_piecewise(x) and x.shape[0] > 40:
+        return _in_pieces(
+            x, 160, lambda piece: _qwen38_sm70_shared_up(piece, weight, packed)
+        )
     if _shared_batch_runtime_ok(x) and packed is not None:
         out = x.new_empty((x.shape[0], 160))
         reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
@@ -374,7 +413,7 @@ def _router_batch_runtime_ok(x, packed) -> bool:
         mtp_batch_enabled("router_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and x.shape[0] in (5, 10)
+        and _verify_rows(x.shape[0])
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -404,6 +443,8 @@ def _qwen38_sm70_fp16_gemv(
         torch.ops._C.qwen38_dense_batch_sm70_out(out, x, weight)
         logger.info_once("SM70 Qwen3.8 exact small-batch dense projections enabled.")
         return out
+    # Above 40 rows the router falls through to cuBLAS (15 us at 80 rows),
+    # which beats 40-row pieces of the batch kernel (27 us).
     if role.endswith(_ROUTER_SUFFIX) and _router_batch_runtime_ok(x, packed_router):
         out = x.new_empty((x.shape[0], 512))
         torch.ops._C.qwen38_router_batch_sm70_out(out, x, packed_router)
@@ -523,7 +564,7 @@ def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
         # Let cuBLAS honor an explicit request for FP16 accumulation.
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 16
+        and 2 <= x.shape[0] <= _GDN_BATCH_ROWS
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16

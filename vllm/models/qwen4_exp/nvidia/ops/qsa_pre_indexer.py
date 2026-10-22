@@ -86,6 +86,7 @@ def _norm_rope(
         "num_state_blocks",
         "num_compressed_blocks",
         "num_k_work",
+        "cos_sin_rows",
     ]
 )
 def _qsa_pre_indexer_kernel(
@@ -97,6 +98,7 @@ def _qsa_pre_indexer_kernel(
     pos_stride_axis,
     pos_stride_token,
     cos_sin_ptr,
+    cos_sin_rows,
     q_norm_weight_ptr,
     k_norm_weight_ptr,
     eps,
@@ -316,6 +318,12 @@ def _qsa_pre_indexer_kernel(
                 cached_pos_t = tl.load(tail, mask=load_cached_position, other=0)
                 cached_pos_h = tl.load(tail + 1, mask=load_cached_position, other=0)
                 cached_pos_w = tl.load(tail + 2, mask=load_cached_position, other=0)
+                # The ring tail is the only cache content that becomes an
+                # address. Clamp it to the cos/sin table so a stale or foreign
+                # page yields a wrong row instead of an out-of-bounds read.
+                cached_pos_t = tl.minimum(tl.maximum(cached_pos_t, 0), cos_sin_rows - 1)
+                cached_pos_h = tl.minimum(tl.maximum(cached_pos_h, 0), cos_sin_rows - 1)
+                cached_pos_w = tl.minimum(tl.maximum(cached_pos_w, 0), cos_sin_rows - 1)
                 pos_t = tl.where(first_in_chunk, first_pos_t.to(tl.int64), cached_pos_t)
                 pos_h = tl.where(first_in_chunk, first_pos_h.to(tl.int64), cached_pos_h)
                 pos_w = tl.where(first_in_chunk, first_pos_w.to(tl.int64), cached_pos_w)
@@ -473,6 +481,7 @@ def qsa_pre_indexer(
         pos_stride_axis,
         pos_stride_token,
         cos_sin_cache,
+        cos_sin_cache.shape[0],
         q_norm_weight,
         k_norm_weight,
         eps,

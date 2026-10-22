@@ -146,3 +146,29 @@ def test_torch_post_saturates_a_float16_store():
 
     assert stored.dtype == torch.float16
     assert stored.float().abs().max() == FP16_MAX
+
+
+@pytest.mark.parametrize("num_tokens", TOKEN_COUNTS)
+@torch.inference_mode()
+def test_hc_head_saturates_a_float16_sink_row(num_tokens: int):
+    torch.manual_seed(0)
+    hs = (4 * torch.randn(num_tokens, HC_MULT, HIDDEN, device="cuda")).half()
+    hs[0] = 30000.0  # the four streams of the sink row add up past 65504
+    fn = 0.01 * torch.randn(HC_MULT, HC_MULT * HIDDEN, device="cuda")
+    hc_scale = torch.tensor([0.5], device="cuda")
+    # sigmoid(~3) ~ 0.95 per stream, so the sink row sums to ~114k.
+    hc_base = torch.full((HC_MULT,), 3.0, device="cuda")
+
+    out = mhc_tilelang.hc_head_fused_kernel_tilelang(
+        hs, fn, hc_scale, hc_base, EPS, EPS
+    )
+
+    x = hs.reshape(num_tokens, -1).float()
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
+    pre = torch.sigmoid((x @ fn.t()) * rsqrt * hc_scale + hc_base) + EPS
+    exact = torch.einsum("tm,tmh->th", pre, hs.float())
+    assert exact[0].abs().max() > FP16_MAX  # the case under test really overflows
+
+    assert torch.isfinite(out).all()
+    assert out[0].float().abs().max() == FP16_MAX
+    torch.testing.assert_close(out[1:].float(), exact[1:], atol=4e-3, rtol=2e-3)

@@ -1,0 +1,47 @@
+# Flash-Next (Qwen3.8 GGUF IQ3_S + MTP4 + vision) on 4x V100, 1Cat-vLLM SM70 build.
+# Build context: a directory holding the 1cat_vllm wheel, serve_flashnext_gguf_256k.sh,
+# expert_profile.pt, tools/ and this entrypoint saved as entrypoint.sh.
+# Torch cu128 wheels bundle the CUDA runtime libraries; the NVIDIA container
+# runtime injects the driver, so a plain Ubuntu base is enough.
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
+# python3.12 for the wheel; gcc for torch.compile/Triton host stubs; curl for the healthcheck.
+ARG APT_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ubuntu
+RUN sed -i "s|http://archive.ubuntu.com/ubuntu|$APT_MIRROR|g; s|http://security.ubuntu.com/ubuntu|$APT_MIRROR|g" \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev gcc g++ curl ca-certificates libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+COPY 1cat_vllm-*.whl /tmp/
+RUN pip install -U pip -i "$PIP_INDEX_URL" \
+    && pip install /tmp/1cat_vllm-*.whl -i "$PIP_INDEX_URL" \
+    && rm /tmp/1cat_vllm-*.whl
+# No GPU driver at build time: check the install without importing CUDA modules.
+RUN python -c "import importlib.metadata as m, importlib.util as u; \
+print(m.version('1cat-vllm')); assert u.find_spec('vllm._gguf_expert_cache_C')"
+
+WORKDIR /app
+COPY serve_flashnext_gguf_256k.sh expert_profile.pt entrypoint.sh /app/
+COPY tools /app/tools
+RUN chmod +x /app/*.sh
+
+# Mount points: models read-only, cache persistent (compile cache makes restarts fast).
+ENV MODEL_DIR=/models CACHE_DIR=/cache PORT=8000 HOST=0.0.0.0
+# Concurrent requests served by default; the launcher sizes its memory pools
+# for it (docker build --build-arg MAX_NUM_SEQS=4, or docker run -e).
+ARG MAX_NUM_SEQS=4
+ENV MAX_NUM_SEQS=${MAX_NUM_SEQS}
+VOLUME ["/cache"]
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=1800s --retries=3 \
+    CMD curl -sf -o /dev/null -H "Authorization: Bearer $VLLM_API_KEY" http://127.0.0.1:${PORT}/v1/models || exit 1
+ENTRYPOINT ["/app/entrypoint.sh"]

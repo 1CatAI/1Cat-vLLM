@@ -238,6 +238,11 @@ class PleOffloadLayer(nn.Module, ABC):
     """
 
     _is_cpu_offloaded = False
+    # Whether the forward gathers this instance's own rows and merges the
+    # worker's rows into them. Decided once by the guarded constructor while the
+    # engine config is current; the forward runs outside it, where
+    # offload_keeps_local_tables() can no longer tell.
+    _keeps_local_tables = False
     _gpu_output_buffer: torch.Tensor
     _sem: CpuGpuSemaphore
 
@@ -253,15 +258,17 @@ class PleOffloadLayer(nn.Module, ABC):
         def guarded_init(
             self: "PleOffloadLayer", *args: object, **kwargs: object
         ) -> None:
+            keeps_local_tables = self.offload_keeps_local_tables()
             if (
                 ple_offload_enabled()
                 and not ple_policy().hybrid
-                and not self.offload_keeps_local_tables()
+                and not keeps_local_tables
                 and not is_offload_process()
             ):
                 nn.Module.__init__(self)
                 return
             original_init(self, *args, **kwargs)
+            self._keeps_local_tables = keeps_local_tables
 
         cls.__init__ = guarded_init  # type: ignore[method-assign, assignment]
 
@@ -376,7 +383,7 @@ class PleOffloadLayer(nn.Module, ABC):
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
             if pinned:
                 return self.wait_offloaded_output(hidden_states, input_ids.shape[0])
-            if self.offload_keeps_local_tables():
+            if self._keeps_local_tables:
                 # The layer gathers its resident rows itself and merges the
                 # worker's rows through wait_offloaded_output.
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
