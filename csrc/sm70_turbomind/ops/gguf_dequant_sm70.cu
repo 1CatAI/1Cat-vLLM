@@ -162,11 +162,25 @@ void gguf_affine_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                   CUBLAS_TENSOR_OP_MATH |
                   CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)));
   const float alpha = 1.f, beta = 0.f;
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  // CUDA12.8's default NN heuristic is slower in this measured SM70 window.
+  // Keep FP32 accumulation and use the original policy outside the window.
+  const bool calibrated =
+      device->major == 7 && device->minor == 0 && m >= 6000 && m <= 6200 &&
+      k == 2560 &&
+      (n == 1536 || n == 3072 || n == 3328 || n == 3584 || n == 4096);
+  const auto algorithm =
+      calibrated ? CUBLAS_GEMM_ALGO3_TENSOR_OP : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   // Row-major X[M,K] * W[K,N] is column-major W[N,K] * X[K,M].
-  const auto status = cublasGemmEx(
+  auto status = cublasGemmEx(
       handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, scratch.data_ptr(),
       CUDA_R_16F, n, input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(),
-      CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      CUDA_R_16F, n, CUBLAS_COMPUTE_32F, algorithm);
+  if (calibrated && status == CUBLAS_STATUS_NOT_SUPPORTED)
+    status = cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha,
+                          scratch.data_ptr(), CUDA_R_16F, n, input.data_ptr(),
+                          CUDA_R_16F, k, &beta, out.data_ptr(), CUDA_R_16F, n,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   const auto restored = cublasSetMathMode(handle, saved_math);
   TORCH_CUDABLAS_CHECK(status);
   TORCH_CUDABLAS_CHECK(restored);

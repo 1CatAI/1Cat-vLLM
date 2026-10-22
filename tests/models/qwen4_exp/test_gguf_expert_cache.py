@@ -139,6 +139,240 @@ def test_prefill_bank_matches_and_interleaves_with_decode():
     assert cache.stats()["errors"] == 0
 
 
+@pytest.mark.parametrize("slack", [0.0, 0.25])
+def test_cold_stage_uses_snapshot_and_preserves_slot_offsets(slack):
+    cache, original = _cache(slack=slack)
+    generator = torch.Generator().manual_seed(9683)
+    try:
+        # Fill holes and exercise write-backs before taking the prefill snapshot.
+        for _ in range(10):
+            for layer in LAYERS:
+                cache.resolve(layer, _random_ids(generator, 5))
+        torch.accelerator.synchronize()
+        stream = torch.cuda.current_stream().cuda_stream
+        for i, layer in enumerate(LAYERS):
+            snapshot = torch.empty(2, EXPERTS, dtype=torch.int32, device="cuda")
+            cache.lane.residency(i, snapshot.data_ptr(), stream)
+            torch.accelerator.synchronize()
+            gpu_slots, host_slots = snapshot.cpu()
+            cold = torch.nonzero(gpu_slots < 0).flatten()
+            selected = host_slots[cold].long()
+            # Source selection must use the saved snapshot, not a later CPU map.
+            saved = cache.slot_of[i].clone()
+            cache.slot_of[i].fill_(0)
+            try:
+                for s, shard in enumerate(gguf_expert_cache.SHARDS):
+                    stage = torch.full_like(
+                        cache.host[layer, shard], 0xA5, device="cuda"
+                    )
+                    cache.lane.stage_cold(i, s, stage.data_ptr(), stream)
+                    torch.testing.assert_close(
+                        stage[selected], original[layer, shard][cold], rtol=0, atol=0
+                    )
+                    holes = torch.ones(cache.host_slots, dtype=torch.bool)
+                    holes[selected] = False
+                    assert (stage[holes] == 0xA5).all()
+            finally:
+                cache.slot_of[i].copy_(saved)
+    finally:
+        torch.accelerator.synchronize()
+        cache.close()
+
+
+@pytest.mark.parametrize("slack", [0.0, 0.25])
+@pytest.mark.parametrize("selection", ["empty", "sparse", "all"])
+@pytest.mark.parametrize("capture", [False, True])
+def test_selected_cold_stage_uses_snapshot_and_preserves_holes(
+    slack, selection, capture
+):
+    cache, original = _cache(slack=slack)
+    try:
+        generator = torch.Generator().manual_seed(9683)
+        for layer in LAYERS:
+            cache.resolve(layer, _random_ids(generator, 5))
+        torch.accelerator.synchronize()
+        stream = torch.cuda.current_stream().cuda_stream
+        for i, layer in enumerate(LAYERS):
+            snapshot = torch.empty(2, EXPERTS, dtype=torch.int32, device="cuda")
+            cache.lane.residency(i, snapshot.data_ptr(), stream)
+            gpu_slots, host_slots = snapshot.cpu()
+            selected = torch.zeros(EXPERTS, dtype=torch.bool)
+            if selection == "sparse":
+                selected[::3] = True
+            elif selection == "all":
+                selected.fill_(True)
+            cold = torch.nonzero((gpu_slots < 0) & selected).flatten()
+            host = host_slots[cold].long()
+            saved = cache.slot_of[i].clone()
+            cache.slot_of[i].fill_(0)
+            try:
+                for s, shard in enumerate(gguf_expert_cache.SHARDS):
+                    stage = torch.full_like(
+                        cache.host[layer, shard], 0xA5, device="cuda"
+                    )
+                    copy_stream = torch.cuda.Stream()
+                    copy_stream.wait_stream(torch.cuda.current_stream())
+                    if capture and len(cold):
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph, stream=copy_stream):
+                            cache.lane.stage_cold_selected(
+                                i,
+                                s,
+                                stage.data_ptr(),
+                                copy_stream.cuda_stream,
+                                selected,
+                            )
+                        graph.replay()
+                    else:
+                        cache.lane.stage_cold_selected(
+                            i, s, stage.data_ptr(), copy_stream.cuda_stream, selected
+                        )
+                        torch.cuda.current_stream().wait_stream(copy_stream)
+                    torch.testing.assert_close(
+                        stage[host],
+                        original[layer, shard][cold],
+                        rtol=0,
+                        atol=0,
+                    )
+                    holes = torch.ones(cache.host_slots, dtype=torch.bool)
+                    holes[host] = False
+                    assert (stage[holes] == 0xA5).all()
+            finally:
+                cache.slot_of[i].copy_(saved)
+    finally:
+        torch.accelerator.synchronize()
+        cache.close()
+
+
+def test_selected_cold_stage_rejects_invalid_masks():
+    cache, _ = _cache()
+    try:
+        cache.start()
+        stream = torch.cuda.current_stream().cuda_stream
+        stage = torch.empty_like(cache.host[LAYERS[0], "w1"], device="cuda")
+        masks = [
+            torch.zeros(EXPERTS, dtype=torch.int32),
+            torch.zeros(EXPERTS - 1, dtype=torch.bool),
+            torch.zeros(2, EXPERTS, dtype=torch.bool),
+            torch.zeros(EXPERTS * 2, dtype=torch.bool)[::2],
+            torch.zeros(EXPERTS, dtype=torch.bool, device="cuda"),
+        ]
+        for mask in masks:
+            with pytest.raises(RuntimeError, match="contiguous CPU bool"):
+                cache.lane.stage_cold_selected(0, 0, stage.data_ptr(), stream, mask)
+    finally:
+        torch.accelerator.synchronize()
+        cache.close()
+
+
+@pytest.mark.parametrize("slack", [0.0, 0.25])
+@pytest.mark.parametrize("batched", [False, True])
+def test_dma_prefill_admission_preserves_original_bytes_and_decode(slack, batched):
+    cache, original = _cache(slack=slack)
+    cache.start()
+    host_plans = torch.empty(
+        (len(LAYERS), cache.plan.numel()), dtype=torch.int32, pin_memory=True
+    )
+    plan = torch.empty_like(cache.plan)
+    temporary_bytes = (
+        8 * max(sum(cache.sizes[layer, s] for s in SHAPES) for layer in LAYERS)
+        if batched
+        else max(cache.sizes.values())
+    )
+    temporary = torch.empty(temporary_bytes, dtype=torch.uint8, device="cuda")
+    previous = torch.cuda.current_stream()
+    work = torch.cuda.Stream()
+    work.wait_stream(previous)
+    torch.cuda.set_stream(work)
+    generator = torch.Generator().manual_seed(9683)
+    try:
+        for step in range(16):
+            for i, layer in enumerate(LAYERS):
+                count = (0, 1, 7, 8, 9, 10, 48, cache.resident0)[step % 8]
+                ids_cpu = torch.randperm(EXPERTS, generator=generator)[:count].int()
+                ids = ids_cpu.cuda()
+                cache.lane.admit_prefill(
+                    i,
+                    ids_cpu,
+                    host_plans[i],
+                    plan,
+                    temporary,
+                    torch.cuda.current_stream().cuda_stream,
+                )
+                slots = torch.empty_like(ids)
+                gguf_expert_cache._remap[(1,)](
+                    ids,
+                    cache.table,
+                    plan,
+                    slots,
+                    i,
+                    count,
+                    EXPERTS=EXPERTS,
+                    BLOCK=max(32, 1 << (max(1, count) - 1).bit_length()),
+                    OPS=gguf_expert_cache._MAX_OPS,
+                )
+                _check_decode(cache, original, layer, ids, slots)
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(cache.table.cpu(), cache.slot_of, rtol=0, atol=0)
+            for i, layer in enumerate(LAYERS):
+                for shard in SHAPES:
+                    for mapping, bank in (
+                        (cache.slot_of[i], cache.bank(layer, shard)),
+                        (cache.host_slot_of[i], cache.host[layer, shard]),
+                    ):
+                        valid = torch.where(mapping >= 0)[0]
+                        torch.testing.assert_close(
+                            bank[mapping[valid].long()].cpu(),
+                            original[layer, shard][valid].cpu(),
+                            rtol=0,
+                            atol=0,
+                        )
+            # Ordinary GPU-polled decode reuses the same LRU state and plan.
+            for layer in LAYERS:
+                ids = _random_ids(generator, 5)
+                _check_decode(cache, original, layer, ids, cache.resolve(layer, ids))
+            torch.accelerator.synchronize()
+        assert cache.stats()["errors"] == 0
+    finally:
+        try:
+            torch.accelerator.synchronize()
+            cache.close()
+        finally:
+            torch.cuda.set_stream(previous)
+
+
+def test_dma_prefill_admission_rejects_invalid_storage_before_mutation():
+    cache, _ = _cache()
+    cache.start()
+    ids = torch.tensor([EXPERTS - 1], dtype=torch.int32)
+    host_plan = torch.empty_like(cache.reply, pin_memory=True)
+    plan = torch.empty_like(cache.plan)
+    temporary = torch.empty(max(cache.sizes.values()), dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.current_stream().cuda_stream
+    before = cache.slot_of.clone()
+    try:
+        for invalid in (
+            ids.long(),
+            ids.cuda(),
+            torch.tensor([-1], dtype=torch.int32),
+            torch.tensor([EXPERTS], dtype=torch.int32),
+            torch.arange(cache.resident0 + 1, dtype=torch.int32),
+        ):
+            with pytest.raises(RuntimeError, match="prefill.*(ids|id)"):
+                cache.lane.admit_prefill(0, invalid, host_plan, plan, temporary, stream)
+        for bad_host, bad_device, bad_temp in (
+            (torch.empty(host_plan.numel(), dtype=torch.int32), plan, temporary),
+            (host_plan, plan[:-1], temporary),
+            (host_plan, plan, temporary[:1]),
+        ):
+            with pytest.raises(RuntimeError, match="(plan|temporary)"):
+                cache.lane.admit_prefill(0, ids, bad_host, bad_device, bad_temp, stream)
+        torch.testing.assert_close(cache.slot_of, before, rtol=0, atol=0)
+    finally:
+        torch.accelerator.synchronize()
+        cache.close()
+
+
 HIDDEN, INTER, TOP_K = 256, 32, 10
 
 
@@ -154,10 +388,16 @@ def _iq4_nl_bank(generator, rows, k):
     return blocks.reshape(EXPERTS, rows, -1)
 
 
-def _turbomind_cache(fraction=0.75, spare=4, prefill_tokens=4096):
+def _turbomind_cache(
+    fraction=0.75,
+    spare=4,
+    prefill_tokens=4096,
+    prepare="all",
+    seed=7,
+):
     """IQ4_NL gate/up/down banks of real (decodable) GGUF blocks."""
     device = torch.device("cuda", torch.accelerator.current_device_index())
-    generator = torch.Generator().manual_seed(7)
+    generator = torch.Generator().manual_seed(seed)
     shapes = {"w1": (INTER, HIDDEN), "w3": (INTER, HIDDEN), "w2": (HIDDEN, INTER)}
     original = {
         (layer, shard): _iq4_nl_bank(generator, *shapes[shard])
@@ -182,6 +422,7 @@ def _turbomind_cache(fraction=0.75, spare=4, prefill_tokens=4096):
         expert_cache_profile=None,
         expert_cache_prefill="turbomind",
         expert_cache_prefill_tokens=prefill_tokens,
+        expert_cache_prefill_prepare=prepare,
     )
     cache = gguf_expert_cache.create_cache(banks, EXPERTS, config, device)
     for (layer, shard), bank in original.items():
@@ -269,3 +510,117 @@ def test_decode_does_not_deadlock_on_one_hardware_queue():
         text=True,
     )
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+@pytest.mark.parametrize("prepare", ["predict", "predict_resident"])
+def test_predictive_prefill_thresholds_misses_restart_and_decode(prepare):
+    cases = []
+    generator = torch.Generator(device="cuda").manual_seed(9683)
+    for index, rows in enumerate((4095, 4096, 4097, 8191, 8192, 8193)):
+        first = 0 if index % 2 == 0 else EXPERTS - 20
+        ids = (torch.arange(rows)[:, None] + torch.arange(TOP_K)) % 20 + first
+        ids = ids.to(device="cuda", dtype=torch.int32)
+        x = (
+            torch.randn(rows, HIDDEN, device="cuda", generator=generator) * 0.125
+        ).half()
+        weights = torch.randn(rows, TOP_K, device="cuda", generator=generator).softmax(
+            1
+        )
+        cases.append((x, ids, weights))
+    control, _ = _turbomind_cache()
+    references = []
+    try:
+        for x, ids, weights in cases:
+            references.append(
+                [control.prefill_moe(layer, x, ids, weights).cpu() for layer in LAYERS]
+            )
+    finally:
+        torch.accelerator.synchronize()
+        control.close()
+    cache, _ = _turbomind_cache(prepare=prepare)
+    assert cache.tm.preparation is not None
+    actuals = []
+    try:
+        for index, (x, ids, weights) in enumerate(cases):
+            if index == 2:
+                # A completely wrong prediction must be completed without
+                # depending on copied canonical bytes from the old pass.
+                torch.accelerator.synchronize()
+                helper = cache.tm.preparation
+                helper.host_hints.zero_()
+                helper.pending = None
+                cache.prefill_moe(LAYERS[0], x, ids, weights)  # interrupted pass
+            actuals.append(
+                [cache.prefill_moe(layer, x, ids, weights) for layer in LAYERS]
+            )
+            assert cache.tm.prediction_step == (4096 <= len(ids) <= 8192)
+        torch.accelerator.synchronize()
+        for actual, expected in zip(actuals, references):
+            for a, b in zip(actual, expected):
+                torch.testing.assert_close(a.cpu(), b, rtol=0, atol=0)
+        for layer in LAYERS:
+            cache.resolve(layer, torch.arange(EXPERTS - 32, EXPERTS, device="cuda"))
+        torch.accelerator.synchronize()
+        x, ids, weights = cases[4]
+        outputs = [cache.prefill_moe(layer, x, ids, weights) for layer in LAYERS]
+        # Teardown itself must drain mapped-host reads and pinned hint copies.
+        cache.close()
+        for actual, expected in zip(outputs, references[4]):
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        assert cache.host_arena is None and cache.tm.preparation is None
+    finally:
+        torch.accelerator.synchronize()
+        cache.close()
+
+
+def test_resident_prefill_fences_preexisting_decode_graph_after_interruption(
+    monkeypatch,
+):
+    cache, original = _turbomind_cache(prepare="predict_resident")
+    original = {key: value.cuda() for key, value in original.items()}
+    cache.start()
+    static = torch.arange(EXPERTS - 20, EXPERTS - 10, device="cuda", dtype=torch.int32)
+    for layer in LAYERS:
+        cache.resolve(layer, static)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            slots = [cache.resolve(layer, static) for layer in LAYERS]
+        helper = cache.tm.preparation
+        raw_read_done = torch.cuda.Event()
+        original_prefetch = cache.tm._prefetch
+
+        def delay_future_reader(key, i):
+            original_prefetch(key, i)
+            if key == "dn" and i == 1:
+                with torch.cuda.stream(cache.tm.cold_stream):
+                    torch.cuda._sleep(20000000)
+                    raw_read_done.record()
+
+        monkeypatch.setattr(cache.tm, "_prefetch", delay_future_reader)
+        # Make the completed hint disjoint from initial residents. The mask is
+        # only a hint: every actual prefill route still gets exact completion.
+        helper.host_hints.zero_()
+        helper.host_hints[:, :, EXPERTS - 20 :].fill_(True)
+        rows = 4096
+        ids = static.expand(rows, -1).contiguous()
+        x = (torch.randn(rows, HIDDEN, device="cuda") * 0.125).half()
+        weights = torch.full((rows, TOP_K), 0.1, device="cuda")
+        for _ in range(3):
+            # Delay the eager producer so graph replay must honor its external
+            # event; no host/device synchronization is inserted before replay.
+            with torch.cuda.stream(helper.admission_stream):
+                torch.cuda._sleep(20000000)
+            cache.prefill_moe(LAYERS[0], x, ids, weights)
+            graph.replay()
+            torch.cuda.current_stream().synchronize()
+            assert raw_read_done.query(), "decode replay overtook a raw reader"
+            for layer, mapped in zip(LAYERS, slots):
+                _check_decode(cache, original, layer, static, mapped)
+            static.copy_((static + 17) % EXPERTS)
+        assert cache.stats()["errors"] == 0
+    finally:
+        torch.accelerator.synchronize()
+        cache.close()

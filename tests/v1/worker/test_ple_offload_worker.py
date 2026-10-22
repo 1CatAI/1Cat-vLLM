@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import queue
+import threading
+import time
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1372,3 +1374,53 @@ def test_ple_registration_outlives_its_sender(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     assert "value=7 managers=0" in result.stdout, result.stdout + result.stderr
     assert "released" in result.stdout
+
+
+class _SlowStartContext:
+    """Spawn context whose Process.start blocks, like spawn pickling a large
+    config while the child imports vLLM."""
+
+    def __init__(self, delay: float, error: BaseException | None = None):
+        self.delay = delay
+        self.error = error
+        self.started = threading.Event()
+        real = ple_offload_worker.get_mp_context()
+        self.Pipe = real.Pipe
+
+    def Process(self, **kwargs):  # noqa: N802 - mirrors multiprocessing API
+        context = self
+
+        class _Proc:
+            def start(self) -> None:
+                time.sleep(context.delay)
+                if context.error is not None:
+                    raise context.error
+                context.started.set()
+
+            def is_alive(self) -> bool:
+                return False
+
+        return _Proc()
+
+
+def test_make_process_does_not_block_on_child_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _SlowStartContext(delay=0.5)
+    monkeypatch.setattr(ple_offload_worker, "get_mp_context", lambda: context)
+    begin = time.monotonic()
+    handle = ple_offload_worker.PleOffloadWorker.make_process(None, 1, "ipc://x")
+    assert time.monotonic() - begin < 0.25
+    assert not context.started.is_set()
+    handle.join_starter()
+    assert context.started.is_set()
+    handle.close()
+
+
+def test_wait_for_ready_reports_start_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _SlowStartContext(delay=0.0, error=OSError("spawn failed"))
+    monkeypatch.setattr(ple_offload_worker, "get_mp_context", lambda: context)
+    handle = ple_offload_worker.PleOffloadWorker.make_process(None, 1, "ipc://x")
+    with pytest.raises(RuntimeError, match="failed to start"):
+        ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
+    handle.close()

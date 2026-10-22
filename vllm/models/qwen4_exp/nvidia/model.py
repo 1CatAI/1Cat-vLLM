@@ -12,10 +12,12 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+from vllm.config.compilation import DynamicShapesType
 from vllm.config.execution_policy import communication_policy, graph_policy
 from vllm.config.sm70_sparse import sparse_policy
 from vllm.distributed import get_pp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -74,6 +76,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen4_exp import (
@@ -105,6 +108,13 @@ from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
 logger = init_logger(__name__)
+
+
+@torch.compiler.assume_constant_result
+def cublas_fp16_accumulation() -> bool:
+    """The process-wide cuBLAS FP16-accumulation flag, constant under Dynamo
+    (whose tracer cannot call its C getter)."""
+    return bool(torch.backends.cuda.matmul.allow_fp16_accumulation)
 
 
 def without_modelopt_fp4(
@@ -309,6 +319,17 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             include_fused=True,
         )
 
+    def forward_partials(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Leave large HC-prefill contributions separate until the row owner."""
+        router_logits = (
+            hidden_states
+            if self.experts.is_internal_router
+            else self.gate(hidden_states)[0]
+        )
+        return self.experts.forward_partials(hidden_states, router_logits)
+
 
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(
@@ -421,14 +442,21 @@ class Qwen4ExpDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        prev_block_output: torch.Tensor | None,
+        prev_block_output: torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor | None]
+        | None,
         prev_injection: torch.Tensor | None,
         positions: torch.Tensor,
         *,
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hc_sequence_parallel: bool = False,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
+        torch.Tensor,
+    ]:
         attn_hc = self.attn_hyper_connection
         if self.ple is not None:
             from .ple_layer import snapshot_ple_diagnostic
@@ -440,7 +468,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
             if prev_block_output is not None and prev_injection is not None:
-                hidden_states = attn_hc.combine(
+                combine = (
+                    attn_hc.sequence_parallel_combine
+                    if hc_sequence_parallel
+                    else attn_hc.combine
+                )
+                hidden_states = combine(
                     hidden_states, prev_block_output, prev_injection
                 )
                 prev_block_output = prev_injection = None
@@ -451,24 +484,34 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = hidden_states + self.ple(
+            ple_output = self.ple(
                 hidden_states,
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                **({"hc_sequence_parallel": True} if hc_sequence_parallel else {}),
             )
+            hidden_states = hidden_states + ple_output
             hidden_states = snapshot_ple_diagnostic(
                 hidden_states, self.ple.prefix + ":09_after_add", diagnostic
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None and prev_injection is not None:
-            hidden_states, block_input, injection = attn_hc.combine_and_mix(
+            combine_and_mix = (
+                attn_hc.sequence_parallel_combine_and_mix
+                if hc_sequence_parallel
+                else attn_hc.combine_and_mix
+            )
+            hidden_states, block_input, injection = combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
             )
         else:
-            hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+            mix = attn_hc.sequence_parallel_mix if hc_sequence_parallel else attn_hc.mix
+            hidden_states, block_input, injection = mix(hidden_states)
 
+        if hc_sequence_parallel:
+            block_input = block_input[: positions.shape[-1]]
         if self.layer_type == "linear_attention":
             use_direct_attention_output = (
                 communication_policy().long_prefill_norm
@@ -500,10 +543,25 @@ class Qwen4ExpDecoderLayer(nn.Module):
             raise ValueError("Invalid layer_type")
 
         mlp_hc = self.mlp_hyper_connection
-        hidden_states, block_input, injection = mlp_hc.combine_and_mix(
+        mlp_mix = (
+            mlp_hc.sequence_parallel_combine_and_mix
+            if hc_sequence_parallel
+            else mlp_hc.combine_and_mix
+        )
+        hidden_states, block_input, injection = mlp_mix(
             hidden_states, attn_out, injection
         )
-        mlp_out = self.mlp(block_input)
+        if hc_sequence_parallel:
+            block_input = block_input[: positions.shape[-1]]
+        mlp_out = (
+            self.mlp.forward_partials(block_input)
+            if (
+                hc_sequence_parallel
+                and isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
+                and getattr(self.mlp_hyper_connection, "_partial_inputs", False)
+            )
+            else self.mlp(block_input)
+        )
         return hidden_states, mlp_out, injection
 
 
@@ -738,6 +796,12 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+def _hc_sequence_rows(value: torch.Tensor) -> torch.Tensor:
+    from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+
+    return hc_sequence_shard_rows(value)
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -886,6 +950,7 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
+        hc_sequence_parallel: bool = False,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -894,6 +959,8 @@ class Qwen4ExpModel(nn.Module):
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
+            if hc_sequence_parallel:
+                hidden_states = _hc_sequence_rows(hidden_states)
             hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
@@ -915,6 +982,7 @@ class Qwen4ExpModel(nn.Module):
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+                hc_sequence_parallel=hc_sequence_parallel,
             )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
@@ -953,15 +1021,28 @@ class Qwen4ExpModel(nn.Module):
         # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
-        multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
+        final_mix = (
+            final_mixer.sequence_parallel_combine_and_mix
+            if hc_sequence_parallel
+            else final_mixer.combine_and_mix
+        )
+        multi_hidden, sample_hidden_states, _ = final_mix(
             hidden_states, block_output, injection
         )
+        if hc_sequence_parallel:
+            sample_hidden_states = sample_hidden_states[: positions.shape[-1]]
         if self._mtp_hidden_buffer is not None:
-            # Capture the pre-final-mixer multi-stream hidden state
-            # [T, hc_count*H] for the MTP drafter (zero extra compute:
-            # this tensor is needed by the final mixer regardless).
-            num_tokens = multi_hidden.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+            if hc_sequence_parallel:
+                from .sm70_hc_prefill_peer import hc_sequence_gather_into
+
+                hc_sequence_gather_into(
+                    self._mtp_hidden_buffer, multi_hidden, positions.shape[-1]
+                )
+            else:
+                # Capture the pre-final-mixer multi-stream hidden state for
+                # the drafter; decode keeps its original copy and graph.
+                num_tokens = multi_hidden.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1048,6 +1129,46 @@ class _Qwen4ExpDecodeGraphModel(nn.Module):
         )
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "query_start_loc": 0,
+        "ngram_context": 0,
+        "deepstack_input_embeds": 0,
+    }
+)
+class _Qwen4ExpPrefillSequenceModel(nn.Module):
+    """Independent compiled prefill view; weights/state keep their old owner."""
+
+    def __init__(self, *, target_model: Qwen4ExpModel, vllm_config: VllmConfig):
+        super().__init__()
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
+        deepstack_input_embeds: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self._target_model.forward(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            query_start_loc,
+            ngram_context,
+            deepstack_input_embeds,
+            hc_sequence_parallel=True,
+        )
+
+
 def _make_qwen38_decode_compile_config(vllm_config: VllmConfig) -> VllmConfig:
     """Build a small-shape compiler config without copying model state."""
     decode_config = copy.copy(vllm_config)
@@ -1130,6 +1251,33 @@ class Qwen4ExpForCausalLM(
             self, self.model_config.dtype, self.vllm_config
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+        object.__setattr__(self, "_hc_prefill_sequence_model", None)
+        self._hc_prefill_sequence_qualified = bool(
+            self.vllm_config.kernel_config.layer_execution.hc_prefill_sequence_parallel
+            and not is_offload_process()
+            and current_platform.is_device_capability(70)
+            and self.model_config.dtype == torch.float16
+            # The current accelerated consumer requires unreduced GGUF
+            # expert contributions. Other quantized runners retain the
+            # original backbone until their reduction contract is qualified.
+            and self.model_config.quantization == "gguf"
+            and (config.hc_count, config.hidden_size, config.hc_lowrank)
+            == (4, 2560, 320)
+            and self.vllm_config.kernel_config.hc_weight_storage == "sharded"
+            and self.vllm_config.kernel_config.sm70_hcx
+            and not self.vllm_config.kernel_config.sm70_hcx_diagnostics
+            and self.vllm_config.lora_config is None
+            and self.vllm_config.scheduler_config.max_num_seqs == 1
+            and self.vllm_config.compilation_config.dynamic_shapes_config.type
+            == DynamicShapesType.BACKED
+            and (
+                self.vllm_config.parallel_config.tensor_parallel_size,
+                self.vllm_config.parallel_config.pipeline_parallel_size,
+                self.vllm_config.parallel_config.decode_context_parallel_size,
+                self.vllm_config.parallel_config.prefill_context_parallel_size,
+            )
+            == (4, 1, 1, 1)
+        )
 
     def prepare_loaded_linear_weights(self) -> None:
         """Prepare dense routes discovered by checkpoint format loaders."""
@@ -1154,9 +1302,16 @@ class Qwen4ExpForCausalLM(
 
         prepare_sharded_hc_storage(self, self.vllm_config)
         if self.vllm_config.kernel_config.hc_weight_storage == "sharded":
-            # Return released replicated-bank pages before draft construction.
-            # This is a loading boundary, never an inference-time operation.
+            # Return released replicated-bank pages before native IPC allocation
+            # and draft construction. This is a loading boundary only.
             torch.accelerator.empty_cache()
+        if self._hc_prefill_sequence_qualified:
+            from .sm70_hc_prefill_peer import prepare_hc_prefill_peer_runtime
+
+            hc_device = self.model.layers[
+                self.model.start_layer
+            ].attn_hyper_connection.hc_norm.weight.device
+            prepare_hc_prefill_peer_runtime(self.vllm_config, hc_device)
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture.
@@ -1205,12 +1360,56 @@ class Qwen4ExpForCausalLM(
                     "SM70 Qwen3.8 decode graph compiler was not prepared"
                 )
             backbone = decode_backbone
-        return backbone(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
-            **kwargs,
+        sequence_parallel = self._use_hc_prefill_sequence_rows(
+            input_ids, inputs_embeds, intermediate_tensors, kwargs
+        )
+        if sequence_parallel:
+            logger.info_once(
+                "Using qualified TP4 HC prefill row owners with FP32 partial "
+                "communication; decode keeps its existing GEMM policy."
+            )
+            if self._hc_prefill_sequence_model is None:
+                config = copy.copy(self.vllm_config)
+                config.compilation_config = copy.copy(config.compilation_config)
+                config.compilation_config.cache_dir = ""
+                config.compilation_config.local_cache_dir = ""
+                config.compilation_config.traced_files = set()
+                with set_current_vllm_config(config):
+                    view = _Qwen4ExpPrefillSequenceModel(
+                        target_model=self.model, vllm_config=config
+                    )
+                object.__setattr__(self, "_hc_prefill_sequence_model", view)
+            backbone = self._hc_prefill_sequence_model
+        from .sm70_hcx import hc_prefill_sequence_parallel_context
+
+        with hc_prefill_sequence_parallel_context(sequence_parallel):
+            return backbone(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                **kwargs,
+            )
+
+    def _use_hc_prefill_sequence_rows(
+        self, input_ids, inputs_embeds, intermediate_tensors, kwargs
+    ) -> bool:
+        rows = (
+            input_ids.shape[0]
+            if input_ids is not None
+            else inputs_embeds.shape[0]
+            if inputs_embeds is not None
+            else 0
+        )
+        return bool(
+            getattr(self, "_hc_prefill_sequence_qualified", False)
+            and 4096 <= rows <= 16384
+            and intermediate_tensors is None
+            and kwargs.get("deepstack_input_embeds") is None
+            and (inputs_embeds is None or inputs_embeds.dtype == torch.float16)
+            and not cublas_fp16_accumulation()
+            and is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1561,6 +1760,9 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
+
+    def prepare_loaded_linear_weights(self) -> None:
+        self.language_model.prepare_loaded_linear_weights()
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)

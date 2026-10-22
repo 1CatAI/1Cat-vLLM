@@ -16,11 +16,20 @@ ROPE = {
 }
 
 
-def _configs(max_model_len, language_model_only=True):
+def _mm_config(language_model_only=True, videos=999):
+    return SimpleNamespace(
+        language_model_only=language_model_only,
+        get_limit_per_prompt=lambda modality: (
+            0 if language_model_only else {"video": videos}.get(modality, 999)
+        ),
+    )
+
+
+def _configs(max_model_len, language_model_only=True, videos=999):
     config = SimpleNamespace(max_position_embeddings=262144, rope_parameters=ROPE)
     model = SimpleNamespace(
         max_model_len=max_model_len,
-        multimodal_config=SimpleNamespace(language_model_only=language_model_only),
+        multimodal_config=_mm_config(language_model_only, videos),
     )
     return config, model
 
@@ -33,6 +42,13 @@ def test_text_only_mrope_cache_covers_exactly_the_engine_positions():
     assert _qsa_rope_cache_length(config, model) * 4 >= 1000
     config, model = _configs(262144, language_model_only=False)
     assert _qsa_rope_cache_length(config, model) == 262144
+
+
+def test_image_only_mrope_cache_is_bounded_like_text():
+    # Image positions advance at most one per token; only video can exceed
+    # max_model_len, so the vision wrapper without video keeps the short table.
+    config, model = _configs(262144, language_model_only=False, videos=0)
+    assert _qsa_rope_cache_length(config, model) == 65536
 
 
 def test_bounded_mrope_rows_match_the_full_cache(default_vllm_config):

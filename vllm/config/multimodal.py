@@ -155,6 +155,11 @@ class MultiModalConfig:
       DP (which is controlled by `--data-parallel-size`).
       This is only supported on a per-model basis and falls back to
       `"weights"` if the encoder does not support DP."""
+    mm_encoder_batch_size: int = Field(default=0, ge=0)
+    """Maximum media items per encoder forward, without limiting request items.
+    Zero keeps the existing unrestricted batching policy. Positive values bound
+    activation and input-transfer memory by splitting batches in input order.
+    """
     mm_encoder_attn_backend: AttentionBackendEnum | None = None
     """Optional override for the multi-modal encoder attention backend when
     using vision transformers. Accepts any value from
@@ -304,6 +309,8 @@ class MultiModalConfig:
             self.mm_encoder_attn_dtype,
             self.mm_encoder_fp8_scale_path,
         ]
+        if self.mm_encoder_batch_size and not self.language_model_only:
+            factors.append(("mm_encoder_batch_size", self.mm_encoder_batch_size))
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 

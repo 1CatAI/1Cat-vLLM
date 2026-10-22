@@ -11,8 +11,9 @@ static __device__ __forceinline__ void moe_q(
     scalar_t* __restrict__ dst, const int* __restrict__ sorted_token_ids,
     const int* __restrict__ expert_ids,
     const int* __restrict__ num_tokens_post_padded, const int exp_stride,
-    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y,
-    const int nrows_dst, const int top_k) {
+    const int num_experts, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst,
+    const int top_k) {
   const int blocks_per_row_x = ncols_x / qk;
   const int blocks_per_col_y = nrows_y / QK8_1;
   const int blocks_per_warp = WARP_SIZE_GGUF / qi;
@@ -30,10 +31,11 @@ static __device__ __forceinline__ void moe_q(
   }
 
   const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx > 255 || exp_idx < 0) return;
+  if (exp_idx >= num_experts || exp_idx < 0) return;
   if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
-  const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
+  const block_q_t* x =
+      (const block_q_t*)((char*)vx + int64_t(exp_idx) * exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);
 
   int* tile_x_ql = nullptr;
@@ -146,9 +148,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_0, 2)
     moe_q4_0(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q4_0;
   const int mmq_y = MOE_Y_Q4_0;
   const int nwarps = NWARPS_Q4_0;
@@ -157,16 +159,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_0, 2)
         allocate_tiles_q4_0<mmq_y>, load_tiles_q4_0<mmq_y, nwarps, need_check>,
         VDR_Q4_0_Q8_1_MMQ, vec_dot_q4_0_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q4_0_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   int mmq_x = MOE_X_Q4_0;
   int mmq_y = MOE_Y_Q4_0;
   int nwarps = NWARPS_Q4_0;
@@ -180,12 +184,14 @@ static void ggml_moe_q4_0_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q4_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q4_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -207,9 +213,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_1, 2)
     moe_q4_1(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q4_1;
   const int mmq_y = MOE_Y_Q4_1;
   const int nwarps = NWARPS_Q4_1;
@@ -218,16 +224,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_1, 2)
         allocate_tiles_q4_1<mmq_y>, load_tiles_q4_1<mmq_y, nwarps, need_check>,
         VDR_Q4_1_Q8_1_MMQ, vec_dot_q4_1_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q4_1_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   int mmq_x = MOE_X_Q4_1;
   int mmq_y = MOE_Y_Q4_1;
   int nwarps = NWARPS_Q4_1;
@@ -241,12 +249,14 @@ static void ggml_moe_q4_1_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q4_1<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q4_1<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -268,9 +278,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_0, 2)
     moe_q5_0(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q5_0;
   const int mmq_y = MOE_Y_Q5_0;
   const int nwarps = NWARPS_Q5_0;
@@ -279,16 +289,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_0, 2)
         allocate_tiles_q5_0<mmq_y>, load_tiles_q5_0<mmq_y, nwarps, need_check>,
         VDR_Q5_0_Q8_1_MMQ, vec_dot_q5_0_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q5_0_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   const int mmq_x = MOE_X_Q5_0;
   const int mmq_y = MOE_Y_Q5_0;
   const int nwarps = NWARPS_Q5_0;
@@ -302,12 +314,14 @@ static void ggml_moe_q5_0_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q5_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q5_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -329,9 +343,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_1, 2)
     moe_q5_1(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q5_1;
   const int mmq_y = MOE_Y_Q5_1;
   const int nwarps = NWARPS_Q5_1;
@@ -340,16 +354,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_1, 2)
         allocate_tiles_q5_1<mmq_y>, load_tiles_q5_1<mmq_y, nwarps, need_check>,
         VDR_Q5_1_Q8_1_MMQ, vec_dot_q5_1_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q5_1_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   const int mmq_x = MOE_X_Q5_1;
   const int mmq_y = MOE_Y_Q5_1;
   const int nwarps = NWARPS_Q5_1;
@@ -363,12 +379,14 @@ static void ggml_moe_q5_1_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q5_1<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q5_1<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -390,9 +408,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0, 2)
     moe_q8_0(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q8_0;
   const int mmq_y = MOE_Y_Q8_0;
   const int nwarps = NWARPS_Q8_0;
@@ -401,16 +419,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0, 2)
         allocate_tiles_q8_0<mmq_y>, load_tiles_q8_0<mmq_y, nwarps, need_check>,
         VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q8_0_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   const int mmq_x = MOE_X_Q8_0;
   const int mmq_y = MOE_Y_Q8_0;
   const int nwarps = NWARPS_Q8_0;
@@ -424,12 +444,14 @@ static void ggml_moe_q8_0_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q8_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q8_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -451,9 +473,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_K, 2)
     moe_q2_K(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q2_K;
   const int mmq_y = MOE_Y_Q2_K;
   const int nwarps = NWARPS_Q2_K;
@@ -462,16 +484,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_K, 2)
         allocate_tiles_q2_K<mmq_y>, load_tiles_q2_K<mmq_y, nwarps, need_check>,
         VDR_Q2_K_Q8_1_MMQ, vec_dot_q2_K_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q2_K_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   const int mmq_x = MOE_X_Q2_K;
   const int mmq_y = MOE_Y_Q2_K;
   const int nwarps = NWARPS_Q2_K;
@@ -485,12 +509,14 @@ static void ggml_moe_q2_K_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q2_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q2_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -512,9 +538,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q3_K, 2)
     moe_q3_K(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
 
   const int mmq_x = MOE_X_Q3_K;
   const int mmq_y = MOE_Y_Q3_K;
@@ -524,15 +550,17 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q3_K, 2)
         allocate_tiles_q3_K<mmq_y>, load_tiles_q3_K<mmq_y, nwarps, need_check>,
         VDR_Q3_K_Q8_1_MMQ, vec_dot_q3_K_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 template <typename scalar_t>
 static void ggml_moe_q3_K_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   const int mmq_x = MOE_X_Q3_K;
   const int mmq_y = MOE_Y_Q3_K;
   const int nwarps = NWARPS_Q3_K;
@@ -546,12 +574,14 @@ static void ggml_moe_q3_K_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q3_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q3_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -573,9 +603,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_K, 2)
     moe_q4_K(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q4_K;
   const int mmq_y = MOE_Y_Q4_K;
   const int nwarps = NWARPS_Q4_K;
@@ -584,16 +614,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_K, 2)
         allocate_tiles_q4_K<mmq_y>, load_tiles_q4_K<mmq_y, nwarps, need_check>,
         VDR_Q4_K_Q8_1_MMQ, vec_dot_q4_K_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q4_K_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   const int mmq_x = MOE_X_Q4_K;
   const int mmq_y = MOE_Y_Q4_K;
   const int nwarps = NWARPS_Q4_K;
@@ -607,12 +639,14 @@ static void ggml_moe_q4_K_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q4_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q4_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -634,9 +668,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_K, 2)
     moe_q5_K(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q5_K;
   const int mmq_y = MOE_Y_Q5_K;
   const int nwarps = NWARPS_Q5_K;
@@ -645,16 +679,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_K, 2)
         allocate_tiles_q5_K<mmq_y>, load_tiles_q5_K<mmq_y, nwarps, need_check>,
         VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q5_K_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   const int mmq_x = MOE_X_Q5_K;
   const int mmq_y = MOE_Y_Q5_K;
   const int nwarps = NWARPS_Q5_K;
@@ -668,12 +704,14 @@ static void ggml_moe_q5_K_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q5_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q5_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }
 
@@ -695,9 +733,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q6_K, 2)
     moe_q6_K(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
-             const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int exp_stride, const int num_experts, const int ncols_x,
+             const int nrows_x, const int ncols_y, const int nrows_y,
+             const int nrows_dst, const int top_k) {
   const int mmq_x = MOE_X_Q6_K;
   const int mmq_y = MOE_Y_Q6_K;
   const int nwarps = NWARPS_Q6_K;
@@ -706,16 +744,18 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q6_K, 2)
         allocate_tiles_q6_K<mmq_y>, load_tiles_q6_K<mmq_y, nwarps, need_check>,
         VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+      top_k);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q6_K_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int exp_stride, const int num_experts, const int ncols_x,
+    const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k, const int tokens_post_padded,
+    cudaStream_t stream) {
   const int mmq_x = MOE_X_Q6_K;
   const int mmq_y = MOE_Y_Q6_K;
   const int nwarps = NWARPS_Q6_K;
@@ -729,11 +769,13 @@ static void ggml_moe_q6_K_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q6_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   } else {
     constexpr bool need_check = true;
     moe_q6_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, num_experts, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
+        top_k);
   }
 }

@@ -229,6 +229,21 @@ class EagleSpeculator(TargetSamplingHooks):
 
         self.model = load_eagle_model(target_model, self.vllm_config)
         self._validate_local_argmax_reduction()
+        # A target that keeps the drafter's input hidden state in a persistent
+        # buffer of the same shape (e.g. HC multi-stream MTP input) is read in
+        # place instead of being copied into a second max-token buffer.
+        get_target_hidden = getattr(target_model, "get_mtp_target_hidden_states", None)
+        target_hidden = get_target_hidden() if get_target_hidden else None
+        if (
+            isinstance(target_hidden, torch.Tensor)
+            and target_hidden.shape == self.hidden_states.shape
+            and target_hidden.dtype == self.hidden_states.dtype
+            and target_hidden.device == self.hidden_states.device
+        ):
+            self.hidden_states = target_hidden
+        adopt = getattr(self.model, "adopt_target_buffers", None)
+        if adopt is not None:
+            adopt(target_model)
 
         draft_hf_config = self.draft_model_config.hf_config
         self.share_mtp_topk_indices = (
@@ -797,7 +812,8 @@ class EagleSpeculator(TargetSamplingHooks):
             )
         else:
             hidden_states = last_hidden_states
-        self.hidden_states[:num_tokens].copy_(hidden_states)
+        if hidden_states.data_ptr() != self.hidden_states.data_ptr():
+            self.hidden_states[:num_tokens].copy_(hidden_states)
 
         # Copy temperature, seeds, and idx mapping to the pre-allocated buffers.
         # NOTE(woosuk): For draft sampling, we only consider the temperature

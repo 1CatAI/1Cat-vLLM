@@ -454,6 +454,10 @@ class MambaSpecDecodeGPUContext:
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
+    # Speculative temporal states are committed by replay inside the GDN
+    # verifier: postprocess copies only conv states.
+    temporal_replay: bool = False
+
     @classmethod
     def create(
         cls,

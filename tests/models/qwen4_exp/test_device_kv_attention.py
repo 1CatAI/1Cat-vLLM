@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ops.device_kv_attention import (
+    PREFILL_ROWS,
     _direct_history_triton,
     initialize_device_history_attention,
+    prefill_history_workspace,
 )
 from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
 from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
@@ -259,3 +264,266 @@ def test_fp32_attention_oracle_aliases_masks_writes_and_graph(rows, dtype):
         graph.replay()
         torch.accelerator.synchronize()
         check()
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize(
+    "rows,width,capacity",
+    [
+        (1, 1, 48),
+        (5, 15, 48),
+        (5, 16, 48),
+        (5, 17, 48),
+        (5, 65, 128),
+        (20, 2051, 128),
+        (21, 2051, 128),
+        (32, 4096, 128),
+        (5, 2051, 32768),
+    ],
+)
+def test_encoded_hot_storage_operands_and_changed_graph(rows, width, capacity, native):
+    """Raw storage is exact; native attention keeps its existing FP16 gate."""
+    torch.manual_seed(73)
+    device = torch.device("cuda:0")
+    states = [
+        HostQSAKV(
+            2,
+            816,
+            256,
+            device,
+            width=width,
+            rows=rows,
+            hot_tokens=capacity,
+            direct_device=native,
+            hot_fp8=encoded,
+        )
+        for encoded in (False, True)
+    ]
+    key = torch.randn(1632, 1, 256, device=device, dtype=torch.float16)
+    value = torch.randn_like(key)
+    slots = torch.arange(1632, device=device)
+    for state in states:
+        state.write(key, value, slots)
+    indices = torch.arange(width, device=device, dtype=torch.int32).repeat(rows, 1)
+    if width > 1:
+        indices[:, -1] = -1
+    table = torch.tensor([[0, 1], [0, -1]], device=device, dtype=torch.int32)
+    requests = torch.arange(rows, device=device, dtype=torch.int32) % 2
+    if rows > 1:
+        requests[-1] = -1
+    positions = torch.full((rows,), 1540, device=device, dtype=torch.int64)
+    lengths = torch.tensor([1600, 1500], device=device, dtype=torch.int32)
+    query = torch.randn(rows, 6, 256, device=device, dtype=torch.float16)
+    gate = torch.randn_like(query)
+    outputs = [torch.empty_like(query) for _ in states]
+
+    def run():
+        for state, output in zip(states, outputs):
+            state.write(key[:2], value[:2], slots[:2])
+            host_qsa_attention(
+                query, state, indices, table, requests, positions, lengths, output, gate
+            )
+
+    def check():
+        assert all(torch.isfinite(output).all() for output in outputs)
+        torch.testing.assert_close(outputs[1], outputs[0], rtol=0.003, atol=0.0002)
+        assert torch.equal(states[0].host, states[1].host)
+        assert torch.equal(states[0].host_scales, states[1].host_scales)
+        for state in states:
+            pages = state.tags.flatten().cpu()
+            live = pages >= 0
+            if not live.any():
+                continue
+            slots_live = torch.arange(pages.numel())[live]
+            offsets = torch.arange(4)
+            tokens = (pages[live, None] * 4 + offsets).flatten().long()
+            cached_tokens = (slots_live[:, None] * 4 + offsets).flatten().long()
+            codes = state.host[tokens // 816, :, tokens % 816, 0]
+            scales = state.host_scales[tokens]
+            cache = state.hot_values[cached_tokens.to(device)].cpu()
+            if state.hot_fp8:
+                assert torch.equal(cache, codes)
+                cached_scales = state.hot_scales[cached_tokens.to(device)].cpu()
+                assert torch.equal(cached_scales, scales)
+            else:
+                decoded = (
+                    codes.view(torch.float8_e4m3fn).float() * scales[..., None]
+                ).half()
+                assert torch.equal(cache, decoded)
+            assert not (state.page_slots == -2).any()
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    value[:2].mul_(-0.125)
+    query.mul_(0.25)
+    positions.fill_(63)
+    for _ in range(3):
+        graph.replay()
+        torch.accelerator.synchronize()
+        check()
+
+
+def test_encoded_hot_fallback_without_new_native_op(monkeypatch):
+    importlib.import_module("vllm._sm70_qsa_device_C")
+    original = torch.ops.vllm_sm70_qsa_device
+    monkeypatch.setattr(
+        torch.ops,
+        "vllm_sm70_qsa_device",
+        SimpleNamespace(run_hot=original.run_hot),
+    )
+    state = HostQSAKV(
+        1,
+        64,
+        256,
+        torch.device("cuda:0"),
+        hot_tokens=64,
+        rows=1,
+        width=64,
+        hot_fp8=True,
+        direct_device=True,
+    )
+    assert state.device_history_workspace is None
+    assert state.device_history_reason == "native_encoded_hot_cache_unavailable"
+    key = torch.zeros(64, 1, 256, device="cuda", dtype=torch.float16)
+    state.write(key, torch.full_like(key, 3.25), torch.arange(64, device="cuda"))
+    query = torch.zeros(1, 6, 256, device="cuda", dtype=torch.float16)
+    output = torch.empty_like(query)
+    host_qsa_attention(
+        query,
+        state,
+        torch.arange(64, device="cuda", dtype=torch.int32)[None],
+        torch.zeros(1, 1, device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        torch.tensor([63], device="cuda", dtype=torch.int64),
+        torch.tensor([64], device="cuda", dtype=torch.int32),
+        output,
+    )
+    torch.testing.assert_close(output, torch.full_like(output, 3.25), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_native_hot_rejects_misaligned_storage(encoded):
+    importlib.import_module("vllm._sm70_qsa_device_C")
+    state = HostQSAKV(
+        1,
+        64,
+        256,
+        torch.device("cuda:0"),
+        width=16,
+        rows=1,
+        hot_tokens=16,
+        hot_fp8=encoded,
+        direct_device=True,
+    )
+    query = torch.zeros(1, 6, 256, device="cuda", dtype=torch.float16)
+    bad = torch.empty(16 * 512 + 1, device="cuda", dtype=state.hot_values.dtype)[1:]
+    bad = bad.view(16, 2, 256)
+    args = (
+        query,
+        state.history,
+        state.scales,
+        torch.arange(16, device="cuda", dtype=torch.int32)[None],
+        torch.zeros(1, 1, device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        torch.tensor([15], device="cuda", dtype=torch.int64),
+        torch.tensor([16], device="cuda", dtype=torch.int32),
+        torch.empty_like(query),
+        None,
+        *state.device_history_workspace,
+        bad,
+        torch.zeros(1, 16, device="cuda", dtype=torch.int32),
+    )
+    op = (
+        torch.ops.vllm_sm70_qsa_device.run_hot_fp8
+        if encoded
+        else torch.ops.vllm_sm70_qsa_device.run_hot
+    )
+    if encoded:
+        args += (state.hot_scales,)
+    with pytest.raises(RuntimeError, match="aligned vector loads"):
+        op(*args)
+
+
+@pytest.mark.parametrize("prefill_first", [False, True])
+def test_prefill_and_decode_share_native_workspace(monkeypatch, prefill_first):
+    import vllm.models.qwen4_exp.nvidia.ops.device_kv_attention as module
+
+    monkeypatch.setattr(module, "_WORKSPACES", {})
+    state = SimpleNamespace(
+        history=torch.empty(1, 2, 64, 1, 256, dtype=torch.float16, device="cuda"),
+        width=2051,
+        resolve_rows=32,
+        device_reference=True,
+        is_speculative_draft=False,
+    )
+    if prefill_first:
+        prefill = prefill_history_workspace(state)
+    initialize_device_history_attention(state, True)
+    decode = state.device_history_workspace
+    prefill = prefill_history_workspace(state)
+    assert prefill is decode
+    assert len(module._WORKSPACES) == 1
+    assert PREFILL_ROWS == 32
+    assert prefill[0].numel() >= 32 * 6 * 33 * 256
+    assert prefill[1].numel() >= 2 * 32 * 6 * 33
+
+
+@pytest.mark.parametrize("rows", [31, 32, 33, 64, 65])
+def test_prefill_workspace_reuse_preserves_tiled_output_and_graph(rows):
+    importlib.import_module("vllm._sm70_qsa_device_C")
+    torch.manual_seed(9683)
+    history = torch.randn(16, 2, 256, 1, 256, dtype=torch.float16, device="cuda")
+    state = SimpleNamespace(history=history, width=2051)
+    workspace = prefill_history_workspace(state)
+    elements = 64 * 6 * 33
+    old_workspace = (
+        torch.empty(elements * 256, dtype=torch.float32, device="cuda"),
+        torch.empty(2 * elements, dtype=torch.float32, device="cuda"),
+    )
+    query = torch.randn(rows, 6, 256, dtype=torch.float16, device="cuda")
+    gate = torch.randn_like(query)
+    table = torch.arange(16, dtype=torch.int32, device="cuda").repeat(2, 1)
+    requests = torch.arange(rows, dtype=torch.int32, device="cuda") % 2
+    requests[-1] = -1
+    positions = torch.full((rows,), 3790, dtype=torch.int64, device="cuda")
+    lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
+    groups = torch.randperm(947, device="cuda")[:512].int().sort().values
+    selected = (groups[:, None] * 4 + torch.arange(4, device="cuda")).flatten()
+    indices = torch.cat([selected, torch.tensor([3788, 3789, 3790], device="cuda")])
+    indices = indices.int().repeat(rows, 1)
+    scales = torch.ones(2, dtype=torch.float32, device="cuda")
+    actual, expected = torch.empty_like(query), torch.empty_like(query)
+
+    def run():
+        for output, scratch, step in (
+            (actual, workspace, PREFILL_ROWS),
+            (expected, old_workspace, 64),
+        ):
+            torch.ops.vllm_sm70_qsa_device.run_tiled(
+                query,
+                history,
+                scales,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                output,
+                gate,
+                *scratch,
+                step,
+            )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        query.mul_(0.75)
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.isfinite(actual).all()
+        assert torch.equal(actual, expected)

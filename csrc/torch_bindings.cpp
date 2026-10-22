@@ -123,7 +123,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "sm70_gdn_verify_out(Tensor qkv, Tensor a, Tensor b, Tensor A_log, "
       "Tensor dt_bias, Tensor(a!) state, Tensor(b!) o, Tensor cu, Tensor idx, "
       "Tensor? nacc, int H, int HV, float scale, int cfg, Tensor? rbuf, "
-      "Tensor? rn, Tensor? ctr, int tmax) -> ()");
+      "Tensor? rn, Tensor? ctr, int tmax, Tensor? rmap=None, "
+      "Tensor? ckt=None, Tensor? cks=None) -> ()");
   ops.impl("sm70_gdn_verify_out", torch::kCUDA, &sm70_gdn_verify_out);
   ops.def(
       "qsa_dense_decode_sm70_out(Tensor(a!) out, Tensor query, Tensor "
@@ -219,6 +220,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("ple_fast_lane_stats", &ple_fast_lane_stats);
   ops.def("ple_fast_lane_stop(int handle) -> ()");
   ops.impl("ple_fast_lane_stop", &ple_fast_lane_stop);
+  // GGUF -> dense_mv (dmv13) decode+pack on the host (startup weight prep).
+  ops.def(
+      "gguf_dmv13_decode_pack(Tensor raw, int gtype, int num_threads) -> "
+      "Tensor[]");
+  ops.impl("gguf_dmv13_decode_pack", torch::kCPU, &gguf_dmv13_decode_pack);
 
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
 #ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C
@@ -432,6 +438,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int lanes_per_row=16, bool bank_aware=False) -> ()");
   ops.impl("gguf_dp4a_gate_up_sm70_out", torch::kCUDA,
            &gguf_dp4a_gate_up_sm70_out);
+  ops.def(
+      "gguf_dp4a_gate_up_grouped_sm70_out(Tensor(a!) out, Tensor activation, "
+      "Tensor ids, Tensor gate, Tensor up, int source_type, "
+      "bool bank_aware=False, int per_cta=8) -> ()");
+  ops.impl("gguf_dp4a_gate_up_grouped_sm70_out", torch::kCUDA,
+           &gguf_dp4a_gate_up_grouped_sm70_out);
   ops.def(
       "gguf_dp4a_lut4_gate_up_sm70_out(Tensor(a!) out, Tensor activation, "
       "Tensor ids, Tensor gate, Tensor gate_stats, Tensor up, Tensor up_stats, "

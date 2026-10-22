@@ -39,6 +39,85 @@ from vllm.v1.worker.block_table import get_block_table_width
 logger = init_logger(__name__)
 
 
+# Shared host pools stay mapped and registered for the worker's lifetime.
+_SHARED_HOST_POOLS: list[Any] = []
+
+
+def _shared_replica_host_pool(pool_size: int, device: torch.device):
+    """One host KV pool per replicated KV head instead of one per TP rank.
+
+    With fewer KV heads than TP ranks, consecutive ranks hold the same KV head
+    and write identical history. Those ranks map one shared-memory pool and
+    register it with CUDA, which divides host KV memory by the replication.
+    Returns None (private pool) when the layout does not replicate heads or
+    the ranks cannot share host memory.
+    """
+    import mmap
+    import os
+    import uuid
+
+    import torch.distributed as dist
+
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.distributed.parallel_state import get_tp_group
+
+    config = get_current_vllm_config_or_none()
+    if config is None or not getattr(
+        config.kernel_config, "qsa_host_kv_share_replicas", True
+    ):
+        return None
+    parallel = config.parallel_config
+    tp = parallel.tensor_parallel_size
+    if parallel.pipeline_parallel_size != 1 or parallel.data_parallel_size != 1:
+        return None
+    try:
+        kv_heads = config.model_config.get_total_num_kv_heads()
+    except Exception:  # noqa: BLE001 - models without a KV head count
+        return None
+    if tp <= 1 or kv_heads >= tp or tp % kv_heads:
+        return None
+    group = get_tp_group()
+    replicas = tp // kv_heads
+    rank = group.rank_in_group
+    leader = rank % replicas == 0
+    tokens = [uuid.uuid4().hex if rank == 0 else None]
+    dist.broadcast_object_list(tokens, src=group.ranks[0], group=group.cpu_group)
+    path = f"/dev/shm/vllm-host-kv-{tokens[0]}-{rank // replicas}"
+    try:
+        if leader:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.ftruncate(fd, pool_size)
+            os.close(fd)
+        ok = True
+    except OSError:
+        ok = False
+    flags = [None] * group.world_size
+    dist.all_gather_object(flags, ok, group=group.cpu_group)
+    if not all(flags):
+        if leader and ok:
+            os.unlink(path)
+        return None
+    fd = os.open(path, os.O_RDWR)
+    shared = mmap.mmap(fd, pool_size, mmap.MAP_SHARED)
+    os.close(fd)
+    dist.barrier(group=group.cpu_group)
+    if leader:
+        os.unlink(path)
+    from vllm.model_executor.layers.quantization.gguf_expert_cache import _native
+
+    host = torch.frombuffer(shared, dtype=torch.int8)
+    native = _native()
+    native.host_register(host.data_ptr(), pool_size)
+    view = native.mapped_view(host, device.index)
+    _SHARED_HOST_POOLS.append((shared, host, view))
+    logger.info(
+        "Host KV pool shared by %d TP ranks per KV head (%s per pool).",
+        replicas,
+        format_gib(pool_size),
+    )
+    return view
+
+
 def allocate_host_kv_cache_pool(
     kv_cache_config: KVCacheConfig, device: torch.device
 ) -> dict[str, torch.Tensor]:
@@ -61,15 +140,18 @@ def allocate_host_kv_cache_pool(
         pool_size,
         len(banks),
     )
-    with torch.accelerator.device_index(device.index):
-        # A pageable source makes the view helper cudaHostAlloc exactly
-        # pool_size bytes. The caching pinned allocator would round this one
-        # allocation up to a power of two (2.3 GB -> 4 GiB per worker). The
-        # untouched source pages are never resident; zero the pool on device.
-        host = torch.empty(pool_size, dtype=torch.int8, device="cpu")
-        pool = get_accelerator_view_from_cpu_tensor(host)
-        del host
-        pool.zero_()
+    pool = _shared_replica_host_pool(pool_size, device)
+    if pool is None:
+        with torch.accelerator.device_index(device.index):
+            # A pageable source makes the view helper cudaHostAlloc exactly
+            # pool_size bytes. The caching pinned allocator would round this
+            # one allocation up to a power of two (2.3 GB -> 4 GiB per worker).
+            # The untouched source pages are never resident; zero the pool on
+            # device.
+            host = torch.empty(pool_size, dtype=torch.int8, device="cpu")
+            pool = get_accelerator_view_from_cpu_tensor(host)
+            del host
+            pool.zero_()
     tensors: dict[str, torch.Tensor] = {}
     offset = 0
     for bank, aligned_size in zip(banks, aligned_sizes):
