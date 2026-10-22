@@ -1334,7 +1334,6 @@ first-choice second. Expensive long quality follows a candidate that passes
 both this gain screen and the objective; smaller gains first guide further
 critical-path work rather than another PR update.
 
-
 ### Local peer result, dynamic compilation and rejected DMA schedules
 
 The first checkpoint peer run (`hcpeer8192`) passes the 32K retrieval/arithmetic,
@@ -1401,7 +1400,6 @@ screen before rejecting or integrating this transport. This screen remains
 outside runtime source. Artifacts: `logs/moe-priority.json`, `moe-banks.json`,
 `qsa-tiles.json`, `hc-peer-gather.json`, `hcpeer-dynamic8192-measure.json`,
 `hcpeer-dynamic8192-attribution.json`, retained exits/logs and owned GPU records.
-
 
 ### Rejected local shared-head QSA and peer launch/row-tile screens
 
@@ -1657,6 +1655,7 @@ codec lies outside its declared lattice subset and rejects. Partial completed
 case evidence is retained; the reproducer now skips unqualified codecs rather
 than misidentifying that failure as a model/kernel regression. No serving
 native or registry changes are made.
+
 ### Continued full-prefill optimization (2026-10-15, local)
 
 The target is now 8,000 actual prompt tokens/client TTFT second. About 34.6K
@@ -2089,7 +2088,7 @@ converted from original GPU slots/mapped host storage. The native lane's new
 stage_cold_selected uses the same mutex/residency snapshot/slot offsets as full
 DMA. Close drains mapped reads before host unregister. Eager SM70 batches
 4096--8192 and<=512 experts qualify; graph capture and other batches fall back.
-No _C/QSA replacement or private serving library is required. Existing helper
+No_C/QSA replacement or private serving library is required. Existing helper
 builds normally from packaged source in the task's standard Torch cache.
 
 Two config/hash/serialization checks pass. Ten GPU contracts pass in32.57 s,
@@ -2221,7 +2220,7 @@ cache and a separate candidate cache. Runtime files are frozen throughout;
 the installed native_C stays5d389732... and QSAcf09ff3f... . The next dense
 algorithm window exists in source but is inactive in this retained native_C;
 neither dense calibration nor native installation changes during this LRU A/B.
-Both arms use this same installed artifact. A fresh ordinary CMake _C build,
+Both arms use this same installed artifact. A fresh ordinary CMake_C build,
 from the owned source and copied declared dependency sources, proceeds on
 separate CPU cores. It is not installed until this A/B ends and affected GPU
 qualification can run. No private probe or historical CMake _C is deployed.
@@ -2355,6 +2354,7 @@ CPU-only; the critical observed rank isTP3. Direct HC kernel attribution fixes
 missing parent scopes for _prepare_row/_peer_combine_norm in the new trace.
 
 Five research decisions follow the source-frozen model cohort:
+
 - Shared decoded-B gate/up is exact but~10x slower (local arrays/extra shared
   staging); reject. M64N128 with one M warp is only2--3% better; keep unpromoted.
 - FP32 fused down+route reduction passes every unchanged numeric check but
@@ -2441,8 +2441,6 @@ column.02934), yet FP32/half complete chains regress~7--21%:e.g.layer0first
 no full-model quality run or native integration is justified. Raw:
 moe-real-fused-whole.json. No further atomic dtype/tile grid is warranted.
 
-
-
 ### Whole-path followups after the6708 tok/s cohort
 
 The latest candidate Torch traces contain no GPU activities on any rank; both
@@ -2498,7 +2496,6 @@ not sent to the GPU. K32 bounds operand live ranges; M16/N320(two warps) uses
 the existing lattice decoder, FP32 MMA and gated epilogue. Numerical and complete-
 chain speed checks are pending after the owned model profile. No serving source
 or installed native changes are made while the trace cohort is frozen.
-
 
 ### Complete four-rank critical path and rejected column-streaming promotion
 
@@ -2703,8 +2700,8 @@ evidence are required before further speed promotion.
 The normal29-object_C_stable_libtorch build is complete. Standard CMake
 installation stages it without runtime overrides; publication replaces the
 owned checkout file atomically so existing foreign processes retain their
-old mapped inode. Active stable DSO SHA256d3dd92653fe967054e9a6a09f3e7b9ede
-4a1409021d7921cf1fe7cf5a7b2a702;ordinary_C518957... and QSAcf09ff... stay
+old mapped inode. Active stable DSO SHA256
+`d3dd92653fe967054e9a6a09f3e7b9ede4a1409021d7921cf1fe7cf5a7b2a702`;ordinary_C518957... and QSAcf09ff... stay
 unchanged. The capacity regression passes10 tests on each of four GPUs in
 ~6.25s, including six Q8/Q4 graph cases and prior Q8 byte/vector tests.
 

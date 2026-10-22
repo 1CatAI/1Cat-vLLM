@@ -360,4 +360,4 @@ class PredictivePrefillPreparation:
         if self.started:
             # Mapped-host reads and pinned hint transfers must finish before
             # either arena is released. This runs only during cache teardown.
-            torch.cuda.synchronize(self.cache.device)
+            torch.accelerator.synchronize(self.cache.device)

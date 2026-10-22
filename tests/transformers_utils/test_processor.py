@@ -70,6 +70,7 @@ def test_get_processor_kwargs_from_processor_module_scan_returns_full_union():
 class _FakeProcessor:
     attributes = ["image_processor", "tokenizer"]
     calls: list[dict] = []
+    tokenizer: object = None
 
     @classmethod
     def from_pretrained(cls, name, *args, **kwargs):

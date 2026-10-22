@@ -118,7 +118,7 @@ def test_mmq_expert_capacity_graph_replay(weight_type, experts, selected):
 
     for _ in range(3):
         run()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = run()

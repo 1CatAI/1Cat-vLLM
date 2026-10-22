@@ -8,7 +8,6 @@ private kernel/provider factories are used.
 """
 
 import argparse
-import base64
 import hashlib
 import io
 import json
@@ -16,6 +15,7 @@ import random
 from pathlib import Path
 
 import numpy as np
+import pybase64 as base64
 from measure_prefill import WORDS, request
 from quality import EXPECTED
 from quality import prompt as quality_prompt

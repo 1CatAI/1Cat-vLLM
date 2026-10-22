@@ -190,7 +190,7 @@ def test_selected_cold_stage_uses_snapshot_and_preserves_holes(
         generator = torch.Generator().manual_seed(9683)
         for layer in LAYERS:
             cache.resolve(layer, _random_ids(generator, 5))
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         stream = torch.cuda.current_stream().cuda_stream
         for i, layer in enumerate(LAYERS):
             snapshot = torch.empty(2, EXPERTS, dtype=torch.int32, device="cuda")
@@ -240,7 +240,7 @@ def test_selected_cold_stage_uses_snapshot_and_preserves_holes(
             finally:
                 cache.slot_of[i].copy_(saved)
     finally:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         cache.close()
 
 
@@ -261,7 +261,7 @@ def test_selected_cold_stage_rejects_invalid_masks():
             with pytest.raises(RuntimeError, match="contiguous CPU bool"):
                 cache.lane.stage_cold_selected(0, 0, stage.data_ptr(), stream, mask)
     finally:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         cache.close()
 
 
@@ -312,7 +312,7 @@ def test_dma_prefill_admission_preserves_original_bytes_and_decode(slack, batche
                     OPS=gguf_expert_cache._MAX_OPS,
                 )
                 _check_decode(cache, original, layer, ids, slots)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             torch.testing.assert_close(cache.table.cpu(), cache.slot_of, rtol=0, atol=0)
             for i, layer in enumerate(LAYERS):
                 for shard in SHAPES:
@@ -331,11 +331,11 @@ def test_dma_prefill_admission_preserves_original_bytes_and_decode(slack, batche
             for layer in LAYERS:
                 ids = _random_ids(generator, 5)
                 _check_decode(cache, original, layer, ids, cache.resolve(layer, ids))
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         assert cache.stats()["errors"] == 0
     finally:
         try:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             cache.close()
         finally:
             torch.cuda.set_stream(previous)
@@ -369,7 +369,7 @@ def test_dma_prefill_admission_rejects_invalid_storage_before_mutation():
                 cache.lane.admit_prefill(0, ids, bad_host, bad_device, bad_temp, stream)
         torch.testing.assert_close(cache.slot_of, before, rtol=0, atol=0)
     finally:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         cache.close()
 
 
@@ -535,7 +535,7 @@ def test_predictive_prefill_thresholds_misses_restart_and_decode(prepare):
                 [control.prefill_moe(layer, x, ids, weights).cpu() for layer in LAYERS]
             )
     finally:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         control.close()
     cache, _ = _turbomind_cache(prepare=prepare)
     assert cache.tm.preparation is not None
@@ -545,7 +545,7 @@ def test_predictive_prefill_thresholds_misses_restart_and_decode(prepare):
             if index == 2:
                 # A completely wrong prediction must be completed without
                 # depending on copied canonical bytes from the old pass.
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 helper = cache.tm.preparation
                 helper.host_hints.zero_()
                 helper.pending = None
@@ -554,13 +554,13 @@ def test_predictive_prefill_thresholds_misses_restart_and_decode(prepare):
                 [cache.prefill_moe(layer, x, ids, weights) for layer in LAYERS]
             )
             assert cache.tm.prediction_step == (4096 <= len(ids) <= 8192)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         for actual, expected in zip(actuals, references):
             for a, b in zip(actual, expected):
                 torch.testing.assert_close(a.cpu(), b, rtol=0, atol=0)
         for layer in LAYERS:
             cache.resolve(layer, torch.arange(EXPERTS - 32, EXPERTS, device="cuda"))
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         x, ids, weights = cases[4]
         outputs = [cache.prefill_moe(layer, x, ids, weights) for layer in LAYERS]
         # Teardown itself must drain mapped-host reads and pinned hint copies.
@@ -569,7 +569,7 @@ def test_predictive_prefill_thresholds_misses_restart_and_decode(prepare):
             torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
         assert cache.host_arena is None and cache.tm.preparation is None
     finally:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         cache.close()
 
 
@@ -582,7 +582,7 @@ def test_resident_prefill_fences_preexisting_decode_graph_after_interruption(
     static = torch.arange(EXPERTS - 20, EXPERTS - 10, device="cuda", dtype=torch.int32)
     for layer in LAYERS:
         cache.resolve(layer, static)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     try:
@@ -622,5 +622,5 @@ def test_resident_prefill_fences_preexisting_decode_graph_after_interruption(
             static.copy_((static + 17) % EXPERTS)
         assert cache.stats()["errors"] == 0
     finally:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         cache.close()

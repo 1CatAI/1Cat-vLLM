@@ -48,12 +48,18 @@ struct Layout {
 
 Layout layout_of(int64_t gtype) {
   switch (gtype) {
-    case T_Q4_K: return {Q4K, 32, 144, 256};
-    case T_Q5_K: return {Q5K, 32, 176, 256};
-    case T_Q6_K: return {Q6K, 16, 210, 256};
-    case T_IQ4_XS: return {LUT4, 32, 136, 256};
-    case T_IQ4_NL: return {LUT4, 32, 18, 32};
-    case T_Q8_0: return {Q8, 32, 34, 32};
+    case T_Q4_K:
+      return {Q4K, 32, 144, 256};
+    case T_Q5_K:
+      return {Q5K, 32, 176, 256};
+    case T_Q6_K:
+      return {Q6K, 16, 210, 256};
+    case T_IQ4_XS:
+      return {LUT4, 32, 136, 256};
+    case T_IQ4_NL:
+      return {LUT4, 32, 18, 32};
+    case T_Q8_0:
+      return {Q8, 32, 34, 32};
   }
   TORCH_CHECK(false, "dmv13 pack: unsupported GGUF type ", gtype);
 }
@@ -102,7 +108,8 @@ void decode_row(const uint8_t* row, int64_t nb, const Layout& L, uint8_t* q,
         const uint8_t *ql = b, *qh = b + 128;
         const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192);
         const float d = f16_to_f32(b + 208);
-        for (int j = 0; j < 16; ++j) s[bi * 16 + j] = d * static_cast<float>(sc[j]);
+        for (int j = 0; j < 16; ++j)
+          s[bi * 16 + j] = d * static_cast<float>(sc[j]);
         for (int n = 0; n < 2; ++n) {
           const uint8_t *low = ql + 64 * n, *h = qh + 32 * n;
           uint8_t* o = qb + 128 * n;
@@ -154,8 +161,8 @@ void decode_row(const uint8_t* row, int64_t nb, const Layout& L, uint8_t* q,
 // Returns (codes, high, scale) uint8 tensors, as gguf_dmv13_dense.pack(
 // *decode(raw, gtype)); LUT4 scales are compacted like compact_lut4_scale.
 std::vector<torch::Tensor> gguf_dmv13_decode_pack(torch::Tensor raw,
-                                                   int64_t gtype,
-                                                   int64_t num_threads) {
+                                                  int64_t gtype,
+                                                  int64_t num_threads) {
   TORCH_CHECK(raw.device().is_cpu() && raw.scalar_type() == at::kByte &&
                   raw.dim() == 2 && raw.is_contiguous(),
               "dmv13 pack expects a contiguous 2-D uint8 CPU tensor");
@@ -166,17 +173,20 @@ std::vector<torch::Tensor> gguf_dmv13_decode_pack(torch::Tensor raw,
   const int64_t K = nb * L.block_elems;
   const int64_t T = (N + 31) / 32, S = (K + 31) / 32, G = (S + 3) / 4,
                 Sp = G * 4;
-  const int64_t spg = 32 / L.gs;      // scales per 32-wide step
-  const int64_t ns = K / L.gs;        // scales per row
+  const int64_t spg = 32 / L.gs;  // scales per 32-wide step
+  const int64_t ns = K / L.gs;    // scales per row
   const bool has_m = L.fmt == Q4K || L.fmt == Q5K;
 
   const int64_t code_words = (L.fmt == Q8 ? 8 : 4);
   auto u8 = torch::TensorOptions().dtype(at::kByte);
   torch::Tensor codes = torch::empty({T * Sp * 32 * code_words * 4}, u8);
   torch::Tensor high;
-  if (L.fmt == Q5K) high = torch::empty({T * G * 32 * 4 * 4}, u8);
-  else if (L.fmt == Q6K) high = torch::empty({T * G * 2 * 32 * 4 * 4}, u8);
-  else high = torch::empty({0}, u8);
+  if (L.fmt == Q5K)
+    high = torch::empty({T * G * 32 * 4 * 4}, u8);
+  else if (L.fmt == Q6K)
+    high = torch::empty({T * G * 2 * 32 * 4 * 4}, u8);
+  else
+    high = torch::empty({0}, u8);
   const int64_t scale_words = L.fmt == LUT4 ? 2 : 4;
   torch::Tensor scale = torch::empty({T * G * 32 * scale_words * 4}, u8);
 
@@ -234,7 +244,8 @@ std::vector<torch::Tensor> gguf_dmv13_decode_pack(torch::Tensor raw,
           for (int c = 0; c < 4; ++c)
             for (int j = 0; j < 4; ++j) {
               w |= uint32_t((Q[8 * c + 2 * j] >> 4) & 1) << (4 * c + j);
-              w |= uint32_t((Q[8 * c + 2 * j + 1] >> 4) & 1) << (16 + 4 * c + j);
+              w |= uint32_t((Q[8 * c + 2 * j + 1] >> 4) & 1)
+                   << (16 + 4 * c + j);
             }
           H[((t * G + g) * 32 + lane) * 4 + s4] = w;  // (T, G, L, 4)
         } else if (L.fmt == Q6K) {
@@ -243,7 +254,8 @@ std::vector<torch::Tensor> gguf_dmv13_decode_pack(torch::Tensor raw,
             for (int j = 0; j < 4; ++j) {
               const int p = 2 * (4 * (c & 1) + j);
               w[c >> 1] |= uint32_t((Q[8 * c + 2 * j] >> 4) & 3) << p;
-              w[c >> 1] |= uint32_t((Q[8 * c + 2 * j + 1] >> 4) & 3) << (16 + p);
+              w[c >> 1] |= uint32_t((Q[8 * c + 2 * j + 1] >> 4) & 3)
+                           << (16 + p);
             }
           // H (T, L, Sp, 2) viewed as (T, L, G, 2, 4) -> (T, G, a, L, b)
           for (int half = 0; half < 2; ++half) {
@@ -265,8 +277,8 @@ std::vector<torch::Tensor> gguf_dmv13_decode_pack(torch::Tensor raw,
         }
         if (L.fmt == LUT4) {
           // compact_lut4_scale: four duplicated halves -> two half2 words.
-          uint16_t* out = reinterpret_cast<uint16_t*>(
-              &SC[((t * G + g) * 32 + lane) * 2]);
+          uint16_t* out =
+              reinterpret_cast<uint16_t*>(&SC[((t * G + g) * 32 + lane) * 2]);
           out[s4] = static_cast<uint16_t>(s16);
         } else {
           SC[((t * G + g) * 32 + lane) * 4 + s4] = w;  // (T, G, L, 4)

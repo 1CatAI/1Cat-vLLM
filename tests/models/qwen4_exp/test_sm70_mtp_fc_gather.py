@@ -92,7 +92,7 @@ def test_prefill_fc_owns_rows_and_only_gathers_weights(monkeypatch, rows):
             pre_fc_norm_embedding=nn.Identity(),
             pre_fc_norm_hidden=nn.Identity(),
         )
-        calls = []
+        calls: list[torch.Tensor] = []
 
         def gather(x, dim, calls=calls):
             assert dim == 0 and x.shape == (640, 2560)
