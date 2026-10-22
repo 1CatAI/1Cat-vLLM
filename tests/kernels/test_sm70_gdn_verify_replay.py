@@ -23,8 +23,9 @@ SEQ = TMAX * (H * K + HV * K + HV * 2)
 
 def _inputs(requests, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    qkv = (torch.randn(requests * T, 2 * H * K + HV * K, device="cuda", generator=g)
-           * 0.5).half()
+    qkv = (
+        torch.randn(requests * T, 2 * H * K + HV * K, device="cuda", generator=g) * 0.5
+    ).half()
     a = torch.randn(requests * T, HV, device="cuda", generator=g).half()
     b = torch.randn(requests * T, HV, device="cuda", generator=g).half()
     return qkv, a, b
@@ -33,9 +34,27 @@ def _inputs(requests, seed):
 def _verify(state, qkv, a, b, A_log, dt_bias, cu, idx, nacc, **replay):
     out = torch.empty(qkv.shape[0], HV, K, device="cuda", dtype=torch.half)
     torch.ops._C.sm70_gdn_verify_out(
-        qkv, a, b, A_log, dt_bias, state, out, cu, idx, nacc, H, HV, K**-0.5, 1,
-        replay.get("rbuf"), replay.get("rn"), replay.get("ctr"), T,
-        replay.get("rmap"), replay.get("ckt"), replay.get("cks"),
+        qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        out,
+        cu,
+        idx,
+        nacc,
+        H,
+        HV,
+        K**-0.5,
+        1,
+        replay.get("rbuf"),
+        replay.get("rn"),
+        replay.get("ctr"),
+        T,
+        replay.get("rmap"),
+        replay.get("ckt"),
+        replay.get("cks"),
     )
     return out
 
@@ -55,10 +74,20 @@ def test_multi_request_verify_matches_triton(requests):
     nacc = torch.randint(1, T + 1, (requests,), device="cuda", dtype=torch.int32)
     ref_state = state.clone()
     ref, _ = fused_sigmoid_gating_delta_rule_update_mixed_qkv(
-        A_log=A_log, a=a, b=b, dt_bias=dt_bias, mixed_qkv=qkv,
-        num_q_heads=H, num_v_heads=HV, head_k_dim=K, head_v_dim=K,
-        initial_state=ref_state, inplace_final_state=True, cu_seqlens=cu,
-        ssm_state_indices=idx, num_accepted_tokens=nacc,
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        mixed_qkv=qkv,
+        num_q_heads=H,
+        num_v_heads=HV,
+        head_k_dim=K,
+        head_v_dim=K,
+        initial_state=ref_state,
+        inplace_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=idx,
+        num_accepted_tokens=nacc,
         use_qk_l2norm_in_kernel=True,
     )
     new_state = state.clone()
@@ -115,8 +144,22 @@ def test_replay_matches_materialized_states(requests):
         if step == 3:
             ckt[-1] = 2  # last request, after its current token 2
             cks[-1] = ckpt
-        out_r = _verify(rep, qkv, a, b, A_log, dt_bias, cu, idx_r, None,
-                        rbuf=rbuf, rn=rn, rmap=rmap, ckt=ckt, cks=cks)
+        out_r = _verify(
+            rep,
+            qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            cu,
+            idx_r,
+            None,
+            rbuf=rbuf,
+            rn=rn,
+            rmap=rmap,
+            ckt=ckt,
+            cks=cks,
+        )
         torch.testing.assert_close(out_r, out_m, atol=0, rtol=0)
         if step == 3:
             want = mat[(requests - 1) * T + 2]
@@ -126,8 +169,20 @@ def test_replay_matches_materialized_states(requests):
     # Commit-only call (no current tokens, no side flip) settles the round.
     empty = torch.zeros(requests + 1, device="cuda", dtype=torch.int32)
     rmap = (2 * slot_of + (side ^ 1)).cuda()
-    _verify(rep, qkv[:0], a[:0], b[:0], A_log, dt_bias, empty, idx_r, None,
-            rbuf=rbuf, rn=rn, rmap=rmap)
+    _verify(
+        rep,
+        qkv[:0],
+        a[:0],
+        b[:0],
+        A_log,
+        dt_bias,
+        empty,
+        idx_r,
+        None,
+        rbuf=rbuf,
+        rn=rn,
+        rmap=rmap,
+    )
     for r in range(requests):
         want = mat[r * T + accepted[-1, r].item() - 1]
         torch.testing.assert_close(rep[committed[r]], want, atol=0, rtol=0)

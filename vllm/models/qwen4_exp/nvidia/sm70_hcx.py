@@ -310,9 +310,7 @@ class Sm70HcxRuntime:
                 p + AR_BYTES + LORA_BYTES + HB_BYTES if p else 0 for p in base
             ]
             self.top1_seq = torch.zeros(1, device=device, dtype=torch.int32)
-            self.xn = torch.zeros(
-                HCX_BATCH_M, KD, device=device, dtype=torch.float16
-            )
+            self.xn = torch.zeros(HCX_BATCH_M, KD, device=device, dtype=torch.float16)
             self.sq = torch.zeros(
                 HCX_GROUPS * 80 * 8 * 4, device=device, dtype=torch.float32
             )

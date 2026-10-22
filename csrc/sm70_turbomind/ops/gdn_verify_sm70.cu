@@ -108,10 +108,12 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
   // Replay: committed state + the previous round's first rn tokens = the
   // round's initial state.
   const unsigned side =
-      !REPLAY ? 0u : (p.rmap ? (unsigned)(p.rmap[n] & 1) : (__ldcg(p.ctr) & 1u));
+      !REPLAY ? 0u
+              : (p.rmap ? (unsigned)(p.rmap[n] & 1) : (__ldcg(p.ctr) & 1u));
   const long long SEQ = seq_floats(p.H, p.HV);
   const int rs = REPLAY && p.rmap ? (p.rmap[n] >> 1) : n;
-  float* cur = REPLAY ? p.rbuf + ((long long)side * p.nmax + rs) * SEQ : nullptr;
+  float* cur =
+      REPLAY ? p.rbuf + ((long long)side * p.nmax + rs) * SEQ : nullptr;
   int R = 0;
   float4 rkv[TT];
   float rvv[TT][ROWS], rdc[TT], rbt[TT];
@@ -337,8 +339,9 @@ void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
     }
     TORCH_CHECK(ckt.has_value() == cks.has_value());
     if (ckt) {
-      TORCH_CHECK(ckt->dtype() == torch::kInt32 && cks->dtype() == torch::kInt32 &&
-                  ckt->numel() >= N && cks->numel() >= N);
+      TORCH_CHECK(ckt->dtype() == torch::kInt32 &&
+                  cks->dtype() == torch::kInt32 && ckt->numel() >= N &&
+                  cks->numel() >= N);
       p.ckt = ckt->data_ptr<int>();
       p.cks = cks->data_ptr<int>();
     }

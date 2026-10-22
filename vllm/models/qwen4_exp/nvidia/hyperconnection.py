@@ -50,11 +50,11 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from .sm70_hcx import HCX_BATCH_M, HCX_MAX_M
 from .sm70_fp16_hc import (
     maybe_apply_qwen38_sm70_fp16_fused_hc,
     sharded_hc_project,
 )
+from .sm70_hcx import HCX_BATCH_M
 
 
 # ---------------------------------------------------------------------------
