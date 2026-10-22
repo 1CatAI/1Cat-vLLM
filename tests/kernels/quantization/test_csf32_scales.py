@@ -8,7 +8,11 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import qpn_prepack
+from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+    QpnFragmentOrder,
+    qpn_prepack,
+    qpn_scale_entries,
+)
 from vllm.model_executor.layers.quantization.utils.csf32_expand import (
     CsfExpertScales,
     expand_csf32_experts,
@@ -150,10 +154,14 @@ def _planes(matrices: list[dict[str, np.ndarray]], rows, groups, projections, de
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("order", list(QpnFragmentOrder))
 @pytest.mark.parametrize(
     ("rows", "groups", "projections"), [(256, 64, 2), (512, 32, 1)]
 )
-def test_expansion_matches_qpn_prepack(rows, groups, projections):
+# 5 slots: fewer than the 6 experts (decode); 14 slots: more (prefill, where
+# only the first group rows can hold groups).
+@pytest.mark.parametrize("num_slots", [5, 14])
+def test_expansion_matches_qpn_prepack(rows, groups, projections, order, num_slots):
     device = torch.device("cuda")
     num_experts = 6
     scales = [
@@ -170,17 +178,19 @@ def test_expansion_matches_qpn_prepack(rows, groups, projections):
     raster = torch.zeros(
         num_experts, projections * rows * groups, dtype=torch.uint8, device=device
     )
-    # Groups for experts 4, 1 and 3, then two empty slots that must be skipped.
-    gids = torch.tensor([4, 1, 3, 0, 0], dtype=torch.int32, device=device)
-    goff = torch.tensor([0, 2, 3, 5, 5, 5], dtype=torch.int32, device=device)
-    expand_csf32_experts(raster, planes, gids, goff)
+    # Groups for experts 4, 1 and 3, then empty slots that must be skipped.
+    gids = torch.zeros(num_slots, dtype=torch.int32, device=device)
+    gids[:3] = torch.tensor([4, 1, 3], dtype=torch.int32)
+    goff = torch.full((num_slots + 1,), num_slots, dtype=torch.int32, device=device)
+    goff[:3] = torch.tensor([0, 2, 3], dtype=torch.int32)
+    expand_csf32_experts(raster, planes, gids, goff, qpn_scale_entries(order, device))
 
     codes = torch.zeros(
         projections * rows, groups * 8, dtype=torch.uint8, device=device
     )
     for expert in range(num_experts):
         stacked = torch.from_numpy(np.concatenate(scales[expert])).to(device)
-        _, expected = qpn_prepack(codes, stacked)
+        _, expected = qpn_prepack(codes, stacked, 16, order)
         if expert in (4, 1, 3):
             assert torch.equal(raster[expert], expected), expert
         else:
