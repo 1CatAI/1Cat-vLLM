@@ -18,8 +18,8 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import (
 from vllm.models.glm5next.sm70 import sparse as sparse_module
 from vllm.models.glm5next.sm70.fp8_kv import (
     sm70_glm5_fp8_kv_insert,
-    sm70_glm5_sparse_attention_paged_fp8,
     sm70_glm5_sparse_attention_paged_fp8_batched_gemm,
+    sm70_glm5_sparse_attention_paged_fp8_blocked,
     sm70_glm5_sparse_attention_paged_fp8_gemm,
 )
 from vllm.models.glm5next.sm70.sparse import Glm5NextSM70SparseBackend
@@ -204,44 +204,56 @@ def test_glm53_sm70_sparse_attention_matches_reference():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.is_device_capability((7, 0)),
-    reason="requires an exact SM70 CUDA device",
+    not current_platform.is_cuda() or current_platform.get_device_capability()[0] != 7,
+    reason="requires a Volta or Turing CUDA device",
 )
-def test_glm53_sm70_fp8_kv_sparse_attention_matches_reference():
-    torch.manual_seed(20260827)
+def test_glm53_sm70_fp8_kv_prefill_blocks_match_reference():
+    # 37 prefill rows in blocks of 16: two full blocks and a remainder, each
+    # row with its own number of selected keys.
+    torch.manual_seed(20261021)
     device = torch.device("cuda")
-    num_kv = 48
-    block_size = 64
+    num_kv, block_size, num_tokens, num_heads, width, block = 96, 64, 37, 16, 24, 16
     kv = torch.randn(num_kv, 512, dtype=torch.float16, device=device) * 0.1
     cache = torch.zeros(2, block_size, 520, dtype=torch.uint8, device=device)
-    slots = torch.arange(num_kv, dtype=torch.int64, device=device)
-    sm70_glm5_fp8_kv_insert(kv, cache, slots)
-
-    q = torch.randn(2, 16, 512, dtype=torch.float16, device=device) * 0.1
-    indices = torch.tensor(
-        [
-            [0, 3, 5, 9, 11, 17, 23, 31] + [-1] * 8,
-            [2, 4, 8, 12, 18, 24, 32, 40, 45] + [-1] * 7,
-        ],
-        dtype=torch.int32,
-        device=device,
+    sm70_glm5_fp8_kv_insert(
+        kv, cache, torch.arange(num_kv, dtype=torch.int64, device=device)
     )
-    lengths = torch.tensor([8, 9], dtype=torch.int32, device=device)
+    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.float16, device=device)
+    q = q * 0.1
+    lengths = torch.randint(1, width + 1, (num_tokens,), dtype=torch.int32)
+    indices = torch.full((num_tokens, width), -1, dtype=torch.int32)
+    for row, length in enumerate(lengths.tolist()):
+        indices[row, :length] = torch.randperm(num_kv)[:length].int()
+    indices, lengths = indices.to(device), lengths.to(device)
+    gathered = torch.empty(block, width, 512, dtype=torch.float16, device=device)
+    scores = torch.empty(block, num_heads, width, dtype=torch.float16, device=device)
+    probs = torch.empty_like(scores)
     out = torch.empty_like(q)
     repeat = torch.empty_like(q)
     scale = 512**-0.5
-    sm70_glm5_sparse_attention_paged_fp8(q, cache, indices, lengths, scale, out)
-    sm70_glm5_sparse_attention_paged_fp8(q, cache, indices, lengths, scale, repeat)
+    for target in (out, repeat):
+        sm70_glm5_sparse_attention_paged_fp8_blocked(
+            q, cache, indices, lengths, scale, target, gathered, scores, probs
+        )
     torch.accelerator.synchronize()
 
+    # Reference on the cache's own E4M3 values: per block all 512-byte rows,
+    # then one E8M0 scale per 64 values and row.
+    flat = cache.cpu().reshape(cache.shape[0], -1)
+    codes = flat[:, : block_size * 512].reshape(-1, 512)
+    exponents = flat[:, block_size * 512 : block_size * 520].reshape(-1, 8)
+    stored = codes.view(torch.float8_e4m3fn).float().reshape(-1, 8, 64)
+    stored = (stored * torch.exp2(exponents.float() - 127.0)[..., None]).reshape(
+        -1, 512
+    )
     refs = []
     for row, length in enumerate(lengths.cpu().tolist()):
-        selected = kv[indices[row, :length].long()].float()
-        probs = torch.softmax(q[row].float() @ selected.T * scale, dim=-1)
-        refs.append(probs @ selected)
-    ref = torch.stack(refs).half()
+        selected = stored[indices[row, :length].cpu().long()]
+        attention = torch.softmax(q[row].float().cpu() @ selected.T * scale, dim=-1)
+        refs.append(attention @ selected)
+    ref = torch.stack(refs).half().to(device)
 
-    torch.testing.assert_close(out, ref, rtol=3e-2, atol=4e-3)
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-3)
     assert torch.equal(out, repeat)
 
 
