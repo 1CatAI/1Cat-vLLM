@@ -310,6 +310,7 @@ class MambaHybridModelState(DefaultModelState):
                 input_batch.query_start_loc,
                 num_computed_tokens,
                 input_batch.num_draft_tokens_per_req,
+                input_batch.is_prefilling_np,
                 input_batch.num_reqs,
                 ctx.block_table_ptrs,
                 ctx.block_table_stride_req,

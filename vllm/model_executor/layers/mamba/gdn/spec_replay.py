@@ -102,6 +102,7 @@ class SpecReplayState:
         query_start_loc: torch.Tensor,
         num_computed_tokens: torch.Tensor,
         num_draft_tokens_per_req: np.ndarray | None,
+        is_prefilling: np.ndarray | None,
         num_reqs: int,
         block_table_ptrs: torch.Tensor,
         block_table_stride: int,
@@ -115,8 +116,14 @@ class SpecReplayState:
             if num_draft_tokens_per_req is None
             else np.asarray(num_draft_tokens_per_req[:num_reqs])
         )
-        spec_rows = np.flatnonzero(drafts > 0)
-        plain_rows = np.flatnonzero(drafts <= 0)
+        # Exactly the GDN metadata's speculative rows (mamba_hybrid builds
+        # num_decode_draft_tokens the same way): the verifier's row n and
+        # these tables must name the same request.
+        spec = drafts > 0
+        if is_prefilling is not None:
+            spec &= ~np.asarray(is_prefilling[:num_reqs], dtype=bool)
+        spec_rows = np.flatnonzero(spec)
+        plain_rows = np.flatnonzero(~spec)
         num_spec, num_plain = spec_rows.size, plain_rows.size
         rows_np = self._rows_host.numpy()
         rows_np[:num_spec] = spec_rows
