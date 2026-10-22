@@ -268,7 +268,11 @@ def start_prefetch(targets, tensors) -> None:
         tensor = tensors[raw]
         rows, span = _slice_spec(layer, method, shard, tensor)
         jobs.append((raw, tensor, shard, rows, span))
-    _PREFETCH = _Prefetcher(jobs) if jobs else None
+    config = _expert_cache_config()
+    depth = config.expert_load_prefetch_banks if config is not None else 4
+    if jobs:
+        logger.info("GGUF expert loading queues at most %d pinned banks.", depth)
+    _PREFETCH = _Prefetcher(jobs, depth=depth) if jobs else None
 
 
 def load_expert_bank(layer, method, shard, tensor, raw=None) -> None:

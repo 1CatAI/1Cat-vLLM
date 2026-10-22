@@ -60,7 +60,10 @@ class AsyncMicrobatchTokenizer:
         return await result_future
 
     async def encode(self, prompt, **kwargs) -> list[int]:
-        return (await self(prompt, **kwargs)).input_ids
+        result_future: Future = self._loop.create_future()
+        queue = self._get_queue(self._loop, self._queue_key("encode_ids", kwargs))
+        await queue.put((prompt, kwargs, result_future))
+        return (await result_future).input_ids
 
     async def decode(self, token_ids, **kwargs) -> str:
         result_future: Future = self._loop.create_future()
@@ -78,16 +81,18 @@ class AsyncMicrobatchTokenizer:
         queue = self._queues.get(key)
         if queue is None:
             self._queues[key] = queue = asyncio.Queue()
-            if key[0] == "encode":
+            if key[0] in ("encode", "encode_ids"):
                 can_batch = key[1] != "other"
-                coro = self._batch_encode_loop(queue, can_batch)
+                coro = self._batch_encode_loop(queue, can_batch, key[0] == "encode_ids")
             else:
                 assert key[0] == "decode", f"Unknown operation type: {key[0]}."
                 coro = self._batch_decode_loop(queue)
             self._batcher_tasks.append(loop.create_task(coro))
         return queue
 
-    async def _batch_encode_loop(self, queue: asyncio.Queue, can_batch: bool):
+    async def _batch_encode_loop(
+        self, queue: asyncio.Queue, can_batch: bool, ids_only: bool = False
+    ):
         """Batch incoming encode requests for efficiency."""
         while True:
             prompt, kwargs, result_future = await queue.get()
@@ -125,9 +130,15 @@ class AsyncMicrobatchTokenizer:
                             data = {k: v[i] for k, v in results.items()}
                             fut.set_result(BatchEncoding(data))
                 else:
-                    encode_fn = lambda prompts=prompts, kwargs=kwargs_list: [
-                        self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs)
-                    ]
+
+                    def encode_fn(prompts=prompts, kwargs_list=kwargs_list):
+                        return [
+                            BatchEncoding({"input_ids": self.tokenizer.encode(p, **kw)})
+                            if ids_only
+                            else self.tokenizer(p, **kw)
+                            for p, kw in zip(prompts, kwargs_list)
+                        ]
+
                     results = await self._loop.run_in_executor(
                         self._executor, encode_fn
                     )
@@ -201,13 +212,13 @@ class AsyncMicrobatchTokenizer:
         max_length = kwargs.get("max_length")
 
         if not truncation:
-            return "encode", add_special_tokens, False, None
+            return op, add_special_tokens, False, None
 
         model_max = getattr(self.tokenizer, "model_max_length", None)
         if max_length is None or (model_max is not None and max_length == model_max):
-            return "encode", add_special_tokens, True, "model_max"
+            return op, add_special_tokens, True, "model_max"
 
-        return "encode", "other"
+        return op, "other"
 
     def __del__(self):
         if (

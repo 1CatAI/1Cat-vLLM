@@ -603,6 +603,7 @@ class EngineArgs:
     )
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
+    mm_encoder_batch_size: int = MultiModalConfig.mm_encoder_batch_size
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
     )
@@ -1288,6 +1289,9 @@ class EngineArgs:
             "--mm-encoder-tp-mode", **multimodal_kwargs["mm_encoder_tp_mode"]
         )
         multimodal_group.add_argument(
+            "--mm-encoder-batch-size", **multimodal_kwargs["mm_encoder_batch_size"]
+        )
+        multimodal_group.add_argument(
             "--mm-encoder-attn-backend",
             **multimodal_kwargs["mm_encoder_attn_backend"],
         )
@@ -1670,6 +1674,7 @@ class EngineArgs:
             mm_shm_cache_max_object_size_mb=self.mm_shm_cache_max_object_size_mb,
             mm_encoder_only=self.mm_encoder_only,
             mm_encoder_tp_mode=self.mm_encoder_tp_mode,
+            mm_encoder_batch_size=self.mm_encoder_batch_size,
             mm_encoder_attn_backend=self.mm_encoder_attn_backend,
             mm_encoder_attn_dtype=self.mm_encoder_attn_dtype,
             mm_encoder_fp8_scale_path=self.mm_encoder_fp8_scale_path,

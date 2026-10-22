@@ -130,6 +130,17 @@ class QSAIndexer(nn.Module):
         # while continuing to update the QSA side cache.
         self.skip_topk = False
         self.shared_key_scoring = vllm_config.kernel_config.sm70_qsa_shared_key
+        self.prefill_tp_group = None
+        parallel = vllm_config.parallel_config
+        if (
+            vllm_config.kernel_config.sm70_sparse.qsa_prefill_tp_rows
+            and parallel.tensor_parallel_size == 4
+            and parallel.decode_context_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+        ):
+            from vllm.distributed.parallel_state import get_tp_group
+
+            self.prefill_tp_group = get_tp_group()
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -362,6 +373,7 @@ class QSAIndexer(nn.Module):
             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
+            tp_group=self.prefill_tp_group,
         )
 
 

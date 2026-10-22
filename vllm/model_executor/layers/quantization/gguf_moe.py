@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF experts with independent gate/up/down storage and aligned TP slices."""
 
+import functools
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 
 
+@functools.cache
+def _grouped_gate_up() -> bool:
+    return hasattr(torch.ops._C, "gguf_dp4a_gate_up_grouped_sm70_out")
+
+
 def _original_expert_dp4a(
     x,
     ids,
@@ -60,17 +66,31 @@ def _original_expert_dp4a(
     )
     output = torch.empty_like(x)
     torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
-    torch.ops._C.gguf_dp4a_gate_up_sm70_out(
-        hidden,
-        q8,
-        ids,
-        gate,
-        up,
-        source_type,
-        True,
-        4 if quantized_hidden and source_type in (20, 23) else 16,
-        bank_aware,
-    )
+    if (
+        quantized_hidden
+        and source_type in (20, 21, 23)
+        and m >= 10
+        and _grouped_gate_up()
+    ):
+        # Concurrent verification rows share routed experts: decode each
+        # expert once per few of its routes (measured on V100). Bitwise equal
+        # to the per-route kernel, which stays faster for a single request.
+        per_cta = 4 if source_type == 21 else (2 if m <= 10 else 8)
+        torch.ops._C.gguf_dp4a_gate_up_grouped_sm70_out(
+            hidden, q8, ids, gate, up, source_type, bank_aware, per_cta
+        )
+    else:
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            hidden,
+            q8,
+            ids,
+            gate,
+            up,
+            source_type,
+            True,
+            4 if quantized_hidden and source_type in (20, 23) else 16,
+            bank_aware,
+        )
     torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
         output,
         hidden,
@@ -376,25 +396,35 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         w1, w3, w2 = layer.gguf_w1, layer.gguf_w3, layer.gguf_w2
         if (
             self.dp4a_admitted
-            and 1 <= tokens <= 20
+            and 1 <= tokens <= 64
             and layer.expert_map is None
             and topk_weights.dtype == torch.float32
         ):
-            if cache is not None:
-                ids = cache.resolve(self.cache_layer, ids)
-            return torch.ops.vllm.gguf_original_expert_dp4a(
-                x.contiguous(),
-                ids,
-                topk_weights.contiguous(),
-                w1,
-                w3,
-                w2,
-                self.weight_types["w1"],
-                self.weight_types["w2"],
-                self.input_padding.get("w2", (0, 0))[0],
-                self.q8_intermediate,
-                self.weight_types["w1"] == 21,
-            )
+            # Concurrent MTP verification batches (up to 8 x 5 rows) stay on
+            # the graph-capturable decode path in pieces of at most 20 rows,
+            # which bounds the routed ids one cache resolution admits.
+            pieces = []
+            for start in range(0, tokens, 20):
+                stop = min(start + 20, tokens)
+                piece_ids = ids[start:stop]
+                if cache is not None:
+                    piece_ids = cache.resolve(self.cache_layer, piece_ids)
+                pieces.append(
+                    torch.ops.vllm.gguf_original_expert_dp4a(
+                        x[start:stop].contiguous(),
+                        piece_ids,
+                        topk_weights[start:stop].contiguous(),
+                        w1,
+                        w3,
+                        w2,
+                        self.weight_types["w1"],
+                        self.weight_types["w2"],
+                        self.input_padding.get("w2", (0, 0))[0],
+                        self.q8_intermediate,
+                        self.weight_types["w1"] == 21,
+                    )
+                )
+            return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
         if cache is not None and cache.tm is not None:
             return cache.prefill_moe(
                 self.cache_layer, x.contiguous(), ids, topk_weights

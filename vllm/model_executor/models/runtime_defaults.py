@@ -81,11 +81,11 @@ def _is_sm70_qwen38_decode_compile_contract(
     if model_config is None or parallel_config is None:
         return False
     architectures = set(getattr(model_config, "architectures", ()) or ())
-    multimodal_config = getattr(model_config, "multimodal_config", None)
+    # The vision tower only feeds prefill embeddings; decode steps run the
+    # same text backbone, so the lane covers the wrapper with or without it.
     supported_architecture = "Qwen4ExpForCausalLM" in architectures or (
         "Qwen4ExpForConditionalGeneration" in architectures
-        and multimodal_config is not None
-        and getattr(multimodal_config, "language_model_only", False)
+        and getattr(model_config, "multimodal_config", None) is not None
     )
     return bool(
         supported_architecture and getattr(model_config, "dtype", None) == torch.float16

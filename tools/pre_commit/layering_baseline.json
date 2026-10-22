@@ -42,7 +42,7 @@
   "platform": 53
  },
  "vllm/config/gdn.py": {
-  "platform": 9
+  "platform": 8
  },
  "vllm/config/gdn_projection.py": {
   "platform": 1

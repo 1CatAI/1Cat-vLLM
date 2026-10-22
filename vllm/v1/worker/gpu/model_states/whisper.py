@@ -67,6 +67,9 @@ class WhisperModelState(ModelState):
             encoder_cache=self.encoder_cache,
             dtype=self.model_config.dtype,
             device=self.device,
+            max_batch_size=getattr(
+                self.model_config.multimodal_config, "mm_encoder_batch_size", 0
+            ),
         )
 
         self.max_encoder_len = getattr(
