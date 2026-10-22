@@ -261,6 +261,11 @@ class SchedulerOutput:
     # Zero denotes hand-built/profile outputs outside the scheduler protocol.
     scheduled_step: int = 0
 
+    # Force-reset invalidates worker-side feedback before any old PP packet is
+    # consumed. Includes requests that cannot be resumed in this batch. Kept
+    # separate from ordinary preemption, whose in-flight output remains valid.
+    prefix_cache_reset_req_ids: set[str] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

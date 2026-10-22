@@ -321,6 +321,41 @@ def test_packed_feedback_does_not_allocate_packets_per_batch(
         pair.exchange(batch, sampled, accepted, rejected, draft)
 
 
+@pytest.mark.parametrize("packed", [False, True])
+def test_transport_metrics_count_submitted_payload_and_skip_non_sampling(
+    feedback_pair, packed
+):
+    pair = feedback_pair.make(4, packed=packed)
+    initial = pair.sender.get_transport_metrics()
+    assert initial["sent_batches"] == initial["sent_bytes"] == 0
+    sampled = torch.ones((3, 5), dtype=torch.int64)
+    draft = torch.ones((3, 4), dtype=torch.int64)
+    counts = torch.ones(3, dtype=torch.int32)
+    pair.receiver.get_prev_sampled_outputs()
+    pair.exchange(_batch([0, 1, 2]), sampled, counts, counts, draft)
+    assert pair.sender.get_transport_metrics() == {
+        "packed_feedback": packed,
+        "feedback_depth": 4,
+        "sent_batches": 1,
+        "received_batches": 0,
+        "sent_collectives": 1 if packed else 2,
+        "received_collectives": 0,
+        "sent_bytes": 3 * 80,
+        "received_bytes": 0,
+    }
+    receiver = pair.receiver.get_transport_metrics()
+    assert receiver["received_batches"] == 1
+    assert receiver["received_collectives"] == (1 if packed else 2)
+    assert receiver["received_bytes"] == 3 * 80
+    assert initial["sent_batches"] == 0  # Snapshot is detached from counters.
+
+    pair.receiver.get_prev_sampled_outputs()
+    partial = _batch([0, 1, 2], computed=[0] * 3, prefill=[8] * 3)
+    pair.exchange(partial, sampled, counts, counts, draft)
+    assert pair.sender.get_transport_metrics()["sent_batches"] == 1
+    assert pair.receiver.get_transport_metrics() == receiver
+
+
 def test_feedback_rejects_capacity_overflow(feedback_pair):
     pair = feedback_pair.make(4)
     with pytest.raises(ValueError, match="buffer capacity"):
@@ -345,6 +380,31 @@ def test_packing_clears_previous_wider_sample(feedback_pair):
     torch.testing.assert_close(
         output["sampled_tokens"], torch.tensor([[8, -1, -1, -1, -1]] * 2)
     )
+
+
+@pytest.mark.parametrize("speculative_steps", [0, 4])
+def test_full_width_packet_overwrites_dirty_storage_without_clear(
+    monkeypatch, speculative_steps
+):
+    samples = torch.arange(3 * (speculative_steps + 1), dtype=torch.int64).view(3, -1)
+    draft = (
+        torch.arange(12, dtype=torch.int64).view(3, 4) + 100
+        if speculative_steps
+        else None
+    )
+    output = torch.full((3, 2 * speculative_steps + 1), -1234, dtype=torch.int64)
+
+    def unexpected_clear(*args, **kwargs):
+        pytest.fail("full-width samples and drafts overwrite the entire packet")
+
+    monkeypatch.setattr(torch.Tensor, "fill_", unexpected_clear)
+    packet = pp_utils._pack_token_packet(
+        samples, draft, speculative_steps + 1, speculative_steps, out=output
+    )
+    assert packet is output
+    torch.testing.assert_close(packet[:, : speculative_steps + 1], samples)
+    if draft is not None:
+        torch.testing.assert_close(packet[:, speculative_steps + 1 :], draft)
 
 
 @pytest.mark.parametrize("cancel_all", [False, True])

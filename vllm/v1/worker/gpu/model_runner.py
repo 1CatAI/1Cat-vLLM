@@ -1515,6 +1515,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.device.type == "cuda":
                 self.mixed_prefill_timer.begin(scheduler_output)
             # Update the request states.
+            # A force-reset releases every affected request's blocks, including
+            # requests that cannot resume in this batch. Invalidate their old
+            # PP generations before a delayed Mamba commit can touch those
+            # blocks after they have been assigned to another request.
+            for req_id in scheduler_output.prefix_cache_reset_req_ids or ():
+                self._remove_request(req_id)
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)

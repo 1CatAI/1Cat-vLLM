@@ -107,6 +107,19 @@ def test_missing_architecture_does_not_use_an_unrelated_library(tmp_path):
     assert state["_fa2_library_path"]((8, 0)) is None
 
 
+@pytest.mark.parametrize("capability", [(8, 7), (9, 0), (10, 0), (12, 0)])
+@pytest.mark.parametrize("with_default", [False, True])
+def test_unqualified_architecture_keeps_ordinary_library(
+    tmp_path, capability, with_default
+):
+    installed = ["_vllm_fa2_C_sm80.abi3.so"]
+    if with_default:
+        installed.append("_vllm_fa2_C.abi3.so")
+    state = load_path_selector(tmp_path, installed)
+    expected = str(tmp_path / "_vllm_fa2_C.abi3.so") if with_default else None
+    assert state["_fa2_library_path"](capability) == expected
+
+
 def test_turing_still_requires_its_dedicated_library(tmp_path):
     state = load_path_selector(tmp_path, ["_vllm_fa2_C.abi3.so"])
     assert state["_fa2_library_path"]((7, 5)) is None

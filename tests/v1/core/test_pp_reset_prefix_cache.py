@@ -11,6 +11,7 @@ from transformers import OPTConfig
 from tests.v1.core import utils
 from vllm.config import SchedulerConfig
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -246,3 +247,59 @@ def test_cancellation_and_reset_do_not_restore_finished_request(
     assert cancelled.status == RequestStatus.FINISHED_ABORTED
     assert list(cancelled.output_token_ids) == [101]
     assert all(list(req.output_token_ids) == [101, 301] for req in requests[1:])
+
+
+@pytest.mark.parametrize("depth", [2, 4, 7])
+def test_reset_invalidates_all_workers_before_partial_resumption(
+    monkeypatch, local_model, depth
+):
+    scheduler = make_scheduler(monkeypatch, local_model, depth)
+    requests = add_prefilled_requests(scheduler)
+    old = next_frame(scheduler)
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    # Only one request fits. The other two still own worker-side request slots
+    # and old feedback, despite their physical cache blocks already being free.
+    scheduler.max_num_scheduled_tokens = 8
+    fresh = scheduler.schedule()
+    expected = {request.request_id for request in requests}
+    assert len(fresh.scheduled_new_reqs) == 1
+    assert fresh.prefix_cache_reset_req_ids == expected
+    assert not fresh.preempted_req_ids
+    scheduler.update_from_output(old, result(old, [201, 202]))
+    assert all(list(request.output_token_ids) == [101] for request in requests)
+
+    following = scheduler.schedule()
+    assert following.prefix_cache_reset_req_ids is None
+    # Dispatching a later batch must not mutate the first batch's snapshot.
+    assert fresh.prefix_cache_reset_req_ids == expected
+
+
+def test_reset_invalidation_survives_empty_steps_repeated_reset_and_cancellation(
+    monkeypatch, local_model
+):
+    scheduler = make_scheduler(monkeypatch, local_model)
+    requests = add_prefilled_requests(scheduler)
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    # A repeated reset before schedule() sees no running requests, but must
+    # retain the first reset's pending notifications.
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    scheduler.finish_requests([requests[0].request_id], RequestStatus.FINISHED_ABORTED)
+    scheduler._pause_state = PauseState.PAUSED_ALL
+    empty = scheduler.schedule()
+    expected = {request.request_id for request in requests}
+    assert empty.total_num_scheduled_tokens == 0
+    assert empty.prefix_cache_reset_req_ids == expected
+    assert requests[0].request_id in empty.finished_req_ids
+    assert scheduler.schedule().prefix_cache_reset_req_ids is None
+    assert empty.prefix_cache_reset_req_ids == expected
+
+    scheduler._pause_state = PauseState.UNPAUSED
+    resumed = scheduler.schedule()
+    assert resumed.prefix_cache_reset_req_ids is None
+    assert len(resumed.scheduled_new_reqs) == 2
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    new_reset = scheduler.schedule()
+    assert new_reset.prefix_cache_reset_req_ids == {
+        request.request_id for request in requests[1:]
+    }
+    assert empty.prefix_cache_reset_req_ids == expected

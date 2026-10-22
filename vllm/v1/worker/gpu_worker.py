@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from copy import deepcopy
 from datetime import timedelta
+from time import perf_counter
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -48,7 +49,11 @@ from vllm.distributed.weight_transfer import (
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
-from vllm.model_executor.models.pp_decode_transfer import StaticPPDecodeTransfer
+from vllm.model_executor.models.pp_decode_transfer import (
+    PPTransportMetrics,
+    StaticPPDecodeTransfer,
+    decode_fallback_reason,
+)
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -1280,11 +1285,20 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if not hasattr(self, "_pp_transport_metrics"):
+            self._pp_transport_metrics = PPTransportMetrics.create(
+                self.vllm_config.additional_config,
+                getattr(get_pp_group(), "rank_in_group", 0),
+            )
+        transport_metrics = self._pp_transport_metrics
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
+            wait_started = perf_counter() if transport_metrics is not None else 0.0
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
+            if transport_metrics is not None:
+                transport_metrics.record_send_wait(perf_counter() - wait_started)
 
         if not getattr(self, "_decode_static_transfer_initialized", False):
             self._decode_static_transfer = StaticPPDecodeTransfer.create(
@@ -1298,6 +1312,28 @@ class Worker(WorkerBase):
         static_decode = decode_transfer is not None and decode_transfer.matches(
             scheduler_output
         )
+        if (
+            transport_metrics is not None
+            and scheduler_output.total_num_scheduled_tokens
+        ):
+            reason = (
+                decode_fallback_reason(
+                    scheduler_output,
+                    decode_transfer.query_len,
+                    decode_transfer.capacity,
+                )
+                if decode_transfer is not None and not static_decode
+                else None
+            )
+            transport_metrics.record_step(static=static_decode, reason=reason)
+            if transport_metrics.steps % transport_metrics.interval == 0:
+                handler = getattr(self.model_runner, "pp_handler", None)
+                if handler is not None:
+                    logger.info(
+                        "PP_FEEDBACK_METRICS rank=%d %s",
+                        transport_metrics.rank,
+                        handler.get_transport_metrics(),
+                    )
         decode_received = False
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -1342,8 +1378,10 @@ class Worker(WorkerBase):
 
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict: dict[str, torch.Tensor] | None
+            receive_protocol = "dynamic"
             comm_postprocess: list[Callable[[], None]] = []
             if static_decode:
+                receive_protocol = "decode_static"
                 assert decode_transfer is not None
                 tensor_dict, comm_handles = decode_transfer.receive(
                     num_scheduled_tokens
@@ -1352,6 +1390,7 @@ class Worker(WorkerBase):
             else:
                 tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
                 if tensor_dict is not None:
+                    receive_protocol = "legacy_static"
                     comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
                     logger.info_once(
                         "Default SM70 metadata-free PP hidden transfer enabled."
@@ -1364,6 +1403,13 @@ class Worker(WorkerBase):
                         )
                     )
             assert tensor_dict is not None
+            if transport_metrics is not None:
+                transport_metrics.record_payload(
+                    "recv",
+                    receive_protocol,
+                    tensor_dict,
+                    num_tokens=num_scheduled_tokens if static_decode else None,
+                )
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
@@ -1402,6 +1448,7 @@ class Worker(WorkerBase):
             self._pp_send_work = decode_transfer.send(
                 output.tensors, num_scheduled_tokens
             )
+            send_protocol = "decode_static"
         elif self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens):
             if not self._is_static_pp_hidden_tensor_dict(
                 output.tensors, num_scheduled_tokens
@@ -1410,6 +1457,7 @@ class Worker(WorkerBase):
                     "static PP hidden transfer output violates its fixed schema"
                 )
             self._pp_send_work = get_pp_group().isend_tensor_dict_static(output.tensors)
+            send_protocol = "legacy_static"
             logger.info_once("Default SM70 metadata-free PP hidden transfer enabled.")
         else:
             self._pp_send_work = get_pp_group().isend_tensor_dict(
@@ -1417,8 +1465,31 @@ class Worker(WorkerBase):
                 all_gather_group=get_tp_group(),
                 all_gather_tensors=all_gather_tensors,
             )
+            send_protocol = "dynamic"
+
+        if transport_metrics is not None:
+            if send_protocol == "dynamic":
+                transport_metrics.record_dynamic_send(
+                    get_pp_group(), output.tensors, get_tp_group(), all_gather_tensors
+                )
+            else:
+                transport_metrics.record_payload(
+                    "send",
+                    send_protocol,
+                    output.tensors,
+                    num_tokens=num_scheduled_tokens if static_decode else None,
+                )
 
         return None
+
+    def get_pp_transport_metrics(self) -> dict[str, Any]:
+        """Read counters via collective RPC without synchronizing the device."""
+        metrics = getattr(self, "_pp_transport_metrics", None)
+        snapshot = {"enabled": False} if metrics is None else metrics.snapshot()
+        handler = getattr(self.model_runner, "pp_handler", None)
+        if handler is not None:
+            snapshot["feedback"] = handler.get_transport_metrics()
+        return snapshot
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()

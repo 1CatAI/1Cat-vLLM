@@ -99,8 +99,12 @@ def _pack_token_packet(
         ):
             raise ValueError("token packet output does not match the PP contract")
         packet = out
-    packet.fill_(-1)
-    packet[:, : sampled_token_ids.shape[1]].copy_(sampled_token_ids)
+    sample_width = sampled_token_ids.shape[1]
+    # Full-width MTP outputs overwrite every token column. Only truncated
+    # samples need padding; do not clear draft columns that are copied below.
+    if sample_width < max_sample_len:
+        packet[:, sample_width:max_sample_len].fill_(-1)
+    packet[:, :sample_width].copy_(sampled_token_ids)
     if draft_token_ids is not None:
         packet[:, max_sample_len:].copy_(draft_token_ids)
     return packet
@@ -188,6 +192,12 @@ class PPHandler:
             for _ in range(self.feedback_depth if packed_feedback else 0)
         ]
         self._next_buffer = 0
+        self._sent_batches = 0
+        self._received_batches = 0
+        self._sent_collectives = 0
+        self._received_collectives = 0
+        self._sent_bytes = 0
+        self._received_bytes = 0
 
         self.queue: deque[PendingRecv | None] = (
             deque() if self.is_last_rank else deque([None] * self.feedback_depth)
@@ -208,6 +218,19 @@ class PPHandler:
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
+
+    def get_transport_metrics(self) -> dict[str, int | bool]:
+        """CPU counters for submitted transport work; no CUDA synchronization."""
+        return {
+            "packed_feedback": self.packed_feedback,
+            "feedback_depth": self.feedback_depth,
+            "sent_batches": self._sent_batches,
+            "received_batches": self._received_batches,
+            "sent_collectives": self._sent_collectives,
+            "received_collectives": self._received_collectives,
+            "sent_bytes": self._sent_bytes,
+            "received_bytes": self._received_bytes,
+        }
 
     def _acquire_buffer(self, num_reqs: int) -> _FeedbackBuffer:
         if not 0 <= num_reqs <= self.max_num_reqs:
@@ -299,6 +322,9 @@ class PPHandler:
             need_sampled_mask=need_sampled_mask,
             gen_at_receive_np=gen_at_receive_np,
         )
+        self._received_batches += 1
+        self._received_collectives += 1 if self.packed_feedback else 2
+        self._received_bytes += num_reqs * (self.packet_width * 8 + 8)
         return bool(need_sampled_mask.all())
 
     def broadcast(
@@ -365,3 +391,6 @@ class PPHandler:
                 tensor.record_stream(self.broadcast_stream)
             if draft_token_ids is not None:
                 draft_token_ids.record_stream(self.broadcast_stream)
+        self._sent_batches += 1
+        self._sent_collectives += 1 if self.packed_feedback else 2
+        self._sent_bytes += num_reqs * (self.packet_width * 8 + 8)

@@ -8,6 +8,8 @@ retain the dynamic protocol. Wire tensors contain only real token rows, so
 different local CUDA graph padding cannot change a peer's receive size.
 """
 
+import json
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -21,25 +23,145 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def is_complete_mtp_decode(output: Any, query_len: int, capacity: int) -> bool:
+def decode_fallback_reason(output: Any, query_len: int, capacity: int) -> str | None:
+    """Return the first disqualifying condition, using common scheduler data."""
     counts = output.num_scheduled_tokens
-    if (
-        not counts
-        or output.scheduled_new_reqs
-        or output.scheduled_encoder_inputs
-        or output.scheduled_cached_reqs.resumed_req_ids
-        or output.total_num_scheduled_tokens != query_len * len(counts)
-        or output.total_num_scheduled_tokens > capacity
-        or any(count != query_len for count in counts.values())
+    if not counts:
+        return "empty"
+    if output.scheduled_new_reqs:
+        return "new_request"
+    if output.scheduled_encoder_inputs:
+        return "encoder"
+    if output.scheduled_cached_reqs.resumed_req_ids:
+        return "resumed_request"
+    if output.total_num_scheduled_tokens > capacity:
+        return "capacity"
+    if output.total_num_scheduled_tokens != query_len * len(counts) or any(
+        count != query_len for count in counts.values()
     ):
-        return False
+        return "nonuniform_query"
     cached = output.scheduled_cached_reqs
     output_counts = dict(zip(cached.req_ids, cached.num_output_tokens))
-    return all(
-        output_counts.get(req_id, 0) > 0
-        and len(output.scheduled_spec_decode_tokens.get(req_id, ())) == query_len - 1
+    if any(output_counts.get(req_id, 0) <= 0 for req_id in counts):
+        return "prefill"
+    if any(
+        len(output.scheduled_spec_decode_tokens.get(req_id, ())) != query_len - 1
         for req_id in counts
-    )
+    ):
+        return "incomplete_draft"
+    return None
+
+
+def is_complete_mtp_decode(output: Any, query_len: int, capacity: int) -> bool:
+    return decode_fallback_reason(output, query_len, capacity) is None
+
+
+class PPTransportMetrics:
+    """Opt-in host counters; never synchronize CUDA or read tensor values.
+
+    Payload bytes exclude protocol metadata and NCCL/network overhead. Host
+    wait time measures Work.wait() submission/blocking, not GPU transfer time.
+    Snapshots are cumulative and may also be read through worker collective RPC.
+    """
+
+    def __init__(self, rank: int, interval: int):
+        self.rank = rank
+        self.interval = interval
+        self.steps = 0
+        self.static_steps = 0
+        self.fallbacks: dict[str, int] = {}
+        self.payload_bytes: dict[str, int] = {}
+        self.tensor_messages: dict[str, int] = {}
+        self.send_wait_calls = 0
+        self.send_wait_host_seconds = 0.0
+
+    @classmethod
+    def create(cls, additional: Any, rank: int) -> "PPTransportMetrics | None":
+        interval = (
+            additional.get("pp_transport_metrics_interval", 0)
+            if isinstance(additional, dict)
+            else 0
+        )
+        if type(interval) is not int or interval < 0:
+            raise ValueError("pp_transport_metrics_interval must be a nonnegative int")
+        return cls(rank, interval) if interval else None
+
+    def record_step(self, *, static: bool, reason: str | None) -> None:
+        # Log the previous complete interval, before beginning the next step.
+        if self.steps and self.steps % self.interval == 0:
+            logger.info("PP_TRANSPORT_METRICS %s", json.dumps(self.snapshot()))
+        self.steps += 1
+        if static:
+            self.static_steps += 1
+        else:
+            reason = reason or "disabled"
+            self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1
+
+    def record_payload(
+        self,
+        direction: str,
+        protocol: str,
+        tensors: dict[str, torch.Tensor],
+        *,
+        num_tokens: int | None = None,
+        elements: dict[str, int] | None = None,
+    ) -> None:
+        key = f"{direction}_{protocol}"
+        size = 0
+        messages = 0
+        for name, tensor in tensors.items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            count = (
+                tensor.numel()
+                if num_tokens is None
+                else num_tokens * math.prod(tensor.shape[1:])
+            )
+            if elements is not None:
+                count = elements[name]
+            size += count * tensor.element_size()
+            messages += int(count > 0)
+        self.payload_bytes[key] = self.payload_bytes.get(key, 0) + size
+        self.tensor_messages[key] = self.tensor_messages.get(key, 0) + messages
+
+    def record_dynamic_send(
+        self,
+        pp: "GroupCoordinator",
+        tensors: dict[str, torch.Tensor],
+        all_gather_group: "GroupCoordinator | None",
+        all_gather_tensors: dict[str, bool] | None,
+    ) -> None:
+        # Reuse the sender's predicate. TP may transmit only a tensor slice;
+        # receiver-side TP reconstruction is a separate collective.
+        elements = {}
+        for name, tensor in tensors.items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            count = tensor.numel()
+            if count and pp._should_use_all_gather(
+                name, count, all_gather_group, all_gather_tensors
+            ):
+                assert all_gather_group is not None
+                count //= all_gather_group.world_size
+            elements[name] = count
+        self.record_payload("send", "dynamic", tensors, elements=elements)
+
+    def record_send_wait(self, seconds: float) -> None:
+        self.send_wait_calls += 1
+        self.send_wait_host_seconds += seconds
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "rank": self.rank,
+            "steps": self.steps,
+            "static_steps": self.static_steps,
+            "static_fraction": self.static_steps / self.steps if self.steps else 0.0,
+            "fallbacks": dict(self.fallbacks),
+            "payload_bytes": dict(self.payload_bytes),
+            "tensor_messages": dict(self.tensor_messages),
+            "send_wait_calls": self.send_wait_calls,
+            "send_wait_host_seconds": self.send_wait_host_seconds,
+        }
 
 
 @dataclass

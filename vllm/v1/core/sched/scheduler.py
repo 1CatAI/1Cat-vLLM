@@ -113,6 +113,9 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        # A reset can happen between schedule() calls. Carry its invalidations
+        # into the next worker batch even if only some requests resume there.
+        self._pending_prefix_cache_reset_req_ids: set[str] = set()
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -1366,6 +1369,9 @@ class Scheduler(SchedulerInterface):
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),
+            prefix_cache_reset_req_ids=(
+                self._pending_prefix_cache_reset_req_ids or None
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1460,6 +1466,8 @@ class Scheduler(SchedulerInterface):
         # NOTE: We shouldn't do self.finished_req_ids.clear() here because
         # it will also affect the scheduler output.
         self.finished_req_ids = set()
+        # Replace rather than clear: the outgoing batch owns this snapshot.
+        self._pending_prefix_cache_reset_req_ids = set()
 
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
@@ -2503,6 +2511,7 @@ class Scheduler(SchedulerInterface):
             while self.running:
                 request = self.running.pop()
                 self._preempt_request(request, timestamp)
+                self._pending_prefix_cache_reset_req_ids.add(request.request_id)
                 # All frames scheduled before this reset are stale, regardless
                 # of the number of output placeholders or accepted draft tokens.
                 # An inclusive step watermark also handles repeated resets while
