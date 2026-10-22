@@ -5,6 +5,7 @@
 
 import hashlib
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -215,6 +216,18 @@ class PlannedChannel:
         self.engine.run(x, out)
         return out
 
+    def result_matches(self, output, reference, values):
+        """Generated kernels must match their declared expression bitwise."""
+        import torch
+
+        return torch.equal(output.view(torch.int16), reference.view(torch.int16))
+
+    def next_values(self, reference, output):
+        # Every generated rank implements the same declared expression. A
+        # failed bitwise check fails qualification collectively, so no extra
+        # tensor collective is needed to propagate a successful reference.
+        return [reference] * len(self.plan["members"])
+
     def qualify(self, repeats=3):
         """Changed dense inputs, all-rank bitwise AST, poisoned chained graphs."""
         import torch
@@ -251,9 +264,9 @@ class PlannedChannel:
             dist.barrier(group=self.group)
             out = self.all_reduce(x)
             torch.accelerator.synchronize(self.device)
-            passed = torch.equal(
-                out.cpu().view(torch.int16), ref.view(torch.int16)
-            ) and torch.equal(x.cpu(), original)
+            passed = self.result_matches(out.cpu(), ref, values) and torch.equal(
+                x.cpu(), original
+            )
             statuses = [None] * len(values)
             dist.all_gather_object(statuses, passed, group=self.group)
             if not all(statuses):
@@ -266,20 +279,21 @@ class PlannedChannel:
             )
         # Replay changes the input after capture. Each intermediate dependent
         # output is checked, with exact fractions chosen to avoid overflow.
-        source = torch.empty(
-            self.capacity // 2, dtype=torch.float16, device=self.device
-        )
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            output = source
-            outputs = []
-            for _ in range(4):
-                output = self.all_reduce(output)
-                outputs.append(output)
+        with getattr(self, "capture", nullcontext)():
+            source = torch.empty(
+                self.capacity // 2, dtype=torch.float16, device=self.device
+            )
+            with torch.cuda.graph(graph):
+                output = source
+                outputs = []
+                for _ in range(4):
+                    output = self.all_reduce(output)
+                    outputs.append(output)
         for trial in range(repeats):
             original = torch.full(
                 (self.capacity // 2,),
-                (self.rank + 1 + trial) / 4096,
+                (self.rank + 1 + trial) / 1048576,
                 dtype=torch.float16,
             )
             values = [None] * dist.get_world_size(self.group)
@@ -294,10 +308,9 @@ class PlannedChannel:
             passed = True
             for output in outputs:
                 ref = expected(values)
-                passed &= torch.equal(
-                    output.cpu().view(torch.int16), ref.view(torch.int16)
-                )
-                values = [ref] * len(values)
+                actual = output.cpu()
+                passed &= self.result_matches(actual, ref, values)
+                values = self.next_values(ref, actual)
                 checks += 1
             statuses = [None] * len(values)
             dist.all_gather_object(statuses, passed, group=self.group)

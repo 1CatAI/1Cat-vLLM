@@ -11,6 +11,7 @@ import math
 import os
 import statistics
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 
 from .collective_planner import fingerprint
@@ -45,7 +46,7 @@ def choose(samples, margin=0.01):
 
 
 class Existing(PlannedChannel):
-    """Out-of-place backend facade for independent AST qualification and timing."""
+    """Existing reduction qualified independently of its accumulation order."""
 
     def __init__(self, backend, group, device, plan):
         import torch.distributed as dist
@@ -55,8 +56,9 @@ class Existing(PlannedChannel):
         self.capacity = plan["payload_bytes"]
         self.native = True
         self.rank = dist.get_rank(group)
-        # Existing FP32-accumulating implementations are checked against FP32
-        # sums, not falsely required to match a new FP16 expression bitwise.
+        self.accumulation = getattr(backend, "precision", "fp16")
+        # The plan supplies a reference tree, not the existing backend's
+        # accumulation order or intermediate precision.
         for value in self.plan["values"]:
             if value["children"] is not None:
                 value["dtype"] = "fp32"
@@ -75,8 +77,45 @@ class Existing(PlannedChannel):
     def all_reduce(self, x):
         return self.backend.all_reduce(x)
 
+    def capture(self):
+        return getattr(self.backend, "capture", nullcontext)()
+
+    def result_matches(self, output, reference, values):
+        """Bound FP16 summation error, including cancellation and subnormals.
+
+        For n inputs, gamma_(n-1) * sum(abs(x)) bounds n-1 rounded additions.
+        Add final FP16 conversion error and n half-subnormal rounding errors.
+        FP64 sums of the supplied FP16 probes provide an independent reference.
+        A relative tolerance alone would incorrectly reject near-zero sums.
+        """
+        import torch
+
+        if output.shape != reference.shape or output.dtype != torch.float16:
+            return False
+        inputs = torch.stack(values).double()
+        exact = inputs.sum(0)
+        n = len(values)
+        unit = 2**-24 if self.accumulation == "fp32" else 2**-11
+        gamma = (n - 1) * unit / (1 - (n - 1) * unit)
+        bound = gamma * inputs.abs().sum(0) + 2**-11 * exact.abs() + n * 2**-25
+        return bool(
+            torch.isfinite(output).all()
+            and ((output.double() - exact).abs() <= bound).all()
+        )
+
     def qualify(self, repeats=3):
-        return PlannedChannel.qualify(self, repeats)
+        return dict(
+            PlannedChannel.qualify(self, repeats),
+            precision=self.accumulation,
+            comparison="forward-error-bound against FP64 sum",
+        )
+
+    def next_values(self, reference, output):
+        import torch.distributed as dist
+
+        values = [None] * len(self.plan["members"])
+        dist.all_gather_object(values, output, group=self.group)
+        return values
 
     def close(self):
         pass  # The caller owns the existing backend.
@@ -85,10 +124,22 @@ class Existing(PlannedChannel):
 class BoundBackend:
     """Snapshot the old method before installing a new communicator wrapper."""
 
-    def __init__(self, backend):
+    def __init__(self, backend, precision="fp16"):
         self.function = backend.all_reduce
+        self.precision = precision
+        ca = getattr(backend, "ca_comm", None)
+        # Match GroupCoordinator.graph_capture: registration happens when the
+        # outer context exits, after CUDA capture and before any replay.
+        self.capture = ca.capture if ca is not None else nullcontext
 
     def all_reduce(self, x):
+        if self.precision == "fp32":
+            import torch
+
+            if x.dtype == torch.float16:
+                # The explicit policy must also hold if the existing backend
+                # wins or an unsupported signature takes the fallback route.
+                return self.function(x.float()).half()
         return self.function(x)
 
 
@@ -120,6 +171,7 @@ def prepare_best(
             measure=measure,
             **options,
         )
+    import torch
     import torch.distributed as dist
 
     try:
@@ -127,7 +179,7 @@ def prepare_best(
     except TypeError:
         source = None
     native = getattr(getattr(existing, "extension", None), "__file__", None)
-    external = dict(
+    external: dict[str, object] = dict(
         type=type(existing).__module__ + "." + type(existing).__qualname__,
         source=hashlib.sha256(Path(source).read_bytes()).hexdigest()
         if source and Path(source).is_file()
@@ -147,7 +199,12 @@ def prepare_best(
         if runtime_file and Path(runtime_file).is_file()
         else None
     )
-    existing = BoundBackend(existing)
+    # A configured collective provider can be loaded separately from vllm._C.
+    external["loaded_libraries"] = sorted(
+        hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for path in torch.ops.loaded_libraries
+    )
+    existing = BoundBackend(existing, options.get("precision", "fp16"))
     extra = dict(
         context or {},
         existing_backend=external,

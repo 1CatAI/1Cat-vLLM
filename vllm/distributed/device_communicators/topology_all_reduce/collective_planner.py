@@ -482,7 +482,7 @@ def solve(
     *,
     helpers=(),
     payload_bytes=5120,
-    precision="fp32",
+    precision="fp16",
     budget=4096,
     shortlist=8,
     seed=271828,

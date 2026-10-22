@@ -10,6 +10,20 @@ from _vllm_topology_all_reduce_tests.planned_codegen import generate, layout
 
 
 class PlannedCodeTests(unittest.TestCase):
+    def test_default_uses_half_sums_and_half_partial_transfers(self):
+        topology = self.topology(3)
+        default = solve(topology, range(3), budget=32)
+        half = solve(topology, range(3), precision="fp16", budget=32)
+        wide = solve(topology, range(3), precision="fp32", budget=32)
+        self.assertEqual(default["key"], half["key"])
+        self.assertNotEqual(default["key"], wide["key"])
+        for candidate in default["candidates"]:
+            plan = candidate["plan"]
+            self.assertTrue(all(v["dtype"] == "fp16" for v in plan["values"]))
+            source = generate([plan], topology, 5120)
+            self.assertIn("=add_half(", source)
+            self.assertNotIn("=add_wide(", source)
+
     def topology(self, n):
         return Topology(
             list(range(n)),

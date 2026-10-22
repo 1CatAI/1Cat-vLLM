@@ -34,7 +34,7 @@ class StartupTests(unittest.TestCase):
 class InstallTests(unittest.TestCase):
     """Exercise startup wiring with a communicator, without a CUDA runtime."""
 
-    def run_install(self, *, world=2, remote=False):
+    def run_install(self, *, world=2, remote=False, precision="fp16"):
         import tempfile
         from contextlib import ExitStack
         from unittest.mock import Mock, patch
@@ -77,7 +77,8 @@ class InstallTests(unittest.TestCase):
 
         def prepare(group, device, **kwargs):
             self.assertIs(comm.all_reduce, old_reduce)
-            self.assertEqual(kwargs["precision"], "fp32")
+            self.assertEqual(kwargs["precision"], precision)
+            self.assertTrue(str(kwargs["cache"]).endswith(f"-{precision}.json"))
             width = kwargs["payload_bytes"]
 
             def close_route():
@@ -97,7 +98,7 @@ class InstallTests(unittest.TestCase):
             vllm_config=SimpleNamespace(
                 kernel_config=SimpleNamespace(
                     topology_all_reduce=SimpleNamespace(
-                        precision="fp32", cache_dir="unused"
+                        precision=precision, cache_dir="unused"
                     )
                 ),
                 model_config=SimpleNamespace(
@@ -158,6 +159,13 @@ class InstallTests(unittest.TestCase):
         tensor.dtype = "fp16"
         tensor.data_ptr = lambda: 2
         self.assertEqual(comm.all_reduce(tensor)[0], "existing")
+        tp.destroy()
+        self.assertEqual(calls, [10240, 81920, "destroy"])
+
+    def test_explicit_fp32_reaches_tuner_and_uses_separate_cache(self):
+        tp, result, calls, count = self.run_install(precision="fp32")
+        self.assertEqual(count, 2)
+        self.assertEqual(sorted(result), [10240, 81920])
         tp.destroy()
         self.assertEqual(calls, [10240, 81920, "destroy"])
 

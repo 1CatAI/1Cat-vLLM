@@ -622,8 +622,9 @@ class TopologyAllReduceConfig:
     enabled: bool = False
     """Qualify and select routes before first model compilation and capture."""
 
-    precision: Literal["fp16", "fp32"] = "fp32"
-    """Accumulation and partial-sum precision; input and output stay FP16."""
+    precision: Literal["fp16", "fp32"] = "fp16"
+    """Use FP16 sums/transfers by default; opt into FP32 sums and partial
+    transfers for accuracy at higher latency. Input and output stay FP16."""
 
     cache_dir: str | None = None
     """Selection cache directory; None uses PyTorch's default extension root."""
