@@ -46,10 +46,10 @@ PREFILL_CHUNK=8192 HOT_TOKENS=32768 STAGE_TOKENS=525504 EXPERT_FRACTION=0.8
 if (( MAX_NUM_SEQS > 1 )); then PREFILL_CHUNK=4096 STAGE_TOKENS=131072; fi
 # Sparse attention touches most of each request's history within ~100 decode
 # steps, so the shared hot cache should cover every concurrent context:
-# misses cross PCIe. A smaller state pool leaves room for it on 16 GB cards
-# (two requests: 64K tokens per layer; three or four: 96K; more keep 32K).
-if (( MAX_NUM_SEQS == 2 )); then HOT_TOKENS=65536
-elif (( MAX_NUM_SEQS >= 3 && MAX_NUM_SEQS <= 4 )); then HOT_TOKENS=98304; fi
+# misses cross PCIe. A smaller state pool leaves room for it on 16 GB cards:
+# two to four requests get 64K tokens per layer (96K leaves under 100 MiB for
+# mixed prefill activations), more keep 32K.
+if (( MAX_NUM_SEQS >= 2 && MAX_NUM_SEQS <= 4 )); then HOT_TOKENS=65536; fi
 # Prefill sharing a step with resident decodes keeps at least half a chunk:
 # the adaptive budget charges the decodes' fixed cost to the prefill tokens
 # and would otherwise shrink to a few tokens per step.
