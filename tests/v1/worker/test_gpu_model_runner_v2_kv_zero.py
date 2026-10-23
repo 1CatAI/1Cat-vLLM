@@ -8,6 +8,7 @@ from unittest import mock
 import torch
 
 from vllm import envs
+from vllm.v1.worker.gpu import kv_connector as mrv2_kv_connector
 from vllm.v1.worker.gpu import model_runner as mrv2
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
@@ -71,7 +72,10 @@ def test_v2_clears_new_cache_blocks_before_zero_token_return() -> None:
         apply_staged_writes=lambda: events.append("apply")
     )
     runner._zero_block_ids = lambda block_ids: events.append(("zero", block_ids))
-    runner.kv_connector = SimpleNamespace(no_forward=no_forward)
+    runner.kv_connector = SimpleNamespace(
+        handle_preemptions=lambda _: events.append("flush"),
+        no_forward=no_forward,
+    )
     scheduler_output = SimpleNamespace(
         total_num_scheduled_tokens=0,
         new_block_ids_to_zero=[3, 7],
@@ -86,6 +90,8 @@ def test_v2_clears_new_cache_blocks_before_zero_token_return() -> None:
         "add",
         "update",
         "apply",
+        # Offload stores of reused blocks must finish before the zeroing.
+        "flush",
         ("zero", [3, 7]),
         "no_forward",
     ]
@@ -141,3 +147,30 @@ def test_v2_warms_qwen38_mtp_moe_prefill_and_decode_shapes(monkeypatch) -> None:
         mock.call(16),
         mock.call(1, uniform_decode=True),
     ]
+
+
+def test_v2_connector_handles_preemptions_once_per_step(monkeypatch) -> None:
+    """The early flush in execute_model must not be repeated by pre_forward,
+    and pre_forward still flushes when no early call happened."""
+    calls: list[str] = []
+    worker = SimpleNamespace(
+        handle_preemptions=lambda meta: calls.append(f"flush:{meta.step}"),
+        bind_connector_metadata=lambda meta: calls.append(f"bind:{meta.step}"),
+        start_load_kv=lambda _: calls.append("load"),
+    )
+    monkeypatch.setattr(mrv2_kv_connector, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(mrv2_kv_connector, "get_forward_context", lambda: None)
+    connector = mrv2_kv_connector.ActiveKVConnector.__new__(
+        mrv2_kv_connector.ActiveKVConnector
+    )
+    connector.kv_connector = worker
+    connector._disabled = False
+    connector._handled_metadata = None
+
+    step1 = SimpleNamespace(kv_connector_metadata=SimpleNamespace(step=1))
+    connector.handle_preemptions(step1)
+    connector.pre_forward(step1)
+    step2 = SimpleNamespace(kv_connector_metadata=SimpleNamespace(step=2))
+    connector.pre_forward(step2)
+
+    assert calls == ["flush:1", "bind:1", "load", "flush:2", "bind:2", "load"]

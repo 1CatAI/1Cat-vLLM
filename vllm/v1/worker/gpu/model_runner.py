@@ -1497,6 +1497,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            # Finish offload stores whose source blocks this step reuses before
+            # zeroing them below; see ActiveKVConnector.handle_preemptions.
+            self.kv_connector.handle_preemptions(scheduler_output)
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             if scheduler_output.total_num_scheduled_tokens == 0:
