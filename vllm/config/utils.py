@@ -121,8 +121,12 @@ def replace(dataclass_instance: ConfigT, /, **kwargs) -> ConfigT:
     but compatible with Pydantic dataclasses which use `pydantic.fields.Field` instead
     of `dataclasses.field`"""
     cls = type(dataclass_instance)
-    dataclass_dict = dataclass_instance.__dict__
-    dataclass_dict = {k: v for k, v in dataclass_dict.items() if is_init_field(cls, k)}
+    # Runtime attachments and cached properties are not constructor arguments.
+    dataclass_dict = {
+        f.name: getattr(dataclass_instance, f.name)
+        for f in fields(cls)
+        if is_init_field(cls, f.name)
+    }
     dataclass_dict.update(kwargs)
     return cls(**dataclass_dict)
 
@@ -465,3 +469,48 @@ def set_from_deprecated_env_if_set(
         elif to_int:
             field_value = int(env_value)
         setattr(config, field_name, field_value)
+
+
+def resolve_legacy_fields(
+    policy,
+    aliases: dict[str, str],
+    *,
+    inactive_defaults: dict[str, int | float] | None = None,
+    reader=None,
+    source_overrides: dict[str, str] | None = None,
+    deferred_errors: dict[str, str] | None = None,
+) -> None:
+    from vllm import envs
+    from vllm.envs_metadata import EnvVar
+
+    for config_field in fields(policy):
+        name = config_field.name
+        if name not in aliases:
+            continue
+        legacy = aliases[name]
+        variable = envs.environment_variables.get(legacy)
+        if isinstance(variable, EnvVar):
+            variable.warn_if_deprecated()
+        if getattr(policy, name) is not None:
+            policy.sources.setdefault(name, "typed")
+        else:
+            source = legacy if legacy in os.environ else "default"
+            try:
+                value = (
+                    reader(legacy)
+                    if reader is not None
+                    else envs.environment_variables[legacy]()
+                )
+            except ValueError as error:
+                if deferred_errors is not None:
+                    deferred_errors[name] = str(error)
+                    policy.sources[name] = source
+                    continue
+                if inactive_defaults is None or name not in inactive_defaults:
+                    raise
+                value = inactive_defaults[name]
+                source = f"inactive default (ignored {legacy})"
+            setattr(policy, name, value)
+            policy.sources[name] = source
+            if source_overrides and legacy in source_overrides:
+                policy.sources[name] = source_overrides[legacy]

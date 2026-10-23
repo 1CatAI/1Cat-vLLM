@@ -11,9 +11,9 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -557,7 +557,10 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
-        if envs.VLLM_DFLASH_DEBUG_CONTEXT_KV and get_tensor_model_parallel_rank() == 0:
+        if (
+            capture_runtime_trace().dflash.value("context_kv")
+            and get_tensor_model_parallel_rank() == 0
+        ):
             row_diffs = (
                 self._k_norm_weights.float()
                 .sub(self._k_norm_weights[0].float())
@@ -726,7 +729,7 @@ class DFlashQwen3Model(nn.Module):
                 all_k, self._k_norm_weights, self._rms_norm_eps
             )
             if (
-                envs.VLLM_DFLASH_DEBUG_CONTEXT_KV
+                capture_runtime_trace().dflash.value("context_kv")
                 and not self._sm70_context_k_debugged
                 and get_tensor_model_parallel_rank() == 0
                 and bool(torch.count_nonzero(all_k).item())
@@ -778,7 +781,9 @@ class DFlashQwen3Model(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ) = None,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -841,19 +846,24 @@ class DFlashQwen3Model(nn.Module):
         self,
         all_k: torch.Tensor,
         all_v: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ),
     ) -> None:
         """Write only the accepted, resident context slots."""
         if context_slot_mapping is None:
             return
         per_layer = isinstance(context_slot_mapping, (list, tuple))
         for i in range(self._num_attn_layers):
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
-            )
+            attn = self._attn_layers[i]
+            if isinstance(context_slot_mapping, dict):
+                slot_mapping = context_slot_mapping[attn.layer_name]
+            else:
+                slot_mapping = (
+                    context_slot_mapping[i] if per_layer else context_slot_mapping
+                )
             if slot_mapping is None:
                 continue  # dummy run: skip cache ops
-            attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,
@@ -952,6 +962,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
+        self._sampling_policy = vllm_config.speculative_config.sampling_policy
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
@@ -1047,7 +1058,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ) = None,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(
@@ -1056,7 +1069,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def get_aux_hidden_state_dtype(self) -> torch.dtype | None:
         if (
-            not envs.VLLM_DFLASH_COMPACT_AUX_HIDDEN
+            not self._sampling_policy.compact_aux_hidden
             or not self.model.use_aux_hidden_state
         ):
             return None

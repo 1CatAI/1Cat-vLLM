@@ -2,6 +2,117 @@
 
 Date: 2026-05-30
 
+## Full-mesh HCX local schedule, 2026-10-09
+
+The Flash-Next TP4 HCX schedule defers up-weight prefetch until combine
+completes, overlaps independent peer loads and stream norm reductions, and
+assigns gate-mix to one warp per row. Persistent counters remove the completion
+arrival/reset phase; acquire/release publication replaces thread-wide barrier
+fences. The arithmetic order is unchanged. Source `71fce5ca51` in the normal
+installed wheel measures 23.753 to 19.013 µs per complete M5 boundary;
+M1 is 18.680 to 14.424 µs and M8 30.525 to 25.927 µs.
+These are boundary measurements with actual weights and synthetic activations,
+not model round latency. Installed-artifact and model results are tracked in
+[the local schedule report](flashnext_hcx_local_schedule.md).
+Both the first fresh-process pair and the subsequent shared-cache comparison
+fail the teacher-distribution gate. The new schedule is explicitly opt-in;
+the Python and native defaults retain the reference schedule. Model promotion
+remains pending repeatable fresh-process validation. The completed same-process
+original/recaptured-reference/candidate/original-again comparisons all pass:
+64/64 logits, eight natural continuations and their acceptance counters are
+identical, with KL zero. A same-artifact fresh-process A/A comparison itself
+has top-1 agreement 63/64 and different natural outputs, so the earlier A/B
+differences do not isolate a native scheduling effect. The underlying startup
+variation remains unresolved. Two symmetric C1 timing blocks give -0.024 and
+-0.771 ms; keep these exploratory and quote the reproducible boundary gain.
+
+Those model results apply to the first-round wheel. V6 source `71fce5ca51`
+passes 73 raw-bit comparisons per rank for every M1–8 shape, including six
+counter-wrap and interleaved-route checks. A separate M5 process measures
+23.737 to 19.004 µs. The V4 model diagnostic was stopped during loading
+at the user's request to prioritize larger kernel scheduling changes; no
+V4–V6 model result is claimed. M5's achieved reduction is about 20%, below the
+requested 30–50% target. Keep the default false and defer full-model work.
+Interleaved up ownership retains norm inputs in the producing CTA and screens
+at 19.804 µs, but is research-only. Raw LoRA-to-register paths, compact
+receiver/consumer pipelines and direct batched polling all regress; do not
+repeat them without a materially different schedule.
+
+The structural reassessment records every warp's phase timing. Norm/partial
+handoffs, grid joins and LoRA staging remain material; up MMA is a small span.
+These are instrumented phase spans, not an additive model latency ledger.
+Three concrete rewrites fail the paired complete-boundary screen against V6:
+joint norm/down exchange with coalesced compact receivers is 21.881 versus
+19.062 µs; one full-K down column per CTA is 24.716 versus 19.005 µs; twenty
+Tensor Core K partitions are 23.093 versus 19.025 µs. Changed-sum-order screens
+are deterministic with maximum relative L2 error 7.07e-5, but are research-only
+and have no model quality gate. Record these failures before trying another
+layout. A real-weight output-projection-plus-HC screen measures 28.481 µs
+for production projection plus V6 and 26.464 µs for fused local scheduling.
+The 2.017-µs saving is measured over the complete chain. This remains a
+research DSO, supports Q4_K/Q6_K with already normalized input, and is not
+part of the installed result or a model speedup. Do not omit producer work
+from the comparison or budget the previous assumed 3.8 µs per fusion.
+
+Source `b0d7af22b5` subsequently adds the local schedule to normal fused
+Q4_K/Q6_K dispatch for already-normalized inputs; gated normalization and
+two-hop paths retain their legacy schedules. Its source-complete `_C` is
+installed in a fresh V7 runtime. The matched M5 production-projection-plus-HC
+chain is 28.505 µs separate, 30.205 µs with the legacy fused schedule, and
+26.395 µs with fused local scheduling: a 2.110-µs (7.4%) complete-chain gain.
+M1 is 23.031 to 20.712 µs; M8 is 35.447 to 32.628 µs. All M1–8 shapes pass
+35 raw-bit eager/graph cases per fused mode per rank, plus 12 counter and
+four fallback comparisons. Poisoned partial outputs rule out stale separate
+producer results. A separate CUDA trace observes both Q4_K/Q6_K selected
+kernel specializations on all four ranks. The unfused M5 regression remains
+18.993 µs, and both unfused SASS variants match V6. This validates native
+operators, not the model layout adapter, quality or latency. Keep the local
+schedule default false and model tests deferred. Identities and raw evidence
+are in [the local schedule report](flashnext_hcx_local_schedule.md).
+
+The 2026-10-10 follow-up targets half the **current** approximately 19-µs
+boundary, or at most approximately 9.5 µs. Five new research screens do not
+reach it. A 94-boundary synthetic recurrent chain, including full block
+delivery every step and full residual delivery at exit, measures 19.350 µs
+per boundary for V6 versus 19.028 for residual carry. Carry saves only
+0.739 µs against the same K-shard arithmetic with materialization every call.
+Its largest changed-chain relative L2 error is 0.001397; this is not a model
+quality gate. Overlapped central norm reduction, earlier mix-input loads,
+per-producer first-join readiness, compact all-row-refresh LoRA packets and
+receiver-only second-join arrivals all regress against their paired V6
+controls. Their raw-bit checks pass. Keep these failures recorded in
+[the local schedule report](flashnext_hcx_local_schedule.md) before reusing
+their layouts. No structural partition candidate is promoted and full-model
+work remains deferred.
+
+Further screens reject full-K Tensor Core column ownership (24.756 / 29.448 µs
+prefetched / streamed versus 19.080 installed), per-M compact LoRA buffers
+(20.289 versus 18.818), and vectorized LoRA staging (22.615 / 20.827 versus
+18.609). Sharing input across four down columns improves the column prototype
+to 21.258 µs from 24.726, but still loses to its 19.016-µs native control.
+Two/eight-column follow-ups take 21.437/22.243 µs against four-column 21.252
+and native 19.094 µs; stop treating wider input reuse as a presumed win.
+The numerical gates pass; changed-tree candidates are not model-qualified.
+An intentionally incorrect-output V6 ablation bypassing weight reads,
+both grid joins and peer waits still measures 13.206 µs against a 19.037-µs
+copied control. It retains arithmetic, intermediate staging and communication
+writes. It is not a usable implementation, an additive cost ledger or a
+rigorous lower bound. The half-current target remains unmet.
+
+The historical approximately 3-ms HC number is 2.9623 ms of profiled target
+HCX service on the earlier two-hop machine, alongside a separate unprofiled
+17.3988-ms model round. It is not the current full-mesh microbenchmark sum.
+At 94 boundaries, 19.004 µs gives a 1.786-ms isolated estimate; less than
+1 ms requires an average below 10.64 µs before draft/remaining HC. Neither
+an under-1-ms HC result nor a new model speedup has been demonstrated.
+
+Do not repeat the K-shard implementations as presumed wins: a centralized
+receiver takes 77–82 µs; distributed receivers take 44–48 µs versus a 23.7-µs
+control, including delivery of the complete residual state. Last-arrival norm
+reduction, grouped partial layouts and a smaller barrier arrival set also
+failed to produce an additional gain. The CTA-local norm cache helps slightly
+alone but loses when combined with the retained schedule, so it is omitted.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:
@@ -49029,3 +49140,559 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+## 2026-10-08 — architecture A0 Flash-V100 package split: validation pending
+
+Continue `agent/arch-flash-v100-split-20261008` from #1049
+(`cd081f4aec77f18362759985081cb9c384815aee`) in
+`/home/ymzx/arch-ws/refactor`. Source and private Git metadata now both live
+on the root disk; the handed-off worktree's Git directory originally pointed
+at full `/mnt/nvme3`. Retain original metadata and data, and do not install
+anything in the shared runtime.
+
+Static extraction audit found 194 original symbols with unchanged normalized
+AST bodies, but a duplicated prefill log flag, distinct module loggers and
+frozen public re-exports broke shared state/old-path monkeypatches. Restore
+one-owner flag access, the original shared logger and dynamic package exports;
+retain wildcard compatibility. Focused CPU compatibility/cleanup/MLA suite:
+11 passed. Coupling totals stay model 2325 / platform 3964 / env 335.
+
+GPU acceptance is pending, not waived. The handed-off base test process
+exhausted its GPU3 lock wait and never executed tests. The original A/B helper
+could mistake two incomplete logs for matching empty failure sets; use
+`/home/ymzx/arch-ws/tmp/ab_checked.sh` instead, which records exit codes and
+JUnit XML and refuses missing completion summaries. The 54-file base/new
+suite and the route/output/timing gate were queued under the GPU3 lock while
+an unrelated TP4 model owned all GPUs; neither job was stopped. A machine
+reboot then interrupted the queued runners. After reboot, `nvidia-smi` cannot
+connect and `lspci -d 10de:` lists no NVIDIA devices. Current static checks and
+the 11-case CPU suite pass again; GPU access must be restored before rerunning
+the paired gates. The checked runner also requires an available SM70 device
+before pytest and compares every JUnit outcome, so skipped/no-GPU runs cannot
+be counted as acceptance. Tests use the
+user-specified `gguf-round-cost-20261008` runtime with task caches under
+`/home/ymzx/arch-ws/tmp/a0-caches` and `VLLM_NO_USAGE_STATS=1`.
+
+Retain evidence at `/home/ymzx/arch-ws/tmp/a0-handoff.md`,
+`split_checked_ab.log`, `operator_gate.log`, `a0-compatibility.txt` and
+`a0-precommit-restart.log`, `a0-compatibility-restart.txt` and
+`no_gpu_probe.log`. Require executed matching GPU failure sets,
+`VLLM_SM70_DEBUG=routing` route equality, bitwise operator equality and the
+requested decode/long-prefill timing within ±2% before accepted commit/push.
+A2 and the remaining campaign are not complete. #1048 overlaps partial
+metadata extraction and provides a useful route inventory, but its CUDA
+reader changes are outside this full Python backend split.
+
+### Campaign validation override
+
+The user explicitly instructed continuation without V100 on 2026-10-08.
+Proceed with CPU/static validation and stacked Draft PRs; do not represent
+unrun GPU failure-set, route, numerical or timing checks as passed. A0 has
+11 passing CPU regressions, 194 matching normalized extracted symbols and
+passing pre-commit/mypy/layering checks. This override supersedes the GPU
+publication gate above; hardware qualification remains unmeasured.
+
+## 2026-10-08 — architecture A2 declarative counters and shared XQA admission
+
+Stack on A0 #1052 (`d8aa0bef64b7bb410380e79849c478ec7f915142`) in
+`agent/v100-arch-route-table-20261008-081749`, worktree
+`/home/ymzx/arch-ws/v100-arch-route-table-20261008-081749` on the root disk.
+The user's no-V100 validation override applies; no GPU precision or speed
+claim is made.
+
+`routing.RouteSpec` declares stage, codec set, head/GQA, page and chunk
+constraints. All 44 literal counter names resolve through the table. Dynamic
+page/partition and FP8 observer families retain their original strings;
+concrete split-D aliases and the sibling FlashInfer shared counters are covered.
+Do not classify the native Triton tree correction as diagnostic fallback.
+Uniform, mixed-row and small-query XQA now use one admission implementation
+with the original stage-specific hint priority, window and batch rules.
+Operator metadata/ABI/stride guards remain necessary. Fallback accounting and
+logs are separate from the original route summary, including when debug route
+counting is disabled. Unknown route names fail explicitly.
+
+Focused CPU suite: 306 passed, covering the generated structural matrix,
+frozen A0 predicate equivalence at 4096/16384/32768 boundaries, graph/workspace
+hints, disabled E4M3 batch, policy/availability/window/partition cases, mixed
+row metadata/scatter, compatibility/cleanup and FlashInfer. No CUDA operator
+was executed. Original/new CPU policy suite A/B is recorded separately under
+`/home/ymzx/arch-ws/tmp/a2_cpu_*`; do not confuse these CPU mocks with GPU tests.
+
+Coupling totals remain model 2325 / platform 3964 / env 335. One existing
+small-query raw env read moved from impl (27 to 26) to routing (14 to 15);
+`--accept-moves` records this without growing any total. The new component
+README explains structural coverage versus installed operator qualification.
+Retain the frozen legacy JSON as a migration oracle; the initial fixture
+annotation namespace omission was fixed, then a clean independent test run
+passed. Next scope: split impl and move feature metadata behind hooks (A3b).
+
+A2 final CPU policy A/B: 243 cases in both arms, identical complete JUnit
+outcomes (233 passed / 9 failed / 1 skipped). All nine inherited failures are
+`DeviceConfig` device inference in metadata-builder setup without hardware;
+they are not new routing failures. Evidence: `a2_cpu_ab.json`, paired JUnit
+XML and logs. The clean focused matrix/compatibility/backend suite has 306
+passes. Pre-commit and mypy pass on all nine owned paths. The table contains
+56 concrete declarations plus four observer families; 1,560 differential
+legacy decisions cover boundaries, availability/window/partition/graph hints
+and disabled E4M3 batch. GPU measurements remain unrun per the user override.
+
+## 2026-10-08 — architecture A3b-1 implementation method extraction
+
+Stack on A2 #1053 (`c7e4baf3c214ecedb6356fb19cd6c80ec94978ea`) in
+`agent/v100-arch-impl-split-20261008-084930`, root-disk worktree
+`/home/ymzx/arch-ws/v100-arch-impl-split-20261008-084930`.
+
+Extract 40 methods into decode (798 lines), prefill (1680), verify (1031)
+and debug_compare (428); core impl drops from 4930 to 1135 lines. Bind the
+same method names on the original class with unchanged inheritance and
+staticmethod descriptors. Move 30 global one-shot states to one state owner
+and register the owners with the compatibility shim. Preserve the original
+class receiver for the extracted comparison super call; a rebound public
+class export must not change the old `__class__` cell semantics.
+
+All 47 normalized calculation bodies match frozen A2 hashes. Normalization
+accounts only for state qualification/global declarations, typed-self
+annotations, docstring dedent and the explicit original-class super receiver.
+The initial seven hash differences were docstring indentation, not algorithm
+changes. The clean hash comparison has zero differences. New descriptor,
+state rebinding and patched-export/super tests: 3 passed. Existing focused
+matrix/mixed-row/compatibility/cleanup/FlashInfer suite: 306 passed. CPU policy
+candidate: 233 passed / 9 inherited device-inference failures / 1 skipped;
+all 243 JUnit case/status outcomes match the retained A2 parent result exactly
+(`a3_cpu_ab.json`). No GPU test is required by the user's active override;
+GPU numerical equivalence, replay and performance remain unmeasured.
+
+Coupling totals stay model 2325 / platform 3964 / env 335; accept per-file
+moves without any total growth. Pre-commit/mypy on moved implementation files
+passed. Raw logs and the source-normalization helper are under
+`/home/ymzx/arch-ws/tmp/a3_*`. This PR only extracts method responsibilities.
+A3b feature metadata hooks and removing family references from the remaining
+initialization/forward orchestration are still pending and must be a separate
+review scope; do not mark the full A3b or the architecture campaign complete.
+
+## 2026-10-08 — architecture A3b-2 speculative metadata hooks
+
+Stack on A3b-1 #1055 (`fb6b12c5b8013ec43b5c34e0135857f3b0fb74e7`) in
+`agent/v100-arch-spec-hooks-20261008-090436`, root-disk worktree
+`/home/ymzx/arch-ws/v100-arch-spec-hooks-20261008-090436`.
+
+Move 14 feature builder methods into spec/builder, draft, tree and
+verify_metadata; move device/group preparation into spec/smallq_metadata with
+a true module alias at the prior path. Register initialization, common attach
+and capture preparation hooks. Keep generic metadata, prefix-anchored windows,
+decode shape hints and partition buffers in metadata.py (1345 to 471 lines).
+The common file has no DFlash/DDTree names. The inherited compatibility mixin
+keeps every method and the extended positional/keyword build signature;
+extracted super calls continue after the mixin and execute the Triton builder
+once. Internal imports use the new device metadata owner.
+
+All 14 normalized calculation bodies match the parent. Six new CPU tests
+plus three retained implementation tests pass. These check legacy
+module alias/patch identity, tree capture restoration and invalid inputs,
+persistent draft buffer addresses/capacity, base builder and feature hook
+order, and small-query capture lengths/partition hints. Existing focused
+suite: 306 passed. Existing policy suite: 233 passed / 9 inherited device
+inference failures / 1 skipped; all 243 JUnit outcomes match A3b-1 exactly.
+Evidence: a3b_cpu_ab.json, a3b_cpu_new.xml, a3b-tests.log and a3b-spec-tests-final.log
+under /home/ymzx/arch-ws/tmp. Initial mypy errors from typed assignments to an
+external self were fixed by retaining field annotations on the owning mixin.
+
+Coupling totals stay model 2325 / platform 3964 / raw env 335. The two
+small-query env reads move to their feature owner; accept-moves records this
+without total growth. GPU validation remains waived by the explicit user
+instruction. Remaining A3b scope: implementation initialization/forward hooks
+and removal of feature names from the backend core. The campaign is ongoing.
+
+## 2026-10-08 — architecture A3b-3 attention feature boundary
+
+Stack on A3b-2 #1056 (`0a38520587c2552b7150907a8f62acc4371b89ec`) in
+`agent/v100-arch-attention-hooks-20261008-091421`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-attention-hooks-20261008-091421`.
+
+Register typed immutable attention callbacks for scalar-tail initialization,
+verifier ABI/policy, prefill wrapper policy, feature contract validation,
+selector XQA exclusions, unsupported-layer fallback and capture accounting.
+Retain legacy methods/fields in a feature compatibility mixin and all existing
+route labels. impl.py drops 1135 to 1021 lines; impl.py, metadata.py and
+backend.py now contain no DFlash/DDTree references. This completes A3b's method
+and metadata extraction plus core feature hooks; A4 grouped-family admission
+and subsequent phases remain outstanding.
+
+After mechanically expanding hook bodies and validating call argument order,
+all 47 calculation hashes still match the original A2 fixture. Seven new
+feature-boundary CPU cases plus nine retained composition/metadata cases pass.
+They exercise the actual forward entrypoint for rejection/fallback/non-causal
+capture, retain route labels/base-call counts and legacy instance patches, and
+check prefill wrapper attributes with both split policies. Initial new tests
+contained an incorrect mock positional index and omitted query_start_loc;
+these test inputs were repaired. Clean evidence: a3c-hooks-tests-final.log.
+
+Existing focused suite: 306 passed. Existing CPU policy suite: 233 passed /
+9 inherited device-inference failures / 1 skipped; all 243 outcomes match
+A3b-2 exactly (a3c_cpu_ab.json and paired JUnit XML). Mypy and the ratchet pass.
+Coupling totals remain model 2325 / platform 3964 / raw env 335; one existing
+env read moves from impl to spec/attention, without total growth. No GPU
+precision, replay or timing evidence is claimed under the user's active
+no-V100 requirement. Root-disk logs are under /home/ymzx/arch-ws/tmp/a3c_*.
+
+## 2026-10-08 — architecture A4a codec-parameterized grouped admission
+
+Stack on A3b-3 #1057 (`71b5fe54aac37d91bc2521b44aab4c4345bfc514`) in
+`agent/v100-arch-grouped-codecs-20261008-092507`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-grouped-codecs-20261008-092507`.
+
+One grouped_fp32_reason(codec, ...) owns FP16/E4M3 request-row and E4M3
+explicit-group admission, returning rejection strings. Declarative contracts
+own native providers/revisions and format-specific measured shape/layout
+limits; compatibility wrappers preserve old signatures and FP16 reason
+precedence. Backend imports use the shared owner. Move scalar/long family
+modules to codec-neutral grouped paths, retaining true old-module aliases and
+original logger names. Native arithmetic/manifests/workspace/launch code stays
+unchanged: 22 normalized function hashes match the parent. Scalar/long remain
+E4M3-only; this PR does not expand their admitted codecs.
+
+Differential CPU evidence: 2940 shape/device/revision combinations plus 98
+policy/layout cases match frozen legacy predicates, including FP16 rejection
+strings. Preserve the old raw partition-env "0" vs typed-zero distinction and
+E4M3 CPU descriptor admission. Declared group boundaries generate additional
+cases. Old-module alias/patch identity, provider dispatch, missing batch
+revision ImportError and sole workspace cleanup are checked. A first import
+run exposed an omitted common cleanup export; restored it. Ruff split a mixed
+compatibility import and removed two unused exports; explicit self-alias
+reexports now survive formatting and the clean admission tests.
+
+Paired family suite: all 86 outcomes match, 71 passed / 15 failed in both
+branches (a4a_family_ab.json, paired XML/logs). Nine scalar tests leave the real
+long native dependency unresolved, yielding None; six existing runner mocks
+lack the device attribute. Do not repeat these as new native regressions.
+Coupling: model 2325 → 2325, platform 3964 → 3964, raw env 335 → 334, from
+consolidating two identical E4M3 reads into one. GPU numerical/replay/timing
+validation remains waived by the user; no precision or speed claim is made.
+Evidence under /home/ymzx/arch-ws/tmp/a4a_*. Next scope: audit the current E4M3
+decode partition/reduce state before implementing A4b; do not assume the
+original p256 observation still describes the current source.
+
+A4a final CPU checks: 13 new shared-family cases pass (3038 differential
+admission comparisons, declaration-generated boundaries, native source/alias
+and workspace/provider checks). The combined admission/implementation/feature
+suite passed 57 cases before two declaration-generated cases were added; the
+final shared-family file includes and passes those two. Retained backend
+routing/mixed-row/compatibility/cleanup/FlashInfer suite: 306 passed. Existing
+policy suite: 233 passed / 9 inherited DeviceConfig inference failures /
+1 skipped, identical across all 243 parent/new outcomes (a4a_cpu_ab.json).
+No new runtime policy failure was introduced.
+
+## 2026-10-08 — architecture A4b shared decode strategy
+
+Stack on A4a #1059 (`58511ea2bc617ef904a0578b6004a58a1479a203`) in
+`agent/v100-arch-decode-strategy-20261008-095916`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-decode-strategy-20261008-095916`.
+
+Audit found the original fixed-p256 observation is stale as a source description:
+current E4M3 plans p64 and has p64/p256 and p512/p896/p1664 wave dispatch;
+wave selection additionally needs the forwarded context bound. E4M3 XQA
+requires FP32 partials by a native static assertion and runtime dtype check.
+Do not force the FP16 partial dtype or claim the old timing describes current
+route hits without a matched artifact.
+
+KernelConfig.sm70_decode_strategy requests shared by default or retained
+legacy. Capture it at impl initialization. New native shared-strategy revision
+1 advertises existing D256/GQA6/B1 p256/p1024 support with the PARTIAL_T
+standard launch/reducer. The Python wrapper propagates the marker once.
+Older artifacts keep legacy planning with explicit counted/logged fallback;
+disabled/unavailable XQA avoids irrelevant warnings. Shared E4M3 uses the
+FP16 shape hint (page784 p256 envelope, otherwise ordinary context planner),
+while keeping uint8 storage, FP32 partials and existing batch/small-query/
+explicit partition guards. Legacy wave and experimental paths are retained.
+Observers no longer mislabel shared p256 as the adaptive p64/p256 route.
+
+This scope intentionally changes partition boundaries/reduction order for new
+qualified artifacts. No CUDA kernel arithmetic is edited; no bitwise or speed
+claim follows from that. Three implementation calculation hashes (init and
+the two policy consumers) are deliberately excluded from the old invariant;
+the other 44 and all descriptor kinds stay protected. E4M3/FP16 hints match
+across six page shapes; mock native interface calls at 4097/32K/128K/256K
+check actual source planning arguments, storage and FP32 workspace. Config
+hash differences and revision/missing/legacy/disabled cases pass. New strategy
+plus retained composition suite: 21 passed. A fixture root-path error was
+corrected; the clean run passes. Host binding syntax check g++ -std=c++17
+-fsyntax-only passed, using the authorized runtime's Torch/Python includes.
+Full pre-commit/mypy on implementation files passed.
+
+GPU numerical error, timing and real route traces are unmeasured under the
+user's explicit no-V100 instruction. The C++ syntax check does not build or
+qualify a linked FA2 wheel. The installed older artifact remains in legacy
+mode; shared-mode CPU tests use the declared native marker and mocked calls.
+Coupling totals stay model 2325 / platform 3964 / raw env 334. The campaign
+continues with A5, avoiding overlap with #1048's newly extended KV tile/storage
+work. Evidence is under /home/ymzx/arch-ws/tmp/a4b_*.
+
+A4b retained backend/mixed-row/compatibility/cleanup/FlashInfer plus feature
+suites: 323 passed, including four generated codec cases for the new policy
+fallback observer. Existing CPU policy suite: 233 passed / 9 inherited device
+inference failures / 1 skipped, identical across all 243 parent/new outcomes
+(a4b_cpu_ab.json). This validates retained old-ABI decisions, not new-ABI GPU
+output or speed. The clean strategy suite has 21 passes and host binding
+syntax exit 0. No CUDA driver repair or GPU execution was attempted.
+
+## 2026-10-09 Phase B delivery 1: common AWQ/FP8 stages
+
+- Integration base: `fc9a518654d8e2dc5dce32507aaece474930ea17`;
+  owned branch `agent/v100-phase-b-mainflow-20261009-021900`;
+  worktree `/home/ymzx/arch-ws/v100-phase-b-mainflow-20261009-021900`.
+- B0 inventory and disposition: `docs/design/architecture/sm70_phase_b.md`
+  and generated `sm70_phase_b_parameters.md`. Four ordinary decomposed flows
+  (AWQ/FP8 × single/routed) now share two stage executors, the existing route
+  plan, a tensor-only weight codec, and a thin lifecycle base. Monolithic
+  experiments and diagnostic reference arithmetic remain explicitly separate.
+- Legacy policy reads move to per-engine `KernelConfig.sm70_moe` initialization.
+  Native single-token capability and plans are initialized once. Explicit typed
+  config wins; legacy OR/compact/indexed/strict precedence is preserved. Only
+  loaded formats affect graph hashes; diagnostics and provenance do not.
+- Reused #1065's layer-owned workspace view and FP8 buffer extraction, including
+  behavioral allocation, rebinding and fullgraph tracing tests. Source banks,
+  resident addresses, overflow allocation and AOT pointer resolution are kept.
+- CPU: 144 passed, four pre-existing failures unchanged from the baseline
+  (NVFP4 test stub lacks GROUPED_MTP5; two obsolete linear workspace test imports;
+  old AWQ hash golden). The new stage/config/workspace checks pass, including
+  48 frozen single-token call/argument/view sequences. The existing route
+  snapshot command reports 168 configurations and zero baseline differences.
+- GPU host `dx.1catai.com:54633`, GPU1 V100-SXM2-32GB, Torch `2.10.0+cu128`,
+  CUDA `12.8`. H=I=256, E4, top-k2; AWQ g32 and FP8 g128; matching source weights,
+  native bytes and flags. Final ordinary/legacy A/B: 105 eager cases bit-exact,
+  60 capture cases each with three changed-input/route replays bit-exact, and
+  identical observed public native-call order. M=0/1/2/3/32/33/65 covers empty,
+  resident/overflow and 128-slot active-W2 boundaries. Four AWQ diagnostic cases
+  additionally preserve output and reference native-call order.
+- Alternating CUDA-event graph timing medians: median relative change +0.102%;
+  largest increase +5.17% (70.354 to 73.989 microseconds, AWQ indexed request M32).
+  A first dense M1 case measures 83.164 to 39.265 microseconds despite identical
+  public call order; retain this unexplained timing outlier, do not claim a 2x
+  speedup. These are small operator timings, not model decode throughput.
+- Native `_C` SHA256:
+  `2f73362d50ec8c92c7c4ebc1323ee7b1fe56b9775513573b5d1a4ec6737ccbe8`;
+  `_moe_C`: `915e5bd5ad46eeb6ad770cf363ce132259abd18241309d8173c70c9cb80e9a14`.
+  Python-only changes; both runs use the same installed extensions, no preload.
+- Reproducer: `benchmarks/kernels/sm70_moe_stage_parity.py --root <ab-directory>`
+  with baseline source under `base/`, candidate package on PYTHONPATH, and
+  `--diagnostics` for reference-observer cases. Raw evidence on 54633:
+  `/home/ymzx/arch-ws/phase-b-20261009/artifacts/`; local CPU/snapshots/artifacts:
+  `/home/ymzx/arch-ws/tmp/phase-b/`. GPU ownership uses
+  `/tmp/1cat-vllm-v100-gpu1.lock`; no service/port is left running.
+- Owner explicitly authorized operator-only acceptance on 2026-10-09. No 35B
+  AWQ/FP8 model speed, TTFT/prefill, MTP or new-model qualification is claimed.
+  Deliveries 2 (remaining MoE) and 3 (linear/native ownership) follow on main;
+  DDTree and repository-wide C/D remain separate.
+
+## 2026-10-09 Phase B delivery 2: shared FP4 stages
+
+- Base `fe63db651e3cc4055bf4349411d372ad801714aa`; owned branch
+  `agent/v100-phase-b-moe-formats-20261009-025824`, worktree
+  `/home/ymzx/arch-ws/v100-phase-b-moe-formats-20261009-025824`.
+  Delivery 1 (#1124) is merged, remote CI passed; superseded #1065/#1066 closed.
+- Seven NVFP4/MXFP4 production sequences now use one FP4 stage executor and a
+  weight codec. Includes direct M1/batch/MTP, raw/prepared scales, fused W13,
+  fused W2/reduce, grouped/MTP and indexed/split-prefill/GLM stages. Existing
+  shape/model/TP gates, arithmetic, split choices and native names are preserved.
+  FP8's legacy decomposed path also reuses its common routed executor. GGUF and
+  skinny share FP32 slot-major reduction while retaining their other numerical
+  and modular/mixed-format contracts.
+- New per-engine NVFP4/MXFP4 policy captures 27 aliases; AWQ QPN M1 joins its
+  existing policy. Workspace owners retain layer-owned addresses, overflow and
+  raw-scale shared workspace/microbatch rejection. The codec uses non-owning
+  layer views and sees tensor rebinding. No native binary or CUDA kernel edit.
+- Focused FP4 safety net: 223 passed (213 frozen-main full-apply native argument,
+  order and view traces plus configuration/workspace/reduction checks). AWQ/FP8,
+  QPN and lifecycle combination: 313 passed before the final native-conflict
+  guard; NVFP4 integration/GLM gates: 82 passed. Broader baseline/head run:
+  348 passed, 35 skipped, two unchanged baseline failures (ModelOpt min-capability
+  test and a GGUF PLE test stub missing `ple_pinned_decode`). The original NVFP4
+  lifecycle stub was updated to own its resolved config and now passes.
+  Final combined suite after all edits: 359 passed, 5 skipped; all applicable
+  pre-commit hooks passed, including typing, policy and layering checks.
+- Existing MoE snapshots: 168 configurations, zero differences from base. New
+  generated bindings/alias table and stage coverage use the codec declarations.
+  Static Python inventory: 95 to 48 legacy read sites, 217 to 179 direct native
+  call sites. Indirect bindings and migrated aliases are not deleted paths.
+  Layering totals: model 2325, platform 3964, raw environment 275 to 274.
+- GPU contract: authorized host `dx.1catai.com:54633`, V100-SXM2-32GB, Torch
+  2.10.0+cu128 / CUDA 12.8, same native `_C` / `_moe_C` digests as delivery 1.
+  Synthetic packed checkpoints, FP16 inputs, FP32 router weights; separate
+  baseline/candidate preparations compare banks, pointer offsets and strides.
+  Qwen NVFP4 E512/H2560/I160/top-k10/g16 (TP4 geometry), MXFP4
+  E256/H4096/I512/top-k6/g32/clamp7 (TP4 geometry), GLM NVFP4
+  E288/H4096/I256/top-k8/g16 (TP8 geometry). These are local operators, not
+  distributed model runs. GPUs 1/2/3 used for the respective FP4 checks; GPU0
+  used for FP8 E4/H256/I256/top-k2/g128. Each uses its GPU lock and task caches.
+- Final numerical evidence: Qwen NVFP4 84 eager + 180 changed-input/route replays;
+  MXFP4 20 + 51; GLM 5 + 12; grouped NVFP4/MTP 6 + 12; FP8 decomposed 7 + 12.
+  All outputs are bit-exact and observed public native stage order agrees.
+  Total: 122 eager cases, 89 captured cases with three changed-data replays each.
+  GLM and grouped cases assert actual requested operator hits, not flag presence.
+- CUDA-event graph time medians (head relative to base): Qwen NVFP4 -0.158%,
+  MXFP4 -0.033%; largest increases +1.55% and +0.625%. The first GLM dense M1
+  retains a large faster-head outlier despite matching public calls (also seen
+  in delivery 1); no speedup claim is based on it. Prefill, TTFT and 35B model
+  throughput remain unmeasured under the owner's operator-only acceptance.
+- Corrected validation failures before promotion: an extracted workspace method
+  accidentally retained both staticmethod/classmethod decorators; pointer-bank
+  checks initially compared allocation-specific addresses/StridedPtr padding;
+  the GLM fixture initially omitted the grouped-expert prerequisite and the
+  recorder missed the GLM symbol prefix; the older FP8 harness needed to
+  initialize codecs for both now-refactored revisions. Final checks exercise
+  the real supported combinations and compare only defined pointer fields.
+- A native audit found unresolved dual Python/C++ policy consumers in AWQ
+  active/grouped W2, MXFP4 grouped/verifier, NVFP4 grouped/prefill, and common
+  permutation paths. Conflicting typed boolean overrides fail clearly until
+  explicit native policy arguments land; no environment mutation is used.
+  Do not claim full typed-native precedence or whole-AOT hash isolation yet.
+  Delivery 3 must finish these native consumers/cache factors and FP8 diagnostic
+  ownership alongside linear/QPN/binding consolidation. Defaults and existing
+  legacy configurations retain their observed behavior in this delivery.
+- Reproducers: `benchmarks/kernels/sm70_fp4_stage_parity.py --root <ab> --family
+  nvfp4|mxfp4`, with `--model glm53` or `--grouped-only` for dedicated cases;
+  `benchmarks/kernels/sm70_moe_stage_parity.py --root <ab> --decomposed` for FP8.
+  Raw GPU evidence: `/home/ymzx/arch-ws/phase-b2-20261009/artifacts/` on 54633.
+  Local CPU/GPU/log evidence: `/home/ymzx/arch-ws/tmp/phase-b2/`.
+  No model service, port, sidecar, preload or background benchmark remains.
+
+## Phase B delivery 3: linear/native consolidation, operator acceptance, 2026-10-09
+
+- Base `fc2f145aebee0d2e7cbfc2b520c383cb64644e57`; PR #1128, owned branch
+  `agent/v100-phase-b-linear-native-20261009-035407`, worktree
+  `/home/ymzx/arch-ws/v100-phase-b-linear-native-20261009-035407`.
+  Deliveries 1 (#1124) and 2 (#1126) are merged with remote CI passing.
+- Prepared linear providers share input/output handling; QPN implementations
+  share one directory and historical module identities remain compatible.
+  Native loading/linear/MoE/auxiliary bindings are split behind `_sm70_ops.py`;
+  all 134 baseline public function/class definitions remain exported.
+  Weight layouts, CUDA arithmetic, defaults and qualification are unchanged.
+- Explicit native policies cross the packaged `_C`/`_moe_C` ABI as one optional
+  string token. Preparation caches parsed values and the calculation key, and
+  binds argument-preserving MoE calls directly. Instrumented public wrappers
+  remain observable. GEMM holders, tuning and imported tables are partitioned
+  by calculation policy; diagnostic differences share calculation caches.
+- Engine-owned scratch registries preserve capacity growth and AOT address
+  reload, including linear pools and NVFP4 raw-scale expansion. Already-matrix
+  linear inputs/outputs avoid redundant views. MoE reads layer buffers directly;
+  there is no tensor-view cache, stale-address shortcut or new buffer lifetime.
+  Disabled AWQ diagnostics skip callbacks; enabled diagnostics keep their stage
+  positions. Stage log-once skips repeated rank queries after an accepted event.
+- CPU evidence: combined regression 583 passed / 7 skipped; lifecycle/buffer/
+  MXFP4/FP8-prefill supplement 79 passed / 5 skipped; owner/explanation recheck
+  36 passed. String transport/prebinding checks: 128 passed locally and 128
+  against the newly built artifact. Host-view changes: 117 passed; provider
+  checks 52 passed / 96 GPU skips. Final binding/flow/owner check: 370 passed /
+  one local old-ABI skip; AWQ stage recheck 59 passed. On the actual artifact,
+  direct native export/reload and instrumentation checks pass all three cases.
+  Counts overlap and must not be added as unique test coverage.
+- Export/reload covers dynamic M=1/32/33/65, full and token policies, and another
+  engine's workspace/policy. The direct native export test uses a CPU dispatcher
+  implementation solely to validate transport/serialization, not CUDA math.
+  Standalone C++ checks cover UTF-8, empty/unset fields, malformed tokens,
+  nested scopes and thread isolation. All source checks pass; remote CI for
+  `9a1aa8b29` is run `37901353942`. The final PR carries the follow-up CI result.
+- Static route comparison: 168 cases, zero differences from the delivery base.
+  Python/C++ declaration order and calculation/diagnostic fields agree. Expanded
+  source audit: 58 files, 135 parameters, 1042 functions; direct reads 74 to 57,
+  direct native call sites 215 to 179. These counts do not mean paths were
+  deleted. Common numerical executors/codecs have no policy reads. Layering
+  totals remain model 2325, platform 3880, environment 271.
+- Normal source-complete CUDA 12.8/SM70 build on 54633 uses Torch 2.10.0+cu128.
+  Fresh import, ABI=55, four-format fake dispatch and `readelf`/`ldd` checks pass
+  without preload or private kernel libraries. Native hashes (unchanged by the
+  final Python-only host changes):
+  `_C` `70cfdcc88eb7b8f2c86db0b78b93c59852f55c7911a8c8371d89bdcb0c624881`,
+  `_moe_C` `4c671824b05e69741be29c39d70c0285062facc4ed9b90d0efba2536a23c7fe3`.
+- Fresh baseline/candidate artifact A/B: 323 outputs bit-exact, matching native
+  order/error contracts (75 eager outputs, 216 changed-input replays, 32 FP8
+  reference intermediates). Final affected-family follow-up: 143 exact outputs
+  for QPN8, AWQ MoE and FP8 MoE. QPN8 traces observe actual native calls on both
+  sides of M=8. Typed routing policies produce distinct generic/fast CUDA hits;
+  six changed-input/ID replays and four alternating-owner calls remain exact.
+  Rechecking FP4 stages on the new ABI gives NVFP4 84 eager / 180 replays and
+  MXFP4 20 / 51, all exact with matching stage order.
+- Performance contract: GPU0 V100-SXM2-32GB, fixed CPU affinity 6, one CPU thread,
+  same environment and frozen GGUF tuning table. N=K=256 linear projections;
+  ordinary MoE E4/top-k2; M=1/2/8/9/32/33/64/65/128. Five timing samples per
+  case; each sample has 100 graph replays and 30 eager calls. Graph device time
+  is separate from synchronized eager host wall time. Final family medians:
+
+  | Family | Graph change | Eager change | Eager delta |
+  |---|---:|---:|---:|
+  | AWQ linear | -0.519% | -12.05% | -8.47 us |
+  | FP8 linear | -0.659% | -9.96% | -8.18 us |
+  | NVFP4 linear | -0.370% | -12.00% | -7.77 us |
+  | MXFP4 linear | -0.472% | -12.82% | -8.66 us |
+  | GGUF affine | -0.311% | -4.78% | -3.27 us |
+  | QPN8 | -0.058% | +3.11% | +4.03 us |
+  | AWQ MoE | +0.098% | -4.17% | -20.52 us |
+  | FP8 MoE | -0.012% | +2.24% | +10.05 us |
+
+  First five rows use the full artifact run; last three use the final affected
+  follow-up. All final graph cases are within +0.63% on the slower side. Eager
+  QPN8/FP8 MoE retain small host overhead (maximum case +6.35%/+4.14%); this is
+  accepted for structural consolidation and engine-policy isolation, not hidden
+  as a speedup or a claim that every eager case is faster. No model performance
+  conclusion is drawn from these synthetic operators.
+- Retained negative evidence: initial `str[]=[]` schema compiled but failed
+  Torch registration. The optional list ABI fixed import but 55 strings added
+  11–23% eager time; compact-list transport still added overhead. The final
+  optional-string token, direct bindings and common host handling replace those
+  variants. Do not repeat their builds. Cold GGUF M9 selected a different tuning
+  descriptor (max difference 0.0001220703125); importing the baseline table fixes
+  the oracle without relaxing equality or changing production defaults.
+  FP4 fixture policy capture also needed both frozen/current Python stages bound
+  to the same per-case native policy; the corrected checks remain bit-exact.
+  Raw baseline AWQ M0 cannot launch; CPU dispatch coverage is retained and raw
+  TM M0 is excluded from GPU timings. GGUF M0 matches its pre-launch error.
+- Raw evidence on 54633: `/home/ymzx/arch-ws/phase-b3-20261009/artifacts/`.
+  `base-operators.*` / `head-operators.*` are the full artifact run;
+  `final-base.*` / `final-head.*` are the affected-family follow-up;
+  `nvfp4-stage.log`, `mxfp4-stage.log`, `typed-policy-isolation.json`,
+  `native-verification.json` and `direct-stage-export.log` cover other gates.
+  Earlier `vector-policy/`, `compact-list-policy/`, `string-policy/`,
+  `direct-*` and untuned GGUF records retain the rejected/intermediate evidence.
+  Local logs/summaries: `/home/ymzx/arch-ws/tmp/phase-b3/`.
+- This closes the three Phase B delivery scopes under the owner's explicit
+  operator-only acceptance. Model throughput, pure 35B decode and TTFT were not
+  run or claimed. DDTree and broad C/D remain subsequent work. GPU leases and
+  task benchmark processes are released; no model service or port was created.
+
+### 2026-10-10 Phase D5b operator handoff
+
+- Base `e2a52d519`, owned branch `agent/v100-phase-d5b-marlin-20261010-003032`.
+  Native ABI 67 binds six Marlin controls; normal `_C`/`_moe_C` context probes
+  coalesce only proven shared TLS. Old-runner/graph event traces use engine owners.
+- 54633: final 47 GPU tests pass, no models loaded; three AB/BA/AB rounds retain
+  deterministic digests and allocation counts. GPU changes within 0.2%; FP16/QPN8
+  native-boundary host cost falls 5–9 us. New Marlin owner boundary costs 20–26 us
+  vs the old standalone path; no model throughput claim.
+- Negative evidence: random split-K=8 legacy rounding variability and independent
+  FP16 tuning winners cannot be used as bitwise reference pairs. Exact checks now
+  use the matched fixed oracle; existing random split-K tests remain.
+- Source, binary hashes, raw samples and detailed limits:
+  `docs/design/architecture/phase_d5b_operators.json`; raw remote artifacts under
+  `/home/ymzx/arch-ws/phase-d5b-20261010/artifacts`.
+- D6 remains pending; full inventory, retained boundaries and FlashQLA's remaining
+  native column-policy binding are being completed there.
+
+### 2026-10-10 Phase D closure
+
+- D5b merged as #1153 (`22c4d22f4`), after native ABI 67 / event-owner CI and
+  47 GPU cases. D6 is based on that merged main; #1152 is retained.
+- D6 closes the full Python/native/FlashQLA parameter inventory: 757 names,
+  zero unassigned names/consumer scopes/dynamic domains. The same scanner counts
+  914 → 355 legacy source positions, including dynamic readers including retained boundaries; these are
+  not per-token execution counts. The always-run ownership hook checks each
+  boundary instead of excluding directories.
+- Final integrated CPU suite: 162 passed. FlashQLA normal-source build: 24 GPU
+  operator/configuration cases on 54633 GPU 1. Three A/B rounds retain exact
+  output/state digests and allocations across nine cases. No model testing.
+- Retain failed/negative evidence: missing-patchelf first build; five pre-existing
+  broad PLE fixture failures reproduced on clean D5b; Marlin legacy split-K=8
+  random-input nondeterminism; native owner host-boundary overhead. Do not rerun
+  model screens to reinterpret these operator contracts.
+- See [the Phase D closure](architecture/sm70_phase_d.md), its machine-readable
+  counts, exact retained boundaries and operator artifacts. DDTree and full E
+  documentation/workflow work remain outside this delivery.

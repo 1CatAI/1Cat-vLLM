@@ -1,3 +1,4 @@
+#include "flash_v100_policy.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -1785,16 +1786,6 @@ __global__ void __launch_bounds__(
   }
 }
 
-inline bool env_flag_enabled(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw != nullptr && std::strcmp(raw, "0") != 0;
-}
-
-inline bool env_flag_default_enabled(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw == nullptr || std::strcmp(raw, "0") != 0;
-}
-
 template <int D, int KV_DTYPE, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
           bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32,
           bool D256_OUTPUT_STRIDE_268 = false, bool D256_SW_PIPELINE_QK = false,
@@ -3127,11 +3118,12 @@ void launcher_flash_attention_forward_paged_d256_bm32_phase(
     torch::Tensor& softmax_lse, const torch::Tensor& block_table,
     const torch::Tensor& seq_lens, float softmax_scale, bool is_causal,
     cudaStream_t stream) {
-  const bool use_all_p =
-      env_flag_default_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P");
+  const bool use_all_p = flash_v100::policy::value(
+      flash_v100::policy::Field::prefill_d256_bm32_all_p_default_on);
   const bool use_pair_scratch =
-      use_all_p && env_flag_default_enabled(
-                       "VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH");
+      use_all_p &&
+      flash_v100::policy::value(
+          flash_v100::policy::Field::prefill_d256_bm32_pair_scratch_default_on);
 
   if (is_causal) {
     if (use_all_p) {
@@ -3211,10 +3203,12 @@ void launcher_flash_attention_forward_paged(
     const int page_block_size = K_cache.size(1);
     const bool use_low_smem =
         M > 1 && page_block_size >= 16 && (page_block_size % 16) == 0 &&
-        env_flag_default_enabled("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM");
+        flash_v100::policy::value(
+            flash_v100::policy::Field::prefill_d256_low_smem_default_on);
     if (use_low_smem) {
       const bool use_d256_bm32_phase =
-          env_flag_default_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE") &&
+          flash_v100::policy::value(
+              flash_v100::policy::Field::prefill_d256_bm32_phase_default_on) &&
           page_block_size % D256_BM32_PHASE_PAGE_SIZE == 0 &&
           M >= D256_BM32_PHASE_BLOCK_M && bfla_mask_ptr == nullptr &&
           window_size_left < 0 && window_size_right < 0;
@@ -3226,32 +3220,36 @@ void launcher_flash_attention_forward_paged(
       }
       const bool use_low_smem_contig_fast =
           page_block_size == 16 ||
-          env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST");
-      const bool use_low_smem_scalar_qk =
-          env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
-      const bool use_low_smem_bm32 =
-          env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32");
+          flash_v100::policy::value(
+              flash_v100::policy::Field::prefill_contig_fast_off);
+      const bool use_low_smem_scalar_qk = flash_v100::policy::value(
+          flash_v100::policy::Field::prefill_d256_scalar_qk_off);
+      const bool use_low_smem_bm32 = flash_v100::policy::value(
+          flash_v100::policy::Field::prefill_d256_bm32_off);
       // Default only for the measured hybrid-cache page size. Other
       // page sizes retain the prior layout unless explicitly enabled.
       const bool use_low_smem_output_stride_268 =
           page_block_size == 784
-              ? env_flag_default_enabled(
-                    "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268")
-              : env_flag_enabled(
-                    "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268");
+              ? flash_v100::policy::value(
+                    flash_v100::policy::Field::
+                        prefill_d256_output_stride_268_default_on)
+              : flash_v100::policy::value(
+                    flash_v100::policy::Field::
+                        prefill_d256_output_stride_268_off);
       const bool use_sw_pipeline =
           page_block_size == 784 &&
-          env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE");
+          flash_v100::policy::value(
+              flash_v100::policy::Field::prefill_d256_software_pipeline_off);
       const bool use_sw_pipeline_qk =
           page_block_size == 784 &&
-          (use_sw_pipeline ||
-           env_flag_default_enabled(
-               "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK"));
+          (use_sw_pipeline || flash_v100::policy::value(
+                                  flash_v100::policy::Field::
+                                      prefill_d256_sw_pipeline_qk_default_on));
       const bool use_sw_pipeline_pv =
           page_block_size == 784 &&
-          (use_sw_pipeline ||
-           env_flag_default_enabled(
-               "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV"));
+          (use_sw_pipeline || flash_v100::policy::value(
+                                  flash_v100::policy::Field::
+                                      prefill_d256_sw_pipeline_pv_default_on));
       if (use_low_smem_contig_fast) {
         if (use_low_smem_scalar_qk) {
           if (use_low_smem_bm32) {
@@ -3455,9 +3453,11 @@ at::Tensor flash_attention_prefill_paged_splitkv(
   const bool fp16_kv = kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16;
   const bool use_low_smem_contig_fast =
       fp16_kv && (page_block_size == 16 ||
-                  env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST"));
+                  flash_v100::policy::value(
+                      flash_v100::policy::Field::prefill_contig_fast_off));
   const bool use_low_smem_scalar_qk =
-      fp16_kv && env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
+      fp16_kv && flash_v100::policy::value(
+                     flash_v100::policy::Field::prefill_d256_scalar_qk_off);
   const int block_n =
       fp16_kv ? (use_low_smem_scalar_qk ? BLOCK_N_256_LOW_SMEM_SCALAR_QK
                                         : BLOCK_N_256_LOW_SMEM)

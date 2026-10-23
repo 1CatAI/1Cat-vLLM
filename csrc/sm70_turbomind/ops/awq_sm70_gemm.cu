@@ -1,3 +1,6 @@
+#include "sm70_policy.h"
+#include "gemm_runtime.h"
+#include "packed_gemm.h"
 /*
  * SM70 AWQ GEMM integration using TurboMind s884h kernels.
  * Adapted from LMDeploy TurboMind (Apache-2.0).
@@ -17,25 +20,17 @@
 #include <cfloat>
 #include <cstring>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <limits>
-#include <mutex>
-#include <optional>
 #include <type_traits>
-#include <unordered_set>
-#include <unordered_map>
 #include <vector>
 
 #include "src/turbomind/core/data_type.h"
 #include "src/turbomind/kernels/gemm/arch/config_sm70_s884.h"
 #include "src/turbomind/kernels/gemm/cast.h"
-#include "src/turbomind/kernels/gemm/convert.h"
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/gemm_universal.h"
 #include "src/turbomind/kernels/gemm/matrix_ptr.h"
-#include "src/turbomind/kernels/gemm/sm70_dflash_context.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
 #include "custom_all_reduce.cuh"
@@ -113,8 +108,7 @@ void sm70_silu_and_mul_interleaved_fp16_out(torch::Tensor out,
 }
 
 bool sm70_profile_trace_enabled() {
-  const char* value = std::getenv("VLLM_SM70_PROFILE_TRACE");
-  return value != nullptr && std::strcmp(value, "1") == 0;
+  return vllm::sm70::policy_exact_one(vllm::sm70::PolicyField::profile_trace);
 }
 
 const char* sm70_scalar_type_name(at::ScalarType scalar_type) {
@@ -156,13 +150,13 @@ unsigned sm70_capture_status_bit(cudaStreamCaptureStatus status) {
   }
 }
 
-void maybe_log_sm70_moe_route_once(std::atomic<unsigned>& logged_mask,
-                                   const char* route,
+void maybe_log_sm70_moe_route_once(const char* counter_name, const char* route,
                                    const torch::Tensor& input, int64_t tokens,
                                    int64_t experts_or_top_k) {
   if (!sm70_profile_trace_enabled()) {
     return;
   }
+  auto& logged_mask = vllm::sm70::diagnostic_counter(counter_name);
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
@@ -892,241 +886,6 @@ __global__ void nvfp4_raw_gemv_warp_kernel(
 
 namespace {
 
-struct WorkspaceHolder {
-  torch::Tensor barriers;
-  torch::Tensor partials;
-  torch::Tensor tensormaps;
-  torch::Tensor flags;
-  turbomind::gemm::Workspace workspace{};
-};
-
-struct GemmHolder {
-  std::unique_ptr<turbomind::gemm::Gemm> gemm;
-};
-
-enum class TuneKeyKind : int {
-  kGenericDense = 0,
-  kAwqDense = 1,
-  kFp8Dense = 2,
-  kGenericMoe = 3,
-  kAwqMoe = 4,
-  kFp8Moe = 5,
-  kMxfp4Dense = 6,
-  kNvfp4Dense = 7,
-  kMxfp4Moe = 8,
-  kNvfp4Moe = 9,
-  kGgufAffineU4 = 10,
-  kGgufAffineU8 = 11,
-  kGgufAffineU2 = 12,
-  kGgufBitPlane3 = 13,
-  kGgufBitPlane5 = 14,
-  kGgufBitPlane6 = 15,
-  kGgufLut4IQ = 16,
-  kGgufLut4E2M1 = 17,
-};
-
-struct DenseTuneKey {
-  TuneKeyKind kind;
-  int device;
-  int m;
-  int n;
-  int k;
-  int group_size;
-
-  bool operator==(const DenseTuneKey& other) const {
-    return kind == other.kind && device == other.device && m == other.m &&
-           n == other.n && k == other.k && group_size == other.group_size;
-  }
-};
-
-struct DenseTuneKeyHash {
-  std::size_t operator()(const DenseTuneKey& key) const {
-    std::size_t h = std::hash<int>()(static_cast<int>(key.kind));
-    h ^= std::hash<int>()(key.device) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.m) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.n) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.k) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.group_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
-struct MoeTuneKey {
-  TuneKeyKind kind;
-  int device;
-  int total_tokens;
-  int n;
-  int k;
-  int num_experts;
-  int group_size;
-
-  bool operator==(const MoeTuneKey& other) const {
-    return kind == other.kind && device == other.device &&
-           total_tokens == other.total_tokens && n == other.n && k == other.k &&
-           num_experts == other.num_experts && group_size == other.group_size;
-  }
-};
-
-struct MoeTuneKeyHash {
-  std::size_t operator()(const MoeTuneKey& key) const {
-    std::size_t h = std::hash<int>()(static_cast<int>(key.kind));
-    h ^= std::hash<int>()(key.device) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.total_tokens) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.n) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.k) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.num_experts) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.group_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
-struct Sm70F16WeightCacheKey {
-  int device;
-  const void* tensor_impl;
-  int64_t rows;
-  int64_t cols;
-
-  bool operator==(const Sm70F16WeightCacheKey& other) const {
-    return device == other.device && tensor_impl == other.tensor_impl &&
-           rows == other.rows && cols == other.cols;
-  }
-};
-
-struct Sm70F16WeightCacheKeyHash {
-  std::size_t operator()(const Sm70F16WeightCacheKey& key) const {
-    std::size_t h = std::hash<int>()(key.device);
-    h ^= std::hash<const void*>()(key.tensor_impl) + 0x9e3779b9 + (h << 6) +
-         (h >> 2);
-    h ^= std::hash<int64_t>()(key.rows) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int64_t>()(key.cols) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
-struct Sm70F16WeightCacheEntry {
-  torch::Tensor tm_weight;
-  int64_t k_ld;
-};
-
-// Per-stream workspace management to eliminate mutex contention
-struct StreamWorkspaceKey {
-  int device;
-  cudaStream_t stream;
-
-  bool operator==(const StreamWorkspaceKey& other) const {
-    return device == other.device && stream == other.stream;
-  }
-};
-
-struct StreamWorkspaceKeyHash {
-  std::size_t operator()(const StreamWorkspaceKey& k) const {
-    return std::hash<int>()(k.device) ^
-           (std::hash<cudaStream_t>()(k.stream) << 1);
-  }
-};
-
-std::mutex workspace_mutex;
-std::mutex gemm_mutex;
-std::mutex tune_mutex;
-std::mutex sm70_f16_weight_cache_mutex;
-std::unordered_map<StreamWorkspaceKey, WorkspaceHolder, StreamWorkspaceKeyHash>
-    workspace_cache;
-std::unordered_map<int, GemmHolder> gemm_cache;
-std::unordered_set<DenseTuneKey, DenseTuneKeyHash> dense_tuned_shapes;
-std::unordered_set<MoeTuneKey, MoeTuneKeyHash> moe_tuned_shapes;
-std::unordered_set<int> imported_cache_devices;
-std::unordered_map<Sm70F16WeightCacheKey, Sm70F16WeightCacheEntry,
-                   Sm70F16WeightCacheKeyHash>
-    sm70_f16_weight_cache;
-
-turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_awq_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-
-bool tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool awq_tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool mxfp4_tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_compact_grouped_decode_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_broadcast_input_decode_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_grouped_m8_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_grouped_verifier_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_grouped_m8_expert_rows_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_grouped_m8_fast_selector_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool nvfp4_tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool nvfp4_moe_grouped_prefill_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool nvfp4_moe_grouped_expert_rows_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
 int glm_mhc_pre_threads() {
   const char* raw = std::getenv("VLLM_SM70_GLM_MHC_PRE_THREADS");
   const int threads = raw == nullptr ? 256 : std::atoi(raw);
@@ -1134,428 +893,6 @@ int glm_mhc_pre_threads() {
     return threads;
   }
   return 256;
-}
-
-bool nvfp4_qwen38_tp4_m1_fast_selector_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool fp8_moe_single_token_per_expert_dispatch_enabled() {
-  const char* raw =
-      std::getenv("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_0dot3_dense_selector_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_safe_fast_selector_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_grouped_bmm_decode_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool awq_reuse_imported_cache_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE");
-  // An imported plan is produced by the coordinated warmup on rank 0.  Keep
-  // it as the default source of truth on the other TP ranks; an explicit 0
-  // remains available for cache-debugging and old standalone warmups.
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool fp8_reuse_imported_cache_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE");
-  // See awq_reuse_imported_cache_enabled().  The Python warmup only marks an
-  // imported cache after rank 0 has finished measuring the shape, so this
-  // does not change the no-cache path.
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool awq_preserve_default_splits_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool awq_preserve_default_splits_only_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_preserve_default_splits_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool fp8_preserve_default_splits_only_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-inline turbomind::gemm::DispatchPolicy maybe_preserve_default_splits(
-    turbomind::gemm::DispatchPolicy policy) {
-  if (policy == turbomind::gemm::DispatchPolicy::kMeasure ||
-      policy == turbomind::gemm::DispatchPolicy::kReuse) {
-    if (awq_preserve_default_splits_only_enabled()) {
-      return policy |
-             turbomind::gemm::DispatchPolicy::kPreserveDefaultSplitCount;
-    }
-    if (!awq_preserve_default_splits_enabled()) {
-      return policy;
-    }
-    return policy | turbomind::gemm::DispatchPolicy::kPreserveDefaultSplits;
-  }
-  return policy;
-}
-
-inline turbomind::gemm::DispatchPolicy maybe_preserve_fp8_default_splits(
-    turbomind::gemm::DispatchPolicy policy) {
-  if (policy == turbomind::gemm::DispatchPolicy::kMeasure ||
-      policy == turbomind::gemm::DispatchPolicy::kReuse) {
-    if (fp8_preserve_default_splits_only_enabled()) {
-      return policy |
-             turbomind::gemm::DispatchPolicy::kPreserveDefaultSplitCount;
-    }
-    if (!fp8_preserve_default_splits_enabled()) {
-      return policy;
-    }
-    return policy | turbomind::gemm::DispatchPolicy::kPreserveDefaultSplits;
-  }
-  return policy;
-}
-
-std::optional<turbomind::gemm::DispatchPolicy>
-dispatch_policy_override_from_env(const char* env_name) {
-  const char* raw = std::getenv(env_name);
-  if (raw == nullptr || std::strcmp(raw, "") == 0) {
-    return std::nullopt;
-  }
-  if (std::strcmp(raw, "default") == 0) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  if (std::strcmp(raw, "reuse") == 0) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (std::strcmp(raw, "measure") == 0) {
-    return turbomind::gemm::DispatchPolicy::kMeasure;
-  }
-  TORCH_CHECK(false, env_name, " must be one of: default, reuse, measure.");
-  return std::nullopt;
-}
-
-std::optional<turbomind::gemm::DispatchPolicy>
-awq_moe_dispatch_policy_override() {
-  return dispatch_policy_override_from_env("VLLM_SM70_AWQ_MOE_DISPATCH_POLICY");
-}
-
-int awq_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int generic_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_F16_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int fp8_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int mxfp4_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int nvfp4_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int moe_tune_max_tokens() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS");
-  return raw ? std::max(std::atoi(raw), 0) : 128;
-}
-
-int nvfp4_moe_tune_max_tokens() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS");
-  return raw ? std::max(std::atoi(raw), 0) : 128;
-}
-
-int sm70_f16_dense_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_F16_DENSE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 64;
-}
-
-bool is_stream_capturing(cudaStream_t stream) {
-  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-  const auto ec = cudaStreamIsCapturing(stream, &status);
-  if (ec != cudaSuccess) {
-    cudaGetLastError();
-    return false;
-  }
-  return status != cudaStreamCaptureStatusNone;
-}
-
-bool has_imported_cache(int device) {
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  return imported_cache_devices.find(device) != imported_cache_devices.end();
-}
-
-turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream,
-    TuneKeyKind kind, bool tune_enabled, bool reuse_imported_cache, int max_m) {
-  if (m > max_m) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  if (reuse_imported_cache && has_imported_cache(device)) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (!tune_enabled) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-
-  DenseTuneKey key{kind, device, m, n, k, group_size};
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  if (dense_tuned_shapes.find(key) != dense_tuned_shapes.end()) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (is_stream_capturing(stream)) {
-    // tune_mutex is already held here. Calling has_imported_cache() would
-    // acquire it recursively and deadlock on the first uncached graph shape.
-    if (imported_cache_devices.find(device) != imported_cache_devices.end()) {
-      return turbomind::gemm::DispatchPolicy::kReuse;
-    }
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  dense_tuned_shapes.insert(key);
-  return turbomind::gemm::DispatchPolicy::kMeasure;
-}
-
-turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  if (group_size == 0 &&
-      turbomind::gemm::UseSm70DflashContextFcStableReduction(m, n, k)) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  const char* dflash2_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
-  const char* dflash2_shadow =
-      std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");
-  const bool exact_dflash2_rerank =
-      (dflash2_rerank && std::atoi(dflash2_rerank) != 0) ||
-      (dflash2_shadow && std::atoi(dflash2_shadow) != 0);
-  if (exact_dflash2_rerank && m >= 1 && m <= 8 && n == 62080 && k == 5120 &&
-      group_size == 0) {
-    // The sparse reranker reproduces this exact split-K contract. Do not let
-    // concurrent startup noise choose a numerically different LM-head spec on
-    // one TP rank.
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  return select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kGenericDense,
-      tune_small_shapes_enabled(), false, generic_dense_tune_max_m());
-}
-
-turbomind::gemm::DispatchPolicy select_awq_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  return maybe_preserve_default_splits(select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kAwqDense,
-      awq_tune_small_shapes_enabled(), awq_reuse_imported_cache_enabled(),
-      awq_dense_tune_max_m()));
-}
-
-turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  if (fp8_0dot3_dense_selector_enabled()) {
-    return select_dense_dispatch_policy_impl(
-        device, m, n, k, group_size, stream, TuneKeyKind::kGenericDense,
-        tune_small_shapes_enabled(), fp8_reuse_imported_cache_enabled(),
-        generic_dense_tune_max_m());
-  }
-  auto policy = select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kFp8Dense,
-      fp8_tune_small_shapes_enabled(), fp8_reuse_imported_cache_enabled(),
-      fp8_dense_tune_max_m());
-  if (!fp8_safe_fast_selector_enabled()) {
-    return policy;
-  }
-  return maybe_preserve_fp8_default_splits(policy);
-}
-
-turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  return select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kMxfp4Dense,
-      mxfp4_tune_small_shapes_enabled(), true, mxfp4_dense_tune_max_m());
-}
-
-turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  if (nvfp4_qwen38_tp4_m1_fast_selector_enabled() && m == 1 &&
-      group_size == 16 &&
-      ((n == 8704 && k == 5120) || (n == 5120 && k == 4352))) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  return select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kNvfp4Dense,
-      nvfp4_tune_small_shapes_enabled(), true, nvfp4_dense_tune_max_m());
-}
-
-turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream, TuneKeyKind kind, bool tune_enabled,
-    int max_tune_tokens = -1) {
-  const int tune_limit =
-      max_tune_tokens >= 0 ? max_tune_tokens : moe_tune_max_tokens();
-  if (!tune_enabled || total_tokens > tune_limit) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-
-  MoeTuneKey key{kind, device, total_tokens, n, k, num_experts, group_size};
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  if (moe_tuned_shapes.find(key) != moe_tuned_shapes.end()) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (is_stream_capturing(stream)) {
-    if (imported_cache_devices.find(device) != imported_cache_devices.end()) {
-      return turbomind::gemm::DispatchPolicy::kReuse;
-    }
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  moe_tuned_shapes.insert(key);
-  return turbomind::gemm::DispatchPolicy::kMeasure;
-}
-
-turbomind::gemm::DispatchPolicy select_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream) {
-  return select_moe_dispatch_policy_impl(
-      device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kGenericMoe, tune_small_shapes_enabled());
-}
-
-turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream) {
-  if (fp8_grouped_bmm_decode_enabled() && total_tokens == 2 && n == 1024 &&
-      k == 4096 && num_experts == 2 && group_size == 128) {
-    // The matching dense WO-A projection uses the fixed launch spec selected
-    // in gemm.cu. Do not let measurement replace its accumulation tree.
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  return select_moe_dispatch_policy_impl(
-      device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kFp8Moe, fp8_tune_small_shapes_enabled());
-}
-
-turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream) {
-  const bool exact_grouped_m8 =
-      total_tokens == 48 && num_experts == 48 && group_size == 32 &&
-      ((n == 512 && k == 4096) || (n == 4096 && k == 256));
-  if (mxfp4_moe_grouped_m8_enabled() &&
-      !mxfp4_moe_grouped_m8_expert_rows_enabled() &&
-      mxfp4_moe_grouped_m8_fast_selector_enabled() && exact_grouped_m8) {
-    return turbomind::gemm::DispatchPolicy::kMxfp4MoeGroupedM8Fast;
-  }
-  return select_moe_dispatch_policy_impl(
-      device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kMxfp4Moe, mxfp4_tune_small_shapes_enabled());
-}
-
-turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream) {
-  return select_moe_dispatch_policy_impl(
-      device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kNvfp4Moe, nvfp4_tune_small_shapes_enabled(),
-      nvfp4_moe_tune_max_tokens());
-}
-
-WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
-  thread_local int cached_device = -1;
-  thread_local cudaStream_t cached_stream = nullptr;
-  thread_local WorkspaceHolder* cached_holder = nullptr;
-  if (cached_holder != nullptr && cached_device == device &&
-      cached_stream == stream) {
-    return *cached_holder;
-  }
-
-  StreamWorkspaceKey key{device, stream};
-
-  // Fast path: check if workspace exists without lock
-  {
-    std::lock_guard<std::mutex> lock(workspace_mutex);
-    auto it = workspace_cache.find(key);
-    if (it != workspace_cache.end()) {
-      cached_device = device;
-      cached_stream = stream;
-      cached_holder = &it->second;
-      return it->second;
-    }
-  }
-
-  // Slow path: create new workspace
-  WorkspaceHolder holder;
-  auto byte_opts = torch::TensorOptions()
-                       .device(torch::Device(torch::kCUDA, device))
-                       .dtype(torch::kUInt8);
-  auto int_opts = torch::TensorOptions()
-                      .device(torch::Device(torch::kCUDA, device))
-                      .dtype(torch::kInt32);
-
-  holder.barriers = torch::zeros(
-      {(long long)turbomind::gemm::Gemm::kBarriersSize}, byte_opts);
-  holder.partials = torch::zeros(
-      {(long long)turbomind::gemm::Gemm::kPartialsSize}, byte_opts);
-  // Keep same tensormap size as TurboMind LlamaLinear.
-  holder.tensormaps = torch::empty({(long long)(8192 * 128)}, byte_opts);
-  holder.flags = torch::zeros({1}, int_opts);
-
-  holder.workspace.barriers = holder.barriers.data_ptr();
-  holder.workspace.barriers_size = holder.barriers.numel();
-  holder.workspace.partials = holder.partials.data_ptr();
-  holder.workspace.partials_size = holder.partials.numel();
-  holder.workspace.tensormaps = holder.tensormaps.data_ptr();
-  holder.workspace.tensormaps_size = holder.tensormaps.numel();
-  holder.workspace.flags = holder.flags.data_ptr<int>();
-
-  std::lock_guard<std::mutex> lock(workspace_mutex);
-  auto [insert_it, _] = workspace_cache.emplace(key, std::move(holder));
-  cached_device = device;
-  cached_stream = stream;
-  cached_holder = &insert_it->second;
-  return insert_it->second;
-}
-
-turbomind::gemm::Gemm& get_gemm(int device) {
-  thread_local int cached_device = -1;
-  thread_local turbomind::gemm::Gemm* cached_gemm = nullptr;
-  if (cached_gemm != nullptr && cached_device == device) {
-    return *cached_gemm;
-  }
-
-  std::lock_guard<std::mutex> lock(gemm_mutex);
-  auto it = gemm_cache.find(device);
-  if (it != gemm_cache.end()) {
-    cached_device = device;
-    cached_gemm = it->second.gemm.get();
-    return *it->second.gemm;
-  }
-  GemmHolder holder;
-  holder.gemm = std::make_unique<turbomind::gemm::Gemm>();
-  auto [insert_it, _] = gemm_cache.emplace(device, std::move(holder));
-  cached_device = device;
-  cached_gemm = insert_it->second.gemm.get();
-  return *insert_it->second.gemm;
 }
 
 void validate_awq_inputs(const torch::Tensor& qweight,
@@ -1773,82 +1110,6 @@ void validate_f16_lm_head_top20_input(const torch::Tensor& values_out,
               "sm70_f16_lm_head_top20_tc_out: invalid weight leading dim.");
   TORCH_CHECK(num_vocab_padding >= 0 && num_vocab_padding < weight.size(0),
               "sm70_f16_lm_head_top20_tc_out: invalid vocab padding.");
-}
-
-Sm70F16WeightCacheKey make_sm70_f16_weight_cache_key(
-    const torch::Tensor& weight) {
-  return Sm70F16WeightCacheKey{
-      weight.get_device(),
-      static_cast<const void*>(weight.unsafeGetTensorImpl()),
-      weight.size(0),
-      weight.size(1),
-  };
-}
-
-Sm70F16WeightCacheEntry prepare_sm70_f16_weight(torch::Tensor weight,
-                                                cudaStream_t stream) {
-  const int64_t n = weight.size(0);
-  const int64_t k = weight.size(1);
-
-  const auto converters = turbomind::gemm::GetConverters(
-      turbomind::kHalf, turbomind::kHalf, turbomind::kHalf, true, 70);
-  const auto* conv_w = converters[0];
-  TORCH_CHECK(conv_w, "sm70_f16_prepare: no compatible TurboMind converter.");
-
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout k_desc = w_desc;
-  k_desc.type = turbomind::kHalf;
-  k_desc.pack = conv_w->pack;
-  if (is_A_w) {
-    k_desc = turbomind::gemm::transpose(k_desc);
-  }
-
-  auto tm_weight = torch::empty_like(weight);
-  TORCH_CHECK(conv_w->Convert(weight.data_ptr(), w_desc, tm_weight.data_ptr(),
-                              k_desc, stream) == 0,
-              "sm70_f16_prepare: weight conversion failed.");
-
-  return {std::move(tm_weight), static_cast<int64_t>(k_desc.ld)};
-}
-
-Sm70F16WeightCacheEntry get_sm70_f16_cached_weight(torch::Tensor weight,
-                                                   cudaStream_t stream) {
-  weight = weight.contiguous();
-  const auto key = make_sm70_f16_weight_cache_key(weight);
-
-  {
-    std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
-    auto it = sm70_f16_weight_cache.find(key);
-    if (it != sm70_f16_weight_cache.end()) {
-      return it->second;
-    }
-  }
-
-  TORCH_CHECK(!is_stream_capturing(stream),
-              "sm70_f16_prepare: cache miss during CUDA graph capture.");
-
-  auto entry = prepare_sm70_f16_weight(weight, stream);
-
-  std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
-  auto [it, _] = sm70_f16_weight_cache.emplace(key, entry);
-  return it->second;
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -2207,7 +1468,7 @@ void sm70_glm_mhc_pre_norm_out(
     torch::Tensor comb_mix, torch::Tensor layer_input,
     torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
     double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
-    double norm_eps) {
+    double norm_eps, int64_t configured_threads) {
   TORCH_CHECK(
       gemm_mul.is_cuda() && gemm_sqrsum.is_cuda() && hc_scale.is_cuda() &&
           hc_base.is_cuda() && residual.is_cuda() && post_mix.is_cuda() &&
@@ -2271,7 +1532,13 @@ void sm70_glm_mhc_pre_norm_out(
           static_cast<float>(hc_sinkhorn_eps),                                 \
           static_cast<float>(hc_post_mult), static_cast<int>(sinkhorn_repeat), \
           static_cast<float>(norm_eps))
-  const int threads = num_tokens == 1 ? 128 : glm_mhc_pre_threads();
+  const int requested_threads = static_cast<int>(configured_threads);
+  const int valid_threads =
+      (requested_threads == 128 || requested_threads == 256 ||
+       requested_threads == 512 || requested_threads == 1024)
+          ? requested_threads
+          : 256;
+  const int threads = num_tokens == 1 ? 128 : valid_threads;
   switch (threads) {
     case 128:
       VLLM_LAUNCH_GLM_MHC_PRE(128);
@@ -3442,11 +2709,11 @@ void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   operation.quant_b = {gguf_affine_quant_type(bits),
                        static_cast<int>(group_size)};
-  auto& workspace = get_workspace(device, stream);
+  auto& workspace = workspace_for(device, stream);
   const int result = get_gemm(device).Run(
       operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
       layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
-      out.data_ptr(), d, workspace.workspace, stream);
+      out.data_ptr(), d, workspace, stream);
   TORCH_CHECK(result == 0, "GGUF affine TurboMind GEMM failed");
 }
 
@@ -3504,11 +2771,11 @@ void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   operation.quant_b = {gguf_affine_quant_type(bits),
                        static_cast<int>(group_size)};
   operation.batch_dim = 0;
-  auto& workspace = get_workspace(device, stream);
+  auto& workspace = workspace_for(device, stream);
   const int result = get_gemm(device).Run(
       operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
       layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
-      out.data_ptr(), d, workspace.workspace, stream);
+      out.data_ptr(), d, workspace, stream);
   TORCH_CHECK(result == 0, "GGUF affine TurboMind grouped GEMM failed");
 }
 
@@ -3645,11 +2912,11 @@ void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   operation.quant_b = {gguf_lut4_quant_type(lut_id),
                        static_cast<int>(group_size)};
-  auto& workspace = get_workspace(device, stream);
+  auto& workspace = workspace_for(device, stream);
   const int result = get_gemm(device).Run(
       operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
       layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
-      out.data_ptr(), d, workspace.workspace, stream);
+      out.data_ptr(), d, workspace, stream);
   TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind GEMM failed");
 }
 
@@ -3705,11 +2972,11 @@ void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   operation.quant_b = {gguf_lut4_quant_type(lut_id),
                        static_cast<int>(group_size)};
   operation.batch_dim = 0;
-  auto& workspace = get_workspace(device, stream);
+  auto& workspace = workspace_for(device, stream);
   const int result = get_gemm(device).Run(
       operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
       layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
-      out.data_ptr(), d, workspace.workspace, stream);
+      out.data_ptr(), d, workspace, stream);
   TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind grouped GEMM failed");
 }
 
@@ -3879,11 +3146,11 @@ void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   operation.quant_b = {gguf_lattice_quant_type(source_type),
                        static_cast<int>(group_size)};
-  auto& workspace = get_workspace(device, stream);
+  auto& workspace = workspace_for(device, stream);
   const int result = get_gemm(device).Run(
       operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
       layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
-      out.data_ptr(), d, workspace.workspace, stream);
+      out.data_ptr(), d, workspace, stream);
   TORCH_CHECK(result == 0, "GGUF lattice TurboMind GEMM failed");
 }
 
@@ -3945,12 +3212,116 @@ void gguf_lattice_grouped_gemm_sm70_out(
   operation.quant_b = {gguf_lattice_quant_type(source_type),
                        static_cast<int>(group_size)};
   operation.batch_dim = 0;
-  auto& workspace = get_workspace(device, stream);
+  auto& workspace = workspace_for(device, stream);
   const int result = get_gemm(device).Run(
       operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
       layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
-      out.data_ptr(), d, workspace.workspace, stream);
+      out.data_ptr(), d, workspace, stream);
   TORCH_CHECK(result == 0, "GGUF lattice TurboMind grouped GEMM failed");
+}
+
+// Prefill grouped GEMM over canonical banks written by the prefill transcode
+// (any source buffer per expert through the pointer tables). family: 0
+// lattice (decoder = GGUF type), 1 LUT4 (decoder = lut id), 2 affine
+// (decoder = bits). gated: the bank interleaves gate/up columns and the
+// epilogue writes silu(gate) * up, so out has n / 2 columns. tune: measure
+// this batch size (warmup only); otherwise reuse the closest measured one.
+void gguf_grouped_prefill_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t family,
+    int64_t decoder, int64_t n, int64_t num_experts, int64_t group_size,
+    bool gated, bool tune, std::optional<torch::Tensor> a_indices) {
+  TORCH_CHECK(family >= 0 && family <= 2, "GGUF prefill GEMM family");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF prefill GEMM tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  offsets.scalar_type() == torch::kInt32 &&
+                  weight_ptrs.scalar_type() == torch::kUInt8 &&
+                  stats_ptrs.scalar_type() == torch::kUInt8 &&
+                  input.dim() == 2 && out.dim() == 2 && input.stride(1) == 1 &&
+                  out.stride(1) == 1 && offsets.is_contiguous() &&
+                  weight_ptrs.is_contiguous() && stats_ptrs.is_contiguous(),
+              "GGUF prefill GEMM requires FP16 rows and prepared pointers");
+  // Rows are routes in expert order: input rows themselves, or input rows
+  // selected by a_indices (no gathered copy of the activations).
+  const bool indexed = a_indices.has_value();
+  TORCH_CHECK(
+      !indexed ||
+          (a_indices->is_cuda() && a_indices->scalar_type() == torch::kInt32 &&
+           a_indices->is_contiguous() && a_indices->device() == input.device()),
+      "GGUF prefill GEMM a_indices must be contiguous int32 CUDA");
+  const int64_t m = indexed ? a_indices->numel() : input.size(0);
+  const int64_t k = input.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  out.size(1) == (gated ? n / 2 : n) &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF prefill GEMM descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  std::array<turbomind::gemm::MatrixLayout, 2> layouts{};
+  turbomind::gemm::Operation operation{};
+  TuneKeyKind kind;
+  if (family == 0) {
+    TORCH_CHECK(gguf_lattice_group_supported(decoder, group_size),
+                "GGUF lattice canonical group is not supported");
+    layouts = gguf_lattice_layouts(n, k, decoder, group_size);
+    operation.quant_b = {gguf_lattice_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    kind = static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(decoder));
+  } else if (family == 1) {
+    TORCH_CHECK(gguf_lut4_group_supported(decoder, group_size),
+                "GGUF LUT4 canonical group is not supported");
+    layouts = gguf_lut4_layouts(n, k, group_size);
+    operation.quant_b = {gguf_lut4_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    kind = decoder == 0 ? TuneKeyKind::kGgufLut4IQ : TuneKeyKind::kGgufLut4E2M1;
+  } else {
+    TORCH_CHECK(!gated, "GGUF affine prefill GEMM is not gated");
+    gguf_affine_weight_type(decoder);
+    TORCH_CHECK(gguf_affine_group_supported(decoder, group_size),
+                "GGUF affine canonical group is not supported");
+    layouts = gguf_affine_layouts(n, k, decoder, group_size);
+    operation.quant_b = {gguf_affine_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    TORCH_CHECK(decoder == 2, "GGUF affine prefill GEMM supports U2 only");
+    kind = TuneKeyKind::kGgufAffineU2;
+  }
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  // Logical N before the gated epilogue; the epilogue halves the columns.
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  a.idxs = indexed ? a_indices->data_ptr<int>() : nullptr;
+  operation.dispatch = select_prefill_moe_dispatch_policy(
+      device, m, n, k, num_experts, group_size, stream, kind, tune);
+  operation.epilogue = gated ? turbomind::gemm::Epilogue::kGatedSilu
+                             : turbomind::gemm::Epilogue::kNone;
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.batch_dim = 0;
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF prefill TurboMind grouped GEMM failed");
 }
 
 std::vector<torch::Tensor> awq_sm70_prepare_impl(
@@ -4752,66 +4123,12 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(conv_w && conv_s,
               "awq_gemm_sm70: no compatible TurboMind converters.");
 
-  turbomind::gemm::MatrixLayout desc_A{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor, static_cast<int>(m),
-      static_cast<int>(k), static_cast<int>(k),
-  };
-  turbomind::gemm::MatrixLayout desc_U{};
+  auto desc_B =
+      vllm::sm70::packed_weight_layout(*conv_w, turbomind::kUint4, n, k, k_ld);
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::data_type_v<turbomind::uint4_t>;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = static_cast<int>(k_ld);
-
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-
-  const int64_t num_groups_raw = k / group_size;
-
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint32,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups_raw),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = static_cast<int>(compact_metadata ? -q_ld : q_ld);
-
-  turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
-  };
+  auto desc_V = vllm::sm70::packed_scale_layout(
+      *conv_s, turbomind::kUint32, n, k / group_size,
+      compact_metadata ? -q_ld : q_ld);
 
   turbomind::gemm::Operation op{};
   op.dispatch = select_awq_dense_dispatch_policy(
@@ -4832,7 +4149,7 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
   void* stats_ptr = tm_scales.data_ptr();
@@ -4840,10 +4157,9 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
     stats_ptr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(stats_ptr) |
                                         uintptr_t{1});
   }
-  const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, stats_ptr, desc_V, 0.f,
-                          out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-                          workspace_holder.workspace, stream);
+  const int ec = vllm::sm70::run_dense_packed_gemm(
+      gemm, workspace_holder, op, stream, in_feats, out, tm_weight.data_ptr(),
+      desc_B, stats_ptr, desc_V, n, k);
   TORCH_CHECK(ec == 0, "awq_gemm_sm70: TurboMind GEMM failed.");
 }
 
@@ -5003,64 +4319,11 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(conv_w && conv_s,
               "fp8_gemm_sm70: no compatible TurboMind converters.");
 
-  turbomind::gemm::MatrixLayout desc_A{
-      turbomind::kHalf,
-      turbomind::gemm::kRowMajor,
-      static_cast<int>(m),
-      static_cast<int>(k),
-      static_cast<int>(in_feats.stride(0)),
-  };
-  turbomind::gemm::MatrixLayout desc_U{};
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat8_e4m3, n, k, k_ld);
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::kFloat8_e4m3;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = static_cast<int>(k_ld);
-
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-  const int64_t num_groups = (k + group_size - 1) / group_size;
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint16,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = static_cast<int>(q_ld);
-
-  turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
-  };
+  auto desc_V = vllm::sm70::packed_scale_layout(
+      *conv_s, turbomind::kUint16, n, (k + group_size - 1) / group_size, q_ld);
 
   turbomind::gemm::Operation op{};
   op.dispatch = select_fp8_dense_dispatch_policy(
@@ -5080,23 +4343,22 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
-  const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, tm_scales.data_ptr(),
-                          desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
-                          desc_D, workspace_holder.workspace, stream);
+  const int ec = vllm::sm70::run_dense_packed_gemm(
+      gemm, workspace_holder, op, stream, in_feats, out, tm_weight.data_ptr(),
+      desc_B, tm_scales.data_ptr(), desc_V, n, in_feats.stride(0));
   TORCH_CHECK(ec == 0, "fp8_gemm_sm70: TurboMind GEMM failed.");
 }
 
 bool sm70_fp8_prefill_cutlass_gated_silu_enabled(
     const torch::Tensor& in_feats, const torch::Tensor& dense_weight) {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
-  return (raw == nullptr || std::atoi(raw) != 0) && in_feats.size(0) >= 8000 &&
-         in_feats.size(0) <= 8192 && in_feats.size(1) > 0 &&
-         in_feats.size(1) % 128 == 0 && dense_weight.size(1) > 0 &&
-         dense_weight.size(1) % 128 == 0;
+  return (vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_prefill_cutlass,
+                                  1) != 0) &&
+         in_feats.size(0) >= 8000 && in_feats.size(0) <= 8192 &&
+         in_feats.size(1) > 0 && in_feats.size(1) % 128 == 0 &&
+         dense_weight.size(1) > 0 && dense_weight.size(1) % 128 == 0;
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(
@@ -5189,64 +4451,11 @@ void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(conv_w && conv_s,
               "mxfp4_gemm_sm70: no compatible TurboMind converters.");
 
-  turbomind::gemm::MatrixLayout desc_A{
-      turbomind::kHalf,
-      turbomind::gemm::kRowMajor,
-      static_cast<int>(m),
-      static_cast<int>(k),
-      static_cast<int>(in_feats.stride(0)),
-  };
-  turbomind::gemm::MatrixLayout desc_U{};
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat4_e2m1, n, k, k_ld);
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::kFloat4_e2m1;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = static_cast<int>(k_ld);
-
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-  const int64_t num_groups = k / group_size;
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint8,   order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = static_cast<int>(q_ld);
-
-  turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
-  };
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint8, n,
+                                                k / group_size, q_ld);
 
   turbomind::gemm::Operation op{};
   op.dispatch = select_mxfp4_dense_dispatch_policy(
@@ -5258,13 +4467,12 @@ void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
-  const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, tm_scales.data_ptr(),
-                          desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
-                          desc_D, workspace_holder.workspace, stream);
+  const int ec = vllm::sm70::run_dense_packed_gemm(
+      gemm, workspace_holder, op, stream, in_feats, out, tm_weight.data_ptr(),
+      desc_B, tm_scales.data_ptr(), desc_V, n, in_feats.stride(0));
   TORCH_CHECK(ec == 0, "mxfp4_gemm_sm70: TurboMind GEMM failed.");
 }
 
@@ -5324,64 +4532,11 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(conv_w && conv_s,
               "nvfp4_gemm_sm70: no compatible TurboMind converters.");
 
-  turbomind::gemm::MatrixLayout desc_A{
-      turbomind::kHalf,
-      turbomind::gemm::kRowMajor,
-      static_cast<int>(m),
-      static_cast<int>(k),
-      static_cast<int>(in_feats.stride(0)),
-  };
-  turbomind::gemm::MatrixLayout desc_U{};
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat4_e2m1, n, k, k_ld);
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::kFloat4_e2m1;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = static_cast<int>(k_ld);
-
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-  const int64_t num_groups = k / group_size;
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint16,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = static_cast<int>(q_ld);
-
-  turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
-  };
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint16, n,
+                                                k / group_size, q_ld);
 
   turbomind::gemm::Operation op{};
   op.dispatch = select_nvfp4_dense_dispatch_policy(
@@ -5398,13 +4553,12 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
-  const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, tm_scales.data_ptr(),
-                          desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
-                          desc_D, workspace_holder.workspace, stream);
+  const int ec = vllm::sm70::run_dense_packed_gemm(
+      gemm, workspace_holder, op, stream, in_feats, out, tm_weight.data_ptr(),
+      desc_B, tm_scales.data_ptr(), desc_V, n, in_feats.stride(0));
   TORCH_CHECK(ec == 0, "nvfp4_gemm_sm70: TurboMind GEMM failed.");
 }
 
@@ -5771,13 +4925,13 @@ void sm70_f16_gemm_out(torch::Tensor out, torch::Tensor in_feats,
   op.quant_b = {turbomind::gemm::QuantType::kNone, 0};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
   const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
                           tm_weight.data_ptr(), desc_B, nullptr, desc_V, 0.f,
                           out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-                          workspace_holder.workspace, stream);
+                          workspace_holder, stream);
   TORCH_CHECK(ec == 0, "sm70_f16_gemm: TurboMind GEMM failed.");
 }
 
@@ -6982,6 +6136,16 @@ void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
       out, input, weight, stats, source_type, k_ld, q_ld, group_size);
 }
 
+void gguf_grouped_prefill_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t family,
+    int64_t decoder, int64_t n, int64_t num_experts, int64_t group_size,
+    bool gated, bool tune, std::optional<torch::Tensor> a_indices) {
+  vllm::awq_sm70::gguf_grouped_prefill_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, family, decoder, n,
+      num_experts, group_size, gated, tune, std::move(a_indices));
+}
+
 void gguf_lattice_grouped_gemm_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
     torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
@@ -7098,8 +6262,8 @@ torch::Tensor sm70_f16_gemm(torch::Tensor _in_feats, torch::Tensor _kernel) {
 }
 
 bool sm70_fp8_moe_prepare_vec_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_MOE_PREPARE_VEC");
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_moe_prepare_vec,
+                                 0) != 0;
 }
 
 void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
@@ -7239,7 +6403,21 @@ void sm70_glm_mhc_pre_norm_out(
   vllm::awq_sm70::sm70_glm_mhc_pre_norm_out(
       gemm_mul, gemm_sqrsum, hc_scale, hc_base, residual, post_mix, comb_mix,
       layer_input, norm_weight, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-      hc_post_mult, sinkhorn_repeat, norm_eps);
+      hc_post_mult, sinkhorn_repeat, norm_eps,
+      vllm::awq_sm70::glm_mhc_pre_threads());
+}
+
+void sm70_glm_mhc_pre_norm_configured_out(
+    torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
+    torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,
+    torch::Tensor comb_mix, torch::Tensor layer_input,
+    torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
+    double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
+    double norm_eps, int64_t configured_threads) {
+  vllm::awq_sm70::sm70_glm_mhc_pre_norm_out(
+      gemm_mul, gemm_sqrsum, hc_scale, hc_base, residual, post_mix, comb_mix,
+      layer_input, norm_weight, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+      hc_post_mult, sinkhorn_repeat, norm_eps, configured_threads);
 }
 
 void sm70_glm_mhc_post_dot_q8_out(torch::Tensor residual_out,
@@ -7372,54 +6550,6 @@ void sm70_dynamic_draft_vocab_refresh_tail_weight_out(
 void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
                            torch::Tensor _gate_weight) {
   vllm::awq_sm70::sm70_f16_gate_mul_out(out, _in_feats, _gate_weight);
-}
-
-int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
-                               const std::string& path) {
-  TORCH_CHECK(device_hint.is_cuda(),
-              "sm70_gemm_import_cache: device_hint must be CUDA.");
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(device_hint));
-  const int device = device_hint.get_device();
-
-  std::ifstream ifs(path, std::ios::binary);
-  if (!ifs.good()) {
-    return 0;
-  }
-
-  auto& gemm = vllm::awq_sm70::get_gemm(device);
-  const int64_t imported = gemm.Import(ifs);
-  if (imported > 0) {
-    std::lock_guard<std::mutex> lock(vllm::awq_sm70::tune_mutex);
-    vllm::awq_sm70::imported_cache_devices.insert(device);
-  }
-  return imported;
-}
-
-int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
-                               const std::string& path) {
-  TORCH_CHECK(device_hint.is_cuda(),
-              "sm70_gemm_export_cache: device_hint must be CUDA.");
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(device_hint));
-  const int device = device_hint.get_device();
-
-  try {
-    const std::filesystem::path fs_path(path);
-    if (fs_path.has_parent_path()) {
-      std::filesystem::create_directories(fs_path.parent_path());
-    }
-  } catch (const std::exception& e) {
-    TORCH_CHECK(false,
-                "sm70_gemm_export_cache: failed to create parent "
-                "directory for ",
-                path, " (", e.what(), ").");
-  }
-
-  std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-  TORCH_CHECK(ofs.good(), "sm70_gemm_export_cache: failed to open ", path,
-              " for writing.");
-
-  auto& gemm = vllm::awq_sm70::get_gemm(device);
-  return gemm.Export(ofs);
 }
 
 // ---------------------------------------------------------------------------
@@ -8754,59 +7884,15 @@ void awq_moe_gemm_sm70_out_impl(
   turbomind::gemm::MatrixLayout desc_U{};
 
   // desc_B: weights via StridedPtr (ld=0 triggers StridedPtr resolution)
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::data_type_v<turbomind::uint4_t>;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = 0;  // StridedPtr mode
+  auto desc_B =
+      vllm::sm70::packed_weight_layout(*conv_w, turbomind::kUint4, n, k, 0);
   desc_B.num = static_cast<int>(num_experts);
   desc_B.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
 
   // desc_V: scales via StridedPtr
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-
-  const int64_t num_groups_raw = k / group_size;
-
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint32,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups_raw),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = 0;  // StridedPtr mode
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint32, n,
+                                                k / group_size, 0);
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
@@ -8846,14 +7932,13 @@ void awq_moe_gemm_sm70_out_impl(
   op.batch_dim = 0;
   op.dispatch_num_override = per_expert_dispatch ? 1 : 0;
 
-  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& workspace_holder = vllm::awq_sm70::workspace_for(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
 
-  const int ec =
-      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+      strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f,
+      out.data_ptr(), desc_D, out.data_ptr(), desc_D, workspace_holder, stream);
 
   TORCH_CHECK(ec == 0,
               "awq_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
@@ -8917,9 +8002,8 @@ void awq_moe_indexed_dense_w13_sm70_out(
                   out.size(1) == n && out.stride(1) == 1,
               "awq_moe_indexed_dense_w13_sm70_out: output shape mismatch.");
 
-  static std::atomic<unsigned> logged_awq_indexed_prefill{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_indexed_prefill,
+      "logged_awq_indexed_prefill",
       "SM70 Qwen3.8 AWQ indexed-A W13 prefill path enabled C++ op reached",
       input, input_row_indices.numel(), num_experts);
   awq_moe_gemm_sm70_out_impl(
@@ -8981,9 +8065,8 @@ void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "awq_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_awq_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_dense_stage,
+      "logged_awq_dense_stage",
       "SM70 AWQ MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
@@ -9227,10 +8310,10 @@ void sm70_glm53_moe_permute_q8_out(torch::Tensor input, torch::Tensor topk_ids,
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "sm70_glm53_moe_permute_q8_out: requires SM70.");
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const char* shuffle_sort_raw =
-      std::getenv("VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8");
+
   const bool use_shuffle_sort =
-      shuffle_sort_raw == nullptr || std::atoi(shuffle_sort_raw) != 0;
+      vllm::sm70::policy_atoi(
+          vllm::sm70::PolicyField::glm53_moe_shuffle_sort_q8, 1) != 0;
   if (use_shuffle_sort) {
     sm70_glm53_moe_sort_q8_kernel<<<1, kGlm53MoeQ8Slots, 0, stream>>>(
         topk_ids.data_ptr<int>(), sorted_row_idx.data_ptr<int>(),
@@ -9296,22 +8379,22 @@ void awq_moe_active_dense_stage_sm70_out(
       static_cast<int>(total_slots));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  static std::atomic<unsigned> logged_awq_active_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_active_dense_stage,
+      "logged_awq_active_dense_stage",
       "SM70 AWQ MoE active dense-stage path enabled C++ op reached", input,
       total_slots, total_slots);
 
   // Reuse the active-segment ABI for the narrow Qwen3.8 TP4 decode shapes.
   // Equal trailing offsets describe empty groups; nonempty groups may contain
   // multiple rows. Keep offsets-based scheduling (not one-row slot dispatch).
-  const char* grouped =
-      std::getenv("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE");
-  const char* exact_w2 =
-      std::getenv("VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2");
-  if ((grouped == nullptr || std::atoi(grouped) != 0) &&
-      (exact_w2 == nullptr || std::atoi(exact_w2) == 0) && group_size == 32 &&
-      total_slots >= 20 && total_slots <= 80 && total_slots % 10 == 0 &&
+
+  if ((vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::awq_qwen38_moe_compact_grouped_decode, 1) !=
+       0) &&
+      (vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::awq_moe_batched_active_exact_w2, 0) == 0) &&
+      group_size == 32 && total_slots >= 20 && total_slots <= 80 &&
+      total_slots % 10 == 0 &&
       ((k == 2560 && n == 320) || (k == 160 && n == 2560))) {
     awq_moe_gemm_sm70_out_impl(out, input, active_expert_offsets, ptrs_w,
                                ptrs_s, total_slots, k, n, group_size, false,
@@ -9749,8 +8832,7 @@ void awq_moe_single_token_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token{0u};
-  maybe_log_sm70_moe_route_once(logged_awq_single_token,
+  maybe_log_sm70_moe_route_once("logged_awq_single_token",
                                 "SM70 AWQ MoE single-token active-expert dense "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -9847,9 +8929,8 @@ void awq_moe_single_token_indexed_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token_indexed{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_single_token_indexed,
+      "logged_awq_single_token_indexed",
       "SM70 AWQ MoE single-token indexed dense path enabled C++ op reached", x,
       x.size(0), top_k);
   constexpr int kThreads = 256;
@@ -9958,8 +9039,7 @@ void awq_moe_single_token_compact_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token_compact{0u};
-  maybe_log_sm70_moe_route_once(logged_awq_single_token_compact,
+  maybe_log_sm70_moe_route_once("logged_awq_single_token_compact",
                                 "SM70 AWQ MoE single-token compact grouped W13 "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -10127,53 +9207,14 @@ void fp8_moe_gemm_sm70_out_impl(
   desc_A.idxs = use_a_indices ? a_indices_flat.data_ptr<int>() : nullptr;
   turbomind::gemm::MatrixLayout desc_U{};
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::kFloat8_e4m3;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = 0;
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat8_e4m3, n, k, 0);
   desc_B.num = static_cast<int>(num_experts);
   desc_B.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
 
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-  const int64_t num_groups = (k + group_size - 1) / group_size;
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint16,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = 0;
+  auto desc_V = vllm::sm70::packed_scale_layout(
+      *conv_s, turbomind::kUint16, n, (k + group_size - 1) / group_size, 0);
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
@@ -10217,13 +9258,12 @@ void fp8_moe_gemm_sm70_out_impl(
   op.active_group_count =
       use_active_group_indices ? static_cast<int>(active_group_count) : 0;
 
-  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& workspace_holder = vllm::awq_sm70::workspace_for(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
-  const int ec =
-      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+      strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f,
+      out.data_ptr(), desc_D, out.data_ptr(), desc_D, workspace_holder, stream);
   TORCH_CHECK(ec == 0,
               "fp8_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
               ").");
@@ -10290,9 +9330,8 @@ void fp8_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_fp8_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_fp8_dense_stage,
+      "logged_fp8_dense_stage",
       "SM70 FP8 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
@@ -10381,52 +9420,13 @@ void mxfp4_moe_gemm_sm70_out_impl(
       broadcast_input_rows ? nullptr : expert_offsets.data_ptr<int>();
   turbomind::gemm::MatrixLayout desc_U{};
 
-  const auto order_w = conv_w->order;
-  const bool is_a_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_b_w = !is_a_w;
-  turbomind::gemm::MatrixLayout weight_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_b_w) {
-    std::swap(weight_desc.rows, weight_desc.cols);
-    weight_desc.order = ~weight_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = weight_desc;
-  desc_B.type = turbomind::kFloat4_e2m1;
-  desc_B.pack = conv_w->pack;
-  if (is_a_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = 0;
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat4_e2m1, n, k, 0);
   desc_B.num = static_cast<int>(num_experts);
   desc_B.group_idxs = b_group_indices.data_ptr<int>();
 
-  const auto order_s = conv_s->order;
-  const bool is_a_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_b_s = !is_a_s;
-  const int64_t num_groups = k / group_size;
-  turbomind::gemm::MatrixLayout scale_desc{
-      turbomind::kUint8,   order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_b_s) {
-    std::swap(scale_desc.rows, scale_desc.cols);
-    scale_desc.order = ~scale_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = scale_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_a_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = 0;
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint8, n,
+                                                k / group_size, 0);
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs = b_group_indices.data_ptr<int>();
 
@@ -10463,13 +9463,12 @@ void mxfp4_moe_gemm_sm70_out_impl(
                               ? -static_cast<int>(num_experts)
                               : 0;
 
-  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& workspace_holder = vllm::awq_sm70::workspace_for(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
-  const int ec =
-      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+      strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f,
+      out.data_ptr(), desc_D, out.data_ptr(), desc_D, workspace_holder, stream);
   TORCH_CHECK(ec == 0,
               "mxfp4_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
               ").");
@@ -10517,9 +9516,8 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "mxfp4_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_mxfp4_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_mxfp4_dense_stage,
+      "logged_mxfp4_dense_stage",
       "SM70 MXFP4 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   const bool compact_decode_shape = input.size(0) == num_experts &&
@@ -10649,52 +9647,13 @@ void nvfp4_moe_gemm_sm70_out_impl(
   desc_A.idxs = use_a_indices ? a_indices_flat.data_ptr<int>() : nullptr;
   turbomind::gemm::MatrixLayout desc_U{};
 
-  const auto order_w = conv_w->order;
-  const bool is_a_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_b_w = !is_a_w;
-  turbomind::gemm::MatrixLayout weight_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_b_w) {
-    std::swap(weight_desc.rows, weight_desc.cols);
-    weight_desc.order = ~weight_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = weight_desc;
-  desc_B.type = turbomind::kFloat4_e2m1;
-  desc_B.pack = conv_w->pack;
-  if (is_a_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = 0;
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat4_e2m1, n, k, 0);
   desc_B.num = static_cast<int>(num_experts);
   desc_B.group_idxs = b_group_indices.data_ptr<int>();
 
-  const auto order_s = conv_s->order;
-  const bool is_a_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_b_s = !is_a_s;
-  const int64_t num_groups = k / group_size;
-  turbomind::gemm::MatrixLayout scale_desc{
-      turbomind::kUint16,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_b_s) {
-    std::swap(scale_desc.rows, scale_desc.cols);
-    scale_desc.order = ~scale_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = scale_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_a_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = 0;
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint16, n,
+                                                k / group_size, 0);
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs = b_group_indices.data_ptr<int>();
 
@@ -10729,13 +9688,12 @@ void nvfp4_moe_gemm_sm70_out_impl(
                               ? -static_cast<int>(num_experts)
                               : 0;
 
-  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& workspace_holder = vllm::awq_sm70::workspace_for(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
-  const int ec =
-      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+      strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f,
+      out.data_ptr(), desc_D, out.data_ptr(), desc_D, workspace_holder, stream);
   TORCH_CHECK(ec == 0,
               "nvfp4_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
               ").");
@@ -10747,11 +9705,11 @@ void nvfp4_moe_indexed_dense_stage_sm70_out_impl(
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
     int64_t n, int64_t group_size, bool fused_swiglu) {
   constexpr int kQwen38TopK = 10;
-  const char* split_w13_raw =
-      std::getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL");
+
   const bool split_w13_candidate =
-      (!split_w13_raw || std::atoi(split_w13_raw) != 0) && fused_swiglu &&
-      (n == 256 || n == 64);
+      (vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) != 0) &&
+      fused_swiglu && (n == 256 || n == 64);
   TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
                   input.scalar_type() == torch::kFloat16 && input.is_cuda(),
               "nvfp4_moe_indexed_dense_stage_sm70_out: exact Qwen3.8 CUDA "
@@ -10773,11 +9731,9 @@ void nvfp4_moe_indexed_dense_stage_sm70_out_impl(
               "nvfp4_moe_indexed_dense_stage_sm70_out requires grouped "
               "prefill dispatch.");
 
-  static std::atomic<unsigned> logged_nvfp4_indexed_prefill{0u};
-  static std::atomic<unsigned> logged_nvfp4_indexed_fused_prefill{0u};
   maybe_log_sm70_moe_route_once(
-      fused_swiglu ? logged_nvfp4_indexed_fused_prefill
-                   : logged_nvfp4_indexed_prefill,
+      fused_swiglu ? "logged_nvfp4_indexed_fused_prefill"
+                   : "logged_nvfp4_indexed_prefill",
       fused_swiglu
           ? "SM70 Qwen3.8 NVFP4 MoE indexed-A fused-SwiGLU W13 prefill "
             "path enabled C++ op reached"
@@ -10848,9 +9804,8 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "nvfp4_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_nvfp4_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_nvfp4_dense_stage,
+      "logged_nvfp4_dense_stage",
       "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
       input, input.size(0), num_experts);
   constexpr int kNvfp4LegacyCompactGroups = 8 * 8;
@@ -10876,9 +9831,8 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       ((k == 2560 && n == 320) || (k == 160 && n == 2560));
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
       (exact_qwen36_prefill_shape || exact_qwen4_exp_prefill_shape)) {
-    static std::atomic<unsigned> logged_nvfp4_grouped_prefill{0u};
     maybe_log_sm70_moe_route_once(
-        logged_nvfp4_grouped_prefill,
+        "logged_nvfp4_grouped_prefill",
         "SM70 NVFP4 MoE grouped TurboMind prefill path enabled C++ op reached",
         input, input.size(0), num_experts);
     nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
@@ -10961,9 +9915,8 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_mxfp4_direct_top6{0u};
   maybe_log_sm70_moe_route_once(
-      logged_mxfp4_direct_top6,
+      "logged_mxfp4_direct_top6",
       "SM70 MXFP4 MoE direct top-6 prepare/W13 path enabled C++ op reached", x,
       x.size(0), kTopK);
 
@@ -11175,8 +10128,7 @@ void fp8_moe_single_token_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token{0u};
-  maybe_log_sm70_moe_route_once(logged_fp8_single_token,
+  maybe_log_sm70_moe_route_once("logged_fp8_single_token",
                                 "SM70 FP8 MoE single-token active-expert dense "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -11274,9 +10226,8 @@ void fp8_moe_single_token_indexed_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token_indexed{0u};
   maybe_log_sm70_moe_route_once(
-      logged_fp8_single_token_indexed,
+      "logged_fp8_single_token_indexed",
       "SM70 FP8 MoE single-token indexed dense path enabled C++ op reached", x,
       x.size(0), top_k);
   constexpr int kThreads = 256;
@@ -11386,8 +10337,7 @@ void fp8_moe_single_token_compact_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token_compact{0u};
-  maybe_log_sm70_moe_route_once(logged_fp8_single_token_compact,
+  maybe_log_sm70_moe_route_once("logged_fp8_single_token_compact",
                                 "SM70 FP8 MoE single-token compact grouped W13 "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);

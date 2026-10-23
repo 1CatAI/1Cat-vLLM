@@ -1,34 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
-
-
-def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
-    """Share when the draft has no own copy, or its copy matches the target."""
-
-    if not getattr(eagle, flag, False) or draft is None:
-        return True
-    if target is None:
-        return False
-    # torch.equal on GPU allocates a bool mask the size of the input.
-    # Use the faster GPU path when there is plenty of headroom;
-    # otherwise compare on CPU.
-    w = draft.weight
-    if w.is_cuda and torch.cuda.mem_get_info(w.device)[0] < w.numel() * 2:
-        return torch.equal(w.cpu(), target.weight.cpu())
-    return torch.equal(w, target.weight)
-
-
-def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):
-    """Return the language-model head for plain and conditional targets."""
-    return getattr(target_language_model, "lm_head", None) or getattr(
-        target_model, "lm_head", None
-    )
+from vllm.model_executor.models.shared_weights import (
+    EAGLE_DRAFT_WEIGHTS,
+    share_embeddings,
+    share_lm_head,
+)
+from vllm.model_executor.models.shared_weights import (
+    get_target_lm_head as get_target_lm_head,
+)
 
 
 def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -49,47 +33,13 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    target_inner = target_language_model.model
-    draft_inner = eagle_model.model
-
-    # Skip embedding sharing under PP — each rank owns its own embedding.
-    if get_pp_group().world_size == 1:
-        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
-            target_inner, "embedding", None
-        )
-        draft_embed = getattr(draft_inner, "embed_tokens", None)
-        if target_embed is not None and _should_share(
-            eagle_model, "has_own_embed_tokens", draft_embed, target_embed
-        ):
-            if draft_embed is not None:
-                del draft_inner.embed_tokens
-            draft_inner.embed_tokens = target_embed
-
-    target_lm_head = get_target_lm_head(target_model, target_language_model)
-    draft_lm_head = getattr(eagle_model, "lm_head", None)
-    if target_lm_head is not None and _should_share(
-        eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
-    ):
-        if draft_lm_head is not None:
-            del eagle_model.lm_head
-        eagle_model.lm_head = target_lm_head
-
-        # MTP layers route logits through layer.shared_head.head, not
-        # eagle_model.lm_head, so the per-layer copies need fixing up too.
-        layers = getattr(draft_inner, "layers", None)
-        if layers is not None:
-            items = layers.values() if isinstance(layers, nn.ModuleDict) else layers
-            for layer in items:
-                sh = getattr(layer, "shared_head", None)
-                if sh is not None and hasattr(sh, "head"):
-                    del sh.head
-                    sh.head = target_lm_head
-
-    # MTP also shares a topk_indices_buffer between target and draft.
-    if hasattr(target_inner, "topk_indices_buffer"):
-        if hasattr(draft_inner, "topk_indices_buffer"):
-            del draft_inner.topk_indices_buffer
-        draft_inner.topk_indices_buffer = target_inner.topk_indices_buffer
+    share_embeddings(
+        eagle_model,
+        target_language_model,
+        EAGLE_DRAFT_WEIGHTS,
+        pp_size=get_pp_group().world_size,
+    )
+    share_lm_head(eagle_model, target_model, target_language_model, EAGLE_DRAFT_WEIGHTS)
 
     # Specialized draft packs must use the final shared checkpoint head and
     # be resident before KV allocation/graph warmup reduce startup headroom.

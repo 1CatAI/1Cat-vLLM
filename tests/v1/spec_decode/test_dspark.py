@@ -332,3 +332,18 @@ def test_dspark_confidence_scheduler_zero_threshold_uses_cap() -> None:
     lengths = proposer._select_verification_lengths(torch.randn(3, 5))
 
     assert lengths.tolist() == [2, 2, 2]
+
+
+def test_alignment_output_contract_is_hashed(tmp_path, monkeypatch):
+    _, spec = _make_dspark_speculative_config(
+        tmp_path, monkeypatch, pp_size=1, tp_size=1
+    )
+    spec.bind_diagnostic_output(False)
+    ordinary = spec.compute_hash()
+    spec.bind_diagnostic_output(True)
+    alignment = spec.compute_hash()
+    assert spec.diagnostic_confidence_logits
+    assert alignment != ordinary
+    spec.dspark_confidence_threshold = 0.5
+    spec.bind_diagnostic_output(False)
+    assert spec.compute_hash() == alignment

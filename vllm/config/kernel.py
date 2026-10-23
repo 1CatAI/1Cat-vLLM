@@ -3,10 +3,17 @@
 import contextlib
 from collections.abc import Callable
 from dataclasses import asdict, fields
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import Field, field_validator
 
+from vllm.config.execution_policy import LayerExecutionPolicy
+from vllm.config.gdn import GdnConfig
+from vllm.config.legacy_inputs import LegacyInputs
+from vllm.config.sm70_moe import Sm70MoEConfig
+from vllm.config.sm70_native import Sm70NativeConfig
+from vllm.config.sm70_runtime import Sm70RuntimeConfig
+from vllm.config.sm70_sparse import Sm70SparseConfig
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
 
@@ -14,6 +21,46 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+
+SM70_AWQ_LINEAR_ALIASES = {
+    "enabled": "VLLM_SM70_AWQ_TURBOMIND",
+    "prefill_exact_dense": "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE",
+    "fused_silu": "VLLM_SM70_AWQ_MLP_ENGINE",
+}
+SM70_FP8_LINEAR_ALIASES = {
+    "enabled": "VLLM_SM70_FP8_TURBOMIND",
+    "dequant_fallback": "VLLM_SM70_FP8_DEQUANT_FALLBACK",
+    "qpn8": "VLLM_SM70_FP8_QPN8",
+    "qpn8_pp2_tp4": "VLLM_SM70_FP8_QPN8_PP2_TP4",
+    "qpn8_shared_gate": "VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE",
+    "prescaled_decode": "VLLM_SM70_FP8_PRESCALED_M1_DECODE",
+    "prescaled_shared_gate": "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE",
+    "prefill_prescaled": "VLLM_SM70_FP8_PREFILL_PRESCALED",
+    "prefill_exact_dense": "VLLM_SM70_FP8_PREFILL_EXACT_DENSE",
+    "prefill_visible_dense_mm": "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM",
+    "gated_silu": "VLLM_SM70_FP8_DENSE_GATED_SILU",
+    "batch_prescaled": "VLLM_SM70_FP8_BATCH_PRESCALED",
+}
+SM70_NVFP4_LINEAR_ALIASES = {
+    "qpn2": "VLLM_SM70_NVFP4_QPN2",
+    "prefill": "VLLM_SM70_NVFP4_QPN2_PREFILL",
+    "shared_weight": "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT",
+    "shared_scales": "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES",
+    "prefill_min_m": "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M",
+}
+
+
+SM70_LOADER_ALIASES = {
+    "awq": {"moe_disable": "VLLM_SM70_AWQ_MOE_DISABLE"},
+    "fp8": {"moe_dequant_fallback": "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK"},
+    "nvfp4": {
+        "qpn4": "VLLM_SM70_NVFP4_QPN4",
+        "enabled": "VLLM_SM70_NVFP4_TURBOMIND",
+        "gated_silu": "VLLM_SM70_NVFP4_DENSE_GATED_SILU",
+        "down_scale_code": "VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE",
+    },
+}
 
 
 @config
@@ -158,13 +205,55 @@ LinearBackend = Literal[
 
 
 @config
-class Sm70NvFp4Config:
+class Sm70LinearCompatibility:
+    """B's format policy keeps compatibility input capture separate from activation."""
+
+    legacy: LegacyInputs = Field(default_factory=LegacyInputs)
+    """Serializable input snapshot, excluded from effective calculation hashes."""
+    input_aliases: ClassVar[tuple[str, ...]] = ()
+    loader_aliases: ClassVar[dict[str, str]] = {}
+
+    def capture_inputs(self) -> None:
+        self.legacy.capture(
+            (
+                *self.input_aliases,
+                *self.loader_aliases.values(),
+                "VLLM_SM70_QUANT_BACKEND",
+            )
+        )
+
+    def loader_value(self, field):
+        self.capture_inputs()
+        value = getattr(self, field)
+        return self.legacy.value(self.loader_aliases[field]) if value is None else value
+
+    def use_turbomind(self, value):
+        backend = self.legacy.value("VLLM_SM70_QUANT_BACKEND")
+        return backend == "turbomind" or (backend == "auto" and bool(value))
+
+
+@config
+class Sm70NvFp4Config(Sm70LinearCompatibility):
     """Per-engine weight-only NVFP4 policy; None retains legacy auto selection.
 
     Resolve before loading layers. Native capability and local layout checks
     remain with the linear kernels. Explicit fields override deprecated envs.
     """
 
+    enabled: bool | None = None
+    """Retain the native weight-only NVFP4 loader admission."""
+    gated_silu: bool | None = None
+    """Retain the qualified dense gate/up epilogue."""
+    down_scale_code: bool | None = None
+    """Retain the experimental down-projection scale-code layout."""
+    active: bool = Field(default=False, init=False)
+    """A loaded provider uses this format; inactive options do not salt graphs."""
+    sources: dict[str, str] = Field(default_factory=dict, init=False)
+    """Initialization provenance for explanations, excluded from graph hashing."""
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Captured native selectors/tuning; unused formats do not affect graph keys."""
+    qpn4: bool | None = None
+    """Retain the shape/model-qualified QPN4 provider."""
     dense_qpn2: bool = True
     """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
     qpn2: bool | None = None
@@ -182,21 +271,33 @@ class Sm70NvFp4Config:
     resolved: bool = Field(default=False, init=False)
     """Prevent reparsing process environment when a config is reused."""
 
-    def resolve(self, *, qualified: bool) -> None:
-        from vllm import envs
+    loader_aliases: ClassVar[dict[str, str]] = SM70_LOADER_ALIASES["nvfp4"]
+    input_aliases: ClassVar[tuple[str, ...]] = (*SM70_NVFP4_LINEAR_ALIASES.values(),)
 
+    def resolve(self, *, qualified: bool, active: bool = True) -> None:
+        self.capture_inputs()
+
+        self.active = self.active or active
         if self.resolved:
             return
         self.qualified = qualified
         defaults = {
-            "qpn2": ("VLLM_SM70_NVFP4_QPN2", qualified),
-            "prefill": ("VLLM_SM70_NVFP4_QPN2_PREFILL", qualified),
-            "shared_weight": ("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", True),
-            "shared_scales": ("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", True),
-            "prefill_min_m": ("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", 256),
+            "qpn2": qualified,
+            "prefill": qualified,
+            "shared_weight": True,
+            "shared_scales": True,
+            "prefill_min_m": 256,
         }
-        for field, (name, default) in defaults.items():
-            if envs.is_set(name):
+        for field, default in defaults.items():
+            name = SM70_NVFP4_LINEAR_ALIASES[field]
+            self.sources[field] = (
+                "configuration"
+                if getattr(self, field) is not None
+                else name
+                if self.legacy.is_set(name)
+                else "default"
+            )
+            if self.legacy.is_set(name):
                 logger.warning_once(
                     "%s is deprecated; use kernel_config.sm70_nvfp4.%s. "
                     "Explicit configuration takes precedence.",
@@ -205,35 +306,49 @@ class Sm70NvFp4Config:
                 )
             if getattr(self, field) is None:
                 setattr(
-                    self, field, getattr(envs, name) if envs.is_set(name) else default
+                    self,
+                    field,
+                    self.legacy.value(name) if self.legacy.is_set(name) else default,
                 )
         self.resolved = True
 
 
 @config
-class Sm70AwqConfig:
+class Sm70AwqConfig(Sm70LinearCompatibility):
     """Per-engine AWQ policy; native support is checked by the linear kernel."""
 
+    sources: dict[str, str] = Field(default_factory=dict, init=False)
+    """Initialization provenance for explanations, excluded from graph hashing."""
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Captured native selectors/tuning; unused formats do not affect graph keys."""
     enabled: bool | None = None
     """Use TurboMind AWQ; auto preserves the legacy backend preference."""
     prefill_exact_dense: bool | None = None
     """Use bounded exact-dense prefill for quality-qualified projections."""
+    moe_disable: bool | None = None
+    """Retained AWQ MoE rollback; does not disable dense linear layers."""
     fused_silu: bool | None = None
     """Experimental fused gate/up epilogue; auto remains disabled."""
     resolved: bool = Field(default=False, init=False)
     """Whether the compatibility adapter has resolved this engine's policy."""
 
+    loader_aliases: ClassVar[dict[str, str]] = SM70_LOADER_ALIASES["awq"]
+    input_aliases: ClassVar[tuple[str, ...]] = (*SM70_AWQ_LINEAR_ALIASES.values(),)
+
     def resolve(self) -> None:
-        from vllm import envs
+        self.capture_inputs()
 
         if self.resolved:
             return
-        for field, name in {
-            "enabled": "VLLM_SM70_AWQ_TURBOMIND",
-            "prefill_exact_dense": "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE",
-            "fused_silu": "VLLM_SM70_AWQ_MLP_ENGINE",
-        }.items():
-            if envs.is_set(name):
+        for field, name in SM70_AWQ_LINEAR_ALIASES.items():
+            self.sources[field] = (
+                "configuration"
+                if getattr(self, field) is not None
+                else name
+                if self.legacy.is_set(name)
+                else "default"
+            )
+            if self.legacy.is_set(name):
                 logger.warning_once(
                     "%s is deprecated for dense linear layers; use "
                     "kernel_config.sm70_awq.%s. Explicit configuration wins.",
@@ -241,15 +356,17 @@ class Sm70AwqConfig:
                     field,
                 )
             if getattr(self, field) is None:
-                value = getattr(envs, name)
+                value = self.legacy.value(name)
+                if field == "batch_prescaled":
+                    value = value == "1"
                 if field == "enabled":
-                    value = envs.use_sm70_turbomind(value)
+                    value = self.use_turbomind(value)
                 setattr(self, field, value)
         self.resolved = True
 
 
 @config
-class Sm70Fp8Config:
+class Sm70Fp8Config(Sm70LinearCompatibility):
     """Per-engine serialized block-FP8 variants; native tuning stays unchanged.
 
     None preserves the legacy default and override precedence. Resolution is
@@ -257,6 +374,10 @@ class Sm70Fp8Config:
     unmigrated online and compressed-tensors FP8 loaders.
     """
 
+    sources: dict[str, str] = Field(default_factory=dict, init=False)
+    """Initialization provenance for explanations, excluded from graph hashing."""
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Captured native selectors/tuning; unused formats do not affect graph keys."""
     enabled: bool | None = None
     """Use TurboMind; auto retains the shared legacy backend preference."""
     block_qpn8: bool = True
@@ -269,6 +390,8 @@ class Sm70Fp8Config:
     below that it serves just prefill, where the dense path keeps pace."""
     dequant_fallback: bool | None = None
     """Keep the legacy dense dequantization route available when requested."""
+    moe_dequant_fallback: bool | None = None
+    """Retain the existing additional MoE dequantization admission gate."""
     qpn8: bool | None = None
     """Use the retained projection-qualified QPN8 weight layout."""
     qpn8_pp2_tp4: bool | None = None
@@ -280,7 +403,7 @@ class Sm70Fp8Config:
     prescaled_shared_gate: bool | None = None
     """Allow the qualified shared-expert M1 prescaled variant."""
     legacy_prefill_fast_selector: bool = Field(default=True, init=False)
-    """Mirror native tuning selection until its host API accepts configuration."""
+    """Resolved native selector, retained for existing layout admission."""
     prefill_prescaled: bool | None = None
     """Prepare the retained exact-8K pre-scaled projection variant."""
     prefill_exact_dense: bool | None = None
@@ -288,9 +411,11 @@ class Sm70Fp8Config:
     prefill_visible_dense_mm: bool | None = None
     """Diagnostic visible dense MM for existing AsyncTP experiments."""
     legacy_grouped_bmm_decode: bool = Field(default=True, init=False)
-    """Mirror the native shared flag; its host API does not accept config yet."""
+    """Resolved native grouped decode selector used during weight preparation."""
     gated_silu: bool | None = None
     """Prepare the existing fused gate/up epilogue."""
+    batch_prescaled: bool | None = None
+    """Retain the channel-FP8 exact batch-scale preparation experiment."""
     explicit_enables: tuple[str, ...] = Field(default=(), init=False)
     """Retain the legacy error for an explicit route with missing native ops."""
     resolved: bool = Field(default=False, init=False)
@@ -298,31 +423,33 @@ class Sm70Fp8Config:
     force_marlin: bool = Field(default=False, init=False)
     """Retained legacy backend rollback, resolved alongside enabled."""
 
+    loader_aliases: ClassVar[dict[str, str]] = SM70_LOADER_ALIASES["fp8"]
+    input_aliases: ClassVar[tuple[str, ...]] = (
+        *SM70_FP8_LINEAR_ALIASES.values(),
+        "VLLM_SM70_FP8_GROUPED_BMM_DECODE",
+        "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR",
+    )
+
     def resolve(self) -> None:
-        from vllm import envs
+        self.capture_inputs()
 
         if self.resolved:
             return
-        aliases = {
-            "enabled": "VLLM_SM70_FP8_TURBOMIND",
-            "dequant_fallback": "VLLM_SM70_FP8_DEQUANT_FALLBACK",
-            "qpn8": "VLLM_SM70_FP8_QPN8",
-            "qpn8_pp2_tp4": "VLLM_SM70_FP8_QPN8_PP2_TP4",
-            "qpn8_shared_gate": "VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE",
-            "prescaled_decode": "VLLM_SM70_FP8_PRESCALED_M1_DECODE",
-            "prescaled_shared_gate": "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE",
-            "prefill_prescaled": "VLLM_SM70_FP8_PREFILL_PRESCALED",
-            "prefill_exact_dense": "VLLM_SM70_FP8_PREFILL_EXACT_DENSE",
-            "prefill_visible_dense_mm": "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM",
-            "gated_silu": "VLLM_SM70_FP8_DENSE_GATED_SILU",
-        }
+        aliases = SM70_FP8_LINEAR_ALIASES
         explicit = []
         generic_is_auto = self.qpn8 is None
         specific_is_auto = self.qpn8_pp2_tp4 is None
-        generic_override = envs.is_set(aliases["qpn8"])
-        specific_override = envs.is_set(aliases["qpn8_pp2_tp4"])
+        generic_override = self.legacy.is_set(aliases["qpn8"])
+        specific_override = self.legacy.is_set(aliases["qpn8_pp2_tp4"])
         for field, name in aliases.items():
-            if envs.is_set(name):
+            self.sources[field] = (
+                "configuration"
+                if getattr(self, field) is not None
+                else name
+                if self.legacy.is_set(name)
+                else "default"
+            )
+            if self.legacy.is_set(name):
                 logger.warning_once(
                     "%s is deprecated for serialized FP8 linear layers; use "
                     "kernel_config.sm70_fp8.%s. Explicit configuration wins.",
@@ -331,11 +458,13 @@ class Sm70Fp8Config:
                 )
             value = getattr(self, field)
             if value is None:
-                value = getattr(envs, name)
+                value = self.legacy.value(name)
+                if field == "batch_prescaled":
+                    value = value == "1"
                 if field == "enabled":
-                    value = envs.use_sm70_turbomind(value)
+                    value = self.use_turbomind(value)
                 setattr(self, field, value)
-                if envs.is_set(name) and value:
+                if self.legacy.is_set(name) and value:
                     explicit.append(field)
             elif value:
                 explicit.append(field)
@@ -343,6 +472,7 @@ class Sm70Fp8Config:
             # An explicit generic rollback wins over a specific legacy enable.
             if generic_override and not self.qpn8:
                 self.qpn8_pp2_tp4 = False
+                self.sources["qpn8_pp2_tp4"] = "qpn8 rollback: " + self.sources["qpn8"]
             elif (
                 not specific_override
                 and generic_override
@@ -350,10 +480,17 @@ class Sm70Fp8Config:
                 and not specific_override
             ):
                 self.qpn8_pp2_tp4 = self.qpn8
+                self.sources["qpn8_pp2_tp4"] = (
+                    "qpn8 inheritance: " + self.sources["qpn8"]
+                )
         self.explicit_enables = tuple(explicit)
-        self.force_marlin = envs.force_sm70_marlin()
-        self.legacy_grouped_bmm_decode = envs.VLLM_SM70_FP8_GROUPED_BMM_DECODE
-        self.legacy_prefill_fast_selector = envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
+        self.force_marlin = self.legacy.value("VLLM_SM70_QUANT_BACKEND") == "marlin"
+        self.legacy_grouped_bmm_decode = self.legacy.value(
+            "VLLM_SM70_FP8_GROUPED_BMM_DECODE"
+        )
+        self.legacy_prefill_fast_selector = self.legacy.value(
+            "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR"
+        )
         self.resolved = True
 
 
@@ -361,8 +498,78 @@ class Sm70Fp8Config:
 class Sm70GgufConfig:
     """Operation-level policy for native GGUF storage on Volta."""
 
+    active: bool = Field(default=False, init=False)
+    """A loaded provider uses this format; inactive options do not salt graphs."""
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Captured native selectors/tuning; unused formats do not affect graph keys."""
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
+
+    expert_storage: Literal["canonical", "original"] = "canonical"
+    """Keep canonical expert banks or use the packaged original-block fallback.
+
+    Original storage avoids retaining both canonical and original expert banks.
+    It trades the calibrated TurboMind expert schedules for the native fallback
+    and covers TP boundaries with original blocks and zero activation padding.
+    """
+
+    expert_arena: bool = False
+    """Allocate original expert banks together before transient dense weights.
+    This avoids interleaving permanent expert banks with loading temporaries.
+    """
+
+    expert_trace_tokens: int = Field(default=0, ge=0)
+    """Diagnostic: record decode routing in a per-layer ring of this many
+    tokens (and prefill expert histograms) for sizing an expert cache. Off at 0."""
+
+    expert_cache_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Keep only this fraction of each layer's routed experts in GPU slots and
+    the rest in pinned host memory (requires ``expert_arena``). Decode misses
+    are copied in by a native host thread while the step waits in-graph; LRU
+    keeps the slots hot. Prefill assembles each layer's full bank. Off at 0."""
+
+    expert_cache_spare_slots: int = Field(default=8, ge=1, le=64)
+    """Free GPU slots kept per layer so decode misses never wait on eviction."""
+
+    expert_cache_host_slack: float = Field(default=0.1, ge=0.0, le=1.0)
+    """Extra host slots per layer, as a fraction of experts, that keep copies
+    of resident experts so evicting them needs no device-to-host copy."""
+
+    expert_cache_profile: str | None = None
+    """Optional ``[layers, experts]`` routing-count tensor (torch.save) that
+    picks the initially resident experts; otherwise the lowest expert ids."""
+
+    expert_cache_prefill: Literal["turbomind", "mmq"] = "turbomind"
+    """Prefill with an expert cache: ``turbomind`` transcodes each layer's
+    experts (GPU slots and host arena) into canonical banks on side streams,
+    one layer ahead, and runs TurboMind grouped GEMMs with fused gate/up SiLU;
+    ``mmq`` assembles the original bank and runs the upstream MMQ kernels."""
+
+    expert_cache_prefill_tokens: int = Field(default=4096, ge=256)
+    """Tokens per TurboMind MoE sub-batch within a prefill chunk. The layer's
+    banks are transcoded once per chunk; sub-batches bound the routed
+    activations (about 50 KiB per token at top-10)."""
+    expert_load_prefetch_banks: int = Field(default=4, ge=1, le=4)
+    """Banks queued in pinned host memory during original expert loading.
+    One reduces startup transient reservation; runtime expert placement,
+    weights and computation remain unchanged."""
+
+    expert_cache_prefill_prepare: Literal["all", "predict", "predict_resident"] = "all"
+    """TurboMind preparation: ``predict`` prefetches a previous pass's active
+    experts and completes all current-route misses from mapped host memory.
+    Eager SM70 batches of4096--8192 rows and at most512 experts qualify;
+    capture and other inputs retain complete-bank preparation. Expert bytes
+    and arithmetic are unchanged. ``predict_resident`` additionally admits
+    completed routing hints into the existing LRU slots through DMA, retaining
+    the configured GPU/host budget. Default ``all`` retains full DMA."""
+
+    dense_storage: Literal["canonical", "original"] = "canonical"
+    """Keep calibrated canonical projections or dispatch original packed rows."""
+
+    embedding_storage: Literal["dense", "original"] = "dense"
+    """Keep a dense token embedding or decode its original GGUF rows on lookup."""
+    dequant_workspace_bytes: int = Field(default=32 * 1024**2, ge=1024**2)
+    """Bound dequantized matrix chunks for the original dense storage policy."""
 
     projection_planes: bool = True
     """Use measured M8 shared-activation projection planes with canonical fallback."""
@@ -388,6 +595,17 @@ class Sm70GgufConfig:
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
 
+    device_transcode: bool = True
+    """Transcode IQ2_S/IQ3/IQ4/Q2_0 expert banks on the GPU while loading.
+
+    Byte-identical to the host codecs; only startup time changes."""
+
+    grouped_mma_gate_up: bool = False
+    """Run routed IQ3 gate/up at M1..8 as expert-grouped FP16 MMA on repacked planes."""
+
+    grouped_mma_release_raw: bool = True
+    """Free the original-block IQ3 gate/up banks once the MMA planes replace them."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 
@@ -406,29 +624,27 @@ class Sm70RingConfig:
     enabled: bool = True
     """Admit the ring operator when topology and peer atomics are supported."""
 
-    max_bytes: int = Field(default=25600, gt=0, le=25600)
+    max_bytes: int = Field(default=25600, gt=0, le=102400)
     """Largest calibrated input payload; larger messages retain NCCL."""
-
-
-@config
-class Sm70SparseConfig:
-    """Per-engine sparse attention policy; individual operators guard layouts."""
-
-    indexer_decode_cublas: bool = True
-    """Share paged index keys between query heads and rows when eligible."""
-    decode_bmm: bool = True
-    """Gather packed FP8 keys for eligible FP16 sparse decode matmuls."""
-    prefill_bmm: bool = True
-    """Use bounded batched matmuls for eligible FP16 sparse prefill."""
-    active: bool = Field(default=False, init=False)
-    """Whether the engine's metadata describes sparse indexed attention."""
-    reason: str | None = Field(default=None, init=False)
-    """Startup capability rejection; individual calls also check tensor layouts."""
 
 
 @config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
+
+    layer_execution: LayerExecutionPolicy = Field(default_factory=LayerExecutionPolicy)
+    """Per-engine execution decisions and initialization provenance."""
+
+    gdn: GdnConfig = Field(default_factory=GdnConfig)
+    """Initialized GDN computation policy; inactive models ignore it in hashes."""
+
+    sm70_runtime: Sm70RuntimeConfig = Field(default_factory=Sm70RuntimeConfig)
+    """Per-engine auxiliary warmup policy, outside compiled computation."""
+
+    sm70_mxfp4: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Native MXFP4 linear policy, captured only when its weights are prepared."""
+    sm70_moe: Sm70MoEConfig = Field(default_factory=Sm70MoEConfig)
+    """Per-engine MoE stage policy; legacy switches resolve at construction."""
 
     ir_op_priority: IrOpPriorityConfig = Field(default_factory=IrOpPriorityConfig)
     """
@@ -482,8 +698,23 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    sm70_packed_topk_gather: bool = True
+    """Gather SM70 TP2/TP4 compact candidates in one lossless message."""
+
+    sm70_decode_strategy: Literal["shared", "legacy"] = "shared"
+    """Use shared FP16/E4M3 XQA partition planning when the native ABI declares
+    support. E4M3 retains FP32 partials; older artifacts retain legacy adaptive
+    planning with an explicit fallback. Legacy selects the retained policy."""
+
+    sm70_fp16_grouped_short_splits: bool = True
+    """Use K32 splits for FP16 q8/B1 grouped verification at 129..2048 tokens."""
+
     sm70_rmsnorm_gated_exact: bool | None = None
     """Native gated norm; auto follows the Flash-Next model quality boundary."""
+
+    sm70_rmsnorm_gated_aliases: ClassVar[dict[str, str]] = {
+        "sm70_rmsnorm_gated_exact": "VLLM_SM70_RMSNORM_GATED_EXACT",
+    }
 
     def resolve_sm70_rmsnorm_gated(self, *, qualified: bool) -> None:
         if self.sm70_rmsnorm_gated_exact is not None:
@@ -492,7 +723,7 @@ class KernelConfig:
 
         from vllm import envs
 
-        name = "VLLM_SM70_RMSNORM_GATED_EXACT"
+        name = self.sm70_rmsnorm_gated_aliases["sm70_rmsnorm_gated_exact"]
         self.sm70_rmsnorm_gated_exact = (
             bool(envs.environment_variables[name]())
             if name in os.environ
@@ -514,8 +745,15 @@ class KernelConfig:
     sm70_ring: Sm70RingConfig = Field(default_factory=Sm70RingConfig)
     """SM70 ring collective policy, resolved from actual peer capabilities."""
 
+    hc_ll_optimized_loads: bool = True
+    """Prefetch HC down weights and pad the up shared-memory rows on SM70."""
+
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
+    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
+    sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
+    """Read the FP16 checkpoint router directly or retain its packed duplicate."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -546,6 +784,107 @@ class KernelConfig:
     )
     """Observed selector decisions for loaded local layouts; diagnostic only."""
 
+    sm70_fused_side_projections: bool = False
+    """Compute the GDN a/b and QSA indexer q/k FP16 projections inside the
+    small-M GGUF input projection launch (packed dense_mv planes)."""
+
+    sm70_qsa_prep: bool = False
+    """Fuse QSA q/k GemmaRMSNorm, partial NeoX RoPE and the FP16 K/V cache
+    write into one SM70 launch for decode batches."""
+
+    sm70_draft_hot_vocab: int = 0
+    """Greedy MTP drafts choose among this many lowest token ids (BPE merge
+    order) spread evenly across TP ranks; 0 keeps the full vocabulary. Only
+    the draft proposal changes; verification still uses the full head."""
+
+    sm70_draft_hot_vocab_ids: str = ""
+    """Optional file of token ids ranked most frequent first (.npy or one id
+    per line). With ``sm70_draft_hot_vocab`` > 0, the draft keeps the first
+    that many ranked ids, each rank reading its own vocabulary shard."""
+
+    sm70_draft_single_graph: bool = False
+    """Capture all MTP draft decode steps, including their slot mappings and
+    attention metadata, as one CUDA graph instead of one replay per step."""
+    sm70_mtp_lossless_storage: bool = False
+    """Store BF16-origin FP16 MTP expert values in exact 13-bit planes on SM70
+    TP4. Preserve subnormals, signed zero and FP32 accumulation; reject weights
+    outside the lossless representation instead of requantizing."""
+
+    sm70_mtp_q8_0_experts: bool = False
+    """Store MTP draft experts as GGUF Q8_0 (about half of FP16). Drafts only
+    propose tokens, so this can change acceptance but never verified output."""
+
+    sm70_top1x: bool = False
+    """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
+    instead of an all-gather."""
+
+    sm70_greedy_verify: bool = False
+    """Verify greedy MTP drafts from TP-local target argmax pairs instead of
+    gathering full-vocabulary logits for the rejection sampler."""
+
+    sm70_sparse_target_sampling: bool = False
+    """Verify argmax drafts of top-k 20 sampled requests from TP-local target
+    candidates (merged global top-k) instead of full-vocabulary logits and the
+    dense sampler. Exact: requests with an ambiguous top-k/top-p cutoff fall
+    back to the full-vocabulary sampler."""
+
+    sm70_sparse_target_reference_check: bool = True
+    """With sparse target sampling, copy the candidates to the host each round
+    and send requests with an ambiguous cutoff (score ties at top-k, a top-p
+    boundary within rounding) to the full-vocabulary sampler, for bit-exact
+    agreement with it. Off: no host synchronization; those rare boundary cases
+    are decided on the compact candidates (ties within the 64-candidate probe
+    are kept in vocabulary order), still a valid top-k/top-p sample."""
+
+    sm70_gdn_verify: bool = False
+    """Run single-request MTP GDN verification with the SM70 sequential CUDA
+    recurrence instead of the Triton fused kernel."""
+    sm70_gdn_spec_replay: bool = False
+    """Commit speculative GDN states by replay (MTP on SM70).
+
+    The native verifier reads each request's committed recurrent state,
+    replays the previous round's accepted tokens and stores no per-position
+    states, so requests hold no speculative state blocks. Requires
+    sm70_gdn_verify and mamba_cache_mode='align'. Results are identical to
+    per-position state storage."""
+
+    @property
+    def gdn_spec_replay(self) -> bool:
+        """Platform-neutral view of ``sm70_gdn_spec_replay`` for generic GDN
+        and Mamba layers."""
+        return self.sm70_gdn_spec_replay
+
+    sm70_hcx: bool = False
+    """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
+    HC down and HC up as one SM70 kernel for verification batches up to 8."""
+
+    sm70_hcx_local_schedule: bool = False
+    """Experimentally delay HC up-weight prefetch and distribute gate-mix for
+    full-mesh TP4 HCX, including fused Q4_K/Q6_K output projection when its
+    input normalization is already complete. Keeps the reference arithmetic
+    order. Opt in before graph capture; full-model quality
+    qualification remains pending."""
+
+    sm70_hcx_output_projection: bool = True
+    """Fuse eligible output projections into HCX when HCX is enabled. Disable
+    to compare the separate projection and HC boundary with identical weights."""
+
+    sm70_hcx_diagnostics: bool = False
+    """Record M5 HCX inputs and outputs in owned graph buffers for numerical
+    diagnosis. Requires separate output projections; timings are diagnostic."""
+
+    qsa_dense_short_context: bool = False
+    """Attend densely, without index selection, in context-bucketed decode graphs
+    whose bucket does not exceed the indexer budget (where QSA selects every
+    visible token)."""
+
+    sm70_turbomind_workspace_bytes: int = Field(
+        default=32 * 1024**2, ge=1024**2, le=32 * 1024**2, multiple_of=256
+    )
+    """Per-stream FP32 split-K scratch bound in the engine-owned TurboMind
+    runtime. Candidate selection respects the available scratch capacity.
+    """
+
     qsa_auto_e4m3: bool = True
     """Default eligible calibrated QSA caches to E4M3 without speculation."""
     qsa_auto_e4m3_active: bool = Field(default=False, init=False)
@@ -553,12 +892,81 @@ class KernelConfig:
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
     """Startup reason when calibrated automatic storage cannot be selected."""
 
+    sm70_qsa_device_history: bool = True
+    """Read target device E4M3/FP16 QSA history directly with FP32 PV at
+    M1..20, H6, D256. Speculative draft attention retains its existing path."""
+    sm70_qsa_shared_key: bool = True
+    """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
+    qsa_host_kv: bool = False
+    """Keep QSA attention history in pinned host storage on SM70."""
+    qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
+    """Authoritative target history format; FP16 isolates placement error."""
+    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
+    """Preserve speculative cache precision independently of target storage."""
+    qsa_host_kv_device_reference: bool = False
+    """Keep identical encoded history on device for controlled placement A/B."""
+    sm70_qsa_host_native: bool = True
+    """With host-authoritative QSA history, run the native SM70 attention:
+    selected pages resolve into the device hot cache, hot tokens are read on
+    device and the remainder directly from mapped host history."""
+    qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
+    """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_hot_dtype: Literal["float16", "fp8_e4m3"] = "float16"
+    """Target hot storage; encoded E4M3 requires E4M3 authoritative history.
+    Encoded hot reads round to the same FP16 operands as the decoded cache."""
+    qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
+    """Optional independent draft hot capacity; None preserves target capacity."""
+    qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
+    """Shared host-miss staging capacity; larger batches use bounded row chunks."""
+    qsa_host_kv_share_replicas: bool = True
+    """TP ranks holding the same replicated KV head share one host history pool
+    (shared memory) instead of keeping identical copies."""
+    qsa_host_kv_prefill_stage_tokens: int = Field(default=0, ge=0)
+    """Prefill with host KV: copy each request's whole history for a layer to
+    one shared device buffer (DMA, once per layer and chunk) and read it there,
+    instead of resolving every query row's selection through the hot cache and
+    mapped host memory (re-reading the same history per row over PCIe).
+    Byte budget in E4M3-equivalent K/V tokens (0.5 KiB each at D256), shared
+    by all layers and rounded down to complete pages. FP16 draft history fits
+    half as many tokens in the same buffer; scales use additional storage.
+    Histories exceeding that capacity keep the hot-cache path. 0 disables it."""
+    qsa_host_kv_prefill_stage_slots: int = Field(default=2, ge=1, le=2)
+    """Shared prefix staging buffers. One slot reuses the current layer's
+    buffer after its attention completion event; prefetch still overlaps the
+    following non-QSA computation. Two preserves the alternating layout."""
+    qsa_host_kv_trim_warmup_cache: bool = False
+    """Return unused allocator pages once after host-QSA kernel/graph warmup.
+    Active tensors and captured private pools remain owned; inference does
+    not trim pages. This initialization resource policy does not change
+    compiled model computation."""
+    qsa_host_kv_allocator_headroom_mib: int = Field(default=0, ge=0, le=4096)
+    """Device bytes kept outside the Torch allocator after host-QSA warmup.
+    MiB units; zero retains the existing allocator policy. This reservation
+    limit preserves active tensors and graph pools and may reject workloads
+    whose retained allocations cannot fit. It does not change computation."""
+    qsa_host_indexer_history: bool = False
+    """Keep the FP16 compressed indexer history and its co-owned compressor
+    state in mapped host storage when QSA host KV is active. Exact score
+    readers retain their arithmetic; host traffic is measured separately."""
+    qsa_host_kv_state_blocks: int = Field(default=0, ge=0)
+    """Bound the recurrent-state ID range with authoritative host KV.
+
+    Zero retains the shared capacity. A nonzero pool retains active states and
+    bounded prefix checkpoints while history IDs use a separate range.
+    """
+    qsa_host_kv_active: bool = Field(default=False, init=False)
+    """Whether the host QSA cache geometry has been admitted."""
+    qsa_host_kv_reason: str | None = Field(default=None, init=False)
+    """Reason the requested host QSA storage is unavailable."""
+
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
     ple_disk_release_pages: bool = False
     """Release file-backed PLE mappings after gathers to reduce resident RAM."""
     ple_disk_row_gather: bool = True
     """Admit byte-preserving native CPU gathers for retained mapped PLE rows."""
+    ple_disk_only: bool = False
+    """Keep PLE tables on disk with only a sentinel row in each rank's staging."""
     ple_disk_row_readers: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
@@ -568,6 +976,14 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_fast_lane: bool = True
+    """Serve eligible CPU PLE requests from a native owner thread."""
+    ple_draft_prefetch: bool = True
+    """Read PLE table pages of drafted tokens into page cache while drafting."""
+    ple_row_cache_mib: int = Field(default=1536, ge=0)
+    """Packed-row cache (MiB) for CPU-owned GGUF PLE: the native fast lane's
+    cache when it serves requests, otherwise the mapped row reader's."""
+
     ple_pinned_decode: bool = True
     """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
     ple_pinned_decode_active: bool = Field(default=False, init=False)
@@ -576,6 +992,13 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed pinned row decoder admission, capacity and fallback reasons."""
+
+    ple_packed_gguf_results: bool = True
+    """Transfer eligible CPU-owned GGUF PLE rows without CPU dequantization."""
+    ple_packed_result_decoders: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed packed result geometry and decoder fallback reasons."""
 
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
@@ -605,6 +1028,70 @@ class KernelConfig:
             return value.lower().replace("-", "_")
         return value
 
+    def resolve_attention_history(self, cfg) -> bool:
+        from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv
+
+        return resolve_qsa_host_kv(cfg)
+
+    @property
+    def capture_all_draft_steps(self) -> bool:
+        """Policy consumed by the generic multistep draft graph manager."""
+        return self.sm70_draft_single_graph
+
+    def top1_exchange_callback(self):
+        if not self.sm70_top1x:
+            return None
+        from vllm.models.qwen4_exp.nvidia.sm70_hcx import maybe_top1_exchange
+
+        return maybe_top1_exchange
+
+    def gdn_verification_callback(self):
+        if not self.sm70_gdn_verify:
+            return None
+        from vllm.model_executor.layers.mamba.gdn.sm70_verify import native_verifier
+
+        return native_verifier()
+
+    def resolve_gdn(self, model_config, additional_config) -> None:
+        """Capture active GDN policy before worker serialization/cache hashing."""
+        from vllm.model_executor.models.config import fla_schedule_family
+
+        family = fla_schedule_family(model_config)
+        self.gdn.schedule.active_family = family
+        if family == "gdn":
+            self.gdn.resolve(
+                additional_config=additional_config,
+                native_verify=self.sm70_gdn_verify,
+            )
+
+    sm70_marlin: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """B's native policy binding for the selected SM70 Marlin provider."""
+
+    def capture_provider_inputs(self) -> None:
+        """Freeze worker inputs without activating unused formats or parsing errors."""
+        self.gdn.schedule.resolve()
+        self.sm70_marlin.capture_inputs()
+        for family in ("awq", "fp8", "nvfp4"):
+            policy = getattr(self, "sm70_" + family)
+            policy.capture_inputs()
+            if self.layer_execution.quant_backend is not None:
+                policy.legacy.values["VLLM_SM70_QUANT_BACKEND"] = (
+                    self.layer_execution.quant_backend
+                )
+                policy.legacy.errors.pop("VLLM_SM70_QUANT_BACKEND", None)
+            policy.native.capture_inputs()
+        for family in ("mxfp4", "gguf"):
+            policy = getattr(self, "sm70_" + family)
+            native = policy if family == "mxfp4" else policy.native
+            native.capture_inputs()
+        self.sm70_moe.capture_inputs()
+
+    def policy_aliases(self) -> set[str]:
+        """Compatibility inputs represented by kernel policy or inactive features."""
+        from vllm.config.sm70_native import compile_ignored_aliases
+
+        return compile_ignored_aliases(self)
+
     def compute_hash(self) -> str:
         """
         Produces a hash unique to the pass configuration.
@@ -613,21 +1100,37 @@ class KernelConfig:
         """
         ignored_factors = {
             "enable_flashinfer_autotune",
+            "gdn",  # Hash only initialized computation policy below.
+            "sm70_marlin",  # Hash only when the provider is prepared.
+            "sm70_gdn_verify",  # Compatibility input is represented by gdn policy.
+            "sm70_runtime",  # Warmup does not alter compiled model computation.
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
             "collective_kernel_selections",
+            "sm70_hcx_local_schedule",  # Native dispatch inside the opaque HC op.
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
             "ple_pinned_decoders",
+            "ple_packed_result_decoders",
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
+            "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
+            "ple_draft_prefetch",  # Page-cache readahead; results unchanged
+            "ple_fast_lane",  # Same packed rows through a native owner thread
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
+            "qsa_host_kv_reason",
+            "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
+            "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
         }
+        if not self.qsa_host_kv_prefill_stage_tokens or not (
+            self.qsa_host_kv or self.qsa_host_kv_active
+        ):
+            ignored_factors.add("qsa_host_kv_prefill_stage_slots")
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
         if not self.fused_fp16_aux_gemv_applicable:
@@ -645,11 +1148,63 @@ class KernelConfig:
         if not self.sm70_awq.resolved:
             # An unused format must not perturb another format's graph cache.
             ignored_factors.add("sm70_awq")
-        if not self.sm70_fp8.resolved:
+        if not self.sm70_fp8.resolved and not self.sm70_fp8.native.values:
             ignored_factors.add("sm70_fp8")
+        if not self.sm70_moe.resolved:
+            ignored_factors.add("sm70_moe")
         if not self.sm70_sparse.active:
             ignored_factors.add("sm70_sparse")
+        for family in ("nvfp4", "gguf"):
+            policy = getattr(self, "sm70_" + family)
+            if not policy.active and not policy.native.values:
+                ignored_factors.add("sm70_" + family)
+        if not self.sm70_mxfp4.values:
+            ignored_factors.add("sm70_mxfp4")
         factors = get_hash_factors(self, ignored_factors)
+        factors["layer_execution"] = self.layer_execution.compute_hash()
+        if self.sm70_sparse.active:
+            factors["sm70_sparse"] = self.sm70_sparse.compute_hash()
+        if self.gdn.resolved:
+            factors["gdn"] = self.gdn.compute_hash()
+        elif self.gdn.schedule.active_family == "kda":
+            factors["fla_schedule"] = self.gdn.schedule.graph_options()
+        if self.sm70_moe.resolved:
+            factors["sm70_moe"] = self.sm70_moe.compute_hash()
+        for family in ("awq", "fp8", "nvfp4", "gguf"):
+            name = "sm70_" + family
+            if name in factors:
+                type_name, entries = cast(Any, factors[name])
+                entries = dict(entries)
+                native = getattr(self, name).native
+                entries.pop("native", None)
+                entries.pop("active", None)
+                entries.pop("sources", None)
+                entries.pop("legacy", None)
+                if family == "gguf":
+                    entries.pop("expert_load_prefetch_banks", None)
+                if family == "gguf" and (
+                    self.sm70_gguf.expert_cache_fraction <= 0
+                    or self.sm70_gguf.expert_cache_prefill != "turbomind"
+                    or self.sm70_gguf.expert_cache_prefill_prepare == "all"
+                ):
+                    entries.pop("expert_cache_prefill_prepare", None)
+                for field, alias in getattr(
+                    getattr(self, name), "loader_aliases", {}
+                ).items():
+                    policy = getattr(self, name)
+                    value = getattr(policy, field)
+                    if value is None and policy.legacy.captured:
+                        value = policy.legacy.errors.get(
+                            alias, policy.legacy.values.get(alias)
+                        )
+                    entries[field] = value
+                if native.values:
+                    entries["native"] = tuple(sorted(native.hash_options().items()))
+                factors[name] = (type_name, tuple(sorted(entries.items())))
+        if self.sm70_mxfp4.values:
+            factors["sm70_mxfp4"] = self.sm70_mxfp4.hash_options()
+        if self.sm70_marlin.values:
+            factors["sm70_marlin"] = self.sm70_marlin.hash_options()
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
 
@@ -669,7 +1224,23 @@ class KernelConfig:
 
         model = vllm_config.model_config
         text = getattr(model, "hf_text_config", None)
-        self.sm70_sparse.active = bool(getattr(text, "index_head_dim", None))
+        self.sm70_moe.unquantized.resolve()
+        self.sm70_moe.unquantized.active = bool(
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and any(
+                getattr(text, key, 0)
+                for key in ("num_experts", "num_local_experts", "n_routed_experts")
+            )
+        )
+        self.sm70_moe.routing.resolve()
+        self.sm70_moe.routing.active = self.sm70_moe.unquantized.active
+        from vllm.model_executor.models.runtime_defaults import sparse_execution_family
+
+        sparse_family = sparse_execution_family(model)
+        self.sm70_sparse.active = sparse_family is not None
+        self.sm70_sparse.qualify(sparse_family)
+        self.sm70_sparse.resolve()
         self.sm70_sparse.reason = (
             "no indexed sparse-attention metadata"
             if not self.sm70_sparse.active
@@ -680,6 +1251,9 @@ class KernelConfig:
                 else ("requires FP16 queries" if model.dtype != torch.float16 else None)
             )
         )
+
+        self.sm70_sparse.active = self.sm70_sparse.reason is None
+        self.sm70_sparse.validate_active()
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)
         logger.debug(
@@ -704,3 +1278,13 @@ class KernelConfig:
             "Final IR op priority after setting platform defaults: %s",
             self.ir_op_priority,
         )
+
+
+def capture_sm70_fp8_linear_config() -> Sm70Fp8Config:
+    """Capture the shared serialized/channel/ModelOpt policy during loading."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    engine = get_current_vllm_config_or_none()
+    policy = engine.kernel_config.sm70_fp8 if engine else Sm70Fp8Config()
+    policy.resolve()
+    return policy

@@ -359,6 +359,7 @@ class ModelConfig:
     mm_shm_cache_max_object_size_mb: InitVar[int | None] = None
     mm_encoder_only: InitVar[bool | None] = None
     mm_encoder_tp_mode: InitVar[MMEncoderTPMode | None] = None
+    mm_encoder_batch_size: InitVar[int | None] = None
     mm_encoder_attn_backend: InitVar[AttentionBackendEnum | str | None] = None
     mm_encoder_attn_dtype: InitVar[str | None] = None
     mm_encoder_fp8_scale_path: InitVar[str | None] = None
@@ -412,6 +413,7 @@ class ModelConfig:
             "mm_processor_cache_type",
             "mm_shm_cache_max_object_size_mb",
             "mm_encoder_tp_mode",
+            "mm_encoder_batch_size",
             "interleave_mm_strings",
             "skip_mm_profiling",
         }
@@ -485,6 +487,7 @@ class ModelConfig:
         mm_shm_cache_max_object_size_mb: int | None,
         mm_encoder_only: bool | None,
         mm_encoder_tp_mode: MMEncoderTPMode | None,
+        mm_encoder_batch_size: int | None,
         mm_encoder_attn_backend: AttentionBackendEnum | str | None,
         mm_encoder_attn_dtype: str | None,
         mm_encoder_fp8_scale_path: str | None,
@@ -704,6 +707,7 @@ class ModelConfig:
                 mm_shm_cache_max_object_size_mb=mm_shm_cache_max_object_size_mb,
                 mm_encoder_only=mm_encoder_only,
                 mm_encoder_tp_mode=mm_encoder_tp_mode,
+                mm_encoder_batch_size=mm_encoder_batch_size,
                 mm_encoder_attn_backend=mm_encoder_attn_backend,
                 mm_encoder_attn_dtype=mm_encoder_attn_dtype,
                 mm_encoder_fp8_scale_path=mm_encoder_fp8_scale_path,
@@ -1322,7 +1326,12 @@ class ModelConfig:
             parallel_config.rank // parallel_config.tensor_parallel_size
         ) % parallel_config.pipeline_parallel_size
         pp_size = parallel_config.pipeline_parallel_size
-        start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+        start, end = get_pp_indices(
+            total_num_hidden_layers,
+            pp_rank,
+            pp_size,
+            partition=parallel_config.communication.pp_layer_partition,
+        )
         return start, end
 
     def get_num_layers(self, parallel_config: ParallelConfig) -> int:

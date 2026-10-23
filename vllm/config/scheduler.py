@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from pydantic import Field, field_validator
 from typing_extensions import Self
 
+from vllm.config.legacy_inputs import LegacyInputs
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.utils.hashing import safe_hash
@@ -95,6 +96,11 @@ class SchedulerConfig:
     The prefill token budget adapts to completed GPU measurements. Pure prefill
     keeps the normal token budget. Zero disables latency control."""
 
+    mixed_prefill_min_tokens: int = Field(default=0, ge=0)
+    """Lower bound on the adaptive mixed-prefill token budget. Zero keeps the
+    purely adaptive budget. Actual scheduled chunks remain subject to the
+    existing token and recurrent-state limits."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -156,6 +162,22 @@ class SchedulerConfig:
     fits in the KV cache before admitting a new request, rather than only
     checking the first chunk. Prevents over-admission and KV cache thrashing
     with chunked prefill."""
+
+    sm70_async_queue_depth: int | None = Field(default=None, ge=0)
+    """Override no-PP asynchronous queue depth; zero preserves the old default."""
+    sm70_inputs: LegacyInputs = Field(default_factory=LegacyInputs, init=False)
+    """Initialization snapshot for deferred scheduler override errors."""
+    sm70_aliases: ClassVar[dict[str, str]] = {
+        "sm70_async_queue_depth": "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH",
+    }
+
+    def capture_sm70_inputs(self) -> None:
+        self.sm70_inputs.capture(self.sm70_aliases.values())
+
+    def sm70_queue_depth(self) -> int:
+        if self.sm70_async_queue_depth is not None:
+            return self.sm70_async_queue_depth
+        return self.sm70_inputs.value(self.sm70_aliases["sm70_async_queue_depth"])
 
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
@@ -240,6 +262,7 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        self.capture_sm70_inputs()
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True

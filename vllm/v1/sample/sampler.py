@@ -3,13 +3,13 @@
 """A layer that samples the next tokens from the model's outputs."""
 
 import os
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-from vllm import envs
+from vllm.config.execution_policy import layer_policy
 from vllm.config.model import LogprobsMode
+from vllm.diagnostics import bind_diagnostics, diagnostic_channel
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
@@ -20,7 +20,6 @@ from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
-_SM70_LOGITS_DUMP_COUNTER = 0
 logger = init_logger(__name__)
 
 
@@ -40,32 +39,27 @@ def _maybe_dump_sm70_sampler_logits(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
     stage: str,
+    *,
+    diagnostics=None,
 ) -> None:
-    dump_dir = os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR")
-    if not dump_dir:
+    channel = diagnostic_channel("sampler_logits", owner=diagnostics)
+    policy = channel.policy
+    if not policy.can_save() or _sm70_cuda_graph_capture_active():
         return
-    enable_file = os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE")
-    if enable_file and not Path(enable_file).exists():
-        return
-    if _sm70_cuda_graph_capture_active():
-        return
-
-    global _SM70_LOGITS_DUMP_COUNTER
-    _SM70_LOGITS_DUMP_COUNTER += 1
-    max_steps = int(os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS", "0"))
-    if max_steps > 0 and max_steps < _SM70_LOGITS_DUMP_COUNTER:
+    step = channel.advance("steps", start=1)
+    max_steps = policy.value("max_dumps")
+    if max_steps > 0 and max_steps < step:
         return
 
     def tensor_cpu(value: torch.Tensor | None) -> torch.Tensor | None:
         return None if value is None else value.detach().cpu()
 
-    path = Path(dump_dir)
-    path.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    channel.write(
+        f"sampler_logits_pid{os.getpid()}_step{step:04d}.pt",
         {
             "logits": logits.detach().cpu(),
             "stage": stage,
-            "step": _SM70_LOGITS_DUMP_COUNTER,
+            "step": step,
             "pid": os.getpid(),
             "shape": tuple(logits.shape),
             "dtype": str(logits.dtype),
@@ -79,8 +73,6 @@ def _maybe_dump_sm70_sampler_logits(
                 list(ids) for ids in sampling_metadata.output_token_ids
             ],
         },
-        path
-        / (f"sampler_logits_pid{os.getpid()}_step{_SM70_LOGITS_DUMP_COUNTER:04d}.pt"),
     )
 
 
@@ -125,8 +117,12 @@ class Sampler(nn.Module):
     9. Return the final `SamplerOutput`.
     """
 
-    def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs"):
+    def __init__(
+        self, logprobs_mode: LogprobsMode = "raw_logprobs", *, diagnostics=None
+    ):
         super().__init__()
+        self._layer_policy = layer_policy()
+        self._diagnostics = bind_diagnostics() if diagnostics is None else diagnostics
         self.topk_topp_sampler = TopKTopPSampler(logprobs_mode)
         self.pin_memory = is_pin_memory_available()
         self.logprobs_mode = logprobs_mode
@@ -156,7 +152,9 @@ class Sampler(nn.Module):
 
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
-        _maybe_dump_sm70_sampler_logits(logits, sampling_metadata, "pre_process")
+        _maybe_dump_sm70_sampler_logits(
+            logits, sampling_metadata, "pre_process", diagnostics=self._diagnostics
+        )
 
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
@@ -308,9 +306,10 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         logprobs_mode: LogprobsMode,
+        policy=None,
     ) -> torch.Tensor | None:
         if not Sampler._sm70_compact_topk20_metadata_supported(
-            sampling_metadata, logprobs_mode
+            sampling_metadata, logprobs_mode, policy
         ):
             return None
         if (
@@ -321,7 +320,8 @@ class Sampler(nn.Module):
         ):
             return None
 
-        chunks = envs.VLLM_SM70_CHUNKED_TOPK20_CHUNKS
+        policy = layer_policy() if policy is None else policy
+        chunks = policy.value("chunked_topk20_chunks")
         if (
             chunks > 0
             and 248320 % chunks == 0
@@ -385,8 +385,10 @@ class Sampler(nn.Module):
     def _sm70_compact_topk20_metadata_supported(
         sampling_metadata: SamplingMetadata,
         logprobs_mode: LogprobsMode,
+        policy=None,
     ) -> bool:
-        if not envs.VLLM_SM70_COMPACT_TOPK20_SAMPLER:
+        policy = layer_policy() if policy is None else policy
+        if not policy.value("compact_topk20"):
             return False
         if logprobs_mode in ("processed_logits", "processed_logprobs"):
             return False
@@ -509,7 +511,7 @@ class Sampler(nn.Module):
     ) -> torch.Tensor | None:
         """Sample exact global top-20 pairs while preserving native RNG use."""
         if not self._sm70_compact_topk20_metadata_supported(
-            sampling_metadata, self.logprobs_mode
+            sampling_metadata, self.logprobs_mode, self._layer_policy
         ):
             return None
         return self._sm70_sample_top20_pairs(top_values, top_indices, sampling_metadata)
@@ -557,7 +559,7 @@ class Sampler(nn.Module):
             logits = processor.apply(logits)
 
         compact_sampled = self._try_sm70_compact_topk20_sample(
-            logits, sampling_metadata, logprobs_mode
+            logits, sampling_metadata, logprobs_mode, self._layer_policy
         )
         if compact_sampled is not None:
             return compact_sampled, None

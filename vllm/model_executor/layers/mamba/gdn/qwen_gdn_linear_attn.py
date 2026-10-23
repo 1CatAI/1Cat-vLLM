@@ -2,11 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
-import functools
 import os
-import time
 from types import SimpleNamespace
-from typing import Literal
 
 import torch
 from einops import rearrange
@@ -16,10 +13,23 @@ from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config,
+)
+from vllm.config.execution_policy import graph_policy
+from vllm.config.gdn import GdnProfileConfig, resolve_gdn_config
+from vllm.config.gdn_projection import legacy_projection_value
+from vllm.config.gdn_state import resolve_state_trace
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
+)
+from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import (
+    diagnostic_channel,
+    legacy_channel,
+    legacy_history,
 )
 from vllm.distributed import (
     divide,
@@ -27,18 +37,73 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule as _fla_chunk_rule
 from vllm.model_executor.layers.fla.ops import (
-    chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
-)
-from vllm.model_executor.layers.fla.ops import (
-    fused_post_conv_prep,
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
     fused_sigmoid_gating_delta_rule_update_mixed_qkv,
     fused_sigmoid_gating_delta_rule_update_mixed_qkv_out,
 )
-from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
+from vllm.model_executor.layers.fla.ops import gdn_diagnostics as _gdn_diagnostics
+from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd as l2norm_fwd
+from vllm.model_executor.layers.fla.ops.gdn_chunk_kernels import bind_chunk_kernels
+from vllm.model_executor.layers.fla.ops.gdn_prefill import (
+    GdnPrefill,
+)
+from vllm.model_executor.layers.fla.ops.gdn_prefill import (
+    fi_chunk_gated_delta_rule as fi_chunk_gated_delta_rule,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    GdnPreparation,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    _sm70_pack_qwen_gdn_qkv as _sm70_pack_qwen_gdn_qkv,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    _sm70_pack_qwen_gdn_qkv_kernel as _sm70_pack_qwen_gdn_qkv_kernel,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    fused_gdn_gating as fused_gdn_gating,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    fused_gdn_gating_kernel as fused_gdn_gating_kernel,
+)
+from vllm.model_executor.layers.fla.ops.gdn_profiling import (
+    GdnPrefillProfiler,
+    bind_gdn_profiler,
+)
+from vllm.model_executor.layers.fla.ops.gdn_selector import (
+    _get_gdn_head_k_dim as _get_gdn_head_k_dim,
+)
+from vllm.model_executor.layers.fla.ops.gdn_selector import (
+    _is_libs_cu13_install_intact as _is_libs_cu13_install_intact,
+)
+from vllm.model_executor.layers.fla.ops.gdn_selector import (
+    _log_gdn_backend_decision as _log_gdn_backend_decision,
+)
+from vllm.model_executor.layers.fla.ops.gdn_selector import (
+    _resolve_gdn_prefill_backend as _resolve_gdn_prefill_backend,
+)
+from vllm.model_executor.layers.fla.ops.gdn_selector import (
+    select_gdn_execution,
+)
+from vllm.model_executor.layers.fla.ops.gdn_stages import (
+    GdnHeadContract,
+    convolve_decode,
+    mixed_qkv_recurrence,
+)
+from vllm.model_executor.layers.fla.ops.sm70 import (
+    gdn_prefill as flashqla_prefill_provider,
+)
+from vllm.model_executor.layers.fla.ops.sm70.gdn_decode import (
+    FlashQlaDecodeAdmission,
+    flashqla_decode,
+)
+from vllm.model_executor.layers.fla.ops.sm70.gdn_verify import (
+    bind_native_verifier,
+    commit_replayed,
+)
 from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
@@ -68,7 +133,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -81,6 +145,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     get_registered_gdn_spec_metadata_tensors,
 )
 from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+from vllm.v1.attention.ops.gdn_state import GdnMetadataOverride
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
@@ -97,17 +162,26 @@ if GDN_AITER_TRITON_AVAILABLE:
         fused_rearrange_sigmoid_gated_delta_rule as gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule,  # noqa: E501
     )
 
+fla_chunk_gated_delta_rule = _fla_chunk_rule  # Legacy import path.
+
+# Retain historical imports while binding the provider once.
+_flashqla_sm70_decode_available = (
+    flashqla_prefill_provider._flashqla_sm70_decode_available
+)
+_flashqla_prefill = flashqla_prefill_provider.flashqla_sm70_chunk_gated_delta_rule
+flashqla_sm70_chunk_gated_delta_rule_vllm_decode = (
+    flashqla_prefill_provider.flashqla_sm70_chunk_gated_delta_rule_vllm_decode
+)
+
 logger = init_logger(__name__)
 
-_SM70_GDN_DUMP_COUNTS: dict[str, int] = {}
-_SM70_GDN_PROJ_DUMP_COUNTS: dict[str, int] = {}
-_SM70_GDN_PACKED_COMPARE_COUNTS: dict[str, int] = {}
-_SM70_GDN_PACKED_COMPARE_REPORTS = 0
-_SM70_GDN_GRAPH_BUFFERS: dict[str, torch.Tensor] = {}
-_SM70_GDN_GRAPH_META: dict[str, dict[str, object]] = {}
-_SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS: dict[str, int] = {}
+_SM70_GDN_DUMP_COUNTS = legacy_channel("gdn_core").counts
+_SM70_GDN_PROJ_DUMP_COUNTS = legacy_channel("gdn_projection").counts
+_SM70_GDN_PACKED_COMPARE_COUNTS = legacy_channel("gdn_compare").counts
+_SM70_GDN_GRAPH_BUFFERS = legacy_channel("gdn_graph").buffers
+_SM70_GDN_GRAPH_META = legacy_channel("gdn_graph").metadata
+_SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS = legacy_history("gdn_route")
 _SM70_GDN_PREFILL_PROFILE_COUNTS: dict[str, int] = {}
-_SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
 _DFLASH_DDTREE_PATH_PROBE_REPORTS = 0
 
 
@@ -121,91 +195,16 @@ def _warmup_sm70_qwen_gdn_causal_conv1d(
     the non-speculative causal-conv variant to JIT on the first structured
     request.
     """
-    if (
-        not envs.VLLM_SM70_AUX_KERNEL_WARMUP
-        or not current_platform.is_device_capability(70)
-    ):
-        return False
+    from vllm.config.sm70_runtime import capture_runtime_config
+    from vllm.model_executor.warmup.sm70_runtime import warmup_bound_convolution
 
-    for layer in forward_context.values():
-        warmup = getattr(layer, "_warmup_sm70_causal_conv1d_real_state", None)
-        if warmup is not None and warmup():
-            return True
-    return False
-
-
-@triton.jit
-def _sm70_pack_qwen_gdn_qkv_kernel(
-    mixed_qkv,
-    packed,
-    input_row_stride: tl.int64,
-    num_rows: tl.constexpr,
-    q_dim: tl.constexpr,
-    k_dim: tl.constexpr,
-    v_dim: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-):
-    """Bitwise row-slice copy into [all Q][all K][all V] storage."""
-    row = tl.program_id(0)
-    input_row = mixed_qkv + row * input_row_stride
-
-    q_cols = tl.arange(0, BLOCK_Q)
-    q_mask = q_cols < q_dim
-    q = tl.load(input_row + q_cols, mask=q_mask)
-    tl.store(packed + row * q_dim + q_cols, q, mask=q_mask)
-
-    k_cols = tl.arange(0, BLOCK_K)
-    k_mask = k_cols < k_dim
-    k = tl.load(input_row + q_dim + k_cols, mask=k_mask)
-    q_numel = num_rows * q_dim
-    tl.store(packed + q_numel + row * k_dim + k_cols, k, mask=k_mask)
-
-    v_cols = tl.arange(0, BLOCK_V)
-    v_mask = v_cols < v_dim
-    v = tl.load(input_row + q_dim + k_dim + v_cols, mask=v_mask)
-    qk_numel = q_numel + num_rows * k_dim
-    tl.store(packed + qk_numel + row * v_dim + v_cols, v, mask=v_mask)
-
-
-def _sm70_pack_qwen_gdn_qkv(
-    mixed_qkv: torch.Tensor,
-    q_dim: int,
-    k_dim: int,
-    v_dim: int,
-) -> torch.Tensor:
-    """Materialize the recurrent Q/K/V layout with one copy launch."""
-    if mixed_qkv.ndim != 2:
-        raise ValueError("mixed_qkv must be rank two")
-    if mixed_qkv.stride(1) != 1:
-        raise ValueError("mixed_qkv must be contiguous by row")
-    if min(q_dim, k_dim, v_dim) <= 0:
-        raise ValueError("Q/K/V widths must be positive")
-    if mixed_qkv.shape[1] < q_dim + k_dim + v_dim:
-        raise ValueError("mixed_qkv is narrower than the Q/K/V widths")
-
-    num_rows = mixed_qkv.shape[0]
-    packed = torch.empty(
-        num_rows * (q_dim + k_dim + v_dim),
-        dtype=mixed_qkv.dtype,
-        device=mixed_qkv.device,
+    return warmup_bound_convolution(
+        forward_context,
+        enabled=bool(
+            capture_runtime_config().auxiliary_warmup
+            and current_platform.is_device_capability(70)
+        ),
     )
-    _sm70_pack_qwen_gdn_qkv_kernel[(num_rows,)](
-        mixed_qkv,
-        packed,
-        mixed_qkv.stride(0),
-        num_rows=num_rows,
-        q_dim=q_dim,
-        k_dim=k_dim,
-        v_dim=v_dim,
-        BLOCK_Q=triton.next_power_of_2(q_dim),
-        BLOCK_K=triton.next_power_of_2(k_dim),
-        BLOCK_V=triton.next_power_of_2(v_dim),
-        num_warps=8,
-        num_stages=1,
-    )
-    return packed
 
 
 def _ddtree_parent_ids_require_branch(
@@ -379,17 +378,12 @@ def _log_runtime_route_once(message: str, *args) -> None:
     logger.info_once(message, *args)
 
 
-def _sm70_gdn_prefill_profile_enabled() -> bool:
-    raw = os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE")
-    if raw is None or raw.strip().lower() not in ("1", "true", "yes", "on"):
-        return False
-    if torch.compiler.is_compiling():
-        return False
-    return not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+def _sm70_gdn_prefill_profile_enabled():
+    return _legacy_gdn_profiler().enabled()
 
 
 def _sm70_profile_trace_enabled() -> bool:
-    return envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling()
+    return capture_runtime_trace().profile_trace and not torch.compiler.is_compiling()
 
 
 def _sm70_flashqla_original_prefill_enabled() -> bool:
@@ -422,176 +416,18 @@ def _sm70_flashqla_decode_warmup_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
-def _sm70_mixed_qkv_decode_layout(mixed_qkv: torch.Tensor) -> str:
-    if mixed_qkv.dim() != 2 or mixed_qkv.stride(1) != 1:
-        return "unsupported"
-    if mixed_qkv.stride(0) < mixed_qkv.shape[1]:
-        return "unsupported"
-    if mixed_qkv.stride(0) == mixed_qkv.shape[1]:
-        return "compact"
-    return "row_strided"
+def _sm70_gdn_prefill_profile_start():
+    return _legacy_gdn_profiler().start()
 
 
-def _sm70_gdn_prefill_profile_start() -> float | None:
-    if not _sm70_gdn_prefill_profile_enabled():
-        return None
-    torch.accelerator.synchronize()
-    return time.perf_counter()
+def _sm70_gdn_prefill_profile_end(*args, **kwargs):
+    return _legacy_gdn_profiler().end(*args, **kwargs)
 
 
-def _sm70_gdn_prefill_profile_end(
-    layer_name: LayerNameType,
-    stage: str,
-    start: float | None,
-    *,
-    tokens: int | None = None,
-    details: str = "",
-) -> None:
-    if start is None:
-        return
-    torch.accelerator.synchronize()
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-    total_key = "__total__"
-    max_logs = int(os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS", "256"))
-    total = _SM70_GDN_PREFILL_PROFILE_COUNTS.get(total_key, 0)
-    if total >= max_logs:
-        return
-    key = f"{os.getpid()}:{layer_name}:{stage}"
-    per_stage_max = int(os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE", "2"))
-    count = _SM70_GDN_PREFILL_PROFILE_COUNTS.get(key, 0)
-    if count >= per_stage_max:
-        return
-    _SM70_GDN_PREFILL_PROFILE_COUNTS[key] = count + 1
-    _SM70_GDN_PREFILL_PROFILE_COUNTS[total_key] = total + 1
-    logger.info(
-        "SM70 GDN prefill profile: layer=%s stage=%s elapsed_ms=%.3f tokens=%s %s",
-        layer_name,
-        stage,
-        elapsed_ms,
-        tokens,
-        details,
-    )
+_sm70_log_flashqla_decode_route = _gdn_diagnostics.log_decode_route
 
 
-def _sm70_log_flashqla_decode_route(
-    *,
-    layer_name: LayerNameType,
-    stage: str,
-    decision: str,
-    reason: str,
-    mixed_qkv: torch.Tensor,
-    state_indices: torch.Tensor | None,
-    num_decode_tokens: int,
-) -> None:
-    if not envs.VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG:
-        return
-    if torch.compiler.is_compiling():
-        return
-    mixed_layout = _sm70_mixed_qkv_decode_layout(mixed_qkv)
-    key = f"{os.getpid()}:{stage}:{decision}:{reason}:{mixed_layout}:{layer_name}"
-    count = _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS.get(key, 0)
-    if count >= 1:
-        return
-    if len(_SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS) >= 96:
-        return
-    _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS[key] = count + 1
-    state_desc = "None"
-    if state_indices is not None:
-        state_desc = (
-            f"shape={tuple(state_indices.shape)} "
-            f"dtype={state_indices.dtype} "
-            f"stride={tuple(state_indices.stride())} "
-            f"contiguous={state_indices.is_contiguous()}"
-        )
-    logger.info(
-        "SM70 FlashQLA GDN decode route debug: layer=%s stage=%s "
-        "decision=%s reason=%s capture=%s tokens=%s "
-        "mixed_shape=%s mixed_dtype=%s mixed_stride=%s "
-        "mixed_contiguous=%s mixed_layout=%s logical_width=%s "
-        "row_stride=%s state_indices=%s",
-        layer_name,
-        stage,
-        decision,
-        reason,
-        torch.cuda.is_current_stream_capturing(),
-        num_decode_tokens,
-        tuple(mixed_qkv.shape),
-        mixed_qkv.dtype,
-        tuple(mixed_qkv.stride()),
-        mixed_qkv.is_contiguous(),
-        mixed_layout,
-        mixed_qkv.shape[1] if mixed_qkv.dim() == 2 else None,
-        mixed_qkv.stride(0) if mixed_qkv.dim() == 2 else None,
-        state_desc,
-    )
-
-
-def _sm70_dump_gdn_core_tensor(
-    label: str,
-    layer_name: LayerNameType,
-    tensor: torch.Tensor,
-    source: str = "core",
-) -> None:
-    dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_CORE_DIR")
-    graph_dump = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") == "1" and bool(
-        os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
-    )
-    # Keep the production path free of CUDA runtime queries. This hook runs
-    # several times per GDN layer, while core dumps are normally disabled.
-    if not dump_dir and not graph_dump:
-        return
-    if graph_dump:
-        _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, source)
-    if not dump_dir or not tensor.is_cuda:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_CORE_LAYER_IDS")
-    if raw_layer_ids:
-        layer_idx = _sm70_gdn_layer_idx(layer_name)
-        layer_ids = _sm70_parse_int_set(raw_layer_ids, set())
-        if layer_idx not in layer_ids:
-            return
-    enable_file = os.getenv("VLLM_SM70_DUMP_GDN_CORE_ENABLE_FILE")
-    if enable_file and not os.path.exists(enable_file):
-        return
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
-        return
-
-    try:
-        max_dumps = int(os.getenv("VLLM_SM70_DUMP_GDN_CORE_MAX_DUMPS", "4"))
-    except ValueError:
-        max_dumps = 4
-    if max_dumps <= 0:
-        return
-
-    key = f"{os.getpid()}:{label}"
-    count = _SM70_GDN_DUMP_COUNTS.get(key, 0)
-    if count >= max_dumps:
-        return
-    _SM70_GDN_DUMP_COUNTS[key] = count + 1
-
-    safe_layer = str(layer_name).replace("/", "_").replace(".", "_")
-    path = os.path.join(
-        dump_dir,
-        f"pid{os.getpid()}_{label}_{count:03d}_{safe_layer}.pt",
-    )
-    os.makedirs(dump_dir, exist_ok=True)
-    torch.save(
-        {
-            "label": label,
-            "layer_name": str(layer_name),
-            "shape": tuple(tensor.shape),
-            "stride": tuple(tensor.stride()),
-            "storage_offset": int(tensor.storage_offset()),
-            "data_ptr": int(tensor.data_ptr()),
-            "is_contiguous": bool(tensor.is_contiguous()),
-            "source": source,
-            "dtype": str(tensor.dtype),
-            "tensor": tensor.detach().cpu(),
-        },
-        path,
-    )
+_sm70_dump_gdn_core_tensor = _gdn_diagnostics.dump_core
 
 
 def _sm70_gdn_layer_idx(layer_name: LayerNameType) -> int | None:
@@ -615,23 +451,10 @@ def _sm70_parse_int_set(raw: str | None, default: set[int]) -> set[int]:
 
 
 def _sm70_parse_int_ranges(raw_ranges: str | None) -> set[int] | None:
-    if not raw_ranges:
-        return None
-    values: set[int] = set()
-    for raw_part in raw_ranges.split(","):
-        part = raw_part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start_raw, end_raw = part.split("-", 1)
-            start = int(start_raw.strip())
-            end = int(end_raw.strip())
-            if end < start:
-                start, end = end, start
-            values.update(range(start, end + 1))
-        else:
-            values.add(int(part))
-    return values
+    from vllm.config.diagnostic_dump import parse_int_filter
+
+    selected = parse_int_filter(raw_ranges)
+    return None if selected is None else set(selected)
 
 
 def _sm70_qwen_gdn_has_active_spec_decode(
@@ -666,10 +489,17 @@ def _sm70_qwen_gdn_metadata_has_active_spec(
 def _sm70_assert_standard_core_not_active_spec(
     layer_name: LayerNameType,
     attn_metadata: GDNAttentionMetadata | None,
+    *,
+    enabled: bool | None = None,
+    spec_core: bool | None = None,
 ) -> None:
-    if os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD") != "1":
+    if enabled is None:
+        enabled = os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD") == "1"
+    if not enabled:
         return
-    if not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+    if spec_core is None:
+        spec_core = envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+    if not spec_core:
         return
     if not _sm70_qwen_gdn_metadata_has_active_spec(attn_metadata):
         return
@@ -684,12 +514,22 @@ def _sm70_assert_standard_core_not_active_spec(
     )
 
 
-def _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(vllm_config: object) -> bool:
+def _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
+    vllm_config: object, policy=None
+) -> bool:
     return (
         _sm70_qwen_gdn_num_speculative_tokens(vllm_config) >= 3
         and _sm70_qwen_gdn_spec_method(vllm_config) == "mtp"
-        and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
-        and not envs.VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP
+        and (
+            legacy_projection_value("spec_core_003")
+            if policy is None
+            else policy.spec_core_003
+        )
+        and not (
+            legacy_projection_value("spec_allow_deep_mtp")
+            if policy is None
+            else policy.spec_allow_deep_mtp
+        )
     )
 
 
@@ -708,18 +548,14 @@ def _is_dflash2_spec_config(vllm_config: object) -> bool:
 
 
 def _sm70_current_device_is_volta() -> bool:
-    """Whether this worker builds its layers on a Volta device.
+    """Inspect the worker's active GPU without creating a CUDA context.
 
-    The other SM70 gates in this file ask device 0, which reads the same card
-    from every rank on a mixed node: all devices stay visible to every worker
-    and only ``set_device`` differs. The full-forward wrapper decides what the
-    compiler gets to see, so it has to ask the accelerator that is current.
+    Initialized workers resolve their selected device through the platform.
+    CPU/meta construction uses context-free metadata for the visibility list.
     """
     if not current_platform.is_cuda():
         return False
-    return current_platform.is_device_capability(
-        (7, 0), device_id=torch.accelerator.current_device_index()
-    )
+    return current_platform.is_device_capability((7, 0))
 
 
 def _sm70_qwen_gdn_full_forward_enabled(
@@ -744,10 +580,12 @@ def _sm70_qwen_gdn_full_forward_enabled(
     return auto_enabled
 
 
-def _sm70_qwen_gdn_input_core_boundary_enabled() -> bool:
-    if envs.VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP:
+def _sm70_qwen_gdn_input_core_boundary_enabled(policy=None) -> bool:
+    if policy is not None:
+        return bool(policy.input_core and not policy.disable_input_core)
+    if legacy_projection_value("disable_input_core"):
         return False
-    return envs.VLLM_SM70_QWEN_GDN_INPUT_CORE_OP
+    return legacy_projection_value("input_core")
 
 
 def _sm70_qwen_gdn_spec_core_enabled(
@@ -783,7 +621,7 @@ def _qwen_gdn_run_recurrent_core(
     Only the recurrent-state commit semantics differ between non-spec and
     active speculative decode, so keep that dispatch localized here.
     """
-    if envs.VLLM_SM70_QWEN_GDN_CONTEXT_CORE:
+    if self.gdn_policy.projection.context_core:
         torch.ops.vllm.qwen_gdn_attention_core_context(
             mixed_qkv,
             b,
@@ -975,106 +813,10 @@ def _qwen_gdn_non_spec_metadata_tensors(
     )
 
 
-def _sm70_gdn_graph_buffer_copy(
-    label: str,
-    layer_name: LayerNameType,
-    tensor: torch.Tensor,
-    source: str,
-) -> None:
-    if torch.compiler.is_compiling():
-        return
-    dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
-    if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") != "1" or not dump_dir:
-        return
-    if not tensor.is_cuda:
-        return
-
-    target_labels = {
-        item.strip()
-        for item in os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LABELS", "").split(",")
-        if item.strip()
-    }
-    if target_labels and label not in target_labels:
-        return
-
-    shape = tuple(tensor.shape)
-    raw_shapes = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_SHAPES")
-    if raw_shapes:
-        allowed_shapes = {
-            item.strip() for item in raw_shapes.split(",") if item.strip()
-        }
-        shape_text = "x".join(str(dim) for dim in shape)
-        if shape_text not in allowed_shapes:
-            return
-
-    layer_idx = _sm70_gdn_layer_idx(layer_name)
-    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS")
-    if raw_layer_ids:
-        try:
-            layer_ids = _sm70_parse_int_ranges(raw_layer_ids) or set()
-        except ValueError:
-            layer_ids = set()
-        if layer_idx not in layer_ids:
-            return
-
-    key = f"{os.getpid()}:{source}:{layer_name}:{label}:{shape}"
-    buffer = _SM70_GDN_GRAPH_BUFFERS.get(key)
-    tensor_meta = {
-        "input_shape": shape,
-        "input_stride": tuple(tensor.stride()),
-        "input_storage_offset": int(tensor.storage_offset()),
-        "input_data_ptr": int(tensor.data_ptr()),
-        "input_is_contiguous": bool(tensor.is_contiguous()),
-    }
-    if (
-        buffer is None
-        or tuple(buffer.shape) != shape
-        or buffer.dtype != tensor.dtype
-        or buffer.device != tensor.device
-    ):
-        buffer = torch.empty_like(tensor)
-        _SM70_GDN_GRAPH_BUFFERS[key] = buffer
-        _SM70_GDN_GRAPH_META[key] = {
-            "label": label,
-            "layer_name": str(layer_name),
-            "layer_idx": layer_idx,
-            "source": source,
-            "shape": shape,
-            "dtype": str(tensor.dtype),
-            "pid": os.getpid(),
-            **tensor_meta,
-        }
-    else:
-        _SM70_GDN_GRAPH_META[key].update(tensor_meta)
-    buffer.copy_(tensor)
+_sm70_gdn_graph_buffer_copy = _gdn_diagnostics.capture_tensor
 
 
-def _sm70_gdn_graph_buffer_copy_state_slice(
-    label: str,
-    layer_name: LayerNameType,
-    state: torch.Tensor,
-    state_indices: torch.Tensor | None,
-    num_tokens: int,
-) -> None:
-    if state_indices is None or num_tokens <= 0:
-        return
-    if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") != "1":
-        return
-    indices = state_indices[:num_tokens].to(device=state.device, dtype=torch.long)
-    indices = indices.clamp(0, state.shape[0] - 1)
-    _sm70_gdn_graph_buffer_copy(
-        label,
-        layer_name,
-        state.index_select(0, indices),
-        "state",
-    )
-    if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STATE_INDICES") == "1":
-        _sm70_gdn_graph_buffer_copy(
-            f"{label}_indices",
-            layer_name,
-            indices.to(dtype=torch.int32),
-            "state",
-        )
+_sm70_gdn_graph_buffer_copy_state_slice = _gdn_diagnostics.capture_state_slice
 
 
 def _sm70_dump_gdn_spec_metadata_graph_buffers(
@@ -1090,7 +832,7 @@ def _sm70_dump_gdn_spec_metadata_graph_buffers(
     num_accepted_tokens: torch.Tensor | None = None,
     spec_state_slot_selectors: torch.Tensor | None = None,
 ) -> None:
-    if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_METADATA") != "1":
+    if not diagnostic_channel("gdn_graph").policy.metadata:
         return
     for label, tensor in (
         ("meta_non_spec_query_start_loc", non_spec_query_start_loc),
@@ -1109,91 +851,10 @@ def _sm70_dump_gdn_spec_metadata_graph_buffers(
 
 
 def dump_sm70_gdn_graph_buffers(step: int, stage: str) -> None:
-    dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
-    if not dump_dir:
-        return
-    enable_file = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_ENABLE_FILE")
-    if enable_file and not os.path.exists(enable_file):
-        return
-    target_steps = _sm70_parse_int_ranges(os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STEPS"))
-    if target_steps is not None and step not in target_steps:
-        return
-    if not _SM70_GDN_GRAPH_BUFFERS:
-        return
-
-    os.makedirs(dump_dir, exist_ok=True)
-    for key, buffer in _SM70_GDN_GRAPH_BUFFERS.items():
-        meta = _SM70_GDN_GRAPH_META.get(key, {})
-        label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
-        source = str(meta.get("source", "unknown")).replace("/", "_").replace(".", "_")
-        layer_idx = meta.get("layer_idx")
-        layer_text = f"{layer_idx:02d}" if isinstance(layer_idx, int) else "none"
-        shape = "x".join(str(dim) for dim in tuple(buffer.shape))
-        path = os.path.join(
-            dump_dir,
-            (
-                f"pid{os.getpid()}_step{step:04d}_layer{layer_text}_"
-                f"{source}_{label}_shape{shape}.pt"
-            ),
-        )
-        torch.save(
-            {
-                **meta,
-                "step": step,
-                "stage": stage,
-                "graph_buffer_key": key,
-                "tensor": buffer.detach().cpu(),
-            },
-            path,
-        )
+    diagnostic_channel("gdn_graph").flush_graph(step, stage, gdn=True)
 
 
-def _sm70_gdn_packed_compare_request(
-    layer_name: LayerNameType,
-) -> tuple[str, int] | None:
-    dump_dir = os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR")
-    if not dump_dir:
-        return None
-    enable_file = os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_ENABLE_FILE")
-    if enable_file and not os.path.exists(enable_file):
-        return None
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
-        return None
-
-    layer_idx = _sm70_gdn_layer_idx(layer_name)
-    if layer_idx is None:
-        return None
-    layer_ids = _sm70_parse_int_set(
-        os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_LAYER_IDS"),
-        {0},
-    )
-    if layer_idx not in layer_ids:
-        return None
-
-    global _SM70_GDN_PACKED_COMPARE_REPORTS
-    max_reports = envs.VLLM_SM70_COMPARE_GDN_PACKED_DECODE_MAX_REPORTS
-    if max_reports <= 0 or max_reports <= _SM70_GDN_PACKED_COMPARE_REPORTS:
-        return None
-
-    key = f"{os.getpid()}:{layer_name}"
-    step = _SM70_GDN_PACKED_COMPARE_COUNTS.get(key, 0) + 1
-    _SM70_GDN_PACKED_COMPARE_COUNTS[key] = step
-
-    target_steps = _sm70_parse_int_set(
-        os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_STEPS"),
-        set(),
-    )
-    if target_steps and step not in target_steps:
-        return None
-
-    _SM70_GDN_PACKED_COMPARE_REPORTS += 1
-    os.makedirs(dump_dir, exist_ok=True)
-    safe_layer = str(layer_name).replace("/", "_").replace(".", "_")
-    path = os.path.join(
-        dump_dir,
-        f"pid{os.getpid()}_step{step:04d}_layer{safe_layer}.pt",
-    )
-    return path, step
+_sm70_gdn_packed_compare_request = _gdn_diagnostics.compare_request
 
 
 def _sm70_save_gdn_packed_compare_report(
@@ -1252,79 +913,10 @@ def _sm70_save_gdn_packed_compare_report(
     )
 
 
-def _sm70_gdn_projection_dump_requested(layer_name: LayerNameType) -> bool:
-    if not os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR") and (
-        os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") != "1"
-        or not os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
-    ):
-        return False
-    layer_idx = _sm70_gdn_layer_idx(layer_name)
-    if layer_idx is None:
-        return False
-    raw_graph_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS")
-    if raw_graph_layer_ids and os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") == "1":
-        try:
-            graph_layer_ids = _sm70_parse_int_ranges(raw_graph_layer_ids) or set()
-        except ValueError:
-            graph_layer_ids = set()
-        return layer_idx in graph_layer_ids
-    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_LAYER_IDS", "0,1")
-    try:
-        layer_ids = {
-            int(item.strip()) for item in raw_layer_ids.split(",") if item.strip()
-        }
-    except ValueError:
-        layer_ids = {0, 1}
-    return layer_idx in layer_ids
+_sm70_gdn_projection_dump_requested = _gdn_diagnostics.projection_requested
 
 
-def _sm70_gdn_projection_dump_impl(
-    tensor: torch.Tensor,
-    label: str,
-    layer_name: LayerNameType,
-) -> torch.Tensor:
-    _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, "proj")
-    if torch.cuda.is_current_stream_capturing():
-        return tensor.clone()
-    dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR")
-    enable_file = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE")
-    if (
-        dump_dir
-        and (not enable_file or os.path.exists(enable_file))
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        try:
-            max_dumps = int(os.getenv("VLLM_SM70_DUMP_GDN_PROJ_MAX_DUMPS", "4"))
-        except ValueError:
-            max_dumps = 4
-        key = f"{os.getpid()}:{layer_name}:{label}"
-        count = _SM70_GDN_PROJ_DUMP_COUNTS.get(key, 0)
-        if max_dumps > 0 and count < max_dumps:
-            _SM70_GDN_PROJ_DUMP_COUNTS[key] = count + 1
-            safe_layer = str(layer_name).replace("/", "_").replace(".", "_")
-            safe_label = label.replace("/", "_").replace(".", "_")
-            path = os.path.join(
-                dump_dir,
-                f"pid{os.getpid()}_{safe_label}_{count:03d}_{safe_layer}.pt",
-            )
-            os.makedirs(dump_dir, exist_ok=True)
-            torch.save(
-                {
-                    "label": label,
-                    "layer_name": str(layer_name),
-                    "shape": tuple(tensor.shape),
-                    "stride": tuple(tensor.stride()),
-                    "storage_offset": int(tensor.storage_offset()),
-                    "data_ptr": int(tensor.data_ptr()),
-                    "is_contiguous": bool(tensor.is_contiguous()),
-                    "dtype": str(tensor.dtype),
-                    "tensor": tensor.detach().cpu(),
-                },
-                path,
-            )
-    # This custom op has a non-aliasing output schema. Returning the input
-    # lets AOT reuse live projection storage across diagnostic boundaries.
-    return tensor.clone()
+_sm70_gdn_projection_dump_impl = _gdn_diagnostics.dump_projection
 
 
 def _sm70_gdn_projection_dump_fake(
@@ -1378,7 +970,7 @@ def _sm70_compile_graph_slice_dim(
         dim += tensor.ndim
     if (
         start == 0
-        or not envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        or not graph_policy().compile_graph
         or not use_sm70_decode_graph_semantics()
     ):
         slices = [slice(None)] * tensor.ndim
@@ -1388,8 +980,10 @@ def _sm70_compile_graph_slice_dim(
     return tensor.index_select(dim, indices)
 
 
-def _sm70_gdn_rmsnorm_onepass_enabled() -> bool:
-    return envs.VLLM_SM70_GDN_RMSNORM_ONEPASS
+def _sm70_gdn_rmsnorm_onepass_enabled(policy=None) -> bool:
+    if policy is not None:
+        return bool(policy.rmsnorm_onepass)
+    return legacy_projection_value("rmsnorm_onepass")
 
 
 _SM70_GDN_QPN8_BA_REQUIRED_OPS = (
@@ -1406,115 +1000,37 @@ def _missing_sm70_gdn_qpn8_ba_ops() -> list[str]:
     ]
 
 
-def _sm70_gdn_qpn8_ba_split_enabled() -> bool:
-    if envs.VLLM_SM70_GDN_QPN8_BA_SPLIT and not envs.VLLM_SM70_GDN_RMSNORM_ONEPASS:
+def _sm70_gdn_qpn8_ba_split_enabled(policy=None) -> bool:
+    requested = (
+        legacy_projection_value("qpn8_ba_split")
+        if policy is None
+        else policy.qpn8_ba_split
+    )
+    if requested and not _sm70_gdn_rmsnorm_onepass_enabled(policy):
         raise RuntimeError(
             "VLLM_SM70_GDN_QPN8_BA_SPLIT=1 requires the accepted "
             "VLLM_SM70_GDN_RMSNORM_ONEPASS=1 pair."
         )
-    if envs.VLLM_SM70_GDN_QPN8_BA_SPLIT:
+    if requested:
         missing_ops = _missing_sm70_gdn_qpn8_ba_ops()
         if missing_ops:
             raise RuntimeError(
                 "VLLM_SM70_GDN_QPN8_BA_SPLIT=1 requires the source-built "
                 f"SM70 GDN extension; missing ops: {missing_ops}."
             )
-    return envs.VLLM_SM70_GDN_QPN8_BA_SPLIT
+    return bool(requested)
 
 
-@triton.jit
-def _sm70_gdn_rmsnorm_gated_onepass_kernel(
-    x_ptr,
-    z_ptr,
-    weight_ptr,
-    out_ptr,
-    D: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offsets = tl.arange(0, D)
-    x = tl.load(x_ptr + row * D + offsets).to(tl.float32)
-    z = tl.load(z_ptr + row * D + offsets).to(tl.float32)
-    weight = tl.load(weight_ptr + offsets).to(tl.float32)
-    sumsq = tl.sum(x * x, axis=0)
-    rstd = tl.rsqrt(sumsq / D + EPS)
-    gated = z * tl.sigmoid(z)
-    tl.store(out_ptr + row * D + offsets, x * rstd * weight * gated)
-
-
-def _sm70_qwen_gdn_rmsnorm_gated_impl(
-    x: torch.Tensor,
-    z: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    group_size: int,
-    norm_before_gate: bool,
-    activation: str,
-) -> torch.Tensor:
-    if (
-        _sm70_gdn_rmsnorm_onepass_enabled()
-        and current_platform.is_device_capability(70)
-        and x.is_cuda
-        and x.dtype == torch.float16
-        and x.shape == (12, 128)
-        and x.is_contiguous()
-        and z.is_cuda
-        and z.device == x.device
-        and z.dtype == x.dtype
-        and z.shape == x.shape
-        and z.is_contiguous()
-        and weight.is_cuda
-        and weight.device == x.device
-        and weight.dtype == x.dtype
-        and weight.shape == (128,)
-        and weight.is_contiguous()
-        and group_size <= 0
-        and norm_before_gate
-        and activation in ("silu", "swish")
-    ):
-        out = torch.empty_like(x)
-        _sm70_gdn_rmsnorm_gated_onepass_kernel[(12,)](
-            x,
-            z,
-            weight,
-            out,
-            D=128,
-            EPS=eps,
-            num_warps=2,
-        )
-        return out
-
-    from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
-
-    return rmsnorm_fn(
-        x,
-        weight,
-        None,
-        z=z,
-        eps=eps,
-        group_size=None if group_size <= 0 else group_size,
-        norm_before_gate=norm_before_gate,
-        activation=activation,
-    )
-
-
-def _sm70_qwen_gdn_rmsnorm_gated_fake(
-    x: torch.Tensor,
-    z: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    group_size: int,
-    norm_before_gate: bool,
-    activation: str,
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-direct_register_custom_op(
-    op_name="sm70_qwen_gdn_rmsnorm_gated",
-    op_func=_sm70_qwen_gdn_rmsnorm_gated_impl,
-    fake_impl=_sm70_qwen_gdn_rmsnorm_gated_fake,
+# Register at the historical checkpoint and retain the private import aliases.
+from vllm.model_executor.layers.fla.ops.sm70 import (  # noqa: E402
+    gdn_norm as _gdn_norm_provider,
 )
+
+_sm70_gdn_rmsnorm_gated_onepass_kernel = (
+    _gdn_norm_provider._sm70_gdn_rmsnorm_gated_onepass_kernel
+)
+_sm70_qwen_gdn_rmsnorm_gated_fake = _gdn_norm_provider._sm70_qwen_gdn_rmsnorm_gated_fake
+_sm70_qwen_gdn_rmsnorm_gated_impl = _gdn_norm_provider._sm70_qwen_gdn_rmsnorm_gated_impl
 
 
 def _sm70_compile_graph_interleaved_indices(
@@ -1632,660 +1148,55 @@ def _sm70_mixed_qkv_state_diff_stats(
 # fixed and the broken wheels are yanked / superseded on PyPI:
 #   https://github.com/NVIDIA/cutlass/issues/3170
 #   https://github.com/NVIDIA/cutlass/issues/3259
-@functools.cache
-def _is_libs_cu13_install_intact() -> bool:
-    """Return True if every file installed by ``nvidia-cutlass-dsl-libs-cu13``
-    matches the SHA-256 declared in its wheel ``RECORD``.
-
-    ``nvidia-cutlass-dsl-libs-base`` and ``nvidia-cutlass-dsl-libs-cu13``
-    both ship into the shared ``nvidia_cutlass_dsl/`` namespace and
-    write many of the same on-disk paths (the runtime ``.so``, the MLIR
-    Python bindings, cuTe-DSL Python sources, ...) with different
-    content. Whichever wheel extracts last wins; with a parallel
-    installer (e.g. ``uv``) the order is racy and the resulting venv
-    can end up with a mix of files from both variants. The
-    ``-libs-base`` variant fails MLIR legalization when JIT-compiling
-    the FlashInfer Blackwell GDN prefill kernel, and any other
-    cuTe-DSL-based kernel can break too if on-disk files diverge from
-    what ``-libs-cu13``'s wheel expects. Tracked upstream at:
-
-      * https://github.com/NVIDIA/cutlass/issues/3170
-      * https://github.com/NVIDIA/cutlass/issues/3259
-
-    This helper re-hashes every file the ``-libs-cu13`` wheel claims to
-    own and compares against its declared SHA-256. Returns False on any
-    error (uninstalled, missing RECORD, missing file, hash mismatch).
-    Result is cached per-process.
-    """
-    import hashlib
-    import importlib.metadata
-
-    import pybase64 as base64
-
-    try:
-        dist = importlib.metadata.distribution("nvidia-cutlass-dsl-libs-cu13")
-    except importlib.metadata.PackageNotFoundError:
-        return False
-
-    files = dist.files
-    if not files:
-        return False
-
-    for pkg_path in files:
-        file_hash = pkg_path.hash
-        # Skip RECORD rows without a hash (RECORD itself, generated
-        # ``.pyc`` files, ...) and any non-SHA-256 hash modes.
-        if file_hash is None or not file_hash.value:
-            continue
-        if file_hash.mode != "sha256":
-            continue
-        try:
-            with open(pkg_path.locate(), "rb") as f:
-                digest = hashlib.sha256(f.read()).digest()
-        except OSError:
-            return False
-        actual = base64.urlsafe_b64encode(digest).decode().rstrip("=")
-        if actual != file_hash.value:
-            return False
-
-    return True
 
 
-def _get_gdn_head_k_dim(vllm_config: VllmConfig) -> int | None:
-    for config in (
-        getattr(vllm_config.model_config, "hf_text_config", None),
-        getattr(vllm_config.model_config, "hf_config", None),
-    ):
-        if config is None:
-            continue
-        head_k_dim = getattr(config, "linear_key_head_dim", None)
-        if head_k_dim is not None:
-            return int(head_k_dim)
-    return None
-
-
-def _resolve_gdn_prefill_backend(
-    vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "flashqla_sm70"]]:
-    """Resolve GDN prefill backend.
-
-    FlashInfer's GDN prefill kernel is chosen when:
-    * ``requested in ["flashinfer", "auto"]``;
-    * ``platform == cuda``;
-    * one of the following:
-      - Hopper (SM90) — no further constraints;
-      - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``,
-        and an intact ``nvidia-cutlass-dsl-libs-cu13`` install on disk
-        (see :func:`_is_libs_cu13_install_intact`).
-
-    In-tree CuteDSL GDN prefill kernel is chosen when:
-    * "cutedsl" is requested; (opt-in only)
-    * Blackwell (SM10.x) with ``head_k_dim == 128``;
-    """
-    additional_config = vllm_config.additional_config
-    backend_cfg = (
-        additional_config.get("gdn_prefill_backend", "auto")
-        if isinstance(additional_config, dict)
-        else "auto"
+def flashqla_sm70_chunk_gated_delta_rule(*args, **kwargs):
+    kwargs.setdefault(
+        "use_original_tilelang", _sm70_flashqla_original_prefill_enabled()
     )
-    backend = str(backend_cfg).strip().lower()
-
-    if not current_platform.is_cuda():
-        return backend, "triton"
-
-    head_k_dim = _get_gdn_head_k_dim(vllm_config)
-    model_dtype = getattr(vllm_config.model_config, "dtype", None)
-
-    supports_flashinfer = False
-    supports_cutedsl = False
-    supports_flashqla_sm70 = False
-
-    if current_platform.is_device_capability(90):
-        supports_flashinfer = True
-    elif head_k_dim == 128 and backend in ("auto", "flashqla_sm70"):
-        capability = current_platform.get_device_capability()
-        is_sm70 = (
-            capability is not None and capability.major == 7 and capability.minor == 0
-        )
-        is_sm75 = (
-            capability is not None and capability.major == 7 and capability.minor == 5
-        )
-        supports_model_dtype = model_dtype == torch.float16
-        try:
-            from flash_qla.ops.gated_delta_rule.chunk.sm70 import (  # noqa: F401
-                chunk_gated_delta_rule_fwd_sm70_vlk_varlen,
-            )
-        except ImportError:
-            supports_flashqla_sm70 = False
-        else:
-            supports_flashqla_sm70 = is_sm70 and supports_model_dtype
-        if is_sm75:
-            logger.warning_once(
-                "FlashQLA-SM70 GDN prefill cannot run on Turing (sm75): the "
-                "kernel asks for 86016 B of dynamic shared memory per block "
-                "and Turing caps the opt-in limit at 65536 B, so the worker "
-                "dies during engine init. Its VLK CUDA variant does fit but "
-                "is slower than Triton/FLA from 2048 tokens per chunk "
-                "upwards. Falling back to Triton/FLA."
-            )
-        if is_sm70 and not supports_model_dtype:
-            logger.warning_once(
-                "FlashQLA-SM70 GDN prefill is V100 production-validated only "
-                "for fp16 model activations; model dtype %s falls back to "
-                "Triton/FLA.",
-                model_dtype,
-            )
-    elif (
-        current_platform.is_device_capability_family(100)
-        and head_k_dim == 128
-        and current_platform.get_cuda_runtime_major() >= 13
-    ):
-        supports_flashinfer = _is_libs_cu13_install_intact()
-        supports_cutedsl = True
-        if not supports_flashinfer:
-            logger.warning_once(
-                "FlashInfer Blackwell GDN requires an intact nvidia-cutlass-dsl"
-                "-libs-cu13 install, but some on-disk files do not match the "
-                "SHA-256 declared in its RECORD (install-order race in "
-                "nvidia-cutlass-dsl packaging -- see "
-                "https://github.com/NVIDIA/cutlass/issues/3170 and "
-                "https://github.com/NVIDIA/cutlass/issues/3259). Falling back "
-                "to Triton/FLA. Repair with: pip install --force-reinstall "
-                "--no-deps nvidia-cutlass-dsl-libs-cu13"
-            )
-
-    if backend in ("auto", "flashqla_sm70") and supports_flashqla_sm70:
-        return backend, "flashqla_sm70"
-    if backend in ["flashinfer", "auto"] and supports_flashinfer:
-        return backend, "flashinfer"
-    if backend == "cutedsl" and supports_cutedsl:
-        return backend, "cutedsl"
-    return backend, "triton"
+    kwargs.setdefault("profiler", _legacy_gdn_profiler())
+    return _flashqla_prefill(*args, **kwargs)
 
 
-def _log_gdn_backend_decision(
-    vllm_config: VllmConfig,
-    requested_backend: str,
-    active_backend: str,
-) -> None:
-    """Log the GDN prefill backend choice in the attention-selector style."""
-    head_k_dim = _get_gdn_head_k_dim(vllm_config)
-    model_dtype = getattr(vllm_config.model_config, "dtype", None)
-    chosen = {
-        "flashinfer": "FlashInfer",
-        "flashqla_sm70": "FlashQLA-SM70",
-        "cutedsl": "CuteDSL",
-        "triton": "Triton/FLA",
-    }[active_backend]
-    logger.info_once(
-        "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s, model_dtype=%s).",
-        chosen,
-        requested_backend,
-        head_k_dim,
-        model_dtype,
-    )
-    if active_backend == "flashinfer" and current_platform.is_device_capability(90):
-        logger.warning_once(
-            "FlashInfer GDN prefill is JIT-compiled; first run may take a "
-            "while. Set --gdn-prefill-backend triton to skip JIT.",
-        )
-
-
-def fi_chunk_gated_delta_rule(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
-    cu_seqlens: torch.Tensor | None = None,
-    use_qk_l2norm_in_kernel: bool = True,
-):
-    from flashinfer.gdn_prefill import (
-        chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
-    )
-
-    if use_qk_l2norm_in_kernel:
-        q = l2norm_fwd(q)
-        k = l2norm_fwd(k)
-
-    # use flashinfer implementation
-    q = q.squeeze(0).contiguous()
-    k = k.squeeze(0).contiguous()
-    v = v.squeeze(0).contiguous()
-
-    g = g.squeeze(0).contiguous()
-    beta = beta.squeeze(0).contiguous()
-    fi_state = initial_state.to(torch.float32)
-    fi_g = g.to(torch.float32)
-    fi_beta = beta.to(torch.float32)
-    result = chunk_gated_delta_rule_fi(
-        q=q,
-        k=k,
-        v=v,
-        g=torch.exp(fi_g),
-        beta=fi_beta,
-        initial_state=fi_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
-    # FlashInfer returns (output, state) when output_final_state=True,
-    # or just output when output_final_state=False.
-    # Unsqueeze back to 4D (1, L, H, D) to match fla output format
-    if output_final_state:
-        output, final_state = result
-        return output.unsqueeze(0), final_state
-    else:
-        return result.unsqueeze(0), None
-
-
-def flashqla_sm70_chunk_gated_delta_rule(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
-    cu_seqlens: torch.Tensor | None = None,
-    chunk_indices: torch.Tensor | None = None,
-    chunk_offsets: torch.Tensor | None = None,
-    state_indices: torch.Tensor | None = None,
-    has_initial_state: torch.Tensor | None = None,
-    inplace_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = True,
-    core_attn_out: torch.Tensor | None = None,
-    gate_is_exp: bool = False,
-):
-    use_original_tilelang = _sm70_flashqla_original_prefill_enabled()
-    if use_original_tilelang:
-        from flash_qla.ops.gated_delta_rule.chunk import (
-            chunk_gated_delta_rule_fwd_sm70_tilelang,
-        )
-
-        _log_runtime_route_once(
-            "Using original FlashQLA-SM70 TileLang GDN prefill path "
-            "(indexed_state=%s, direct_output=%s).",
-            state_indices is not None,
-            core_attn_out is not None,
-        )
-    else:
-        from flash_qla.ops.gated_delta_rule.chunk.sm70 import (
-            chunk_gated_delta_rule_fwd_sm70_vlk_varlen,
-        )
-
-    if use_qk_l2norm_in_kernel:
-        profile_start = _sm70_gdn_prefill_profile_start()
-        q = l2norm_fwd(q)
-        k = l2norm_fwd(k)
-        _sm70_gdn_prefill_profile_end(
-            "flashqla",
-            "qk_l2norm",
-            profile_start,
-            tokens=q.shape[1],
-        )
-    if cu_seqlens is None:
-        cu_seqlens = torch.tensor([0, q.shape[1]], device=q.device, dtype=torch.int32)
-    if cu_seqlens.dtype != torch.int32:
-        cu_seqlens = cu_seqlens.to(torch.int32)
-
-    output = None
-    if core_attn_out is not None:
-        candidate = core_attn_out[: q.shape[1]].unsqueeze(0)
-        if (
-            candidate.shape == v.shape
-            and candidate.dtype == v.dtype
-            and candidate.is_contiguous()
-        ):
-            output = candidate
-
-    q_contiguous = q.is_contiguous()
-    k_contiguous = k.is_contiguous()
-    v_contiguous = v.is_contiguous()
-    g_contiguous = g.is_contiguous()
-    beta_contiguous = beta.is_contiguous()
-    state_contiguous = initial_state.is_contiguous()
-    profile_start = _sm70_gdn_prefill_profile_start()
-    q_arg = q if q_contiguous else q.contiguous()
-    k_arg = k if k_contiguous else k.contiguous()
-    v_arg = v if v_contiguous else v.contiguous()
-    g_arg = g if g_contiguous else g.contiguous()
-    beta_arg = beta if beta_contiguous else beta.contiguous()
-    state_arg = initial_state if state_contiguous else initial_state.contiguous()
-    cu_arg = cu_seqlens if cu_seqlens.is_contiguous() else cu_seqlens.contiguous()
-    _sm70_gdn_prefill_profile_end(
-        "flashqla",
-        "input_contiguous",
-        profile_start,
-        tokens=q.shape[1],
-        details=(
-            f"q={q_contiguous} k={k_contiguous} v={v_contiguous} "
-            f"g={g_contiguous} beta={beta_contiguous} "
-            f"state={state_contiguous} direct_output={output is not None} "
-            f"gate_is_exp={gate_is_exp}"
-        ),
-    )
-
-    profile_start = _sm70_gdn_prefill_profile_start()
-    if use_original_tilelang:
-        if gate_is_exp:
-            logger.warning_once(
-                "SM70 original TileLang FlashQLA prefill received exp(g); "
-                "converting back to log(g). Configure fused_post_conv_prep to "
-                "emit raw g for best performance."
-            )
-            g_arg = torch.log(g_arg)
-        _, _, out, _, final_state = chunk_gated_delta_rule_fwd_sm70_tilelang(
-            q=q_arg,
-            k=k_arg,
-            v=v_arg,
-            g=g_arg,
-            beta=beta_arg,
-            cu_seqlens=cu_arg,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            state_indices=state_indices,
-            has_initial_state=has_initial_state,
-            initial_state=state_arg,
-            scale=q.shape[-1] ** -0.5,
-            output_final_state=output_final_state,
-            output_h=False,
-            auto_cp=False,
-            state_layout_vlk=True,
-            output=output,
-            inplace_final_state=inplace_final_state,
-        )
-    else:
-        out, final_state = chunk_gated_delta_rule_fwd_sm70_vlk_varlen(
-            q=q_arg,
-            k=k_arg,
-            v=v_arg,
-            g=g_arg,
-            beta=beta_arg,
-            cu_seqlens=cu_arg,
-            initial_state=state_arg,
-            scale=q.shape[-1] ** -0.5,
-            output_final_state=output_final_state,
-            validate_cu_seqlens=False,
-            output=output,
-            gate_is_exp=gate_is_exp,
-        )
-    _sm70_gdn_prefill_profile_end(
-        "flashqla",
-        "kernel",
-        profile_start,
-        tokens=q.shape[1],
-        details=(
-            f"direct_output={output is not None} gate_is_exp={gate_is_exp} "
-            f"original_tilelang={use_original_tilelang}"
-        ),
-    )
-    if core_attn_out is not None and output is None:
-        profile_start = _sm70_gdn_prefill_profile_start()
-        out_flat = out.squeeze(0).reshape(-1)
-        out_view = core_attn_out.reshape(-1)[: out_flat.numel()]
-        out_view.copy_(out_flat)
-        out = core_attn_out[: out.shape[1]].unsqueeze(0)
-        _sm70_gdn_prefill_profile_end(
-            "flashqla",
-            "output_copy",
-            profile_start,
-            tokens=q.shape[1],
-        )
-    return out, final_state
-
-
-def flashqla_sm70_chunk_gated_delta_rule_vllm_decode(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    use_qk_l2norm_in_kernel: bool = True,
-):
-    from flash_qla.ops.gated_delta_rule.chunk.sm70.fused_fwd import _load_ext
-
-    if use_qk_l2norm_in_kernel:
-        q = l2norm_fwd(q)
-        k = l2norm_fwd(k)
-    ext = _load_ext()
-    return ext.gdn_forward_vlk_varlen(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        g.contiguous(),
-        beta.contiguous(),
-        initial_state.contiguous(),
-        cu_seqlens.contiguous(),
-        float(q.shape[-1] ** -0.5),
-        True,
-        False,
-        False,
-    )
-
-
-@functools.cache
-def _flashqla_sm70_decode_available() -> bool:
-    try:
-        from flash_qla.ops.gated_delta_rule.chunk.sm70.fused_fwd import (  # noqa: F401
-            gdn_decode_mixed_qkv_global_state_sm70,
-        )
-    except ImportError:
-        return False
-    return True
+def _legacy_gdn_profiler():
+    config = GdnProfileConfig()
+    config.resolve()
+    profiler = GdnPrefillProfiler(config)
+    profiler.counts = _SM70_GDN_PREFILL_PROFILE_COUNTS
+    return profiler
 
 
 @CustomOp.register("chunk_gated_delta_rule")
-class ChunkGatedDeltaRule(CustomOp):
+class ChunkGatedDeltaRule(GdnPrefill, CustomOp):
     def __init__(self) -> None:
-        super().__init__()
-        vllm_config = get_current_vllm_config()
-        backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
-        self.gdn_prefill_backend = active_backend
-
+        CustomOp.__init__(self)
+        config = get_current_vllm_config()
+        plan = select_gdn_execution(config)
+        GdnPrefill.__init__(
+            self,
+            plan,
+            bind_gdn_profiler(config),
+            bind_chunk_kernels(config, resolve_gdn_config(config).schedule)
+            if plan.prefill.backend in ("triton", "flashqla_sm70")
+            else None,
+            native_policy=flashqla_prefill_provider.bind_flashqla_native_policy(
+                config,
+                resolve_gdn_config(config),
+                needed=plan.needs_native_flashqla,
+            ),
+        )
+        # Preserve the CustomOp/nn.Module call boundary and its forward hooks.
+        self._call_prefill = self.__call__
         if (
-            backend in ("flashinfer", "cutedsl", "flashqla_sm70")
-            and active_backend != backend
+            plan.requested_backend in ("flashinfer", "cutedsl", "flashqla_sm70")
+            and plan.prefill.backend != plan.requested_backend
         ):
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
                 "kernel on the current platform. Falling back to Triton/FLA.",
-                backend,
+                plan.requested_backend,
             )
-        _log_gdn_backend_decision(vllm_config, backend, active_backend)
-
-        if active_backend == "flashinfer":
-            self._forward_method = self.forward_cuda
-        elif active_backend == "flashqla_sm70":
-            self._forward_method = self.forward_flashqla_sm70
-        elif active_backend == "cutedsl":
-            self._forward_method = self.forward_cutedsl
-        else:
-            self._forward_method = self.forward_native
-
-    def forward_cuda(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: torch.Tensor,
-        output_final_state: bool,
-        cu_seqlens: torch.Tensor | None = None,
-        chunk_indices: torch.Tensor | None = None,
-        chunk_offsets: torch.Tensor | None = None,
-        use_qk_l2norm_in_kernel: bool = True,
-        core_attn_out: torch.Tensor | None = None,
-        gate_is_exp: bool = False,
-    ):
-        if gate_is_exp:
-            g = torch.log(g)
-        o, final_state = fi_chunk_gated_delta_rule(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
-        if core_attn_out is not None:
-            o_flat = o.squeeze(0).reshape(-1)
-            co_flat = core_attn_out.reshape(-1)
-            co_flat[: o_flat.numel()].copy_(o_flat)
-        return o, final_state
-
-    def forward_flashqla_sm70(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: torch.Tensor,
-        output_final_state: bool,
-        cu_seqlens: torch.Tensor | None = None,
-        chunk_indices: torch.Tensor | None = None,
-        chunk_offsets: torch.Tensor | None = None,
-        state_indices: torch.Tensor | None = None,
-        has_initial_state: torch.Tensor | None = None,
-        inplace_final_state: bool = False,
-        use_qk_l2norm_in_kernel: bool = True,
-        core_attn_out: torch.Tensor | None = None,
-        gate_is_exp: bool = False,
-    ):
-        if (
-            q.dtype != torch.float16
-            or k.dtype != torch.float16
-            or v.dtype != torch.float16
-        ):
-            logger.warning_once(
-                "FlashQLA-SM70 GDN prefill only runs on fp16 q/k/v tensors "
-                "for SM70/V100 production use; got q=%s k=%s v=%s. Falling "
-                "using the native GDN path for this call.",
-                q.dtype,
-                k.dtype,
-                v.dtype,
-            )
-            return self.forward_native(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                chunk_offsets=chunk_offsets,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                core_attn_out=core_attn_out,
-                gate_is_exp=gate_is_exp,
-            )
-        o, final_state = flashqla_sm70_chunk_gated_delta_rule(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            state_indices=state_indices,
-            has_initial_state=has_initial_state,
-            inplace_final_state=inplace_final_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            core_attn_out=core_attn_out,
-            gate_is_exp=gate_is_exp,
-        )
-        return o, final_state
-
-    def forward_native(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: torch.Tensor,
-        output_final_state: bool,
-        cu_seqlens: torch.Tensor | None = None,
-        chunk_indices: torch.Tensor | None = None,
-        chunk_offsets: torch.Tensor | None = None,
-        use_qk_l2norm_in_kernel: bool = True,
-        core_attn_out: torch.Tensor | None = None,
-        gate_is_exp: bool = False,
-    ):
-        if gate_is_exp:
-            g = torch.log(g)
-        return fla_chunk_gated_delta_rule(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            core_attn_out=core_attn_out,
-        )
-
-    def forward_cutedsl(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: torch.Tensor,
-        output_final_state: bool,
-        cu_seqlens: torch.Tensor | None = None,
-        chunk_indices: torch.Tensor | None = None,
-        chunk_offsets: torch.Tensor | None = None,
-        use_qk_l2norm_in_kernel: bool = True,
-        core_attn_out: torch.Tensor | None = None,
-        gate_is_exp: bool = False,
-    ):
-        from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
-            chunk_gated_delta_rule_cutedsl,
-        )
-
-        if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
-        if gate_is_exp:
-            g = torch.log(g)
-
-        assert cu_seqlens is not None
-        assert chunk_indices is not None
-        assert chunk_offsets is not None
-
-        o, final_state = chunk_gated_delta_rule_cutedsl(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            core_attn_out=core_attn_out,
-        )
-        if not output_final_state:
-            final_state = None
-        return o, final_state
+        _log_gdn_backend_decision(config, plan.requested_backend, plan.prefill.backend)
 
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
@@ -2311,6 +1222,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        self._execution_graph_policy = graph_policy(vllm_config)
+        self.gdn_policy = resolve_gdn_config(vllm_config)
+        self.gdn_state_trace = resolve_state_trace(vllm_config)
+        self._gdn_profiler = bind_gdn_profiler(vllm_config)
+        from vllm.runtime_resources import runtime_resources_for
+
+        self._prefill_warmup_keys = runtime_resources_for(vllm_config).setdefault(
+            "gdn_prefill_warmup_keys", set()
+        )
         # Runtime forward/capture need not retain the initialization config.
         # Capture LoRA exclusion while the owning configuration is available.
         self.enable_sm70_gdn_ba_verify = vllm_config.lora_config is None
@@ -2322,6 +1242,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+        self.gdn_heads = GdnHeadContract(
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.tp_size,
+        )
         self.gqa_interleaved_layout = gqa_interleaved_layout
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
@@ -2413,7 +1340,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             group_size=None,
             norm_before_gate=True,
             activation=output_gate_type,
-            device=current_platform.current_device(),
+            device=self.dt_bias.device,
         )
 
         self.out_proj = RowParallelLinear(
@@ -2433,8 +1360,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 1,
                 1 + int(vllm_config.speculative_config.num_speculative_state_tokens()),
             )
+        self.verification_update = bind_native_verifier(
+            self.gdn_heads,
+            enabled=self.gdn_policy.native_verify,
+        )
+        from vllm.model_executor.layers.mamba.gdn.spec_replay import (
+            spec_replay_enabled,
+        )
+
+        self._spec_replay = spec_replay_enabled(vllm_config)
+        if self._spec_replay and self.verification_update is None:
+            raise ValueError("GDN speculative replay requires the native verifier.")
+        # Per-request buffer stride of the replayed recurrent rows.
+        speculative = vllm_config.speculative_config
+        self._replay_stride = (
+            1 + speculative.num_speculative_state_tokens()
+            if self._spec_replay and speculative is not None
+            else 1
+        )
         self.enable_sm70_gdn_rmsnorm_onepass = (
-            _sm70_gdn_rmsnorm_onepass_enabled()
+            _sm70_gdn_rmsnorm_onepass_enabled(self.gdn_policy.projection)
             and current_platform.is_device_capability(70)
             and self._sm70_spec_cache_stride == 1
             and self.hidden_size in (2560, 5120)
@@ -2453,44 +1398,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and not self.gqa_interleaved_layout
             and not self.disable_tp_for_ba_proj
             and self.in_proj_ba is not None
-            and _sm70_gdn_qpn8_ba_split_enabled()
+            and _sm70_gdn_qpn8_ba_split_enabled(self.gdn_policy.projection)
         )
-        self.enable_packed_recurrent_decode = (
-            envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
-        )
-        self.enable_sm70_fused_sigmoid_mixed_qkv = (
-            envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV
-        )
+        self.enable_packed_recurrent_decode = self.gdn_policy.packed_recurrent_decode
+        self.enable_sm70_fused_sigmoid_mixed_qkv = self.gdn_policy.mixed_qkv_decode
+        verifier_policy = capture_sm70_dflash2_config(vllm_config)
         self.enable_sm70_dflash2_fused_gdn_verify = bool(
-            sm70_dflash2_enabled(
-                "fused_gdn_verify", capture_sm70_dflash2_config(vllm_config)
-            )
+            sm70_dflash2_enabled("fused_gdn_verify", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_tp2_gdn_bv2 = bool(
             self.enable_sm70_dflash2_fused_gdn_verify
             and self.tp_size == 2
-            and envs.VLLM_SM70_DFLASH2_TP2_GDN_BV2
+            and sm70_dflash2_enabled("tp2_gdn_bv2", verifier_policy)
         )
         self.enable_sm70_dflash2_fused_gdn_norm = bool(
-            sm70_dflash2_enabled(
-                "fused_gdn_norm", capture_sm70_dflash2_config(vllm_config)
-            )
+            sm70_dflash2_enabled("fused_gdn_norm", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_split = bool(
-            sm70_dflash2_enabled(
-                "fused_gdn_split", capture_sm70_dflash2_config(vllm_config)
-            )
+            sm70_dflash2_enabled("fused_gdn_split", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_combined_split = bool(
-            sm70_dflash2_enabled(
-                "fused_gdn_combined_split", capture_sm70_dflash2_config(vllm_config)
-            )
+            sm70_dflash2_enabled("fused_gdn_combined_split", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
@@ -2515,18 +1449,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.num_v_heads // self.tp_size,
             )
         self.enable_sm70_dflash2_fused_qkv_pack = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
+            sm70_dflash2_enabled("fused_qkv_pack", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
-        self.compare_sm70_fused_sigmoid_mixed_qkv = (
-            envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE
+        self.compare_sm70_fused_sigmoid_mixed_qkv = capture_runtime_trace().value(
+            "gdn_mixed_compare"
         )
-        self.enable_flashqla_decode = envs.VLLM_SM70_GDN_DECODE_FLASHQLA
-        self.force_sm70_qwen_gdn_full_forward = envs.VLLM_SM70_QWEN_GDN_FULL_FORWARD
+        self.enable_flashqla_decode = self.gdn_policy.flashqla_decode
+        self.flashqla_decode_admission = FlashQlaDecodeAdmission.bind(
+            self.gdn_heads, self.enable_flashqla_decode, device=self.dt_bias.device
+        )
+        self._flashqla_native_policy = (
+            flashqla_prefill_provider.bind_flashqla_native_policy(
+                vllm_config,
+                self.gdn_policy,
+                needed=self.flashqla_decode_admission.needs_native_policy(
+                    vllm_config.model_config.dtype
+                ),
+            )
+        )
+        self.force_sm70_qwen_gdn_full_forward = bool(
+            self.gdn_policy.projection.full_forward
+        )
         num_speculative_tokens = _sm70_qwen_gdn_num_speculative_tokens(vllm_config)
         block_003_deep_mtp = _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
-            vllm_config
+            vllm_config, self.gdn_policy.projection
         )
         if block_003_deep_mtp:
             logger.warning_once(
@@ -2539,24 +1487,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "diagnostic reruns of the unsafe route.",
                 num_speculative_tokens,
             )
-        self.disable_sm70_qwen_gdn_full_forward = (
-            envs.VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD and not block_003_deep_mtp
+        self.disable_sm70_qwen_gdn_full_forward = bool(
+            self.gdn_policy.projection.disable_full_forward and not block_003_deep_mtp
         )
         self.auto_sm70_qwen_gdn_full_forward = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            bool(self._execution_graph_policy.compile_graph)
             and vllm_config.speculative_config is not None
-            and not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
-            and (not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP or block_003_deep_mtp)
+            and not self.gdn_policy.state.spec_core
+            and (not self.gdn_policy.projection.spec_core_003 or block_003_deep_mtp)
         )
         self.auto_sm70_qwen_gdn_spec_core = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            bool(self._execution_graph_policy.compile_graph)
             and vllm_config.speculative_config is not None
-            and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+            and self.gdn_policy.state.spec_core
         )
         self.auto_sm70_qwen_gdn_003_spec_core = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            bool(self._execution_graph_policy.compile_graph)
             and vllm_config.speculative_config is not None
-            and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
+            and self.gdn_policy.projection.spec_core_003
             and not block_003_deep_mtp
         )
         # The automatic arm is Volta-only. The wrapper runs the whole layer
@@ -2588,23 +1536,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             logger.info_once(
                 "SM70 Qwen GDN 0.0.3-style spec recurrent-core route armed."
             )
-        self.enable_sm70_legacy_prefill_prep = envs.VLLM_SM70_GDN_LEGACY_PREFILL_PREP
+        self.enable_sm70_legacy_prefill_prep = self.gdn_policy.legacy_prefill_prep
+        self.gdn_preparation = GdnPreparation(
+            self.gdn_heads,
+            legacy=bool(self.enable_sm70_legacy_prefill_prep),
+            fused_pack=self.enable_sm70_dflash2_fused_qkv_pack,
+            gate_is_exp=(
+                not self.enable_sm70_legacy_prefill_prep
+                and self.gdn_prefill_backend == "flashqla_sm70"
+                and not self.gdn_policy.original_prefill
+            ),
+        )
         if current_platform.is_device_capability(70) and (
-            envs.VLLM_SM70_GDN_KKT_SCHEDULE
-            or envs.VLLM_SM70_GDN_DELTA_H_SCHEDULE
-            or envs.VLLM_SM70_GDN_CHUNK_O_SCHEDULE
-            or envs.VLLM_SM70_FLA_RECURRENT_SCHEDULE
-            or envs.VLLM_SM70_FUSED_SIGMOID_GATING_SCHED
+            self.gdn_policy.schedule.kkt_enabled
+            or self.gdn_policy.schedule.delta_h_enabled
+            or self.gdn_policy.schedule.chunk_o_enabled
+            or self.gdn_policy.schedule.recurrent_enabled
+            or self.gdn_policy.schedule.sigmoid_enabled
         ):
             logger.info_once(
                 "SM70 GDN/FLA schedule gates enabled: "
                 "kkt=%s delta_h=%s chunk_o=%s recurrent=%s "
                 "sigmoid_gating=%s.",
-                envs.VLLM_SM70_GDN_KKT_SCHEDULE,
-                envs.VLLM_SM70_GDN_DELTA_H_SCHEDULE,
-                envs.VLLM_SM70_GDN_CHUNK_O_SCHEDULE,
-                envs.VLLM_SM70_FLA_RECURRENT_SCHEDULE,
-                envs.VLLM_SM70_FUSED_SIGMOID_GATING_SCHED,
+                self.gdn_policy.schedule.kkt_enabled,
+                self.gdn_policy.schedule.delta_h_enabled,
+                self.gdn_policy.schedule.chunk_o_enabled,
+                self.gdn_policy.schedule.recurrent_enabled,
+                self.gdn_policy.schedule.sigmoid_enabled,
                 scope="local",
             )
         if self.enable_sm70_legacy_prefill_prep:
@@ -2637,7 +1595,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "SM70 DFlash2 fused post-convolution Q/K/V packing enabled.",
                 scope="local",
             )
-        if envs.is_set("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING"):
+        if capture_runtime_trace().gdn_legacy_fused_notice:
             logger.info_once(
                 "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING is upstream-split "
                 "into VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE, "
@@ -2645,7 +1603,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV controls.",
                 scope="local",
             )
-        if envs.VLLM_SM70_GDN_EMPTY_CORE_OUT:
+        if capture_runtime_trace().value("gdn_empty_output_notice"):
             logger.info_once(
                 "VLLM_SM70_GDN_EMPTY_CORE_OUT is paused-unsafe; latest keeps "
                 "GDN core_attn_out allocated with torch.zeros until a route-hit "
@@ -2764,10 +1722,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         group_width_qkvz = q_size + k_size + v_size + z_size
         group_width_ba = 2 * ba_size
 
-        if (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and use_sm70_decode_graph_semantics()
-        ):
+        if bool(
+            self._execution_graph_policy.compile_graph
+        ) and use_sm70_decode_graph_semantics(self._execution_graph_policy):
             q_idx = _sm70_compile_graph_interleaved_indices(
                 ng, group_width_qkvz, 0, q_size, mixed_qkvz.device
             )
@@ -2881,10 +1838,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_start = value_start + v_size
         a_start = ba_size
 
-        if (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and use_sm70_decode_graph_semantics()
-        ):
+        if bool(
+            self._execution_graph_policy.compile_graph
+        ) and use_sm70_decode_graph_semantics(self._execution_graph_policy):
             q_idx = _sm70_compile_graph_interleaved_indices(
                 ng, group_width_qkvz, 0, q_size, mixed_qkvz.device
             )
@@ -2986,48 +1942,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return mixed_qkv_out, z_out, b_out, a_out
 
     def rearrange_mixed_qkv(self, mixed_qkv):
-        """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
-
-        The original code used ``rearrange(x, "l (h d) -> 1 l h d", d=...)``
-        followed by ``.contiguous()`` on each tensor.  This version flattens
-        all three splits into a single buffer via ``torch.cat`` so that
-        torch.compile emits one Triton copy kernel instead of three separate
-        contiguous() calls.
-        """
-        if mixed_qkv is None:
-            return None, None, None
-
-        seq_len = mixed_qkv.shape[0]
-        q_dim = self.key_dim // self.tp_size
-        k_dim = self.key_dim // self.tp_size
-        v_dim = self.value_dim // self.tp_size
-
-        if (
-            self.enable_sm70_dflash2_fused_qkv_pack
-            and seq_len == 8
-            and mixed_qkv.is_cuda
-            and mixed_qkv.dtype == torch.float16
-            and mixed_qkv.stride(1) == 1
-        ):
-            fused = _sm70_pack_qwen_gdn_qkv(mixed_qkv, q_dim, k_dim, v_dim)
-        else:
-            query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
-            fused = torch.cat(
-                [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
-            )
-
-        q_size = seq_len * q_dim
-        k_size = seq_len * k_dim
-
-        q_contig = fused[0:q_size]
-        k_contig = fused[q_size : q_size + k_size]
-        v_contig = fused[q_size + k_size :]
-
-        query = q_contig.view(1, seq_len, -1, self.head_k_dim)
-        key = k_contig.view(1, seq_len, -1, self.head_k_dim)
-        value = v_contig.view(1, seq_len, -1, self.head_v_dim)
-
-        return query, key, value
+        return self.gdn_preparation.unpack(mixed_qkv)
 
     def _probe_ddtree_path_replay_states(
         self,
@@ -3385,7 +2300,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             _log_runtime_route_once(
                 "Using fused DDTree Qwen GDN pure-spec verifier path."
             )
-            profile_start = _sm70_gdn_prefill_profile_start()
+            profile_start = self._gdn_profiler.start()
             mixed_qkv_spec = causal_conv1d_update_ddtree(
                 mixed_qkv_spec,
                 conv_state,
@@ -3410,7 +2325,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_spec_decodes=num_spec_decodes,
                 )
                 if core_attn_out_spec is not None:
-                    _sm70_gdn_prefill_profile_end(
+                    self._gdn_profiler.end(
                         layer_name,
                         "ddtree_pure_spec_flashqla",
                         profile_start,
@@ -3441,7 +2356,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ddtree_parent_ids=ddtree_parent_ids,
                 use_qk_l2norm_in_kernel=True,
             )
-            _sm70_gdn_prefill_profile_end(
+            self._gdn_profiler.end(
                 layer_name,
                 "ddtree_pure_spec_fused",
                 profile_start,
@@ -3461,7 +2376,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
 
         layer_name = _encode_layer_name(self.prefix)
-        profile_start = _sm70_gdn_prefill_profile_start()
+        profile_start = self._gdn_profiler.start()
         prefix_rows, depth_batches = _ddtree_depth_batches(
             parent_ids=ddtree_parent_ids,
             num_tree_tokens_cpu=ddtree_num_tree_tokens_cpu,
@@ -3487,7 +2402,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_indices=spec_state_indices_tensor[:, 0],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # Replay keeps one state block per request, so the index
+                # width no longer bounds the rows of a verification round.
+                max_query_len=(
+                    self._replay_stride
+                    if self._spec_replay
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
             query_linear, key_linear, value_linear = self.rearrange_mixed_qkv(
@@ -3513,7 +2434,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_accepted_tokens=spec_state_slot_selectors,
                 use_qk_l2norm_in_kernel=True,
             )
-            _sm70_gdn_prefill_profile_end(
+            self._gdn_profiler.end(
                 layer_name,
                 "ddtree_pure_spec_linear_diagnostic",
                 profile_start,
@@ -3748,7 +2669,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 initial_ssm_state=path_probe_initial_ssm_state,
             )
 
-        _sm70_gdn_prefill_profile_end(
+        self._gdn_profiler.end(
             layer_name,
             "ddtree_pure_spec_replay",
             profile_start,
@@ -3763,166 +2684,39 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def _can_use_flashqla_decode(
         self,
-        mixed_qkv: torch.Tensor,
-        state_indices: torch.Tensor | None,
-        num_decode_tokens: int,
+        mixed_qkv,
+        state_indices,
+        num_decode_tokens,
         *,
-        layer_name: LayerNameType | None = None,
-        stage: str = "decode",
-    ) -> bool:
+        layer_name=None,
+        stage="decode",
+    ):
         if layer_name is None:
             layer_name = _encode_layer_name(self.prefix)
-        reason = "ok"
-        if not self.enable_flashqla_decode:
-            reason = "env_disabled"
-            _sm70_log_flashqla_decode_route(
-                layer_name=layer_name,
-                stage=stage,
-                decision="skip",
-                reason=reason,
-                mixed_qkv=mixed_qkv,
-                state_indices=state_indices,
-                num_decode_tokens=num_decode_tokens,
-            )
-            return False
-        if num_decode_tokens <= 0 or state_indices is None:
-            reason = "no_decode_tokens_or_state_indices"
-            _sm70_log_flashqla_decode_route(
-                layer_name=layer_name,
-                stage=stage,
-                decision="skip",
-                reason=reason,
-                mixed_qkv=mixed_qkv,
-                state_indices=state_indices,
-                num_decode_tokens=num_decode_tokens,
-            )
-            return False
-        if state_indices.dtype != torch.int32:
-            reason = "state_indices_dtype"
-            _sm70_log_flashqla_decode_route(
-                layer_name=layer_name,
-                stage=stage,
-                decision="skip",
-                reason=reason,
-                mixed_qkv=mixed_qkv,
-                state_indices=state_indices,
-                num_decode_tokens=num_decode_tokens,
-            )
-            return False
-        if (
-            not mixed_qkv.is_cuda
-            or mixed_qkv.dtype != torch.float16
-            or _sm70_mixed_qkv_decode_layout(mixed_qkv) == "unsupported"
-        ):
-            reason = "mixed_qkv_contract"
-            _sm70_log_flashqla_decode_route(
-                layer_name=layer_name,
-                stage=stage,
-                decision="skip",
-                reason=reason,
-                mixed_qkv=mixed_qkv,
-                state_indices=state_indices,
-                num_decode_tokens=num_decode_tokens,
-            )
-            return False
-        if self.head_k_dim != 128 or self.head_v_dim != 128:
-            reason = "head_dim"
-            _sm70_log_flashqla_decode_route(
-                layer_name=layer_name,
-                stage=stage,
-                decision="skip",
-                reason=reason,
-                mixed_qkv=mixed_qkv,
-                state_indices=state_indices,
-                num_decode_tokens=num_decode_tokens,
-            )
-            return False
-        if self.num_k_heads % self.tp_size != 0 or self.num_v_heads % self.tp_size != 0:
-            reason = "head_tp_divisibility"
-            _sm70_log_flashqla_decode_route(
-                layer_name=layer_name,
-                stage=stage,
-                decision="skip",
-                reason=reason,
-                mixed_qkv=mixed_qkv,
-                state_indices=state_indices,
-                num_decode_tokens=num_decode_tokens,
-            )
-            return False
-        capability = torch.cuda.get_device_capability(mixed_qkv.device)
-        if capability[0] != 7 or capability[1] not in (0, 5):
-            reason = "device_capability"
-            _sm70_log_flashqla_decode_route(
-                layer_name=layer_name,
-                stage=stage,
-                decision="skip",
-                reason=reason,
-                mixed_qkv=mixed_qkv,
-                state_indices=state_indices,
-                num_decode_tokens=num_decode_tokens,
-            )
-            return False
-        available = _flashqla_sm70_decode_available()
-        if not available:
-            reason = "flashqla_decode_import"
+        reason = self.flashqla_decode_admission.rejection(
+            mixed_qkv,
+            state_indices,
+            num_decode_tokens,
+        )
         _sm70_log_flashqla_decode_route(
             layer_name=layer_name,
             stage=stage,
-            decision="take" if available else "skip",
-            reason=reason,
+            decision="take" if reason is None else "skip",
+            reason=reason or "ok",
             mixed_qkv=mixed_qkv,
             state_indices=state_indices,
             num_decode_tokens=num_decode_tokens,
         )
-        return available
+        return reason is None
 
-    def _forward_core_decode_flashqla(
-        self,
-        *,
-        mixed_qkv: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        ssm_state: torch.Tensor,
-        state_indices: torch.Tensor,
-        num_decode_tokens: int,
-        cu_seqlens: torch.Tensor | None = None,
-        core_attn_out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        del cu_seqlens
-        from flash_qla.ops.gated_delta_rule.chunk.sm70.fused_fwd import (
-            gdn_decode_mixed_qkv_global_state_sm70,
+    def _forward_core_decode_flashqla(self, **kwargs):
+        return flashqla_decode(
+            self.gdn_heads,
+            self.A_log,
+            self.dt_bias,
+            native_policy=self._flashqla_native_policy,
+            **kwargs,
         )
-
-        state_indices = state_indices[:num_decode_tokens].contiguous()
-        if core_attn_out is None:
-            core_attn_out = mixed_qkv.new_empty(
-                (
-                    num_decode_tokens,
-                    self.num_v_heads // self.tp_size,
-                    self.head_v_dim,
-                )
-            )
-        out = core_attn_out[:num_decode_tokens]
-        kernel_out = (
-            out
-            if out.is_contiguous()
-            else torch.empty(out.shape, dtype=out.dtype, device=out.device)
-        )
-        gdn_decode_mixed_qkv_global_state_sm70(
-            mixed_qkv=mixed_qkv[:num_decode_tokens],
-            a=a[:num_decode_tokens].contiguous(),
-            b=b[:num_decode_tokens].contiguous(),
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            state=ssm_state,
-            state_indices=state_indices,
-            output=kernel_out,
-            scale=self.head_k_dim**-0.5,
-            use_qk_l2norm_in_kernel=True,
-        )
-        if kernel_out is not out:
-            out.copy_(kernel_out)
-        return out.unsqueeze(0)
 
     def forward(
         self,
@@ -3978,7 +2772,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         by the compilation pass when fuse_norm_quant is enabled.
         """
         layer_name = _encode_layer_name(self.prefix)
-        total_start = _sm70_gdn_prefill_profile_start()
+        total_start = self._gdn_profiler.start()
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
@@ -3986,7 +2780,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             "proj_core_in", layer_name, core_attn_out
         )
         z = _sm70_dump_gdn_projection_tensor("proj_z", layer_name, z)
-        profile_start = _sm70_gdn_prefill_profile_start()
+        profile_start = self._gdn_profiler.start()
         use_sm70_onepass_norm = (
             self.enable_sm70_gdn_rmsnorm_onepass
             and num_tokens == 1
@@ -4003,8 +2797,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.norm_before_gate
             and self.norm.activation in ("silu", "swish")
         )
-        if self.enable_sm70_dflash2_fused_gdn_norm:
-            # RMSNormGated is decomposed into a nine-kernel native chain when
+        if self.enable_sm70_dflash2_fused_gdn_norm or num_tokens > 64:
+            # Prefill (and the fused-norm draft path): RMSNormGated is
+            # decomposed into a nine-kernel native chain when
             # it is reached from the opaque Qwen GDN op under the default
             # inductor custom-op policy. Its canonical CUDA implementation is
             # a one-pass Triton kernel with the same FP32 accumulation and
@@ -4014,7 +2809,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             _log_runtime_route_once(
                 "SM70 GDN 12x128 RMSNormGated one-pass route enabled."
             )
-            core_attn_out = torch.ops.vllm.sm70_qwen_gdn_rmsnorm_gated(
+            core_attn_out = torch.ops.vllm.sm70_qwen_gdn_rmsnorm_gated_configured(
                 core_attn_out,
                 z,
                 self.norm.weight,
@@ -4022,10 +2817,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 -1,
                 True,
                 self.norm.activation,
+                self.gdn_policy.projection.rmsnorm_onepass,
             )
         else:
             core_attn_out = self.norm(core_attn_out, z)
-        _sm70_gdn_prefill_profile_end(
+        self._gdn_profiler.end(
             layer_name,
             "projection_norm",
             profile_start,
@@ -4036,8 +2832,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
-        profile_start = _sm70_gdn_prefill_profile_start()
-        if output is None:
+        profile_start = self._gdn_profiler.start()
+        projection_override = getattr(self, "output_projection_override", None)
+        if projection_override is not None and output is None:
+            proj_out = projection_override(core_attn_out)
+        elif output is None:
             proj_out, _ = self.out_proj(core_attn_out)
         else:
             # The caller guards the bias-free, non-reducing SM70 FP8 route.
@@ -4046,14 +2845,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             proj_out = self.out_proj.scheme.apply_weights(
                 self.out_proj, core_attn_out, output=output
             )
-        _sm70_gdn_prefill_profile_end(
+        self._gdn_profiler.end(
             layer_name,
             "projection_out_proj",
             profile_start,
             tokens=num_tokens,
         )
         proj_out = _sm70_dump_gdn_projection_tensor("proj_out", layer_name, proj_out)
-        _sm70_gdn_prefill_profile_end(
+        self._gdn_profiler.end(
             layer_name,
             "projection_total",
             total_start,
@@ -4167,7 +2966,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
-        if _sm70_qwen_gdn_input_core_boundary_enabled():
+        if _sm70_qwen_gdn_input_core_boundary_enabled(self.gdn_policy.projection):
             z = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
@@ -4186,7 +2985,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_cache,
                 layer_name,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+            if self.gdn_policy.projection.output_projection:
                 torch.ops.vllm.qwen_gdn_output_projection(
                     core_attn_out,
                     z,
@@ -4198,7 +2997,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 return self._output_projection(core_attn_out, z, output, num_tokens)
             return None
 
-        if envs.VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP:
+        if self.gdn_policy.projection.input_projection:
             mixed_qkv = torch.empty(
                 (num_tokens, (self.key_dim * 2 + self.value_dim) // self.tp_size),
                 dtype=hidden_states.dtype,
@@ -4238,7 +3037,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_cache=conv_state_cache,
                 ssm_state_cache=ssm_state_cache,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+            if self.gdn_policy.projection.output_projection:
                 torch.ops.vllm.qwen_gdn_output_projection(
                     core_attn_out,
                     z,
@@ -4270,7 +3069,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # linears; other layers still benefit from their base GEMV method.
             and isinstance(self.in_proj_qkvz, LinearBase)
             and isinstance(self.in_proj_ba, LinearBase)
-            and use_sm70_decode_graph_semantics()
+            and use_sm70_decode_graph_semantics(self._execution_graph_policy)
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
         from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
@@ -4292,8 +3091,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            side = getattr(self, "input_projection_override", None)
+            if side is not None and 1 <= hidden_states.shape[0] <= 8:
+                mixed_qkvz, ba = side(hidden_states)
+            else:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
             mixed_qkvz = _sm70_dump_gdn_projection_tensor(
                 "in_proj_qkvz", layer_name, mixed_qkvz
             )
@@ -4314,7 +3117,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ):
                 z = mixed_qkvz.new_empty((num_tokens, 12, 128))
                 mixed_qkv, b, a = _split_gdn_projection_tails(mixed_qkvz, ba, z)
-                if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                if self.gdn_policy.projection.mixed_qkv_contiguous:
                     mixed_qkv = mixed_qkv.contiguous()
                 _log_runtime_route_once(
                     "SM70 default GDN projection tail-copy route hit."
@@ -4337,7 +3140,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv = _sm70_dump_gdn_projection_tensor(
                     "split_mixed_qkv", layer_name, mixed_qkv
                 )
-                if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                if self.gdn_policy.projection.mixed_qkv_contiguous:
                     mixed_qkv = mixed_qkv.contiguous()
                 z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
                 z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
@@ -4353,8 +3156,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b = b.contiguous()
                 a = a.contiguous()
 
-        if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
-            70
+        if (
+            self.gdn_policy.projection.z_contiguous
+            and current_platform.is_device_capability(70)
         ):
             z = z.contiguous()
 
@@ -4386,7 +3190,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+        if self.gdn_policy.projection.output_projection:
             torch.ops.vllm.qwen_gdn_output_projection(
                 core_attn_out,
                 z,
@@ -4648,596 +3452,44 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return True
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
-        """Warm up GDN prefill kernels during V1 profiling.
-
-        During V1 profile runs, ``_forward_core`` returns early because
-        ``attn_metadata`` is ``None``, so the autotuned kernels used by
-        ``chunk_gated_delta_rule`` (e.g. ``solve_tril``,
-        ``chunk_scaled_dot_kkt``) are never invoked.  After profiling,
-        vLLM allocates KV cache using most of the remaining GPU memory.
-        When the first real inference triggers the autotuner it OOMs
-        because there is not enough memory left for benchmarking.
-
-        This method runs minimal forward passes through
-        ``chunk_gated_delta_rule`` and the decode recurrent kernel with
-        small dummy tensors to force compilation/autotuning while GPU memory
-        is still plentiful.  The autotuner results are cached globally, so
-        only the first layer incurs actual benchmarking cost.
-
-        All kernels including ``chunk_fwd_kernel_o`` now use a fixed
-        ``BT = chunk_size`` (64).  A single warmup pass with T = 64
-        is sufficient to populate the autotuner cache.
-
-        The decode path uses fixed-parameter kernels, but they are still
-        JIT-compiled on first use. Warm them here so the first real decode
-        step does not trip the JIT monitor.
-        """
+        """Bind the model's weights/layout; the warmup owner runs ordered stages."""
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
+        from vllm.model_executor.warmup.gdn import GdnWarmup
 
-        device = qkv_or_qkvz.device
-        dtype = qkv_or_qkvz.dtype
-        num_k_heads = self.num_k_heads // self.tp_size
-        num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
         qkv_dim = qkv_or_qkvz.shape[-1] - v_dim
-        qkv_row_stride = qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
-        self._sm70_gdn_prefill_qkv_row_stride = max(qkv_dim, int(qkv_row_stride))
-        prefill_token_counts = (FLA_CHUNK_SIZE, max(1, FLA_CHUNK_SIZE - 1))
-        warmup_key = (
-            qkv_or_qkvz.device.type,
-            qkv_or_qkvz.device.index,
-            dtype,
-            state_dtype,
-            self.gdn_prefill_backend,
-            _sm70_flashqla_original_prefill_enabled(),
-            _sm70_flashqla_direct_output_enabled(),
-            _sm70_flashqla_indexed_prefill_enabled(),
-            num_k_heads,
-            num_v_heads,
-            self.head_k_dim,
-            self.head_v_dim,
-            qkv_dim,
-            qkv_row_stride,
-            prefill_token_counts,
-            is_conv_state_dim_first(),
-        )
-        if warmup_key in _SM70_GDN_PREFILL_WARMUP_KEYS:
-            if _sm70_profile_trace_enabled():
-                logger.info(
-                    "SM70 profile trace: GDN prefill/decode warmup skip "
-                    "layer=%s reason=shape_already_warmed",
-                    self.prefix,
-                )
-            return
-        _SM70_GDN_PREFILL_WARMUP_KEYS.add(warmup_key)
-
-        # All kernels use BT = chunk_size, so a single pass with T = chunk_size
-        # is sufficient to populate every autotuner cache. Also run the
-        # conv1d prefill kernel once; otherwise Qwen3.5/Next can still JIT
-        # _causal_conv1d_fwd_kernel on the first real request after the JIT
-        # monitor has been activated.
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
-        if is_conv_state_dim_first():
-            dummy_conv_state = torch.zeros(
+        row_stride = qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
+        self._sm70_gdn_prefill_qkv_row_stride = max(qkv_dim, int(row_stride))
+        _, state_dtype = self.get_state_dtype()
+        GdnWarmup(
+            heads=self.gdn_heads,
+            prefill=self.chunk_gated_delta_rule,
+            decode_admission=self.flashqla_decode_admission,
+            native_policy=self._flashqla_native_policy,
+            schedule=self.gdn_policy.schedule,
+            conv_weight=self.conv1d.weight,
+            conv_bias=self.conv1d.bias,
+            activation=self.activation,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            state_dtype=state_dtype,
+            device=qkv_or_qkvz.device,
+            dtype=qkv_or_qkvz.dtype,
+            input_width=qkv_or_qkvz.shape[-1],
+            qkv_dim=qkv_dim,
+            qkv_row_stride=row_stride,
+            spec_cache_stride=max(
                 1,
-                conv_weights.shape[0],
-                conv_weights.shape[1] - 1,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            dummy_conv_state = torch.zeros(
-                1,
-                conv_weights.shape[1] - 1,
-                conv_weights.shape[0],
-                device=device,
-                dtype=dtype,
-            ).transpose(-1, -2)
-        spec_cache_stride = max(
-            1,
-            int(getattr(self, "num_spec", 1)),
-            int(getattr(self, "_sm70_spec_cache_stride", 1)),
-            _sm70_spec_cache_stride_from_config(),
-        )
-        dummy_cache_indices_variants = [
-            torch.zeros(1, device=device, dtype=torch.int32)
-        ]
-        if spec_cache_stride > 1:
-            dummy_cache_base = torch.zeros(
-                spec_cache_stride, device=device, dtype=torch.int32
-            )
-            dummy_cache_indices_variants.append(
-                torch.as_strided(
-                    dummy_cache_base,
-                    size=(1,),
-                    stride=(spec_cache_stride,),
-                )
-            )
-        dummy_has_initial_state = torch.ones(1, device=device, dtype=torch.bool)
-        try:
-            for prefill_tokens in prefill_token_counts:
-                dummy_conv_inputs = [
-                    torch.randn(
-                        prefill_tokens,
-                        qkv_dim,
-                        device=device,
-                        dtype=dtype,
-                    ).transpose(0, 1)
-                ]
-                if qkv_row_stride > qkv_dim:
-                    dummy_qkv = torch.randn(
-                        prefill_tokens,
-                        qkv_row_stride,
-                        device=device,
-                        dtype=dtype,
-                    )
-                    dummy_conv_inputs.append(dummy_qkv[:, :qkv_dim].transpose(0, 1))
-                cu_seqlens = torch.tensor(
-                    [0, prefill_tokens], device=device, dtype=torch.int32
-                )
-                for dummy_conv_in in dummy_conv_inputs:
-                    for dummy_cache_indices in dummy_cache_indices_variants:
-                        causal_conv1d_fn(
-                            dummy_conv_in,
-                            conv_weights,
-                            self.conv1d.bias,
-                            activation=self.activation,
-                            conv_states=dummy_conv_state,
-                            cache_indices=dummy_cache_indices,
-                            has_initial_state=dummy_has_initial_state,
-                            query_start_loc=cu_seqlens,
-                        )
-                        dummy_conv_state.zero_()
-        except Exception:
-            logger.warning(
-                "GDN causal-conv prefill warmup failed for layer %s. "
-                "First inference may JIT _causal_conv1d_fwd_kernel.",
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            logger.debug(
-                "GDN causal-conv prefill warmup completed for layer %s",
-                self.prefix,
-            )
-
-        # Mirror the real prefill path here: build q/k/v/g/beta via
-        # fused_post_conv_prep and then run chunk_gated_delta_rule with
-        # in-kernel L2 norm disabled.
-        for prefill_tokens in prefill_token_counts:
-            compact_a = torch.randn(
-                prefill_tokens, num_v_heads, device=device, dtype=dtype
-            )
-            compact_b = torch.randn(
-                prefill_tokens, num_v_heads, device=device, dtype=dtype
-            )
-            gate_inputs = [(compact_a, compact_b)]
-            gate_row_stride = 2 * num_v_heads
-            if gate_row_stride > num_v_heads:
-                dummy_ba = torch.randn(
-                    prefill_tokens,
-                    gate_row_stride,
-                    device=device,
-                    dtype=dtype,
-                )
-                # Split-projection Qwen keeps b as a view into [b, a], while
-                # a is contiguous when compile-graph slicing uses index_select.
-                gate_inputs.append((compact_a, dummy_ba[:, :num_v_heads]))
-                # Keep the pure view case warmed as well for non-graph runs.
-                gate_inputs.append(
-                    (
-                        dummy_ba[:, num_v_heads:gate_row_stride],
-                        dummy_ba[:, :num_v_heads],
-                    )
-                )
-            dummy_post_conv_inputs = [
-                torch.randn(prefill_tokens, qkv_dim, device=device, dtype=dtype)
-            ]
-            if qkv_row_stride > qkv_dim:
-                dummy_qkv_post = torch.randn(
-                    prefill_tokens,
-                    qkv_row_stride,
-                    device=device,
-                    dtype=dtype,
-                )
-                dummy_post_conv_inputs.append(dummy_qkv_post[:, :qkv_dim])
-            for dummy_mixed_qkv in dummy_post_conv_inputs:
-                for dummy_a, dummy_b in gate_inputs:
-                    q, k, v, g, beta = fused_post_conv_prep(
-                        conv_output=dummy_mixed_qkv,
-                        a=dummy_a,
-                        b=dummy_b,
-                        A_log=self.A_log,
-                        dt_bias=self.dt_bias,
-                        num_k_heads=num_k_heads,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        apply_l2norm=True,
-                        output_g_exp=False,
-                    )
-                    del q, k, v, g, beta
-        # The warmup is only meant to compile/autotune the GDN prefill
-        # kernels. Keep the actual kernel inputs deterministic and bounded so
-        # random profile tensors cannot trigger pathological TileLang runtime
-        # waits before real inference starts.
-        T = FLA_CHUNK_SIZE
-        q = torch.full(
-            (1, T, num_k_heads, self.head_k_dim),
-            1.0e-3,
-            device=device,
-            dtype=dtype,
-        )
-        k = torch.full(
-            (1, T, num_k_heads, self.head_k_dim),
-            1.0e-3,
-            device=device,
-            dtype=dtype,
-        )
-        v = torch.full(
-            (1, T, num_v_heads, self.head_v_dim),
-            1.0e-3,
-            device=device,
-            dtype=dtype,
-        )
-        g = torch.zeros(
-            1,
-            T,
-            num_v_heads,
-            device=device,
-            dtype=torch.float32,
-        )
-        beta = torch.full(
-            (1, T, num_v_heads),
-            1.0e-2,
-            device=device,
-            dtype=torch.float32,
-        )
-        state = torch.zeros(
-            1,
-            num_v_heads,
-            self.head_v_dim,
-            self.head_k_dim,
-            device=device,
-            dtype=state_dtype,
-        )
-        dummy_prefill_core_attn_out = None
-        if (
-            self.gdn_prefill_backend == "flashqla_sm70"
-            and _sm70_flashqla_original_prefill_enabled()
-            and _sm70_flashqla_direct_output_enabled()
-        ):
-            dummy_prefill_core_attn_out = torch.empty(
-                T,
-                num_v_heads,
-                self.head_v_dim,
-                device=device,
-                dtype=dtype,
-            )
-        # CuteDSL kernels require metadata
-        chunk_indices = None
-        chunk_offsets = None
-        if self.gdn_prefill_backend == "cutedsl":
-            from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
-                prepare_metadata_cutedsl,
-            )
-
-            chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
-
-        trace_prefill_warmup = (
-            _sm70_profile_trace_enabled()
-            and self.gdn_prefill_backend == "flashqla_sm70"
-            and _sm70_flashqla_original_prefill_enabled()
-        )
-        prefill_warmup_start = time.perf_counter()
-        if trace_prefill_warmup:
-            logger.info(
-                "SM70 profile trace: GDN prefill warmup enter layer=%s "
-                "T=%d q_shape=%s v_shape=%s direct_output=%s",
-                self.prefix,
-                T,
-                tuple(q.shape),
-                tuple(v.shape),
-                dummy_prefill_core_attn_out is not None,
-            )
-        try:
-            self.chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                chunk_offsets=chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-                core_attn_out=dummy_prefill_core_attn_out,
-            )
-        except Exception:
-            logger.warning(
-                "GDN prefill kernel warmup (T=%d) failed for "
-                "layer %s. First inference may OOM due to "
-                "autotuner.",
-                T,
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            if trace_prefill_warmup:
-                torch.accelerator.synchronize()
-                logger.info(
-                    "SM70 profile trace: GDN prefill warmup exit layer=%s "
-                    "T=%d elapsed_ms=%.3f",
-                    self.prefix,
-                    T,
-                    (time.perf_counter() - prefill_warmup_start) * 1000.0,
-                )
-            logger.debug(
-                "GDN prefill kernel warmup (T=%d) completed for layer %s",
-                T,
-                self.prefix,
-            )
-            if (
-                self.gdn_prefill_backend == "flashqla_sm70"
-                and _sm70_flashqla_original_prefill_enabled()
-                and _sm70_flashqla_indexed_prefill_enabled()
-            ):
-                indexed_state = torch.zeros(
-                    1,
-                    num_v_heads,
-                    self.head_v_dim,
-                    self.head_k_dim,
-                    device=device,
-                    dtype=state_dtype,
-                )
-                indexed_out = torch.empty(
-                    T,
-                    num_v_heads,
-                    self.head_v_dim,
-                    device=device,
-                    dtype=dtype,
-                )
-                indexed_state_indices = torch.zeros(1, device=device, dtype=torch.long)
-                indexed_has_initial_state = torch.ones(
-                    1, device=device, dtype=torch.bool
-                )
-                try:
-                    self.chunk_gated_delta_rule(
-                        q=q,
-                        k=k,
-                        v=v,
-                        g=g,
-                        beta=beta,
-                        initial_state=indexed_state,
-                        output_final_state=False,
-                        cu_seqlens=cu_seqlens,
-                        chunk_indices=chunk_indices,
-                        chunk_offsets=chunk_offsets,
-                        state_indices=indexed_state_indices,
-                        has_initial_state=indexed_has_initial_state,
-                        inplace_final_state=True,
-                        use_qk_l2norm_in_kernel=False,
-                        core_attn_out=(
-                            indexed_out
-                            if _sm70_flashqla_direct_output_enabled()
-                            else None
-                        ),
-                    )
-                except Exception:
-                    logger.warning(
-                        "GDN indexed/direct FlashQLA prefill warmup (T=%d) "
-                        "failed for layer %s. First real prefill may JIT the "
-                        "indexed original TileLang variant.",
-                        T,
-                        self.prefix,
-                        exc_info=True,
-                    )
-                else:
-                    logger.debug(
-                        "GDN indexed/direct FlashQLA prefill warmup (T=%d) "
-                        "completed for layer %s",
-                        T,
-                        self.prefix,
-                    )
-                finally:
-                    del (
-                        indexed_state,
-                        indexed_out,
-                        indexed_state_indices,
-                        indexed_has_initial_state,
-                    )
-        finally:
-            del (
-                dummy_mixed_qkv,
-                dummy_conv_in,
-                dummy_conv_state,
-                dummy_cache_indices,
-                dummy_has_initial_state,
-                q,
-                k,
-                v,
-                dummy_a,
-                dummy_b,
-                g,
-                beta,
-                state,
-                dummy_prefill_core_attn_out,
-                cu_seqlens,
-                chunk_indices,
-                chunk_offsets,
-            )
-
-        decode_qkv_dim = qkv_or_qkvz.shape[-1] - v_dim
-        for decode_tokens in (1, 2):
-            dummy_decode_views = [
-                torch.zeros(
-                    decode_tokens,
-                    decode_qkv_dim,
-                    device=device,
-                    dtype=dtype,
-                )
-            ]
-            if qkv_or_qkvz.shape[-1] > decode_qkv_dim:
-                dummy_decode_qkvz = torch.zeros(
-                    decode_tokens,
-                    qkv_or_qkvz.shape[-1],
-                    device=device,
-                    dtype=dtype,
-                )
-                dummy_decode_views.append(dummy_decode_qkvz[:, :decode_qkv_dim])
-            for dummy_decode_mixed_qkv in dummy_decode_views:
-                dummy_decode_a = torch.zeros(
-                    decode_tokens, num_v_heads, device=device, dtype=dtype
-                )
-                dummy_decode_b = torch.zeros(
-                    decode_tokens, num_v_heads, device=device, dtype=dtype
-                )
-                dummy_decode_state = torch.zeros(
-                    1,
-                    num_v_heads,
-                    self.head_v_dim,
-                    self.head_k_dim,
-                    device=device,
-                    dtype=state_dtype,
-                )
-                dummy_decode_out = torch.empty(
-                    decode_tokens,
-                    1,
-                    num_v_heads,
-                    self.head_v_dim,
-                    device=device,
-                    dtype=dtype,
-                )
-                dummy_decode_indices = torch.zeros(
-                    decode_tokens, device=device, dtype=torch.int32
-                )
-                dummy_decode_query_start_loc = torch.arange(
-                    decode_tokens + 1, device=device, dtype=torch.int32
-                )
-                trace_decode_warmup = _sm70_profile_trace_enabled()
-                mixed_decode_warmup_start = time.perf_counter()
-                if trace_decode_warmup:
-                    logger.info(
-                        "SM70 profile trace: GDN mixed-QKV decode warmup enter "
-                        "layer=%s tokens=%d mixed_shape=%s mixed_stride=%s "
-                        "layout=%s",
-                        self.prefix,
-                        decode_tokens,
-                        tuple(dummy_decode_mixed_qkv.shape),
-                        tuple(dummy_decode_mixed_qkv.stride()),
-                        _sm70_mixed_qkv_decode_layout(dummy_decode_mixed_qkv),
-                    )
-                try:
-                    fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
-                        A_log=self.A_log,
-                        a=dummy_decode_a,
-                        b=dummy_decode_b,
-                        dt_bias=self.dt_bias,
-                        mixed_qkv=dummy_decode_mixed_qkv,
-                        num_q_heads=self.num_k_heads // self.tp_size,
-                        num_v_heads=num_v_heads,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        scale=self.head_k_dim**-0.5,
-                        initial_state=dummy_decode_state,
-                        out=dummy_decode_out,
-                        cu_seqlens=dummy_decode_query_start_loc,
-                        ssm_state_indices=dummy_decode_indices,
-                        use_qk_l2norm_in_kernel=True,
-                    )
-                except Exception:
-                    logger.warning(
-                        "GDN mixed-QKV decode warmup failed for layer %s. "
-                        "First inference may JIT "
-                        "fused_sigmoid_gating_delta_rule_update_kernel.",
-                        self.prefix,
-                        exc_info=True,
-                    )
-                else:
-                    if trace_decode_warmup:
-                        torch.accelerator.synchronize()
-                        logger.info(
-                            "SM70 profile trace: GDN mixed-QKV decode warmup "
-                            "exit layer=%s elapsed_ms=%.3f",
-                            self.prefix,
-                            (time.perf_counter() - mixed_decode_warmup_start) * 1000.0,
-                        )
-                    logger.debug(
-                        "GDN mixed-QKV decode warmup completed for layer %s",
-                        self.prefix,
-                    )
-                if self._can_use_flashqla_decode(
-                    dummy_decode_mixed_qkv,
-                    dummy_decode_indices,
-                    decode_tokens,
-                    layer_name=_encode_layer_name(self.prefix),
-                    stage="warmup",
-                ):
-                    if not _sm70_flashqla_decode_warmup_enabled():
-                        if trace_decode_warmup:
-                            logger.info(
-                                "SM70 profile trace: GDN FlashQLA decode "
-                                "warmup skip layer=%s reason=disabled",
-                                self.prefix,
-                            )
-                    else:
-                        flashqla_decode_warmup_start = time.perf_counter()
-                        if trace_decode_warmup:
-                            logger.info(
-                                "SM70 profile trace: GDN FlashQLA decode "
-                                "warmup enter layer=%s tokens=%d layout=%s",
-                                self.prefix,
-                                decode_tokens,
-                                _sm70_mixed_qkv_decode_layout(dummy_decode_mixed_qkv),
-                            )
-                        try:
-                            self._forward_core_decode_flashqla(
-                                mixed_qkv=dummy_decode_mixed_qkv,
-                                a=dummy_decode_a,
-                                b=dummy_decode_b,
-                                ssm_state=dummy_decode_state,
-                                state_indices=dummy_decode_indices,
-                                num_decode_tokens=decode_tokens,
-                                cu_seqlens=dummy_decode_query_start_loc,
-                                core_attn_out=dummy_decode_out.squeeze(1),
-                            )
-                        except Exception:
-                            logger.warning(
-                                "GDN FlashQLA decode warmup failed for layer %s. "
-                                "First inference may JIT flash_qla_sm70_gdn.",
-                                self.prefix,
-                                exc_info=True,
-                            )
-                        else:
-                            if trace_decode_warmup:
-                                torch.accelerator.synchronize()
-                                logger.info(
-                                    "SM70 profile trace: GDN FlashQLA decode "
-                                    "warmup exit layer=%s elapsed_ms=%.3f",
-                                    self.prefix,
-                                    (time.perf_counter() - flashqla_decode_warmup_start)
-                                    * 1000.0,
-                                )
-                            logger.debug(
-                                "GDN FlashQLA decode warmup completed for layer %s",
-                                self.prefix,
-                            )
-                del (
-                    dummy_decode_a,
-                    dummy_decode_b,
-                    dummy_decode_state,
-                    dummy_decode_out,
-                    dummy_decode_indices,
-                    dummy_decode_query_start_loc,
-                )
-            del dummy_decode_views
-
-        torch.accelerator.empty_cache()
+                int(getattr(self, "num_spec", 1)),
+                int(getattr(self, "_sm70_spec_cache_stride", 1)),
+                _sm70_spec_cache_stride_from_config(),
+            ),
+            conv_dim_first=is_conv_state_dim_first(),
+            prefix=self.prefix,
+            trace=_sm70_profile_trace_enabled(),
+            decode_warmup=bool(self.gdn_policy.decode_warmup),
+        ).run(self._prefill_warmup_keys)
 
     def _forward_core_rocm(
         self,
@@ -5469,8 +3721,69 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             match_recurrent_schedule=True,
             match_recurrent_numerics=True,
             sm70_tp2_q8_bv2=getattr(self, "enable_sm70_dflash2_tp2_gdn_bv2", False),
+            schedule=self.gdn_policy.schedule,
         )
         return out.transpose(0, 1)
+
+    def _spec_replay_args(self):
+        from vllm.model_executor.layers.mamba.gdn.spec_replay import (
+            get_spec_replay_state,
+        )
+
+        state = get_spec_replay_state()
+        assert state is not None, "GDN speculative replay state is not set"
+        group = state.group_of[self.prefix]
+        return (
+            state.layer_buffer(
+                self.prefix,
+                self.num_k_heads // self.tp_size,
+                self.num_v_heads // self.tp_size,
+                self.A_log.device,
+            ),
+            state.spec_replay,
+            state.spec_map,
+            state.spec_ckpt_token,
+            state.spec_ckpt_slot[group],
+            self._replay_stride,
+        )
+
+    def _commit_replayed_decodes(
+        self, ssm_state, attn_metadata, state_indices=None
+    ) -> None:
+        """Commit the previous verification of requests decoding without
+        drafts this step (their rows read the committed state directly).
+
+        Every path that runs non-speculative decode rows must call this
+        first: the step's replay tables already cleared their verified flag.
+        """
+        from vllm.model_executor.layers.mamba.gdn.spec_replay import (
+            get_spec_replay_state,
+        )
+
+        state = get_spec_replay_state()
+        assert state is not None, "GDN speculative replay state is not set"
+        rows = attn_metadata.num_decodes
+        commit_replayed(
+            self.gdn_heads,
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            state.empty_starts[: rows + 1],
+            (
+                attn_metadata.non_spec_state_indices_tensor
+                if state_indices is None
+                else state_indices
+            )[:rows],
+            state.layer_buffer(
+                self.prefix,
+                self.gdn_heads.local_k_heads,
+                self.gdn_heads.local_v_heads,
+                self.A_log.device,
+            ),
+            state.plain_replay,
+            state.plain_map,
+            self._replay_stride,
+        )
 
     def _forward_core(
         self,
@@ -5498,6 +3811,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata_raw, dict)
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if self._spec_replay and attn_metadata.num_decodes > 0:
+            self._commit_replayed_decodes(kv_cache[1], attn_metadata)
 
         mixed_qkv_decode_requested = (
             self.enable_sm70_fused_sigmoid_mixed_qkv
@@ -5507,7 +3822,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv.is_contiguous()
                 or (
                     attn_metadata.spec_sequence_masks is not None
-                    and mixed_qkv.shape[0] in (5, 20)
+                    and (mixed_qkv.shape[0] in (5, 20) or self._spec_replay)
                     and mixed_qkv.stride(1) == 1
                     and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
                 )
@@ -5651,18 +3966,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         elif spec_sequence_masks is not None and not ddtree_tree_gdn_pure_spec:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
-            mixed_qkv_spec = causal_conv1d_update(
+            mixed_qkv_spec = convolve_decode(
                 mixed_qkv_spec,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][  # type: ignore[index]
+                state_indices=spec_state_indices_tensor[:, 0][  # type: ignore[index]
                     : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
                 ],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # Replay keeps one state block per request, so the index
+                # width no longer bounds the rows of a verification round.
+                max_query_len=(
+                    self._replay_stride
+                    if self._spec_replay
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
 
@@ -5691,13 +4012,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
-            mixed_qkv_non_spec = causal_conv1d_update(
+            mixed_qkv_non_spec = convolve_decode(
                 mixed_qkv_non_spec,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
                     :num_non_spec_tokens
                 ],
                 validate_data=True,
@@ -5770,27 +4091,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.compare_sm70_fused_sigmoid_mixed_qkv
                 and not torch.cuda.is_current_stream_capturing()
             )
-            core_attn_out_non_spec, mixed_final_state = (
-                fused_sigmoid_gating_delta_rule_update_mixed_qkv(
-                    A_log=self.A_log,
-                    a=a,
-                    b=b,
-                    dt_bias=self.dt_bias,
-                    mixed_qkv=mixed_qkv_non_spec,
-                    num_q_heads=self.num_k_heads // self.tp_size,
-                    num_v_heads=self.num_v_heads // self.tp_size,
-                    head_k_dim=self.head_k_dim,
-                    head_v_dim=self.head_v_dim,
-                    initial_state=ssm_state,
-                    inplace_final_state=not compare_mixed_qkv,
-                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_decodes + 1
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor[
-                        :num_non_spec_tokens
-                    ],
-                    use_qk_l2norm_in_kernel=True,
-                )
+            core_attn_out_non_spec, mixed_final_state = mixed_qkv_recurrence(
+                self.gdn_heads,
+                A_log=self.A_log,
+                a=a,
+                b=b,
+                dt_bias=self.dt_bias,
+                mixed_qkv=mixed_qkv_non_spec,
+                initial_state=ssm_state,
+                inplace_final_state=not compare_mixed_qkv,
+                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                    : attn_metadata.num_decodes + 1
+                ],
+                state_indices=non_spec_state_indices_tensor[:num_non_spec_tokens],
+                schedule=self.gdn_policy.schedule,
             )
             if compare_mixed_qkv:
                 query_ref, key_ref, value_ref = self.rearrange_mixed_qkv(
@@ -5813,6 +4127,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         :num_non_spec_tokens
                     ],
                     use_qk_l2norm_in_kernel=True,
+                    schedule=self.gdn_policy.schedule,
                 )
                 out_max_diff, out_mean_diff, out_num_different = _sm70_diff_stats(
                     core_attn_out_non_spec,
@@ -5893,22 +4208,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and (
                 mixed_qkv_spec.is_contiguous()
                 or (
-                    mixed_qkv_spec.shape[0] in (5, 20)
+                    (mixed_qkv_spec.shape[0] in (5, 20) or self._spec_replay)
                     and mixed_qkv_spec.stride(1) == 1
                     and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
                 )
             )
-            and (1 < mixed_qkv_spec.shape[0] <= 16 or mixed_qkv_spec.shape[0] == 20)
+            and (
+                1 < mixed_qkv_spec.shape[0] <= 16
+                or mixed_qkv_spec.shape[0] == 20
+                or (self._spec_replay and mixed_qkv_spec.stride(1) == 1)
+            )
         )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
         else:
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         prefill_l2norm_in_kernel = False
-        use_original_flashqla_prefill = _sm70_flashqla_original_prefill_enabled()
         prefill_gate_is_exp = False
         if attn_metadata.num_prefills > 0:
-            profile_start = _sm70_gdn_prefill_profile_start()
+            profile_start = self._gdn_profiler.start()
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
@@ -5919,43 +4237,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_non_spec = a
                 b_non_spec = b
 
-            if self.enable_sm70_legacy_prefill_prep:
-                query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
-                    mixed_qkv_non_spec
-                )
-                g_non_spec, beta_non_spec = fused_gdn_gating(
-                    self.A_log, a_non_spec, b_non_spec, self.dt_bias
-                )
-                prefill_l2norm_in_kernel = True
-            else:
-                prefill_gate_is_exp = (
-                    self.gdn_prefill_backend == "flashqla_sm70"
-                    and not use_original_flashqla_prefill
-                )
-                (
-                    query_non_spec,
-                    key_non_spec,
-                    value_non_spec,
-                    g_non_spec,
-                    beta_non_spec,
-                ) = fused_post_conv_prep(
-                    conv_output=mixed_qkv_non_spec,
-                    a=a_non_spec,
-                    b=b_non_spec,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    num_k_heads=self.num_k_heads // self.tp_size,
-                    head_k_dim=self.head_k_dim,
-                    head_v_dim=self.head_v_dim,
-                    apply_l2norm=True,
-                    output_g_exp=prefill_gate_is_exp,
-                )
-                query_non_spec = query_non_spec.unsqueeze(0)
-                key_non_spec = key_non_spec.unsqueeze(0)
-                value_non_spec = value_non_spec.unsqueeze(0)
-                g_non_spec = g_non_spec.unsqueeze(0)
-                beta_non_spec = beta_non_spec.unsqueeze(0)
-            _sm70_gdn_prefill_profile_end(
+            prefill_l2norm_in_kernel = self.gdn_preparation.legacy
+            prefill_gate_is_exp = self.gdn_preparation.gate_is_exp
+            (
+                query_non_spec,
+                key_non_spec,
+                value_non_spec,
+                g_non_spec,
+                beta_non_spec,
+            ) = self.gdn_preparation.prefill(
+                mixed_qkv_non_spec,
+                a_non_spec,
+                b_non_spec,
+                self.A_log,
+                self.dt_bias,
+            )
+            self._gdn_profiler.end(
                 layer_name,
                 "post_conv_prep",
                 profile_start,
@@ -6038,7 +4335,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_spec_decodes=attn_metadata.num_spec_decodes,
                     precomputed_gating=precomputed_gating,
                 )
-                last_recurrent_state = ssm_state
+                _last_recurrent_state = ssm_state
                 _log_runtime_route_once(
                     "SM70 DFlash2 packed GDN target-verification route hit."
                     if spec_rows_are_batch
@@ -6076,7 +4373,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ],
                     num_spec_decodes=attn_metadata.num_spec_decodes,
                 )
-                last_recurrent_state = ssm_state
+                _last_recurrent_state = ssm_state
             elif use_sm70_mixed_qkv_verify:
                 assert mixed_qkv_spec is not None
                 assert spec_query_start_loc is not None
@@ -6086,40 +4383,76 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 direct_verify_out = bool(
                     spec_rows_are_batch
                     and num_actual_tokens == mixed_qkv_spec.shape[0]
-                    and num_actual_tokens in (5, 20)
+                    and (num_actual_tokens in (5, 20) or self._spec_replay)
                     and core_attn_out.is_contiguous()
                     and core_attn_out.dtype == mixed_qkv_spec.dtype
                 )
-                core_attn_out_spec, last_recurrent_state = (
-                    fused_sigmoid_gating_delta_rule_update_mixed_qkv(
-                        A_log=self.A_log,
-                        a=a_spec,
-                        b=b_spec,
-                        dt_bias=self.dt_bias,
-                        mixed_qkv=mixed_qkv_spec,
-                        num_q_heads=self.num_k_heads // self.tp_size,
-                        num_v_heads=self.num_v_heads // self.tp_size,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=spec_query_start_loc[
-                            : attn_metadata.num_spec_decodes + 1
-                        ],
-                        ssm_state_indices=spec_state_indices_tensor,
-                        num_accepted_tokens=spec_state_slot_selectors,
-                        use_qk_l2norm_in_kernel=True,
-                        out=(
-                            core_attn_out[:num_actual_tokens].unsqueeze(0)
-                            if direct_verify_out
-                            else None
-                        ),
+                verified = (
+                    self.verification_update(
+                        self.A_log,
+                        self.dt_bias,
+                        attn_metadata.num_spec_decodes,
+                        mixed_qkv_spec,
+                        a_spec,
+                        b_spec,
+                        ssm_state,
+                        core_attn_out,
+                        num_actual_tokens,
+                        direct_verify_out,
+                        spec_query_start_loc,
+                        spec_state_indices_tensor,
+                        spec_state_slot_selectors,
+                        replay=self._spec_replay_args() if self._spec_replay else None,
                     )
+                    if self.verification_update is not None
+                    else None
                 )
+                if verified is None and self._spec_replay:
+                    raise RuntimeError(
+                        "GDN speculative replay: the CUDA verifier rejected "
+                        f"{mixed_qkv_spec.shape[0]} rows (requests="
+                        f"{attn_metadata.num_spec_decodes}, dtype="
+                        f"{mixed_qkv_spec.dtype}, strides={mixed_qkv_spec.stride()}, "
+                        f"state={ssm_state.dtype})."
+                    )
+                if verified is not None:
+                    core_attn_out_spec, _last_recurrent_state = verified
+                else:
+                    core_attn_out_spec, _last_recurrent_state = (
+                        fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                            A_log=self.A_log,
+                            a=a_spec,
+                            b=b_spec,
+                            dt_bias=self.dt_bias,
+                            mixed_qkv=mixed_qkv_spec,
+                            num_q_heads=self.num_k_heads // self.tp_size,
+                            num_v_heads=self.num_v_heads // self.tp_size,
+                            head_k_dim=self.head_k_dim,
+                            head_v_dim=self.head_v_dim,
+                            initial_state=ssm_state,
+                            inplace_final_state=True,
+                            cu_seqlens=spec_query_start_loc[
+                                : attn_metadata.num_spec_decodes + 1
+                            ],
+                            ssm_state_indices=spec_state_indices_tensor,
+                            num_accepted_tokens=spec_state_slot_selectors,
+                            use_qk_l2norm_in_kernel=True,
+                            out=(
+                                core_attn_out[:num_actual_tokens].unsqueeze(0)
+                                if direct_verify_out
+                                else None
+                            ),
+                            schedule=self.gdn_policy.schedule,
+                        )
+                    )
                 _log_runtime_route_once(
                     "SM70 mixed-QKV fused GDN target-verification route hit."
                 )
             else:
+                if self._spec_replay:
+                    raise RuntimeError(
+                        "GDN speculative replay requires the mixed-QKV verifier."
+                    )
                 assert query_spec is not None
                 assert key_spec is not None
                 assert value_spec is not None
@@ -6127,7 +4460,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # kernel computes the sigmoid gating itself, so g/beta never
                 # materialize and the surrounding elementwise work disappears.
                 # Same routine the DFlash2 branch above already uses.
-                core_attn_out_spec, last_recurrent_state = (
+                core_attn_out_spec, _last_recurrent_state = (
                     fused_sigmoid_gating_delta_rule_update(
                         A_log=self.A_log,
                         a=a_spec,
@@ -6145,142 +4478,44 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         ssm_state_indices=spec_state_indices_tensor,
                         num_accepted_tokens=spec_state_slot_selectors,
                         use_qk_l2norm_in_kernel=True,
+                        schedule=self.gdn_policy.schedule,
                     )
                 )
         else:
-            core_attn_out_spec, last_recurrent_state = None, None
+            core_attn_out_spec, _last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            assert non_spec_state_indices_tensor is not None
-            assert has_initial_state is not None
-            use_indexed_original_prefill = (
-                self.gdn_prefill_backend == "flashqla_sm70"
-                and use_original_flashqla_prefill
-                and _sm70_flashqla_indexed_prefill_enabled()
-                and non_spec_state_indices_tensor.ndim == 1
-            )
-            profile_start = _sm70_gdn_prefill_profile_start()
-            if use_indexed_original_prefill:
-                initial_state = ssm_state
-            else:
-                initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()  # type: ignore[index]
-                initial_state[~has_initial_state, ...] = 0  # type: ignore[operator]
-            _sm70_gdn_prefill_profile_end(
-                layer_name,
-                "state_gather",
-                profile_start,
-                tokens=num_non_spec_tokens,
-                details=(
-                    f"state_shape={tuple(initial_state.shape)} "
-                    f"indices_contig={non_spec_state_indices_tensor.is_contiguous()} "
-                    f"indexed={use_indexed_original_prefill}"
-                ),
-            )
-            if use_indexed_original_prefill:
-                _sm70_gdn_graph_buffer_copy_state_slice(
-                    "prefill_initial_state",
-                    layer_name,
-                    ssm_state,
-                    non_spec_state_indices_tensor,
-                    int(has_initial_state.shape[0]),
-                )
-            else:
-                _sm70_gdn_graph_buffer_copy(
-                    "prefill_initial_state",
-                    layer_name,
-                    initial_state,
-                    "state",
-                )
-            prefill_core_attn_out = None
-            if (
-                _sm70_flashqla_direct_output_enabled()
+            prefill_core_attn_out = (
+                core_attn_out
+                if self.gdn_policy.direct_prefill_output
                 and spec_sequence_masks is None
                 and core_attn_out.shape[0] >= num_non_spec_tokens
-            ):
-                prefill_core_attn_out = core_attn_out
-
-            profile_start = _sm70_gdn_prefill_profile_start()
-            chunk_kwargs = {
-                "q": query_non_spec,
-                "k": key_non_spec,
-                "v": value_non_spec,
-                "g": g_non_spec,
-                "beta": beta_non_spec,
-                "initial_state": initial_state,
-                "output_final_state": not use_indexed_original_prefill,
-                "cu_seqlens": non_spec_query_start_loc,
-                "chunk_indices": attn_metadata.chunk_indices,
-                "chunk_offsets": attn_metadata.chunk_offsets,
-                "use_qk_l2norm_in_kernel": prefill_l2norm_in_kernel,
-                "gate_is_exp": prefill_gate_is_exp,
-                "core_attn_out": prefill_core_attn_out,
-            }
-            if self.gdn_prefill_backend == "flashqla_sm70":
-                chunk_kwargs.update(
-                    {
-                        "state_indices": (
-                            non_spec_state_indices_tensor
-                            if use_indexed_original_prefill
-                            else None
-                        ),
-                        "has_initial_state": (
-                            has_initial_state if use_indexed_original_prefill else None
-                        ),
-                        "inplace_final_state": use_indexed_original_prefill,
-                    }
-                )
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(**chunk_kwargs)
-            _sm70_gdn_prefill_profile_end(
-                layer_name,
-                "core_call",
-                profile_start,
-                tokens=num_non_spec_tokens,
-                details=f"backend={self.gdn_prefill_backend}",
+                else None
             )
-            _sm70_gdn_graph_buffer_copy(
-                "prefill_core_out",
-                layer_name,
-                core_attn_out_non_spec,
-                "core",
-            )
-            if last_recurrent_state is not None:
-                _sm70_gdn_graph_buffer_copy(
-                    "prefill_last_recurrent_state",
-                    layer_name,
-                    last_recurrent_state,
-                    "state",
+            core_attn_out_non_spec, _last_recurrent_state = (
+                self.chunk_gated_delta_rule.execute_prefill(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    ssm_state=ssm_state,
+                    state_indices=non_spec_state_indices_tensor,
+                    has_initial_state=has_initial_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=prefill_l2norm_in_kernel,
+                    gate_is_exp=prefill_gate_is_exp,
+                    core_attn_out=prefill_core_attn_out,
+                    layer_name=layer_name,
+                    num_tokens=num_non_spec_tokens,
                 )
-            # Init cache
-            profile_start = _sm70_gdn_prefill_profile_start()
-            if not use_indexed_original_prefill:
-                assert last_recurrent_state is not None
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                    ssm_state.dtype
-                )
-            _sm70_gdn_prefill_profile_end(
-                layer_name,
-                "state_writeback",
-                profile_start,
-                tokens=num_non_spec_tokens,
-                details=(
-                    f"state_dtype={ssm_state.dtype} "
-                    f"indexed={use_indexed_original_prefill}"
-                ),
-            )
-            _sm70_gdn_graph_buffer_copy_state_slice(
-                "prefill_post_ssm_state",
-                layer_name,
-                ssm_state,
-                non_spec_state_indices_tensor,
-                int(has_initial_state.shape[0]),
             )
         elif attn_metadata.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
-            core_attn_out_non_spec, last_recurrent_state = (
+            core_attn_out_non_spec, _last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
                     a=a,
@@ -6299,6 +4534,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         :num_non_spec_tokens
                     ],
                     use_qk_l2norm_in_kernel=True,
+                    schedule=self.gdn_policy.schedule,
                 )
             )
             _sm70_gdn_graph_buffer_copy(
@@ -6315,7 +4551,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_non_spec_tokens,
             )
         else:
-            core_attn_out_non_spec, last_recurrent_state = None, None
+            core_attn_out_non_spec, _last_recurrent_state = None, None
 
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
@@ -6477,13 +4713,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        mixed_qkv_non_spec = causal_conv1d_update(
+        mixed_qkv_non_spec = convolve_decode(
             mixed_qkv,
             conv_state,
             conv_weights,
             self.conv1d.bias,
             self.activation,
-            conv_state_indices=state_indices,  # type: ignore[arg-type]
+            state_indices=state_indices,  # type: ignore[arg-type]
             validate_data=False,
         )
         _sm70_gdn_graph_buffer_copy(
@@ -6578,22 +4814,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             return
         _log_runtime_route_once("SM70 exact mixed-QKV GDN decode route enabled.")
-        fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
+        mixed_qkv_recurrence(
+            self.gdn_heads,
             A_log=self.A_log,
             a=a,
             b=b,
             dt_bias=self.dt_bias,
             mixed_qkv=mixed_qkv_non_spec,
-            num_q_heads=self.num_k_heads // self.tp_size,
-            num_v_heads=self.num_v_heads // self.tp_size,
-            head_k_dim=self.head_k_dim,
-            head_v_dim=self.head_v_dim,
-            scale=self.head_k_dim**-0.5,
             initial_state=ssm_state,
             out=out_buf,
             cu_seqlens=cu_seqlens,
-            ssm_state_indices=state_indices,  # type: ignore[arg-type]
-            use_qk_l2norm_in_kernel=True,
+            state_indices=state_indices,  # type: ignore[arg-type]
+            schedule=self.gdn_policy.schedule,
         )
         _sm70_gdn_graph_buffer_copy("recurrent_out", layer_name, out_buf, "core")
         _sm70_gdn_graph_buffer_copy_state_slice(
@@ -6637,39 +4869,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 out=packed_out,
                 ssm_state_indices=local_indices,
                 use_qk_l2norm_in_kernel=True,
+                schedule=self.gdn_policy.schedule,
             )
-            fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
+            mixed_qkv_recurrence(
+                self.gdn_heads,
                 A_log=self.A_log,
                 a=cmp_a,
                 b=cmp_b,
                 dt_bias=self.dt_bias,
                 mixed_qkv=cmp_mixed_qkv,
-                num_q_heads=self.num_k_heads // self.tp_size,
-                num_v_heads=self.num_v_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                scale=self.head_k_dim**-0.5,
                 initial_state=mixed_state,
                 out=mixed_out,
                 cu_seqlens=local_cu_seqlens,
-                ssm_state_indices=local_indices,
-                use_qk_l2norm_in_kernel=True,
+                state_indices=local_indices,
+                schedule=self.gdn_policy.schedule,
             )
-            ref_out, ref_state = fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+            ref_out, ref_state = mixed_qkv_recurrence(
+                self.gdn_heads,
                 A_log=self.A_log,
                 a=cmp_a,
                 b=cmp_b,
                 dt_bias=self.dt_bias,
                 mixed_qkv=cmp_mixed_qkv,
-                num_q_heads=self.num_k_heads // self.tp_size,
-                num_v_heads=self.num_v_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
                 initial_state=ref_state,
                 inplace_final_state=True,
                 cu_seqlens=local_cu_seqlens,
-                ssm_state_indices=local_indices,
-                use_qk_l2norm_in_kernel=True,
+                state_indices=local_indices,
+                schedule=self.gdn_policy.schedule,
             )
             _sm70_save_gdn_packed_compare_report(
                 report_path,
@@ -6721,7 +4947,12 @@ def qwen_gdn_attention_core(
         candidate = attn_metadata_raw.get(layer_name)
         if isinstance(candidate, GDNAttentionMetadata):
             attn_metadata = candidate
-    _sm70_assert_standard_core_not_active_spec(layer_name, attn_metadata)
+    _sm70_assert_standard_core_not_active_spec(
+        layer_name,
+        attn_metadata,
+        enabled=self.gdn_state_trace.assert_standard_boundary,
+        spec_core=self.gdn_policy.state.spec_core,
+    )
     if conv_state_cache.numel() == 0 and ssm_state_cache.numel() == 0:
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
@@ -6834,6 +5065,10 @@ def qwen_gdn_attention_core_standard_spec(
         and non_spec_query_start_loc.numel() > 0
         and non_spec_state_indices_tensor.numel() > 0
     ):
+        if self._spec_replay:
+            self._commit_replayed_decodes(
+                ssm_state_cache, attn_metadata, non_spec_state_indices_tensor
+            )
         self._forward_core_decode_non_spec_explicit(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -6850,25 +5085,18 @@ def qwen_gdn_attention_core_standard_spec(
         )
         return
 
-    restore_fields: dict[str, object] = {}
-
-    def _patch_metadata(name: str, tensor: torch.Tensor) -> None:
-        if attn_metadata is not None and tensor.numel() > 0:
-            restore_fields[name] = getattr(attn_metadata, name)
-            setattr(attn_metadata, name, tensor)
-
-    _patch_metadata("non_spec_query_start_loc", non_spec_query_start_loc)
-    _patch_metadata("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
-    _patch_metadata("spec_query_start_loc", spec_query_start_loc)
-    _patch_metadata("spec_state_indices_tensor", spec_state_indices_tensor)
-    _patch_metadata("spec_token_indx", spec_token_indx)
-    _patch_metadata("non_spec_token_indx", non_spec_token_indx)
-    _patch_metadata("spec_sequence_masks", spec_sequence_masks)
-    _patch_metadata("num_accepted_tokens", num_accepted_tokens)
-    if spec_state_slot_selectors.numel() == 0:
-        spec_state_slot_selectors = num_accepted_tokens
-    _patch_metadata("spec_state_slot_selectors", spec_state_slot_selectors)
-    try:
+    with GdnMetadataOverride(attn_metadata, skip_empty=True) as view:
+        view.set("non_spec_query_start_loc", non_spec_query_start_loc)
+        view.set("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
+        view.set("spec_query_start_loc", spec_query_start_loc)
+        view.set("spec_state_indices_tensor", spec_state_indices_tensor)
+        view.set("spec_token_indx", spec_token_indx)
+        view.set("non_spec_token_indx", non_spec_token_indx)
+        view.set("spec_sequence_masks", spec_sequence_masks)
+        view.set("num_accepted_tokens", num_accepted_tokens)
+        if spec_state_slot_selectors.numel() == 0:
+            spec_state_slot_selectors = num_accepted_tokens
+        view.set("spec_state_slot_selectors", spec_state_slot_selectors)
         self._forward_core(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -6876,10 +5104,6 @@ def qwen_gdn_attention_core_standard_spec(
             core_attn_out=core_attn_out,
             kv_cache=(conv_state_cache, ssm_state_cache),
         )
-    finally:
-        if attn_metadata is not None:
-            for name, value in restore_fields.items():
-                setattr(attn_metadata, name, value)
     _sm70_dump_gdn_core_tensor(
         "core_out", layer_name, core_attn_out, "core_standard_spec"
     )
@@ -6925,26 +5149,18 @@ def qwen_gdn_attention_core_spec_commit(
         or attn_metadata.spec_sequence_masks is None
     )
     if fallback_to_standard:
-        fallback_restore_fields: dict[str, object] = {}
-
-        def _patch_fallback_metadata(name: str, value: object) -> None:
-            if attn_metadata is None:
-                return
-            fallback_restore_fields[name] = getattr(attn_metadata, name)
-            setattr(attn_metadata, name, value)
-
-        if (
-            attn_metadata is not None
-            and attn_metadata.num_spec_decodes <= 0
-            and attn_metadata.spec_sequence_masks is not None
-        ):
-            _patch_fallback_metadata("spec_sequence_masks", None)
-            _patch_fallback_metadata("spec_token_indx", None)
-            _patch_fallback_metadata("non_spec_token_indx", None)
-            _patch_fallback_metadata("spec_query_start_loc", None)
-            _patch_fallback_metadata("spec_state_indices_tensor", None)
-            _patch_fallback_metadata("num_accepted_tokens", None)
-        try:
+        with GdnMetadataOverride(attn_metadata) as view:
+            if (
+                attn_metadata is not None
+                and attn_metadata.num_spec_decodes <= 0
+                and attn_metadata.spec_sequence_masks is not None
+            ):
+                view.set("spec_sequence_masks", None)
+                view.set("spec_token_indx", None)
+                view.set("non_spec_token_indx", None)
+                view.set("spec_query_start_loc", None)
+                view.set("spec_state_indices_tensor", None)
+                view.set("num_accepted_tokens", None)
             qwen_gdn_attention_core_standard(
                 mixed_qkv,
                 b,
@@ -6956,10 +5172,6 @@ def qwen_gdn_attention_core_spec_commit(
                 non_spec_state_indices_tensor,
                 layer_name,
             )
-        finally:
-            if attn_metadata is not None:
-                for name, value in fallback_restore_fields.items():
-                    setattr(attn_metadata, name, value)
         return core_attn_out
     assert attn_metadata is not None
     pure_spec_decode = (
@@ -7131,16 +5343,22 @@ def qwen_gdn_attention_core_spec_commit(
             precomputed_gating = (g, beta)
             _log_runtime_route_once("SM70 DFlash2 conv/gating/zero route hit.")
         else:
-            mixed_qkv_spec = causal_conv1d_update(
+            mixed_qkv_spec = convolve_decode(
                 mixed_qkv,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0],
+                state_indices=spec_state_indices_tensor[:, 0],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # Replay keeps one state block per request, so the index
+                # width no longer bounds the rows of a verification round.
+                max_query_len=(
+                    self._replay_stride
+                    if self._spec_replay
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
         if isinstance(self, QwenGatedDeltaNetAttention) and (
@@ -7192,6 +5410,7 @@ def qwen_gdn_attention_core_spec_commit(
             ssm_state_indices=spec_state_indices_tensor,
             num_accepted_tokens=spec_state_slot_selectors,
             use_qk_l2norm_in_kernel=True,
+            schedule=self.gdn_policy.schedule,
         )
         core_attn_out[: mixed_qkv.shape[0]] = core_attn_out_spec.squeeze(0)
         _sm70_dump_gdn_core_tensor(
@@ -7199,35 +5418,25 @@ def qwen_gdn_attention_core_spec_commit(
         )
         return core_attn_out
 
-    restore_fields: dict[str, object] = {}
-
-    def _patch_metadata(name: str, value: torch.Tensor) -> None:
-        restore_fields[name] = getattr(attn_metadata, name)
-        setattr(attn_metadata, name, value)
-
-    def _patch_metadata_scalar(name: str, value: int) -> None:
-        restore_fields[name] = getattr(attn_metadata, name)
-        setattr(attn_metadata, name, value)
-
-    _patch_metadata("non_spec_query_start_loc", non_spec_query_start_loc)
-    _patch_metadata("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
-    _patch_metadata("spec_query_start_loc", spec_query_start_loc)
-    _patch_metadata("spec_state_indices_tensor", spec_state_indices_tensor)
-    _patch_metadata("spec_token_indx", spec_token_indx)
-    _patch_metadata("non_spec_token_indx", non_spec_token_indx)
-    _patch_metadata("spec_sequence_masks", spec_sequence_masks)
-    _patch_metadata("num_accepted_tokens", num_accepted_tokens)
-    _patch_metadata("spec_state_slot_selectors", spec_state_slot_selectors)
-    if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-        # The tensor rows are the graph-visible contract for FULL graph replay.
-        # They include PAD_SLOT_ID rows with zero-length query ranges, so the
-        # conv/recurrent kernels can skip padded rows without relying on the
-        # capture-time Python num_spec_decodes scalar.
-        _patch_metadata_scalar(
-            "num_spec_decodes",
-            int(spec_state_indices_tensor.shape[0]),
-        )
-    try:
+    with GdnMetadataOverride(attn_metadata) as view:
+        view.set("non_spec_query_start_loc", non_spec_query_start_loc)
+        view.set("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
+        view.set("spec_query_start_loc", spec_query_start_loc)
+        view.set("spec_state_indices_tensor", spec_state_indices_tensor)
+        view.set("spec_token_indx", spec_token_indx)
+        view.set("non_spec_token_indx", non_spec_token_indx)
+        view.set("spec_sequence_masks", spec_sequence_masks)
+        view.set("num_accepted_tokens", num_accepted_tokens)
+        view.set("spec_state_slot_selectors", spec_state_slot_selectors)
+        if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+            # The tensor rows are the graph-visible contract for FULL graph replay.
+            # They include PAD_SLOT_ID rows with zero-length query ranges, so the
+            # conv/recurrent kernels can skip padded rows without relying on the
+            # capture-time Python num_spec_decodes scalar.
+            view.set(
+                "num_spec_decodes",
+                int(spec_state_indices_tensor.shape[0]),
+            )
         self._forward_core(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -7235,9 +5444,6 @@ def qwen_gdn_attention_core_spec_commit(
             core_attn_out=core_attn_out,
             kv_cache=(conv_state_cache, ssm_state_cache),
         )
-    finally:
-        for name, value in restore_fields.items():
-            setattr(attn_metadata, name, value)
     _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out, metadata_source)
     return core_attn_out
 
@@ -7287,6 +5493,10 @@ def qwen_gdn_attention_core_standard(
         and non_spec_query_start_loc.numel() > 0
         and non_spec_state_indices_tensor.numel() > 0
     ):
+        if self._spec_replay:
+            self._commit_replayed_decodes(
+                ssm_state_cache, attn_metadata, non_spec_state_indices_tensor
+            )
         self._forward_core_decode_non_spec_explicit(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -7303,21 +5513,9 @@ def qwen_gdn_attention_core_standard(
         )
         return
 
-    restore_query_start_loc = False
-    restore_state_indices = False
-    if attn_metadata is not None and non_spec_query_start_loc.numel() > 0:
-        old_non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-        attn_metadata.non_spec_query_start_loc = non_spec_query_start_loc
-        restore_query_start_loc = True
-    else:
-        old_non_spec_query_start_loc = None
-    if attn_metadata is not None and non_spec_state_indices_tensor.numel() > 0:
-        old_non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
-        attn_metadata.non_spec_state_indices_tensor = non_spec_state_indices_tensor
-        restore_state_indices = True
-    else:
-        old_non_spec_state_indices_tensor = None
-    try:
+    with GdnMetadataOverride(attn_metadata, skip_empty=True) as view:
+        view.set("non_spec_query_start_loc", non_spec_query_start_loc)
+        view.set("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
         self._forward_core(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -7325,13 +5523,6 @@ def qwen_gdn_attention_core_standard(
             core_attn_out=core_attn_out,
             kv_cache=(conv_state_cache, ssm_state_cache),
         )
-    finally:
-        if restore_query_start_loc and attn_metadata is not None:
-            attn_metadata.non_spec_query_start_loc = old_non_spec_query_start_loc
-        if restore_state_indices and attn_metadata is not None:
-            attn_metadata.non_spec_state_indices_tensor = (
-                old_non_spec_state_indices_tensor
-            )
     _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out, "core_standard")
 
 
@@ -7752,7 +5943,7 @@ def qwen_gdn_input_projection_core(
         )
         if copied_tails:
             mixed_qkv, b, a = _split_gdn_projection_tails(mixed_qkvz, ba, z_out)
-            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+            if self.gdn_policy.projection.mixed_qkv_contiguous:
                 mixed_qkv = mixed_qkv.contiguous()
             _log_runtime_route_once("SM70 GDN projection tail-copy route hit.")
         elif self.gqa_interleaved_layout:
@@ -7769,7 +5960,7 @@ def qwen_gdn_input_projection_core(
             qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
             z_size = self.value_dim // self.tp_size
             mixed_qkv = mixed_qkvz[..., :qkv_size]
-            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+            if self.gdn_policy.projection.mixed_qkv_contiguous:
                 mixed_qkv = mixed_qkv.contiguous()
             z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
@@ -7786,7 +5977,7 @@ def qwen_gdn_input_projection_core(
 
         if not copied_tails:
             if (
-                envs.VLLM_SM70_GDN_Z_CONTIGUOUS
+                self.gdn_policy.projection.z_contiguous
                 and current_platform.is_device_capability(70)
             ):
                 z = z.contiguous()
@@ -7903,7 +6094,10 @@ def qwen_gdn_input_projection(
             b = b[:, ba_start : ba_start + ba_chunk]
             a = a[:, ba_start : ba_start + ba_chunk]
 
-    if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(70):
+    if (
+        self.gdn_policy.projection.z_contiguous
+        and current_platform.is_device_capability(70)
+    ):
         z = z.contiguous()
     mixed_qkv_out.copy_(mixed_qkv)
     z_out.copy_(z)
@@ -8039,82 +6233,3 @@ direct_register_custom_op(
     ],
     fake_impl=qwen_gdn_attention_core_003_spec_fake,
 )
-
-
-@triton.jit
-def fused_gdn_gating_kernel(
-    g,
-    beta_output,
-    A_log,
-    a,
-    b,
-    dt_bias,
-    seq_len,
-    NUM_HEADS: tl.constexpr,
-    beta: tl.constexpr,
-    threshold: tl.constexpr,
-    BLK_HEADS: tl.constexpr,
-):
-    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
-    mask = head_off < NUM_HEADS
-    blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
-    blk_b = tl.load(b + off, mask=mask)
-    blk_bias = tl.load(dt_bias + head_off, mask=mask)
-    # If the model is loaded in fp16, without the .float() here, A might be -inf
-    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
-    softplus_x = tl.where(
-        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-    )
-    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
-    # compute beta_output = sigmoid(b)
-    blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(
-        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
-    )
-
-
-def fused_gdn_gating(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    beta: float = 1.0,
-    threshold: float = 20.0,
-    *,
-    beta_dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fused computation of g and beta for Gated Delta Net.
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-    beta_output = b.sigmoid(), materialized in beta_dtype when provided.
-
-    Speculative recurrent updates request FP32 beta to match the fused packed
-    decode transition. Other callers retain the historical b.dtype output.
-    TODO maybe use torch.compile to replace this triton kernel
-    """
-    batch, num_heads = a.shape
-    seq_len = 1
-    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
-    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    if beta_dtype is None:
-        beta_dtype = b.dtype
-    beta_output = torch.empty(1, batch, num_heads, dtype=beta_dtype, device=b.device)
-    fused_gdn_gating_kernel[grid](
-        g,
-        beta_output,
-        A_log,
-        a,
-        b,
-        dt_bias,
-        seq_len,
-        num_heads,
-        beta,
-        threshold,
-        8,
-        num_warps=1,
-    )
-    return g, beta_output

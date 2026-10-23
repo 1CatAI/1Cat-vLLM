@@ -8,7 +8,9 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm._sm70.policy import NativeBindings, call_gguf_native, register_policy_op
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.sm70_native import capture_linear_native_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
@@ -22,15 +24,18 @@ from vllm.model_executor.kernels.gguf import (
     select_lattice_grouped_capability,
     small_grouped_vector_capabilities,
 )
+from vllm.model_executor.layers.fused_moe.sm70.reduction import weighted_reduce_rows
 from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
     SM70_SMALL_ROUTING,
 )
+from vllm.model_executor.layers.quantization import gguf_device_transcode
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     LATTICE_TYPES,
     LatticeGGUFProjection,
     transcode_lattice,
 )
 from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
+    LUT4_IQ,
     LUT4_TYPES,
     Lut4GGUFProjection,
     transcode_lut4,
@@ -43,7 +48,7 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
     transcode_affine,
 )
 from vllm.platforms import current_platform
-from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
+from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -66,6 +71,7 @@ def _expert_gate_up(
     top_k: int,
     raw_batches: list[int],
     vector_bands: list[int],
+    native_policy: list[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Resolve original M inside the opaque op. Range compilation must not
     # freeze the prefill choice for subsequent MTP verification batches.
@@ -97,7 +103,9 @@ def _expert_gate_up(
             (gate, gate_ptrs, gate_stats),
             (up, up_ptrs, up_stats),
         ):
-            op(
+            call_gguf_native(
+                op,
+                native_policy,
                 out,
                 x,
                 offsets,
@@ -127,16 +135,22 @@ def _expert_gate_up_fake(
     top_k,
     raw_batches,
     vector_bands,
+    native_policy: list[str] | None = None,
 ):
     return x.new_empty((x.shape[0], output_size)), x.new_empty(
         (x.shape[0], output_size)
     )
 
 
-direct_register_custom_op(
-    op_name="gguf_expert_gate_up",
-    op_func=_expert_gate_up,
-    fake_impl=_expert_gate_up_fake,
+register_policy_op(
+    "gguf_expert_gate_up",
+    "(Tensor x, Tensor offsets, Tensor ids, Tensor raw_gate, Tensor raw_up,"
+    " Tensor gate_ptrs, Tensor gate_stats, Tensor up_ptrs, Tensor up_stats,"
+    " int source_type, int experts, int group, int output_size, int top_k, "
+    "int[] raw_batches, int[] vector_bands, str[]? native_policy=None) -> "
+    "(Tensor, Tensor)",
+    _expert_gate_up,
+    _expert_gate_up_fake,
 )
 
 
@@ -151,6 +165,7 @@ def _expert_down(
     experts: int,
     group: int,
     vector_batches: list[int],
+    native_policy: list[str] | None = None,
 ) -> None:
     # Inspect actual routed rows inside the opaque boundary, including graph
     # capture. Range compilation must not freeze the prefill fallback.
@@ -169,7 +184,18 @@ def _expert_down(
             if source_type == 20
             else torch.ops._C.gguf_affine_grouped_gemm_sm70_out
         )
-        op(out, x, offsets, weight_ptrs, stat_ptrs, decoder, experts, group)
+        call_gguf_native(
+            op,
+            native_policy,
+            out,
+            x,
+            offsets,
+            weight_ptrs,
+            stat_ptrs,
+            decoder,
+            experts,
+            group,
+        )
 
 
 def _expert_down_fake(
@@ -183,15 +209,18 @@ def _expert_down_fake(
     experts,
     group,
     vector_batches,
+    native_policy: list[str] | None = None,
 ):
     return None
 
 
-direct_register_custom_op(
-    op_name="gguf_expert_down",
-    op_func=_expert_down,
-    mutates_args=["out"],
-    fake_impl=_expert_down_fake,
+register_policy_op(
+    "gguf_expert_down",
+    "(Tensor(a!) out, Tensor x, Tensor offsets, Tensor weight_ptrs, Tensor "
+    "stat_ptrs, int source_type, int decoder, int experts, int group, int[]"
+    " vector_batches, str[]? native_policy=None) -> ()",
+    _expert_down,
+    _expert_down_fake,
 )
 
 
@@ -218,6 +247,7 @@ def _expert_dp4a(
     down_vector_batches: list[int],
     dp4a_batches: list[int],
     q8_intermediate_batches: list[int],
+    native_policy: list[str] | None = None,
 ) -> torch.Tensor:
     # Resolve actual M inside the opaque boundary so range compilation cannot
     # freeze a prefill choice into an MTP verification graph.
@@ -265,8 +295,19 @@ def _expert_dp4a(
                 4 if quantized_hidden else 16,
             )
         else:
+            # Bank-aware codebook loads: byte-identical and faster in the full
+            # model. The fully unrolled K2560 loop (lanes 0) wins in isolation
+            # but loses in-model next to the concurrent shared expert.
             torch.ops._C.gguf_dp4a_gate_up_sm70_out(
-                hidden, q8, ids, raw_gate, raw_up, source_type, True
+                hidden,
+                q8,
+                ids,
+                raw_gate,
+                raw_up,
+                source_type,
+                True,
+                16,
+                quantized_hidden,
             )
         torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
             output,
@@ -299,6 +340,7 @@ def _expert_dp4a(
         top_k,
         raw_batches,
         vector_bands,
+        native_policy,
     )
     hidden = (torch.nn.functional.silu(gate) * up).contiguous()
     down = x.new_empty((m * top_k, x.shape[1]))
@@ -313,6 +355,7 @@ def _expert_dp4a(
         experts,
         32,
         down_vector_batches,
+        native_policy,
     )
     return torch.ops.vllm.sm70_small_expert_unroute(down, inverse, probabilities)
 
@@ -340,20 +383,199 @@ def _expert_dp4a_fake(
     down_vector_batches,
     dp4a_batches,
     q8_intermediate_batches,
+    native_policy: list[str] | None = None,
+):
+    return torch.empty_like(x)
+
+
+register_policy_op(
+    "gguf_expert_dp4a",
+    "(Tensor x, Tensor ids, Tensor probabilities, Tensor raw_gate, Tensor "
+    "raw_up, Tensor gate_ptrs, Tensor gate_stats, Tensor up_ptrs, Tensor "
+    "up_stats, Tensor down_ptrs, Tensor down_stats, int source_type, int "
+    "down_type, int down_decoder, int experts, int group, int intermediate,"
+    " int[] raw_batches, int[] vector_bands, int[] down_vector_batches, "
+    "int[] dp4a_batches, int[] q8_intermediate_batches, str[]? "
+    "native_policy=None) -> Tensor",
+    _expert_dp4a,
+    _expert_dp4a_fake,
+)
+
+
+def _expert_mma(
+    x: torch.Tensor,
+    ids: torch.Tensor,
+    probabilities: torch.Tensor,
+    gate_codes: torch.Tensor,
+    gate_scale: torch.Tensor,
+    up_codes: torch.Tensor,
+    up_scale: torch.Tensor,
+    table: torch.Tensor,
+    down_ptrs: torch.Tensor,
+    down_stats: torch.Tensor,
+    plane_format: int,
+    down_type: int,
+    experts: int,
+    intermediate: int,
+    kw: int,
+    q8_batches: list[int],
+) -> torch.Tensor:
+    m, top_k = ids.shape
+    hidden = (
+        torch.empty(
+            (m, top_k, intermediate // 32, 36), dtype=torch.uint8, device=x.device
+        )
+        if m in q8_batches
+        else x.new_empty((m, top_k, intermediate))
+    )
+    ids32 = ids if ids.dtype == torch.int32 else ids.to(torch.int32)
+    torch.ops._C.gguf_moe_gate_up_sm70_out(
+        hidden,
+        x,
+        ids32.contiguous(),
+        gate_codes,
+        gate_scale,
+        up_codes,
+        up_scale,
+        plane_format,
+        table,
+        kw,
+    )
+    output = torch.empty_like(x)
+    torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
+        output,
+        hidden,
+        ids32,
+        probabilities,
+        down_ptrs,
+        down_stats,
+        down_type,
+        experts,
+    )
+    return output
+
+
+def _expert_mma_fake(
+    x,
+    ids,
+    probabilities,
+    gate_codes,
+    gate_scale,
+    up_codes,
+    up_scale,
+    table,
+    down_ptrs,
+    down_stats,
+    plane_format,
+    down_type,
+    experts,
+    intermediate,
+    kw,
+    q8_batches,
 ):
     return torch.empty_like(x)
 
 
 direct_register_custom_op(
-    op_name="gguf_expert_dp4a",
-    op_func=_expert_dp4a,
-    fake_impl=_expert_dp4a_fake,
+    op_name="gguf_expert_mma",
+    op_func=_expert_mma,
+    fake_impl=_expert_mma_fake,
 )
+
+MMA_MAX_TOKENS = 20
+MMA_TOP_K = 10
+MMA_PLANE_KW = 4
+
+
+def _expert_planes(raw: torch.Tensor, source_type: int, n: int, k: int):
+    """Repack [E, N, stride] original IQ3 rows into dense_mv tile planes."""
+    from vllm.model_executor.layers.quantization.gguf_moe_planes import (
+        BLOCK_BYTES,
+        expert_planes,
+    )
+
+    experts = raw.shape[0]
+    payload = k // 256 * BLOCK_BYTES[source_type]
+    rows = raw[:, :n, :payload].reshape(experts * n, payload).cpu().numpy()
+    fmt, codes, meta = expert_planes(rows, source_type)
+    return (
+        fmt,
+        torch.from_numpy(codes).to(raw.device).view(experts, -1),
+        torch.from_numpy(meta).to(raw.device).view(experts, -1),
+    )
+
+
+# Reusable pinned host chunks for staging packed expert rows.
+_STAGING_POOL: list[torch.Tensor] = []
+
+
+def _acquire_staging(nbytes: int) -> torch.Tensor:
+    for i, buf in enumerate(_STAGING_POOL):
+        if buf.numel() >= nbytes:
+            return _STAGING_POOL.pop(i)
+    return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+
+def _release_staging(buf: torch.Tensor) -> None:
+    _STAGING_POOL.append(buf)
+
+
+def release_staging_pool() -> int:
+    """Return pinned staging chunks to the OS once loading has finished."""
+    freed = sum(buf.numel() for buf in _STAGING_POOL)
+    _STAGING_POOL.clear()
+    empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+    if empty_host_cache is not None:
+        empty_host_cache()
+    return freed
+
+
+def _tp_rows(source, weight_type, rank, size, axis):
+    """This rank's packed rows as a view, or None when slicing cuts a block."""
+    if size <= 0 or not 0 <= rank < size or axis not in (0, 1):
+        raise ValueError("Invalid GGUF TP rank, size or axis")
+    block, block_bytes = quant_size(weight_type)
+    if source.dtype != np.uint8 or source.ndim != 2 or source.shape[1] % block_bytes:
+        raise ValueError("GGUF projection needs complete packed rows [N,bytes]")
+    shape = (source.shape[0], source.shape[1] // block_bytes * block)
+    span, remainder = divmod(shape[axis], size)
+    if remainder:
+        raise ValueError("GGUF TP dimension is not divisible")
+    if axis == 0:
+        return source[rank * span : (rank + 1) * span]
+    if span % block:
+        return None
+    span = span // block * block_bytes
+    return source[:, rank * span : (rank + 1) * span]
 
 
 class GGUFExpertBank(torch.nn.Module):
-    def __init__(self, source_type, experts, device, dtype, retain_raw=False):
+    # Experts per staged/transcoded chunk; bounds pinned staging and the
+    # device int64 temporaries to a few hundred MiB.
+    DEVICE_CHUNK = 128
+
+    def __init__(
+        self,
+        source_type,
+        experts,
+        device,
+        dtype,
+        retain_raw=False,
+        device_transcode=False,
+    ):
         super().__init__()
+        # Supported formats are staged per rank and transcoded on the device
+        # in chunks; the result is byte-identical to the host codecs below.
+        self.device_transcode = bool(
+            device_transcode
+            and source_type in gguf_device_transcode.DEVICE_TYPES
+            and torch.device(device).type == "cuda"
+        )
+        self.host_tp: tuple[int, int, int] | None = None
+        self.host_presliced = True
+        self.host_shape: tuple[int, ...] | None = None
+        self.staging: dict[int, tuple[torch.Tensor, np.ndarray, set[int]]] = {}
+        self.native_ops = NativeBindings(capture_linear_native_config("gguf").values)
         self.source_type = source_type
         self.experts = experts
         self.device = device
@@ -378,6 +600,9 @@ class GGUFExpertBank(torch.nn.Module):
             self.pending[index] = local.to(self.device).contiguous()
             return
         source = weight.detach().cpu().numpy()
+        if self.device_transcode:
+            self._stage(index, source, rank, size, axis)
+            return
         canonical: LatticeGGUFProjection | Lut4GGUFProjection | AffineGGUFProjection
         if self.source_type in LATTICE_TYPES:
             canonical = transcode_lattice(source, self.source_type)
@@ -437,7 +662,139 @@ class GGUFExpertBank(torch.nn.Module):
                 )
         self.pending[index] = prepared
 
+    def _stage(self, index, source, rank, size, axis):
+        """Copy this rank's packed rows into a pinned chunk.
+
+        Rows are copied straight from the (mmap-backed) source; every full
+        chunk is uploaded once and transcoded on the device.
+        """
+        if self.host_tp not in (None, (rank, size, axis)):
+            raise ValueError("GGUF expert bank mixes TP slices")
+        rows = _tp_rows(source, self.source_type, rank, size, axis)
+        presliced = rows is not None
+        if rows is None:
+            # Slicing K would cut a source block (Q2_0 TP4 down): decode full
+            # rows and slice the canonical groups, like tp_slice() does.
+            if axis != 1:
+                raise ValueError("GGUF row slice must retain source blocks")
+            rows = source
+        if self.host_tp is None:
+            self.host_tp = (rank, size, axis)
+            self.host_presliced = presliced
+            self.host_shape = rows.shape
+            block, block_bytes = quant_size(self.source_type)
+            self.n = rows.shape[0]
+            self.k = rows.shape[1] // block_bytes * block
+            if not presliced:
+                self.k //= size
+            self.group = 16 if self.source_type == 22 else 32
+            if self.source_type in gguf_device_transcode.DEVICE_LUT4_TYPES:
+                self.decoder = LUT4_IQ
+            elif self.source_type in gguf_device_transcode.DEVICE_AFFINE_TYPES:
+                self.decoder = 2  # unsigned U2 codes
+            if self.n % 32:
+                raise ValueError("Canonical GGUF expert output cuts a 32-row pack")
+            if self.k % self.group:
+                raise ValueError("GGUF canonical TP boundary cuts a group")
+            self.raw_capabilities = raw_grouped_gate_up_capabilities(
+                self.source_type,
+                self.k,
+                self.n,
+                self.experts,
+                self.dtype,
+                is_sm70=current_platform.is_device_capability(70),
+                original_storage_available=self.retain_raw,
+            )
+        elif rows.shape != self.host_shape or presliced != self.host_presliced:
+            raise ValueError("GGUF experts disagree on packed shape")
+        chunk = index // self.DEVICE_CHUNK
+        if chunk not in self.staging:
+            count = len(self._chunk_ids(chunk))
+            buf = _acquire_staging(count * rows.size)
+            host = buf.numpy()[: count * rows.size].reshape(count, *rows.shape)
+            self.staging[chunk] = (buf, host, set())
+        _, host, present = self.staging[chunk]
+        if index in present:
+            raise ValueError("Duplicate canonical GGUF expert")
+        np.copyto(host[index - chunk * self.DEVICE_CHUNK], rows)
+        present.add(index)
+        if len(present) == len(self._chunk_ids(chunk)):
+            self._decode_chunk(chunk)
+
+    def _chunk_ids(self, chunk):
+        start = chunk * self.DEVICE_CHUNK
+        return range(start, min(start + self.DEVICE_CHUNK, self.experts))
+
+    def _decode_chunk(self, chunk):
+        buf, host, _ = self.staging.pop(chunk)
+        ids = self._chunk_ids(chunk)
+        count, rows, width = host.shape
+        # Blocking copy from pinned memory, so the buffer can be reused.
+        data = buf[: host.size].view(count, rows, width).to(self.device)
+        _release_staging(buf)
+        assert self.host_tp is not None
+        rank = self.host_tp[0]
+        transcode = gguf_device_transcode
+        flat = data.view(count * rows, width)
+        if self.retain_raw and any(c.reason is None for c in self.raw_capabilities):
+            # Same storage as RawGGUFProjection: rows padded to 8 bytes.
+            stride = (width + 7) // 8 * 8
+            raw = data
+            if stride != width:
+                raw = torch.zeros(
+                    (count, rows, stride), dtype=torch.uint8, device=self.device
+                )
+                raw[..., :width] = data
+            for j, i in enumerate(ids):
+                self.raw_pending[i] = raw[j]
+        if self.source_type in transcode.DEVICE_LATTICE_TYPES:
+            codes, stats = transcode.lattice_storage(flat, self.source_type)
+            codes = codes.view(count, rows, -1)
+            stats = stats.view(count, rows, -1)
+            for j, i in enumerate(ids):
+                self.pending[i] = torch.ops._C.gguf_lattice_sm70_prepare(
+                    codes[j], stats[j], self.source_type, self.group
+                )
+            return
+        mins = None
+        if self.source_type in transcode.DEVICE_LUT4_TYPES:
+            codes, scales = transcode.lut4_codes(flat, self.source_type)
+        else:
+            codes, scales, mins = transcode.affine_codes(flat, self.source_type)
+        codes = codes.view(count, rows, -1)
+        scales = scales.view(count, rows, -1)
+        if mins is not None:
+            mins = mins.view(count, rows, -1)
+        if not self.host_presliced:
+            c0, g0 = rank * self.k, rank * self.k // self.group
+            g1 = g0 + self.k // self.group
+            codes = codes[..., c0 : c0 + self.k]
+            scales = scales[..., g0:g1]
+            if mins is not None:
+                mins = mins[..., g0:g1]
+        for j, i in enumerate(ids):
+            if mins is None:
+                self.pending[i] = torch.ops._C.gguf_lut4_sm70_prepare(
+                    codes[j].contiguous(),
+                    scales[j].contiguous(),
+                    self.decoder,
+                    self.group,
+                )
+            else:
+                self.pending[i] = torch.ops._C.gguf_affine_sm70_prepare(
+                    codes[j].contiguous(),
+                    scales[j].contiguous(),
+                    mins[j].contiguous(),
+                    self.decoder,
+                    self.group,
+                )
+
     def finalize(self):
+        if self.staging:
+            for buf, _, _ in self.staging.values():
+                _release_staging(buf)
+            self.staging.clear()
+            raise ValueError("Incomplete canonical GGUF expert bank")
         if set(self.pending) != set(range(self.experts)):
             raise ValueError("Incomplete canonical GGUF expert bank")
         prepared = [self.pending[i] for i in range(self.experts)]
@@ -520,7 +877,8 @@ class GGUFExpertBank(torch.nn.Module):
                 x.shape[0],
             )
         if self.source_type in (20, 42) and self.down_vector_batches:
-            torch.ops.vllm.gguf_expert_down(
+            self.native_ops.invoke(
+                torch.ops.vllm.gguf_expert_down,
                 output,
                 x,
                 offsets,
@@ -531,6 +889,7 @@ class GGUFExpertBank(torch.nn.Module):
                 self.experts,
                 self.group,
                 self.down_vector_batches,
+                self.native_ops.arguments,
             )
             return output
         capability = (
@@ -545,7 +904,9 @@ class GGUFExpertBank(torch.nn.Module):
             if self.family == GGUFDecoderFamily.LATTICE
             else self.decoder
         )
-        getattr(torch.ops._C, capability.operator)(
+        call_gguf_native(
+            getattr(torch.ops._C, capability.operator),
+            self.native_ops.arguments,
             output,
             x,
             offsets,
@@ -561,6 +922,7 @@ class GGUFExpertBank(torch.nn.Module):
 class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
     def __init__(self, quant_config, moe):
         super().__init__(quant_config, moe)
+        self.native_ops = NativeBindings(capture_linear_native_config("gguf").values)
         self.builders: dict[str, GGUFExpertBank] = {}
         config = get_current_vllm_config_or_none()
         self.dp4a_enabled = self.native_enabled and (
@@ -571,10 +933,23 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             if config is not None
             else True
         )
+        self.mma_enabled = bool(
+            self.native_enabled
+            and config is not None
+            and config.kernel_config.sm70_gguf.grouped_mma_gate_up
+        )
+        self.mma_release_raw = bool(
+            config is not None
+            and config.kernel_config.sm70_gguf.grouped_mma_release_raw
+        )
+        self.mma_planes = False
         self.q8_intermediate_enabled = self.dp4a_enabled and (
             config.kernel_config.sm70_gguf.q8_expert_intermediate
             if config is not None
             else True
+        )
+        self.device_transcode = bool(
+            config is None or config.kernel_config.sm70_gguf.device_transcode
         )
 
     def load_expert(self, layer, param, weight, shard_id, expert_id):
@@ -594,6 +969,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 retain_raw=self.native_enabled
                 and shard_id in ("w1", "w3")
                 and self.weight_types[shard_id] in (18, 21, 22),
+                device_transcode=self.device_transcode,
             )
         self.builders[shard_id].add(
             expert_id,
@@ -634,6 +1010,52 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             and hasattr(gate, "raw_weights")
             and hasattr(up, "raw_weights")
         )
+        down = banks["w2"]
+        if self.mma_enabled and not (
+            self.raw_gate_up
+            and gate.source_type in (18, 21, 22)
+            and down.source_type in (20, 42)
+        ):
+            logger.info_once(
+                "SM70 grouped-MMA GGUF expert gate/up not admitted "
+                "(raw=%s, gate=%d, down=%d).",
+                self.raw_gate_up,
+                gate.source_type,
+                down.source_type,
+            )
+        self.mma_planes = bool(
+            self.mma_enabled
+            and self.raw_gate_up
+            and gate.source_type in (18, 21, 22)
+            and down.source_type in (20, 42)
+            and gate.k % 128 == 0
+            and gate.n % 32 == 0
+            and self.params_dtype == torch.float16
+        )
+        if self.mma_planes:
+            from vllm.model_executor.layers.quantization.gguf_moe_planes import (
+                expert_table,
+            )
+
+            fmt, gate.plane_codes, gate.plane_scale = _expert_planes(
+                gate.raw_weights, gate.source_type, gate.n, gate.k
+            )
+            _, up.plane_codes, up.plane_scale = _expert_planes(
+                up.raw_weights, up.source_type, up.n, up.k
+            )
+            self.plane_format = int(fmt)
+            logger.info_once(
+                "SM70 grouped-MMA GGUF expert gate/up planes enabled "
+                "(type=%d, down=%d, raw released=%s).",
+                gate.source_type,
+                down.source_type,
+                self.mma_release_raw,
+            )
+            gate.plane_table = torch.from_numpy(expert_table(gate.source_type)).to(
+                gate.plane_codes.device
+            )
+            if self.mma_release_raw:
+                self.raw_gate_up = False
         if not self.raw_gate_up:
             for bank in (gate, up):
                 if hasattr(bank, "raw_weights"):
@@ -674,7 +1096,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             self.params_dtype,
             is_sm70=current_platform.is_device_capability(70),
             enabled=dp4a_enabled,
-            original_storage_available=self.raw_gate_up,
+            original_storage_available=self.raw_gate_up or self.mma_planes,
             canonical_storage_available=canonical_iq4,
         )
         self.dp4a_batches = [
@@ -689,7 +1111,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             self.params_dtype,
             is_sm70=current_platform.is_device_capability(70),
             enabled=self.q8_intermediate_enabled and dp4a_enabled,
-            original_storage_available=self.raw_gate_up,
+            original_storage_available=self.raw_gate_up or self.mma_planes,
             canonical_storage_available=canonical_iq4,
         )
         self.q8_intermediate_batches = [
@@ -757,6 +1179,35 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             )
         if x.shape[0] == 0:
             return torch.empty_like(x)
+        if (
+            self.mma_planes
+            and layer.expert_map is None
+            and x.shape[0] <= MMA_MAX_TOKENS
+            and topk_ids.shape[1] == MMA_TOP_K
+            and topk_weights.dtype == torch.float32
+            and x.is_contiguous()
+            and topk_weights.is_contiguous()
+        ):
+            bank = layer.gguf_expert_banks
+            gate, up, down = bank["w1"], bank["w3"], bank["w2"]
+            return torch.ops.vllm.gguf_expert_mma(
+                x,
+                topk_ids,
+                topk_weights,
+                gate.plane_codes,
+                gate.plane_scale,
+                up.plane_codes,
+                up.plane_scale,
+                gate.plane_table,
+                down.weight_ptrs,
+                down.stat_ptrs,
+                self.plane_format,
+                down.source_type,
+                self.num_experts,
+                self.intermediate_size,
+                MMA_PLANE_KW,
+                self.q8_intermediate_batches,
+            )
         if self.dp4a_batches and layer.expert_map is None:
             bank = layer.gguf_expert_banks
             gate, up, down = bank["w1"], bank["w3"], bank["w2"]
@@ -783,6 +1234,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 down.down_vector_batches,
                 self.dp4a_batches,
                 self.q8_intermediate_batches,
+                self.native_ops.arguments,
             )
         ids = topk_ids
         mask = None
@@ -824,6 +1276,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 top_k,
                 self.raw_batches,
                 self.vector_bands,
+                self.native_ops.arguments,
             )
         else:
             gate = bank["w1"](routed, offsets, sorted_ids)
@@ -835,4 +1288,4 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
         restored = down[order.argsort()].view(tokens, top_k, self.hidden_size)
         if mask is not None:
             restored = torch.where(mask[..., None], restored, 0)
-        return (restored.float() * topk_weights[..., None].float()).sum(1).to(x.dtype)
+        return weighted_reduce_rows(restored, topk_weights, x.dtype)

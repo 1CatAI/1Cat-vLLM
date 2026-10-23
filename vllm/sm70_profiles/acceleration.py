@@ -4,19 +4,29 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, fields, is_dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm import envs
+from vllm.config.execution_policy import graph_policy, layer_policy
 from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
+from vllm.utils.mem_utils import loaded_cuda_model_storage as loaded_cuda_model_storage
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+
+def _json_default(value: Any) -> Any:
+    # Parsed diagnostic filters (e.g. selected steps) are frozensets.
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def linear_policy_report(kernel_config) -> dict[str, Any]:
@@ -25,7 +35,9 @@ def linear_policy_report(kernel_config) -> dict[str, Any]:
         field.name: {
             "scope": "configured_policy",
             "status": "runtime_guarded",
-            "configuration": json.loads(json.dumps(asdict(value))),
+            "configuration": json.loads(
+                json.dumps(asdict(value), default=_json_default)
+            ),
         }
         for field in fields(kernel_config)
         if field.name.startswith("sm70_")
@@ -118,12 +130,15 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "GGUFLinearMethod",
             "GGUFEmbeddingMethod",
             "GGUFMoEMethod",
+            "GGUFNativeMoEMethod",
         ):
             continue
         descriptor = getattr(layer, "qweight_type", None)
         types = list(getattr(descriptor, "shard_weight_type", {}).values())
         if descriptor is not None and not types:
             types = [getattr(descriptor, "weight_type", None)]
+        if not types:
+            types = list(getattr(method, "weight_types", {}).values())
         layout = getattr(method, "layout", None)
         candidates = getattr(method, "native_admission", {}).get(
             "canonical_projections", ()
@@ -161,6 +176,13 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "single_projection": getattr(method, "native_admission", {}).get(
                 "single_projection"
             ),
+            "original_expert_projections": getattr(method, "native_admission", {}).get(
+                "projections"
+            ),
+            "original_prefill_projections": getattr(method, "native_admission", {}).get(
+                "prefill_projections"
+            ),
+            "small_m_dp4a": getattr(method, "native_admission", {}).get("small_m_dp4a"),
             "canonical_projections": [
                 projection.admission()
                 for projection in getattr(method, "canonical_projections", ())
@@ -168,6 +190,7 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "acceleration_fallback_reason": (
                 None
                 if getattr(method, "canonical_projections", ())
+                or getattr(method, "dp4a_admitted", False)
                 else next(
                     (p["reason"] for p in candidates if p.get("reason")),
                     "gguf_turbomind_repack_not_integrated",
@@ -176,6 +199,54 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "scope": "prepared_gguf_storage_and_operator_capability",
         }
     return result
+
+
+def loaded_qsa_cache_storage(forward_context: Mapping[str, Any]) -> dict[str, int]:
+    """Read actual QSA cache backing, deduplicating shared staging buffers."""
+    seen = set()
+    totals = {"hot_bytes": 0, "workspace_bytes": 0, "device_history_bytes": 0}
+    for module in forward_context.values():
+        state = getattr(module, "host_kv", None)
+        if state is None:
+            continue
+        categories = {
+            "hot_bytes": [
+                getattr(state, key)
+                for key in (
+                    "hot_values",
+                    "tags",
+                    "stamps",
+                    "hands",
+                    "page_slots",
+                    "epoch",
+                    "_stats",
+                )
+            ],
+            "workspace_bytes": [
+                getattr(state, key)
+                for key in (
+                    "staging",
+                    "remapped",
+                    "requests",
+                    "positions",
+                    "lengths",
+                    "initial",
+                    "resolved",
+                )
+            ]
+            + list(state.device_history_workspace or ()),
+            "device_history_bytes": [state.history, state.scales]
+            if state.device_reference
+            else [],
+        }
+        for category, tensors in categories.items():
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                identity = (str(tensor.device), storage.data_ptr())
+                if storage.nbytes() and identity not in seen:
+                    seen.add(identity)
+                    totals[category] += storage.nbytes()
+    return totals
 
 
 def loaded_sm70_preparations(model) -> dict[str, Any]:
@@ -251,13 +322,17 @@ def _row(reason: str | None = None, **values: Any) -> dict[str, Any]:
     return {"enabled": reason is None, "reason": reason, **values}
 
 
-def _switches(defaults: dict[str, str]) -> dict[str, Any]:
-    return {name: getattr(envs, name) for name in defaults}
+def _switches(defaults: dict[str, str], cfg) -> dict[str, Any]:
+    from vllm.config.policy_defaults import effective_runtime_values
+
+    effective = effective_runtime_values(cfg)
+    return {name: effective.get(name) for name in defaults}
 
 
 def _switches_match(values: dict[str, Any], defaults: dict[str, str]) -> bool:
     return all(
-        (
+        value is not None
+        and (
             int(value) >= int(defaults[name])
             if int(defaults[name]) > 1
             else str(int(value) if isinstance(value, bool) else value) == defaults[name]
@@ -278,10 +353,19 @@ def _is_sm70(cfg: VllmConfig) -> bool:
 
 def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     """Explain qualified defaults and packed-copy cost, without claiming hits."""
+    from vllm.config.policy_defaults import effective_runtime_values
+
+    effective = effective_runtime_values(cfg)
+    values = {
+        name: effective.get(name)
+        for name, getter in envs.environment_variables.items()
+        if "Flash-Next qualified batch"
+        in cast(EnvVar, getter).metadata.acceleration_paths
+    }
     controls = {
         name: {
-            "enabled": bool(getattr(envs, name)),
-            "reason": None if getattr(envs, name) else "user_override",
+            "enabled": bool(values[name]),
+            "reason": None if values[name] else "user_override",
             "description": cast(EnvVar, getter).metadata.description,
         }
         for name, getter in envs.environment_variables.items()
@@ -290,9 +374,11 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     }
     from vllm.model_executor.models.config import sm70_flash_next_batch_qualified
 
-    if (
-        not sm70_flash_next_batch_qualified(cfg)
-        and "VLLM_SM70_QWEN38_GDN_INPUT_BATCH" not in envs.os.environ
+    if not sm70_flash_next_batch_qualified(
+        cfg
+    ) and cfg.kernel_config.gdn.projection.sources.get("input_batch") not in (
+        "typed",
+        "VLLM_SM70_QWEN38_GDN_INPUT_BATCH",
     ):
         controls["VLLM_SM70_QWEN38_GDN_INPUT_BATCH"].update(
             enabled=False, reason="speculation_not_quality_qualified"
@@ -322,16 +408,16 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     )
     copies: dict[str, int] = {}
     if reference_layout:
-        batch = envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        batch = layer_policy(cfg).batch_fastpath
         gdn_layers = list(getattr(text, "layer_types", ())).count("linear_attention")
-        if batch or envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH:
+        if batch or values["VLLM_SM70_QWEN38_GDN_INPUT_BATCH"]:
             copies["gdn_input"] = gdn_layers * (4096 + 32) * 2560 * 2
-        if batch or (draft_layers and envs.VLLM_SM70_MTP_HC_BATCH):
+        if batch or (draft_layers and layer_policy(cfg).hc_mtp_batch):
             copies["hc_target"] = layers * 2 * (96 * 10240 + 2560 * 320) * 2
             copies["hc_draft"] = draft_layers * 2 * (96 * 10240 + 2560 * 320) * 2
-        if draft_layers and envs.VLLM_SM70_MTP_ROUTER_BATCH:
+        if draft_layers and values["VLLM_SM70_MTP_ROUTER_BATCH"]:
             copies["router"] = (layers + draft_layers) * 512 * 2560 * 2
-        if draft_layers and envs.VLLM_SM70_MTP_SHARED_BATCH:
+        if draft_layers and values["VLLM_SM70_MTP_SHARED_BATCH"]:
             copies["shared_expert"] = (layers + draft_layers) * 320 * 2560 * 2
     return {
         "scope": "configured_capabilities",
@@ -368,7 +454,7 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     }
 
 
-def _native_capabilities(page_size: int) -> dict[str, bool]:
+def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
     import torch
 
     # Register FA2 operators before probing availability.
@@ -384,22 +470,27 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
     )
 
     # isort: split
-    from vllm.v1.attention.backends.flash_attn_v100 import (
+    from vllm.v1.attention.backends.flash_v100.ops import (
         _get_sm70_d256_gqa_architecture_q8192_op,
     )
-    from vllm.v1.attention.ops.sm70_e4m3_long import (
+    from vllm.v1.attention.ops.sm70_grouped_long import (
         BUILTIN_MANIFEST,
         builtin_long_attention,
         long_attention_enabled,
         long_attention_page_supported,
     )
-    from vllm.v1.attention.ops.sm70_e4m3_scalar import scalar_tail_attention_available
+    from vllm.v1.attention.ops.sm70_grouped_scalar import (
+        scalar_tail_attention_available,
+    )
 
     return {
         "fp16_grouped": hasattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_fwd"),
+        "fp16_short_splits": hasattr(
+            torch.ops._vllm_fa2_C, "sm70_grouped_fp16_short_split_revision"
+        ),
         "grouped_fp32": bool(flash_attn_grouped_e4m3_fp32_available()),
         "long_operator": builtin_long_attention() is not None,
-        "long_enabled": long_attention_enabled(),
+        "long_enabled": long_attention_enabled(policy),
         "page_supported": long_attention_page_supported(page_size, BUILTIN_MANIFEST),
         "scalar": scalar_tail_attention_available(),
         "q8000": _get_sm70_d256_gqa_architecture_q8192_op() is not None,
@@ -461,8 +552,8 @@ def _bm32_paged_prefill_report(cfg, native: Mapping[str, bool]) -> dict[str, Any
         else "page_alignment"
         if page < 16 or page % 16
         else "user_override"
-        if not envs.VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM
-        or not envs.VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE
+        if not cfg.attention_config.flash_v100.options.value("prefill_d256_low_smem")
+        or not cfg.attention_config.flash_v100.options.value("prefill_d256_bm32_phase")
         else "operator_missing:aligned_bm32_paged_prefill"
         if not native.get("bm32_aligned_pages", False)
         else None
@@ -502,7 +593,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         _dflash_reason(cfg) is None
         and not cfg.kernel_config.sm70_awq.resolved
         and not cfg.kernel_config.sm70_fp8.resolved
-    ) or envs.VLLM_SM70_REQUIRE_PROFILE_ACCELERATION
+    ) or cfg.observability_config.runtime_trace.require_profile_acceleration
     paths: dict[str, dict[str, Any]] = {}
     report = {
         "profile": "qwen38_27b_nvfp4_dflash2" if release_profile else None,
@@ -529,6 +620,69 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": cfg.kernel_config.qsa_auto_e4m3_reason,
         "scope": "calibrated_cache_storage",
     }
+    report["qsa_host_kv"] = {
+        "enabled": cfg.kernel_config.qsa_host_kv_active,
+        "reason": cfg.kernel_config.qsa_host_kv_reason,
+        "scope": "active_attention_history",
+        "host_dtype": (
+            cfg.kernel_config.qsa_host_kv_draft_dtype
+            if getattr(cfg, "is_speculative_draft", False)
+            else cfg.kernel_config.qsa_host_kv_dtype
+        ),
+        "history_storage": (
+            "device_reference"
+            if cfg.kernel_config.qsa_host_kv_device_reference
+            else "host"
+        ),
+        "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
+        "attention_staging_dtype": "float16",
+        "recurrent_state_storage": "device",
+        "compressed_indexer_history_storage": (
+            "host"
+            if cfg.kernel_config.qsa_host_indexer_history
+            and cfg.kernel_config.qsa_host_kv_active
+            and not cfg.kernel_config.qsa_host_kv_device_reference
+            else "device"
+        ),
+    }
+    device_history_reason = None
+    if not cfg.kernel_config.sm70_qsa_device_history:
+        device_history_reason = "user_override"
+    elif getattr(cfg, "is_speculative_draft", False):
+        device_history_reason = "speculative_draft_unqualified"
+    elif not cfg.kernel_config.qsa_host_kv_active:
+        device_history_reason = "qsa_history_inactive"
+    elif not cfg.kernel_config.qsa_host_kv_device_reference:
+        device_history_reason = "history_on_host"
+    elif not sm70:
+        device_history_reason = "requires_SM70"
+    elif importlib.util.find_spec("vllm._sm70_qsa_device_C") is None:
+        device_history_reason = "native_extension_unavailable"
+    report["qsa_device_history"] = {
+        "enabled": device_history_reason is None,
+        "reason": device_history_reason,
+        "scope": "configured_native_capability",
+        "runtime_guards": (
+            "device E4M3/FP16 history; FP16 query; M1..20, H6, D256; width<=4096"
+        ),
+        "arithmetic": "FP16 QK operands; FP32 accumulation, softmax, PV and merge",
+        "fallback": "protected hot-page reader",
+    }
+    shared_key_reason = None
+    if not cfg.kernel_config.sm70_qsa_shared_key:
+        shared_key_reason = "user_override"
+    elif not sm70:
+        shared_key_reason = "requires_SM70"
+    elif importlib.util.find_spec("vllm._sm70_qsa_indexer_C") is None:
+        shared_key_reason = "native_extension_unavailable"
+    report["qsa_shared_key_indexer"] = {
+        "enabled": shared_key_reason is None,
+        "reason": shared_key_reason,
+        "scope": "configured_native_capability",
+        "runtime_guards": "one request; M2..8, H4, D128; FP16 Q and indexer K",
+        "arithmetic": "FP16 MMA inputs; FP32 accumulation and scores",
+        "fallback": "paged Triton indexer; multiple requests and other shapes",
+    }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {
         "scope": "indexed_sparse_attention",
@@ -551,7 +705,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         report["linear_kernel_policy"] = {
             "scope": "ct_nvfp4_linear",
             "status": "runtime_guarded",
-            "configuration": asdict(policy),
+            "configuration": json.loads(json.dumps(asdict(policy))),
             "qpn2_reason": (
                 "configuration_not_resolved"
                 if not policy.resolved
@@ -565,6 +719,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
                 else "draft_selector_state_contract_not_quality_qualified"
             ),
         }
+    from vllm.config.policy_defaults import runtime_policy_report
+
+    report["runtime_policies"] = runtime_policy_report(cfg)
     if not sm70:
         names = set(load_profile()["expected_acceleration"]) | {
             "qwen38_decode",
@@ -597,18 +754,27 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             from vllm.config.sm70_dflash2 import (
                 SM70_DFLASH2_LEGACY_FIELDS,
                 capture_sm70_dflash2_config,
-                sm70_dflash2_enabled,
             )
 
             policy = capture_sm70_dflash2_config(cfg)
+            if policy is None or not policy.resolved:
+                reason = reason or "policy_unresolved"
             values = {
-                alias: sm70_dflash2_enabled(field, policy)
+                alias: getattr(policy, field) if policy is not None else None
                 for alias, field in SM70_DFLASH2_LEGACY_FIELDS.items()
             }
         else:
-            values = _switches(defaults)
+            values = _switches(defaults, cfg)
         paths[name] = _row(
-            reason or (None if _switches_match(values, defaults) else "user_override"),
+            reason
+            or (
+                None
+                if _switches_match(
+                    {key: value for key, value in values.items() if key in defaults},
+                    defaults,
+                )
+                else "user_override"
+            ),
             switches=values,
         )
 
@@ -619,7 +785,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP",
         "VLLM_SM70_MOE_ADD_ALLREDUCE",
     )
-    decode_values = {name: getattr(envs, name) for name in decode_names}
+    decode_values = _switches(dict.fromkeys(decode_names, ""), cfg)
     decode_contract = _is_sm70_qwen38_decode_compile_contract(
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     )
@@ -642,9 +808,12 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         switches=decode_values,
     )
 
+    attention_options = cfg.attention_config.flash_v100.options
     page_size = int(cfg.cache_config.block_size or 0)
     try:
-        native = _native_capabilities(page_size)
+        native = _native_capabilities(
+            page_size, cfg.attention_config.flash_v100.options
+        )
     except (ImportError, AttributeError, RuntimeError, OSError) as exc:
         native = dict.fromkeys(
             (
@@ -683,6 +852,17 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         runtime_guards="FP16 operands; local Q/KV heads=6/1, D=256; page=832; "
         "causal full context; B1 q2..8 or B2..4 q8; capacity<=266240",
         arithmetic="FP32 probability/PV/numerator/max/sum",
+        short_context_splits=_row(
+            fp16_reason
+            or (
+                "disabled_by_policy"
+                if not cfg.kernel_config.sm70_fp16_grouped_short_splits
+                else "operator_missing:sm70_grouped_fp16_short_split_revision"
+                if not native.get("fp16_short_splits", False)
+                else None
+            ),
+            runtime_guards="FP16 q8/B1 at device context 129..2048; K64 elsewhere",
+        ),
     )
     if release_profile and dtype in ("auto", "float16", "bfloat16") and fp16_shape:
         report["expected_acceleration"] = [
@@ -696,7 +876,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         if dtype != "fp8_e4m3"
         else (
             "user_override"
-            if not envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32
+            if not cfg.attention_config.flash_v100.options.value("e4m3_grouped_fp32")
             else (
                 None
                 if native["grouped_fp32"]
@@ -708,7 +888,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         grouped_reason,
         kv_cache_dtype=dtype,
         switches={
-            "VLLM_FLASH_V100_E4M3_GROUPED_FP32": envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32
+            "VLLM_FLASH_V100_E4M3_GROUPED_FP32": attention_options.value(
+                "e4m3_grouped_fp32"
+            )
         },
     )
     long_reason = grouped_reason or (
@@ -726,8 +908,8 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         or (
             "user_override"
             if (
-                not envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
-                or envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE
+                not cfg.attention_config.flash_v100.options.value("tail_cudagraphs")
+                or graph_policy(cfg).decode_partition_size
             )
             else (
                 "page_size"
@@ -741,9 +923,11 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         ),
         block_size=page_size,
         switches={
-            "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS,
+            "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": attention_options.value(
+                "tail_cudagraphs"
+            ),
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": (
-                envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE
+                graph_policy(cfg).decode_partition_size
             ),
         },
     )
@@ -753,7 +937,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         if budget < 8000
         else (
             "user_override"
-            if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+            if cfg.attention_config.flash_v100.options.value("prefill_d256_gqa_v37")
             else (
                 None
                 if native["q8000"]
@@ -763,7 +947,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         max_num_batched_tokens=budget,
         switches={
             "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": (
-                envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+                cfg.attention_config.flash_v100.options.value("prefill_d256_gqa_v37")
             )
         },
     )
@@ -780,25 +964,29 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     )
     from torch._inductor import config as inductor_config
 
-    from vllm.compilation.compiler_interface import is_compile_cache_enabled
-
+    startup = getattr(cfg, "runtime_default_sources", {}).get(
+        "VLLM_DISABLE_COMPILE_CACHE", []
+    )
+    cache_disabled = bool(int(startup[-1]["raw"])) if startup else None
     cache_config = compilation.inductor_compile_config
     cache_reason = None
-    if envs.VLLM_DISABLE_COMPILE_CACHE:
+    if cache_disabled:
         cache_reason = "compile_cache_disabled"
     elif cfg.model_config.enforce_eager or compilation.mode in (
         None,
         CompilationMode.NONE,
     ):
         cache_reason = "compilation_disabled"
-    elif not is_compile_cache_enabled(cache_config):
+    elif inductor_config.force_disable_caches or cache_config.get(
+        "force_disable_caches", False
+    ):
         cache_reason = "inductor_cache_disabled"
     paths["compile_cache"] = _row(
         cache_reason,
         mode=getattr(compilation.mode, "name", None),
         switches={
-            "VLLM_DISABLE_COMPILE_CACHE": envs.VLLM_DISABLE_COMPILE_CACHE,
-            "VLLM_USE_AOT_COMPILE": envs.VLLM_USE_AOT_COMPILE,
+            "VLLM_DISABLE_COMPILE_CACHE": cache_disabled,
+            "VLLM_USE_AOT_COMPILE": graph_policy(cfg).aot_compile,
             "force_disable_caches": cache_config.get("force_disable_caches", False),
             "torch_force_disable_caches": inductor_config.force_disable_caches,
         },
@@ -814,7 +1002,10 @@ def log_and_validate(cfg: VllmConfig) -> dict[str, Any]:
     # Diagnostic state must not become part of additional_config's compile hash.
     cfg.sm70_acceleration_report = report
     failures = []
-    if report["sm70"] or envs.VLLM_SM70_REQUIRE_PROFILE_ACCELERATION:
+    if (
+        report["sm70"]
+        or cfg.observability_config.runtime_trace.require_profile_acceleration
+    ):
         for name in report["expected_acceleration"]:
             row = report["paths"][name]
             if not row["enabled"]:
@@ -828,8 +1019,31 @@ def log_and_validate(cfg: VllmConfig) -> dict[str, Any]:
                 )
         logger.info("SM70 acceleration status: %s", report)
     report["expected_failures"] = failures
-    if envs.VLLM_SM70_REQUIRE_PROFILE_ACCELERATION and failures:
+    if cfg.observability_config.runtime_trace.require_profile_acceleration and failures:
         raise ValueError(
             "SM70 profile acceleration requirement failed: " + "; ".join(failures)
         )
     return report
+
+
+def loaded_native_workspace(config) -> dict | None:
+    """Read scratch allocations under the worker's native resource owner."""
+    import torch
+
+    from vllm._sm70.runtime import bind_native_runtime
+    from vllm.config import set_current_vllm_config
+
+    query = getattr(torch.ops._C, "sm70_gemm_workspace_storage", None)
+    if query is None:
+        return None
+    with set_current_vllm_config(config):
+        owner = bind_native_runtime()
+        if owner is None:
+            return None
+        with owner.activate():
+            streams, partials, total = query()
+    return {
+        "streams": streams,
+        "partials_bytes_per_stream": partials,
+        "total_bytes": total,
+    }

@@ -19,7 +19,9 @@ def interface(monkeypatch):
         / "flash-attention-v100/flash_attn_v100/flash_attn_interface.py"
     )
     name = "_xqa_workspace_test_interface"
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = importlib.util.spec_from_file_location(
+        name, path, submodule_search_locations=[str(path.parent)]
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)

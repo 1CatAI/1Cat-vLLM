@@ -15,7 +15,6 @@ import regex as re
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
@@ -309,8 +308,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.config = self.draft_model_config.hf_config
         speculative_config = vllm_config.speculative_config
         self._confidence_head_required = bool(
-            speculative_config.dspark_confidence_threshold > 0.0
-            or envs.VLLM_SPEC_DUMP_ALIGNMENT
+            speculative_config.diagnostic_confidence_logits
         )
         self._confidence_head_loaded = False
         self.model = DSparkDeepseekV4Model(

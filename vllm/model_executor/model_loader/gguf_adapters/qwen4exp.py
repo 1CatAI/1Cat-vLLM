@@ -41,6 +41,8 @@ _EXTRA = {
 
 
 class Qwen4ExpAdapter(Qwen35MoeAdapter):
+    language_model_prefix: str = ""
+    packed_embeddings = False
     native_expert_storage = True
     architecture_label = "Qwen4Exp"
     layer_names = {**_LAYERS, **_HC, **_EXPERTS, **_EXTRA}

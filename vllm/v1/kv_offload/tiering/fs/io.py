@@ -85,6 +85,14 @@ def load_block(
     view_slice = view.cast("B")[offset : offset + block_size]
     try:
         fd = os.open(source_path, os.O_RDONLY | O_DIRECT)
+        # A block file is one complete page, not a prefix of a larger page.
+        # Check the opened file before touching the destination so stale or
+        # truncated pages follow the existing failed-load/recompute path.
+        file_size = os.fstat(fd).st_size
+        if file_size != block_size:
+            raise OSError(
+                f"Invalid block size: expected {block_size} bytes, found {file_size}"
+            )
         bytes_read = os.readv(fd, [view_slice])
         if bytes_read < block_size:
             raise OSError(f"Short read: expected {block_size} bytes, read {bytes_read}")

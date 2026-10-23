@@ -6,14 +6,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.config.kernel import Sm70SparseConfig
 from vllm.platforms.interface import DeviceCapability
 
 
 @pytest.fixture(autouse=True)
 def sparse_engine_config():
-    cfg = VllmConfig()
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
     with set_current_vllm_config(cfg):
         yield cfg
 
@@ -165,6 +165,7 @@ def test_sm70_sparse_qk_dsplit_uses_graph_workspace():
     q = torch.empty((1, 8, 512), dtype=torch.float16)
     output = torch.empty_like(q)
     layer = MagicMock()
+    layer.sm70_sparse = Sm70SparseConfig()
     layer.compress_ratio = 1
     layer.swa_cache_layer.kv_cache = torch.empty((1, 256, 584), dtype=torch.uint8)
     layer.scale = 512**-0.5
@@ -180,8 +181,8 @@ def test_sm70_sparse_qk_dsplit_uses_graph_workspace():
         torch.empty(shape, dtype=dtype) for shape, dtype in specs
     )
     with (
-        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", True),
-        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", True),
+        patch.object(layer.sm70_sparse, "mla_splitk_swa", True),
+        patch.object(layer.sm70_sparse, "mla_qk_dsplit", True),
         patch.object(
             sparse, "current_workspace_manager", return_value=workspace_manager
         ),
@@ -310,6 +311,7 @@ def test_v4_c128_boundary_detection():
 
 
 def test_sm70_private_compressor_state_requires_a_contiguous_single_request():
+    from vllm.config.sm70_sparse import Sm70SparseConfig
     from vllm.models.deepseek_v4 import compressor
 
     platform = MagicMock()
@@ -326,9 +328,9 @@ def test_sm70_private_compressor_state_requires_a_contiguous_single_request():
     with (
         patch.object(compressor, "current_platform", platform),
         patch.object(
-            compressor.envs,
-            "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE",
-            False,
+            config.kernel_config,
+            "sm70_sparse",
+            Sm70SparseConfig(private_compressor_state=False),
         ),
     ):
         assert not compressor._can_use_sm70_private_compressor_state(config)
@@ -336,9 +338,9 @@ def test_sm70_private_compressor_state_requires_a_contiguous_single_request():
     with (
         patch.object(compressor, "current_platform", platform),
         patch.object(
-            compressor.envs,
-            "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE",
-            True,
+            config.kernel_config,
+            "sm70_sparse",
+            Sm70SparseConfig(private_compressor_state=True),
         ),
     ):
         assert compressor._can_use_sm70_private_compressor_state(config)
@@ -435,6 +437,7 @@ def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers():
     q = torch.empty((6, 64, 512), dtype=torch.float16)
     output = torch.empty_like(q)
     layer = MagicMock()
+    layer.sm70_sparse = Sm70SparseConfig()
     layer.compress_ratio = 1
     layer.swa_cache_layer.kv_cache = torch.empty((1, 256, 584), dtype=torch.uint8)
     layer.scale = 512**-0.5
@@ -451,7 +454,7 @@ def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers():
     )
     with (
         patch.object(sparse, "_bmm_blocker", return_value=None),
-        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", True),
+        patch.object(layer.sm70_sparse, "mla_splitk_swa", True),
         patch.object(
             sparse, "current_workspace_manager", return_value=workspace_manager
         ),

@@ -383,6 +383,9 @@ __device__ __forceinline__ void body6(
   }
   uint4* slot = xs + kslot * 256;
   uint4 X[PARTS];
+  // Three value heads per key head: TP4 has four groups, TP2 has eight.
+  const int head_shift = G == 24 ? 3 : 2;
+  const int head_mask = (1 << head_shift) - 1;
   auto xload = [&](int gg) {
 #pragma unroll
     for (int jj = 0; jj < PARTS; ++jj) {
@@ -390,7 +393,8 @@ __device__ __forceinline__ void body6(
       X[jj] = make_uint4(0, 0, 0, 0);
       if (row < M)
         X[jj] = __ldg(reinterpret_cast<const uint4*>(
-            x + row * ldx + (gdn_heads ? (gg % 4) * 3 + gg / 4 : gg) * 128 +
+            x + row * ldx +
+            (gdn_heads ? (gg & head_mask) * 3 + (gg >> head_shift) : gg) * 128 +
             c * 8));
     }
   };
@@ -801,7 +805,8 @@ void gguf_dmv_dispatch(torch::Tensor x, std::vector<torch::Tensor> codes,
                     ab_out->stride(1) == 1,
                 "invalid DMV floating operands");
   }
-  TORCH_CHECK(!gdn_heads || K == 1536, "GDN head tiling requires K1536");
+  TORCH_CHECK(!gdn_heads || K == 1536 || K == 3072,
+              "GDN head tiling requires K1536 or K3072");
   Segs segs{};
   segs.gdn_heads = gdn_heads;
   if (pair_out && pair_out->numel()) {

@@ -1373,6 +1373,14 @@ def marlin_int4_fp8_preprocess(
     return torch.ops._C.marlin_int4_fp8_preprocess(qweight, qzeros_or_none, inplace)
 
 
+def prepare_marlin_workspace_policy(device: torch.device) -> None:
+    """Initialize the selected native Marlin provider with its workspace."""
+    if sm70_marlin_available():
+        from vllm._sm70.marlin import bind_marlin_workspace
+
+        bind_marlin_workspace(device)
+
+
 def marlin_gemm(
     a: torch.Tensor,
     c: torch.Tensor | None,
@@ -2994,9 +3002,18 @@ def init_custom_ar(
     rank: int,
     fully_connected: bool,
 ) -> int:
-    return _custom_ar_op("init_custom_ar")(
-        ipc_tensors, rank_data, rank, fully_connected
-    )
+    owner = _custom_ar_owner_namespace()
+    if hasattr(owner, "init_custom_ar_configured"):
+        # Preserve the historical Python defaults without publishing them to
+        # the process environment. This compatibility entry is initialization.
+        from vllm.config.collective import CollectiveNativeConfig
+
+        policy = CollectiveNativeConfig()
+        policy.resolve()
+        return owner.init_custom_ar_configured(
+            ipc_tensors, rank_data, rank, fully_connected, list(policy.values)
+        )
+    return owner.init_custom_ar(ipc_tensors, rank_data, rank, fully_connected)
 
 
 def all_reduce(

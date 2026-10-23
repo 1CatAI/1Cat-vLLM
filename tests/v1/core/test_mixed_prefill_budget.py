@@ -27,6 +27,19 @@ def test_budget_adapts_to_gpu_cost_and_ignores_short_boundaries():
     assert 2400 <= budget.tokens <= 2512
 
 
+def test_floor_holds_on_slow_steps_and_growth_starts_from_it():
+    budget = MixedPrefillBudget(8192, 250, min_tokens=1632)
+    assert budget.tokens == 1632
+    for _ in range(5):
+        # 1632 tokens take 700 ms: the target alone would shrink the budget.
+        budget.update(MixedPrefillTiming(1632, 16, 1632, 700))
+    assert budget.tokens == 1632
+    for _ in range(3):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 16, n, n * 0.05))
+    assert budget.tokens > 1632
+
+
 @pytest.mark.parametrize("elapsed", [0, -1, float("nan"), float("inf")])
 def test_invalid_timing_does_not_change_budget(elapsed):
     budget = MixedPrefillBudget(8192, 250)
@@ -146,3 +159,16 @@ def test_adaptive_threshold_floor_does_not_override_mixed_latency_budget():
     assert output.num_scheduled_tokens[resident.request_id] > 0
     assert output.num_scheduled_tokens[incoming.request_id] == 512
     assert output.mixed_prefill_tokens == 512
+
+
+def test_mixed_step_uses_the_budget_floor():
+    scheduler = create_scheduler(max_num_batched_tokens=1024)
+    scheduler.mixed_prefill_enabled = True
+    scheduler.mixed_prefill_budget = MixedPrefillBudget(1024, 250, min_tokens=768)
+    resident = _resident(scheduler)
+    long = create_requests(num_requests=1, num_tokens=1536, req_ids=["long"])[0]
+    scheduler.add_request(long)
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens[resident.request_id] == 1
+    assert step.num_scheduled_tokens["long"] == 768
+    assert step.mixed_prefill_budget == 768

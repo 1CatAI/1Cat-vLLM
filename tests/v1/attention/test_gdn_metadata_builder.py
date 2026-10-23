@@ -108,6 +108,7 @@ def test_mamba_hybrid_passes_seq_lens_cpu_upper_bound(monkeypatch):
     )
     state = object.__new__(MambaHybridModelState)
     state.max_model_len = 4096
+    state._spec_replay = None  # speculative GDN states stored per position
     seq_lens_cpu_upper_bound = torch.tensor([130], dtype=torch.int32)
     input_batch = SimpleNamespace(
         num_reqs=1,
@@ -303,6 +304,20 @@ def _create_gdn_builder(
         vllm_config=vllm_config,
         device=device,
     )
+
+
+def _create_grouped_gdn_builders(model_name, count, **kwargs):
+    """Cache groups of one engine share one configuration/resource owner."""
+    first = _create_gdn_builder(model_name, **kwargs)
+    return [first] + [
+        GDNAttentionMetadataBuilder(
+            kv_cache_spec=first.kv_cache_spec,
+            layer_names=[f"layer.{index}"],
+            vllm_config=first.vllm_config,
+            device=kwargs.get("device", DEVICE),
+        )
+        for index in range(1, count)
+    ]
 
 
 def _clear_envs_cache() -> None:
@@ -831,16 +846,14 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
     qwen_gdn.envs.disable_envs_cache()
 
-    builders = [
-        _create_gdn_builder(
-            local_gdn_model,
-            num_speculative_tokens=7,
-            use_full_cuda_graph=True,
-            max_cudagraph_capture_size=16,
-            device=device,
-        )
-        for _ in range(2)
-    ]
+    builders = _create_grouped_gdn_builders(
+        local_gdn_model,
+        2,
+        num_speculative_tokens=7,
+        use_full_cuda_graph=True,
+        max_cudagraph_capture_size=16,
+        device=device,
+    )
     width = builders[0].num_spec_state_tokens + 1
     assert width == 8
     query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
@@ -980,17 +993,15 @@ def test_dflash2_fused_gdn_group_metadata_align_replay(
     monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
     qwen_gdn.envs.disable_envs_cache()
 
-    builders = [
-        _create_gdn_builder(
-            local_gdn_model,
-            num_speculative_tokens=7,
-            use_full_cuda_graph=True,
-            mamba_cache_mode="align",
-            max_cudagraph_capture_size=16,
-            device=device,
-        )
-        for _ in range(2)
-    ]
+    builders = _create_grouped_gdn_builders(
+        local_gdn_model,
+        2,
+        num_speculative_tokens=7,
+        use_full_cuda_graph=True,
+        mamba_cache_mode="align",
+        max_cudagraph_capture_size=16,
+        device=device,
+    )
     width = builders[0].num_spec_state_tokens + 1
     query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
     common_metadata = compute_common_gdn_attn_metadata(
@@ -1140,7 +1151,16 @@ def test_mtp_fused_gdn_group_metadata_matches_legacy_replay(
         )
 
     legacy_builders = [make_builder() for _ in range(3)]
-    fused_builders = [make_builder() for _ in range(3)]
+    first_fused = make_builder()
+    fused_builders = [first_fused] + [
+        GDNAttentionMetadataBuilder(
+            kv_cache_spec=first_fused.kv_cache_spec,
+            layer_names=[f"layer.{i}"],
+            vllm_config=first_fused.vllm_config,
+            device=device,
+        )
+        for i in range(1, 3)
+    ]
     assert all(b._ddtree_fast_common_buffers is not None for b in fused_builders)
     seq_lens = torch.tensor([16, 17, 63], dtype=torch.int32, device=device)
     query_start_loc = torch.arange(
@@ -1695,12 +1715,13 @@ def test_spec_core_placeholder_registry_includes_state_slot_selector(
 ):
     monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "1")
 
-    _create_gdn_builder(
+    builder = _create_gdn_builder(
         local_gdn_model,
         num_speculative_tokens=4,
         use_full_cuda_graph=True,
     )
-    tensors = get_registered_gdn_spec_metadata_tensors("layer.0", DEVICE)
+    with set_forward_context(None, builder.vllm_config):
+        tensors = get_registered_gdn_spec_metadata_tensors("layer.0", DEVICE)
 
     assert len(tensors) == 9
     assert tensors[7].numel() > 0
@@ -1798,8 +1819,11 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
             self.conv1d.weight = torch.empty((8, 1, 1), device=DEVICE)
             self.conv1d.bias = torch.empty(8, device=DEVICE)
             self.activation = "silu"
+            self.gdn_policy = builder.gdn_policy
             self.A_log = torch.empty(1)
             self.dt_bias = torch.empty(1)
+            self._spec_replay = False
+            self._replay_stride = 1
 
         def rearrange_mixed_qkv(
             self,
@@ -1811,6 +1835,10 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
 
         def _forward_core(self, **kwargs) -> None:
             raise AssertionError("pure spec_commit should not use metadata fallback")
+
+        def _can_use_sm70_gdn_preprocess(self, *args) -> bool:
+            # This case covers the existing convolution/gating path.
+            return False
 
     def fake_conv_update(
         x,
@@ -1850,7 +1878,9 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
         out = torch.full((1, mixed_qkv.shape[0], 1, 1), 7.0, device=DEVICE)
         return out, None
 
-    monkeypatch.setattr(qwen_gdn, "causal_conv1d_update", fake_conv_update)
+    from vllm.model_executor.layers.fla.ops import gdn_stages
+
+    monkeypatch.setattr(gdn_stages, "causal_conv1d_update", fake_conv_update)
     monkeypatch.setattr(qwen_gdn, "fused_gdn_gating", fake_gating)
     monkeypatch.setattr(
         qwen_gdn,

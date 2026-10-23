@@ -7,7 +7,9 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm.config import DeviceConfig, VllmConfig
 from vllm.config.model import ModelConfig
+from vllm.config.policy_defaults import PolicyDefaults
 from vllm.config.vllm import _configure_sm70_dflash2_graph_cache
 
 
@@ -44,17 +46,29 @@ def release(monkeypatch):
     return model, spec, parallel, NS(cache_dtype="fp8_e4m3")
 
 
+def defaults():
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    # Exercise this original checkpoint before platform defaults resolve it.
+    from vllm.config.execution_policy import GraphPolicy
+
+    cfg.compilation_config.runtime = GraphPolicy()
+    return PolicyDefaults(cfg)
+
+
 def test_release_uses_graph_cache_without_disabling_compilation_cache(release):
-    assert _configure_sm70_dflash2_graph_cache(*release)
-    assert not envs.VLLM_USE_AOT_COMPILE
+    policy = defaults()
+    assert _configure_sm70_dflash2_graph_cache(*release, defaults=policy)
+    assert not policy.value("VLLM_USE_AOT_COMPILE")
+    assert "VLLM_USE_AOT_COMPILE" not in os.environ
     assert not envs.VLLM_DISABLE_COMPILE_CACHE
 
 
 @pytest.mark.parametrize("override", ["0", "1"])
 def test_explicit_aot_choice_is_preserved(release, monkeypatch, override):
     monkeypatch.setenv("VLLM_USE_AOT_COMPILE", override)
-    assert _configure_sm70_dflash2_graph_cache(*release)
-    assert (override == "1") == envs.VLLM_USE_AOT_COMPILE
+    policy = defaults()
+    assert _configure_sm70_dflash2_graph_cache(*release, defaults=policy)
+    assert (override == "1") == policy.value("VLLM_USE_AOT_COMPILE")
 
 
 @pytest.mark.parametrize(
@@ -76,6 +90,8 @@ def test_unqualified_routes_keep_their_existing_aot_default(
         spec.num_speculative_tokens = 5
     else:
         spec = None
-    assert not _configure_sm70_dflash2_graph_cache(model, spec, parallel, cache)
+    assert not _configure_sm70_dflash2_graph_cache(
+        model, spec, parallel, cache, defaults=defaults()
+    )
     assert "VLLM_USE_AOT_COMPILE" not in os.environ
     assert envs.VLLM_USE_AOT_COMPILE  # Existing SM70 graph default.

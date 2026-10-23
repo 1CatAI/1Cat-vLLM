@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 from vllm import _custom_ops as ops
+from vllm.distributed.device_communicators.collective_provider import (
+    NativeCollectiveBindings,
+)
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
 
@@ -25,7 +28,9 @@ def test_hc_cta_default_and_old_extension_fallback(monkeypatch, supports_split):
     )
     buffers = [object() for _ in range(8)]
     CustomAllreduce.sm70_qwen38_hc_batch(
-        SimpleNamespace(_ptr=123), *buffers, fused_chain=True
+        SimpleNamespace(_ptr=123, _native=NativeCollectiveBindings(None)),
+        *buffers,
+        fused_chain=True,
     )
     assert calls[0][:9] == (123, *buffers)
     assert calls[0][9:13] == (False, False, False, True)

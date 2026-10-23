@@ -81,3 +81,43 @@ def resolve_qsa_auto_e4m3(cfg) -> bool:
         cfg.cache_config.cache_dtype = "fp8_e4m3"
         cfg.cache_config.cache_dtype_from_checkpoint = False
     return policy.qsa_auto_e4m3_active
+
+
+def resolve_qsa_host_kv(cfg) -> bool:
+    """Admit per-vector host storage independently of draft cache precision."""
+    from vllm.platforms import current_platform
+
+    policy = cfg.kernel_config
+    model = cfg.model_config
+    reason = None
+    if not policy.qsa_host_kv:
+        reason = "disabled by KernelConfig"
+    elif model is None or not getattr(model.hf_text_config, "indexer_n_heads", None):
+        reason = "no QSA selector metadata"
+    elif not current_platform.is_cuda() or not current_platform.is_device_capability(
+        70
+    ):
+        reason = "requires SM70 CUDA"
+    elif model.dtype != torch.float16:
+        reason = "host staging requires FP16 activations"
+    elif getattr(model.hf_text_config, "head_dim", None) != 256:
+        reason = "host staging requires D256"
+    elif getattr(model.hf_text_config, "indexer_compress_ratio", None) != 4 or (
+        getattr(model.hf_text_config, "indexer_budget", 0) % 4
+    ):
+        reason = "host staging requires complete four-token selector pages"
+    elif model.get_num_kv_heads(cfg.parallel_config) != 1:
+        reason = "host writer requires one TP-local KV head"
+    elif cfg.parallel_config.decode_context_parallel_size != 1 or (
+        cfg.parallel_config.prefill_context_parallel_size != 1
+    ):
+        reason = "host QSA storage requires DCP1 and PCP1"
+    elif cfg.cache_config.cache_dtype not in ("auto", "float16"):
+        reason = "host E4M3 uses separate per-vector scales; keep draft KV FP16"
+    elif cfg.cache_config.kv_offloading_size is not None:
+        reason = "active host storage cannot share a prefix-offloading connector"
+    elif getattr(getattr(cfg, "kv_transfer_config", None), "kv_connector", None):
+        reason = "active host storage is not qualified with KV transfer connectors"
+    policy.qsa_host_kv_reason = reason
+    policy.qsa_host_kv_active = reason is None
+    return policy.qsa_host_kv_active

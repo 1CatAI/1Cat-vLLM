@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import sys
+import weakref
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
 import torch
 
+from tests.models.qwen4_exp.qsa_policy_utils import set_qsa_option
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_indexer_cublas_shape_supported,
@@ -162,8 +164,8 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
     token_to_request = torch.zeros(rows, dtype=torch.int32)
     query_positions = torch.arange(rows, dtype=torch.int64)
     sequence_lengths = torch.full((1,), rows, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", rows)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", rows)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -190,7 +192,7 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
         query_positions[:-1],
         sequence_lengths,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", False)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", False)
     assert not qsa_ops._use_sm70_qsa_xqa_page4(query, *args)
 
 
@@ -266,8 +268,8 @@ def test_qsa_e4m3_page4_routes_large_mixed_batch_below_prefill_boundary(
     token_to_request = torch.zeros(rows, dtype=torch.int32)
     query_positions = torch.arange(rows, dtype=torch.int64)
     sequence_lengths = torch.full((4,), rows, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 4096)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 4096)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -312,7 +314,7 @@ def test_qsa_xqa_page4_splits_non_grouped_large_batch(
         "flash_attn_v100.flash_attn_interface",
         flash_interface,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
+    set_qsa_option(monkeypatch, "qsa_grouped_page4", True)
 
     calls = []
 
@@ -462,8 +464,8 @@ def test_qsa_xqa_page4_table_rejects_stale_or_invalid_tail_metadata():
 def test_qsa_indexer_cublas_does_not_capture_decode_rows(monkeypatch):
     cache = torch.empty(2, 400, 1, 128, dtype=torch.float16)
     page_table = torch.empty(1, 2, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS_MIN_ROWS", 256)
+    set_qsa_option(monkeypatch, "qsa_indexer_cublas", True)
+    set_qsa_option(monkeypatch, "qsa_cublas_min_rows", 256)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -479,11 +481,7 @@ def test_qsa_indexer_cublas_does_not_capture_decode_rows(monkeypatch):
 
 
 def test_qsa_indexer_cublas_requires_enough_score_work(monkeypatch):
-    monkeypatch.setattr(
-        qsa_ops,
-        "_SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS",
-        1024**2,
-    )
+    set_qsa_option(monkeypatch, "qsa_cublas_min_score_elements", 1024**2)
 
     assert not qsa_ops._qsa_indexer_cublas_work_supported(1024, 512)
     assert qsa_ops._qsa_indexer_cublas_work_supported(2048, 512)
@@ -523,3 +521,156 @@ def test_qsa_lexicographic_topk_prefers_validation_sidecar(monkeypatch):
 
     qsa_ops.torch.ops._C_qsa_sm70 = SimpleNamespace()
     assert _sm70_qsa_lexicographic_topk_op() is wheel
+
+
+@pytest.mark.parametrize("exact", (False, True))
+def test_chunked_selection_allocates_scratch_only_for_generic_topk(monkeypatch, exact):
+    """The generic selector owns one reusable scratch; exact selection needs none."""
+    rows, columns = 5, 16
+    q = torch.empty(rows, 4, 128)
+    output = torch.empty(rows, 2051, dtype=torch.int32)
+    events = []
+    scratch = []
+    previous_scores: list[weakref.ReferenceType[torch.Tensor]] = []
+    allocate = torch.empty
+
+    def record_allocation(shape, **kwargs):
+        tensor = allocate(shape, **kwargs)
+        if kwargs.get("dtype") == torch.uint8:
+            scratch.append(tensor)
+        return tensor
+
+    def score(query, *args, **kwargs):
+        assert all(ref() is None for ref in previous_scores)
+        events.append("score")
+        n = query.shape[0]
+        logits = torch.ones(n, columns)
+        visible = torch.full((n,), columns, dtype=torch.int32)
+        previous_scores.extend((weakref.ref(logits), weakref.ref(visible)))
+        return logits, visible
+
+    def select(logits, lengths, indices, *args):
+        events.append("select")
+        if not exact:
+            assert args[0] is scratch[0]
+            assert args[0].numel() == qsa_ops._TOPK_WORKSPACE_BYTES
+        indices.zero_()
+
+    def expand(*args):
+        events.append("expand")
+        args[-1].fill_(-1)
+
+    monkeypatch.setattr(torch, "empty", record_allocation)
+    monkeypatch.setattr(qsa_ops, "_LOGITS_WORKSPACE_BYTES", 2 * columns * 4)
+    monkeypatch.setattr(qsa_ops, "_use_sm70_qsa_indexer_cublas", lambda *a: False)
+    monkeypatch.setattr(qsa_ops, "_use_sm70_qsa_lexicographic_topk", lambda *a: exact)
+    monkeypatch.setattr(qsa_ops, "_sm70_qsa_lexicographic_topk_op", lambda: select)
+    monkeypatch.setattr(
+        qsa_ops.current_platform, "has_device_capability", lambda *a: False
+    )
+    monkeypatch.setattr(qsa_ops, "qsa_mqa_paged", score)
+    monkeypatch.setattr(qsa_ops.torch.ops._C, "persistent_topk", select, raising=False)
+    monkeypatch.setattr(qsa_ops, "expand_qsa_block_indices_cuda", expand)
+    actual = qsa_ops.qsa_select_paged_tokens(
+        q,
+        torch.ones(1, columns, 1, 128),
+        torch.zeros(1, 1, dtype=torch.int32),
+        torch.zeros(rows, dtype=torch.int32),
+        torch.arange(rows),
+        torch.tensor([columns * 4], dtype=torch.int32),
+        2048,
+        4,
+        output,
+    )
+    assert actual is output
+    assert torch.all(output == -1)
+    assert len(scratch) == (0 if exact else 1)
+    assert events == ["score", "select", "expand"] * 3
+
+
+def test_qsa_cublas_releases_scores_between_column_tiles(monkeypatch):
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 1)
+    query = torch.randn(512, 4, 16)
+    keys = torch.randn(600, 16)
+    valid = torch.ones(600, dtype=torch.uint8)
+    visible = torch.full((512,), 600, dtype=torch.int32)
+    previous: list[weakref.ReferenceType[torch.Tensor]] = []
+    original_mm = torch.mm
+
+    def multiply(left, right, *, out_dtype):
+        assert out_dtype == torch.float32
+        assert all(ref() is None for ref in previous)
+        result = original_mm(left, right)
+        previous.append(weakref.ref(result))
+        return result
+
+    class Epilogue:
+        def __getitem__(self, grid):
+            def apply(scores, visibility, mask, logits, *args, **kwargs):
+                width, column = args[3:5]
+                heads = kwargs["NUM_HEADS"]
+                logits[:, column : column + width].copy_(
+                    scores.reshape(query.shape[0], heads, width).relu().sum(dim=1)
+                )
+
+            return apply
+
+    expected = original_mm(query.reshape(-1, 16), keys.T)
+    expected = expected.reshape(512, 4, 600).relu().sum(dim=1)
+    monkeypatch.setattr(torch, "mm", multiply)
+    monkeypatch.setattr(qsa_ops, "_qsa_relu_headsum_visible_kernel", Epilogue())
+    actual, actual_visible = qsa_ops._qsa_mqa_cublas(query, keys, valid, visible)
+    torch.testing.assert_close(actual, expected)
+    assert actual_visible is visible
+    assert len(previous) == 3
+    assert all(ref() is None for ref in previous)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qsa_cublas_tiled_scores_preserve_graph_replay(monkeypatch):
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 1)
+    query = torch.randn(512, 4, 128, device="cuda", dtype=torch.float16)
+    keys = torch.randn(600, 128, device="cuda", dtype=torch.float16)
+    valid = torch.ones(600, dtype=torch.uint8, device="cuda")
+    visible = torch.full((512,), 600, dtype=torch.int32, device="cuda")
+
+    def reference():
+        # Same tile shapes and arithmetic as the previous retained-score path.
+        out = torch.empty(512, 600, dtype=torch.float32, device="cuda")
+        scores = None
+        for first in range(0, 600, 256):
+            last = min(first + 256, 600)
+            width = last - first
+            scores = torch.mm(
+                query.reshape(-1, 128), keys[first:last].T, out_dtype=torch.float32
+            )
+            qsa_ops._qsa_relu_headsum_visible_kernel[(512, 1)](
+                scores,
+                visible,
+                valid,
+                out,
+                scores.stride(0),
+                scores.stride(1),
+                out.stride(0),
+                width,
+                first,
+                128**0.5,
+                NUM_HEADS=4,
+                BLOCK_N=256,
+                num_warps=4,
+            )
+        return out
+
+    qsa_ops._qsa_mqa_cublas(query, keys, valid, visible)
+    expected = reference()
+    actual, _ = qsa_ops._qsa_mqa_cublas(query, keys, valid, visible)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured, _ = qsa_ops._qsa_mqa_cublas(query, keys, valid, visible)
+    for _ in range(3):
+        query.normal_()
+        keys.normal_()
+        graph.replay()
+        torch.testing.assert_close(captured, reference(), rtol=0, atol=0)
+        assert torch.isfinite(captured).all()

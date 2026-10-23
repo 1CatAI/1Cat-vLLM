@@ -39,6 +39,129 @@ from vllm.v1.worker.block_table import get_block_table_width
 logger = init_logger(__name__)
 
 
+# Shared host pools stay mapped and registered for the worker's lifetime.
+_SHARED_HOST_POOLS: list[Any] = []
+
+
+def _shared_replica_host_pool(pool_size: int, device: torch.device):
+    """One host KV pool per replicated KV head instead of one per TP rank.
+
+    With fewer KV heads than TP ranks, consecutive ranks hold the same KV head
+    and write identical history. Those ranks map one shared-memory pool and
+    register it with CUDA, which divides host KV memory by the replication.
+    Returns None (private pool) when the layout does not replicate heads or
+    the ranks cannot share host memory.
+    """
+    import mmap
+    import os
+    import uuid
+
+    import torch.distributed as dist
+
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.distributed.parallel_state import get_tp_group
+
+    config = get_current_vllm_config_or_none()
+    if config is None or not getattr(
+        config.kernel_config, "qsa_host_kv_share_replicas", True
+    ):
+        return None
+    parallel = config.parallel_config
+    tp = parallel.tensor_parallel_size
+    if parallel.pipeline_parallel_size != 1 or parallel.data_parallel_size != 1:
+        return None
+    try:
+        kv_heads = config.model_config.get_total_num_kv_heads()
+    except Exception:  # noqa: BLE001 - models without a KV head count
+        return None
+    if tp <= 1 or kv_heads >= tp or tp % kv_heads:
+        return None
+    group = get_tp_group()
+    replicas = tp // kv_heads
+    rank = group.rank_in_group
+    leader = rank % replicas == 0
+    tokens = [uuid.uuid4().hex if rank == 0 else None]
+    dist.broadcast_object_list(tokens, src=group.ranks[0], group=group.cpu_group)
+    path = f"/dev/shm/vllm-host-kv-{tokens[0]}-{rank // replicas}"
+    try:
+        if leader:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.ftruncate(fd, pool_size)
+            os.close(fd)
+        ok = True
+    except OSError:
+        ok = False
+    flags = [None] * group.world_size
+    dist.all_gather_object(flags, ok, group=group.cpu_group)
+    if not all(flags):
+        if leader and ok:
+            os.unlink(path)
+        return None
+    fd = os.open(path, os.O_RDWR)
+    shared = mmap.mmap(fd, pool_size, mmap.MAP_SHARED)
+    os.close(fd)
+    dist.barrier(group=group.cpu_group)
+    if leader:
+        os.unlink(path)
+    from vllm.model_executor.layers.quantization.gguf_expert_cache import _native
+
+    host = torch.frombuffer(shared, dtype=torch.int8)
+    native = _native()
+    native.host_register(host.data_ptr(), pool_size)
+    view = native.mapped_view(host, device.index)
+    _SHARED_HOST_POOLS.append((shared, host, view))
+    logger.info(
+        "Host KV pool shared by %d TP ranks per KV head (%s per pool).",
+        replicas,
+        format_gib(pool_size),
+    )
+    return view
+
+
+def allocate_host_kv_cache_pool(
+    kv_cache_config: KVCacheConfig, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Pack host cache banks into one pinned allocation per worker.
+
+    The caching pinned allocator rounds each allocation to a power of two, so
+    the pool is one exact cudaHostAlloc instead of per-layer pinned tensors.
+    Aligned views retain the mapped pool owner and keep stable graph pointers.
+    """
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    banks = [t for t in kv_cache_config.kv_cache_tensors if t.host_backed]
+    if not banks:
+        return {}
+    aligned_sizes = [(t.size + 255) // 256 * 256 for t in banks]
+    pool_size = sum(aligned_sizes)
+    logger.info(
+        "Host KV pinned pool: payload=%d allocation=%d banks=%d bytes",
+        sum(t.size for t in banks),
+        pool_size,
+        len(banks),
+    )
+    pool = _shared_replica_host_pool(pool_size, device)
+    if pool is None:
+        with torch.accelerator.device_index(device.index):
+            # A pageable source makes the view helper cudaHostAlloc exactly
+            # pool_size bytes. The caching pinned allocator would round this
+            # one allocation up to a power of two (2.3 GB -> 4 GiB per worker).
+            # The untouched source pages are never resident; zero the pool on
+            # device.
+            host = torch.empty(pool_size, dtype=torch.int8, device="cpu")
+            pool = get_accelerator_view_from_cpu_tensor(host)
+            del host
+            pool.zero_()
+    tensors: dict[str, torch.Tensor] = {}
+    offset = 0
+    for bank, aligned_size in zip(banks, aligned_sizes):
+        view = pool.narrow(0, offset, bank.size)
+        for name in bank.shared_by:
+            tensors[name] = view
+        offset += aligned_size
+    return tensors
+
+
 def _resolve_zeroer_kernel_layout(
     spec: FullAttentionSpec,
     group_kernel_block_size: int,
@@ -116,6 +239,7 @@ def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
     seg_block_strides_ptr,
     seg_page_sizes_ptr,
+    seg_num_blocks_ptr,
     block_ids_ptr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -134,6 +258,11 @@ def _zero_kv_blocks_kernel(
 
     Programs are mapped as (block_index, seg_index, chunk_index). Segment page
     sizes may differ across hybrid cache groups.
+
+    Block IDs carry no cache-group identity. A segment whose tensor holds
+    fewer blocks than the pool (a bounded recurrent-state range) never owns
+    IDs past its own capacity, so those are skipped rather than written past
+    the end of the allocation.
     """
     block_index = tl.program_id(0)
     seg_index = tl.program_id(1)
@@ -143,6 +272,8 @@ def _zero_kv_blocks_kernel(
     if chunk_offset >= page_size_el:
         return
     block_id = tl.load(block_ids_ptr + block_index)
+    if block_id < 0 or block_id >= tl.load(seg_num_blocks_ptr + seg_index):
+        return
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
     block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
@@ -167,7 +298,8 @@ class KVBlockZeroer:
         self.device = device
         self.pin_memory = pin_memory
         self._meta: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]
+            | None
         ) = None
 
     def init_meta(
@@ -177,6 +309,7 @@ class KVBlockZeroer:
         cache_dtype: str,
         runner_only_attn_layers: set[str],
         static_forward_context: dict[str, Any],
+        host_backed_layers: set[str] | None = None,
     ) -> None:
         """One-time precomputation for zero_block_ids.
 
@@ -193,18 +326,28 @@ class KVBlockZeroer:
         they can contribute multiple segments. Mamba/GDN layers expose typed
         state tensor views over one raw page per block; the first state tensor
         starts at the page base, so one segment per layer zeros the whole page.
+
+        Host-backed layers (pinned host history mapped into the device address
+        space) are not zeroed: their readers only touch slots below each
+        request's length, and zeroing them writes every new block across PCIe
+        (~13 ms per 8K-token prefill step on x8 Gen3).
         """
+        host_backed_layers = host_backed_layers or set()
         seen_ptrs: dict[int, int] = {}
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
+        # Logical blocks each segment's tensor actually holds.
+        seg_num_blocks: list[int] = []
 
-        def add_segment(address: int, page_size_el: int) -> None:
+        def add_segment(address: int, page_size_el: int, num_blocks: int) -> None:
             if (index := seen_ptrs.get(address)) is not None:
                 seg_page_sizes[index] = max(seg_page_sizes[index], page_size_el)
+                seg_num_blocks[index] = min(seg_num_blocks[index], num_blocks)
                 return
             seen_ptrs[address] = len(seg_addrs)
             seg_addrs.append(address)
             seg_page_sizes.append(page_size_el)
+            seg_num_blocks.append(num_blocks)
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -212,7 +355,10 @@ class KVBlockZeroer:
                 continue
 
             for layer_name in group.layer_names:
-                if layer_name in runner_only_attn_layers:
+                if (
+                    layer_name in runner_only_attn_layers
+                    or layer_name in host_backed_layers
+                ):
                     continue
                 kv = static_forward_context[layer_name].kv_cache
                 if isinstance(spec, FullAttentionSpec):
@@ -243,9 +389,10 @@ class KVBlockZeroer:
                         if kv.stride(d) * el > block_stride_bytes
                     ]
                     outer_strides = [kv.stride(d) * el for d in outer_dims]
+                    num_blocks = kv.shape[block_dim] // ratio
                     for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                         off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                        add_segment(dp + off_bytes, cur_page_el)
+                        add_segment(dp + off_bytes, cur_page_el, num_blocks)
                 elif isinstance(spec, MambaSpec):
                     if not isinstance(kv, (list, tuple)) or not kv:
                         continue
@@ -257,8 +404,17 @@ class KVBlockZeroer:
                     page_bytes = spec.page_size_bytes
                     assert page_bytes % 4 == 0
                     cur_page_el = page_bytes // 4
-                    add_segment(dp, cur_page_el)
+                    # A bounded state pool exposes fewer pages than the
+                    # scheduler's block-ID range.
+                    add_segment(dp, cur_page_el, first_state.shape[0])
 
+        logger.info(
+            "KV block zeroer: %d segments, %.1f MiB per block (skipped %d "
+            "host-backed layers)",
+            len(seg_addrs),
+            sum(seg_page_sizes) * 4 / 2**20,
+            len(host_backed_layers),
+        )
         if not seg_addrs:
             self._meta = None
             return
@@ -293,6 +449,7 @@ class KVBlockZeroer:
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
             seg_block_strides,
             torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
+            torch.tensor(seg_num_blocks, dtype=torch.int64, device=self.device),
             (max_page_size_el + blk_size - 1) // blk_size,
             blk_size,
             n_segs,
@@ -306,6 +463,7 @@ class KVBlockZeroer:
             seg_addrs,
             seg_block_strides,
             seg_page_sizes,
+            seg_num_blocks,
             max_chunks,
             blk_size,
             n_segs,
@@ -327,6 +485,7 @@ class KVBlockZeroer:
             seg_addrs,
             seg_block_strides,
             seg_page_sizes,
+            seg_num_blocks,
             idx,
             BLOCK_SIZE=blk_size,
         )

@@ -14,6 +14,7 @@ from vllm.config.sm70_dflash2 import (
     sm70_dflash2_enabled,
 )
 from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 
 
 @pytest.fixture(autouse=True)
@@ -68,10 +69,13 @@ def test_legacy_parser_and_configuration_precedence(monkeypatch, raw, expected):
 
 
 def test_norm_retains_its_policy_after_initialization_context_ends(monkeypatch):
+    from vllm.model_executor.kernels.norm import sm70 as norm_provider
     from vllm.model_executor.layers import layernorm
 
-    monkeypatch.setattr(layernorm, "_sm70_gemma_long_prefill_available", lambda: True)
-    monkeypatch.setattr(envs, "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", True)
+    monkeypatch.setattr(
+        norm_provider, "_sm70_gemma_long_prefill_available", lambda: True
+    )
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
     cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
     policy = Sm70DFlash2Config()
     policy.resolve(qualified=True)
@@ -103,6 +107,7 @@ def _hash_subject(method, policy):
         method=method,
         use_local_argmax_reduction=False,
         sm70_dflash2=policy,
+        sampling_policy=SpeculativeSamplingPolicy(),
         mtp_expert_quantization=None,
         draft_model_config=None,
         use_dflash_family=lambda: method == "dflash",
@@ -157,7 +162,10 @@ def test_loaded_report_includes_actual_verifier_flags_and_reason():
     assert row["reasons"]["_sm70_dflash2_combined_split_reason"] == "local_tail_layout"
 
 
-def test_failed_order_switch_is_removed_and_dense_alias_warns(monkeypatch, caplog):
+def test_failed_order_switch_is_removed_and_dense_alias_warns(monkeypatch):
+    from vllm import envs_metadata
+
+    monkeypatch.setattr(envs_metadata, "_warned_names", set())
     assert (
         "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER" not in envs.environment_variables
     )
@@ -165,5 +173,7 @@ def test_failed_order_switch_is_removed_and_dense_alias_warns(monkeypatch, caplo
     assert not hasattr(policy, "qpn8_allow_candidate_order")
     assert not hasattr(policy, "qpn8_dense_order")
     monkeypatch.setenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "0")
-    policy.resolve(qualified=True)
-    assert "dense tie ordering is mandatory" in caplog.text
+    with pytest.warns(
+        FutureWarning, match="dense vocabulary tie ordering is now mandatory"
+    ):
+        policy.resolve(qualified=True)

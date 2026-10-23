@@ -3,11 +3,10 @@
 
 """DeepSeek V4 C4 indexer fallback using FP16 HMMA on SM70."""
 
-import os
-
 import torch
 
 from vllm.config import CUDAGraphMode
+from vllm.config.sm70_sparse import sparse_policy
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
@@ -26,7 +25,6 @@ _INDEX_CACHE_BYTES = _INDEX_HEAD_DIM + 4
 # [rows, max_seq_len, 128] fp16 and running a dense bmm. Set to 0 to get the
 # old gather+bmm path back for an A/B. Only affects decode; prefill scores a
 # contiguous chunk whose width is the real chunk length already.
-_FUSED_DECODE_LOGITS = os.getenv("VLLM_SM70_INDEXER_FUSED_LOGITS", "1") == "1"
 
 # Score with the model's actual indexer function,
 #     I[t, s] = sum_h weights[t, h] * relu(q[t, h] . k[s]),
@@ -38,7 +36,6 @@ _FUSED_DECODE_LOGITS = os.getenv("VLLM_SM70_INDEXER_FUSED_LOGITS", "1") == "1"
 # applies it inside its logits kernel). Dropping it costs 64x fewer flops and
 # ranks the wrong keys, which only shows up once top-k is actually selective.
 # Set 0 to restore the factored form for an A/B.
-_RELU_LOGITS = os.getenv("VLLM_SM70_INDEXER_RELU", "1") == "1"
 
 # Key-axis splits are chosen so the launch is roughly this many blocks, which
 # keeps all 80 SMs busy at long context without paying for thousands of
@@ -54,11 +51,9 @@ _RELU_BLOCK_M = 32
 # Route prefill scoring through cuBLAS instead of the Triton MMA. Set 0 for an
 # A/B against the Triton kernel above (which stays as the reference shape and
 # is what the decode path still uses, since decode gathers from a paged cache).
-_PREFILL_CUBLAS = os.getenv("VLLM_SM70_INDEXER_PREFILL_CUBLAS", "1") == "1"
 # Cap (MiB) on the [tokens*heads, key_tile] fp16 score tile. At the default
 # 2048-token prefill chunk and 64 heads this is 128 KiB per key, so the tile
 # is what keeps a long-context chunk from asking for gigabytes in one go.
-_PREFILL_TILE_MB = int(os.getenv("VLLM_SM70_INDEXER_PREFILL_TILE_MB", "192"))
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
 
@@ -68,10 +63,6 @@ _EPILOGUE_BLOCK_H = 8
 # FP32 output is deliberate: an FP16 score intermediate produced rare top-k
 # set changes at 16K/64K compressed tokens. Short and generic shapes retain the
 # fused paged kernel, whose launch overhead is lower there.
-_DECODE_CUBLAS = os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS", "1") == "1"
-_DECODE_CUBLAS_MIN_KEYS = int(
-    os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS", "1024")
-)
 # Measured on V100: with 6 verifier rows and a 16384-key graph bucket the cuBLAS
 # route costs a flat 0.13 ms, the paged kernel 0.04-0.68 ms as the live length
 # goes from 256 to 16384 keys, same top-512 set.
@@ -598,6 +589,7 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
     GEMM whose output is reduced over heads afterwards. Keys are tiled so that
     intermediate stays bounded; it is the largest allocation in the indexer.
     """
+    policy = sparse_policy()
     num_q, num_heads, head_dim = q.shape
     num_k = k_quant.shape[0]
     out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
@@ -617,7 +609,7 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
         q2 = q2.contiguous()
 
     rows = num_q * num_heads
-    budget = max(1, _PREFILL_TILE_MB * 2**20 // max(1, rows * 2))
+    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 2))
     k_tile = max(_RELU_BLOCK_N, min(num_k, budget // _RELU_BLOCK_N * _RELU_BLOCK_N))
 
     for start in range(0, num_k, k_tile):
@@ -652,15 +644,16 @@ def sm70_indexer_prefill_logits(
     weights: torch.Tensor,
 ) -> torch.Tensor:
     """Compute all prefill index scores; caller supplies causal row bounds."""
+    policy = sparse_policy()
     assert k_quant.dtype == torch.float8_e4m3fn
     assert k_quant.ndim == 2 and k_quant.shape[1] == _INDEX_HEAD_DIM
     k_scales = k_scale_storage.view(torch.float32).reshape(-1)
     assert k_scales.shape[0] == k_quant.shape[0]
 
-    if _RELU_LOGITS and _PREFILL_CUBLAS:
+    if policy.value("indexer_relu") and policy.value("indexer_prefill_cublas"):
         return _prefill_logits_cublas(q, k_quant, k_scales, weights)
 
-    if _RELU_LOGITS:
+    if policy.value("indexer_relu"):
         num_q, num_heads, _ = q.shape
         num_k = k_quant.shape[0]
         out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
@@ -812,6 +805,7 @@ def _decode_cublas_blocker(
     table_rows_per_request: int,
 ) -> str | None:
     """The first requirement of `_decode_logits_cublas` this call misses."""
+    policy = sparse_policy()
     if is_forward_context_available():
         context = get_forward_context()
         descriptor = context.batch_descriptor
@@ -838,8 +832,8 @@ def _decode_cublas_blocker(
             and current_platform.is_device_capability_family(70),
         ),
         (
-            f"a key bound of at least {_DECODE_CUBLAS_MIN_KEYS}",
-            lambda: max_seq_len >= _DECODE_CUBLAS_MIN_KEYS,
+            f"a key bound of at least {policy.value('indexer_decode_min_keys')}",
+            lambda: max_seq_len >= policy.value("indexer_decode_min_keys"),
         ),
         (
             "whole requests in the block table",
@@ -872,7 +866,7 @@ def _decode_cublas_blocker(
             "shared gather and FP32 scores within the indexer workspace budget",
             lambda: max_seq_len
             * (_INDEX_HEAD_DIM * 2 + rows_per_request() * q.shape[1] * 4)
-            <= _PREFILL_TILE_MB * 2**20,
+            <= policy.value("indexer_prefill_tile_mb") * 2**20,
         ),
         (
             f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
@@ -931,11 +925,14 @@ def sm70_indexer_decode_logits(
     speculative decode was flattened to one row per token.
     `indexer_decode_cublas` is the engine's `KernelConfig.sm70_sparse` setting;
     callers pass it because the forward pass runs outside the config context."""
+    policy = sparse_policy()
     assert cache.dtype == torch.uint8 and cache.ndim == 3
     assert cache.shape[-1] >= _INDEX_CACHE_BYTES
     # The relu path scores per head, so it needs q as [rows, heads, dim]; the
     # factored path collapses the head axis up front.
-    weighted_q = q if _RELU_LOGITS else _combine_index_queries(q, weights)
+    weighted_q = (
+        q if policy.value("indexer_relu") else _combine_index_queries(q, weights)
+    )
 
     native_rows = seq_lens.ndim == 2
     if native_rows:
@@ -948,7 +945,11 @@ def sm70_indexer_decode_logits(
     max_seq_len = max(1, int(max_seq_len))
     total_rows = weighted_q.shape[0]
 
-    if _RELU_LOGITS and _DECODE_CUBLAS and indexer_decode_cublas:
+    if (
+        policy.value("indexer_relu")
+        and policy.value("indexer_decode_cublas_enabled")
+        and indexer_decode_cublas
+    ):
         blocker = _decode_cublas_blocker(
             q,
             cache,
@@ -981,7 +982,7 @@ def sm70_indexer_decode_logits(
         block_table = block_table.repeat_interleave(next_n, dim=0)
     assert block_table.shape[0] == weighted_q.shape[0]
 
-    if _RELU_LOGITS:
+    if policy.value("indexer_relu"):
         out = torch.empty(
             (total_rows, max_seq_len), dtype=torch.float32, device=q.device
         )
@@ -1011,7 +1012,7 @@ def sm70_indexer_decode_logits(
         # seq_lens (see the note on the factored path below).
         return out
 
-    if _FUSED_DECODE_LOGITS:
+    if policy.value("indexer_fused_logits"):
         out = torch.empty(
             (total_rows, max_seq_len), dtype=torch.float32, device=q.device
         )

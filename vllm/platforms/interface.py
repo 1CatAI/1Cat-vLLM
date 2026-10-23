@@ -456,6 +456,13 @@ class Platform:
         pass
 
     @classmethod
+    def apply_runtime_policy_defaults(cls, vllm_config: "VllmConfig"):
+        """Resolve early graph/kernel defaults before the existing late checks."""
+        from vllm.platforms.runtime_defaults import apply_runtime_policy_defaults
+
+        return apply_runtime_policy_defaults(vllm_config)
+
+    @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
         """
         Apply the platform-specific default values to the config.
@@ -818,6 +825,17 @@ class Platform:
     ) -> float:
         """
         Return the memory usage in bytes.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def limit_allocator_headroom(
+        cls, headroom_bytes: int, device: torch.types.Device | None = None
+    ) -> int:
+        """Bound cached device reservation, returning the allocator byte limit.
+
+        Must retain active tensors and captured pools. Unsupported platforms
+        explicitly reject this requested resource limit.
         """
         raise NotImplementedError
 

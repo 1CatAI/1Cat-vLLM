@@ -189,7 +189,8 @@ class BlockTable:
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         can_skip_padding = (
-            self._slot_mapping_pad_initialized
+            self.device.type != "cpu"
+            and self._slot_mapping_pad_initialized
             and num_tokens >= self._slot_mapping_last_num_tokens
         )
         if can_skip_padding and num_reqs == 1 and total_cp_world_size == 1:

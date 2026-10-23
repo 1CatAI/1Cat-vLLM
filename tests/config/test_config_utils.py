@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import pytest
+from pydantic import Field
 
-from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
+from vllm.config.utils import (
+    config,
+    get_hash_factors,
+    hash_factors,
+    normalize_value,
+    replace,
+)
 
 # Helpers
 
@@ -31,6 +38,30 @@ def expected_path(p_str: str = ".") -> str:
 class SimpleConfig:
     a: object
     b: object | None = None
+
+
+@pytest.mark.parametrize("pydantic", [False, True])
+def test_replace_skips_runtime_attachments_and_non_init_fields(pydantic):
+    decorator = config if pydantic else dataclass
+    make_field = Field if pydantic else field
+
+    @decorator
+    class RuntimeConfig:
+        value: int = 1
+        derived: int = make_field(default=2, init=False)
+
+    original = RuntimeConfig()
+    original.derived = 99
+    # GDN binds this runtime owner before MTP copies the target configuration.
+    vars(original)["_gdn_prefill_profiler"] = object()
+
+    copied = replace(original, value=3)
+
+    assert copied.value == 3
+    assert copied.derived == 2
+    assert not hasattr(copied, "_gdn_prefill_profiler")
+    assert original.value == 1
+    assert original.derived == 99
 
 
 class DummyLogprobsMode(Enum):

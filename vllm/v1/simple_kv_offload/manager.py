@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -455,6 +456,10 @@ class SimpleCPUOffloadScheduler:
             return [], [], []
 
         free_queue = gpu_pool.free_block_queue
+        if not isinstance(free_queue, FreeKVCacheBlockQueue):
+            # Partitioned state/history pools have one eviction order per
+            # range; the cursor walk covers a single queue only.
+            return [], [], []
         cpu_pool = self.cpu_block_pool
         num_cpu_free = cpu_pool.get_num_free_blocks()
 

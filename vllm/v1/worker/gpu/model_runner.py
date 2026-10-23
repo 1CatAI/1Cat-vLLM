@@ -19,7 +19,6 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
-import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -28,14 +27,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
-    is_last_pp_first_tp_rank,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -50,12 +47,22 @@ from vllm.model_executor.offloader import (
     get_offloader,
     set_offloader,
 )
+from vllm.model_executor.warmup.plan import run_warmup_tasks, warmup_boolean
+from vllm.model_executor.warmup.sm70_runtime import (
+    auxiliary_warmup_enabled,
+    speculator_warmup_tasks,
+    warmup_v2_convolution,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.mem_utils import (
+    DeviceMemoryProfiler,
+    format_gib,
+    loaded_cuda_model_storage,
+    reclaim_cpu_allocator_pages,
+)
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -66,6 +73,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.spec_decode.profiling import create_step_profiler
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -114,16 +122,16 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
-from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
-    DFlash2LogitsFallback,
-    try_dflash2_sparse_target_rejection,
-)
-from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+from vllm.v1.worker.gpu.spec_decode.sm70_greedy_verify import (
+    greedy_capability,
+    maybe_sample_greedy,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.target_sampling import ComputedTargetLogits
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -159,6 +167,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         set_default_max_concurrency(vllm_config.max_concurrent_batches)
 
         self.device = device
+        self._sm70_greedy_capability = greedy_capability(
+            device, self.lora_config is not None
+        )
+        self._auxiliary_warmup_enabled = auxiliary_warmup_enabled(vllm_config)
         from vllm.v1.worker.mixed_prefill import MixedPrefillTimer
 
         self.mixed_prefill_timer = MixedPrefillTimer()
@@ -183,6 +195,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.is_first_pp_rank = get_pp_group().is_first_rank
         self.is_last_pp_rank = get_pp_group().is_last_rank
+        self._step_profiler = create_step_profiler(
+            vllm_config,
+            device,
+            role="runner_v2",
+            logger=logger,
+            is_last_pp_rank=self.is_last_pp_rank,
+        )
         self.pp_handler: PPHandler | None = None
 
         # Persistent buffer for intermediate tensors (non-first PP ranks).
@@ -312,120 +331,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
         self._ple_offload_connector: Any | None = None
+        self._ple_draft_ring: Any | None = None
         self._sm70_v2_mtp_profile_pending: dict[str, Any] | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
-
-    def _sm70_v2_mtp_profile_enabled(self) -> bool:
-        return (
-            self.speculative_config is not None
-            and self.speculative_config.method in ("mtp", "dflash", "dspark")
-            and self.is_last_pp_rank
-            and self.device.type == "cuda"
-            and envs.VLLM_SM70_MTP_PROFILE
-        )
-
-    @staticmethod
-    def _sm70_v2_mtp_profile_start(
-        ctx: dict[str, Any] | None,
-    ) -> torch.cuda.Event | None:
-        if ctx is None:
-            return None
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
-        return event
-
-    @staticmethod
-    def _sm70_v2_mtp_profile_finish(
-        ctx: dict[str, Any] | None,
-        name: str,
-        start: torch.cuda.Event | None,
-    ) -> None:
-        if ctx is None or start is None:
-            return
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-        ctx["events"].append((name, start, end))
-
-    def _sm70_v2_mtp_profile_report(self, ctx: dict[str, Any] | None) -> None:
-        if ctx is None:
-            return
-        events = ctx["events"]
-        if events:
-            events[-1][2].synchronize()
-
-        timings: dict[str, float] = {}
-        for name, start, end in events:
-            timings[name] = timings.get(name, 0.0) + start.elapsed_time(end)
-        timings["target_verifier_gpu"] = sum(
-            timings.get(name, 0.0)
-            for name in ("target_forward", "target_sample", "target_state_update")
-        )
-        timings["target_verifier_wall_cpu"] = ctx["target_verifier_wall_cpu"]
-        timings["total_wall_cpu"] = (
-            time.perf_counter() - ctx["total_wall_start"]
-        ) * 1000.0
-
-        totals = getattr(self, "_sm70_v2_mtp_profile_totals", None)
-        if totals is None:
-            totals = {}
-            self._sm70_v2_mtp_profile_totals = totals
-        calls = getattr(self, "_sm70_v2_mtp_profile_calls", 0) + 1
-        self._sm70_v2_mtp_profile_calls = calls
-        for name, value in timings.items():
-            totals[name] = totals.get(name, 0.0) + value
-
-        interval = envs.VLLM_SM70_MTP_PROFILE_INTERVAL
-        if calls != 1 and calls % interval != 0:
-            return
-        # Profiling is enabled on the last PP stage only (see
-        # _sm70_v2_mtp_profile_enabled); report from that stage as well.
-        if not is_last_pp_first_tp_rank():
-            return
-
-        preferred = (
-            "target_verifier_wall_cpu",
-            "target_verifier_gpu",
-            "target_forward",
-            "target_sample",
-            "target_state_update",
-            "draft_total",
-            "total_gpu",
-            "total_wall_cpu",
-        )
-        keys = [name for name in preferred if name in totals]
-        summary = " ".join(f"{name}={totals[name] / calls:.3f}" for name in keys)
-        logger.info(
-            "SM70 V2 MTP profile avg_ms calls=%d tokens=%d drafts=%d %s",
-            calls,
-            ctx["num_tokens"],
-            ctx["num_draft_tokens"],
-            summary,
-        )
-
-        last_totals = getattr(self, "_sm70_v2_mtp_profile_last_totals", {})
-        last_calls = getattr(self, "_sm70_v2_mtp_profile_last_calls", 0)
-        interval_calls = calls - last_calls
-        if interval_calls > 0:
-            interval_summary = " ".join(
-                f"{name}="
-                f"{(totals[name] - last_totals.get(name, 0.0)) / interval_calls:.3f}"
-                for name in keys
-            )
-            logger.info(
-                "SM70 V2 MTP profile interval_avg_ms calls=%d "
-                "interval_calls=%d tokens=%d drafts=%d %s",
-                calls,
-                interval_calls,
-                ctx["num_tokens"],
-                ctx["num_draft_tokens"],
-                interval_summary,
-            )
-        self._sm70_v2_mtp_profile_last_totals = dict(totals)
-        self._sm70_v2_mtp_profile_last_calls = calls
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -471,6 +383,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_source=query_start_loc_source,
             ngram_context_source=ngram_context_source,
         )
+        ring = self._ple_offload_connector.draft_ring
+        speculator = self.speculator
+        if (
+            ring is not None
+            and speculator is not None
+            and hasattr(speculator, "draft_step_listener")
+        ):
+            # Set before graph capture so every draft graph publishes.
+            speculator.draft_step_listener = ring.publish_draft_step
+            self._ple_draft_ring = ring
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
@@ -494,11 +416,47 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if self.speculator is not None:
+                # Checkpoint conversion can leave cycles holding replaced tensor
+                # banks. Reclaim them before allocating the independent draft.
+                allocated_before = torch.accelerator.memory_allocated()
+                gc.collect()
+                torch.accelerator.empty_cache()
+                if self.vllm_config.kernel_config.qsa_host_kv_active:
+                    before, after = reclaim_cpu_allocator_pages()
+                    logger.info(
+                        "Checkpoint CPU allocator RSS: %d -> %d bytes", before, after
+                    )
+                logger.info(
+                    "Target loading cleanup: allocated %d -> %d bytes, "
+                    "reserved %d bytes",
+                    allocated_before,
+                    torch.accelerator.memory_allocated(),
+                    torch.accelerator.memory_reserved(),
+                )
+                logger.info(
+                    "Target CUDA storage before speculative loading: %s",
+                    loaded_cuda_model_storage({"target": self.model}),
+                )
                 self.speculator.load_model(self.model)
+                if self.vllm_config.kernel_config.qsa_host_kv_active:
+                    before, after = reclaim_cpu_allocator_pages()
+                    logger.info(
+                        "Draft checkpoint CPU allocator RSS: %d -> %d bytes",
+                        before,
+                        after,
+                    )
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
         time_after_load = time.perf_counter()
+        # Pinned expert staging is only needed while converting checkpoints.
+        from vllm.model_executor.layers.quantization.gguf_turbomind_moe import (
+            release_staging_pool,
+        )
+
+        released = release_staging_pool()
+        if released:
+            logger.info("Released %.2f GiB of pinned loading staging", released / 2**30)
 
         self.model_memory_usage = m.consumed_memory
         logger.info(
@@ -670,7 +628,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
         elif self.speculator is not None:
             # Preserve the existing Eagle initialization order.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            self.speculator.init_cudagraph_manager(
+                cudagraph_mode,
+                capture_context=(
+                    self.cudagraph_manager.get_capture_context()
+                    if cudagraph_mode
+                    else None
+                ),
+            )
             # HACK(woosuk)
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables
@@ -700,6 +665,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=set(),
             static_forward_context=self.compilation_config.static_forward_context,
+            host_backed_layers={
+                name
+                for tensor in self.kv_cache_config.kv_cache_tensors
+                if tensor.host_backed
+                for name in tensor.shared_by
+            },
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
@@ -708,36 +679,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
     def _warmup_sm70_aux_kernels(self) -> None:
-        """Warm SM70 kernels whose production cache exists only in MRV2."""
-        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-            _warmup_sm70_qwen_gdn_causal_conv1d,
+        """Compatibility hook preserving the independent convolution warmup."""
+        warmup_v2_convolution(
+            self.compilation_config.static_forward_context,
+            logger,
+            enabled=self._auxiliary_warmup_enabled,
         )
-
-        if _warmup_sm70_qwen_gdn_causal_conv1d(
-            self.compilation_config.static_forward_context
-        ):
-            logger.info_once("SM70 MRV2 GDN causal-conv warmup finished.")
-
-        if (
-            not envs.VLLM_SM70_AUX_KERNEL_WARMUP
-            or not current_platform.is_device_capability(70)
-        ):
+        if not self._auxiliary_warmup_enabled:
             return
-
-        warmed: list[str] = []
-        if hasattr(self, "_kv_block_zeroer") and self._kv_block_zeroer.warmup_kernel():
-            warmed.append("zero_kv_blocks")
-
-        speculator_warmup = getattr(
-            self.speculator, "warmup_sm70_mtp_moe_kernels", None
-        )
-        if speculator_warmup is not None:
-            warmed.extend(speculator_warmup(self._dummy_run))
-
-        if warmed:
-            logger.info_once(
-                "SM70 V2 auxiliary kernel warmup finished: %s", tuple(warmed)
+        tasks = []
+        if hasattr(self, "_kv_block_zeroer"):
+            tasks.append(
+                warmup_boolean("zero_kv_blocks", self._kv_block_zeroer.warmup_kernel)
             )
+        tasks.extend(speculator_warmup_tasks(self.speculator, self._dummy_run))
+        warmed = run_warmup_tasks(tasks)
+        if warmed:
+            logger.info_once("SM70 V2 auxiliary kernel warmup finished: %s", warmed)
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -914,6 +872,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.compilation_config.cudagraph_mode
         )
 
+    def _check_graph_capture_headroom(self, free_bytes: int) -> None:
+        """Fail before compiling capture graphs when the reserve is not free.
+
+        Capture-time compilation, autotuning and graph pools run after the KV
+        cache is allocated. With an explicit VLLM_V2_CUDAGRAPH_MEM_MIB reserve,
+        report the ledger and stop here instead of at a late out-of-memory.
+        """
+        reserve = get_explicit_cudagraph_memory_reserve(
+            self.compilation_config.cudagraph_mode
+        )
+        allocated = torch.accelerator.memory_allocated()
+        reserved = torch.accelerator.memory_reserved()
+        logger.info(
+            "Graph capture headroom: driver_free=%.0f MiB reserve=%.0f MiB "
+            "allocated=%.0f MiB reserved=%.0f MiB",
+            free_bytes / 2**20,
+            reserve / 2**20,
+            allocated / 2**20,
+            reserved / 2**20,
+        )
+        if reserve and free_bytes < reserve:
+            raise RuntimeError(
+                f"CUDA graph capture needs {reserve / 2**20:.0f} MiB "
+                f"(VLLM_V2_CUDAGRAPH_MEM_MIB) but only {free_bytes / 2**20:.0f} "
+                "MiB is free after KV allocation; reduce KV/state pools or "
+                "weights before capture."
+            )
+
     @torch.inference_mode()
     def capture_model(self) -> int:
         assert self.cudagraph_manager is not None
@@ -930,6 +916,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         gc.collect()
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        self._check_graph_capture_headroom(start_free_gpu_memory)
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
@@ -951,6 +938,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
             )
             if self.speculator is not None:
+                # Target warmup leaves eager allocator blocks outside its graph
+                # pool. Release them before allocating the draft's separate
+                # pool; captured tensors and live workspaces remain owned.
+                torch.accelerator.synchronize()
+                gc.collect()
+                free_before = torch.cuda.mem_get_info()[0]
+                torch.accelerator.empty_cache()
+                logger.info(
+                    "Draft graph capture allocator cleanup: freed=%d "
+                    "driver_free=%d allocated=%d reserved=%d bytes",
+                    torch.cuda.mem_get_info()[0] - free_before,
+                    torch.cuda.mem_get_info()[0],
+                    torch.accelerator.memory_allocated(),
+                    torch.accelerator.memory_reserved(),
+                )
                 if isinstance(self.speculator, DraftModelSpeculator):
                     self.speculator.capture()
                 else:
@@ -1332,67 +1334,39 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if input_batch.num_draft_tokens > 0:
             assert self.rejection_sampler is not None
             assert self.speculator is not None
-            sparse_result = try_dflash2_sparse_target_rejection(
+            sparse_result = self.speculator.try_sample_target(
                 self.model,
-                self.speculator,
                 self.rejection_sampler,
                 sample_hidden_states,
                 input_batch,
                 grammar_output,
                 allow_graph=self.lora_config is None,
             )
-            if isinstance(sparse_result, DFlash2LogitsFallback):
+            if isinstance(sparse_result, ComputedTargetLogits):
                 cached_logits = sparse_result
             else:
                 sampler_output = sparse_result
-        sm70_greedy_decode = (
-            sampler_output is None
-            and input_batch.num_draft_tokens == 0
-            and input_batch.num_reqs == 1
-            and input_batch.num_tokens == 1
-            and not input_batch.is_prefilling_np[0]
-            and grammar_output is None
-            and self.device.type == "cuda"
-            and current_platform.is_device_capability(70)
-            and getattr(self, "lora_config", None) is None
-            and hasattr(self.model, "get_top_tokens")
-            and self.sampler is not None
-            and self.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
+        sampler_output = maybe_sample_greedy(
+            self.model,
+            self.sampler,
+            self.rejection_sampler,
+            self._sm70_greedy_capability,
+            self.vllm_config.kernel_config.sm70_greedy_verify,
+            sample_hidden_states,
+            input_batch,
+            grammar_output,
+            sampler_output,
+            cached_logits,
         )
-        if sm70_greedy_decode:
-            sampled = self.model.get_top_tokens(sample_hidden_states)
-            sampler_output = SamplerOutput(
-                sampled_token_ids=sampled.view(-1, 1),
-                logprobs_tensors=None,
-                num_nans=None,
-                num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
-            )
-            logger.info_once("SM70 MRv2 greedy TP-local pair path enabled.")
         if sampler_output is None:
             logits = (
                 cached_logits.logits
                 if cached_logits is not None
                 else self.model.compute_logits(sample_hidden_states)
             )
-            if (
-                input_batch.num_draft_tokens > 0
-                and os.getenv("VLLM_DFLASH_DEBUG_TARGET_LOGITS", "0") == "1"
-                and logits is not None
-            ):
-                debug_positions = input_batch.positions[input_batch.logits_indices]
-                min_position = int(
-                    os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
-                )
-                if int(debug_positions[0].item()) >= min_position:
-                    top_values, top_ids = torch.topk(logits.float(), 2, dim=-1)
-                    logger.warning(
-                        "DFLASH_TARGET_LOGITS_TRACE inputs=%s positions=%s "
-                        "top1=%s top1_margin=%s",
-                        input_batch.input_ids[input_batch.logits_indices].tolist(),
-                        debug_positions.tolist(),
-                        top_ids[:, 0].tolist(),
-                        (top_values[:, 0] - top_values[:, 1]).tolist(),
-                    )
+            if input_batch.num_draft_tokens > 0:
+                assert self.speculator is not None
+                self.speculator.trace_target_logits(logits, input_batch, logger)
             if grammar_output is not None:
                 # Apply grammar bitmask to the logits in-place.
                 assert self.structured_outputs_worker is not None
@@ -1427,18 +1401,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,
         )
-        if input_batch.num_draft_tokens > 0 and getattr(
-            self.speculator, "_debug_proposal_stages", False
-        ):
-            logger.info(
-                "DFlash target verification diagnostic: draft_input=%s "
-                "sampled=%s num_sampled=%s num_rejected=%s "
-                "finite_hidden=%s",
-                input_batch.input_ids[input_batch.logits_indices].tolist(),
-                sampler_output.sampled_token_ids.tolist(),
-                num_sampled.tolist(),
-                num_rejected.tolist(),
-                bool(torch.isfinite(sample_hidden_states).all().item()),
+        if input_batch.num_draft_tokens > 0:
+            assert self.speculator is not None
+            self.speculator.trace_target_output(
+                input_batch,
+                sampler_output,
+                num_sampled,
+                num_rejected,
+                sample_hidden_states,
+                logger,
             )
         return sampler_output, num_sampled, num_rejected
 
@@ -1702,7 +1673,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if (
             not dummy_run
             and input_batch.num_draft_tokens > 0
-            and self._sm70_v2_mtp_profile_enabled()
+            and self._step_profiler.enabled
         ):
             mtp_profile_ctx = {
                 "events": [],
@@ -1711,10 +1682,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "target_wall_start": time.perf_counter(),
                 "total_wall_start": time.perf_counter(),
             }
-            mtp_profile_ctx["total_gpu_start"] = self._sm70_v2_mtp_profile_start(
+            mtp_profile_ctx["total_gpu_start"] = self._step_profiler.start_context(
                 mtp_profile_ctx
             )
-        mtp_target_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+        mtp_target_start = self._step_profiler.start_context(mtp_profile_ctx)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -1749,7 +1720,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
-        self._sm70_v2_mtp_profile_finish(
+        self._step_profiler.finish_context(
             mtp_profile_ctx, "target_forward", mtp_target_start
         )
 
@@ -1821,15 +1792,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        if isinstance(self.speculator, DFlash2Speculator):
+        if self.speculator is not None:
             self.speculator.prepare_target_context(
                 input_batch, hidden_states, aux_hidden_states
             )
-        mtp_sample_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+        mtp_sample_start = self._step_profiler.start_context(mtp_profile_ctx)
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
-        self._sm70_v2_mtp_profile_finish(
+        self._step_profiler.finish_context(
             mtp_profile_ctx, "target_sample", mtp_sample_start
         )
 
@@ -1887,7 +1858,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        mtp_state_update_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+        mtp_state_update_start = self._step_profiler.start_context(mtp_profile_ctx)
         self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
@@ -1895,7 +1866,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
-        self._sm70_v2_mtp_profile_finish(
+        self._step_profiler.finish_context(
             mtp_profile_ctx, "target_state_update", mtp_state_update_start
         )
         if mtp_profile_ctx is not None:
@@ -1920,7 +1891,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            mtp_draft_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+            mtp_draft_start = self._step_profiler.start_context(mtp_profile_ctx)
+            if self._ple_draft_ring is not None:
+                # The committed state now ends at each request's bonus token.
+                self._ple_draft_ring.publish_round(
+                    input_batch.idx_mapping,
+                    input_batch.num_reqs,
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.num_computed_tokens.gpu,
+                    self.model_state.ngram_eos_token_id,
+                )
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1953,7 +1933,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     else None
                 ),
             )
-            self._sm70_v2_mtp_profile_finish(
+            self._step_profiler.finish_context(
                 mtp_profile_ctx, "draft_total", mtp_draft_start
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -1987,12 +1967,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.mixed_prefill_timing = self.mixed_prefill_timer.finish()
 
-        self._sm70_v2_mtp_profile_finish(
+        self._step_profiler.finish_context(
             mtp_profile_ctx,
             "total_gpu",
             None if mtp_profile_ctx is None else mtp_profile_ctx["total_gpu_start"],
         )
-        self._sm70_v2_mtp_profile_report(mtp_profile_ctx)
+        self._step_profiler.report(mtp_profile_ctx)
 
         if self.use_async_scheduling:
             return async_output
@@ -2054,6 +2034,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.close()
             self._ple_offload_connector = None
+        self._ple_draft_ring = None
+        speculator = getattr(self, "speculator", None)
+        if speculator is not None and getattr(speculator, "draft_step_listener", None):
+            speculator.draft_step_listener = None
 
         target_model = getattr(self, "model", None)
         speculator = getattr(self, "speculator", None)

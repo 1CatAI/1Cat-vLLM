@@ -151,7 +151,7 @@ __global__ __launch_bounds__(32, 8) void dense_batch_kernel(const half* x,
     }
   }
 }
-template <int Unroll>
+template <int Unroll, bool RowMajor = false>
 __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
                                                                   const half* w,
                                                                   half* out,
@@ -161,10 +161,14 @@ __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
   float acc[8] = {};
 #pragma unroll Unroll
   for (int g = 0; g < 40; ++g) {
-    const half* weights =
-        w + (blockIdx.x * 40 * 64 + g * 64 + split * 8 + r) * 8;
+    const half* weights;
+    if constexpr (RowMajor)
+      weights = w + (blockIdx.x * 8 + r) * 2560 + split * 640 + g * 16;
+    else
+      weights = w + (blockIdx.x * 40 * 64 + g * 64 + split * 8 + r) * 8;
     const uint4 lo = *reinterpret_cast<const uint4*>(weights);
-    const uint4 hi = *reinterpret_cast<const uint4*>(weights + 32 * 8);
+    const uint4 hi =
+        *reinterpret_cast<const uint4*>(weights + (RowMajor ? 8 : 32 * 8));
     uint4 a = {}, b = {};
     if (row < m) {
       const half* input = x + row * 2560 + split * 640 + g * 16;
@@ -347,8 +351,8 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
 }
 void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 &&
-                  x.size(0) <= 16 && x.size(1) == 2560,
-              "SM70 batch router requires M2..16, K2560");
+                  x.size(0) <= 40 && x.size(1) == 2560,
+              "SM70 batch router requires M2..40, K2560");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -357,11 +361,15 @@ void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
                     t.scalar_type() == at::kHalf &&
                     reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
                 "Batch router requires aligned contiguous FP16 storage");
-  TORCH_CHECK(packed.sizes() == at::IntArrayRef({64, 40, 2, 4, 8, 8}) &&
-                  output.sizes() == at::IntArrayRef({x.size(0), 512}),
-              "Invalid batch router geometry");
-  router_split_quad_kernel<40><<<dim3(64, (x.size(0) + 7) / 8), 32, 0,
-                                 at::cuda::getCurrentCUDAStream()>>>(
+  const bool row_major = packed.sizes() == at::IntArrayRef({512, 2560});
+  TORCH_CHECK(
+      (row_major || packed.sizes() == at::IntArrayRef({64, 40, 2, 4, 8, 8})) &&
+          output.sizes() == at::IntArrayRef({x.size(0), 512}),
+      "Invalid batch router geometry");
+  const auto kernel = row_major ? router_split_quad_kernel<40, true>
+                                : router_split_quad_kernel<40, false>;
+  kernel<<<dim3(64, (x.size(0) + 7) / 8), 32, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const half*>(x.data_ptr()),
       reinterpret_cast<const half*>(packed.data_ptr()),
       reinterpret_cast<half*>(output.data_ptr()), x.size(0));
@@ -370,9 +378,9 @@ void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
 
 void shared_up_batch(torch::Tensor output, torch::Tensor partial,
                      torch::Tensor x, torch::Tensor packed) {
-  TORCH_CHECK(x.is_cuda() && x.dim() == 2 &&
-                  (x.size(0) == 5 || x.size(0) == 10) && x.size(1) == 2560,
-              "Shared expert batch projection requires M5/M10, K2560");
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) % 5 == 0 &&
+                  x.size(0) >= 5 && x.size(0) <= 40 && x.size(1) == 2560,
+              "Shared expert batch projection requires M5..40 (x5), K2560");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -421,9 +429,9 @@ void shared_up_batch_fp32(torch::Tensor output, torch::Tensor partial,
 void shared_gate_mul(torch::Tensor output, torch::Tensor logits,
                      torch::Tensor source) {
   TORCH_CHECK(source.is_cuda() && source.dim() == 2 &&
-                  (source.size(0) == 5 || source.size(0) == 10) &&
-                  source.size(1) == 2560,
-              "Shared gate epilogue requires M5/M10, N2560");
+                  source.size(0) % 5 == 0 && source.size(0) >= 5 &&
+                  source.size(0) <= 40 && source.size(1) == 2560,
+              "Shared gate epilogue requires M5..40 (x5), N2560");
   const c10::cuda::CUDAGuard guard(source.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");

@@ -12,6 +12,7 @@ from compressed_tensors.quantization import (
 )
 
 import vllm.envs as envs
+from vllm import _sm70_ops as sm70_ops
 from vllm.config.kernel import Sm70Fp8Config
 from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
     _SM70_FP8_EXACT_8K_PREFILL_M,
@@ -47,9 +48,25 @@ from vllm.model_executor.layers.quantization.utils import (
 
 
 @pytest.fixture(autouse=True)
-def _sm70_fp8_workspace_ops_on_cpu():
+def _sm70_fp8_workspace_ops_on_cpu(monkeypatch):
     """The tests dispatch on CPU tensors; the opaque workspace ops register CUDA
     kernels only. Every test starts with empty workspace caches."""
+    # Mocked CPU kernels check preparation/dispatch, not the native policy ABI.
+    monkeypatch.setattr(
+        ct_fp8_module,
+        "capture_linear_native_config",
+        lambda family: SimpleNamespace(values=()),
+    )
+    monkeypatch.setattr(
+        "vllm.config.sm70_native.capture_linear_native_config",
+        lambda family: SimpleNamespace(values=()),
+    )
+    from vllm._sm70 import policy as native_policy
+
+    native_bindings = native_policy.NativeBindings
+    monkeypatch.setattr(
+        native_policy, "NativeBindings", lambda values=(): native_bindings()
+    )
     libraries = []
     for op_name, impl in (
         ("sm70_fp8_qpn8_dispatch", ws_module._sm70_fp8_qpn8_dispatch),
@@ -621,7 +638,7 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
     )
     workspace = torch.empty(1, dtype=torch.float16)
     _bind_sm70_fp8_prefill_workspace(layer, workspace)
-    method = SimpleNamespace()
+    method = SimpleNamespace(native_ops=sm70_ops)
 
     for m in (1, _SM70_FP8_PREFILL_DENSE_MIN_M):
         method.policy = Sm70Fp8Config()
@@ -673,7 +690,7 @@ def test_fp8_prefill_prescaled_scales_only_reach_exact_8k_route(monkeypatch):
         sm70_fp8_k_ld=4,
         sm70_fp8_q_ld=6,
     )
-    method = SimpleNamespace()
+    method = SimpleNamespace(native_ops=sm70_ops)
 
     monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1")
@@ -812,7 +829,7 @@ def test_fp8_prescaled_m1_decode_only_handles_m1(monkeypatch):
         sm70_fp8_k_ld=4,
         sm70_fp8_q_ld=6,
     )
-    method = SimpleNamespace()
+    method = SimpleNamespace(native_ops=sm70_ops)
 
     monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1")
     envs.disable_envs_cache()
@@ -876,7 +893,7 @@ def test_fp8_qpn8_dispatches_small_m_and_workspace_fallback(monkeypatch):
     )
     workspace = torch.empty(1, dtype=torch.float16)
     _bind_sm70_fp8_prefill_workspace(layer, workspace)
-    method = SimpleNamespace()
+    method = SimpleNamespace(native_ops=sm70_ops)
 
     for m in (1, 9):
         method.policy = Sm70Fp8Config()
@@ -921,7 +938,7 @@ def test_fp8_qpn8_fused_gate_dispatches_without_intermediate(monkeypatch):
     )
     workspace = torch.empty(1, dtype=torch.float16)
     _bind_sm70_fp8_prefill_workspace(layer, workspace)
-    method = SimpleNamespace()
+    method = SimpleNamespace(native_ops=sm70_ops)
 
     for m in (8, 16):
         method.policy = Sm70Fp8Config()

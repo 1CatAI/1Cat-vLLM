@@ -17,8 +17,9 @@
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-bool sm70_profile_trace_enabled() {
-  const char* value = std::getenv("VLLM_SM70_PROFILE_TRACE");
+bool sm70_profile_trace_enabled(const vllm::CustomAllreduce& owner) {
+  const char* value =
+      owner.policy_.raw(vllm::CollectivePolicyField::sm70_profile_trace);
   return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
@@ -48,9 +49,10 @@ const char* capture_status_name(cudaStreamCaptureStatus status) {
   }
 }
 
-fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
-                      torch::Tensor& rank_data, int64_t rank,
-                      bool fully_connected) {
+static fptr_t init_custom_ar_impl(const std::vector<fptr_t>& fake_ipc_ptrs,
+                                  torch::Tensor& rank_data, int64_t rank,
+                                  bool fully_connected,
+                                  const vllm::CollectivePolicy& policy) {
   int world_size = fake_ipc_ptrs.size();
   if (world_size > 8)
     throw std::invalid_argument("world size > 8 is not supported");
@@ -65,7 +67,22 @@ fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
   }
   return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data.data_ptr(),
                                             rank_data.numel(), rank, world_size,
-                                            fully_connected);
+                                            fully_connected, policy);
+}
+
+fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
+                      torch::Tensor& rank_data, int64_t rank,
+                      bool fully_connected) {
+  return init_custom_ar_impl(fake_ipc_ptrs, rank_data, rank, fully_connected,
+                             vllm::CollectivePolicy::legacy());
+}
+
+fptr_t init_custom_ar_configured(const std::vector<fptr_t>& fake_ipc_ptrs,
+                                 torch::Tensor& rank_data, int64_t rank,
+                                 bool fully_connected,
+                                 const std::vector<std::string>& policy) {
+  return init_custom_ar_impl(fake_ipc_ptrs, rank_data, rank, fully_connected,
+                             vllm::CollectivePolicy(policy));
 }
 
 /**
@@ -612,14 +629,12 @@ void sm70_all_reduce_gemma_rms_norm_impl(
   const float epsilon_f = static_cast<float>(epsilon);
 
   if constexpr (kWorldSize == 4) {
-    static const bool trace_enabled = sm70_profile_trace_enabled();
-    static std::atomic<bool> logged_route{false};
-    if (trace_enabled) {
+    if (sm70_profile_trace_enabled(*fa)) {
       cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
       AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
       bool expected = false;
       if (capture_status == cudaStreamCaptureStatusActive &&
-          logged_route.compare_exchange_strong(expected, true)) {
+          fa->logged_norm_route_.compare_exchange_strong(expected, true)) {
         std::cerr << "SM70 TP4 all_reduce_gemma_rms_norm op reached"
                   << " rank=" << fa->rank_ << " num_tokens=" << num_tokens
                   << " residual=" << scalar_type_name(residual.scalar_type())
@@ -791,10 +806,9 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
   TORCH_CHECK(_is_weak_contiguous(inp_b));
   TORCH_CHECK(_is_weak_contiguous(out));
 
-  static std::atomic<bool> logged_sum2_route{false};
   bool expected = false;
-  if (sm70_profile_trace_enabled() &&
-      logged_sum2_route.compare_exchange_strong(expected, true)) {
+  if (sm70_profile_trace_enabled(*fa) &&
+      fa->logged_sum2_route_.compare_exchange_strong(expected, true)) {
     std::cerr << "SM70 custom all_reduce_sum2 op reached"
               << " rank=" << fa->rank_ << " world_size=" << fa->world_size_
               << " numel=" << out.numel()

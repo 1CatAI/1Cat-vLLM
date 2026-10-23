@@ -11,14 +11,12 @@ using Pivot-based Truncation and Selection" By Park et al.
 
 import torch
 
-from vllm import envs
+from vllm.config.execution_policy import layer_policy
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
-
-_TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
-_TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 
 
 def _use_sm70_topk_topp_8_warps(
@@ -27,6 +25,7 @@ def _use_sm70_topk_topp_8_warps(
     vocab_size: int,
     topk_enabled: bool,
     topp_enabled: bool,
+    policy=None,
 ) -> bool:
     if (
         device.type != "cuda"
@@ -35,8 +34,9 @@ def _use_sm70_topk_topp_8_warps(
     ):
         return False
 
+    policy = layer_policy() if policy is None else policy
     if (
-        envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS
+        policy.value("topk_topp_b8_b16_warps8")
         and vocab_size == 154_880
         and batch_size == 8
         and not topk_enabled
@@ -44,7 +44,7 @@ def _use_sm70_topk_topp_8_warps(
     ):
         return True
     if (
-        envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS
+        policy.value("topk_topp_b8_b16_warps8")
         and vocab_size == 248_320
         and batch_size in (8, 16)
         and topk_enabled
@@ -55,7 +55,7 @@ def _use_sm70_topk_topp_8_warps(
         vocab_size == 248_320
         and topk_enabled
         and topp_enabled
-        and envs.VLLM_SM70_TOPK_TOPP_8_WARPS
+        and policy.value("topk_topp_warps8")
         and batch_size in (5, 10, 20, 40, 60, 80)
     )
 
@@ -1221,6 +1221,8 @@ def apply_top_k_top_p_triton(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     mask_value: float = float("-inf"),
+    *,
+    runtime=None,
 ) -> torch.Tensor:
     """
     Apply combined top-k and top-p masking using Triton.
@@ -1293,22 +1295,23 @@ def apply_top_k_top_p_triton(
     num_sm = num_compute_units(logits.device.index)
     NUM_PROGRAMS = min(num_sm, batch_size)
 
-    # Cache per-Triton Program buffer on each device.
+    runtime = bind_topk_topp_runtime() if runtime is None else runtime
+    # Cache per-Triton Program buffer on each device and engine.
     buf_key = (logits.device, logits.dtype, vocab_size)
-    buffer = _TRITON_BUFFER_CACHE.get(buf_key)
+    buffer = runtime.buffers.get(buf_key)
     if buffer is None or buffer.shape[0] < NUM_PROGRAMS:
         size = min(next_power_of_2(NUM_PROGRAMS), num_sm)
         buffer = logits.new_empty((size, vocab_size))
-        _TRITON_BUFFER_CACHE[buf_key] = buffer
+        runtime.buffers[buf_key] = buffer
     if buffer.shape[0] > NUM_PROGRAMS:
         buffer = buffer[:NUM_PROGRAMS]
 
     # Cache lookup table entries on each device.
-    tables = _TRITON_TABLE_CACHE.get(logits.device)
+    tables = runtime.tables.get(logits.device)
     if tables is None:
         normal_cdf_to_sigma_table = logits.new_tensor(_NORMAL_CDF_TO_SIGMA_TABLE)
         percentile_to_std_table = logits.new_tensor(_PERCENTILE_TO_STD_TABLE)
-        _TRITON_TABLE_CACHE[logits.device] = (
+        runtime.tables[logits.device] = (
             normal_cdf_to_sigma_table,
             percentile_to_std_table,
         )
@@ -1328,6 +1331,7 @@ def apply_top_k_top_p_triton(
         vocab_size,
         topk_enabled,
         topp_enabled,
+        policy=runtime.policy,
     ):
         # Eight warps preserve the tile and masking algorithm while using the
         # otherwise idle lanes in its reduction-heavy passes. B8/B16 no-MTP
@@ -1373,7 +1377,7 @@ def apply_top_k_top_p_triton(
     return logits
 
 
-def reset_buffer_cache():
-    _TRITON_BUFFER_CACHE.clear()
-    _TRITON_TABLE_CACHE.clear()
+def reset_buffer_cache(runtime=None):
+    runtime = bind_topk_topp_runtime() if runtime is None else runtime
+    runtime.close()
     torch.accelerator.empty_cache()

@@ -3,7 +3,7 @@
 import torch
 from torch.nn.parameter import Parameter
 
-import vllm.envs as envs
+from vllm.config.execution_policy import layer_policy
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
@@ -97,7 +97,7 @@ class GateLinear(ReplicatedLinear):
         import vllm._custom_ops as ops
 
         if (
-            envs.VLLM_SM70_DSV4_FP16_GEMV or envs.VLLM_SM70_DSV4_FP13_GEMV
+            layer_policy().dsv4_fp16_gemv or layer_policy().dsv4_fp13_gemv
         ) and self.out_dtype is not None:
             from vllm.models.deepseek_v4.sm70.gemv import (
                 maybe_sm70_dsv4_fp16_gemv,

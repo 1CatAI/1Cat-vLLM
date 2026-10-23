@@ -68,6 +68,8 @@ from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weigh
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.ple_offload.draft_prefetch import DraftRowPrefetcher
+from vllm.v1.ple_offload.fast_lane import FastLaneOwner
 from vllm.v1.ple_offload.protocol import (
     _PLE_OFFLOAD_REQUEST_DECODER,
     PleOffloadRegistration,
@@ -208,7 +210,16 @@ def _prefault_module_storage(modules: Iterable[torch.nn.Module]) -> int:
     if not envs.VLLM_PLE_OFFLOAD_PREFAULT:
         return 0
 
-    storage_views = list(_iter_unique_module_storage_views(modules))
+    active_modules = []
+    for module in modules:
+        if isinstance(module, PleOffloadLayer) and not module.needs_weight_prefault():
+            logger.info(
+                "Skipping PLE RAM prefault for %s: registered ranks own all rows.",
+                type(module).__name__,
+            )
+        else:
+            active_modules.append(module)
+    storage_views = list(_iter_unique_module_storage_views(active_modules))
     required_bytes = sum(view.numel() for view in storage_views)
     if required_bytes == 0:
         return 0
@@ -235,7 +246,8 @@ def _prefault_module_storage(modules: Iterable[torch.nn.Module]) -> int:
         return 0
 
     page_bytes = int(os.sysconf("SC_PAGE_SIZE"))
-    chunk_bytes = 256 * 1024 * 1024
+    # Small steps: this runs beside the serving loop, so return the GIL often.
+    chunk_bytes = 16 * 1024 * 1024
     checksum = 0
     started = time.perf_counter()
     for view in storage_views:
@@ -317,9 +329,23 @@ class PleOffloadWorkerHandle:
     death_writer: Connection | None
     ready_pipe_reader: Connection | None
     row_readers: dict[str, Any] = field(default_factory=dict)
+    # Background thread running proc.start(), and any error it raised.
+    starter: threading.Thread | None = None
+    start_error: BaseException | None = None
+
+    def join_starter(self) -> None:
+        """Wait for the background start; re-raise its error once."""
+        if self.starter is not None:
+            self.starter.join()
+            self.starter = None
+        if self.start_error is not None:
+            error, self.start_error = self.start_error, None
+            raise RuntimeError("PLE offload worker failed to start") from error
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
+        with contextlib.suppress(RuntimeError):
+            self.join_starter()
         if self.ready_pipe_reader is not None:
             self.ready_pipe_reader.close()
             self.ready_pipe_reader = None
@@ -341,11 +367,6 @@ class PleOffloadWorkerHandle:
 
 def _init_offload_distributed() -> None:
     """Initialize the single-rank Gloo world required by TP-aware layers."""
-    # The worker builds its model in the PP1 world configured below, but it
-    # inherits the GPU workers' environment: a VLLM_PP_LAYER_PARTITION written
-    # for the real pipeline makes get_pp_indices() refuse the single stage
-    # ("len(partitions) != pp_size") while the meta model is constructed.
-    os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
     if dist.is_initialized():
         return
 
@@ -418,26 +439,41 @@ class PleOffloadWorker:
             daemon=True,
         )
 
-        # Python normally forbids a daemon WorkerProc from spawning children.
-        # vLLM owns this process through death_pipe and explicit shutdown, so
-        # temporarily clear the daemon flag while the child is created.
-        parent = multiprocessing.process._current_process  # type: ignore[attr-defined]
-        saved_daemon = parent._config.get("daemon")
-        parent._config["daemon"] = False
-        try:
-            proc.start()
-        finally:
-            parent._config["daemon"] = saved_daemon
-        ready_writer.close()
-        return PleOffloadWorkerHandle(
+        handle = PleOffloadWorkerHandle(
             proc=proc,
             death_writer=death_writer,
             ready_pipe_reader=ready_reader,
         )
 
+        def start() -> None:
+            # Python normally forbids a daemon WorkerProc from spawning
+            # children. vLLM owns this process through death_pipe and explicit
+            # shutdown, so temporarily clear the daemon flag while the child
+            # is created.
+            parent = multiprocessing.process._current_process  # type: ignore[attr-defined]
+            saved_daemon = parent._config.get("daemon")
+            parent._config["daemon"] = False
+            try:
+                proc.start()
+            except BaseException as error:  # surfaced by wait_for_ready
+                handle.start_error = error
+            finally:
+                parent._config["daemon"] = saved_daemon
+                ready_writer.close()
+
+        # Under spawn, start() blocks until the child has unpickled the config,
+        # which first imports vLLM (~15-20 s). Start it in the background so
+        # the spawning rank loads its weights meanwhile.
+        handle.starter = threading.Thread(
+            target=start, name="ple-offload-start", daemon=True
+        )
+        handle.starter.start()
+        return handle
+
     @staticmethod
     def wait_for_ready(handle: PleOffloadWorkerHandle) -> None:
         """Wait until weights and all GPU registrations are ready to serve."""
+        handle.join_starter()
         reader = handle.ready_pipe_reader
         if reader is None:
             return
@@ -508,6 +544,7 @@ class PleOffloadWorker:
 
             # Initialize Gloo before installing the real VllmConfig. This keeps
             # the CPU process in an isolated rank-zero, world-size-one group.
+            vllm_config.parallel_config.communication.pp_layer_partition = None
             _init_offload_distributed()
 
             # Model components read the active VllmConfig while the meta model
@@ -527,7 +564,15 @@ class PleOffloadWorker:
             # READY means that the process can immediately serve requests. Wait
             # for every DP/TP worker to register before notifying the parent.
             runner.accept_registrations(pull_socket, num_workers)
-            _prefault_module_storage(runner._layers.values())
+            # Prefault only warms pages of the disk-backed table: rows are
+            # served from the same mapping meanwhile. Touching ~26 GiB took
+            # ~2 min, all of it on the startup critical path.
+            threading.Thread(
+                target=_prefault_module_storage,
+                args=(list(runner._layers.values()),),
+                name="ple-prefault",
+                daemon=True,
+            ).start()
             ready_writer.send(
                 {
                     "status": PleOffloadWorker.READY_STR,
@@ -772,6 +817,7 @@ class PleOffloadRunner:
                     f"got {tp_ranks}"
                 )
 
+        self._bind_result_layouts(registrations)
         for registration in registrations:
             cpu_buffers = registration.cpu_output_buffers or {}
             if set(cpu_buffers) & set(registration.gpu_output_buffers):
@@ -804,7 +850,9 @@ class PleOffloadRunner:
                     or cpu_buffer.shape[0]
                     < self.vllm_config.scheduler_config.max_num_batched_tokens
                     or cpu_buffer.shape[1]
-                    != int(self.vllm_config.model_config.hf_text_config.ple_embed_dim)
+                    != self._layers[layer_name].get_offload_output_dim(
+                        int(self.vllm_config.model_config.hf_text_config.ple_embed_dim)
+                    )
                     or cpu_buffer.dtype
                     != self._layers[layer_name].get_offload_output_dtype(
                         self.vllm_config.model_config.dtype
@@ -859,7 +907,7 @@ class PleOffloadRunner:
                     continue
                 self._pinned_bufs[dp_rank][layer_name] = torch.empty(
                     max_tokens,
-                    embedding_dim,
+                    self._layers[layer_name].get_offload_output_dim(embedding_dim),
                     dtype=self._layers[layer_name].get_offload_output_dtype(
                         self.vllm_config.model_config.dtype
                     ),
@@ -871,6 +919,125 @@ class PleOffloadRunner:
             tp_size,
             sorted(self.layer_names),
         )
+        self._start_fast_lane(registrations)
+        if self._fast_lane is None:
+            self._start_draft_prefetch(registrations)
+
+    def _fast_lane_reason(self, registrations: list[PleOffloadRegistration]):
+        """Return why the native lane cannot serve, or None when it can."""
+        lanes = [r for r in registrations if r.fast_lane_request is not None]
+        if len(lanes) != 1 or lanes[0].fast_lane_geometry is None:
+            return "no_mapped_request_slot"
+        if set(self._worker_targets) != {0} or len(self._layers) != 1:
+            return "requires_one_dp_rank_and_one_ple_layer"
+        layer = next(iter(self._layers.values()))
+        reader = getattr(getattr(layer, "ngram_embedding", None), "_cpu_reader", None)
+        if reader is None or reader.source_type != 20:
+            return "requires_cpu_owned_iq4nl_rows"
+        if getattr(layer, "_packed_result_layout", None) is None:
+            return "requires_packed_results"
+        if getattr(layer, "_cascade", False):
+            # Packed rows split across device/host tiers merge in Python.
+            return "tiered_cascade_uses_the_python_owner"
+        if (layer.ngram_size, layer.heads_per_ngram, layer.ngram_heads) != (3, 8, 16):
+            return "requires_trigram_16_head_hashing"
+        targets = next(iter(self._worker_targets[0].values()))
+        if any(t.cpu_output_buffer is None for t in targets):
+            return "requires_mapped_result_transport"
+        return None
+
+    @staticmethod
+    def _native_draft_ring(registrations: list[PleOffloadRegistration]):
+        """Draft ring arguments for the native lane's page prefetch."""
+        rings = [r for r in registrations if r.draft_ring is not None]
+        if len(rings) != 1 or rings[0].draft_ring_geometry is None:
+            return None, 0, 0
+        max_reqs, num_spec = rings[0].draft_ring_geometry
+        return rings[0].draft_ring, max_reqs, num_spec
+
+    def _start_fast_lane(self, registrations: list[PleOffloadRegistration]) -> None:
+        """Serve requests from a native thread when every condition holds."""
+        self._fast_lane = None
+        if not self.vllm_config.kernel_config.ple_fast_lane:
+            return
+        reason = self._fast_lane_reason(registrations)
+        if reason is not None:
+            logger.info("PLE fast lane not used: %s", reason)
+            return
+        registration = next(r for r in registrations if r.fast_lane_request is not None)
+        request = registration.fast_lane_request
+        assert registration.fast_lane_geometry is not None
+        max_reqs, max_tokens = registration.fast_lane_geometry
+        layer = next(iter(self._layers.values()))
+        reader = layer.ngram_embedding._cpu_reader
+        targets = sorted(
+            next(iter(self._worker_targets[0].values())), key=lambda t: t.tp_rank
+        )
+        handle = torch.ops._C.ple_fast_lane_start(
+            request,
+            max_reqs,
+            max_tokens,
+            reader.data.ctypes.data,
+            reader.data.shape[1],
+            reader.logical_rows,
+            layer.layer_multipliers.tolist(),
+            layer.ngram_heads_vocab_sizes.tolist(),
+            layer.ngram_heads_offsets.tolist(),
+            int(layer.eos_token_id),
+            [t.cpu_output_buffer.data_ptr() for t in targets],  # type: ignore[union-attr]
+            [t.sem.flag_tensor.data_ptr() for t in targets],
+            int(self.vllm_config.kernel_config.ple_row_cache_mib) << 20,
+            50_000,
+            self._clamp_input_ids,
+            *self._native_draft_ring(registrations),
+        )
+        self._fast_lane = FastLaneOwner(request, handle)
+        logger.info(
+            "PLE fast lane serving %d TP result buffer(s) natively.", len(targets)
+        )
+
+    def _start_draft_prefetch(self, registrations: list[PleOffloadRegistration]):
+        """Read drafted tokens' table pages ahead of their verify request."""
+        rings = [r for r in registrations if r.draft_ring is not None]
+        if len(rings) != 1 or rings[0].draft_ring_geometry is None:
+            return
+        tables = []
+        for layer in self._layers.values():
+            row_ids = getattr(layer, "draft_prefetch_row_ids", None)
+            reader = getattr(
+                getattr(layer, "ngram_embedding", None), "_cpu_reader", None
+            )
+            if row_ids is None or reader is None:
+                continue
+            data = reader.data
+            tables.append((row_ids, data.ctypes.data, data.shape[1], data.shape[0]))
+        if not tables:
+            return
+        max_reqs, num_spec = rings[0].draft_ring_geometry
+        self._draft_prefetcher = DraftRowPrefetcher(
+            rings[0].draft_ring, max_reqs, num_spec, tables
+        )
+        self._draft_prefetcher.start()
+        logger.info(
+            "PLE draft-token page prefetch enabled for %d table(s).", len(tables)
+        )
+
+    def _bind_result_layouts(self, registrations: list[PleOffloadRegistration]) -> None:
+        """Negotiate post-load GPU geometry before validating result buffers."""
+        layouts = registrations[0].result_layouts
+        if any(item.result_layouts != layouts for item in registrations[1:]):
+            raise ValueError("PLE result layouts differ between DP/TP consumers")
+        if set(layouts) - set(self._layers):
+            raise ValueError("PLE result layout names an unknown CPU layer")
+        if not layouts:
+            return
+        policy = self.vllm_config.kernel_config
+        if not policy.ple_packed_gguf_results:
+            raise ValueError("Packed PLE results are disabled in the CPU configuration")
+        for name, layout in layouts.items():
+            self._layers[name].bind_offload_result_layout(layout)
+        if layouts:
+            logger.info("Bound packed PLE result layouts: %s", layouts)
 
     def _bind_remote_placements(
         self,

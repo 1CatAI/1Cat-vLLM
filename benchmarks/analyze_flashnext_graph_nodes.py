@@ -48,7 +48,28 @@ def family(name):
     return "Other"
 
 
-def analyze(sqlite_path, benchmark_path):
+def select_target_ranges(workers, ranges, tokens, requests):
+    """Match CPU records and NVTX ranges by worker ordinal, then filter shape."""
+    if tokens is None:
+        return ranges
+    workers_by_pid = {w["pid"]: w for w in workers}
+    selected = {}
+    for tid, spans in ranges.items():
+        pid = (tid >> 24) & 0xFFFFFF
+        events = sorted(
+            (e for e in workers_by_pid[pid]["events"] if e["label"] == "target.replay"),
+            key=lambda e: e["start_ns"],
+        )
+        assert len(events) == len(spans), (pid, len(events), len(spans))
+        selected[tid] = [
+            span
+            for span, event in zip(spans, events)
+            if event.get("tokens") == tokens and event.get("requests") == requests
+        ]
+    return selected
+
+
+def analyze(sqlite_path, benchmark_path, tokens=None, requests=1):
     report = json.loads(benchmark_path.read_text())
     workers = report["node_trace"]["workers"]
     ranks = {w["pid"]: w["rank"] for w in workers}
@@ -66,6 +87,9 @@ def analyze(sqlite_path, benchmark_path):
             ):
                 if (tid >> 24) & 0xFFFFFF in ranks:
                     ranges[tid].append((start, end))
+        ranges = select_target_ranges(workers, ranges, tokens, requests)
+        if tokens is not None:
+            assert ranges, "Shape filtering requires target replay NVTX ranges"
         selected = collections.defaultdict(list)
         for start, end, tid, correlation in db.execute(
             "select a.start,a.end,a.globalTid,a.correlationId "
@@ -176,8 +200,10 @@ def main():
     parser.add_argument("sqlite", type=Path)
     parser.add_argument("benchmark", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--tokens", type=int)
+    parser.add_argument("--requests", type=int, default=1)
     args = parser.parse_args()
-    result = analyze(args.sqlite, args.benchmark)
+    result = analyze(args.sqlite, args.benchmark, args.tokens, args.requests)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({k: v for k, v in result.items() if k != "kernels"}, indent=2))
 

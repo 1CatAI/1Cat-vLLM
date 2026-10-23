@@ -5,6 +5,8 @@
 #include <cuda_runtime_api.h>
 #include <torch/library.h>
 
+#include "../../sm70_policy.h"
+
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -332,37 +334,13 @@ inline Sm70MarlinAutoParams sm70_marlin_default_auto_params(
 }
 
 inline bool sm70_marlin_parse_int_component(char const*& cursor, int& value) {
-  char* end = nullptr;
-  long parsed = std::strtol(cursor, &end, 10);
-  if (end == cursor) {
-    return false;
-  }
-  value = static_cast<int>(parsed);
-  cursor = end;
-  return true;
+  return vllm::sm70::marlin_parse_int_component(cursor, value);
 }
 
 inline bool sm70_marlin_parse_geometry_env_value(char const* value,
                                                  Sm70CtaGeometry& geometry) {
-  if (value == nullptr || value[0] == '\0') {
-    return false;
-  }
-  char const* cursor = value;
-  int fields[7] = {0, 0, 0, 0, 0, 0, 0};
-  for (int i = 0; i < 7; ++i) {
-    if (!sm70_marlin_parse_int_component(cursor, fields[i])) {
-      return false;
-    }
-    if (i < 6) {
-      if (*cursor != 'x') {
-        return false;
-      }
-      ++cursor;
-    }
-  }
-  if (*cursor != '\0') {
-    return false;
-  }
+  std::array<int, 7> fields{};
+  if (!vllm::sm70::marlin_parse_geometry(value, fields)) return false;
   geometry = {fields[0], fields[1], fields[2], fields[3],
               fields[4], fields[5], fields[6]};
   return true;
@@ -467,6 +445,23 @@ inline Sm70MarlinAutoParams sm70_marlin_auto_params_from_env(
   sm70_marlin_try_get_split_k_env(split_k_env_name, params.requested_split_k);
   sm70_marlin_try_get_metadata_env(metadata_env_name,
                                    params.use_metadata_vector_words);
+  validate_sm70_marlin_auto_params(op_name, params);
+  return params;
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_auto_params_from_policy(
+    char const* op_name, const vllm::sm70::MarlinOverrides& policy,
+    int packed_macro_n) {
+  // Keep parsing-error order ahead of shape/geometry validation.
+  for (const auto& error : policy.errors) TORCH_CHECK(error.empty(), error);
+  auto params = sm70_marlin_default_auto_params(packed_macro_n);
+  if (policy.geometry) {
+    const auto& g = *policy.geometry;
+    params.geometry = {g[0], g[1], g[2], g[3], g[4], g[5], g[6]};
+  }
+  if (policy.split_k) params.requested_split_k = *policy.split_k;
+  if (policy.vector_words)
+    params.use_metadata_vector_words = *policy.vector_words;
   validate_sm70_marlin_auto_params(op_name, params);
   return params;
 }
@@ -1385,7 +1380,12 @@ inline Sm70MarlinAutoParams sm70_marlin_dense_auto_params(
       quant_format, group_size, size_m,
       size_n,       size_k,     sm70_marlin_auto_packed_macro_n(size_n)};
 
-  if (sm70_marlin_dense_auto_env_is_set()) {
+  if (const auto* policy = vllm::sm70::bound_marlin_policy(false)) {
+    if (policy->active)
+      return sm70_marlin_auto_params_from_policy("Dense", *policy,
+                                                 ctx.packed_macro_n);
+  } else if (sm70_marlin_dense_auto_env_is_set()) {
+    // Independent old no-config calls retain their per-call legacy adapter.
     return sm70_marlin_dense_auto_params_from_env(ctx);
   }
 

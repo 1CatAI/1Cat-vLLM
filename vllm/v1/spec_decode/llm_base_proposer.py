@@ -16,10 +16,16 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
+from vllm.config.sm70_dflash2 import proposer_diagnostic_flag, proposer_diagnostic_flags
+from vllm.config.sm70_moe import unquantized_moe_policy
+from vllm.config.speculative_sampling import (
+    SpeculativeSamplingPolicy,
+    resolve_sampling_policy,
+)
+from vllm.diagnostics import bind_diagnostics, write_payload
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
-    is_last_pp_first_tp_rank,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -39,6 +45,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import (
     MAX_SPEC_LEN,
@@ -48,6 +55,7 @@ from vllm.v1.sample.rejection_sampler import (
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.profiling import create_step_profiler
 from vllm.v1.spec_decode.static_draft_vocab import (
     DynamicDraftVocabRuntime,
     StaticDraftVocabRuntime,
@@ -75,16 +83,8 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
-def _sm70_mtp_profile_env_enabled() -> bool:
-    return envs.VLLM_SM70_MTP_PROFILE
-
-
 def _dflash_ddtree_worker_profile_enabled() -> bool:
     return os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "0") == "1"
-
-
-def _sm70_mtp_profile_interval() -> int:
-    return envs.VLLM_SM70_MTP_PROFILE_INTERVAL
 
 
 def _sm70_mtp_moe_warmup_sizes(
@@ -132,23 +132,24 @@ def _is_dflash_method(method: str | None) -> bool:
     return method in ("dflash", "dflash_ddtree", "dspark")
 
 
-def _spec_debug_corruption_enabled(method: str) -> bool:
-    if _is_dflash_method(method) and envs.VLLM_DFLASH_DEBUG_CORRUPTION:
-        return True
-    return envs.VLLM_SPEC_DEBUG_CORRUPTION
+def _spec_debug_corruption_enabled(method: str, policy=None) -> bool:
+    return proposer_diagnostic_flag(method, "corruption", policy)
 
 
-def _spec_dump_draft_logits_enabled(method: str) -> bool:
-    if _is_dflash_method(method) and envs.VLLM_DFLASH_DUMP_DRAFT_LOGITS:
-        return True
-    return envs.VLLM_SPEC_DUMP_DRAFT_LOGITS
+def _spec_dump_draft_logits_enabled(method: str, policy=None) -> bool:
+    return proposer_diagnostic_flag(method, "draft_logits", policy)
 
 
-def _dump_spec_debug(payload: dict[str, Any], method: str, suffix: str) -> str:
+def _dump_spec_debug(
+    payload: dict[str, Any], method: str, suffix: str, *, diagnostics=None
+) -> str:
     prefix = method if _is_dflash_method(method) else f"spec_{method}"
-    dump_path = f"/tmp/{prefix}_{suffix}_pid{os.getpid()}.pt"
-    torch.save(payload, dump_path)
-    return dump_path
+    return write_payload(
+        "/tmp",
+        f"{prefix}_{suffix}_pid{os.getpid()}.pt",
+        payload,
+        diagnostics.engine_tag if diagnostics is not None else "",
+    )
 
 
 def _clone_tensor_or_none(tensor: torch.Tensor | None) -> torch.Tensor | None:
@@ -214,15 +215,28 @@ class SpecDecodeBaseProposer:
         runner=None,
     ):
         self.vllm_config = vllm_config
+        self._topk_runtime = bind_topk_topp_runtime(vllm_config)
+        self._diagnostics = bind_diagnostics(vllm_config)
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
+        self._sampling_policy = resolve_sampling_policy(
+            self.speculative_config,
+            draft=self.speculative_config.draft_sample_method == "probabilistic",
+            vocab=self.speculative_config.method == "mtp",
+        )
         self.draft_model_config = self.speculative_config.draft_model_config
         method = self.speculative_config.method
         assert method is not None
         self.method: str = method
+        self._diagnostic_flags = proposer_diagnostic_flags(
+            method, self._diagnostics.trace
+        )
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
 
         self.device = device
+        self._step_profiler = create_step_profiler(
+            vllm_config, device, role="proposer", logger=logger
+        )
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -280,6 +294,7 @@ class SpecDecodeBaseProposer:
             vllm_config.parallel_config.tensor_parallel_size,
             vllm_config.model_config.architecture,
             vllm_config.model_config.model,
+            policy=self._sampling_policy,
         )
         if draft_vocab_config.gpu_lru_enabled:
             if self.max_batch_size != 1:
@@ -577,7 +592,7 @@ class SpecDecodeBaseProposer:
 
     def _uses_spec_step_idx(self) -> bool:
         if (
-            envs.VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX
+            self._sampling_policy.legacy_qwen_step_idx
             and self.method == "mtp"
             and self.model.__class__.__name__ in ("Qwen3_5MTP", "Qwen3_5MoeMTP")
         ):
@@ -686,7 +701,10 @@ class SpecDecodeBaseProposer:
                 token_ids = self._static_draft_vocab.token_id_map[token_ids]
             return token_ids, None
         token_ids, probs = compute_probs_and_sample_next_token(
-            logits, sampling_metadata
+            logits,
+            sampling_metadata,
+            policy=self._sampling_policy,
+            runtime=self._topk_runtime,
         )
         if self._static_draft_vocab is None:
             return token_ids, probs
@@ -756,14 +774,14 @@ class SpecDecodeBaseProposer:
             temperatures is None
             or len(temperatures) != 1
             or abs(float(temperatures[0]) - 1.0) > 1e-6
-            or envs.VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE != 1.0
+            or self._sampling_policy.draft_temperature_scale != 1.0
         ):
             return None
 
-        draft_top_p_override = envs.VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE
+        draft_top_p_override = self._sampling_policy.draft_top_p_override
         if draft_top_p_override is not None:
             top_p = float(draft_top_p_override)
-        elif envs.VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P:
+        elif self._sampling_policy.use_fused_top_p():
             top_ps = sampling_metadata.top_p_cpu
             if top_ps is None or len(top_ps) != 1:
                 return None
@@ -781,102 +799,6 @@ class SpecDecodeBaseProposer:
         if self.model.__class__.__name__ in ("Qwen3_5MTP", "Qwen3_5MoeMTP"):
             model_kwargs.setdefault("intermediate_tensors", None)
         return model_kwargs
-
-    def _sm70_mtp_profile_enabled(self) -> bool:
-        device_type = self.device.type if hasattr(self.device, "type") else self.device
-        return (
-            (self.method == "mtp" or _is_dflash_method(self.method))
-            and device_type == "cuda"
-            and _sm70_mtp_profile_env_enabled()
-        )
-
-    def _sm70_mtp_profile_start(
-        self,
-        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
-    ) -> torch.cuda.Event | None:
-        if events is None:
-            return None
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
-        return event
-
-    def _sm70_mtp_profile_finish(
-        self,
-        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
-        name: str,
-        start: torch.cuda.Event | None,
-    ) -> None:
-        if events is None or start is None:
-            return
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-        events.append((name, start, end))
-
-    def _sm70_mtp_profile_add_cpu_ms(
-        self,
-        cpu_ms: dict[str, float],
-        name: str,
-        start: float,
-    ) -> None:
-        cpu_ms[name] = cpu_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000.0
-
-    def _sm70_mtp_profile_report(
-        self,
-        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
-        cpu_ms: dict[str, float],
-        batch_size: int,
-        num_tokens: int,
-    ) -> None:
-        if events is None:
-            return
-        if events:
-            events[-1][2].synchronize()
-
-        timings: dict[str, float] = {}
-        for name, start, end in events:
-            timings[name] = timings.get(name, 0.0) + start.elapsed_time(end)
-        timings.update(cpu_ms)
-
-        totals = getattr(self, "_sm70_mtp_profile_totals", None)
-        if totals is None:
-            totals = {}
-            self._sm70_mtp_profile_totals = totals
-        calls = getattr(self, "_sm70_mtp_profile_calls", 0) + 1
-        self._sm70_mtp_profile_calls = calls
-        for name, value in timings.items():
-            totals[name] = totals.get(name, 0.0) + value
-
-        if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
-            return
-        # The drafter lives on the last PP stage; the global first rank
-        # never runs it when PP > 1.
-        if not is_last_pp_first_tp_rank():
-            return
-
-        preferred = [
-            "total_gpu",
-            "total_wall_cpu",
-            "first_setup_cpu",
-            "first_forward",
-            "first_sample",
-            "loop_metadata_cpu",
-            "loop0_forward",
-            "loop0_sample",
-            "loop1_forward",
-            "loop1_sample",
-            "loop2_forward",
-            "loop2_sample",
-        ]
-        keys = [key for key in preferred if key in totals]
-        keys.extend(sorted(key for key in totals if key not in keys))
-        summary = " ".join(f"{key}={totals[key] / calls:.3f}" for key in keys)
-        logger.info(
-            "SM70 MTP proposer profile avg_ms calls=%d batch=%d tokens=%d %s",
-            calls,
-            batch_size,
-            num_tokens,
-            summary,
-        )
 
     def _warmup_sm70_mtp_hotpath_batch(
         self, batch_size: int, vocab_size: int, warm_draft_topk: bool
@@ -995,7 +917,9 @@ class SpecDecodeBaseProposer:
                 dtype=torch.int32,
                 device=self.device,
             )
-            apply_top_k_top_p(draft_logits, draft_top_k, None)
+            apply_top_k_top_p(
+                draft_logits, draft_top_k, None, runtime=self._topk_runtime
+            )
 
     def warmup_sm70_mtp_hotpath_kernels(self) -> tuple[str, ...]:
         """Warm MTP helper kernels that otherwise JIT on the first request."""
@@ -1013,7 +937,9 @@ class SpecDecodeBaseProposer:
 
         try:
             vocab_size = max(2, self.draft_model_config.get_vocab_size())
-            expanded_warmup = envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP
+            expanded_warmup = bool(
+                self.vllm_config.kernel_config.sm70_runtime.mtp_concurrency_warmup
+            )
             for batch_size in _sm70_mtp_hotpath_warmup_batch_sizes(
                 self.max_batch_size, include_alternate=expanded_warmup
             ):
@@ -1031,7 +957,7 @@ class SpecDecodeBaseProposer:
             "mtp_rejection_expand",
             "mtp_step_slot_mapping",
         ]
-        if envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP:
+        if self.vllm_config.kernel_config.sm70_runtime.mtp_concurrency_warmup:
             warmed_kernels.append("mtp_draft_topk")
         return tuple(warmed_kernels)
 
@@ -1041,7 +967,7 @@ class SpecDecodeBaseProposer:
             self.method != "mtp"
             or self.device.type != "cuda"
             or not current_platform.is_device_capability(70)
-            or not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG
+            or not unquantized_moe_policy(self.vllm_config).value("legacy_tiles")
             or not self.draft_model_config.is_moe
         ):
             return ()
@@ -1054,7 +980,7 @@ class SpecDecodeBaseProposer:
         num_experts = self.draft_model_config.get_num_experts()
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         use_qwen36_mtp_decode_tiles = (
-            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
             and num_experts == 256
             and top_k == 8
             and self.draft_model_config.get_hidden_size() == 2048
@@ -1062,7 +988,7 @@ class SpecDecodeBaseProposer:
             and tp_size == 4
         )
         use_qwen38_mtp_decode_tiles = (
-            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
             and num_experts == 512
             and top_k == 10
             and self.draft_model_config.get_hidden_size() == 2560
@@ -1151,11 +1077,11 @@ class SpecDecodeBaseProposer:
         batch_size = common_attn_metadata.batch_size()
         common_attn_metadata = _clone_drafter_mutable_metadata(common_attn_metadata)
         profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = (
-            [] if self._sm70_mtp_profile_enabled() else None
+            [] if self._step_profiler.enabled else None
         )
         profile_cpu_ms: dict[str, float] = {}
         profile_wall_start = time.perf_counter() if profile_events is not None else 0.0
-        profile_total_start = self._sm70_mtp_profile_start(profile_events)
+        profile_total_start = self._step_profiler.start(profile_events)
 
         setup_stage_start = time.perf_counter() if profile_events is not None else 0.0
         if self.method == "eagle3" or _is_dflash_method(self.method):
@@ -1172,7 +1098,7 @@ class SpecDecodeBaseProposer:
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_combine_cpu", setup_stage_start
             )
 
@@ -1189,7 +1115,7 @@ class SpecDecodeBaseProposer:
             )
         )
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_set_inputs_cpu", setup_stage_start
             )
 
@@ -1198,7 +1124,7 @@ class SpecDecodeBaseProposer:
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_attn_metadata_cpu", setup_stage_start
             )
 
@@ -1210,7 +1136,7 @@ class SpecDecodeBaseProposer:
             batch_descriptor,
         ) = self._determine_batch_execution_and_padding(num_tokens)
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_batch_exec_cpu", setup_stage_start
             )
 
@@ -1221,12 +1147,12 @@ class SpecDecodeBaseProposer:
         model_kwargs = self._add_spec_step_idx(model_kwargs, 0)
         batch_descriptor = self._batch_descriptor_for_spec_step(batch_descriptor, 0)
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_model_inputs_cpu", setup_stage_start
             )
 
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "first_setup_cpu", profile_wall_start
             )
         ddtree_worker_profile = (
@@ -1240,7 +1166,7 @@ class SpecDecodeBaseProposer:
             torch.cuda.current_stream(self.device).synchronize()
             pre_forward_stream_wait_ms = (time.perf_counter() - sync_t0) * 1000.0
         forward_enqueue_t0 = time.perf_counter() if ddtree_worker_profile else 0.0
-        first_forward_start = self._sm70_mtp_profile_start(profile_events)
+        first_forward_start = self._step_profiler.start(profile_events)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -1258,9 +1184,7 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
-        self._sm70_mtp_profile_finish(
-            profile_events, "first_forward", first_forward_start
-        )
+        self._step_profiler.finish(profile_events, "first_forward", first_forward_start)
         if ddtree_worker_profile:
             forward_enqueue_ms = (time.perf_counter() - forward_enqueue_t0) * 1000.0
             sync_t0 = time.perf_counter()
@@ -1282,9 +1206,9 @@ class SpecDecodeBaseProposer:
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
         debug_logits = None
         debug_summary: dict[str, Any] | None = None
-        should_collect_draft_logits = _spec_debug_corruption_enabled(
-            self.method
-        ) or _spec_dump_draft_logits_enabled(self.method)
+        should_collect_draft_logits = (
+            self._diagnostic_flags[0] or self._diagnostic_flags[1]
+        )
         if should_collect_draft_logits:
             debug_logits = self._compute_logits_for_step(sample_hidden_states, 0)
             topk = min(5, debug_logits.shape[-1])
@@ -1321,7 +1245,7 @@ class SpecDecodeBaseProposer:
                 "logits_topk_vals": topk_vals.detach().cpu(),
                 "first_pass": getattr(self, "_debug_last_first_pass", None),
             }
-            if _spec_dump_draft_logits_enabled(self.method):
+            if self._diagnostic_flags[1]:
                 debug_summary["sample_hidden_states"] = (
                     sample_hidden_states.detach().to(torch.float16).cpu()
                 )
@@ -1332,7 +1256,10 @@ class SpecDecodeBaseProposer:
                 or int(nonfinite_counts.sum().item()) > 0
             ):
                 dump_path = _dump_spec_debug(
-                    debug_summary, self.method, "draft_corruption"
+                    debug_summary,
+                    self.method,
+                    "draft_corruption",
+                    diagnostics=self._diagnostics,
                 )
                 self._spec_corruption_dumped = True
                 logger.warning(
@@ -1343,14 +1270,14 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            first_sample_start = self._sm70_mtp_profile_start(profile_events)
+            first_sample_start = self._step_profiler.start(profile_events)
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 sample_hidden_states,
                 sampling_metadata,
                 debug_logits,
                 spec_step_idx=0,
             )
-            self._sm70_mtp_profile_finish(
+            self._step_profiler.finish(
                 profile_events, "first_sample", first_sample_start
             )
             if draft_probs is not None:
@@ -1358,7 +1285,7 @@ class SpecDecodeBaseProposer:
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
             if (
-                _spec_dump_draft_logits_enabled(self.method)
+                self._diagnostic_flags[1]
                 and not getattr(self, "_spec_logits_dumped", False)
                 and debug_summary is not None
             ):
@@ -1367,18 +1294,21 @@ class SpecDecodeBaseProposer:
                     debug_summary["draft_probs"] = (
                         draft_probs.detach().to(torch.float16).cpu()
                     )
-                dump_path = _dump_spec_debug(debug_summary, self.method, "draft_logits")
+                dump_path = _dump_spec_debug(
+                    debug_summary,
+                    self.method,
+                    "draft_logits",
+                    diagnostics=self._diagnostics,
+                )
                 self._spec_logits_dumped = True
                 logger.warning(
                     "Saved %s draft logits debug to %s", self.method, dump_path
                 )
-            self._sm70_mtp_profile_finish(
-                profile_events, "total_gpu", profile_total_start
-            )
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.finish(profile_events, "total_gpu", profile_total_start)
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "total_wall_cpu", profile_wall_start
             )
-            self._sm70_mtp_profile_report(
+            self._step_profiler.report_proposal(
                 profile_events, profile_cpu_ms, batch_size, num_tokens
             )
             if isinstance(self._static_draft_vocab, DynamicDraftVocabRuntime):
@@ -1397,24 +1327,27 @@ class SpecDecodeBaseProposer:
             # (which read via _get_positions) use the correct values.
             self.positions[:batch_size] = positions
 
-        first_sample_start = self._sm70_mtp_profile_start(profile_events)
+        first_sample_start = self._step_profiler.start(profile_events)
         draft_token_ids, draft_probs = self._sample_draft_tokens(
             sample_hidden_states,
             sampling_metadata,
             debug_logits,
             spec_step_idx=0,
         )
-        self._sm70_mtp_profile_finish(
-            profile_events, "first_sample", first_sample_start
-        )
+        self._step_profiler.finish(profile_events, "first_sample", first_sample_start)
         draft_probs_list = None if draft_probs is None else [draft_probs]
         if (
-            _spec_dump_draft_logits_enabled(self.method)
+            self._diagnostic_flags[1]
             and not getattr(self, "_spec_logits_dumped", False)
             and debug_summary is not None
         ):
             debug_summary["draft_token_ids"] = draft_token_ids.detach().cpu()
-            dump_path = _dump_spec_debug(debug_summary, self.method, "draft_logits")
+            dump_path = _dump_spec_debug(
+                debug_summary,
+                self.method,
+                "draft_logits",
+                diagnostics=self._diagnostics,
+            )
             self._spec_logits_dumped = True
             logger.warning("Saved %s draft logits debug to %s", self.method, dump_path)
 
@@ -1452,7 +1385,7 @@ class SpecDecodeBaseProposer:
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
             if (
-                envs.VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU
+                self._sampling_policy.exact_draft_seq_lens_cpu
                 and common_attn_metadata.seq_lens_cpu_upper_bound is not None
             ):
                 common_attn_metadata.seq_lens_cpu_upper_bound -= (
@@ -1516,7 +1449,7 @@ class SpecDecodeBaseProposer:
 
             if profile_events is not None:
                 metadata_name = f"loop{token_index}_metadata_cpu"
-                self._sm70_mtp_profile_add_cpu_ms(
+                self._step_profiler.add_cpu_ms(
                     profile_cpu_ms, metadata_name, loop_cpu_start
                 )
                 profile_cpu_ms["loop_metadata_cpu"] = (
@@ -1524,7 +1457,7 @@ class SpecDecodeBaseProposer:
                     + profile_cpu_ms[metadata_name]
                 )
 
-            loop_forward_start = self._sm70_mtp_profile_start(profile_events)
+            loop_forward_start = self._step_profiler.start(profile_events)
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -1542,18 +1475,18 @@ class SpecDecodeBaseProposer:
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
-            self._sm70_mtp_profile_finish(
+            self._step_profiler.finish(
                 profile_events, f"loop{token_index}_forward", loop_forward_start
             )
 
             hidden_states = hidden_states[:batch_size]
-            loop_sample_start = self._sm70_mtp_profile_start(profile_events)
+            loop_sample_start = self._step_profiler.start(profile_events)
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 last_hidden_states[:batch_size],
                 sampling_metadata,
                 spec_step_idx=spec_step_idx,
             )
-            self._sm70_mtp_profile_finish(
+            self._step_profiler.finish(
                 profile_events, f"loop{token_index}_sample", loop_sample_start
             )
             if draft_probs is not None:
@@ -1565,11 +1498,11 @@ class SpecDecodeBaseProposer:
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
-        self._sm70_mtp_profile_finish(profile_events, "total_gpu", profile_total_start)
-        self._sm70_mtp_profile_add_cpu_ms(
+        self._step_profiler.finish(profile_events, "total_gpu", profile_total_start)
+        self._step_profiler.add_cpu_ms(
             profile_cpu_ms, "total_wall_cpu", profile_wall_start
         )
-        self._sm70_mtp_profile_report(
+        self._step_profiler.report_proposal(
             profile_events, profile_cpu_ms, batch_size, num_tokens
         )
         if isinstance(self._static_draft_vocab, DynamicDraftVocabRuntime):
@@ -1956,7 +1889,7 @@ class SpecDecodeBaseProposer:
         seq_lens_cpu_upper_bound = _clone_tensor_or_none(
             common_attn_metadata.seq_lens_cpu_upper_bound
         )
-        if envs.VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU:
+        if self._sampling_policy.exact_draft_seq_lens_cpu:
             seq_lens_cpu_upper_bound = seq_lens.detach().cpu()
 
         spec_common_attn_metadata = CommonAttentionMetadata(
@@ -2242,153 +2175,32 @@ class SpecDecodeBaseProposer:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
-        """
-        Some draft models may not have their own embedding layers, and some may
-        have a duplicate copy of the target model's embedding layers. In these cases,
-        we share the target model's embedding layers with the draft model to save
-        memory.
-        """
-        if get_pp_group().world_size == 1:
-            inner_model = getattr(target_language_model, "model", None)
-            if inner_model is None:
-                raise AttributeError("Target model does not have 'model' attribute")
-            if hasattr(inner_model, "embed_tokens"):
-                target_embed_tokens = inner_model.embed_tokens
-            elif hasattr(inner_model, "embedding"):
-                target_embed_tokens = inner_model.embedding
-            else:
-                raise AttributeError(
-                    "Target model does not have 'embed_tokens' or 'embedding' attribute"
-                )
+        from vllm.model_executor.models.shared_weights import (
+            LEGACY_DRAFT_WEIGHTS,
+            share_embeddings,
+        )
 
-            share_embeddings = False
-            if hasattr(self.model, "has_own_embed_tokens"):
-                # EAGLE model
-                if not self.model.has_own_embed_tokens:
-                    share_embeddings = True
-                    logger.info(
-                        "Detected EAGLE model without its own embed_tokens in the"
-                        " checkpoint. Sharing target model embedding weights with the"
-                        " draft model."
-                    )
-                elif (
-                    isinstance(target_embed_tokens.weight, torch.Tensor)
-                    and isinstance(self.model.model.embed_tokens.weight, torch.Tensor)
-                    # TODO: Offload to CPU for comparison to avoid extra GPU memory
-                    # usage in CI testing environments with limited GPU memory
-                    and torch.equal(
-                        target_embed_tokens.weight.cpu(),
-                        self.model.model.embed_tokens.weight.cpu(),
-                    )
-                ):
-                    share_embeddings = True
-                    logger.info(
-                        "Detected EAGLE model with embed_tokens identical to the target"
-                        " model. Sharing target model embedding weights with the draft"
-                        " model."
-                    )
-                else:
-                    logger.info(
-                        "Detected EAGLE model with distinct embed_tokens weights. "
-                        "Keeping separate embedding weights from the target model."
-                    )
-            else:
-                # MTP model
-                share_embeddings = True
-                logger.info(
-                    "Detected MTP model. "
-                    "Sharing target model embedding weights with the draft model."
-                )
-
-            if share_embeddings:
-                if hasattr(self.model.model, "embed_tokens"):
-                    del self.model.model.embed_tokens
-                self.model.model.embed_tokens = target_embed_tokens
-        else:
-            logger.info(
-                "The draft model's vocab embedding will be loaded separately"
-                " from the target model."
-            )
+        share_embeddings(
+            self.model,
+            target_language_model,
+            LEGACY_DRAFT_WEIGHTS,
+            pp_size=get_pp_group().world_size,
+            log=logger,
+        )
 
     def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
-        """
-        Some draft models may not have their own LM head, and some may have a
-        duplicate copy of the target model's LM head. In these cases, we share
-        the target model's LM head with the draft model to save memory.
-        """
-        share_lm_head = False
-        if hasattr(self.model, "has_own_lm_head"):
-            # EAGLE model
-            if not self.model.has_own_lm_head:
-                share_lm_head = True
-                logger.info(
-                    "Detected EAGLE model without its own lm_head in the checkpoint. "
-                    "Sharing target model lm_head weights with the draft model."
-                )
-            elif (
-                hasattr(target_language_model, "lm_head")
-                and hasattr(target_language_model.lm_head, "weight")
-                and hasattr(self.model.lm_head, "weight")
-                and isinstance(target_language_model.lm_head.weight, torch.Tensor)
-                and isinstance(self.model.lm_head.weight, torch.Tensor)
-                # TODO: Offload to CPU for comparison to avoid extra GPU memory
-                # usage in CI testing environments with limited GPU memory
-                and torch.equal(
-                    target_language_model.lm_head.weight.cpu(),
-                    self.model.lm_head.weight.cpu(),
-                )
-            ):
-                share_lm_head = True
-                logger.info(
-                    "Detected EAGLE model with lm_head identical to the target model. "
-                    "Sharing target model lm_head weights with the draft model."
-                )
-            else:
-                logger.info(
-                    "Detected EAGLE model with distinct lm_head weights. "
-                    "Keeping separate lm_head weights from the target model."
-                )
-        else:
-            # MTP model
-            share_lm_head = True
-            logger.info(
-                "Detected MTP model. "
-                "Sharing target model lm_head weights with the draft model."
-            )
+        from vllm.model_executor.models.shared_weights import (
+            LEGACY_DRAFT_WEIGHTS,
+            share_lm_head,
+        )
 
-        if share_lm_head and hasattr(target_language_model, "lm_head"):
-            if hasattr(self.model, "lm_head"):
-                del self.model.lm_head
-            self.model.lm_head = target_language_model.lm_head
-
-            # MTP models call compute_logits via shared_head.head (a
-            # ParallelLMHead inside each MTP layer), not self.model.lm_head.
-            # If the checkpoint omits a copy of the lm_head weights at the
-            # MTP layer path, shared_head.head stays uninitialised and
-            # produces NaN logits. Always share it explicitly.
-            inner = getattr(self.model, "model", None)
-            layers = getattr(inner, "layers", None) if inner else None
-            if layers is not None:
-                items = layers.values() if isinstance(layers, nn.ModuleDict) else layers
-                for layer in items:
-                    sh = getattr(layer, "shared_head", None)
-                    if sh is not None and hasattr(sh, "head"):
-                        del sh.head
-                        sh.head = target_language_model.lm_head
-                        logger.info(
-                            "Shared target model lm_head with MTP shared_head.head."
-                        )
-
-        if hasattr(target_language_model.model, "topk_indices_buffer"):
-            if hasattr(self.model.model, "topk_indices_buffer"):
-                del self.model.model.topk_indices_buffer
-            self.model.model.topk_indices_buffer = (
-                target_language_model.model.topk_indices_buffer
-            )
-            logger.info(
-                "Detected MTP model with topk_indices_buffer. "
-                "Sharing target model topk_indices_buffer with the draft model."
-            )
+        share_lm_head(
+            self.model,
+            target_language_model,
+            target_language_model,
+            LEGACY_DRAFT_WEIGHTS,
+            log=logger,
+        )
 
         if self.use_local_argmax_reduction:
             if not hasattr(self.model, "get_top_tokens"):
@@ -2421,6 +2233,7 @@ class SpecDecodeBaseProposer:
             self.vllm_config.parallel_config.tensor_parallel_size,
             self.vllm_config.model_config.architecture,
             self.vllm_config.model_config.model,
+            policy=self._sampling_policy,
         )
         ranking_path = vocab_config.ranking_path
         shortlist_size = vocab_config.shortlist_size
@@ -2776,6 +2589,9 @@ class SpecDecodeBaseProposer:
 def compute_probs_and_sample_next_token(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    *,
+    policy: SpeculativeSamplingPolicy | None = None,
+    runtime=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if sampling_metadata.all_greedy:
         # For greedy requests, draft_probs is not used in rejection sampling.
@@ -2784,6 +2600,11 @@ def compute_probs_and_sample_next_token(
         next_token_ids = logits.argmax(dim=-1)
         return next_token_ids, probs
 
+    if policy is None:
+        policy = SpeculativeSamplingPolicy()
+        policy.resolve_fields(
+            field for field in policy.aliases if field.startswith("draft_")
+        )
     assert sampling_metadata.temperature is not None
     logits = logits.float()
 
@@ -2799,7 +2620,8 @@ def compute_probs_and_sample_next_token(
     if not sampling_metadata.all_random:
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
-    draft_temperature_scale = envs.VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE
+    draft_temperature_scale = policy.draft_temperature_scale
+    assert draft_temperature_scale is not None
     if draft_temperature_scale <= 0.0:
         raise ValueError(
             "VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE must be positive, "
@@ -2822,11 +2644,9 @@ def compute_probs_and_sample_next_token(
     # sampling corrects the final distribution. The SM70 experiment flag lets us
     # test a closer top-k+top-p proposal while keeping standard rejection
     # correction and official target sampling semantics.
-    draft_top_p_override = os.getenv("VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE")
-    apply_draft_top_p_with_top_k = (
-        os.getenv("VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P", "0") == "1"
-    )
-    if draft_top_p_override:
+    draft_top_p_override = policy.draft_top_p_override
+    apply_draft_top_p_with_top_k = policy.draft_apply_top_p
+    if draft_top_p_override is not None and draft_top_p_override != "":
         draft_top_p_value = float(draft_top_p_override)
         if not 0.0 < draft_top_p_value <= 1.0:
             raise ValueError(
@@ -2855,6 +2675,7 @@ def compute_probs_and_sample_next_token(
         sampling_metadata,
         top_k,
         top_p,
+        enabled=policy.draft_sparse_topk,
     ):
         assert sampling_metadata.top_k_cpu is not None
         return _compute_sparse_topk_draft_probs_and_sample_next_token(
@@ -2863,7 +2684,7 @@ def compute_probs_and_sample_next_token(
             int(sampling_metadata.top_k_cpu[0]),
         )
 
-    logits = apply_top_k_top_p(logits, top_k, top_p)
+    logits = apply_top_k_top_p(logits, top_k, top_p, runtime=runtime)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
     q = torch.empty_like(probs)
@@ -2888,8 +2709,12 @@ def _can_use_sparse_topk_draft_proposal(
     sampling_metadata: SamplingMetadata,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
+    *,
+    enabled: bool | None = None,
 ) -> bool:
-    if not envs.VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK:
+    if enabled is None:
+        enabled = envs.VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK
+    if not enabled:
         return False
     if top_k is None or top_p is not None:
         return False

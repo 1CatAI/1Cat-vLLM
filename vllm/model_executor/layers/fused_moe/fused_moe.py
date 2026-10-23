@@ -7,6 +7,7 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import torch
@@ -14,6 +15,7 @@ import torch
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.config.sm70_moe import unquantized_moe_policy
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -36,19 +38,17 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-_force_sm70_mtp_moe_legacy_config = False
+_force_sm70_mtp_moe_legacy_config = ContextVar("sm70_moe_legacy_warmup", default=False)
 
 
 @contextmanager
 def force_sm70_mtp_moe_legacy_config() -> Iterator[None]:
     """Temporarily select the legacy SM70 MoE tile during startup warmup."""
-    global _force_sm70_mtp_moe_legacy_config
-    previous = _force_sm70_mtp_moe_legacy_config
-    _force_sm70_mtp_moe_legacy_config = True
+    token = _force_sm70_mtp_moe_legacy_config.set(True)
     try:
         yield
     finally:
-        _force_sm70_mtp_moe_legacy_config = previous
+        _force_sm70_mtp_moe_legacy_config.reset(token)
 
 
 @triton.jit
@@ -891,10 +891,10 @@ def dispatch_fused_moe_kernel(
     num_tokens = M * top_k
 
     if (
-        envs.VLLM_SM70_MTP_MOE_FP16_EXACT
+        unquantized_moe_policy().value("mtp_fp16_exact")
         and not envs.VLLM_BATCH_INVARIANT
-        and not _force_sm70_mtp_moe_legacy_config
-        and envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+        and not _force_sm70_mtp_moe_legacy_config.get()
+        and unquantized_moe_policy().value("mtp_tuned")
         and sorted_token_ids is None
         and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
         and A_scale is None
@@ -1297,7 +1297,9 @@ def _get_sm70_mtp_moe_decode_config(
     topk: int,
 ) -> dict[str, int] | None:
     """Return graph-tuned exact-shape SM70 MTP tiles."""
-    if _force_sm70_mtp_moe_legacy_config or not envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG:
+    if _force_sm70_mtp_moe_legacy_config.get() or not unquantized_moe_policy().value(
+        "mtp_tuned"
+    ):
         return None
     if (E, N, K, topk) == (256, 128, 2048, 8) and 2 <= M <= 16:
         # Qwen3.6 TP4 shards the checkpoint-global I512 expert width to I128
@@ -1380,7 +1382,7 @@ def get_default_config(
         else:
             config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
     elif (
-        envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG
+        unquantized_moe_policy().value("legacy_tiles")
         and dtype is None
         and block_shape is None
         and current_platform.is_cuda()

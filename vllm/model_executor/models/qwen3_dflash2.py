@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Callable
 from functools import cache
 
@@ -28,6 +27,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.sm70_topk_gather import gather_topk_pairs
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
@@ -58,8 +58,10 @@ def _use_sm70_bf16_emulation(config) -> bool:
         "bf16",
         "torch.bfloat16",
     }
-    enabled = os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION", "1").strip().lower()
-    enabled = enabled in ("1", "true", "yes", "on")
+    policy = capture_sm70_dflash2_config()
+    from vllm.config.sm70_dflash2 import dflash2_bf16_emulation
+
+    enabled = dflash2_bf16_emulation(policy)
     if not (enabled and is_bf16 and current_platform.is_cuda()):
         return False
     # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the
@@ -508,6 +510,10 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._packed_topk_enabled = vllm_config.kernel_config.sm70_packed_topk_gather
+        self._packed_topk_selections = (
+            vllm_config.kernel_config.collective_kernel_selections
+        )
         self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
         draft_config = self.config.dflash_config
         self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
@@ -559,8 +565,18 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             values, ids = local_candidates
 
         if get_tensor_model_parallel_world_size() > 1:
-            values = tensor_model_parallel_all_gather(values, dim=-1)
-            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            packed = gather_topk_pairs(
+                values,
+                ids,
+                vocab_size=self.lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
+            )
+            if packed is None:
+                values = tensor_model_parallel_all_gather(values, dim=-1)
+                ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            else:
+                values, ids = packed
 
         if values.shape[-1] > selector.top_k:
             values, selected = _topk(values, selector.top_k)

@@ -14,7 +14,11 @@ def get_gguf_adapter(config, tp_size=1):
     if config.get_text_config().model_type == "qwen4_exp_text":
         from .qwen4exp import Qwen4ExpAdapter
 
-        return Qwen4ExpAdapter(config.get_text_config(), tp_size=tp_size)
+        adapter = Qwen4ExpAdapter(config.get_text_config(), tp_size=tp_size)
+        adapter.language_model_prefix = (
+            "language_model" if config.model_type == "qwen4_exp" else ""
+        )
+        return adapter
     if config.get_text_config().model_type == "qwen3_5_moe_text":
         from .qwen35_moe import Qwen35MoeAdapter
 

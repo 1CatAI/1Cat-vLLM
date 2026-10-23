@@ -5,7 +5,6 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_mxfp4_linear_kernel
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
@@ -41,13 +40,13 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
     def __init__(self):
         self.group_size = 32
         self.kernel = None
-        if not sm70_tm.use_turbomind(envs.VLLM_SM70_MXFP4_TURBOMIND):
+        if not sm70_tm.use_turbomind(sm70_tm.layer_policy().value("mxfp4_turbomind")):
             self.kernel = init_mxfp4_linear_kernel()
 
     @classmethod
     def get_min_capability(cls) -> int:
         if (
-            sm70_tm.use_turbomind(envs.VLLM_SM70_MXFP4_TURBOMIND)
+            sm70_tm.use_turbomind(sm70_tm.layer_policy().value("mxfp4_turbomind"))
             or sm70_tm.forces_marlin()
         ):
             return 70
@@ -101,7 +100,7 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if sm70_tm.should_prepare_turbomind(
-            layer.weight_packed, envs.VLLM_SM70_MXFP4_TURBOMIND
+            layer.weight_packed, sm70_tm.layer_policy().value("mxfp4_turbomind")
         ):
             logger.info_once(
                 "SM70 compressed-tensors MXFP4 TurboMind dense path enabled."

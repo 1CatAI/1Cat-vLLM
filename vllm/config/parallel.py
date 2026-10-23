@@ -13,6 +13,7 @@ from torch.distributed import ProcessGroup, ReduceOp, Store
 from typing_extensions import Self
 
 import vllm.envs as envs
+from vllm.config.execution_policy import CommunicationPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -108,6 +109,9 @@ class EPLBConfig:
 @config
 class ParallelConfig:
     """Configuration for the distributed execution."""
+
+    communication: CommunicationPolicy = Field(default_factory=CommunicationPolicy)
+    """Per-engine execution decisions and initialization provenance."""
 
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel groups."""
@@ -791,9 +795,18 @@ class ParallelConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
+        factors["communication"] = self.communication.compute_hash()
         return hash_factors(factors)
 
     def __post_init__(self) -> None:
+        from vllm.config.sm70_runtime import resolve_legacy_fields
+
+        resolve_legacy_fields(
+            self.communication,
+            {
+                "pp_layer_partition": "VLLM_PP_LAYER_PARTITION",
+            },
+        )
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size

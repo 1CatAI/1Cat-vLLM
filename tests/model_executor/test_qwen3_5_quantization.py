@@ -29,8 +29,8 @@ def test_sm70_gdn_qpn8_ba_split_is_disabled_without_split_flag(
 ) -> None:
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
-    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_QPN8_BA_SPLIT", split_enabled)
-    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_RMSNORM_ONEPASS", norm_enabled)
+    monkeypatch.setenv("VLLM_SM70_GDN_QPN8_BA_SPLIT", str(int(split_enabled)))
+    monkeypatch.setenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", str(int(norm_enabled)))
 
     assert not gdn._sm70_gdn_qpn8_ba_split_enabled()
 
@@ -38,8 +38,8 @@ def test_sm70_gdn_qpn8_ba_split_is_disabled_without_split_flag(
 def test_sm70_gdn_qpn8_ba_split_rejects_unpaired_route(monkeypatch) -> None:
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
-    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_QPN8_BA_SPLIT", True)
-    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_RMSNORM_ONEPASS", False)
+    monkeypatch.setenv("VLLM_SM70_GDN_QPN8_BA_SPLIT", "1")
+    monkeypatch.setenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "0")
 
     with pytest.raises(RuntimeError, match="requires the accepted"):
         gdn._sm70_gdn_qpn8_ba_split_enabled()
@@ -48,8 +48,8 @@ def test_sm70_gdn_qpn8_ba_split_rejects_unpaired_route(monkeypatch) -> None:
 def test_sm70_gdn_qpn8_ba_split_requires_source_built_ops(monkeypatch) -> None:
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
-    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_QPN8_BA_SPLIT", True)
-    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_RMSNORM_ONEPASS", True)
+    monkeypatch.setenv("VLLM_SM70_GDN_QPN8_BA_SPLIT", "1")
+    monkeypatch.setenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "1")
     monkeypatch.setattr(
         gdn,
         "_missing_sm70_gdn_qpn8_ba_ops",
@@ -63,8 +63,8 @@ def test_sm70_gdn_qpn8_ba_split_requires_source_built_ops(monkeypatch) -> None:
 def test_sm70_gdn_qpn8_ba_split_accepts_complete_contract(monkeypatch) -> None:
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
-    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_QPN8_BA_SPLIT", True)
-    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_RMSNORM_ONEPASS", True)
+    monkeypatch.setenv("VLLM_SM70_GDN_QPN8_BA_SPLIT", "1")
+    monkeypatch.setenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "1")
     monkeypatch.setattr(gdn, "_missing_sm70_gdn_qpn8_ba_ops", lambda: [])
 
     assert gdn._sm70_gdn_qpn8_ba_split_enabled()
@@ -234,6 +234,12 @@ def test_qwen3_5_mtp_lm_head_receives_quant_config():
     mock_vllm_config.cache_config.mamba_cache_mode = "align"
     mock_vllm_config.compilation_config.mode = CompilationMode.NONE
     mock_vllm_config.quant_config = mock_quant_config
+    from vllm.config.execution_policy import LayerExecutionPolicy
+
+    mock_vllm_config.kernel_config.layer_execution = LayerExecutionPolicy(
+        mtp_share_io_weights=False, mtp_keep_quant=False
+    )
+    mock_vllm_config.kernel_config.layer_execution.resolve()
 
     mock_pp_group = Mock()
     mock_pp_group.is_last_rank = True

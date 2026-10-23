@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import queue
+import threading
+import time
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -504,26 +506,18 @@ def test_ple_offload_wait_only_waits_for_done(
         "current_stream",
         lambda: stream,
     )
-    monkeypatch.setattr(
-        ple_offload_layer.cuda_driver,
-        "CUstream",
-        lambda value: value,
+    driver = SimpleNamespace(
+        CUstream=lambda value: value,
+        CUdeviceptr=lambda value: value,
+        cuStreamWaitValue32=fake_wait,
+        cuStreamWriteValue32=lambda *args: pytest.fail(
+            f"wait unexpectedly wrote the flag: {args}"
+        ),
+        CUstreamWaitValue_flags=SimpleNamespace(
+            CU_STREAM_WAIT_VALUE_EQ=SimpleNamespace(value=1)
+        ),
     )
-    monkeypatch.setattr(
-        ple_offload_layer.cuda_driver,
-        "CUdeviceptr",
-        lambda value: value,
-    )
-    monkeypatch.setattr(
-        ple_offload_layer.cuda_driver,
-        "cuStreamWaitValue32",
-        fake_wait,
-    )
-    monkeypatch.setattr(
-        ple_offload_layer.cuda_driver,
-        "cuStreamWriteValue32",
-        lambda *args: pytest.fail(f"wait unexpectedly wrote the flag: {args}"),
-    )
+    monkeypatch.setattr(ple_offload_layer, "cuda_driver", driver)
 
     result = ple_offload_layer._ple_offload_wait_impl(
         flag_tensor,
@@ -537,7 +531,7 @@ def test_ple_offload_wait_only_waits_for_done(
             stream.cuda_stream,
             flag_tensor.data_ptr(),
             ple_offload_layer.CpuGpuSemaphore.DONE_VALUE,
-            ple_offload_layer.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+            ple_offload_layer.cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
         )
     ]
 
@@ -871,7 +865,10 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
         ),
     )
     runner._layers = {
-        "ple": SimpleNamespace(get_offload_output_dtype=lambda default: default)
+        "ple": SimpleNamespace(
+            get_offload_output_dtype=lambda default: default,
+            get_offload_output_dim=lambda default: default,
+        )
     }
     runner._worker_targets = {}
     runner._pinned_bufs = {}
@@ -1227,6 +1224,7 @@ def test_offload_world_drops_the_pipeline_layer_partition(
     """The worker builds its model as a single pipeline stage; a partition
     inherited from the GPU workers' pipeline would make get_pp_indices refuse
     that stage."""
+    from vllm.config import DeviceConfig, set_current_vllm_config
     from vllm.distributed.utils import get_pp_indices
 
     set_lazy_env(monkeypatch, "VLLM_PP_LAYER_PARTITION", "24,24")
@@ -1235,9 +1233,14 @@ def test_offload_world_drops_the_pipeline_layer_partition(
     # An initialized world leaves only the environment handling to run.
     monkeypatch.setattr(ple_offload_worker.dist, "is_initialized", lambda: True)
 
+    child_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    child_config.parallel_config.communication.pp_layer_partition = None
     ple_offload_worker._init_offload_distributed()
-
-    assert get_pp_indices(48, 0, 1) == (0, 48)
+    with set_current_vllm_config(child_config):
+        assert get_pp_indices(48, 0, 1) == (0, 48)
+    # The GPU parent's legacy partition is never removed from the process.
+    with pytest.raises(ValueError, match="does not match pp_size"):
+        get_pp_indices(48, 0, 1)
 
 
 def _registration_with_cpu_inputs(
@@ -1371,3 +1374,53 @@ def test_ple_registration_outlives_its_sender(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     assert "value=7 managers=0" in result.stdout, result.stdout + result.stderr
     assert "released" in result.stdout
+
+
+class _SlowStartContext:
+    """Spawn context whose Process.start blocks, like spawn pickling a large
+    config while the child imports vLLM."""
+
+    def __init__(self, delay: float, error: BaseException | None = None):
+        self.delay = delay
+        self.error = error
+        self.started = threading.Event()
+        real = ple_offload_worker.get_mp_context()
+        self.Pipe = real.Pipe
+
+    def Process(self, **kwargs):  # noqa: N802 - mirrors multiprocessing API
+        context = self
+
+        class _Proc:
+            def start(self) -> None:
+                time.sleep(context.delay)
+                if context.error is not None:
+                    raise context.error
+                context.started.set()
+
+            def is_alive(self) -> bool:
+                return False
+
+        return _Proc()
+
+
+def test_make_process_does_not_block_on_child_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _SlowStartContext(delay=0.5)
+    monkeypatch.setattr(ple_offload_worker, "get_mp_context", lambda: context)
+    begin = time.monotonic()
+    handle = ple_offload_worker.PleOffloadWorker.make_process(None, 1, "ipc://x")
+    assert time.monotonic() - begin < 0.25
+    assert not context.started.is_set()
+    handle.join_starter()
+    assert context.started.is_set()
+    handle.close()
+
+
+def test_wait_for_ready_reports_start_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _SlowStartContext(delay=0.0, error=OSError("spawn failed"))
+    monkeypatch.setattr(ple_offload_worker, "get_mp_context", lambda: context)
+    handle = ple_offload_worker.PleOffloadWorker.make_process(None, 1, "ipc://x")
+    with pytest.raises(RuntimeError, match="failed to start"):
+        ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
+    handle.close()
