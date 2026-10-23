@@ -736,3 +736,63 @@ def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
         has_fp8_dense=True,
         fp4_kinds=set(),
     )
+
+
+def test_freeze_makes_the_measured_plan_final(monkeypatch):
+    device = torch.device("cpu")
+    frozen = []
+
+    def fake_freeze(hint):
+        frozen.append(hint)
+        return 7
+
+    monkeypatch.setattr(warmup.sm70_native_cache, "freeze_tuning", fake_freeze)
+    assert warmup._freeze_tuning_plan(device) == 7
+    assert len(frozen) == 1
+    assert frozen[0].device == device and frozen[0].numel() == 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_freeze_runs_only_with_the_switch(monkeypatch, enabled):
+    frozen = []
+
+    def fake_freeze(device):
+        frozen.append(device)
+        return 0
+
+    monkeypatch.setattr(warmup, "_freeze_tuning_plan", fake_freeze)
+    runtime = Sm70RuntimeConfig(freeze_tuning_after_warmup=enabled)
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(kernel_config=SimpleNamespace(sm70_runtime=runtime))
+    )
+    device = torch.device("cpu")
+    warmup._freeze_tuning_if_requested(worker, device)
+    assert frozen == ([device] if enabled else [])
+
+
+def test_warmup_runs_inside_the_workers_config_context(monkeypatch):
+    # Outside the context the warmup captures default native policies, a
+    # partition the layers never dispatch in.
+    events = []
+    worker = SimpleNamespace(vllm_config=object())
+
+    class Context:
+        def __init__(self, config):
+            events.append(("enter", config))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            events.append(("exit", None))
+
+    monkeypatch.setattr(warmup, "set_current_vllm_config", Context)
+    monkeypatch.setattr(
+        warmup, "_sm70_awq_warmup", lambda w: events.append(("warmup", w))
+    )
+    warmup.sm70_awq_warmup(worker)
+    assert events == [
+        ("enter", worker.vllm_config),
+        ("warmup", worker),
+        ("exit", None),
+    ]

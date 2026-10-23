@@ -108,6 +108,7 @@ CONFIGURED_OPERATORS = GGUF_OPERATORS + (
     "sm70_f16_gemm_out",
     "sm70_f16_prepare",
     "sm70_gemm_export_cache",
+    "sm70_gemm_freeze_tuning",
     "sm70_gemm_import_cache",
     "sm70_glm53_fp16_gemv_out",
     "sm70_glm53_moe_permute_q8_out",

@@ -514,6 +514,8 @@ int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
 int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
                                const std::string& path);
 
+int64_t sm70_gemm_freeze_tuning(torch::Tensor device_hint);
+
 std::vector<torch::Tensor> awq_moe_build_strided_ptrs(torch::Tensor tm_weights,
                                                       torch::Tensor tm_scales,
                                                       int64_t k_ld,

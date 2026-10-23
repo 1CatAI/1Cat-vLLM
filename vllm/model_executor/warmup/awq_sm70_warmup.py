@@ -13,6 +13,7 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings
+from vllm.config import set_current_vllm_config
 from vllm.config.sm70_moe import (
     capture_mxfp4_moe_config,
     capture_nvfp4_moe_config,
@@ -188,6 +189,27 @@ def _import_lut_bytes(device: torch.device, payload: bytes) -> int:
         path = Path(tmpdir) / "gemm-lut.bin"
         path.write_bytes(payload)
         return int(sm70_native_cache.import_cache(device_hint, str(path)))
+
+
+def _freeze_tuning_plan(device: torch.device) -> int:
+    """Make the plan measured during warmup final on this device: a shape it
+    lacks takes the plan of the next larger measured one instead of a
+    measurement on the request that brings it; returns the measured shapes."""
+    device_hint = torch.empty(0, dtype=torch.uint8, device=device)
+    return sm70_native_cache.freeze_tuning(device_hint)
+
+
+def _freeze_tuning_if_requested(worker: Worker, device: torch.device) -> None:
+    if not worker.vllm_config.kernel_config.sm70_runtime.value(
+        "freeze_tuning_after_warmup"
+    ):
+        return
+    logger.info(
+        "SM70 TurboMind tuning frozen after warmup: %d measured shapes "
+        "final for the service lifetime on device %s.",
+        _freeze_tuning_plan(device),
+        device,
+    )
 
 
 def _run_coordinated_dense_warmup(
@@ -1233,6 +1255,14 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
 
 
 def sm70_awq_warmup(worker: Worker) -> None:
+    # The warmup captures its native policies from the current vLLM config;
+    # outside this context they are the defaults, a policy partition the layers
+    # never dispatch in, so nothing measured here would reach the service.
+    with set_current_vllm_config(worker.vllm_config):
+        _sm70_awq_warmup(worker)
+
+
+def _sm70_awq_warmup(worker: Worker) -> None:
     if not worker.vllm_config.kernel_config.sm70_runtime.value("awq_warmup"):
         return
     if not hasattr(torch.ops._C, "awq_gemm_sm70_out"):
@@ -1340,3 +1370,4 @@ def sm70_awq_warmup(worker: Worker) -> None:
             exported_records,
             device,
         )
+    _freeze_tuning_if_requested(worker, device)

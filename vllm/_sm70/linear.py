@@ -2069,6 +2069,12 @@ def sm70_gemm_export_cache(
     return call_native(_op("sm70_gemm_export_cache"), native_policy, device_hint, path)
 
 
+def sm70_gemm_freeze_tuning(
+    device_hint: torch.Tensor, native_policy: tuple[str, ...] = ()
+) -> int:
+    return call_native(_op("sm70_gemm_freeze_tuning"), native_policy, device_hint)
+
+
 if hasattr(torch.ops._C, "gguf_affine_dequantize_sm70_out"):
 
     @register_fake("_C::gguf_affine_dequantize_sm70_out")
