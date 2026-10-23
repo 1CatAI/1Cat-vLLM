@@ -272,6 +272,7 @@ def sparse_attn_indexer_kpool(
     # path and when the tail cache is disabled.
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    canonical_prefill_order: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -331,6 +332,7 @@ def sparse_attn_indexer_kpool(
             topk_indices_buffer,
             skip_k_cache_insert,
             use_fp4_cache,
+            canonical_prefill_order=canonical_prefill_order,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -420,10 +422,6 @@ def sparse_attn_indexer_kpool(
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
-        config = get_current_vllm_config_or_none()
-        canonical_prefill_order = bool(
-            config is not None and config.kernel_config.canonical_prefill_topk_order
-        )
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
@@ -915,6 +913,7 @@ def sparse_attn_indexer_kpool_fake(
     positions: torch.Tensor | None = None,
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    canonical_prefill_order: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -972,6 +971,12 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        # Initialization owns the engine config; execution may have only a
+        # ForwardContext. Keep this graph-affecting option local to the layer.
+        config = get_current_vllm_config_or_none()
+        self.canonical_prefill_topk_order = bool(
+            config is not None and config.kernel_config.canonical_prefill_topk_order
+        )
         from vllm.models.deepseek_v4.common.portable_sparse import use_portable_sparse
 
         if (
@@ -1055,6 +1060,7 @@ class SparseAttnIndexerKpool(CustomOp):
             positions,
             self.tail_cache.kv_cache if self.tail_cache is not None else None,
             self.tail_cache.prefix if self.tail_cache is not None else None,
+            self.canonical_prefill_topk_order,
         )
 
     def forward_hip(
