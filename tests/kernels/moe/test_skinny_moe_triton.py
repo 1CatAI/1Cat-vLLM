@@ -49,12 +49,12 @@ def _expert_weights(n: int, k: int, gen: torch.Generator):
     return codes, scales, global_scales, dense
 
 
-def _routing(tokens: int, gen: torch.Generator):
-    ids = torch.stack(
-        [
-            torch.randperm(EXPERTS, device="cuda", generator=gen)[:TOP_K]
-            for _ in range(tokens)
-        ]
+def _routing(tokens: int, gen: torch.Generator, skew: float = 0.0):
+    # Expert popularity ~ 1 / rank^skew: skewed routing gives groups of every
+    # size, as real routers do.
+    popularity = 1.0 / torch.arange(1, EXPERTS + 1, device="cuda").float() ** skew
+    ids = torch.multinomial(
+        popularity.expand(tokens, EXPERTS), TOP_K, replacement=False, generator=gen
     )
     flat = ids.reshape(-1).to(torch.int64)
     slots = flat.numel()
@@ -80,11 +80,16 @@ def _routing(tokens: int, gen: torch.Generator):
 @pytest.mark.parametrize(
     ("n", "k", "slot_major"), [(512, 1024, False), (512, 512, True)]
 )
-@pytest.mark.parametrize("tokens", [8, 200])
-def test_triton_projection_matches_hand_kernel(n, k, slot_major, tokens):
+@pytest.mark.parametrize(("tokens", "skew"), [(8, 0.0), (200, 0.0), (120, 1.5)])
+def test_triton_projection_matches_hand_kernel(n, k, slot_major, tokens, skew):
     gen = torch.Generator(device="cuda").manual_seed(tokens + n + k)
     codes, scales, global_scales, dense = _expert_weights(n, k, gen)
-    ids, perm, gids, goff = _routing(tokens, gen)
+    ids, perm, gids, goff = _routing(tokens, gen, skew)
+    if skew:
+        # The case must reach all three row tiles (<= 16, 17-32, > 32 rows).
+        rows = torch.bincount(ids.reshape(-1), minlength=EXPERTS)
+        assert (rows <= 16).any() and ((rows > 16) & (rows <= 32)).any()
+        assert (rows > 32).any()
     rows = tokens * TOP_K if slot_major else tokens
     x = (torch.randn(rows, k, device="cuda", generator=gen) * 0.5).half()
     flat = ids.reshape(-1)
