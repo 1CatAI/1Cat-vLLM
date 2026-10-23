@@ -378,7 +378,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if self.is_producer:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens = num_scheduled_tokens + num_computed_tokens
-                assert req_id in self.chunked_prefill
+                if req_id not in self.chunked_prefill:
+                    # Producer request whose prompt was fully prefilled in
+                    # a single step (no chunking): its KV was already
+                    # registered when that prefill step was scheduled. It
+                    # has no chunked-prefill bookkeeping, and any decode
+                    # step scheduled for it on the producer (callers are
+                    # expected to stop producer requests after prefill,
+                    # e.g. max_tokens=1) must be skipped. Previously this
+                    # path crashed the engine with an AssertionError.
+                    continue
                 assert new_block_ids is not None
                 block_ids = new_block_ids[0]
                 if not resumed_from_preemption:
