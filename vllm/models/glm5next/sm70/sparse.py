@@ -256,7 +256,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 self.index_width,
             )
             logger.info_once(
-                "Sparse FP16 single-request prefill uses bounded %d-token "
+                "Sparse FP16 proven-prefill batches use bounded %d-token "
                 "batched GEMM chunks; decode retains per-token GEMM.",
                 self.fp16_gemm_workspace_tokens,
             )
@@ -451,6 +451,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             attn_metadata.num_reqs,
             attn_metadata.max_query_len,
             self.max_decode_query_len,
+            num_actual_tokens=attn_metadata.num_actual_tokens,
         ):
             chunk_tokens = min(num_tokens, self.fp16_gemm_workspace_tokens)
             out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(

@@ -178,7 +178,7 @@ def sparse_attention_fp16_gemm_chunked(
     """Bound prefill scratch space while batching the per-query GEMMs.
 
     Keep the default per-token geometry for speculative decode. The caller must
-    establish a single prefill request before selecting this batched route.
+    prove every query is prefill before selecting this batched route.
     """
     capacity = gathered_kv.shape[0]
     assert capacity > 0 and out.shape == q.shape
