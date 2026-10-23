@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     RequestOffloadState,
     SchedulerOffloadConfig,
 )
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -1637,7 +1638,7 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
     )
 
 
-def _make_scratch_scheduler(*, full_attention_only=False):
+def _make_scratch_scheduler(*, full_attention_only=False, eagle=False):
     from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
     from vllm.v1.kv_cache_interface import CircularBufferSpec
 
@@ -1680,6 +1681,9 @@ def _make_scratch_scheduler(*, full_attention_only=False):
     config.cache_config.block_size = 16
     config.cache_config.hash_block_size = None
     config.kv_transfer_config.kv_connector_extra_config = {"offload_prompt_only": False}
+    config.speculative_config = (
+        SimpleNamespace(use_eagle_kv_cache=lambda: True) if eagle else None
+    )
     spec = MockOffloadingSpec(config, kv_config)
     scheduler = OffloadingConnectorScheduler(spec)
     scheduler.manager.prepare_store.side_effect = lambda keys, ctx: (
@@ -1860,6 +1864,78 @@ def test_external_junction_is_recorded_when_sparse_group_misses():
     num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
     assert num_hit == 32
     assert req.shared_prefix_boundary == 0
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+@pytest.mark.parametrize("num_tokens", [47, 48, 49])
+def test_eagle_external_hit_ends_on_gpu_replay_boundary(eagle, num_tokens):
+    """With EAGLE/MTP, a GPU hit on an align Mamba group ends one page before
+    the last matched page, where sparse retention keeps the state. The external
+    hit must end there too, or the restored state is not reusable on the GPU
+    and every later request with this prefix reloads it from the CPU tier."""
+    scheduler, req, _ = _make_scratch_scheduler(eagle=eagle)
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(num_tokens // 4)]
+    req.num_prompt_tokens = req.num_tokens = num_tokens
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    scheduler.manager.lookup.side_effect = lambda key, ctx: True
+
+    num_hit, load_async = scheduler.get_num_new_matched_tokens(req, 0)
+
+    last_page = (num_tokens - 1) // 16 * 16
+    expected = last_page - 16 if eagle else last_page
+    assert num_hit == expected
+    assert load_async == (expected > 0)
+    assert req.shared_prefix_boundary == 0  # a complete hit is no junction
+    # The same page the GPU retains for this prompt (replay boundary).
+    if eagle:
+        boundaries = KVCacheCoordinator.get_replay_boundaries(
+            SimpleNamespace(eagle_group_ids={0}),
+            SimpleNamespace(num_tokens=num_tokens),
+            16,
+        )
+        assert expected in boundaries
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+def test_eagle_external_state_one_page_before_partial_reach(eagle):
+    """A sibling that shares only part of the stored prompt: full attention
+    reaches 48 tokens, Mamba states exist at 32 and 48. With EAGLE/MTP the GPU
+    could use only the state at 32, so the external hit ends there and no
+    junction is recorded."""
+    scheduler, req, _ = _make_scratch_scheduler(eagle=eagle)
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(20)]
+    req.num_prompt_tokens = req.num_tokens = 80
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    stored = set(state.group_states[0].offload_keys[:3])
+    stored |= set(state.group_states[1].offload_keys)
+    stored |= set(state.group_states[2].offload_keys[1:3])
+    scheduler.manager.lookup.side_effect = lambda key, ctx: key in stored
+
+    num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+
+    assert num_hit == (32 if eagle else 48)
+    assert state.external_full_attention_hit_tokens == 48
+    assert req.shared_prefix_boundary == 0
+
+
+def test_eagle_external_junction_one_page_before_reach():
+    """The junction is recorded where an EAGLE/MTP GPU hit can use its state:
+    one page before the full-attention reach (32 tokens -> 16)."""
+    scheduler, req, _ = _make_scratch_scheduler(eagle=True)
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(12)]
+    req.num_prompt_tokens = req.num_tokens = 48
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    full_keys = set(state.group_states[0].offload_keys[:2])
+    scheduler.manager.lookup.side_effect = lambda key, ctx: key in full_keys
+
+    num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+
+    assert num_hit == 0
+    assert state.external_full_attention_hit_tokens == 32
+    assert req.shared_prefix_boundary == 16
 
 
 def test_external_junction_not_recorded_without_sparse_groups():
