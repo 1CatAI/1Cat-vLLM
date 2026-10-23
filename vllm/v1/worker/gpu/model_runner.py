@@ -117,6 +117,14 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
+from vllm.v1.worker.gpu.prefill_overlap import (
+    HALF_BUILDER_IDS,
+    NUM_METADATA_BUILDERS,
+    PrefillOverlap,
+    token_range_batch,
+    token_range_model_inputs,
+    token_range_requests,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -336,6 +344,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+        self.prefill_overlap = (
+            PrefillOverlap(self.vllm_config, self.device)
+            if self.vllm_config.kernel_config.tp_prefill_overlap_min_tokens > 0
+            else None
+        )
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
 
@@ -374,6 +387,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise RuntimeError("PLE offload requires a query_start_loc source")
         if not isinstance(ngram_context_source, torch.Tensor):
             raise RuntimeError("PLE offload requires an ngram_context source")
+        if self.prefill_overlap is not None:
+            raise ValueError(
+                "kernel_config.tp_prefill_overlap_min_tokens cannot split the "
+                "PLE offload connector's per-batch rows."
+            )
         self._ple_offload_connector = PleOffloadConnector(
             self.vllm_config,
             self.model,
@@ -411,6 +429,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
                 )
+            if self.prefill_overlap is not None:
+                self.prefill_overlap.check_model(self.model)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
@@ -581,7 +601,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group.append(max_num_blocks)
 
         self.attn_groups, attn_cg_support, kernel_block_sizes = init_attn_backend(
-            self.kv_cache_config, self.vllm_config, self.device
+            self.kv_cache_config,
+            self.vllm_config,
+            self.device,
+            num_metadata_builders=(
+                NUM_METADATA_BUILDERS if self.prefill_overlap is not None else 1
+            ),
         )
         self._kernel_block_sizes = kernel_block_sizes
         self.block_tables = BlockTables(
@@ -1690,6 +1715,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         mtp_target_start = self._step_profiler.start_context(mtp_profile_ctx)
 
+        overlap_split = None
+        if self.prefill_overlap is not None and not dummy_run:
+            overlap_split = self.prefill_overlap.split_token(
+                input_batch, batch_desc.cg_mode, self.model_state
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1701,6 +1732,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+        elif overlap_split is not None:
+            assert block_tables is not None and slot_mappings is not None
+            self.kv_connector.pre_forward(scheduler_output)
+            model_output = self._run_prefill_halves(
+                input_batch,
+                model_inputs,
+                overlap_split,
+                block_tables,
+                slot_mappings,
+                skip_compiled,
+            )
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1757,6 +1799,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors
         return None
+
+    def _run_prefill_halves(
+        self,
+        input_batch: InputBatch,
+        model_inputs: dict[str, Any],
+        split_token: int,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        skip_compiled: bool,
+    ) -> Any:
+        assert self.prefill_overlap is not None
+        half_inputs = []
+        forward_contexts = []
+        bounds = ((0, split_token), (split_token, input_batch.num_tokens))
+        for ubatch_id, (start, end) in zip(HALF_BUILDER_IDS, bounds):
+            reqs = token_range_requests(input_batch.query_start_loc_np, start, end)
+            half_slot_mappings = slot_mappings[:, start:end]
+            attn_metadata = self.model_state.prepare_attn(
+                token_range_batch(input_batch, start, end),
+                CUDAGraphMode.NONE,
+                tuple(block_table[reqs] for block_table in block_tables),
+                half_slot_mappings,
+                self.attn_groups,
+                self.kv_cache_config,
+                ubatch_id=ubatch_id,
+            )
+            forward_contexts.append(
+                self.prefill_overlap.forward_context(
+                    attn_metadata,
+                    build_slot_mappings_by_layer(
+                        half_slot_mappings, self.kv_cache_config
+                    ),
+                    end - start,
+                    skip_compiled,
+                )
+            )
+            half_inputs.append(token_range_model_inputs(model_inputs, start, end))
+        return self.prefill_overlap.run(self.model, half_inputs, forward_contexts)
 
     @torch.inference_mode()
     @step_eplb_after()

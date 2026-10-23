@@ -801,6 +801,12 @@ class KernelConfig:
     host_reduce: HostReduceConfig = Field(default_factory=HostReduceConfig)
     """Two-rank host-memory all-reduce policy, resolved from peer access."""
 
+    tp_prefill_overlap_min_tokens: int = Field(default=0, ge=0)
+    """Prefill batches of at least this many tokens run as two interleaved
+    halves on a tensor-parallel engine without pipeline stages: while one half
+    all-reduces on a side stream, the other half computes. 0 keeps batches
+    whole. Every collective in the model's forward must be an all-reduce."""
+
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -1179,6 +1185,8 @@ class KernelConfig:
             "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
             # Collective transport chosen outside the compiled graph.
             "host_reduce",
+            # Micro-batch interleaving around the same compiled graph.
+            "tp_prefill_overlap_min_tokens",
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active
