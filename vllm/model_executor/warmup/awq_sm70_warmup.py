@@ -21,6 +21,9 @@ from vllm.config.sm70_moe import (
 from vllm.config.sm70_native import NATIVE_FIELDS, UNSET, capture_linear_native_config
 from vllm.config.sm70_runtime import capture_runtime_config
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
+    SM70_FP8_GROUPED_DECODE_MAX_TOKENS,
+)
 from vllm.model_executor.kernels.linear.qpn.fp8_block import _QPN8_MAX_M
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
@@ -696,25 +699,28 @@ def _warmup_fp8_dense_layers(
             calls += 1
         if getattr(layer, "sm70_fp8_bmm_grouped_decode", False):
             group_count = int(layer.sm70_fp8_bmm_groups)
-            grouped_x = torch.empty(
-                (group_count, k_dim), dtype=torch.float16, device=device
-            )
-            grouped_out = torch.empty(
-                (group_count, n_dim), dtype=torch.float16, device=device
-            )
-            native.fp8_moe_gemm_sm70_per_expert_dispatch_out(
-                grouped_out,
-                grouped_x,
-                layer.sm70_fp8_bmm_grouped_offsets,
-                layer.sm70_fp8_bmm_grouped_ptrs_w,
-                layer.sm70_fp8_bmm_grouped_ptrs_s,
-                group_count,
-                k_dim,
-                n_dim,
-                128,
-                False,
-            )
-            calls += 1
+            for tokens in m_values:
+                if tokens > SM70_FP8_GROUPED_DECODE_MAX_TOKENS:
+                    continue
+                grouped_x = torch.empty(
+                    (group_count * tokens, k_dim), dtype=torch.float16, device=device
+                )
+                grouped_out = torch.empty(
+                    (group_count * tokens, n_dim), dtype=torch.float16, device=device
+                )
+                native.fp8_moe_gemm_sm70_per_expert_dispatch_out(
+                    grouped_out,
+                    grouped_x,
+                    layer.sm70_fp8_bmm_grouped_offsets[tokens - 1],
+                    layer.sm70_fp8_bmm_grouped_ptrs_w,
+                    layer.sm70_fp8_bmm_grouped_ptrs_s,
+                    group_count,
+                    k_dim,
+                    n_dim,
+                    128,
+                    False,
+                )
+                calls += 1
     return calls
 
 

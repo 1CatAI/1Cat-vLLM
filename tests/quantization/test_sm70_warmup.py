@@ -8,6 +8,9 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
+    SM70_FP8_GROUPED_DECODE_MAX_TOKENS,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
     TurboMindFp8LinearKernel,
 )
@@ -29,6 +32,12 @@ def _grouped_fp8_layer() -> nn.Module:
         torch.empty((3, 1, 64), dtype=torch.float32), requires_grad=False
     )
     return layer
+
+
+def _grouped_offsets(groups: int) -> torch.Tensor:
+    """Row m - 1: group offsets for m tokens per group, as prepared."""
+    tokens = torch.arange(1, SM70_FP8_GROUPED_DECODE_MAX_TOKENS + 1, dtype=torch.int32)
+    return tokens[:, None] * torch.arange(groups + 1, dtype=torch.int32)[None, :]
 
 
 def test_fp8_grouped_bmm_decode_defaults_on_with_rollback(monkeypatch):
@@ -175,7 +184,7 @@ def test_fp8_warmup_includes_one_launch_grouped_decode(monkeypatch):
     layer.weight_scale_inv = nn.Parameter(
         torch.empty((2, 1, 64), dtype=torch.float16), requires_grad=False
     )
-    layer.sm70_fp8_bmm_grouped_offsets = torch.arange(3, dtype=torch.int32)
+    layer.sm70_fp8_bmm_grouped_offsets = _grouped_offsets(2)
     layer.sm70_fp8_bmm_grouped_ptrs_w = torch.empty(2, dtype=torch.int64)
     layer.sm70_fp8_bmm_grouped_ptrs_s = torch.empty(2, dtype=torch.int64)
     dense_calls = []
@@ -184,33 +193,35 @@ def test_fp8_warmup_includes_one_launch_grouped_decode(monkeypatch):
     monkeypatch.setattr(
         warmup.sm70_ops,
         "fp8_gemm_sm70_out",
-        lambda *args: dense_calls.append(args),
+        lambda *args, **kwargs: dense_calls.append(args),
     )
     monkeypatch.setattr(
         warmup.sm70_ops,
         "fp8_moe_gemm_sm70_per_expert_dispatch_out",
-        lambda *args: grouped_calls.append(args),
+        lambda *args, **kwargs: grouped_calls.append(args),
     )
+    too_many = SM70_FP8_GROUPED_DECODE_MAX_TOKENS + 1
 
-    count = warmup._warmup_fp8_dense_layers([(layer, False)], [1, 4])
+    count = warmup._warmup_fp8_dense_layers([(layer, False)], [1, 4, too_many])
 
-    assert count == 3
-    assert len(dense_calls) == 2
-    assert len(grouped_calls) == 1
-    call = grouped_calls[0]
-    assert tuple(call[0].shape) == (2, 64)
-    assert tuple(call[1].shape) == (2, 128)
-    assert call[2] is layer.sm70_fp8_bmm_grouped_offsets
-    assert call[3] is layer.sm70_fp8_bmm_grouped_ptrs_w
-    assert call[4] is layer.sm70_fp8_bmm_grouped_ptrs_s
-    assert call[5:] == (2, 128, 64, 128, False)
+    # One grouped launch per decode size it serves; the dense shapes as before.
+    assert count == 3 + 2
+    assert len(dense_calls) == 3
+    assert len(grouped_calls) == 2
+    for call, tokens in zip(grouped_calls, (1, 4)):
+        assert tuple(call[0].shape) == (2 * tokens, 64)
+        assert tuple(call[1].shape) == (2 * tokens, 128)
+        assert call[2].tolist() == [0, tokens, 2 * tokens]
+        assert call[3] is layer.sm70_fp8_bmm_grouped_ptrs_w
+        assert call[4] is layer.sm70_fp8_bmm_grouped_ptrs_s
+        assert call[5:] == (2, 128, 64, 128, False)
 
 
 def test_fp8_grouped_bmm_decode_uses_one_dispatch(monkeypatch):
     layer = _grouped_fp8_layer()
     layer.sm70_fp8_bmm_groups = 2
     layer.sm70_fp8_bmm_grouped_decode = True
-    layer.sm70_fp8_bmm_grouped_offsets = torch.arange(3, dtype=torch.int32)
+    layer.sm70_fp8_bmm_grouped_offsets = _grouped_offsets(2)
     layer.sm70_fp8_bmm_grouped_ptrs_w = torch.empty(2, dtype=torch.int64)
     layer.sm70_fp8_bmm_grouped_ptrs_s = torch.empty(2, dtype=torch.int64)
     layer.output_size_per_partition = 128
@@ -233,28 +244,29 @@ def test_fp8_grouped_bmm_decode_uses_one_dispatch(monkeypatch):
         "fp8_gemm_sm70_out",
         fail_dense,
     )
-    x = torch.empty((1, 2, 128), dtype=torch.float16)
-
     kernel = object.__new__(TurboMindFp8LinearKernel)
     kernel.native_ops = warmup.sm70_ops
-    out = kernel.apply_weights(layer, x)
+    # Decode (one token) and speculative verification (six tokens per group).
+    for tokens in (1, 6):
+        calls.clear()
+        x = torch.empty((tokens, 2, 128), dtype=torch.float16)
+        out = kernel.apply_weights(layer, x)
 
-    assert tuple(out.shape) == (1, 2, 64)
-    assert len(calls) == 1
-    grouped_out, grouped_x, args = calls[0]
-    assert tuple(grouped_out.shape) == (2, 64)
-    assert tuple(grouped_x.shape) == (2, 128)
-    assert args[0] is layer.sm70_fp8_bmm_grouped_offsets
-    assert args[1] is layer.sm70_fp8_bmm_grouped_ptrs_w
-    assert args[2] is layer.sm70_fp8_bmm_grouped_ptrs_s
-    assert args[3:] == (2, 128, 64, 128, False)
-    torch.testing.assert_close(
-        out,
-        torch.arange(128, dtype=torch.float16).reshape(1, 2, 64),
-    )
+        assert tuple(out.shape) == (tokens, 2, 64)
+        assert len(calls) == 1
+        grouped_out, grouped_x, args = calls[0]
+        assert tuple(grouped_out.shape) == (2 * tokens, 64)
+        assert tuple(grouped_x.shape) == (2 * tokens, 128)
+        assert args[0].tolist() == [0, tokens, 2 * tokens]
+        assert args[1] is layer.sm70_fp8_bmm_grouped_ptrs_w
+        assert args[2] is layer.sm70_fp8_bmm_grouped_ptrs_s
+        assert args[3:] == (2, 128, 64, 128, False)
+        # Rows come back group-major: [group][token] -> [token][group].
+        expected = torch.arange(2 * tokens * 64, dtype=torch.float16)
+        torch.testing.assert_close(out, expected.reshape(2, tokens, 64).transpose(0, 1))
 
 
-def test_fp8_grouped_bmm_decode_retains_multirow_fallback(monkeypatch):
+def test_fp8_grouped_bmm_decode_loops_above_its_token_bound(monkeypatch):
     layer = _grouped_fp8_layer()
     layer.sm70_fp8_bmm_groups = 2
     layer.sm70_fp8_bmm_grouped_decode = True
@@ -266,7 +278,7 @@ def test_fp8_grouped_bmm_decode_retains_multirow_fallback(monkeypatch):
         out.zero_()
 
     def fail_grouped(*args):
-        raise AssertionError("grouped decode must remain batch-one only")
+        raise AssertionError("grouped decode beyond its token bound")
 
     monkeypatch.setattr(warmup.sm70_ops, "fp8_gemm_sm70_out", dense)
     monkeypatch.setattr(
@@ -274,16 +286,17 @@ def test_fp8_grouped_bmm_decode_retains_multirow_fallback(monkeypatch):
         "fp8_moe_gemm_sm70_per_expert_dispatch_out",
         fail_grouped,
     )
-    x = torch.empty((2, 2, 128), dtype=torch.float16)
+    tokens = SM70_FP8_GROUPED_DECODE_MAX_TOKENS + 1
+    x = torch.empty((tokens, 2, 128), dtype=torch.float16)
 
     kernel = object.__new__(TurboMindFp8LinearKernel)
     kernel.native_ops = warmup.sm70_ops
     out = kernel.apply_weights(layer, x)
 
-    assert tuple(out.shape) == (2, 2, 64)
+    assert tuple(out.shape) == (tokens, 2, 64)
     assert [call[:2] for call in dense_calls] == [
-        ((2, 64), (2, 128)),
-        ((2, 64), (2, 128)),
+        ((tokens, 64), (tokens, 128)),
+        ((tokens, 64), (tokens, 128)),
     ]
 
 
