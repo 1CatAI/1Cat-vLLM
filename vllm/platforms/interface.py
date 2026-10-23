@@ -577,6 +577,7 @@ class Platform:
         from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
         from vllm.v1.attention.backend import MultipleOf
         from vllm.v1.kv_cache_interface import (
+            AttentionSpec,
             FullAttentionSpec,
             MambaSpec,
             MLAAttentionSpec,
@@ -594,16 +595,20 @@ class Platform:
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
-        # Compute attention page size for 1 token
+        # A one-token page is only an estimate for selecting a block. Padding
+        # and separate scale regions need not grow linearly with token count.
+        attention_page_specs: list[AttentionSpec]
         if model_config.use_mla:
-            attn_page_size_1_token = MLAAttentionSpec(
-                block_size=1,
-                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                head_size=model_config.get_head_size(),
-                dtype=kv_cache_dtype,
-                cache_dtype_str=cache_config.cache_dtype,
-                kv_quant_mode=kv_quant_mode,
-            ).page_size_bytes
+            attention_page_specs = [
+                MLAAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=kv_cache_dtype,
+                    cache_dtype_str=cache_config.cache_dtype,
+                    kv_quant_mode=kv_quant_mode,
+                )
+            ]
         elif cache_config.cache_dtype.startswith("turboquant_"):
             # TQ has a packed K|V layout; the standard FullAttentionSpec
             # formula over-sizes it and trips unify_kv_cache_spec_page_size
@@ -618,7 +623,7 @@ class Platform:
             tq_cfg = TurboQuantConfig.from_cache_dtype(
                 cache_config.cache_dtype, model_config.get_head_size()
             )
-            tq_page = TQFullAttentionSpec(
+            tq_spec = TQFullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
@@ -626,28 +631,39 @@ class Platform:
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
                 tq_slot_size=tq_cfg.slot_size_aligned,
-            ).page_size_bytes
+            )
+            attention_page_specs = [tq_spec]
             if cache_config.kv_cache_dtype_skip_layers:
-                skip_page = FullAttentionSpec(
+                skip_spec = FullAttentionSpec(
                     block_size=1,
                     num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                     head_size=model_config.get_head_size(),
                     dtype=model_config.dtype,
-                ).page_size_bytes
+                )
                 # lcm, not max: skip_page is often not a multiple of
                 # tq_page, so max would leave per-layer page sizes
                 # un-unifiable downstream.
-                attn_page_size_1_token = lcm(tq_page, skip_page)
-            else:
-                attn_page_size_1_token = tq_page
+                attention_page_specs.append(skip_spec)
         else:
-            attn_page_size_1_token = FullAttentionSpec(
-                block_size=1,
-                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                head_size=model_config.get_head_size(),
-                dtype=kv_cache_dtype,
-                kv_quant_mode=kv_quant_mode,
-            ).page_size_bytes
+            attention_page_specs = [
+                FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=kv_cache_dtype,
+                    kv_quant_mode=kv_quant_mode,
+                )
+            ]
+
+        def attention_page_bytes(block_tokens: int) -> int:
+            return lcm(
+                *(
+                    spec.copy_with_new_block_size(block_tokens).page_size_bytes
+                    for spec in attention_page_specs
+                )
+            )
+
+        attn_page_size_1_token = attention_page_bytes(1)
 
         # Compute mamba page size
         model_cls, _ = ModelRegistry.resolve_model_cls(
@@ -706,6 +722,7 @@ class Platform:
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
             attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
             cache_config.mamba_block_size = attn_block_size
+            block_step = chunk_size
         else:
             # Without prefix caching, use minimum block size that satisfies
             # both backend alignment and mamba page size compatibility
@@ -716,6 +733,11 @@ class Platform:
             indexer_align = cls._get_indexer_block_alignment(vllm_config)
             if indexer_align:
                 attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
+            block_step = lcm(kernel_block_alignment_size, indexer_align or 1)
+        while attention_page_bytes(attn_block_size) < mamba_page_size:
+            attn_block_size += block_step
+        if cache_config.mamba_cache_mode == "all":
+            cache_config.mamba_block_size = attn_block_size
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size
@@ -742,7 +764,7 @@ class Platform:
                 cache_config.mamba_block_size = cache_config.block_size
 
         # Pad mamba page size to exactly match attention page size
-        attn_page_size = cache_config.block_size * attn_page_size_1_token
+        attn_page_size = attention_page_bytes(cache_config.block_size)
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
