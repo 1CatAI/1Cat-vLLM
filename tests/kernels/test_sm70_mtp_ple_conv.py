@@ -24,6 +24,7 @@ def test_changed_metadata_and_successive_state(
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     layer.conv_state_len = 9
+    layer.conv_kernel_size = 4
     layer.short_conv_dilation = 3
     shape = (3, 13, 10240) if time_major else (3, 10240, 13)
     initial = torch.randn(shape, device="cuda", dtype=state_dtype)

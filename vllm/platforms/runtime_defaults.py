@@ -677,15 +677,14 @@ def apply_runtime_policy_defaults(self):
                     "DFlash2 release contract. Remove this override to reuse "
                     "compiled graph caches without AOT FX-graph reload."
                 )
-            inductor = self.compilation_config.inductor_compile_config
-            inductor["combo_kernels"] = True
-            # An explicit benchmark_combo_kernel=False is kept: its trial
-            # tensors can exceed the free memory left on 16 GiB devices.
-            inductor.setdefault("benchmark_combo_kernel", True)
+            inductor_config = self.compilation_config.inductor_compile_config
+            inductor_config.setdefault("combo_kernels", True)
+            inductor_config.setdefault("benchmark_combo_kernel", True)
             logger.info_once(
-                "Using combo_kernels=True and benchmark_combo_kernel=%s "
-                "for SM70 Flash-V100 0.0.3 compile graph quality parity.",
-                inductor["benchmark_combo_kernel"],
+                "Using combo_kernels=%s and benchmark_combo_kernel=%s "
+                "for SM70 Flash-V100 0.0.3 compile graphs.",
+                inductor_config["combo_kernels"],
+                inductor_config["benchmark_combo_kernel"],
             )
             logger.info_once(
                 "Using SM70 Flash-V100 0.0.3 compile CUDA graph policy: "

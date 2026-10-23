@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.layers import sm70_draft47 as draft_ops
 from vllm.models.qwen4_exp.nvidia import sm70_mtp_head as head_ops
 
 
@@ -115,9 +116,10 @@ def test_older_extension_does_not_attempt_parallel_packet(monkeypatch):
     assert view.maybe_get_sm70_lm_head_top1_pair(hidden) is None
 
 
+@pytest.mark.parametrize("d1a_enabled", [False, True])
 @pytest.mark.parametrize("use_custom_ipc", [False, True])
 def test_parallel_packet_reuses_compact_transport_without_recomputing_logits(
-    monkeypatch, use_custom_ipc
+    monkeypatch, use_custom_ipc, d1a_enabled
 ):
     from unittest.mock import Mock
 
@@ -125,6 +127,12 @@ def test_parallel_packet_reuses_compact_transport_without_recomputing_logits(
 
     monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(module, "_maybe_sync_top1_all_gather", lambda *args: None)
+    monkeypatch.setattr(draft_ops, "enabled", lambda _: d1a_enabled)
+    monkeypatch.setattr(
+        draft_ops,
+        "top_tokens",
+        Mock(side_effect=AssertionError("upstream first")),
+    )
     packet = torch.tensor([[4.0, 102.0], [2.0, 100.0]])
     ids = torch.tensor([102, 100])
     head = SimpleNamespace(
@@ -171,4 +179,77 @@ def test_parallel_packet_preserves_logit_transform_fallback(monkeypatch, scale, 
     proc._maybe_custom_top1_argmax = lambda pair: None
     proc._maybe_dump_top_token_margin = lambda *args: None
     assert proc.get_top_tokens(head, torch.zeros(1, 2560)).tolist() == [102]
+    head.maybe_get_sm70_lm_head_top1_pair.assert_not_called()
+
+
+def test_local_top1_precedes_d1a_full_logits_fallback(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.model_executor.layers import logits_processor as module
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(module, "_maybe_sync_top1_all_gather", lambda *args: None)
+    monkeypatch.setattr(draft_ops, "enabled", lambda _: True)
+    monkeypatch.setattr(
+        draft_ops,
+        "top_tokens",
+        Mock(side_effect=AssertionError("upstream first")),
+    )
+    monkeypatch.setattr(
+        module,
+        "tensor_model_parallel_all_gather",
+        lambda pair, dim: torch.cat([pair] * 4, dim=dim),
+    )
+    head = SimpleNamespace(
+        maybe_get_sm70_lm_head_top1_pair=Mock(return_value=None),
+        maybe_get_sm70_lm_head_top1=Mock(
+            return_value=(torch.tensor([4.0]), torch.tensor([102]))
+        ),
+        quant_method=SimpleNamespace(
+            apply=Mock(side_effect=AssertionError("duplicate projection"))
+        ),
+    )
+    proc = module.LogitsProcessor(256)
+    proc._maybe_custom_top1_argmax = lambda pair: None
+    proc._maybe_dump_top_token_margin = lambda *args: None
+    assert proc.get_top_tokens(head, torch.zeros(1, 2560)).tolist() == [102]
+    head.quant_method.apply.assert_not_called()
+
+
+@pytest.mark.parametrize("fused_result", [None, [102]])
+def test_d1a_only_receives_transformed_full_logits(monkeypatch, fused_result):
+    from unittest.mock import Mock
+
+    from vllm.model_executor.layers import logits_processor as module
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(module, "_maybe_sync_top1_all_gather", lambda *args: None)
+    monkeypatch.setattr(draft_ops, "enabled", lambda _: True)
+    fallback = Mock(
+        return_value=None if fused_result is None else torch.tensor(fused_result)
+    )
+    monkeypatch.setattr(draft_ops, "top_tokens", fallback)
+    monkeypatch.setattr(
+        module,
+        "tensor_model_parallel_all_gather",
+        lambda pair, dim: torch.cat([pair] * 4, dim=dim),
+    )
+    head = SimpleNamespace(
+        maybe_get_sm70_lm_head_top1_pair=Mock(),
+        maybe_get_sm70_lm_head_top1=Mock(return_value=None),
+        quant_method=SimpleNamespace(
+            apply=lambda *args, **kwargs: torch.tensor([[0.0, 1.0, 3.0]])
+        ),
+        shard_indices=SimpleNamespace(
+            num_org_vocab_padding=0, org_vocab_start_index=100
+        ),
+    )
+    proc = module.LogitsProcessor(256, scale=2.0)
+    proc._maybe_custom_top1_argmax = lambda pair: None
+    proc._maybe_dump_top_token_margin = lambda *args: None
+    assert proc.get_top_tokens(head, torch.zeros(1, 2560)).tolist() == [102]
+    torch.testing.assert_close(
+        fallback.call_args.args[0], torch.tensor([[0.0, 2.0, 6.0]])
+    )
+    assert fallback.call_args.args[1:] == (100, 4)
     head.maybe_get_sm70_lm_head_top1_pair.assert_not_called()

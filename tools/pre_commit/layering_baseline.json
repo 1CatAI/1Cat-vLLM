@@ -191,7 +191,6 @@
   "platform": 1
  },
  "vllm/model_executor/layers/fused_moe/fused_moe.py": {
-  "model": 1,
   "platform": 25
  },
  "vllm/model_executor/layers/fused_moe/modular_kernel.py": {
@@ -543,8 +542,7 @@
   "model": 6
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/speculator.py": {
-  "model": 1,
-  "platform": 11
+  "platform": 3
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": {
   "platform": 1

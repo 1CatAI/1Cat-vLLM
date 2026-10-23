@@ -18,7 +18,13 @@ if model_type == "qwen38":
     assert counts["model"] == 2
     assert counts["platform"] == 2
     assert python_references(source) == [
-        dict(name="VLLM_SM70_QWEN38_FP16_GEMV", line=3, kind="registered", scope="")
+        dict(
+            name="VLLM_SM70_QWEN38_FP16_GEMV",
+            line=3,
+            kind="registered",
+            scope="",
+            reader_expression="envs.VLLM_SM70_QWEN38_FP16_GEMV",
+        )
     ]
     # An actual getter in a table must still be counted.
     counts = measure("vllm/generic.py", 'aliases = {"x": os.getenv("VLLM_SM70_X")}')

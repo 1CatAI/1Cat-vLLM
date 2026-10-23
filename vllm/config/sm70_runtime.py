@@ -202,6 +202,7 @@ class RuntimeTraceConfig:
         "gdn_mixed_compare": "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE",
         "sync_before_compile": "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD",
         "spec_target_nvtx": "VLLM_SM70_SPEC_TARGET_FORWARD_NVTX",
+        "cg_dispatch": "VLLM_SM70_CG_DISPATCH_DEBUG",
         "tp_allreduce": "VLLM_TP_ALLREDUCE_TRACE",
         "dense_debug": "VLLM_SM70_F16_DENSE_DEBUG",
         "qwen_next_trace": "VLLM_QWEN3_NEXT_SM70_TRACE",
@@ -252,6 +253,8 @@ class RuntimeTraceConfig:
     """Existing opt-in synchronization before graph forwarding."""
     spec_target_nvtx: bool | None = None
     """Existing speculative target-forward NVTX diagnostic."""
+    cg_dispatch: bool | None = None
+    """Bounded runner graph-dispatch diagnostics; no computation changes."""
 
     tp_allreduce: bool | None = None
     """Explain each collective route once per owning communicator or layer."""
@@ -347,6 +350,7 @@ class RuntimeTraceConfig:
                             "gdn_mixed_compare",
                             "mtp_load",
                             "mtp_load_verbose",
+                            "cg_dispatch",
                         )
                         if self.layer_aliases[field] == name
                     ),
