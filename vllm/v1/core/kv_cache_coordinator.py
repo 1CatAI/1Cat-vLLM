@@ -122,14 +122,16 @@ class KVCacheCoordinator(ABC):
 
         Adapted from upstream #53945/#54713. Use the current request length so
         resumed output-token prefills follow 1Cat's existing scheduler behavior.
+        Positions are aligned: the scheduler ends prefill chunks at them, and a
+        raw ``num_tokens - 1`` would split every prompt one token before its end.
         """
+        resend = (request.num_tokens - 1) // alignment * alignment
+        extension = request.num_tokens // alignment * alignment
         if not self.eagle_group_ids:
             # At an exact boundary, retain the completed extension block now.
             # Once the cache horizon advances, the next decode token cannot
             # retroactively admit it. The preceding boundary serves a resend.
-            return (request.num_tokens - 1, request.num_tokens)
-        resend = (request.num_tokens - 1) // alignment * alignment
-        extension = request.num_tokens // alignment * alignment
+            return tuple(sorted({resend, extension}))
         return tuple(
             sorted({max(resend - alignment, 0), max(extension - alignment, 0)})
         )
