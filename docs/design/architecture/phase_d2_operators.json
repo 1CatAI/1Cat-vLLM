@@ -1,0 +1,309 @@
+{
+  "baseline": "5dc280bb7f073f76c514a4696c5f434a0080c156",
+  "candidate": "e9434be7acba7c6f07777458e6f46be33f2cfdc6",
+  "contract": "54633 GPU 2; V100-SXM2-32GB; Torch 2.10.0+cu128; CUDA 12.8; driver 580.173.02; TP1; no models; norm FP16 M=12/24 N=128, seed911; CPU stochastic proposal M=1 vocab4096 seed51; 3 alternating rounds, medians of 9 samples; graph GPU timing 64 repeated norm calls x100 replays; host timing 100 eager calls; task-owned caches; same unmodified normal native libraries for both Python source lanes",
+  "normal_C_sha256": "46d5abe030c305419894cb6954b82064ab3bf6423b3a99e5c3705feac5951954",
+  "post_archive_delta": "Only input-core disabled-getter short-circuit, its CPU tests, layering ledger and docs changed after operator source freeze; affected numerical providers, schemas and execution consumers match the candidate commit. Final short-circuit/hash cases passed on CPU.",
+  "runs": [
+    {
+      "lane": "baseline",
+      "round": "1",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "rows": [
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": false,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.5744000673294067,
+          "host_enqueue_us": 153.45436999999998,
+          "peak_extra_bytes": 3584
+        },
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": true,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.3859200477600098,
+          "host_enqueue_us": 72.22267,
+          "peak_extra_bytes": 3072
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": false,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5825599431991577,
+          "host_enqueue_us": 149.33551,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": true,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5988799929618835,
+          "host_enqueue_us": 161.98057999999997,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "proposal_cpu",
+          "host_us": 175.60595,
+          "sha256": "f032c06c0a63fbc5a4619a62e43488050a5264ef74ed8152ea20262900116cb2"
+        }
+      ]
+    },
+    {
+      "lane": "baseline",
+      "round": "2",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "rows": [
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": false,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.5760000050067902,
+          "host_enqueue_us": 157.10398999999998,
+          "peak_extra_bytes": 3584
+        },
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": true,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.39055997133255,
+          "host_enqueue_us": 72.17986,
+          "peak_extra_bytes": 3072
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": false,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5748800337314606,
+          "host_enqueue_us": 158.4075,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": true,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5961599349975586,
+          "host_enqueue_us": 165.60853,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "proposal_cpu",
+          "host_us": 185.95977,
+          "sha256": "f032c06c0a63fbc5a4619a62e43488050a5264ef74ed8152ea20262900116cb2"
+        }
+      ]
+    },
+    {
+      "lane": "baseline",
+      "round": "3",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "rows": [
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": false,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.571359932422638,
+          "host_enqueue_us": 148.33863,
+          "peak_extra_bytes": 3584
+        },
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": true,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.3857600092887878,
+          "host_enqueue_us": 70.76606,
+          "peak_extra_bytes": 3072
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": false,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5771199762821198,
+          "host_enqueue_us": 151.86823,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": true,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5955199301242828,
+          "host_enqueue_us": 160.31270999999998,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "proposal_cpu",
+          "host_us": 180.57082,
+          "sha256": "f032c06c0a63fbc5a4619a62e43488050a5264ef74ed8152ea20262900116cb2"
+        }
+      ]
+    },
+    {
+      "lane": "candidate",
+      "round": "1",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "rows": [
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": false,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.5688000619411469,
+          "host_enqueue_us": 153.91989,
+          "peak_extra_bytes": 3584
+        },
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": true,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.3859200477600098,
+          "host_enqueue_us": 66.73581,
+          "peak_extra_bytes": 3072
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": false,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5833599865436554,
+          "host_enqueue_us": 154.10351,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": true,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5990400314331055,
+          "host_enqueue_us": 160.3855,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "proposal_cpu",
+          "host_us": 172.896,
+          "sha256": "f032c06c0a63fbc5a4619a62e43488050a5264ef74ed8152ea20262900116cb2"
+        }
+      ]
+    },
+    {
+      "lane": "candidate",
+      "round": "2",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "rows": [
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": false,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.5675200521945953,
+          "host_enqueue_us": 143.64747,
+          "peak_extra_bytes": 3584
+        },
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": true,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.3846400380134583,
+          "host_enqueue_us": 64.58218,
+          "peak_extra_bytes": 3072
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": false,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.5827199816703796,
+          "host_enqueue_us": 143.98984,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": true,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.6040000319480896,
+          "host_enqueue_us": 152.42372,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "proposal_cpu",
+          "host_us": 180.74601,
+          "sha256": "f032c06c0a63fbc5a4619a62e43488050a5264ef74ed8152ea20262900116cb2"
+        }
+      ]
+    },
+    {
+      "lane": "candidate",
+      "round": "3",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "rows": [
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": false,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.5668800473213196,
+          "host_enqueue_us": 140.88217,
+          "peak_extra_bytes": 3584
+        },
+        {
+          "kind": "norm",
+          "rows": 12,
+          "onepass": true,
+          "sha256": "faaafd1d7b34d3d77daef7e2c6925ed6cba6a4bcbdd61319da6a7bec1e850c2a",
+          "gpu_us": 1.3814400136470795,
+          "host_enqueue_us": 58.84982,
+          "peak_extra_bytes": 3072
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": false,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.581760048866272,
+          "host_enqueue_us": 142.73665,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "norm",
+          "rows": 24,
+          "onepass": true,
+          "sha256": "9755f7f16b8ec77855e4105814ce296e9b73f03eb3d1a0b8ffff1485ef36a5eb",
+          "gpu_us": 1.600320041179657,
+          "host_enqueue_us": 149.28382000000002,
+          "peak_extra_bytes": 6656
+        },
+        {
+          "kind": "proposal_cpu",
+          "host_us": 165.7885,
+          "sha256": "f032c06c0a63fbc5a4619a62e43488050a5264ef74ed8152ea20262900116cb2"
+        }
+      ]
+    }
+  ]
+}

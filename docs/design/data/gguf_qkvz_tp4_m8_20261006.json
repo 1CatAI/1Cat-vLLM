@@ -1,0 +1,4804 @@
+{
+  "model": "Qwen3.8-27B GSQ-RCO IQ3_S",
+  "source": "b9cd0d55a9517281397b62389d9ac6c2927cc11e",
+  "cuda": "12.8",
+  "torch": "2.10.0+cu128",
+  "gpu": "V100-SXM2-32GB",
+  "tp_size": 4,
+  "rank": 0,
+  "clock_mhz": 1290,
+  "memory_clock_mhz": 877,
+  "power_w": 300,
+  "cold_l2_bytes": 16777216,
+  "samples_per_arm": 84,
+  "cases": [
+    {
+      "layer": 1,
+      "source_types": [
+        21,
+        21,
+        21,
+        18,
+        30,
+        30
+      ],
+      "operator_types": [
+        21,
+        21,
+        21,
+        18,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 8888320,
+      "loaded_candidate_bytes": 9297920,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00031751865753903985,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.00031937670428305864,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0003225137770641595,
+          "max_abs": 0.001953125
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 76.80000364780426,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 39.93599861860275,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 39.93599861860275,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 76.80000364780426,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 5,
+      "loaded_candidate_gbps": [
+        232.8205208738388,
+        232.8205208738388
+      ]
+    },
+    {
+      "layer": 0,
+      "source_types": [
+        23,
+        23,
+        23,
+        23,
+        30,
+        30
+      ],
+      "operator_types": [
+        23,
+        23,
+        23,
+        23,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 11386880,
+      "loaded_candidate_bytes": 11796480,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.000319232844049111,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0003250054724048823,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.00031922737252898514,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 51.19999870657921,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 45.05600035190582,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 45.05600035190582,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 48.128001391887665,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 4,
+      "loaded_candidate_gbps": [
+        261.81817977327455,
+        261.81817977327455
+      ]
+    },
+    {
+      "layer": 9,
+      "source_types": [
+        21,
+        21,
+        21,
+        10,
+        30,
+        30
+      ],
+      "operator_types": [
+        21,
+        21,
+        21,
+        102,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 8458240,
+      "loaded_candidate_bytes": 10219520,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.0004523923562373966,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0004482348740566522,
+          "max_abs": 0.00244140625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0004413420974742621,
+          "max_abs": 0.0029296875
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 73.72800260782242,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 38.91199827194214,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 38.91199827194214,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 73.72800260782242,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        262.631590610675,
+        262.631590610675
+      ]
+    },
+    {
+      "layer": 20,
+      "source_types": [
+        18,
+        18,
+        18,
+        12,
+        30,
+        30
+      ],
+      "operator_types": [
+        18,
+        18,
+        18,
+        104,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 9687040,
+      "loaded_candidate_bytes": 10588160,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.000512325728777796,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0005200169398449361,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0005101115093566477,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 66.56000018119812,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 41.98399931192398,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 41.98399931192398,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 66.56000018119812,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        252.1951260844469,
+        252.1951260844469
+      ]
+    },
+    {
+      "layer": 2,
+      "source_types": [
+        18,
+        18,
+        18,
+        21,
+        30,
+        30
+      ],
+      "operator_types": [
+        18,
+        18,
+        18,
+        21,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 8642560,
+      "loaded_candidate_bytes": 9052160,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.0003165361995343119,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0003186549583915621,
+          "max_abs": 0.001953125
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.00032008098787628114,
+          "max_abs": 0.001953125
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 76.80000364780426,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 40.95999896526337,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 40.95999896526337,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 76.80000364780426,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 5,
+      "loaded_candidate_gbps": [
+        221.00000558292973,
+        221.00000558292973
+      ]
+    },
+    {
+      "layer": 5,
+      "source_types": [
+        21,
+        21,
+        21,
+        21,
+        30,
+        30
+      ],
+      "operator_types": [
+        21,
+        21,
+        21,
+        21,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 9256960,
+      "loaded_candidate_bytes": 9666560,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00031519404728896916,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0003220259677618742,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0003217459307052195,
+          "max_abs": 0.001953125
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 51.19999870657921,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 39.93599861860275,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 39.93599861860275,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 51.19999870657921,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 8,
+      "loaded_candidate_gbps": [
+        242.0512904239029,
+        242.0512904239029
+      ]
+    },
+    {
+      "layer": 10,
+      "source_types": [
+        18,
+        18,
+        18,
+        10,
+        30,
+        30
+      ],
+      "operator_types": [
+        18,
+        18,
+        18,
+        102,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 7843840,
+      "loaded_candidate_bytes": 9605120,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00044185874867253006,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0004459895135369152,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0004405916843097657,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 72.7040022611618,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 41.98399931192398,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 41.98399931192398,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 72.7040022611618,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 3,
+      "loaded_candidate_gbps": [
+        228.78049155436284,
+        228.78049155436284
+      ]
+    },
+    {
+      "layer": 14,
+      "source_types": [
+        17,
+        17,
+        17,
+        18,
+        30,
+        30
+      ],
+      "operator_types": [
+        17,
+        17,
+        17,
+        18,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 7045120,
+      "loaded_candidate_bytes": 7454720,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00031910426332615316,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.000324121443554759,
+          "max_abs": 0.001953125
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.00031848932849243283,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 77.82399654388428,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 39.93599861860275,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 39.93599861860275,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 77.82399654388428,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        186.66667312351836,
+        186.66667312351836
+      ]
+    },
+    {
+      "layer": 16,
+      "source_types": [
+        18,
+        18,
+        18,
+        23,
+        30,
+        30
+      ],
+      "operator_types": [
+        18,
+        18,
+        18,
+        23,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 9441280,
+      "loaded_candidate_bytes": 9850880,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.0003238686767872423,
+          "max_abs": 0.001953125
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.00032161211129277945,
+          "max_abs": 0.001953125
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.00032114682835526764,
+          "max_abs": 0.001953125
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 73.72800260782242,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 43.007999658584595,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 43.007999658584595,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 73.72800260782242,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 2,
+      "loaded_candidate_gbps": [
+        229.0476208658944,
+        229.0476208658944
+      ]
+    },
+    {
+      "layer": 17,
+      "source_types": [
+        21,
+        21,
+        21,
+        22,
+        30,
+        30
+      ],
+      "operator_types": [
+        21,
+        21,
+        21,
+        22,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 8396800,
+      "loaded_candidate_bytes": 8806400,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00031428103102371097,
+          "max_abs": 0.001953125
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0003195114550180733,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.00032115651993080974,
+          "max_abs": 0.001953125
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 81.91999793052673,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 43.007999658584595,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 43.007999658584595,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 81.91999793052673,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        204.76190638739,
+        204.76190638739
+      ]
+    },
+    {
+      "layer": 18,
+      "source_types": [
+        10,
+        10,
+        10,
+        18,
+        30,
+        30
+      ],
+      "operator_types": [
+        102,
+        102,
+        102,
+        18,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 7557120,
+      "loaded_candidate_bytes": 10219520,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.000514959916472435,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0005148669588379562,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0005122360889799893,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 72.7040022611618,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 40.95999896526337,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 40.95999896526337,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 72.7040022611618,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        249.5000063029003,
+        249.5000063029003
+      ]
+    },
+    {
+      "layer": 21,
+      "source_types": [
+        21,
+        21,
+        21,
+        23,
+        30,
+        30
+      ],
+      "operator_types": [
+        21,
+        21,
+        21,
+        23,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 10055680,
+      "loaded_candidate_bytes": 10465280,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.0003238157951273024,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.00031903039780445397,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0003199414350092411,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 73.72800260782242,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 43.007999658584595,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 43.007999658584595,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 73.72800260782242,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 5,
+      "loaded_candidate_gbps": [
+        243.33333526501465,
+        243.33333526501465
+      ]
+    },
+    {
+      "layer": 29,
+      "source_types": [
+        18,
+        18,
+        18,
+        18,
+        30,
+        30
+      ],
+      "operator_types": [
+        18,
+        18,
+        18,
+        18,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 8273920,
+      "loaded_candidate_bytes": 8683520,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00032054021721705794,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0003246641717851162,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0003207353875041008,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 50.175998359918594,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 41.98399931192398,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 41.98399931192398,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 50.175998359918594,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        206.82927168240906,
+        206.82927168240906
+      ]
+    },
+    {
+      "layer": 32,
+      "source_types": [
+        23,
+        23,
+        23,
+        21,
+        30,
+        30
+      ],
+      "operator_types": [
+        23,
+        23,
+        23,
+        21,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 10588160,
+      "loaded_candidate_bytes": 10997760,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.0003185670357197523,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0003179465711582452,
+          "max_abs": 0.001953125
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.00032299745362251997,
+          "max_abs": 0.001953125
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 75.77600330114365,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 44.03200000524521,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 44.03200000524521,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 75.77600330114365,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 4,
+      "loaded_candidate_gbps": [
+        249.76744183071216,
+        249.76744183071216
+      ]
+    },
+    {
+      "layer": 37,
+      "source_types": [
+        21,
+        21,
+        21,
+        12,
+        30,
+        30
+      ],
+      "operator_types": [
+        21,
+        21,
+        21,
+        104,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 10301440,
+      "loaded_candidate_bytes": 11202560,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.0005151565419510007,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0005323068471625447,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0005101634305901825,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 67.58400052785873,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 39.93599861860275,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 39.93599861860275,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 67.58400052785873,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 2,
+      "loaded_candidate_gbps": [
+        280.51283021583663,
+        280.51283021583663
+      ]
+    },
+    {
+      "layer": 42,
+      "source_types": [
+        23,
+        23,
+        23,
+        18,
+        30,
+        30
+      ],
+      "operator_types": [
+        23,
+        23,
+        23,
+        18,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 10219520,
+      "loaded_candidate_bytes": 10629120,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00032262984314002097,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0003218488418497145,
+          "max_abs": 0.001953125
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0003215864999219775,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 74.75200295448303,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 44.03200000524521,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 44.03200000524521,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 74.75200295448303,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        241.39534880845366,
+        241.39534880845366
+      ]
+    },
+    {
+      "layer": 48,
+      "source_types": [
+        18,
+        18,
+        18,
+        22,
+        30,
+        30
+      ],
+      "operator_types": [
+        18,
+        18,
+        18,
+        22,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 7782400,
+      "loaded_candidate_bytes": 8192000,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00032093044137582183,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.00031516814487986267,
+          "max_abs": 0.001953125
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.000320741964969784,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 80.89599758386612,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 40.95999896526337,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 40.95999896526337,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 80.89599758386612,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        200.00000505242508,
+        200.00000505242508
+      ]
+    },
+    {
+      "layer": 49,
+      "source_types": [
+        12,
+        12,
+        12,
+        21,
+        30,
+        30
+      ],
+      "operator_types": [
+        104,
+        104,
+        104,
+        21,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 10997760,
+      "loaded_candidate_bytes": 12226560,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.0006546646472997963,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.0006697744247503579,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0006459740689024329,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 69.63200122117996,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 41.98399931192398,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 40.95999896526337,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 69.63200122117996,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        291.2195169679203,
+        298.50000754074443
+      ]
+    },
+    {
+      "layer": 58,
+      "source_types": [
+        16,
+        16,
+        16,
+        23,
+        30,
+        30
+      ],
+      "operator_types": [
+        16,
+        16,
+        16,
+        23,
+        1
+      ],
+      "m": 8,
+      "n": 4120,
+      "k": 5120,
+      "source_bytes": 7802880,
+      "loaded_candidate_bytes": 8212480,
+      "checks": [
+        {
+          "seed": 131,
+          "relative_l2": 0.00032072211615741253,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 132,
+          "relative_l2": 0.00031971593853086233,
+          "max_abs": 0.00390625
+        },
+        {
+          "seed": 133,
+          "relative_l2": 0.0003186465473845601,
+          "max_abs": 0.00390625
+        }
+      ],
+      "timings": [
+        {
+          "arm": "canonical_a",
+          "us": 73.72800260782242,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 40.95999896526337,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "qkvz_b",
+          "us": 41.98399931192398,
+          "clock": "1290, 877, 300.00"
+        },
+        {
+          "arm": "canonical_a",
+          "us": 73.72800260782242,
+          "clock": "1290, 877, 300.00"
+        }
+      ],
+      "layer_count": 1,
+      "loaded_candidate_gbps": [
+        200.50000506505614,
+        195.60975930341044
+      ]
+    }
+  ],
+  "complete": true,
+  "estimated_per_round_saving_us": [
+    1261.568110436201,
+    1275.9041003882885
+  ],
+  "maximum_relative_l2": 0.0006697744247503579,
+  "fused_checkpoint_line_fp8_reference_us": 35.84,
+  "installed_wiring": {
+    "source": "112814feaf949d2b3548aee04e3408444fd839e5",
+    "complete": true,
+    "prefill_first_full_graph": true,
+    "cpu_checks": 24,
+    "estimated_per_round_saving_us": [
+      1305.0401248037815,
+      1325.5681172013283
+    ],
+    "cases": [
+      {
+        "layer": 1,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            21,
+            21,
+            21,
+            18,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          21,
+          21,
+          21,
+          18,
+          30,
+          30
+        ],
+        "operator_types": [
+          21,
+          21,
+          21,
+          18,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 8888320,
+        "loaded_candidate_bytes": 9297920,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00031751865753903985,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.00031937670428305864,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0003225137770641595,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 76.80000364780426,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 39.423998445272446,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 76.80000364780426,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 5,
+        "loaded_candidate_gbps": [
+          235.84416514492244,
+          238.94737903255802
+        ]
+      },
+      {
+        "layer": 0,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            23,
+            23,
+            23,
+            23,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          23,
+          23,
+          23,
+          23,
+          30,
+          30
+        ],
+        "operator_types": [
+          23,
+          23,
+          23,
+          23,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 11386880,
+        "loaded_candidate_bytes": 11796480,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.000319232844049111,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0003250054724048823,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.00031922737252898514,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 50.6879985332489,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 45.05600035190582,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 45.05600035190582,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 49.15200173854828,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 4,
+        "loaded_candidate_gbps": [
+          261.81817977327455,
+          261.81817977327455
+        ]
+      },
+      {
+        "layer": 9,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            21,
+            21,
+            21,
+            10,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          21,
+          21,
+          21,
+          10,
+          30,
+          30
+        ],
+        "operator_types": [
+          21,
+          21,
+          21,
+          102,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 8458240,
+        "loaded_candidate_bytes": 10219520,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0004523923562373966,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0004482348740566522,
+            "max_abs": 0.00244140625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0004413420974742621,
+            "max_abs": 0.0029296875
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 73.72800260782242,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 73.72800260782242,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          262.631590610675,
+          262.631590610675
+        ]
+      },
+      {
+        "layer": 20,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            18,
+            18,
+            18,
+            12,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          18,
+          18,
+          18,
+          12,
+          30,
+          30
+        ],
+        "operator_types": [
+          18,
+          18,
+          18,
+          104,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 9687040,
+        "loaded_candidate_bytes": 10588160,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.000512325728777796,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0005200169398449361,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0005101115093566477,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 66.56000018119812,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 41.471999138593674,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 66.56000018119812,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          258.50000653025944,
+          255.3086472782717
+        ]
+      },
+      {
+        "layer": 2,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            18,
+            18,
+            18,
+            21,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          18,
+          18,
+          18,
+          21,
+          30,
+          30
+        ],
+        "operator_types": [
+          18,
+          18,
+          18,
+          21,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 8642560,
+        "loaded_candidate_bytes": 9052160,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0003165361995343119,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0003186549583915621,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.00032008098787628114,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 76.80000364780426,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.44799879193306,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 76.80000364780426,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 5,
+        "loaded_candidate_gbps": [
+          221.00000558292973,
+          223.7974750386257
+        ]
+      },
+      {
+        "layer": 5,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            21,
+            21,
+            21,
+            21,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          21,
+          21,
+          21,
+          21,
+          30,
+          30
+        ],
+        "operator_types": [
+          21,
+          21,
+          21,
+          21,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 9256960,
+        "loaded_candidate_bytes": 9666560,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00031519404728896916,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0003220259677618742,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0003217459307052195,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 51.711998879909515,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 52.22399905323982,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 8,
+        "loaded_candidate_gbps": [
+          242.0512904239029,
+          242.0512904239029
+        ]
+      },
+      {
+        "layer": 10,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            18,
+            18,
+            18,
+            10,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          18,
+          18,
+          18,
+          10,
+          30,
+          30
+        ],
+        "operator_types": [
+          18,
+          18,
+          18,
+          102,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 7843840,
+        "loaded_candidate_bytes": 9605120,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00044185874867253006,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0004459895135369152,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0004405916843097657,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 72.7040022611618,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.97599908709526,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 72.7040022611618,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 3,
+        "loaded_candidate_gbps": [
+          234.40843942777664,
+          234.50000592396842
+        ]
+      },
+      {
+        "layer": 14,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            17,
+            17,
+            17,
+            18,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          17,
+          17,
+          17,
+          18,
+          30,
+          30
+        ],
+        "operator_types": [
+          17,
+          17,
+          17,
+          18,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 7045120,
+        "loaded_candidate_bytes": 7454720,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00031910426332615316,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.000324121443554759,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.00031848932849243283,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 78.84799689054489,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 78.84799689054489,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          191.57895587632404,
+          191.57895587632404
+        ]
+      },
+      {
+        "layer": 16,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            18,
+            18,
+            18,
+            23,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          18,
+          18,
+          18,
+          23,
+          30,
+          30
+        ],
+        "operator_types": [
+          18,
+          18,
+          18,
+          23,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 9441280,
+        "loaded_candidate_bytes": 9850880,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0003238686767872423,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.00032161211129277945,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.00032114682835526764,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 74.75200295448303,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 43.007999658584595,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 43.007999658584595,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 74.75200295448303,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 2,
+        "loaded_candidate_gbps": [
+          229.0476208658944,
+          229.0476208658944
+        ]
+      },
+      {
+        "layer": 17,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            21,
+            21,
+            21,
+            22,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          21,
+          21,
+          21,
+          22,
+          30,
+          30
+        ],
+        "operator_types": [
+          21,
+          21,
+          21,
+          22,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 8396800,
+        "loaded_candidate_bytes": 8806400,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00031428103102371097,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0003195114550180733,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.00032115651993080974,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 81.91999793052673,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 43.007999658584595,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 41.98399931192398,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 81.91999793052673,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          204.76190638739,
+          209.75610099866958
+        ]
+      },
+      {
+        "layer": 18,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            10,
+            10,
+            10,
+            18,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          10,
+          10,
+          10,
+          18,
+          30,
+          30
+        ],
+        "operator_types": [
+          102,
+          102,
+          102,
+          18,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 7557120,
+        "loaded_candidate_bytes": 10219520,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.000514959916472435,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0005148669588379562,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0005122360889799893,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 72.7040022611618,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 72.7040022611618,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          255.89744474899905,
+          255.89744474899905
+        ]
+      },
+      {
+        "layer": 21,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            21,
+            21,
+            21,
+            23,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          21,
+          21,
+          21,
+          23,
+          30,
+          30
+        ],
+        "operator_types": [
+          21,
+          21,
+          21,
+          23,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 10055680,
+        "loaded_candidate_bytes": 10465280,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0003238157951273024,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.00031903039780445397,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0003199414350092411,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 75.77600330114365,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 41.98399931192398,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 41.98399931192398,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 75.77600330114365,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 5,
+        "loaded_candidate_gbps": [
+          249.2682967681864,
+          249.2682967681864
+        ]
+      },
+      {
+        "layer": 29,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            18,
+            18,
+            18,
+            18,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          18,
+          18,
+          18,
+          18,
+          30,
+          30
+        ],
+        "operator_types": [
+          18,
+          18,
+          18,
+          18,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 8273920,
+        "loaded_candidate_bytes": 8683520,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00032054021721705794,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0003246641717851162,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0003207353875041008,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 51.19999870657921,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 50.175998359918594,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          212.0000053555706,
+          212.0000053555706
+        ]
+      },
+      {
+        "layer": 32,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            23,
+            23,
+            23,
+            21,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          23,
+          23,
+          23,
+          21,
+          30,
+          30
+        ],
+        "operator_types": [
+          23,
+          23,
+          23,
+          21,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 10588160,
+        "loaded_candidate_bytes": 10997760,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0003185670357197523,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0003179465711582452,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.00032299745362251997,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 76.80000364780426,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 76.80000364780426,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 4,
+        "loaded_candidate_gbps": [
+          249.76744183071216,
+          249.76744183071216
+        ]
+      },
+      {
+        "layer": 37,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            21,
+            21,
+            21,
+            12,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          21,
+          21,
+          21,
+          12,
+          30,
+          30
+        ],
+        "operator_types": [
+          21,
+          21,
+          21,
+          104,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 10301440,
+        "loaded_candidate_bytes": 11202560,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0005151565419510007,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0005323068471625447,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0005101634305901825,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 67.58400052785873,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 67.58400052785873,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 2,
+        "loaded_candidate_gbps": [
+          280.51283021583663,
+          287.89474962733306
+        ]
+      },
+      {
+        "layer": 42,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            23,
+            23,
+            23,
+            18,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          23,
+          23,
+          23,
+          18,
+          30,
+          30
+        ],
+        "operator_types": [
+          23,
+          23,
+          23,
+          18,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 10219520,
+        "loaded_candidate_bytes": 10629120,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00032262984314002097,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0003218488418497145,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0003215864999219775,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 75.77600330114365,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 75.77600330114365,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          241.39534880845366,
+          241.39534880845366
+        ]
+      },
+      {
+        "layer": 48,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            18,
+            18,
+            18,
+            22,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          18,
+          18,
+          18,
+          22,
+          30,
+          30
+        ],
+        "operator_types": [
+          18,
+          18,
+          18,
+          22,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 7782400,
+        "loaded_candidate_bytes": 8192000,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00032093044137582183,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.00031516814487986267,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.000320741964969784,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 80.89599758386612,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 80.89599758386612,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          200.00000505242508,
+          200.00000505242508
+        ]
+      },
+      {
+        "layer": 49,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            12,
+            12,
+            12,
+            21,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          12,
+          12,
+          12,
+          21,
+          30,
+          30
+        ],
+        "operator_types": [
+          104,
+          104,
+          104,
+          21,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 10997760,
+        "loaded_candidate_bytes": 12226560,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0006546646472997963,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0006697744247503579,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0006459740689024329,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 69.12000104784966,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 41.98399931192398,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 41.98399931192398,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 69.63200122117996,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          291.2195169679203,
+          291.2195169679203
+        ]
+      },
+      {
+        "layer": 58,
+        "admission": {
+          "operator": "gguf_qkvz_sm70_out",
+          "source_types": [
+            16,
+            16,
+            16,
+            23,
+            30,
+            30
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_XXS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "float",
+              "source_type": "BF16",
+              "operator": "gguf_qkvz_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 4120,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true,
+            "route": "canonical"
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true,
+            "route": "qkvz"
+          }
+        ],
+        "source_types": [
+          16,
+          16,
+          16,
+          23,
+          30,
+          30
+        ],
+        "operator_types": [
+          16,
+          16,
+          16,
+          23,
+          1
+        ],
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "source_bytes": 7802880,
+        "loaded_candidate_bytes": 8212480,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.00032072211615741253,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.00031971593853086233,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0003186465473845601,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "arm": "canonical_a",
+            "us": 75.77600330114365,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "qkvz_b",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "arm": "canonical_a",
+            "us": 75.77600330114365,
+            "clock": "1290, 877, 300.00"
+          }
+        ],
+        "layer_count": 1,
+        "loaded_candidate_gbps": [
+          200.50000506505614,
+          200.50000506505614
+        ]
+      }
+    ]
+  }
+}

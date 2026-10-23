@@ -14,14 +14,16 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.backends.flash_attn_v100 import (
+from vllm.v1.attention.backends.flash_v100 import (
     DFlash2SmallQPreparedMetadata,
     FlashAttnV100Backend,
     FlashAttnV100Impl,
     FlashAttnV100MetadataBuilder,
+)
+from vllm.v1.attention.backends.flash_v100.kv_layout import _split_paged_kv_cache
+from vllm.v1.attention.backends.flash_v100.routing import (
     _is_cuda_graph_capturing,
     _record_route,
-    _split_paged_kv_cache,
 )
 from vllm.v1.attention.backends.flashinfer_sm70_planner import (
     FlashInferSM70PlannerDecision,
@@ -264,6 +266,7 @@ class FlashInferSM70MetadataBuilder(FlashAttnV100MetadataBuilder):
         ddtree_parent_ids=None,
         ddtree_num_tree_tokens_cpu=None,
         prepared_dflash2_smallq_metadata: DFlash2SmallQPreparedMetadata | None = None,
+        **feature_inputs,
     ):
         attn_metadata = super().build(
             common_prefix_len,
@@ -272,6 +275,7 @@ class FlashInferSM70MetadataBuilder(FlashAttnV100MetadataBuilder):
             ddtree_parent_ids,
             ddtree_num_tree_tokens_cpu,
             prepared_dflash2_smallq_metadata,
+            **feature_inputs,
         )
         return self._attach_planner_decision(
             attn_metadata,

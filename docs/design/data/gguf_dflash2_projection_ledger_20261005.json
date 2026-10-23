@@ -1,0 +1,1721 @@
+{
+  "scope": "first target GPU node to next target GPU node; weight-stream footprints are not measured DRAM traffic; service sums are non-additive",
+  "ranks": [
+    {
+      "rank": 0,
+      "rounds": [
+        {
+          "round_ms": 23.722324,
+          "target_graph_ms": 19.865109,
+          "target_kernel_union_ms": 18.456641,
+          "target_inter_kernel_gap_ms": 1.408468,
+          "after_target_ms": 3.857215,
+          "after_target_kernel_union_ms": 3.25146,
+          "after_target_inter_kernel_gap_ms": 0.605755,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.336,
+          "graph_boundary_idle_us": 362.3,
+          "draft_graph_end_to_next_target_us": 217.759,
+          "last_tail_graph_to_next_target_us": 217.759
+        },
+        {
+          "round_ms": 24.014512,
+          "target_graph_ms": 20.13845,
+          "target_kernel_union_ms": 18.421218,
+          "target_inter_kernel_gap_ms": 1.717232,
+          "after_target_ms": 3.876062,
+          "after_target_kernel_union_ms": 3.241606,
+          "after_target_inter_kernel_gap_ms": 0.634456,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.256,
+          "graph_boundary_idle_us": 380.827,
+          "draft_graph_end_to_next_target_us": 223.582,
+          "last_tail_graph_to_next_target_us": 223.582
+        },
+        {
+          "round_ms": 24.026864,
+          "target_graph_ms": 20.150706,
+          "target_kernel_union_ms": 18.445598,
+          "target_inter_kernel_gap_ms": 1.705108,
+          "after_target_ms": 3.876158,
+          "after_target_kernel_union_ms": 3.241764,
+          "after_target_inter_kernel_gap_ms": 0.634394,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.399,
+          "graph_boundary_idle_us": 376.765,
+          "draft_graph_end_to_next_target_us": 223.998,
+          "last_tail_graph_to_next_target_us": 223.998
+        },
+        {
+          "round_ms": 24.138832,
+          "target_graph_ms": 20.225554,
+          "target_kernel_union_ms": 18.518816,
+          "target_inter_kernel_gap_ms": 1.706738,
+          "after_target_ms": 3.913278,
+          "after_target_kernel_union_ms": 3.265923,
+          "after_target_inter_kernel_gap_ms": 0.647355,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 13.12,
+          "graph_boundary_idle_us": 380.637,
+          "draft_graph_end_to_next_target_us": 221.886,
+          "last_tail_graph_to_next_target_us": 221.886
+        },
+        {
+          "round_ms": 24.142511,
+          "target_graph_ms": 20.254641,
+          "target_kernel_union_ms": 18.587264,
+          "target_inter_kernel_gap_ms": 1.667377,
+          "after_target_ms": 3.88787,
+          "after_target_kernel_union_ms": 3.280485,
+          "after_target_inter_kernel_gap_ms": 0.607385,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.192,
+          "graph_boundary_idle_us": 348.06,
+          "draft_graph_end_to_next_target_us": 208.766,
+          "last_tail_graph_to_next_target_us": 208.766
+        },
+        {
+          "round_ms": 24.154352,
+          "target_graph_ms": 20.259633,
+          "target_kernel_union_ms": 18.594851,
+          "target_inter_kernel_gap_ms": 1.664782,
+          "after_target_ms": 3.894719,
+          "after_target_kernel_union_ms": 3.256103,
+          "after_target_inter_kernel_gap_ms": 0.638616,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.968,
+          "graph_boundary_idle_us": 370.173,
+          "draft_graph_end_to_next_target_us": 214.047,
+          "last_tail_graph_to_next_target_us": 214.047
+        },
+        {
+          "round_ms": 24.171695,
+          "target_graph_ms": 20.255249,
+          "target_kernel_union_ms": 18.624095,
+          "target_inter_kernel_gap_ms": 1.631154,
+          "after_target_ms": 3.916446,
+          "after_target_kernel_union_ms": 3.279748,
+          "after_target_inter_kernel_gap_ms": 0.636698,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.912,
+          "graph_boundary_idle_us": 359.549,
+          "draft_graph_end_to_next_target_us": 214.334,
+          "last_tail_graph_to_next_target_us": 214.334
+        },
+        {
+          "round_ms": 24.140015,
+          "target_graph_ms": 20.205329,
+          "target_kernel_union_ms": 18.532123,
+          "target_inter_kernel_gap_ms": 1.673206,
+          "after_target_ms": 3.934686,
+          "after_target_kernel_union_ms": 3.295942,
+          "after_target_inter_kernel_gap_ms": 0.638744,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.256,
+          "graph_boundary_idle_us": 372.509,
+          "draft_graph_end_to_next_target_us": 229.79,
+          "last_tail_graph_to_next_target_us": 229.79
+        },
+        {
+          "round_ms": 24.128016,
+          "target_graph_ms": 20.217105,
+          "target_kernel_union_ms": 18.483846,
+          "target_inter_kernel_gap_ms": 1.733259,
+          "after_target_ms": 3.910911,
+          "after_target_kernel_union_ms": 3.281602,
+          "after_target_inter_kernel_gap_ms": 0.629309,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.872,
+          "graph_boundary_idle_us": 371.134,
+          "draft_graph_end_to_next_target_us": 223.614,
+          "last_tail_graph_to_next_target_us": 223.614
+        },
+        {
+          "round_ms": 24.110031,
+          "target_graph_ms": 20.192177,
+          "target_kernel_union_ms": 18.519418,
+          "target_inter_kernel_gap_ms": 1.672759,
+          "after_target_ms": 3.917854,
+          "after_target_kernel_union_ms": 3.290627,
+          "after_target_inter_kernel_gap_ms": 0.627227,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 13.824,
+          "graph_boundary_idle_us": 366.813,
+          "draft_graph_end_to_next_target_us": 228.126,
+          "last_tail_graph_to_next_target_us": 228.126
+        },
+        {
+          "round_ms": 24.189743,
+          "target_graph_ms": 20.261489,
+          "target_kernel_union_ms": 18.600448,
+          "target_inter_kernel_gap_ms": 1.661041,
+          "after_target_ms": 3.928254,
+          "after_target_kernel_union_ms": 3.302306,
+          "after_target_inter_kernel_gap_ms": 0.625948,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.968,
+          "graph_boundary_idle_us": 367.005,
+          "draft_graph_end_to_next_target_us": 223.774,
+          "last_tail_graph_to_next_target_us": 223.774
+        },
+        {
+          "round_ms": 24.151024,
+          "target_graph_ms": 20.238769,
+          "target_kernel_union_ms": 18.641918,
+          "target_inter_kernel_gap_ms": 1.596851,
+          "after_target_ms": 3.912255,
+          "after_target_kernel_union_ms": 3.287714,
+          "after_target_inter_kernel_gap_ms": 0.624541,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.072,
+          "graph_boundary_idle_us": 360.286,
+          "draft_graph_end_to_next_target_us": 217.151,
+          "last_tail_graph_to_next_target_us": 217.151
+        },
+        {
+          "round_ms": 24.122223,
+          "target_graph_ms": 20.203345,
+          "target_kernel_union_ms": 18.594076,
+          "target_inter_kernel_gap_ms": 1.609269,
+          "after_target_ms": 3.918878,
+          "after_target_kernel_union_ms": 3.288355,
+          "after_target_inter_kernel_gap_ms": 0.630523,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.968,
+          "graph_boundary_idle_us": 360.316,
+          "draft_graph_end_to_next_target_us": 209.534,
+          "last_tail_graph_to_next_target_us": 209.534
+        }
+      ],
+      "projection_roles": {
+        "qkvz": {
+          "calls_per_round": 83.0,
+          "us_per_call": 35.965636700648744,
+          "service_ms_per_round": 2.985147846153846,
+          "weight_stream_bytes_per_call": 6259477.590361446,
+          "effective_weight_gbps": 174.04050545415586
+        },
+        "a_b": {
+          "calls_per_round": 96.0,
+          "us_per_call": 4.333649038461538,
+          "service_ms_per_round": 0.4160303076923077,
+          "weight_stream_bytes_per_call": 122880.0,
+          "effective_weight_gbps": 28.354857282956825
+        },
+        "gdn_out": {
+          "calls_per_round": 48.0,
+          "us_per_call": 25.279016025641024,
+          "service_ms_per_round": 1.2133927692307693,
+          "weight_stream_bytes_per_call": 4218880.0,
+          "effective_weight_gbps": 166.8925719150106
+        },
+        "gate_up.native": {
+          "calls_per_round": 48.0,
+          "us_per_call": 61.409783653846155,
+          "service_ms_per_round": 2.9476696153846156,
+          "weight_stream_bytes_per_call": 18764373.333333332,
+          "effective_weight_gbps": 305.5599973955958
+        },
+        "down": {
+          "calls_per_round": 64.0,
+          "us_per_call": 39.73003966346154,
+          "service_ms_per_round": 2.5427225384615384,
+          "weight_stream_bytes_per_call": 11859200.0,
+          "effective_weight_gbps": 298.4945421765217
+        },
+        "attention.q": {
+          "calls_per_round": 15.0,
+          "us_per_call": 37.04372307692308,
+          "service_ms_per_round": 0.5556558461538461,
+          "weight_stream_bytes_per_call": 7929856.0,
+          "effective_weight_gbps": 214.0674678820288
+        },
+        "attention.k+v": {
+          "calls_per_round": 6.0,
+          "us_per_call": 28.47321794871795,
+          "service_ms_per_round": 0.1708393076923077,
+          "weight_stream_bytes_per_call": 1556480.0,
+          "effective_weight_gbps": 54.66470290795083
+        },
+        "attention.o": {
+          "calls_per_round": 16.0,
+          "us_per_call": 22.166687500000002,
+          "service_ms_per_round": 0.354667,
+          "weight_stream_bytes_per_call": 4177920.0,
+          "effective_weight_gbps": 188.47741684453302
+        },
+        "gate_up.canonical": {
+          "calls_per_round": 16.0,
+          "us_per_call": 63.87501442307693,
+          "service_ms_per_round": 1.0220002307692309,
+          "weight_stream_bytes_per_call": 22978560.0,
+          "effective_weight_gbps": 359.7425410787578
+        },
+        "attention.k": {
+          "calls_per_round": 9.0,
+          "us_per_call": 32.64875213675214,
+          "service_ms_per_round": 0.29383876923076924,
+          "weight_stream_bytes_per_call": 728177.7777777778,
+          "effective_weight_gbps": 22.303387729115705
+        },
+        "attention.v": {
+          "calls_per_round": 10.0,
+          "us_per_call": 31.270107692307693,
+          "service_ms_per_round": 0.3127010769230769,
+          "weight_stream_bytes_per_call": 720896.0,
+          "effective_weight_gbps": 23.053838096545388
+        },
+        "attention.q+k": {
+          "calls_per_round": 1.0,
+          "us_per_call": 37.94176923076923,
+          "service_ms_per_round": 0.03794176923076923,
+          "weight_stream_bytes_per_call": 9584640.0,
+          "effective_weight_gbps": 252.61447197426014
+        }
+      },
+      "target_aux_categories": {
+        "communication_or_reduction": {
+          "calls_per_round": 130.0,
+          "us_per_call": 11.274979289940829,
+          "service_ms_per_round": 1.4657473076923078
+        },
+        "rms_norm": {
+          "calls_per_round": 129.0,
+          "us_per_call": 6.056993440667859,
+          "service_ms_per_round": 0.7813521538461538
+        },
+        "layout_or_copy": {
+          "calls_per_round": 143.0,
+          "us_per_call": 4.561330285099516,
+          "service_ms_per_round": 0.6522702307692309
+        },
+        "GDN_state_or_gating": {
+          "calls_per_round": 144.0,
+          "us_per_call": 8.408178418803418,
+          "service_ms_per_round": 1.2107776923076925
+        },
+        "other_target": {
+          "calls_per_round": 128.0,
+          "us_per_call": 3.9461388221153846,
+          "service_ms_per_round": 0.5051057692307692
+        },
+        "attention": {
+          "calls_per_round": 32.0,
+          "us_per_call": 32.06466586538461,
+          "service_ms_per_round": 1.0260693076923075
+        },
+        "unfused_FFN_epilogue": {
+          "calls_per_round": 16.0,
+          "us_per_call": 3.6325865384615383,
+          "service_ms_per_round": 0.058121384615384616
+        }
+      },
+      "tail_categories": {
+        "other_tail": {
+          "calls_per_round": 139.0,
+          "us_per_call": 5.796713337022689,
+          "service_ms_per_round": 0.8057431538461539
+        },
+        "draft_GEMM": {
+          "calls_per_round": 23.0,
+          "us_per_call": 43.25399331103679,
+          "service_ms_per_round": 0.9948418461538461
+        },
+        "communication_or_reduction": {
+          "calls_per_round": 18.0,
+          "us_per_call": 13.154081196581197,
+          "service_ms_per_round": 0.23677346153846154
+        },
+        "target_head": {
+          "calls_per_round": 1.0,
+          "us_per_call": 270.35076923076923,
+          "service_ms_per_round": 0.27035076923076923
+        },
+        "sampling_and_sorting": {
+          "calls_per_round": 23.0,
+          "us_per_call": 7.346023411371237,
+          "service_ms_per_round": 0.16895853846153844
+        },
+        "draft_attention": {
+          "calls_per_round": 5.0,
+          "us_per_call": 104.83650769230769,
+          "service_ms_per_round": 0.5241825384615385
+        },
+        "draft_shared_head": {
+          "calls_per_round": 1.0,
+          "us_per_call": 273.53146153846154,
+          "service_ms_per_round": 0.27353146153846153
+        }
+      }
+    },
+    {
+      "rank": 1,
+      "rounds": [
+        {
+          "round_ms": 24.121366,
+          "target_graph_ms": 20.266753,
+          "target_kernel_union_ms": 18.740947,
+          "target_inter_kernel_gap_ms": 1.525806,
+          "after_target_ms": 3.854613,
+          "after_target_kernel_union_ms": 3.259422,
+          "after_target_inter_kernel_gap_ms": 0.595191,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.071,
+          "graph_boundary_idle_us": 356.859,
+          "draft_graph_end_to_next_target_us": 215.549,
+          "last_tail_graph_to_next_target_us": 215.549
+        },
+        {
+          "round_ms": 24.002777,
+          "target_graph_ms": 20.141315,
+          "target_kernel_union_ms": 18.545233,
+          "target_inter_kernel_gap_ms": 1.596082,
+          "after_target_ms": 3.861462,
+          "after_target_kernel_union_ms": 3.259963,
+          "after_target_inter_kernel_gap_ms": 0.601499,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 9.76,
+          "graph_boundary_idle_us": 348.156,
+          "draft_graph_end_to_next_target_us": 208.606,
+          "last_tail_graph_to_next_target_us": 208.606
+        },
+        {
+          "round_ms": 24.036631,
+          "target_graph_ms": 20.16541,
+          "target_kernel_union_ms": 18.506393,
+          "target_inter_kernel_gap_ms": 1.659017,
+          "after_target_ms": 3.871221,
+          "after_target_kernel_union_ms": 3.273179,
+          "after_target_inter_kernel_gap_ms": 0.598042,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 9.792,
+          "graph_boundary_idle_us": 348.509,
+          "draft_graph_end_to_next_target_us": 216.029,
+          "last_tail_graph_to_next_target_us": 216.029
+        },
+        {
+          "round_ms": 24.125175,
+          "target_graph_ms": 20.230274,
+          "target_kernel_union_ms": 18.536955,
+          "target_inter_kernel_gap_ms": 1.693319,
+          "after_target_ms": 3.894901,
+          "after_target_kernel_union_ms": 3.322272,
+          "after_target_inter_kernel_gap_ms": 0.572629,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 9.952,
+          "graph_boundary_idle_us": 325.404,
+          "draft_graph_end_to_next_target_us": 204.222,
+          "last_tail_graph_to_next_target_us": 204.222
+        },
+        {
+          "round_ms": 24.161975,
+          "target_graph_ms": 20.273121,
+          "target_kernel_union_ms": 18.669965,
+          "target_inter_kernel_gap_ms": 1.603156,
+          "after_target_ms": 3.888854,
+          "after_target_kernel_union_ms": 3.301818,
+          "after_target_inter_kernel_gap_ms": 0.587036,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.136,
+          "graph_boundary_idle_us": 330.909,
+          "draft_graph_end_to_next_target_us": 207.582,
+          "last_tail_graph_to_next_target_us": 207.582
+        },
+        {
+          "round_ms": 24.154646,
+          "target_graph_ms": 20.258369,
+          "target_kernel_union_ms": 18.566992,
+          "target_inter_kernel_gap_ms": 1.691377,
+          "after_target_ms": 3.896277,
+          "after_target_kernel_union_ms": 3.303325,
+          "after_target_inter_kernel_gap_ms": 0.592952,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.832,
+          "graph_boundary_idle_us": 343.229,
+          "draft_graph_end_to_next_target_us": 216.35,
+          "last_tail_graph_to_next_target_us": 216.35
+        },
+        {
+          "round_ms": 24.17199,
+          "target_graph_ms": 20.253825,
+          "target_kernel_union_ms": 18.572659,
+          "target_inter_kernel_gap_ms": 1.681166,
+          "after_target_ms": 3.918165,
+          "after_target_kernel_union_ms": 3.309822,
+          "after_target_inter_kernel_gap_ms": 0.608343,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.752,
+          "graph_boundary_idle_us": 348.317,
+          "draft_graph_end_to_next_target_us": 215.357,
+          "last_tail_graph_to_next_target_us": 215.357
+        },
+        {
+          "round_ms": 24.130679,
+          "target_graph_ms": 20.203746,
+          "target_kernel_union_ms": 18.584369,
+          "target_inter_kernel_gap_ms": 1.619377,
+          "after_target_ms": 3.926933,
+          "after_target_kernel_union_ms": 3.28659,
+          "after_target_inter_kernel_gap_ms": 0.640343,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 9.44,
+          "graph_boundary_idle_us": 376.857,
+          "draft_graph_end_to_next_target_us": 222.205,
+          "last_tail_graph_to_next_target_us": 222.205
+        },
+        {
+          "round_ms": 24.118807,
+          "target_graph_ms": 20.224706,
+          "target_kernel_union_ms": 18.612696,
+          "target_inter_kernel_gap_ms": 1.61201,
+          "after_target_ms": 3.894101,
+          "after_target_kernel_union_ms": 3.29241,
+          "after_target_inter_kernel_gap_ms": 0.601691,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.592,
+          "graph_boundary_idle_us": 347.644,
+          "draft_graph_end_to_next_target_us": 207.646,
+          "last_tail_graph_to_next_target_us": 207.646
+        },
+        {
+          "round_ms": 24.116695,
+          "target_graph_ms": 20.209058,
+          "target_kernel_union_ms": 18.58642,
+          "target_inter_kernel_gap_ms": 1.622638,
+          "after_target_ms": 3.907637,
+          "after_target_kernel_union_ms": 3.288283,
+          "after_target_inter_kernel_gap_ms": 0.619354,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.368,
+          "graph_boundary_idle_us": 356.219,
+          "draft_graph_end_to_next_target_us": 216.958,
+          "last_tail_graph_to_next_target_us": 216.958
+        },
+        {
+          "round_ms": 24.190902,
+          "target_graph_ms": 20.271681,
+          "target_kernel_union_ms": 18.653294,
+          "target_inter_kernel_gap_ms": 1.618387,
+          "after_target_ms": 3.919221,
+          "after_target_kernel_union_ms": 3.323133,
+          "after_target_inter_kernel_gap_ms": 0.596088,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.352,
+          "graph_boundary_idle_us": 342.493,
+          "draft_graph_end_to_next_target_us": 215.358,
+          "last_tail_graph_to_next_target_us": 215.358
+        },
+        {
+          "round_ms": 24.164182,
+          "target_graph_ms": 20.247713,
+          "target_kernel_union_ms": 18.644589,
+          "target_inter_kernel_gap_ms": 1.603124,
+          "after_target_ms": 3.916469,
+          "after_target_kernel_union_ms": 3.295192,
+          "after_target_inter_kernel_gap_ms": 0.621277,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.784,
+          "graph_boundary_idle_us": 363.839,
+          "draft_graph_end_to_next_target_us": 221.565,
+          "last_tail_graph_to_next_target_us": 221.565
+        },
+        {
+          "round_ms": 24.124599,
+          "target_graph_ms": 20.19853,
+          "target_kernel_union_ms": 18.511765,
+          "target_inter_kernel_gap_ms": 1.686765,
+          "after_target_ms": 3.926069,
+          "after_target_kernel_union_ms": 3.320571,
+          "after_target_inter_kernel_gap_ms": 0.605498,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.304,
+          "graph_boundary_idle_us": 351.646,
+          "draft_graph_end_to_next_target_us": 215.293,
+          "last_tail_graph_to_next_target_us": 215.293
+        }
+      ],
+      "projection_roles": {
+        "qkvz": {
+          "calls_per_round": 83.0,
+          "us_per_call": 36.01158943466172,
+          "service_ms_per_round": 2.988961923076923,
+          "weight_stream_bytes_per_call": 6259477.590361446,
+          "effective_weight_gbps": 173.81842036487842
+        },
+        "a_b": {
+          "calls_per_round": 96.0,
+          "us_per_call": 4.356023237179487,
+          "service_ms_per_round": 0.4181782307692308,
+          "weight_stream_bytes_per_call": 122880.0,
+          "effective_weight_gbps": 28.209215908490986
+        },
+        "gdn_out": {
+          "calls_per_round": 48.0,
+          "us_per_call": 25.332653846153846,
+          "service_ms_per_round": 1.2159673846153847,
+          "weight_stream_bytes_per_call": 4218880.0,
+          "effective_weight_gbps": 166.53920373370337
+        },
+        "gate_up.native": {
+          "calls_per_round": 48.0,
+          "us_per_call": 61.90933173076923,
+          "service_ms_per_round": 2.9716479230769233,
+          "weight_stream_bytes_per_call": 18764373.333333332,
+          "effective_weight_gbps": 303.09442548880475
+        },
+        "down": {
+          "calls_per_round": 64.0,
+          "us_per_call": 39.82128365384615,
+          "service_ms_per_round": 2.5485621538461536,
+          "weight_stream_bytes_per_call": 11859200.0,
+          "effective_weight_gbps": 297.8105905145671
+        },
+        "attention.q": {
+          "calls_per_round": 15.0,
+          "us_per_call": 37.08905128205128,
+          "service_ms_per_round": 0.5563357692307692,
+          "weight_stream_bytes_per_call": 7929856.0,
+          "effective_weight_gbps": 213.80584635869457
+        },
+        "attention.k+v": {
+          "calls_per_round": 6.0,
+          "us_per_call": 28.4550641025641,
+          "service_ms_per_round": 0.1707303846153846,
+          "weight_stream_bytes_per_call": 1556480.0,
+          "effective_weight_gbps": 54.69957805717066
+        },
+        "attention.o": {
+          "calls_per_round": 16.0,
+          "us_per_call": 22.074360576923077,
+          "service_ms_per_round": 0.3531897692307692,
+          "weight_stream_bytes_per_call": 4177920.0,
+          "effective_weight_gbps": 189.2657314100265
+        },
+        "gate_up.canonical": {
+          "calls_per_round": 16.0,
+          "us_per_call": 64.12222596153846,
+          "service_ms_per_round": 1.0259556153846154,
+          "weight_stream_bytes_per_call": 22978560.0,
+          "effective_weight_gbps": 358.3556193726479
+        },
+        "attention.k": {
+          "calls_per_round": 9.0,
+          "us_per_call": 32.629495726495726,
+          "service_ms_per_round": 0.2936654615384615,
+          "weight_stream_bytes_per_call": 728177.7777777778,
+          "effective_weight_gbps": 22.316550150865023
+        },
+        "attention.v": {
+          "calls_per_round": 10.0,
+          "us_per_call": 31.468676923076924,
+          "service_ms_per_round": 0.31468676923076927,
+          "weight_stream_bytes_per_call": 720896.0,
+          "effective_weight_gbps": 22.90836700132586
+        },
+        "attention.q+k": {
+          "calls_per_round": 1.0,
+          "us_per_call": 38.348,
+          "service_ms_per_round": 0.038348,
+          "weight_stream_bytes_per_call": 9584640.0,
+          "effective_weight_gbps": 249.93845832898717
+        }
+      },
+      "target_aux_categories": {
+        "communication_or_reduction": {
+          "calls_per_round": 130.0,
+          "us_per_call": 11.423662130177515,
+          "service_ms_per_round": 1.4850760769230769
+        },
+        "rms_norm": {
+          "calls_per_round": 129.0,
+          "us_per_call": 6.076694096601074,
+          "service_ms_per_round": 0.7838935384615384
+        },
+        "layout_or_copy": {
+          "calls_per_round": 143.0,
+          "us_per_call": 4.586616460462614,
+          "service_ms_per_round": 0.6558861538461539
+        },
+        "GDN_state_or_gating": {
+          "calls_per_round": 144.0,
+          "us_per_call": 8.453393696581196,
+          "service_ms_per_round": 1.2172886923076924
+        },
+        "other_target": {
+          "calls_per_round": 128.0,
+          "us_per_call": 3.8187698317307692,
+          "service_ms_per_round": 0.4888025384615385
+        },
+        "attention": {
+          "calls_per_round": 32.0,
+          "us_per_call": 32.14642307692308,
+          "service_ms_per_round": 1.0286855384615385
+        },
+        "unfused_FFN_epilogue": {
+          "calls_per_round": 16.0,
+          "us_per_call": 3.212423076923077,
+          "service_ms_per_round": 0.05139876923076923
+        }
+      },
+      "tail_categories": {
+        "other_tail": {
+          "calls_per_round": 139.0,
+          "us_per_call": 5.881846707249585,
+          "service_ms_per_round": 0.8175766923076923
+        },
+        "draft_GEMM": {
+          "calls_per_round": 23.0,
+          "us_per_call": 43.59571571906355,
+          "service_ms_per_round": 1.0027014615384615
+        },
+        "communication_or_reduction": {
+          "calls_per_round": 18.0,
+          "us_per_call": 12.352260683760683,
+          "service_ms_per_round": 0.2223406923076923
+        },
+        "target_head": {
+          "calls_per_round": 1.0,
+          "us_per_call": 277.84553846153847,
+          "service_ms_per_round": 0.2778455384615385
+        },
+        "sampling_and_sorting": {
+          "calls_per_round": 23.0,
+          "us_per_call": 7.408183946488294,
+          "service_ms_per_round": 0.17038823076923076
+        },
+        "draft_attention": {
+          "calls_per_round": 5.0,
+          "us_per_call": 105.18929230769231,
+          "service_ms_per_round": 0.5259464615384616
+        },
+        "draft_shared_head": {
+          "calls_per_round": 1.0,
+          "us_per_call": 278.6652307692308,
+          "service_ms_per_round": 0.2786652307692308
+        }
+      }
+    },
+    {
+      "rank": 2,
+      "rounds": [
+        {
+          "round_ms": 23.944963,
+          "target_graph_ms": 20.095948,
+          "target_kernel_union_ms": 18.597663,
+          "target_inter_kernel_gap_ms": 1.498285,
+          "after_target_ms": 3.849015,
+          "after_target_kernel_union_ms": 3.234527,
+          "after_target_inter_kernel_gap_ms": 0.614488,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.912,
+          "graph_boundary_idle_us": 353.819,
+          "draft_graph_end_to_next_target_us": 209.278,
+          "last_tail_graph_to_next_target_us": 209.278
+        },
+        {
+          "round_ms": 24.015906,
+          "target_graph_ms": 20.146827,
+          "target_kernel_union_ms": 18.504346,
+          "target_inter_kernel_gap_ms": 1.642481,
+          "after_target_ms": 3.869079,
+          "after_target_kernel_union_ms": 3.249566,
+          "after_target_inter_kernel_gap_ms": 0.619513,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.352,
+          "graph_boundary_idle_us": 358.78,
+          "draft_graph_end_to_next_target_us": 215.422,
+          "last_tail_graph_to_next_target_us": 215.422
+        },
+        {
+          "round_ms": 24.025025,
+          "target_graph_ms": 20.158666,
+          "target_kernel_union_ms": 18.467355,
+          "target_inter_kernel_gap_ms": 1.691311,
+          "after_target_ms": 3.866359,
+          "after_target_kernel_union_ms": 3.266911,
+          "after_target_inter_kernel_gap_ms": 0.599448,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.127,
+          "graph_boundary_idle_us": 345.244,
+          "draft_graph_end_to_next_target_us": 212.125,
+          "last_tail_graph_to_next_target_us": 212.125
+        },
+        {
+          "round_ms": 24.139009,
+          "target_graph_ms": 20.235242,
+          "target_kernel_union_ms": 18.604126,
+          "target_inter_kernel_gap_ms": 1.631116,
+          "after_target_ms": 3.903767,
+          "after_target_kernel_union_ms": 3.280029,
+          "after_target_inter_kernel_gap_ms": 0.623738,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.432,
+          "graph_boundary_idle_us": 353.565,
+          "draft_graph_end_to_next_target_us": 213.118,
+          "last_tail_graph_to_next_target_us": 213.118
+        },
+        {
+          "round_ms": 24.16032,
+          "target_graph_ms": 20.264074,
+          "target_kernel_union_ms": 18.618846,
+          "target_inter_kernel_gap_ms": 1.645228,
+          "after_target_ms": 3.896246,
+          "after_target_kernel_union_ms": 3.269726,
+          "after_target_inter_kernel_gap_ms": 0.62652,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.584,
+          "graph_boundary_idle_us": 356.219,
+          "draft_graph_end_to_next_target_us": 215.773,
+          "last_tail_graph_to_next_target_us": 215.773
+        },
+        {
+          "round_ms": 24.136833,
+          "target_graph_ms": 20.251242,
+          "target_kernel_union_ms": 18.572446,
+          "target_inter_kernel_gap_ms": 1.678796,
+          "after_target_ms": 3.885591,
+          "after_target_kernel_union_ms": 3.267962,
+          "after_target_inter_kernel_gap_ms": 0.617629,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.464,
+          "graph_boundary_idle_us": 356.415,
+          "draft_graph_end_to_next_target_us": 206.718,
+          "last_tail_graph_to_next_target_us": 206.718
+        },
+        {
+          "round_ms": 24.18608,
+          "target_graph_ms": 20.263754,
+          "target_kernel_union_ms": 18.56998,
+          "target_inter_kernel_gap_ms": 1.693774,
+          "after_target_ms": 3.922326,
+          "after_target_kernel_union_ms": 3.32355,
+          "after_target_inter_kernel_gap_ms": 0.598776,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.56,
+          "graph_boundary_idle_us": 347.642,
+          "draft_graph_end_to_next_target_us": 219.902,
+          "last_tail_graph_to_next_target_us": 219.902
+        },
+        {
+          "round_ms": 24.114561,
+          "target_graph_ms": 20.19921,
+          "target_kernel_union_ms": 18.598169,
+          "target_inter_kernel_gap_ms": 1.601041,
+          "after_target_ms": 3.915351,
+          "after_target_kernel_union_ms": 3.298206,
+          "after_target_inter_kernel_gap_ms": 0.617145,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.592,
+          "graph_boundary_idle_us": 359.804,
+          "draft_graph_end_to_next_target_us": 211.006,
+          "last_tail_graph_to_next_target_us": 211.006
+        },
+        {
+          "round_ms": 24.137792,
+          "target_graph_ms": 20.237386,
+          "target_kernel_union_ms": 18.569568,
+          "target_inter_kernel_gap_ms": 1.667818,
+          "after_target_ms": 3.900406,
+          "after_target_kernel_union_ms": 3.299615,
+          "after_target_inter_kernel_gap_ms": 0.600791,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 13.055,
+          "graph_boundary_idle_us": 347.483,
+          "draft_graph_end_to_next_target_us": 213.565,
+          "last_tail_graph_to_next_target_us": 213.565
+        },
+        {
+          "round_ms": 24.100801,
+          "target_graph_ms": 20.202571,
+          "target_kernel_union_ms": 18.574854,
+          "target_inter_kernel_gap_ms": 1.627717,
+          "after_target_ms": 3.89823,
+          "after_target_kernel_union_ms": 3.280733,
+          "after_target_inter_kernel_gap_ms": 0.617497,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 9.503,
+          "graph_boundary_idle_us": 355.709,
+          "draft_graph_end_to_next_target_us": 208.061,
+          "last_tail_graph_to_next_target_us": 208.061
+        },
+        {
+          "round_ms": 24.19056,
+          "target_graph_ms": 20.280426,
+          "target_kernel_union_ms": 18.606173,
+          "target_inter_kernel_gap_ms": 1.674253,
+          "after_target_ms": 3.910134,
+          "after_target_kernel_union_ms": 3.31337,
+          "after_target_inter_kernel_gap_ms": 0.596764,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.911,
+          "graph_boundary_idle_us": 340.285,
+          "draft_graph_end_to_next_target_us": 207.389,
+          "last_tail_graph_to_next_target_us": 207.389
+        },
+        {
+          "round_ms": 24.162017,
+          "target_graph_ms": 20.25729,
+          "target_kernel_union_ms": 18.553015,
+          "target_inter_kernel_gap_ms": 1.704275,
+          "after_target_ms": 3.904727,
+          "after_target_kernel_union_ms": 3.31219,
+          "after_target_inter_kernel_gap_ms": 0.592537,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.24,
+          "graph_boundary_idle_us": 335.005,
+          "draft_graph_end_to_next_target_us": 210.878,
+          "last_tail_graph_to_next_target_us": 210.878
+        },
+        {
+          "round_ms": 24.137952,
+          "target_graph_ms": 20.210858,
+          "target_kernel_union_ms": 18.588379,
+          "target_inter_kernel_gap_ms": 1.622479,
+          "after_target_ms": 3.927094,
+          "after_target_kernel_union_ms": 3.304476,
+          "after_target_inter_kernel_gap_ms": 0.622618,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.719,
+          "graph_boundary_idle_us": 363.035,
+          "draft_graph_end_to_next_target_us": 215.677,
+          "last_tail_graph_to_next_target_us": 215.677
+        }
+      ],
+      "projection_roles": {
+        "qkvz": {
+          "calls_per_round": 83.0,
+          "us_per_call": 36.03471825764597,
+          "service_ms_per_round": 2.9908816153846156,
+          "weight_stream_bytes_per_call": 6259477.590361446,
+          "effective_weight_gbps": 173.70685530566865
+        },
+        "a_b": {
+          "calls_per_round": 96.0,
+          "us_per_call": 4.369471955128205,
+          "service_ms_per_round": 0.41946930769230767,
+          "weight_stream_bytes_per_call": 122880.0,
+          "effective_weight_gbps": 28.122391277916915
+        },
+        "gdn_out": {
+          "calls_per_round": 48.0,
+          "us_per_call": 25.27210096153846,
+          "service_ms_per_round": 1.2130608461538461,
+          "weight_stream_bytes_per_call": 4218880.0,
+          "effective_weight_gbps": 166.9382377990932
+        },
+        "gate_up.native": {
+          "calls_per_round": 48.0,
+          "us_per_call": 61.80248878205128,
+          "service_ms_per_round": 2.966519461538461,
+          "weight_stream_bytes_per_call": 18764373.333333332,
+          "effective_weight_gbps": 303.61840927647074
+        },
+        "down": {
+          "calls_per_round": 64.0,
+          "us_per_call": 39.85157211538462,
+          "service_ms_per_round": 2.5505006153846157,
+          "weight_stream_bytes_per_call": 11859200.0,
+          "effective_weight_gbps": 297.58424499950354
+        },
+        "attention.q": {
+          "calls_per_round": 15.0,
+          "us_per_call": 37.12668205128205,
+          "service_ms_per_round": 0.5569002307692308,
+          "weight_stream_bytes_per_call": 7929856.0,
+          "effective_weight_gbps": 213.58913756544985
+        },
+        "attention.k+v": {
+          "calls_per_round": 6.0,
+          "us_per_call": 28.333628205128207,
+          "service_ms_per_round": 0.17000176923076923,
+          "weight_stream_bytes_per_call": 1556480.0,
+          "effective_weight_gbps": 54.93401652380993
+        },
+        "attention.o": {
+          "calls_per_round": 16.0,
+          "us_per_call": 22.09714423076923,
+          "service_ms_per_round": 0.3535543076923077,
+          "weight_stream_bytes_per_call": 4177920.0,
+          "effective_weight_gbps": 189.07058560908715
+        },
+        "gate_up.canonical": {
+          "calls_per_round": 16.0,
+          "us_per_call": 63.72746153846154,
+          "service_ms_per_round": 1.0196393846153846,
+          "weight_stream_bytes_per_call": 22978560.0,
+          "effective_weight_gbps": 360.5754794757
+        },
+        "attention.k": {
+          "calls_per_round": 9.0,
+          "us_per_call": 32.707188034188036,
+          "service_ms_per_round": 0.2943646923076923,
+          "weight_stream_bytes_per_call": 728177.7777777778,
+          "effective_weight_gbps": 22.26353965423842
+        },
+        "attention.v": {
+          "calls_per_round": 10.0,
+          "us_per_call": 31.483730769230768,
+          "service_ms_per_round": 0.31483730769230767,
+          "weight_stream_bytes_per_call": 720896.0,
+          "effective_weight_gbps": 22.89741343819824
+        },
+        "attention.q+k": {
+          "calls_per_round": 1.0,
+          "us_per_call": 38.38723076923077,
+          "service_ms_per_round": 0.03838723076923077,
+          "weight_stream_bytes_per_call": 9584640.0,
+          "effective_weight_gbps": 249.68302760934125
+        }
+      },
+      "target_aux_categories": {
+        "communication_or_reduction": {
+          "calls_per_round": 130.0,
+          "us_per_call": 11.277666863905326,
+          "service_ms_per_round": 1.4660966923076924
+        },
+        "rms_norm": {
+          "calls_per_round": 129.0,
+          "us_per_call": 6.0803870005963025,
+          "service_ms_per_round": 0.784369923076923
+        },
+        "layout_or_copy": {
+          "calls_per_round": 143.0,
+          "us_per_call": 4.593146315223239,
+          "service_ms_per_round": 0.656819923076923
+        },
+        "GDN_state_or_gating": {
+          "calls_per_round": 144.0,
+          "us_per_call": 8.445806623931624,
+          "service_ms_per_round": 1.2161961538461536
+        },
+        "other_target": {
+          "calls_per_round": 128.0,
+          "us_per_call": 3.834271033653846,
+          "service_ms_per_round": 0.4907866923076923
+        },
+        "attention": {
+          "calls_per_round": 32.0,
+          "us_per_call": 32.157425480769234,
+          "service_ms_per_round": 1.0290376153846152
+        },
+        "unfused_FFN_epilogue": {
+          "calls_per_round": 16.0,
+          "us_per_call": 3.308120192307692,
+          "service_ms_per_round": 0.05292992307692308
+        }
+      },
+      "tail_categories": {
+        "other_tail": {
+          "calls_per_round": 139.0,
+          "us_per_call": 5.871273381294964,
+          "service_ms_per_round": 0.8161069999999999
+        },
+        "draft_GEMM": {
+          "calls_per_round": 23.0,
+          "us_per_call": 43.63179598662207,
+          "service_ms_per_round": 1.0035313076923076
+        },
+        "communication_or_reduction": {
+          "calls_per_round": 18.0,
+          "us_per_call": 11.925615384615385,
+          "service_ms_per_round": 0.21466107692307693
+        },
+        "target_head": {
+          "calls_per_round": 1.0,
+          "us_per_call": 276.9817692307692,
+          "service_ms_per_round": 0.2769817692307692
+        },
+        "sampling_and_sorting": {
+          "calls_per_round": 23.0,
+          "us_per_call": 7.426290969899665,
+          "service_ms_per_round": 0.17080469230769227
+        },
+        "draft_attention": {
+          "calls_per_round": 5.0,
+          "us_per_call": 105.02436923076922,
+          "service_ms_per_round": 0.5251218461538462
+        },
+        "draft_shared_head": {
+          "calls_per_round": 1.0,
+          "us_per_call": 277.7619230769231,
+          "service_ms_per_round": 0.2777619230769231
+        }
+      }
+    },
+    {
+      "rank": 3,
+      "rounds": [
+        {
+          "round_ms": 23.913724,
+          "target_graph_ms": 20.067915,
+          "target_kernel_union_ms": 18.597278,
+          "target_inter_kernel_gap_ms": 1.470637,
+          "after_target_ms": 3.845809,
+          "after_target_kernel_union_ms": 3.247128,
+          "after_target_inter_kernel_gap_ms": 0.598681,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.008,
+          "graph_boundary_idle_us": 340.635,
+          "draft_graph_end_to_next_target_us": 206.301,
+          "last_tail_graph_to_next_target_us": 206.301
+        },
+        {
+          "round_ms": 24.017019,
+          "target_graph_ms": 20.150026,
+          "target_kernel_union_ms": 18.426431,
+          "target_inter_kernel_gap_ms": 1.723595,
+          "after_target_ms": 3.866993,
+          "after_target_kernel_union_ms": 3.27116,
+          "after_target_inter_kernel_gap_ms": 0.595833,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.544,
+          "graph_boundary_idle_us": 342.235,
+          "draft_graph_end_to_next_target_us": 214.141,
+          "last_tail_graph_to_next_target_us": 214.141
+        },
+        {
+          "round_ms": 24.021019,
+          "target_graph_ms": 20.158474,
+          "target_kernel_union_ms": 18.40874,
+          "target_inter_kernel_gap_ms": 1.749734,
+          "after_target_ms": 3.862545,
+          "after_target_kernel_union_ms": 3.260313,
+          "after_target_inter_kernel_gap_ms": 0.602232,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.808,
+          "graph_boundary_idle_us": 350.874,
+          "draft_graph_end_to_next_target_us": 209.406,
+          "last_tail_graph_to_next_target_us": 209.406
+        },
+        {
+          "round_ms": 24.162009,
+          "target_graph_ms": 20.23924,
+          "target_kernel_union_ms": 18.540705,
+          "target_inter_kernel_gap_ms": 1.698535,
+          "after_target_ms": 3.922769,
+          "after_target_kernel_union_ms": 3.277464,
+          "after_target_inter_kernel_gap_ms": 0.645305,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 13.088,
+          "graph_boundary_idle_us": 379.356,
+          "draft_graph_end_to_next_target_us": 231.998,
+          "last_tail_graph_to_next_target_us": 231.998
+        },
+        {
+          "round_ms": 24.141401,
+          "target_graph_ms": 20.246568,
+          "target_kernel_union_ms": 18.541731,
+          "target_inter_kernel_gap_ms": 1.704837,
+          "after_target_ms": 3.894833,
+          "after_target_kernel_union_ms": 3.277432,
+          "after_target_inter_kernel_gap_ms": 0.617401,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.224,
+          "graph_boundary_idle_us": 369.406,
+          "draft_graph_end_to_next_target_us": 213.758,
+          "last_tail_graph_to_next_target_us": 213.758
+        },
+        {
+          "round_ms": 24.154681,
+          "target_graph_ms": 20.252744,
+          "target_kernel_union_ms": 18.601468,
+          "target_inter_kernel_gap_ms": 1.651276,
+          "after_target_ms": 3.901937,
+          "after_target_kernel_union_ms": 3.282041,
+          "after_target_inter_kernel_gap_ms": 0.619896,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.232,
+          "graph_boundary_idle_us": 356.38,
+          "draft_graph_end_to_next_target_us": 222.622,
+          "last_tail_graph_to_next_target_us": 222.622
+        },
+        {
+          "round_ms": 24.155705,
+          "target_graph_ms": 20.247784,
+          "target_kernel_union_ms": 18.531394,
+          "target_inter_kernel_gap_ms": 1.71639,
+          "after_target_ms": 3.907921,
+          "after_target_kernel_union_ms": 3.297944,
+          "after_target_inter_kernel_gap_ms": 0.609977,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.488,
+          "graph_boundary_idle_us": 352.733,
+          "draft_graph_end_to_next_target_us": 208.798,
+          "last_tail_graph_to_next_target_us": 208.798
+        },
+        {
+          "round_ms": 24.137529,
+          "target_graph_ms": 20.213769,
+          "target_kernel_union_ms": 18.546362,
+          "target_inter_kernel_gap_ms": 1.667407,
+          "after_target_ms": 3.92376,
+          "after_target_kernel_union_ms": 3.289655,
+          "after_target_inter_kernel_gap_ms": 0.634105,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.904,
+          "graph_boundary_idle_us": 377.084,
+          "draft_graph_end_to_next_target_us": 221.533,
+          "last_tail_graph_to_next_target_us": 221.533
+        },
+        {
+          "round_ms": 24.133689,
+          "target_graph_ms": 20.226761,
+          "target_kernel_union_ms": 18.57097,
+          "target_inter_kernel_gap_ms": 1.655791,
+          "after_target_ms": 3.906928,
+          "after_target_kernel_union_ms": 3.29551,
+          "after_target_inter_kernel_gap_ms": 0.611418,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.624,
+          "graph_boundary_idle_us": 356.477,
+          "draft_graph_end_to_next_target_us": 219.517,
+          "last_tail_graph_to_next_target_us": 219.517
+        },
+        {
+          "round_ms": 24.12265,
+          "target_graph_ms": 20.196106,
+          "target_kernel_union_ms": 18.517082,
+          "target_inter_kernel_gap_ms": 1.679024,
+          "after_target_ms": 3.926544,
+          "after_target_kernel_union_ms": 3.301211,
+          "after_target_inter_kernel_gap_ms": 0.625333,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.544,
+          "graph_boundary_idle_us": 371.61,
+          "draft_graph_end_to_next_target_us": 236.253,
+          "last_tail_graph_to_next_target_us": 236.253
+        },
+        {
+          "round_ms": 24.175257,
+          "target_graph_ms": 20.254376,
+          "target_kernel_union_ms": 18.562081,
+          "target_inter_kernel_gap_ms": 1.692295,
+          "after_target_ms": 3.920881,
+          "after_target_kernel_union_ms": 3.280856,
+          "after_target_inter_kernel_gap_ms": 0.640025,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.144,
+          "graph_boundary_idle_us": 379.036,
+          "draft_graph_end_to_next_target_us": 218.014,
+          "last_tail_graph_to_next_target_us": 218.014
+        },
+        {
+          "round_ms": 24.16732,
+          "target_graph_ms": 20.245704,
+          "target_kernel_union_ms": 18.591897,
+          "target_inter_kernel_gap_ms": 1.653807,
+          "after_target_ms": 3.921616,
+          "after_target_kernel_union_ms": 3.283542,
+          "after_target_inter_kernel_gap_ms": 0.638074,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 12.159,
+          "graph_boundary_idle_us": 370.012,
+          "draft_graph_end_to_next_target_us": 226.237,
+          "last_tail_graph_to_next_target_us": 226.237
+        },
+        {
+          "round_ms": 24.11433,
+          "target_graph_ms": 20.193834,
+          "target_kernel_union_ms": 18.51456,
+          "target_inter_kernel_gap_ms": 1.679274,
+          "after_target_ms": 3.920496,
+          "after_target_kernel_union_ms": 3.300952,
+          "after_target_inter_kernel_gap_ms": 0.619544,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.936,
+          "graph_boundary_idle_us": 358.553,
+          "draft_graph_end_to_next_target_us": 212.445,
+          "last_tail_graph_to_next_target_us": 212.445
+        }
+      ],
+      "projection_roles": {
+        "qkvz": {
+          "calls_per_round": 83.0,
+          "us_per_call": 35.88220667284523,
+          "service_ms_per_round": 2.978223153846154,
+          "weight_stream_bytes_per_call": 6259477.590361446,
+          "effective_weight_gbps": 174.44516853247114
+        },
+        "a_b": {
+          "calls_per_round": 96.0,
+          "us_per_call": 4.3452035256410255,
+          "service_ms_per_round": 0.4171395384615385,
+          "weight_stream_bytes_per_call": 122880.0,
+          "effective_weight_gbps": 28.27945786080806
+        },
+        "gdn_out": {
+          "calls_per_round": 48.0,
+          "us_per_call": 25.199945512820513,
+          "service_ms_per_round": 1.2095973846153845,
+          "weight_stream_bytes_per_call": 4218880.0,
+          "effective_weight_gbps": 167.41623500152562
+        },
+        "gate_up.native": {
+          "calls_per_round": 48.0,
+          "us_per_call": 61.663775641025644,
+          "service_ms_per_round": 2.959861230769231,
+          "weight_stream_bytes_per_call": 18764373.333333332,
+          "effective_weight_gbps": 304.3014012403284
+        },
+        "down": {
+          "calls_per_round": 64.0,
+          "us_per_call": 39.660943509615386,
+          "service_ms_per_round": 2.538300384615385,
+          "weight_stream_bytes_per_call": 11859200.0,
+          "effective_weight_gbps": 299.01457077350824
+        },
+        "attention.q": {
+          "calls_per_round": 15.0,
+          "us_per_call": 36.93326666666667,
+          "service_ms_per_round": 0.553999,
+          "weight_stream_bytes_per_call": 7929856.0,
+          "effective_weight_gbps": 214.7076799777617
+        },
+        "attention.k+v": {
+          "calls_per_round": 6.0,
+          "us_per_call": 28.33205128205128,
+          "service_ms_per_round": 0.1699923076923077,
+          "weight_stream_bytes_per_call": 1556480.0,
+          "effective_weight_gbps": 54.93707407575003
+        },
+        "attention.o": {
+          "calls_per_round": 16.0,
+          "us_per_call": 21.91399519230769,
+          "service_ms_per_round": 0.3506239230769231,
+          "weight_stream_bytes_per_call": 4177920.0,
+          "effective_weight_gbps": 190.6507673902632
+        },
+        "gate_up.canonical": {
+          "calls_per_round": 16.0,
+          "us_per_call": 63.168605769230766,
+          "service_ms_per_round": 1.0106976923076922,
+          "weight_stream_bytes_per_call": 22978560.0,
+          "effective_weight_gbps": 363.7655085177262
+        },
+        "attention.k": {
+          "calls_per_round": 9.0,
+          "us_per_call": 32.657333333333334,
+          "service_ms_per_round": 0.293916,
+          "weight_stream_bytes_per_call": 728177.7777777778,
+          "effective_weight_gbps": 22.297527184637786
+        },
+        "attention.v": {
+          "calls_per_round": 10.0,
+          "us_per_call": 31.32545384615385,
+          "service_ms_per_round": 0.31325453846153845,
+          "weight_stream_bytes_per_call": 720896.0,
+          "effective_weight_gbps": 23.013106323709717
+        },
+        "attention.q+k": {
+          "calls_per_round": 1.0,
+          "us_per_call": 38.04753846153846,
+          "service_ms_per_round": 0.03804753846153846,
+          "weight_stream_bytes_per_call": 9584640.0,
+          "effective_weight_gbps": 251.9122231702041
+        }
+      },
+      "target_aux_categories": {
+        "communication_or_reduction": {
+          "calls_per_round": 130.0,
+          "us_per_call": 11.608323076923076,
+          "service_ms_per_round": 1.5090819999999998
+        },
+        "rms_norm": {
+          "calls_per_round": 129.0,
+          "us_per_call": 6.086320214669052,
+          "service_ms_per_round": 0.7851353076923078
+        },
+        "layout_or_copy": {
+          "calls_per_round": 143.0,
+          "us_per_call": 4.577748789671866,
+          "service_ms_per_round": 0.6546180769230769
+        },
+        "GDN_state_or_gating": {
+          "calls_per_round": 144.0,
+          "us_per_call": 8.404706196581197,
+          "service_ms_per_round": 1.2102776923076923
+        },
+        "other_target": {
+          "calls_per_round": 128.0,
+          "us_per_call": 3.804737379807692,
+          "service_ms_per_round": 0.4870063846153846
+        },
+        "attention": {
+          "calls_per_round": 32.0,
+          "us_per_call": 32.092310096153845,
+          "service_ms_per_round": 1.0269539230769231
+        },
+        "unfused_FFN_epilogue": {
+          "calls_per_round": 16.0,
+          "us_per_call": 2.504894230769231,
+          "service_ms_per_round": 0.0400783076923077
+        }
+      },
+      "tail_categories": {
+        "other_tail": {
+          "calls_per_round": 139.0,
+          "us_per_call": 5.9084941892639735,
+          "service_ms_per_round": 0.8212806923076922
+        },
+        "draft_GEMM": {
+          "calls_per_round": 23.0,
+          "us_per_call": 44.37369230769231,
+          "service_ms_per_round": 1.0205949230769231
+        },
+        "communication_or_reduction": {
+          "calls_per_round": 18.0,
+          "us_per_call": 10.215995726495727,
+          "service_ms_per_round": 0.18388792307692306
+        },
+        "target_head": {
+          "calls_per_round": 1.0,
+          "us_per_call": 277.7933076923077,
+          "service_ms_per_round": 0.2777933076923077
+        },
+        "sampling_and_sorting": {
+          "calls_per_round": 23.0,
+          "us_per_call": 7.41019397993311,
+          "service_ms_per_round": 0.17043446153846156
+        },
+        "draft_attention": {
+          "calls_per_round": 5.0,
+          "us_per_call": 106.25533846153846,
+          "service_ms_per_round": 0.5312766923076924
+        },
+        "draft_shared_head": {
+          "calls_per_round": 1.0,
+          "us_per_call": 277.6556923076923,
+          "service_ms_per_round": 0.27765569230769227
+        }
+      }
+    }
+  ],
+  "source": "7f1d25f4d3917d05060444226bff5e5aed559538",
+  "runtime_code": "5620850f8119a744d0c7d3d737c40f1255dde9a5",
+  "contract": {
+    "target": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
+    "draft": "Qwen3.8-27B-DFlash2-Q8_0.gguf",
+    "tp": 4,
+    "input_tokens": 1024,
+    "output_budget": 64,
+    "max_model_len": 32768,
+    "sm_clock_mhz": 1290,
+    "memory_clock_mhz": 877,
+    "power_watts": 300,
+    "retained_rounds_per_rank": 13
+  },
+  "projection_counterparts": {
+    "complete": true,
+    "model": "Qwen3.8-27B-NVFP4",
+    "runtime": "1.5.2.dev43+g05ef35e37c",
+    "cases": [
+      {
+        "role": "gate_up",
+        "m": 8,
+        "n": 4352,
+        "k": 5120,
+        "weight_stream_bytes": 25067520,
+        "parameters": {
+          "operator": "nvfp4_qpn2_gated_sm70_out",
+          "split_k": 8,
+          "accumulator_chains": 2
+        },
+        "timings": [
+          {
+            "median_us": 53.247999399900436,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 50.175998359918594,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "down",
+        "m": 8,
+        "n": 5120,
+        "k": 4352,
+        "weight_stream_bytes": 12533760,
+        "parameters": {
+          "operator": "nvfp4_qpn2_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2
+        },
+        "timings": [
+          {
+            "median_us": 26.623999699950218,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 26.623999699950218,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "qkvz",
+        "m": 8,
+        "n": 4096,
+        "k": 5120,
+        "weight_stream_bytes": 20979712,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020872967434115708
+        },
+        "timings": [
+          {
+            "median_us": 38.91199827194214,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 35.840000957250595,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "GDN_out",
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "weight_stream_bytes": 7874560,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 1,
+          "fast_decoder": true,
+          "relative_l2": 0.00019928715482819825
+        },
+        "timings": [
+          {
+            "median_us": 18.432000651955605,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 18.432000651955605,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_qkv",
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "weight_stream_bytes": 18357248,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020985465380363166
+        },
+        "timings": [
+          {
+            "median_us": 34.81600061058998,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 31.74399957060814,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_q",
+        "m": 8,
+        "n": 3072,
+        "k": 5120,
+        "weight_stream_bytes": 15734784,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020705357019323856
+        },
+        "timings": [
+          {
+            "median_us": 31.74399957060814,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 30.719999223947525,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_k",
+        "m": 8,
+        "n": 256,
+        "k": 5120,
+        "weight_stream_bytes": 1311232,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020819861674681306
+        },
+        "timings": [
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_v",
+        "m": 8,
+        "n": 256,
+        "k": 5120,
+        "weight_stream_bytes": 1311232,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020196763216517866
+        },
+        "timings": [
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 19.967999309301376,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_kv",
+        "m": 8,
+        "n": 512,
+        "k": 5120,
+        "weight_stream_bytes": 2622464,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020581770513672382
+        },
+        "timings": [
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_qk",
+        "m": 8,
+        "n": 3328,
+        "k": 5120,
+        "weight_stream_bytes": 17046016,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020763601060025394
+        },
+        "timings": [
+          {
+            "median_us": 33.28000009059906,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 31.74399957060814,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_o",
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "weight_stream_bytes": 7874560,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 1,
+          "fast_decoder": true,
+          "relative_l2": 0.00020659450092352927
+        },
+        "timings": [
+          {
+            "median_us": 19.45599913597107,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 18.432000651955605,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "qkvz_ab",
+        "m": 8,
+        "n": 4120,
+        "k": 5120,
+        "weight_stream_bytes": 21225472,
+        "parameters": {
+          "operator": "fp8_qpn8_dispatch_ba_split_sm70_out",
+          "output_n": 4120
+        },
+        "timings": [
+          {
+            "median_us": 35.840000957250595,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 35.840000957250595,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      }
+    ],
+    "scope": "operator cold graph; FP8 attention/GDN, NVFP4 FFN; no cross-model numerical comparison",
+    "source": "05ef35e37c6e0a213902b3ffc2440c7446800a8c"
+  }
+}

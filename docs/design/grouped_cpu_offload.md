@@ -215,6 +215,14 @@ Separate instances therefore handle different group row sizes without changing
 its I/O interface. Slot IDs are transient locations; the existing OffloadKey
 and FileMapper identify persisted data independently of those locations.
 
+Each FS load checks that the opened file has exactly the destination group's
+page size before copying bytes. Empty, truncated and oversized files fail the
+load and are removed through the existing invalidation path; the destination
+slot remains untouched. The request can recompute the missing block and store
+a replacement under the same key. This validates the page extent, not a
+content checksum. Run `pytest tests/v1/kv_offload/test_fs_tier.py` for the
+failed-load and replacement regression cases.
+
 ## Serving gate and remaining work
 
 The composition test now enters `TieringOffloadingSpec.get_manager()`. The spec

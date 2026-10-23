@@ -8,6 +8,13 @@ from packaging.version import parse
 from pydantic import Field, field_validator, model_validator
 
 from vllm import version
+from vllm.config.gdn import GdnProfileConfig
+from vllm.config.gdn_state import GdnStateTraceConfig
+from vllm.config.sm70_runtime import (
+    RuntimeTraceConfig,
+    SpecDecodeTraceConfig,
+    StepProfilerConfig,
+)
 from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
@@ -17,6 +24,23 @@ DetailedTraceModules = Literal["model", "worker", "all"]
 @config
 class ObservabilityConfig:
     """Configuration for observability - metrics and tracing."""
+
+    gdn_state: GdnStateTraceConfig = Field(default_factory=GdnStateTraceConfig)
+    """State diagnostics captured per engine, excluded from graph hashes."""
+
+    gdn_profile: GdnProfileConfig = Field(default_factory=GdnProfileConfig)
+    """GDN prefill timing policy, excluded from computation graph hashes."""
+
+    spec_decode_trace: SpecDecodeTraceConfig = Field(
+        default_factory=SpecDecodeTraceConfig
+    )
+    """Captured target-logit diagnostics, excluded from computation graph hashes."""
+
+    runtime_trace: RuntimeTraceConfig = Field(default_factory=RuntimeTraceConfig)
+    """Per-engine runner trace controls, excluded from computation graph hashes."""
+
+    step_profiler: StepProfilerConfig = Field(default_factory=StepProfilerConfig)
+    """Per-engine speculative timing; excluded from computation graph hashes."""
 
     show_hidden_metrics_for_version: str | None = None
     """Enable deprecated Prometheus metrics that have been hidden since the

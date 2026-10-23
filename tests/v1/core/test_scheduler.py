@@ -197,6 +197,9 @@ def test_schedule_partial_requests():
         model="llava-hf/llava-1.5-7b-hf",
         max_num_batched_tokens=1024,
     )
+    # This test is about the encoder budget; keep the mixed-prefill limit, which
+    # caps a prefill next to a running decode, out of it.
+    scheduler.mixed_prefill_enabled = False
     mm_positions = [[PlaceholderRange(offset=100, length=600)] for _ in range(3)]
     requests = create_requests(
         num_requests=3,

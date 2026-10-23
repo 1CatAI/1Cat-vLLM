@@ -589,6 +589,18 @@ build_qsa_metadata = (
 )
 
 
+def _host_max_seq_len(common_attn_metadata) -> int | None:
+    """Host upper bound of the step's sequence lengths, or None.
+
+    Some runners report max_model_len as max_seq_len; the per-request host
+    upper bound is the tight one when it is available.
+    """
+    bound = common_attn_metadata.seq_lens_cpu_upper_bound
+    if bound is None or not bound.numel():
+        return None
+    return int(bound.max())
+
+
 @dataclass
 class QSAForwardMetadata(AttentionMetadata):
     """Common per-forward metadata for one QSA side cache."""
@@ -606,6 +618,8 @@ class QSAForwardMetadata(AttentionMetadata):
     # Host copy of query_start_loc. It lets QSA selection split a mixed batch
     # by request without a device synchronization.
     query_start_loc_cpu: torch.Tensor | None = None
+    # Host upper bound of seq_lens (bounds prefill scoring without a sync).
+    max_seq_len: int | None = None
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -800,6 +814,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+            max_seq_len=_host_max_seq_len(common_attn_metadata),
         )
 
 
@@ -980,6 +995,7 @@ class QSACompressedKeyCache(_QSAStateCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         _, side_block_size, _ = qsa_dcp_block_geometry(vllm_config, self.prefix)
+        policy = vllm_config.kernel_config
         return MLAAttentionSpec(
             block_size=side_block_size,
             num_kv_heads=1,
@@ -987,6 +1003,11 @@ class QSACompressedKeyCache(_QSAStateCache):
             dtype=self.dtype,
             compress_ratio=self.compress_ratio,
             dcp_sharded=False,
+            host_backed=bool(
+                policy.qsa_host_indexer_history
+                and policy.qsa_host_kv_active
+                and not policy.qsa_host_kv_device_reference
+            ),
         )
 
 

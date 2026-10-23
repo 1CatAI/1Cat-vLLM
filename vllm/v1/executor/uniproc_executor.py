@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.config.execution_policy import ple_policy
 from vllm.logger import init_logger
 from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.platforms import current_platform
@@ -66,17 +67,17 @@ class UniProcExecutor(Executor):
 
         if (
             ple_offload_enabled(self.vllm_config)
-            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+            and not ple_policy(self.vllm_config).hybrid
         ):
             self.driver_worker.spawn_ple_offload()
-        elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        elif ple_policy(self.vllm_config).hybrid:
             self.driver_worker.prepare_ple_offload_spawn()
 
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.driver_worker.elastic_ep_execute("load_model")
         else:
             self.driver_worker.load_model()
-        if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        if ple_policy(self.vllm_config).hybrid:
             self.driver_worker.spawn_ple_offload()
         if ple_offload_enabled(self.vllm_config):
             self.driver_worker.wait_ple_offload_ready()
@@ -93,7 +94,7 @@ class UniProcExecutor(Executor):
     @cached_property
     def max_concurrent_batches(self) -> int:
         if self.scheduler_config.async_scheduling:
-            return max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH)
+            return max(2, self.scheduler_config.sm70_queue_depth())
         return 1
 
     def collective_rpc(  # type: ignore[override]

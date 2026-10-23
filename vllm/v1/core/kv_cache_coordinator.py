@@ -59,6 +59,8 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            device_state_blocks=kv_cache_config.device_state_blocks,
+            device_state_group_ids=kv_cache_config.device_state_group_ids,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -185,7 +187,9 @@ class KVCacheCoordinator(ABC):
             The number of blocks to allocate.
         """
         num_blocks_to_allocate = 0
+        group_demand = {}
         for i, manager in enumerate(self.single_type_managers):
+            before = num_blocks_to_allocate
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
@@ -206,6 +210,10 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
+            group_demand[i] = num_blocks_to_allocate - before
+        if not self.block_pool.can_allocate_group_blocks(group_demand):
+            # Preserve the caller's existing admission/preemption contract.
+            return self.block_pool.get_num_free_blocks() + 1
         return num_blocks_to_allocate
 
     def allocate_new_computed_blocks(

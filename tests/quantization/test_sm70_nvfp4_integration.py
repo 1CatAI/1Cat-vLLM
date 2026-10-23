@@ -8,13 +8,18 @@ import pytest
 import torch
 
 from vllm import _sm70_ops as ops
+from vllm.model_executor.layers.fused_moe.sm70 import fp4_stages, fp4_workspace
+from vllm.model_executor.layers.fused_moe.sm70.fp4_codec import Fp4MoECodec
 from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as moe
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    LayerWorkspaceView,
+)
 from vllm.model_executor.models import qwen2_moe
 
 
 def test_raw_scale_shared_workspace_rejects_microbatching(monkeypatch):
     monkeypatch.setattr(
-        moe,
+        fp4_workspace,
         "get_current_vllm_config_or_none",
         lambda: NS(parallel_config=NS(use_ubatching=True)),
     )
@@ -58,13 +63,19 @@ def test_m1_fusions_never_consume_raw_scale_workspace(monkeypatch, raw_scale, fu
         w13_raw_global_scales=object(),
         w2_raw_global_scales=object(),
     )
+    layer.sm70_fp4_codec = Fp4MoECodec(
+        "nvfp4",
+        LayerWorkspaceView(layer, ""),
+        LayerWorkspaceView(layer, "sm70_nvfp4_"),
+        raw_scale=raw_scale,
+    )
     buffers = {
         key: torch.empty(1)
         for key in ("output", "intermediate", "gate_up", "sorted_output")
     }
     method = object.__new__(moe.ModelOptNvFp4SM70MoEMethod)
     method._get_buffers = Mock(return_value=buffers)
-    method._apply_swiglu = Mock()
+    monkeypatch.setattr(fp4_stages, "apply_swiglu", Mock())
     calls = {}
     for name in (
         "nvfp4_moe_qpn_m1_sm70_out",
@@ -75,7 +86,7 @@ def test_m1_fusions_never_consume_raw_scale_workspace(monkeypatch, raw_scale, fu
         calls[name] = Mock()
         monkeypatch.setattr(ops, name, calls[name])
     reduce = Mock()
-    monkeypatch.setattr(moe, "_single_token_weighted_reduce", reduce)
+    monkeypatch.setattr(fp4_stages, "_single_token_weighted_reduce", reduce)
     result = method.apply(
         layer,
         torch.zeros(1, 2560, dtype=torch.float16),

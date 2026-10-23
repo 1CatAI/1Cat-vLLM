@@ -197,6 +197,10 @@ def _small_route_fake(x: torch.Tensor, ids: torch.Tensor, experts: int):
     )
 
 
+# FP32 elements per fallback chunk (~16 MiB), see _small_unroute.
+_UNROUTE_FALLBACK_ELEMENTS = 1 << 22
+
+
 def _small_unroute(
     down: torch.Tensor, inverse: torch.Tensor, weights: torch.Tensor
 ) -> torch.Tensor:
@@ -213,8 +217,22 @@ def _small_unroute(
         and inverse.is_contiguous()
         and weights.is_contiguous()
     ):
-        restored = down[inverse.long()].view(m, top_k, h)
-        return (restored.float() * weights[..., None].float()).sum(1).to(down.dtype)
+        # Large prefill batches (e.g. an 8192-token profile run gathers 80K
+        # routed rows) would otherwise materialise several hundred MiB of FP32
+        # temporaries at once. Each output row reduces only its own top_k
+        # rows, so row chunks produce the same values with bounded memory.
+        out = down.new_empty((m, h))
+        rows = max(1, _UNROUTE_FALLBACK_ELEMENTS // max(1, top_k * h))
+        index = inverse.long().view(m, top_k)
+        for start in range(0, m, rows):
+            stop = min(m, start + rows)
+            restored = down[index[start:stop].reshape(-1)].view(-1, top_k, h)
+            out[start:stop] = (
+                (restored.float() * weights[start:stop, :, None].float())
+                .sum(1)
+                .to(down.dtype)
+            )
+        return out
     out = down.new_empty((m, h))
     _unroute_weighted_sum[(triton.cdiv(m * h, 256),)](
         down,

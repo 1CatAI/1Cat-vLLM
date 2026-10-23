@@ -7,9 +7,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.gdn import resolve_gdn_config
+from vllm.config.gdn_state import resolve_state_trace
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -22,7 +23,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.attention.backends.flash_attn_v100 import (
+from vllm.v1.attention.backends.flash_v100 import (
     DFlash2SmallQGroupDescriptor,
     DFlash2SmallQPreparedMetadata,
     FlashAttnV100MetadataBuilder,
@@ -34,17 +35,15 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
     prepare_dflash2_gdn_group_metadata,
 )
-from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
-from vllm.v1.attention.backends.short_conv_attn import (
-    PleShortConvAttentionMetadataBuilder,
+from vllm.v1.attention.ops.gdn_state import (
+    CommonGDNSpecMetadata,
+    compute_common_gdn_attn_metadata,
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import (
-    CommonGDNSpecMetadata,
     build_attn_metadata,
-    compute_common_gdn_attn_metadata,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mamba_align import (
@@ -89,40 +88,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
         attn_metadata_builder: Any,
         num_reqs: int,
     ) -> dict[str, Any]:
-        if isinstance(attn_metadata_builder, FlashAttnV100MetadataBuilder):
-            return {
-                "prepared_dflash2_smallq_metadata": (
-                    None
-                    if self.prepared_dflash2_smallq_metadata is None
-                    else self.prepared_dflash2_smallq_metadata.get(
-                        id(attn_metadata_builder)
-                    )
-                )
-            }
-        if not isinstance(
-            attn_metadata_builder,
-            (
-                Mamba2AttentionMetadataBuilder,
-                GDNAttentionMetadataBuilder,
-                PleShortConvAttentionMetadataBuilder,
-            ),
-        ):
-            return {}
-        kwargs = {
-            "num_accepted_tokens": None
-            if self.num_accepted_tokens is None
-            else self.num_accepted_tokens[:num_reqs],
-            "num_decode_draft_tokens_cpu": None
-            if self.num_decode_draft_tokens_cpu is None
-            else self.num_decode_draft_tokens_cpu[:num_reqs],
-        }
-        if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
-            kwargs["common_gdn_metadata"] = self.common_gdn_metadata
-            if self.prepared_dflash2_gdn_metadata is not None:
-                kwargs["prepared_dflash2_metadata"] = (
-                    self.prepared_dflash2_gdn_metadata.get(id(attn_metadata_builder))
-                )
-        return kwargs
+        return attn_metadata_builder.get_model_state_kwargs(self, num_reqs)
 
 
 class MambaHybridModelState(DefaultModelState):
@@ -137,6 +103,8 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        self.gdn_state_policy = resolve_gdn_config(vllm_config).state
+        self.gdn_state_trace = resolve_state_trace(vllm_config)
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -153,7 +121,7 @@ class MambaHybridModelState(DefaultModelState):
         # draft depth only through num_spec_state_tokens, so every native MTP
         # depth qualifies. The MTP4 prefix on these names is historical.
         self._use_mtp4_common_gdn_metadata = bool(
-            envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
+            self.gdn_state_policy.shared_mtp_metadata
             and speculative_config is not None
             and speculative_config.method == "mtp"
             and device.type == "cuda"
@@ -175,7 +143,7 @@ class MambaHybridModelState(DefaultModelState):
         )
         self._use_mtp4_fused_gdn_metadata = bool(
             self._use_mtp4_common_gdn_metadata
-            and envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
+            and self.gdn_state_policy.fused_mtp_metadata
             and self.cache_config.mamba_cache_mode in ("none", "align")
         )
         self._dflash2_gdn_builders: (
@@ -202,6 +170,28 @@ class MambaHybridModelState(DefaultModelState):
         )
         self._dflash2_grouped_smallq_metadata_logged = False
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        from vllm.model_executor.layers.mamba.gdn.spec_replay import (
+            SpecReplayState,
+            set_spec_replay_state,
+            spec_replay_enabled,
+        )
+
+        self._spec_replay: SpecReplayState | None = None
+        if spec_replay_enabled(vllm_config):
+            if not self._align_mode:
+                raise ValueError(
+                    "GDN speculative replay requires mamba_cache_mode='align'."
+                )
+            # Up to 8 Mamba KV groups; the layers' group map is bound once the
+            # KV cache layout is known.
+            self._spec_replay = SpecReplayState(
+                self.max_num_reqs, self.max_num_reqs, 8, self.device
+            )
+            set_spec_replay_state(self._spec_replay)
+            logger.info_once(
+                "GDN speculative states are committed by replay "
+                "(no speculative state blocks)."
+            )
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.full(
                 (self.max_num_reqs,), -2, dtype=torch.int32, device=self.device
@@ -221,6 +211,8 @@ class MambaHybridModelState(DefaultModelState):
         # A recycled request slot may contain the previous request's accepted
         # count. The neutral value is required in both align and non-align mode.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
+        if self._spec_replay is not None:
+            self._spec_replay.reset_request(req_index)
         if self._align_mode:
             # Delay state-column seeding until preprocess_state has the
             # resolved MambaSpec block size. -2 is distinct from -1 (fresh
@@ -269,6 +261,7 @@ class MambaHybridModelState(DefaultModelState):
                 ),
             )
         ctx = self._mamba_ctx
+        ctx.temporal_replay = self._spec_replay is not None
         if not ctx.is_initialized:
             if copy_funcs is None:
                 copy_funcs = self.model.get_mamba_state_copy_funcs(
@@ -311,6 +304,18 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        if self._spec_replay is not None:
+            self._spec_replay.prepare(
+                input_batch.idx_mapping,
+                input_batch.query_start_loc,
+                num_computed_tokens,
+                input_batch.num_draft_tokens_per_req,
+                input_batch.is_prefilling_np,
+                input_batch.num_reqs,
+                ctx.block_table_ptrs,
+                ctx.block_table_stride_req,
+                mamba_spec.block_size,
+            )
         run_mamba_align_precopy(
             ctx,
             input_batch.num_reqs,
@@ -359,6 +364,13 @@ class MambaHybridModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
     ) -> dict[str, Any]:
+        if self._spec_replay is not None and not self._spec_replay.group_of:
+            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+            if len(mamba_group_ids) > self._spec_replay.num_groups:
+                raise ValueError("GDN speculative replay supports 8 Mamba groups")
+            for group, group_id in enumerate(mamba_group_ids):
+                for name in kv_cache_config.kv_cache_groups[group_id].layer_names:
+                    self._spec_replay.group_of[name] = group
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -410,7 +422,7 @@ class MambaHybridModelState(DefaultModelState):
                         speculative_config.num_speculative_state_tokens()
                     ),
                     legacy_mixed_decode_routing=(
-                        envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+                        bool(self.gdn_state_policy.legacy_mixed_decode_routing)
                     ),
                 )
 
@@ -527,7 +539,7 @@ class MambaHybridModelState(DefaultModelState):
             # the same current stream, which already supplies the required
             # device ordering. Retain the old value check as an opt-in debug
             # fence while the no-sync route is quality- and trace-gated.
-            if envs.VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT:
+            if self.gdn_state_trace.sync_assert:
                 assert (
                     common_gdn_metadata.spec_query_start_loc[-1].item()
                     == common_gdn_metadata.num_spec_decode_tokens
@@ -556,6 +568,8 @@ class MambaHybridModelState(DefaultModelState):
                 _scatter_num_accepted_kernel[(num_reqs,)](
                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
                 )
+        if self._spec_replay is not None:
+            self._spec_replay.record_accepted(idx_mapping, self.num_accepted_tokens_gpu)
         if (
             self._align_mode
             and num_computed_tokens is not None

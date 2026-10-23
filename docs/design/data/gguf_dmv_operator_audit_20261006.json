@@ -1,0 +1,4133 @@
+{
+  "contract": {
+    "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S",
+    "gpu": "V100-SXM2-32GB",
+    "tp_shard": 0,
+    "tp_size": 4,
+    "m": 8,
+    "runtime": "1.5.2.dev1003+gd6268878bb",
+    "main_base": "bc01f2899db721a99788f3bc2abc041e4b9a7fd0",
+    "cuda": "12.8",
+    "torch": "2.10.0+cu128",
+    "clock_policy": "Recorded dynamic SM clocks; ABBA within each process, not fixed-clock qualification",
+    "method": "Cold resident weight rotation, graph replay, four balanced measurements; production shape configuration; fallback rows measured once and shared by both arms",
+    "fixture_limits": "Prototype rank0 fixtures use contiguous first-quarter slices; GDN loader head selection is validated separately. This measures operator costs, not a full model-equivalent execution graph."
+  },
+  "weighted_roles": {
+    "ffn_down": {
+      "calls": 64,
+      "existing_main_ms": 1.8590425764833178,
+      "candidate_ms": 1.293611956204687,
+      "saving_ms": 0.5654306202786308
+    },
+    "gate_up": {
+      "calls": 64,
+      "existing_main_ms": 2.9822828972339632,
+      "candidate_ms": 2.3611945557594303,
+      "saving_ms": 0.621088341474533
+    },
+    "qkvz_ab": {
+      "calls": 48,
+      "existing_main_ms": 1.511735170006752,
+      "candidate_ms": 1.1592723420063655,
+      "saving_ms": 0.35246282800038653
+    },
+    "ssm_out": {
+      "calls": 48,
+      "existing_main_ms": 0.6743975960578753,
+      "candidate_ms": 0.4733697152504554,
+      "saving_ms": 0.2010278808074199
+    },
+    "attn_qkv": {
+      "calls": 16,
+      "existing_main_ms": 0.47522508863608043,
+      "candidate_ms": 0.4080966834028562,
+      "saving_ms": 0.06712840523322422
+    },
+    "attn_o": {
+      "calls": 16,
+      "existing_main_ms": 0.22148945824511637,
+      "candidate_ms": 0.15633040578548724,
+      "saving_ms": 0.06515905245962914
+    }
+  },
+  "weighted_total": {
+    "existing_main_ms": 7.724172786663106,
+    "candidate_ms": 5.8518756584092815,
+    "saving_ms": 1.8722971282538234
+  },
+  "original_vs_wheel_supported": {
+    "calls": 193,
+    "original_ms": 4.136680955804311,
+    "wheel_ms": 4.142642609156095
+  },
+  "context_control": {
+    "original.normal": {
+      "count": 1120,
+      "mean_us": 11.1183875,
+      "min_us": 10.048,
+      "max_us": 19.808
+    },
+    "original.reused": {
+      "count": 1120,
+      "mean_us": 11.3793875,
+      "min_us": 9.952,
+      "max_us": 19.616
+    },
+    "original.wide": {
+      "count": 1120,
+      "mean_us": 19.09351517857143,
+      "min_us": 11.648,
+      "max_us": 22.208000000000002
+    },
+    "wheel.normal": {
+      "count": 1120,
+      "mean_us": 11.416355357142857,
+      "min_us": 10.048,
+      "max_us": 20.863
+    },
+    "wheel.reused": {
+      "count": 1120,
+      "mean_us": 11.722752678571428,
+      "min_us": 10.08,
+      "max_us": 21.248
+    },
+    "wheel.wide": {
+      "count": 1120,
+      "mean_us": 19.3674375,
+      "min_us": 11.808,
+      "max_us": 21.952
+    }
+  },
+  "historical_baselines": [
+    {
+      "runtime": "1.5.2.dev53+g49ac1c58ff",
+      "input_1k_round_ms": 20.63931425042916,
+      "input_8k_round_ms": 21.734425415596988,
+      "projection_trace_service_ms": 11.371877916666667
+    },
+    {
+      "runtime": "1.5.2.dev59+g6d11576ee9",
+      "input_1k_round_ms": 19.512083330393562,
+      "input_8k_round_ms": 20.55705372991077,
+      "projection_trace_service_ms": 10.541797846153846
+    }
+  ],
+  "clock_histograms": {
+    "original-wheel-clocks.csv": {
+      "1057": 15,
+      "1290": 155,
+      "1425": 3,
+      "1507": 28,
+      "1515": 85,
+      "1522": 101,
+      "1530": 917
+    },
+    "existing-main-down-pair-clocks.csv": {
+      "1290": 101,
+      "1425": 6,
+      "1492": 3,
+      "1507": 122,
+      "1515": 55,
+      "1522": 128,
+      "1530": 643
+    },
+    "compare-clocks.csv": {
+      "1530": 246
+    },
+    "context-clocks.csv": {
+      "1290": 86,
+      "1425": 3,
+      "1530": 109
+    },
+    "remaining-clocks.csv": {
+      "1290": 389,
+      "1425": 3,
+      "1530": 1062
+    }
+  },
+  "evidence_sha256": {
+    "original-wheel-abba.json": "4c7de0523f6f985ed27b3a921d7b76145c61a6bd2edf6baf4e37b18da7e07d22",
+    "same-input-abba.json": "18be35723e3d84377c185df0d6268a89c356616b4fb2dc2ec248934b802ff589",
+    "remaining-abba.json": "2a9f85094a86a56eb44c855b938098a28029bc8914766c341bd687e1c94fe3cf",
+    "context.sqlite": "9d46ef7ae6dc243cdc06bc6b5ccec33f5fb6be16fa02d7472da3b49f3acc2ef3",
+    "context-kernel-summary.json": "26f2423411867784752b514ad5302e8b2df2243f7c82d59dcb61b61063f7c9fb",
+    "src/dmv11.cu": "9af3135107eb25d5f6698eab58db9d5ff73a453c505bb05560c9452ce8fe30b5",
+    "src/pack3.py": "33ec911f80a47716ecdbdd7635bedddae86691f4037ef6cf60ae1a79f04ed2de",
+    "src/pack.py": "bfc83d5fe9c55cef5e1c48523d95d306b4336c38507271e061cb021dd075c78d"
+  },
+  "points": [
+    {
+      "role": "ffn_down",
+      "types": [
+        12
+      ],
+      "n": [
+        5120
+      ],
+      "k": 4352,
+      "layer_count": 6,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 21.828265984853108,
+          "abba_us": [
+            21.16949399312337,
+            21.131946245829266,
+            21.157546043395996,
+            21.15242640177409
+          ],
+          "relative_l2": 0.0006904176552779973,
+          "ab_relative_l2": null,
+          "bytes": 13926400,
+          "copies": 3,
+          "mean_us": 21.15285317103068,
+          "effective_gbs": 658.369813632164,
+          "quantized_and_packed_operand_bytes": 13926400,
+          "all_weight_operand_bytes": 13926400
+        },
+        "ordinary_wheel": {
+          "best5_us": 21.862399578094482,
+          "abba_us": [
+            21.236054102579754,
+            21.20192050933838,
+            21.205333073933918,
+            21.195093790690105
+          ],
+          "relative_l2": 0.0006904176552779973,
+          "ab_relative_l2": null,
+          "bytes": 13926400,
+          "copies": 3,
+          "mean_us": 21.20960036913554,
+          "effective_gbs": 656.6083168764396,
+          "quantized_and_packed_operand_bytes": 13926400,
+          "all_weight_operand_bytes": 13926400
+        },
+        "existing_main": {
+          "route": "canonical",
+          "bytes": 13926400,
+          "copies": 3,
+          "best5_us": 28.945066531499226,
+          "abba_us": [
+            28.931414286295574,
+            28.846079508463543,
+            28.861440022786457,
+            28.90581448872884
+          ],
+          "mean_us": 28.886187076568604,
+          "effective_gbs": 482.1127815549106,
+          "quantized_and_packed_operand_bytes": 13926400,
+          "all_weight_operand_bytes": 13926400
+        }
+      }
+    },
+    {
+      "role": "ffn_down",
+      "types": [
+        18
+      ],
+      "n": [
+        5120
+      ],
+      "k": 4352,
+      "layer_count": 7,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 17.97119975090027,
+          "abba_us": [
+            17.906688690185547,
+            17.899520874023438,
+            17.915903091430664,
+            18.070528030395508
+          ],
+          "relative_l2": 0.0010887356474995613,
+          "ab_relative_l2": null,
+          "bytes": 9052160,
+          "copies": 5,
+          "mean_us": 17.94816017150879,
+          "effective_gbs": 504.3503018414974,
+          "quantized_and_packed_operand_bytes": 9052160,
+          "all_weight_operand_bytes": 9052160
+        },
+        "ordinary_wheel": {
+          "best5_us": 18.216960430145264,
+          "abba_us": [
+            18.191360473632812,
+            18.184192657470703,
+            18.17804718017578,
+            18.267135620117188
+          ],
+          "relative_l2": 0.0003558890603017062,
+          "ab_relative_l2": null,
+          "bytes": 9052160,
+          "copies": 5,
+          "mean_us": 18.20518398284912,
+          "effective_gbs": 497.22980050780745,
+          "quantized_and_packed_operand_bytes": 9052160,
+          "all_weight_operand_bytes": 9052160
+        },
+        "existing_main": {
+          "route": "native_linear",
+          "bytes": 8529920,
+          "copies": 5,
+          "best5_us": 27.852799892425537,
+          "abba_us": [
+            27.840511322021484,
+            27.825151443481445,
+            27.830272674560547,
+            28.11903953552246
+          ],
+          "mean_us": 27.903743743896484,
+          "effective_gbs": 305.6908807036256,
+          "quantized_and_packed_operand_bytes": 8529920,
+          "all_weight_operand_bytes": 8529920
+        }
+      }
+    },
+    {
+      "role": "ffn_down",
+      "types": [
+        21
+      ],
+      "n": [
+        5120
+      ],
+      "k": 4352,
+      "layer_count": 22,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 18.367999792099,
+          "abba_us": [
+            18.48960041999817,
+            18.47424030303955,
+            18.461439609527588,
+            18.447359800338745
+          ],
+          "relative_l2": 0.00035396963357925415,
+          "ab_relative_l2": null,
+          "bytes": 9748480,
+          "copies": 4,
+          "mean_us": 18.468160033226013,
+          "effective_gbs": 527.8533423178886,
+          "quantized_and_packed_operand_bytes": 9748480,
+          "all_weight_operand_bytes": 9748480
+        },
+        "ordinary_wheel": {
+          "best5_us": 18.31679940223694,
+          "abba_us": [
+            18.42944025993347,
+            18.440959453582764,
+            18.384640216827393,
+            18.332159519195557
+          ],
+          "relative_l2": 0.00035396963357925415,
+          "ab_relative_l2": null,
+          "bytes": 9748480,
+          "copies": 4,
+          "mean_us": 18.396799862384796,
+          "effective_gbs": 529.9008562860071,
+          "quantized_and_packed_operand_bytes": 9748480,
+          "all_weight_operand_bytes": 9748480
+        },
+        "existing_main": {
+          "route": "native_linear",
+          "bytes": 9574400,
+          "copies": 5,
+          "best5_us": 26.808319091796875,
+          "abba_us": [
+            26.795007705688477,
+            26.72640037536621,
+            26.72435188293457,
+            26.665983200073242
+          ],
+          "mean_us": 26.727935791015625,
+          "effective_gbs": 358.2169635119505,
+          "quantized_and_packed_operand_bytes": 9574400,
+          "all_weight_operand_bytes": 9574400
+        }
+      }
+    },
+    {
+      "role": "ffn_down",
+      "types": [
+        23
+      ],
+      "n": [
+        5120
+      ],
+      "k": 4352,
+      "layer_count": 21,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 20.565332969029743,
+          "abba_us": [
+            20.47317345937093,
+            20.427093505859375,
+            20.43903986612956,
+            20.445866584777832
+          ],
+          "relative_l2": 0.00033705454552546144,
+          "ab_relative_l2": null,
+          "bytes": 12533760,
+          "copies": 3,
+          "mean_us": 20.446293354034424,
+          "effective_gbs": 613.0089098778807,
+          "quantized_and_packed_operand_bytes": 12533760,
+          "all_weight_operand_bytes": 12533760
+        },
+        "ordinary_wheel": {
+          "best5_us": 19.814399878184002,
+          "abba_us": [
+            20.24789333343506,
+            20.22058645884196,
+            20.249600410461426,
+            20.217173894246418
+          ],
+          "relative_l2": 0.00033705454552546144,
+          "ab_relative_l2": null,
+          "bytes": 12533760,
+          "copies": 3,
+          "mean_us": 20.233813524246216,
+          "effective_gbs": 619.4462544087783,
+          "quantized_and_packed_operand_bytes": 12533760,
+          "all_weight_operand_bytes": 12533760
+        },
+        "existing_main": {
+          "route": "canonical",
+          "bytes": 12533760,
+          "copies": 3,
+          "best5_us": 32.085333267847695,
+          "abba_us": [
+            31.89759890238444,
+            31.914666493733723,
+            31.928319931030273,
+            31.93855921427409
+          ],
+          "mean_us": 31.919786135355633,
+          "effective_gbs": 392.6642849939745,
+          "quantized_and_packed_operand_bytes": 12533760,
+          "all_weight_operand_bytes": 12533760
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        12,
+        21
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 1,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 34.93120074272156,
+          "abba_us": [
+            34.81343984603882,
+            34.9183988571167,
+            34.887681007385254,
+            34.83135938644409
+          ],
+          "relative_l2": 0.000893855991307646,
+          "ab_relative_l2": null,
+          "bytes": 23674880,
+          "copies": 4,
+          "mean_us": 34.862719774246216,
+          "effective_gbs": 679.0887272509675,
+          "quantized_and_packed_operand_bytes": 23674880,
+          "all_weight_operand_bytes": 23674880
+        },
+        "ordinary_wheel": {
+          "best5_us": 35.443198680877686,
+          "abba_us": [
+            35.111680030822754,
+            35.121920108795166,
+            35.06688117980957,
+            35.12063980102539
+          ],
+          "relative_l2": 0.000893855991307646,
+          "ab_relative_l2": null,
+          "bytes": 23674880,
+          "copies": 4,
+          "mean_us": 35.10528028011322,
+          "effective_gbs": 674.3965526294793,
+          "quantized_and_packed_operand_bytes": 23674880,
+          "all_weight_operand_bytes": 23674880
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 22108160,
+          "copies": 4,
+          "best5_us": 54.6176016330719,
+          "abba_us": [
+            54.64191913604736,
+            55.041279792785645,
+            54.79680061340332,
+            54.533119201660156
+          ],
+          "mean_us": 54.75327968597412,
+          "effective_gbs": 403.77782165372895,
+          "quantized_and_packed_operand_bytes": 22108160,
+          "all_weight_operand_bytes": 22108160
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        12,
+        23
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 1,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 38.15680146217346,
+          "abba_us": [
+            38.09664011001587,
+            38.156800270080566,
+            38.12351942062378,
+            38.13503980636597
+          ],
+          "relative_l2": 0.0008944483706727624,
+          "ab_relative_l2": null,
+          "bytes": 26460160,
+          "copies": 4,
+          "mean_us": 38.127999901771545,
+          "effective_gbs": 693.9823769452585,
+          "quantized_and_packed_operand_bytes": 26460160,
+          "all_weight_operand_bytes": 26460160
+        },
+        "ordinary_wheel": {
+          "best5_us": 38.32319974899292,
+          "abba_us": [
+            37.86367893218994,
+            37.83936023712158,
+            37.83423900604248,
+            37.86623954772949
+          ],
+          "relative_l2": 0.0008944483706727624,
+          "ab_relative_l2": null,
+          "bytes": 26460160,
+          "copies": 4,
+          "mean_us": 37.850879430770874,
+          "effective_gbs": 699.0632819614017,
+          "quantized_and_packed_operand_bytes": 26460160,
+          "all_weight_operand_bytes": 26460160
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 24371200,
+          "copies": 4,
+          "best5_us": 61.055999994277954,
+          "abba_us": [
+            61.10079765319824,
+            60.27775764465332,
+            60.87935924530029,
+            60.93440055847168
+          ],
+          "mean_us": 60.798078775405884,
+          "effective_gbs": 400.8547719086589,
+          "quantized_and_packed_operand_bytes": 24371200,
+          "all_weight_operand_bytes": 24371200
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        18,
+        18
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 12,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 30.425599217414856,
+          "abba_us": [
+            30.648319721221924,
+            31.206400394439697,
+            31.04896068572998,
+            30.99008083343506
+          ],
+          "relative_l2": 0.0015694369794800878,
+          "ab_relative_l2": null,
+          "bytes": 18104320,
+          "copies": 4,
+          "mean_us": 30.973440408706665,
+          "effective_gbs": 584.5111089083555,
+          "quantized_and_packed_operand_bytes": 18104320,
+          "all_weight_operand_bytes": 18104320
+        },
+        "ordinary_wheel": {
+          "best5_us": 30.348798632621765,
+          "abba_us": [
+            31.008000373840332,
+            31.120638847351074,
+            30.94912052154541,
+            31.01696014404297
+          ],
+          "relative_l2": 0.0006133083952590823,
+          "ab_relative_l2": null,
+          "bytes": 18104320,
+          "copies": 4,
+          "mean_us": 31.023679971694946,
+          "effective_gbs": 583.5645550920402,
+          "quantized_and_packed_operand_bytes": 18104320,
+          "all_weight_operand_bytes": 18104320
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 17059840,
+          "copies": 4,
+          "best5_us": 45.64479887485504,
+          "abba_us": [
+            45.60128211975098,
+            46.50752067565918,
+            46.43968105316162,
+            46.408958435058594
+          ],
+          "mean_us": 46.23936057090759,
+          "effective_gbs": 368.94627843823463,
+          "quantized_and_packed_operand_bytes": 17059840,
+          "all_weight_operand_bytes": 17059840
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        18,
+        21
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 4,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 34.39359962940216,
+          "abba_us": [
+            38.85440111160278,
+            36.09600067138672,
+            35.808000564575195,
+            34.31807994842529
+          ],
+          "relative_l2": 0.0011791120050475001,
+          "ab_relative_l2": null,
+          "bytes": 18800640,
+          "copies": 4,
+          "mean_us": 36.2691205739975,
+          "effective_gbs": 518.3649259331307,
+          "quantized_and_packed_operand_bytes": 18800640,
+          "all_weight_operand_bytes": 18800640
+        },
+        "ordinary_wheel": {
+          "best5_us": 34.82879996299744,
+          "abba_us": [
+            39.54303979873657,
+            38.13375949859619,
+            36.48128032684326,
+            34.744319915771484
+          ],
+          "relative_l2": 0.0006167862447910011,
+          "ab_relative_l2": null,
+          "bytes": 18800640,
+          "copies": 4,
+          "mean_us": 37.22559988498688,
+          "effective_gbs": 505.0459914168453,
+          "quantized_and_packed_operand_bytes": 18800640,
+          "all_weight_operand_bytes": 18800640
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 18104320,
+          "copies": 4,
+          "best5_us": 52.07039713859558,
+          "abba_us": [
+            51.81824207305908,
+            47.548160552978516,
+            46.304001808166504,
+            45.38368225097656
+          ],
+          "mean_us": 47.763521671295166,
+          "effective_gbs": 379.04072745289847,
+          "quantized_and_packed_operand_bytes": 18104320,
+          "all_weight_operand_bytes": 18104320
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        18,
+        23
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 3,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 34.07360017299652,
+          "abba_us": [
+            33.9084792137146,
+            34.4320011138916,
+            34.21695947647095,
+            34.07104015350342
+          ],
+          "relative_l2": 0.0011889208108186722,
+          "ab_relative_l2": null,
+          "bytes": 21585920,
+          "copies": 4,
+          "mean_us": 34.15711998939514,
+          "effective_gbs": 631.9596033477601,
+          "quantized_and_packed_operand_bytes": 21585920,
+          "all_weight_operand_bytes": 21585920
+        },
+        "ordinary_wheel": {
+          "best5_us": 33.139199018478394,
+          "abba_us": [
+            33.153278827667236,
+            33.3516788482666,
+            33.42592000961304,
+            33.29535961151123
+          ],
+          "relative_l2": 0.0006032527890056372,
+          "ab_relative_l2": null,
+          "bytes": 21585920,
+          "copies": 4,
+          "mean_us": 33.306559324264526,
+          "effective_gbs": 648.0981655848854,
+          "quantized_and_packed_operand_bytes": 21585920,
+          "all_weight_operand_bytes": 21585920
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 20367360,
+          "copies": 4,
+          "best5_us": 47.02720046043396,
+          "abba_us": [
+            46.995201110839844,
+            47.84383773803711,
+            47.54432201385498,
+            47.28831768035889
+          ],
+          "mean_us": 47.417919635772705,
+          "effective_gbs": 429.52875529854737,
+          "quantized_and_packed_operand_bytes": 20367360,
+          "all_weight_operand_bytes": 20367360
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        21,
+        12
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 1,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 34.84160006046295,
+          "abba_us": [
+            34.9068808555603,
+            34.93119955062866,
+            34.9017596244812,
+            34.90943908691406
+          ],
+          "relative_l2": 0.0008611615048721433,
+          "ab_relative_l2": null,
+          "bytes": 23674880,
+          "copies": 4,
+          "mean_us": 34.91231977939606,
+          "effective_gbs": 678.123944487127,
+          "quantized_and_packed_operand_bytes": 23674880,
+          "all_weight_operand_bytes": 23674880
+        },
+        "ordinary_wheel": {
+          "best5_us": 34.98240113258362,
+          "abba_us": [
+            34.987521171569824,
+            34.987521171569824,
+            34.995200634002686,
+            35.016961097717285
+          ],
+          "relative_l2": 0.0008611615048721433,
+          "ab_relative_l2": null,
+          "bytes": 23674880,
+          "copies": 4,
+          "mean_us": 34.996801018714905,
+          "effective_gbs": 676.4869734047867,
+          "quantized_and_packed_operand_bytes": 23674880,
+          "all_weight_operand_bytes": 23674880
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 22108160,
+          "copies": 4,
+          "best5_us": 54.72000241279602,
+          "abba_us": [
+            54.64320182800293,
+            54.57280158996582,
+            54.919681549072266,
+            54.72640037536621
+          ],
+          "mean_us": 54.71552133560181,
+          "effective_gbs": 404.0564625967451,
+          "quantized_and_packed_operand_bytes": 22108160,
+          "all_weight_operand_bytes": 22108160
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        21,
+        18
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 3,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 33.9711993932724,
+          "abba_us": [
+            33.87135982513428,
+            33.768959045410156,
+            33.890559673309326,
+            34.14527893066406
+          ],
+          "relative_l2": 0.0012075398117303848,
+          "ab_relative_l2": null,
+          "bytes": 18800640,
+          "copies": 4,
+          "mean_us": 33.919039368629456,
+          "effective_gbs": 554.279848426016,
+          "quantized_and_packed_operand_bytes": 18800640,
+          "all_weight_operand_bytes": 18800640
+        },
+        "ordinary_wheel": {
+          "best5_us": 34.48320031166077,
+          "abba_us": [
+            34.31168079376221,
+            34.2630410194397,
+            34.26559925079346,
+            34.671359062194824
+          ],
+          "relative_l2": 0.0006445235922001302,
+          "ab_relative_l2": null,
+          "bytes": 18800640,
+          "copies": 4,
+          "mean_us": 34.377920031547546,
+          "effective_gbs": 546.8812535123486,
+          "quantized_and_packed_operand_bytes": 18800640,
+          "all_weight_operand_bytes": 18800640
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 18104320,
+          "copies": 4,
+          "best5_us": 44.85119879245758,
+          "abba_us": [
+            44.73343849182129,
+            44.84992027282715,
+            45.34912109375,
+            45.296640396118164
+          ],
+          "mean_us": 45.05728006362915,
+          "effective_gbs": 401.8067662857895,
+          "quantized_and_packed_operand_bytes": 18104320,
+          "all_weight_operand_bytes": 18104320
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        21,
+        21
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 8,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 32.61440098285675,
+          "abba_us": [
+            32.59007930755615,
+            32.72831916809082,
+            32.98687934875488,
+            33.00607919692993
+          ],
+          "relative_l2": 0.0006145863444544375,
+          "ab_relative_l2": null,
+          "bytes": 19496960,
+          "copies": 4,
+          "mean_us": 32.82783925533295,
+          "effective_gbs": 593.9154218574614,
+          "quantized_and_packed_operand_bytes": 19496960,
+          "all_weight_operand_bytes": 19496960
+        },
+        "ordinary_wheel": {
+          "best5_us": 33.11359882354736,
+          "abba_us": [
+            33.386240005493164,
+            33.337600231170654,
+            33.1660795211792,
+            33.62560033798218
+          ],
+          "relative_l2": 0.0006145863444544375,
+          "ab_relative_l2": null,
+          "bytes": 19496960,
+          "copies": 4,
+          "mean_us": 33.3788800239563,
+          "effective_gbs": 584.1106707596801,
+          "quantized_and_packed_operand_bytes": 19496960,
+          "all_weight_operand_bytes": 19496960
+        },
+        "existing_main": {
+          "route": "iq3_gated",
+          "bytes": 19148800,
+          "copies": 4,
+          "best5_us": 37.491199374198914,
+          "abba_us": [
+            37.54623889923096,
+            37.68320083618164,
+            38.0351996421814,
+            37.95072078704834
+          ],
+          "mean_us": 37.80384004116058,
+          "effective_gbs": 506.5305529584007,
+          "quantized_and_packed_operand_bytes": 19148800,
+          "all_weight_operand_bytes": 19148800
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        21,
+        23
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 2,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 34.58560109138489,
+          "abba_us": [
+            34.77760076522827,
+            34.7545599937439,
+            34.88127946853638,
+            34.72127914428711
+          ],
+          "relative_l2": 0.0006032800883986056,
+          "ab_relative_l2": null,
+          "bytes": 22282240,
+          "copies": 4,
+          "mean_us": 34.783679842948914,
+          "effective_gbs": 640.5946725765098,
+          "quantized_and_packed_operand_bytes": 22282240,
+          "all_weight_operand_bytes": 22282240
+        },
+        "ordinary_wheel": {
+          "best5_us": 35.31520068645477,
+          "abba_us": [
+            35.54559946060181,
+            35.52767992019653,
+            35.48799991607666,
+            35.392000675201416
+          ],
+          "relative_l2": 0.0006032800883986056,
+          "ab_relative_l2": null,
+          "bytes": 22282240,
+          "copies": 4,
+          "mean_us": 35.488319993019104,
+          "effective_gbs": 627.8753123389084,
+          "quantized_and_packed_operand_bytes": 22282240,
+          "all_weight_operand_bytes": 22282240
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 21411840,
+          "copies": 4,
+          "best5_us": 46.18239998817444,
+          "abba_us": [
+            46.133761405944824,
+            46.12864017486572,
+            46.62655830383301,
+            46.24767780303955
+          ],
+          "mean_us": 46.284159421920776,
+          "effective_gbs": 462.6170220531017,
+          "quantized_and_packed_operand_bytes": 21411840,
+          "all_weight_operand_bytes": 21411840
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        23,
+        12
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 2,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 38.00320029258728,
+          "abba_us": [
+            38.04800033569336,
+            38.04160118103027,
+            38.03904056549072,
+            38.02367925643921
+          ],
+          "relative_l2": 0.0008794647292234004,
+          "ab_relative_l2": null,
+          "bytes": 26460160,
+          "copies": 4,
+          "mean_us": 38.03808033466339,
+          "effective_gbs": 695.622906497922,
+          "quantized_and_packed_operand_bytes": 26460160,
+          "all_weight_operand_bytes": 26460160
+        },
+        "ordinary_wheel": {
+          "best5_us": 38.00320029258728,
+          "abba_us": [
+            38.168320655822754,
+            38.1606388092041,
+            38.14016103744507,
+            38.119680881500244
+          ],
+          "relative_l2": 0.0008794647292234004,
+          "ab_relative_l2": null,
+          "bytes": 26460160,
+          "copies": 4,
+          "mean_us": 38.14720034599304,
+          "effective_gbs": 693.6330781815645,
+          "quantized_and_packed_operand_bytes": 26460160,
+          "all_weight_operand_bytes": 26460160
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 24371200,
+          "copies": 4,
+          "best5_us": 60.95359921455383,
+          "abba_us": [
+            61.11487865447998,
+            60.97152233123779,
+            60.79232215881348,
+            60.8128023147583
+          ],
+          "mean_us": 60.92288136482239,
+          "effective_gbs": 400.03360730853785,
+          "quantized_and_packed_operand_bytes": 24371200,
+          "all_weight_operand_bytes": 24371200
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        23,
+        21
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 9,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 34.48320031166077,
+          "abba_us": [
+            34.51136112213135,
+            34.83392000198364,
+            34.695680141448975,
+            34.70720052719116
+          ],
+          "relative_l2": 0.0005950453924015164,
+          "ab_relative_l2": null,
+          "bytes": 22282240,
+          "copies": 4,
+          "mean_us": 34.68704044818878,
+          "effective_gbs": 642.3793933438184,
+          "quantized_and_packed_operand_bytes": 22282240,
+          "all_weight_operand_bytes": 22282240
+        },
+        "ordinary_wheel": {
+          "best5_us": 34.44480001926422,
+          "abba_us": [
+            35.19871950149536,
+            35.20895957946777,
+            35.02336025238037,
+            35.20639896392822
+          ],
+          "relative_l2": 0.0005950453924015164,
+          "ab_relative_l2": null,
+          "bytes": 22282240,
+          "copies": 4,
+          "mean_us": 35.15935957431793,
+          "effective_gbs": 633.7498825284636,
+          "quantized_and_packed_operand_bytes": 22282240,
+          "all_weight_operand_bytes": 22282240
+        },
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 21411840,
+          "copies": 4,
+          "best5_us": 45.40160000324249,
+          "abba_us": [
+            45.306878089904785,
+            46.04032039642334,
+            45.90464115142822,
+            45.987839698791504
+          ],
+          "mean_us": 45.80991983413696,
+          "effective_gbs": 467.40618795067553,
+          "quantized_and_packed_operand_bytes": 21411840,
+          "all_weight_operand_bytes": 21411840
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        23,
+        23
+      ],
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "layer_count": 4,
+      "config": [
+        4,
+        4,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 36.76159977912903,
+          "abba_us": [
+            36.277759075164795,
+            36.34047985076904,
+            36.328959465026855,
+            36.28416061401367
+          ],
+          "relative_l2": 0.0006100704777054489,
+          "ab_relative_l2": null,
+          "bytes": 25067520,
+          "copies": 4,
+          "mean_us": 36.30783975124359,
+          "effective_gbs": 690.4161793085309,
+          "quantized_and_packed_operand_bytes": 25067520,
+          "all_weight_operand_bytes": 25067520
+        },
+        "ordinary_wheel": {
+          "best5_us": 36.160001158714294,
+          "abba_us": [
+            35.564799308776855,
+            35.6492805480957,
+            35.630080699920654,
+            35.613439083099365
+          ],
+          "relative_l2": 0.0006100704777054489,
+          "ab_relative_l2": null,
+          "bytes": 25067520,
+          "copies": 4,
+          "mean_us": 35.614399909973145,
+          "effective_gbs": 703.8591149469379,
+          "quantized_and_packed_operand_bytes": 25067520,
+          "all_weight_operand_bytes": 25067520
+        },
+        "existing_main": {
+          "route": "canonical",
+          "bytes": 25067520,
+          "copies": 4,
+          "best5_us": 50.752002000808716,
+          "abba_us": [
+            50.80704212188721,
+            50.95168113708496,
+            51.01056098937988,
+            50.952959060668945
+          ],
+          "mean_us": 50.93056082725525,
+          "effective_gbs": 492.19014267334035,
+          "quantized_and_packed_operand_bytes": 25067520,
+          "all_weight_operand_bytes": 25067520
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        12,
+        21
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 1,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 25.945600867271423,
+          "abba_us": [
+            26.0262393951416,
+            26.005759239196777,
+            25.895678997039795,
+            24.76799964904785
+          ],
+          "relative_l2": 0.000615545257460326,
+          "ab_relative_l2": 0.00020301167387515306,
+          "bytes": 11632640,
+          "copies": 4,
+          "mean_us": 25.673919320106506,
+          "effective_gbs": 462.6640697860822,
+          "quantized_and_packed_operand_bytes": 11632640,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 11878400
+        },
+        "ordinary_wheel": {
+          "best5_us": 26.13759934902191,
+          "abba_us": [
+            26.078720092773438,
+            26.0697603225708,
+            26.0646390914917,
+            24.707839488983154
+          ],
+          "relative_l2": 0.000615545257460326,
+          "ab_relative_l2": 0.00020301167387515306,
+          "bytes": 11632640,
+          "copies": 4,
+          "mean_us": 25.730239748954773,
+          "effective_gbs": 461.65135326741483,
+          "quantized_and_packed_operand_bytes": 11632640,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 11878400
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 12226560,
+          "copies": 3,
+          "best5_us": 33.65546862284342,
+          "abba_us": [
+            33.79199981689453,
+            33.85685284932455,
+            32.098986307779946,
+            32.11946805318197
+          ],
+          "mean_us": 32.96682675679525,
+          "effective_gbs": 370.8746398371452,
+          "quantized_and_packed_operand_bytes": 12226560,
+          "all_weight_operand_bytes": 12226560
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        18,
+        12
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 1,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 22.77120053768158,
+          "abba_us": [
+            22.7622389793396,
+            22.773759365081787,
+            22.720000743865967,
+            22.751998901367188
+          ],
+          "relative_l2": 0.000774588726926595,
+          "ab_relative_l2": 0.0002120926365023479,
+          "bytes": 10240000,
+          "copies": 4,
+          "mean_us": 22.751999497413635,
+          "effective_gbs": 460.8720214323134,
+          "quantized_and_packed_operand_bytes": 10240000,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 10485760
+        },
+        "ordinary_wheel": {
+          "best5_us": 22.463999688625336,
+          "abba_us": [
+            22.685439586639404,
+            22.690560817718506,
+            22.66239881515503,
+            22.677760124206543
+          ],
+          "relative_l2": 0.0005385096301324666,
+          "ab_relative_l2": 0.0002120926365023479,
+          "bytes": 10240000,
+          "copies": 4,
+          "mean_us": 22.67903983592987,
+          "effective_gbs": 462.35467091457974,
+          "quantized_and_packed_operand_bytes": 10240000,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 10485760
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 10588160,
+          "copies": 4,
+          "best5_us": 31.859201192855835,
+          "abba_us": [
+            31.76192045211792,
+            31.6646409034729,
+            31.709439754486084,
+            31.677439212799072
+          ],
+          "mean_us": 31.703360080718994,
+          "effective_gbs": 333.9759562721995,
+          "quantized_and_packed_operand_bytes": 10588160,
+          "all_weight_operand_bytes": 10588160
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        18,
+        18
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 1,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 21.708800792694092,
+          "abba_us": [
+            21.69036865234375,
+            21.68115234375,
+            21.707775115966797,
+            21.72211265563965
+          ],
+          "relative_l2": 0.0007929398561827838,
+          "ab_relative_l2": 0.0001917020999826491,
+          "bytes": 8519680,
+          "copies": 5,
+          "mean_us": 21.70035219192505,
+          "effective_gbs": 403.9307713753015,
+          "quantized_and_packed_operand_bytes": 8519680,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 8765440
+        },
+        "ordinary_wheel": {
+          "best5_us": 21.74976110458374,
+          "abba_us": [
+            21.939199447631836,
+            21.938175201416016,
+            21.9105281829834,
+            21.91360092163086
+          ],
+          "relative_l2": 0.0003622141375672072,
+          "ab_relative_l2": 0.0001917020999826491,
+          "bytes": 8519680,
+          "copies": 5,
+          "mean_us": 21.925375938415527,
+          "effective_gbs": 399.785163302128,
+          "quantized_and_packed_operand_bytes": 8519680,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 8765440
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 8683520,
+          "copies": 5,
+          "best5_us": 31.02720022201538,
+          "abba_us": [
+            31.0067195892334,
+            30.954496383666992,
+            30.963712692260742,
+            30.99238395690918
+          ],
+          "mean_us": 30.979328155517578,
+          "effective_gbs": 280.3004621794363,
+          "quantized_and_packed_operand_bytes": 8683520,
+          "all_weight_operand_bytes": 8683520
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        18,
+        21
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 5,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 21.90335988998413,
+          "abba_us": [
+            21.839872360229492,
+            21.848064422607422,
+            21.86137580871582,
+            21.85625648498535
+          ],
+          "relative_l2": 0.0006565593648701906,
+          "ab_relative_l2": 0.0002023878478212282,
+          "bytes": 8765440,
+          "copies": 5,
+          "mean_us": 21.85139226913452,
+          "effective_gbs": 412.38562234446175,
+          "quantized_and_packed_operand_bytes": 8765440,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 9011200
+        },
+        "ordinary_wheel": {
+          "best5_us": 22.087678909301758,
+          "abba_us": [
+            22.04876708984375,
+            22.047744750976562,
+            22.04262351989746,
+            22.037504196166992
+          ],
+          "relative_l2": 0.000361403712304309,
+          "ab_relative_l2": 0.0002023878478212282,
+          "bytes": 8765440,
+          "copies": 5,
+          "mean_us": 22.04415988922119,
+          "effective_gbs": 408.7794701764142,
+          "quantized_and_packed_operand_bytes": 8765440,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 9011200
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 9052160,
+          "copies": 5,
+          "best5_us": 30.82240104675293,
+          "abba_us": [
+            30.833663940429688,
+            30.8090877532959,
+            30.79680061340332,
+            30.77734375
+          ],
+          "mean_us": 30.804224014282227,
+          "effective_gbs": 293.8609976282152,
+          "quantized_and_packed_operand_bytes": 9052160,
+          "all_weight_operand_bytes": 9052160
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        18,
+        23
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 2,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 22.55360037088394,
+          "abba_us": [
+            22.51391887664795,
+            22.54080057144165,
+            22.526719570159912,
+            22.51136064529419
+          ],
+          "relative_l2": 0.0006511476822197437,
+          "ab_relative_l2": 0.0002291758282808587,
+          "bytes": 9748480,
+          "copies": 4,
+          "mean_us": 22.523199915885925,
+          "effective_gbs": 443.7309102314065,
+          "quantized_and_packed_operand_bytes": 9748480,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 9994240
+        },
+        "ordinary_wheel": {
+          "best5_us": 22.310400009155273,
+          "abba_us": [
+            22.457599639892578,
+            22.458879947662354,
+            22.444798946380615,
+            22.426879405975342
+          ],
+          "relative_l2": 0.0003605743986554444,
+          "ab_relative_l2": 0.0002291758282808587,
+          "bytes": 9748480,
+          "copies": 4,
+          "mean_us": 22.447039484977722,
+          "effective_gbs": 445.23644227954713,
+          "quantized_and_packed_operand_bytes": 9748480,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 9994240
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 9850880,
+          "copies": 4,
+          "best5_us": 32.678401470184326,
+          "abba_us": [
+            32.6694393157959,
+            32.66815900802612,
+            32.68735885620117,
+            32.6361608505249
+          ],
+          "mean_us": 32.665279507637024,
+          "effective_gbs": 301.5703569197043,
+          "quantized_and_packed_operand_bytes": 9850880,
+          "all_weight_operand_bytes": 9850880
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        21,
+        12
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 2,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 23.01439940929413,
+          "abba_us": [
+            22.928640842437744,
+            22.951679229736328,
+            22.955520153045654,
+            22.919681072235107
+          ],
+          "relative_l2": 0.0005495389341376722,
+          "ab_relative_l2": 0.00022820974118076265,
+          "bytes": 10649600,
+          "copies": 4,
+          "mean_us": 22.93888032436371,
+          "effective_gbs": 474.97348806636757,
+          "quantized_and_packed_operand_bytes": 10649600,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 10895360
+        },
+        "ordinary_wheel": {
+          "best5_us": 22.758400440216064,
+          "abba_us": [
+            22.849280834197998,
+            22.849280834197998,
+            22.858240604400635,
+            22.871038913726807
+          ],
+          "relative_l2": 0.0005495389341376722,
+          "ab_relative_l2": 0.00022820974118076265,
+          "bytes": 10649600,
+          "copies": 4,
+          "mean_us": 22.85696029663086,
+          "effective_gbs": 476.6758072203498,
+          "quantized_and_packed_operand_bytes": 10649600,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 10895360
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 11202560,
+          "copies": 4,
+          "best5_us": 30.41279911994934,
+          "abba_us": [
+            30.337278842926025,
+            30.327041149139404,
+            30.25791883468628,
+            30.31167984008789
+          ],
+          "mean_us": 30.3084796667099,
+          "effective_gbs": 369.6180119619995,
+          "quantized_and_packed_operand_bytes": 11202560,
+          "all_weight_operand_bytes": 11202560
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        21,
+        18
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 5,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 21.964800357818604,
+          "abba_us": [
+            21.942272186279297,
+            21.945344924926758,
+            21.949440002441406,
+            21.958656311035156
+          ],
+          "relative_l2": 0.0005648487131111324,
+          "ab_relative_l2": 0.0002074084768537432,
+          "bytes": 8929280,
+          "copies": 5,
+          "mean_us": 21.948928356170654,
+          "effective_gbs": 418.01767499143335,
+          "quantized_and_packed_operand_bytes": 8929280,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 9175040
+        },
+        "ordinary_wheel": {
+          "best5_us": 22.261760234832764,
+          "abba_us": [
+            22.25663948059082,
+            22.2607364654541,
+            22.26585578918457,
+            22.26585578918457
+          ],
+          "relative_l2": 0.00036370221641846,
+          "ab_relative_l2": 0.0002074084768537432,
+          "bytes": 8929280,
+          "copies": 5,
+          "mean_us": 22.262271881103516,
+          "effective_gbs": 412.13403775685106,
+          "quantized_and_packed_operand_bytes": 8929280,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 9175040
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 9297920,
+          "copies": 5,
+          "best5_us": 29.74720001220703,
+          "abba_us": [
+            29.76972770690918,
+            29.77280044555664,
+            29.750272750854492,
+            29.75539207458496
+          ],
+          "mean_us": 29.76204824447632,
+          "effective_gbs": 312.40860587361107,
+          "quantized_and_packed_operand_bytes": 9297920,
+          "all_weight_operand_bytes": 9297920
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        21,
+        21
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 8,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 22.0467209815979,
+          "abba_us": [
+            22.040576934814453,
+            22.022144317626953,
+            22.019071578979492,
+            22.03340721130371
+          ],
+          "relative_l2": 0.00036980491131544113,
+          "ab_relative_l2": 0.00020642053277697414,
+          "bytes": 9175040,
+          "copies": 5,
+          "mean_us": 22.028800010681152,
+          "effective_gbs": 427.6583379681198,
+          "quantized_and_packed_operand_bytes": 9175040,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 9420800
+        },
+        "ordinary_wheel": {
+          "best5_us": 21.821439266204834,
+          "abba_us": [
+            21.817344665527344,
+            21.823488235473633,
+            21.800960540771484,
+            21.82758331298828
+          ],
+          "relative_l2": 0.00036980491131544113,
+          "ab_relative_l2": 0.00020642053277697414,
+          "bytes": 9175040,
+          "copies": 5,
+          "mean_us": 21.817344188690186,
+          "effective_gbs": 431.803244176879,
+          "quantized_and_packed_operand_bytes": 9175040,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 9420800
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 9666560,
+          "copies": 4,
+          "best5_us": 30.297601222991943,
+          "abba_us": [
+            30.26560068130493,
+            30.273280143737793,
+            30.27967929840088,
+            30.31167984008789
+          ],
+          "mean_us": 30.282559990882874,
+          "effective_gbs": 319.2121142634671,
+          "quantized_and_packed_operand_bytes": 9666560,
+          "all_weight_operand_bytes": 9666560
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        21,
+        23
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 5,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 22.259199619293213,
+          "abba_us": [
+            22.210559844970703,
+            22.183680534362793,
+            22.19264030456543,
+            22.204160690307617
+          ],
+          "relative_l2": 0.00036112713860347867,
+          "ab_relative_l2": 0.000186177872819826,
+          "bytes": 10158080,
+          "copies": 4,
+          "mean_us": 22.197760343551636,
+          "effective_gbs": 468.68872530296846,
+          "quantized_and_packed_operand_bytes": 10158080,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 10403840
+        },
+        "ordinary_wheel": {
+          "best5_us": 22.18240052461624,
+          "abba_us": [
+            22.247679233551025,
+            22.22208023071289,
+            22.242560386657715,
+            22.25152015686035
+          ],
+          "relative_l2": 0.00036112713860347867,
+          "ab_relative_l2": 0.000186177872819826,
+          "bytes": 10158080,
+          "copies": 4,
+          "mean_us": 22.240960001945496,
+          "effective_gbs": 467.7783692381057,
+          "quantized_and_packed_operand_bytes": 10158080,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 10403840
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 10465280,
+          "copies": 4,
+          "best5_us": 32.06399977207184,
+          "abba_us": [
+            31.97824001312256,
+            32.001280784606934,
+            31.989760398864746,
+            31.872000694274902
+          ],
+          "mean_us": 31.960320472717285,
+          "effective_gbs": 327.4460282378463,
+          "quantized_and_packed_operand_bytes": 10465280,
+          "all_weight_operand_bytes": 10465280
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        23,
+        18
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 1,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 22.950400412082672,
+          "abba_us": [
+            22.977280616760254,
+            22.94015884399414,
+            22.93760061264038,
+            22.936320304870605
+          ],
+          "relative_l2": 0.0005667470977641642,
+          "ab_relative_l2": 0.00019969456479884684,
+          "bytes": 10567680,
+          "copies": 4,
+          "mean_us": 22.947840094566345,
+          "effective_gbs": 471.21820421610994,
+          "quantized_and_packed_operand_bytes": 10567680,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 10813440
+        },
+        "ordinary_wheel": {
+          "best5_us": 22.758400440216064,
+          "abba_us": [
+            22.93760061264038,
+            22.943999767303467,
+            22.947840690612793,
+            22.909440994262695
+          ],
+          "relative_l2": 0.00036007052403874695,
+          "ab_relative_l2": 0.00019969456479884684,
+          "bytes": 10567680,
+          "copies": 4,
+          "mean_us": 22.934720516204834,
+          "effective_gbs": 471.48775989485546,
+          "quantized_and_packed_operand_bytes": 10567680,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 10813440
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 10629120,
+          "copies": 4,
+          "best5_us": 33.395200967788696,
+          "abba_us": [
+            33.286399841308594,
+            33.18655967712402,
+            33.17888021469116,
+            33.19295883178711
+          ],
+          "mean_us": 33.21119964122772,
+          "effective_gbs": 320.04625291539367,
+          "quantized_and_packed_operand_bytes": 10629120,
+          "all_weight_operand_bytes": 10629120
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        23,
+        21
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 4,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 22.87359982728958,
+          "abba_us": [
+            22.917120456695557,
+            22.922239303588867,
+            22.91584014892578,
+            22.911999225616455
+          ],
+          "relative_l2": 0.0003571870329324156,
+          "ab_relative_l2": 0.00017785269301384687,
+          "bytes": 10813440,
+          "copies": 4,
+          "mean_us": 22.916799783706665,
+          "effective_gbs": 482.5804695410764,
+          "quantized_and_packed_operand_bytes": 10813440,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 11059200
+        },
+        "ordinary_wheel": {
+          "best5_us": 22.655999660491943,
+          "abba_us": [
+            22.7839994430542,
+            22.795519828796387,
+            22.804479598999023,
+            22.804479598999023
+          ],
+          "relative_l2": 0.0003571870329324156,
+          "ab_relative_l2": 0.00017785269301384687,
+          "bytes": 10813440,
+          "copies": 4,
+          "mean_us": 22.797119617462158,
+          "effective_gbs": 485.1139172656209,
+          "quantized_and_packed_operand_bytes": 10813440,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 11059200
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 10997760,
+          "copies": 4,
+          "best5_us": 33.44640135765076,
+          "abba_us": [
+            33.48223924636841,
+            33.42207908630371,
+            33.44383955001831,
+            33.40672016143799
+          ],
+          "mean_us": 33.438719511032104,
+          "effective_gbs": 328.8929767891267,
+          "quantized_and_packed_operand_bytes": 10997760,
+          "all_weight_operand_bytes": 10997760
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        23,
+        23
+      ],
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "layer_count": 4,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 24.422399699687958,
+          "abba_us": [
+            24.391679763793945,
+            24.38528060913086,
+            24.376320838928223,
+            24.373760223388672
+          ],
+          "relative_l2": 0.00035008281702175736,
+          "ab_relative_l2": 0.00018246716354042292,
+          "bytes": 11796480,
+          "copies": 4,
+          "mean_us": 24.381760358810425,
+          "effective_gbs": 493.9036321734866,
+          "quantized_and_packed_operand_bytes": 11796480,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 12042240
+        },
+        "ordinary_wheel": {
+          "best5_us": 24.25599992275238,
+          "abba_us": [
+            24.316160678863525,
+            24.303359985351562,
+            24.31488037109375,
+            24.276480674743652
+          ],
+          "relative_l2": 0.00035008281702175736,
+          "ab_relative_l2": 0.00018246716354042292,
+          "bytes": 11796480,
+          "copies": 4,
+          "mean_us": 24.302720427513123,
+          "effective_gbs": 495.50995889196724,
+          "quantized_and_packed_operand_bytes": 11796480,
+          "floating_ab_bytes": 245760,
+          "all_weight_operand_bytes": 12042240
+        },
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 11796480,
+          "copies": 4,
+          "best5_us": 34.68799889087677,
+          "abba_us": [
+            34.66495990753174,
+            34.52928066253662,
+            34.65984106063843,
+            34.70463991165161
+          ],
+          "mean_us": 34.6396803855896,
+          "effective_gbs": 340.54817679286197,
+          "quantized_and_packed_operand_bytes": 11796480,
+          "all_weight_operand_bytes": 11796480
+        }
+      }
+    },
+    {
+      "role": "ssm_out",
+      "types": [
+        12
+      ],
+      "n": [
+        5120
+      ],
+      "k": 1536,
+      "layer_count": 6,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 10.092088911268446,
+          "abba_us": [
+            10.203591452704536,
+            10.20302242702908,
+            10.201315350002712,
+            10.188799964057075
+          ],
+          "relative_l2": 0.0007515539764426649,
+          "ab_relative_l2": null,
+          "bytes": 4915200,
+          "copies": 9,
+          "mean_us": 10.199182298448351,
+          "effective_gbs": 481.92098701361306,
+          "quantized_and_packed_operand_bytes": 4915200,
+          "all_weight_operand_bytes": 4915200
+        },
+        "ordinary_wheel": {
+          "best5_us": 10.03520025147332,
+          "abba_us": [
+            10.144995583428276,
+            10.146133634779188,
+            10.147839652167427,
+            10.144995583428276
+          ],
+          "relative_l2": 0.0007515539764426649,
+          "ab_relative_l2": null,
+          "bytes": 4915200,
+          "copies": 9,
+          "mean_us": 10.145991113450792,
+          "effective_gbs": 484.44749704972605,
+          "quantized_and_packed_operand_bytes": 4915200,
+          "all_weight_operand_bytes": 4915200
+        },
+        "existing_main": {
+          "route": "canonical",
+          "bytes": 4915200,
+          "copies": 9,
+          "best5_us": 15.433955192565918,
+          "abba_us": [
+            15.44248898824056,
+            15.378203921847874,
+            15.396977530585396,
+            15.406648847791883
+          ],
+          "mean_us": 15.406079822116428,
+          "effective_gbs": 319.0428750696145,
+          "quantized_and_packed_operand_bytes": 4915200,
+          "all_weight_operand_bytes": 4915200
+        }
+      }
+    },
+    {
+      "role": "ssm_out",
+      "types": [
+        18
+      ],
+      "n": [
+        5120
+      ],
+      "k": 1536,
+      "layer_count": 4,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 9.362773100535074,
+          "abba_us": [
+            9.401344299316406,
+            9.400320053100586,
+            9.378133138020834,
+            9.383935928344727
+          ],
+          "relative_l2": 0.000785182579420507,
+          "ab_relative_l2": null,
+          "bytes": 3194880,
+          "copies": 15,
+          "mean_us": 9.390933354695639,
+          "effective_gbs": 340.208995137049,
+          "quantized_and_packed_operand_bytes": 3194880,
+          "all_weight_operand_bytes": 3194880
+        },
+        "ordinary_wheel": {
+          "best5_us": 9.280853271484375,
+          "abba_us": [
+            9.334101359049479,
+            9.314645131429037,
+            9.345024108886719,
+            9.30679448445638
+          ],
+          "relative_l2": 0.00036269560223445296,
+          "ab_relative_l2": null,
+          "bytes": 3194880,
+          "copies": 15,
+          "mean_us": 9.325141270955404,
+          "effective_gbs": 342.6092867837775,
+          "quantized_and_packed_operand_bytes": 3194880,
+          "all_weight_operand_bytes": 3194880
+        },
+        "existing_main": {
+          "route": "small_output",
+          "bytes": 3010560,
+          "copies": 15,
+          "best5_us": 13.090133666992188,
+          "abba_us": [
+            13.112660725911459,
+            13.101397196451822,
+            13.114368438720703,
+            13.104469299316406
+          ],
+          "mean_us": 13.108223915100098,
+          "effective_gbs": 229.6695585533878,
+          "quantized_and_packed_operand_bytes": 3010560,
+          "all_weight_operand_bytes": 3010560
+        }
+      }
+    },
+    {
+      "role": "ssm_out",
+      "types": [
+        21
+      ],
+      "n": [
+        5120
+      ],
+      "k": 1536,
+      "layer_count": 22,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 9.672861832838793,
+          "abba_us": [
+            9.747298314021183,
+            9.744541461651142,
+            9.752024870652418,
+            9.739421697763296
+          ],
+          "relative_l2": 0.0003683110699057579,
+          "ab_relative_l2": null,
+          "bytes": 3440640,
+          "copies": 13,
+          "mean_us": 9.74582158602201,
+          "effective_gbs": 353.03744990927737,
+          "quantized_and_packed_operand_bytes": 3440640,
+          "all_weight_operand_bytes": 3440640
+        },
+        "ordinary_wheel": {
+          "best5_us": 9.700430356539213,
+          "abba_us": [
+            9.792196567241962,
+            9.799679976243238,
+            9.772110718947191,
+            9.799286035391
+          ],
+          "relative_l2": 0.0003683110699057579,
+          "ab_relative_l2": null,
+          "bytes": 3440640,
+          "copies": 13,
+          "mean_us": 9.790818324455847,
+          "effective_gbs": 351.41495695062076,
+          "quantized_and_packed_operand_bytes": 3440640,
+          "all_weight_operand_bytes": 3440640
+        },
+        "existing_main": {
+          "route": "small_output",
+          "bytes": 3379200,
+          "copies": 14,
+          "best5_us": 13.717942578451973,
+          "abba_us": [
+            13.728914260864258,
+            13.730742590767997,
+            13.715748105730329,
+            13.72269766671317
+          ],
+          "mean_us": 13.724525656018937,
+          "effective_gbs": 246.2161596468757,
+          "quantized_and_packed_operand_bytes": 3379200,
+          "all_weight_operand_bytes": 3379200
+        }
+      }
+    },
+    {
+      "role": "ssm_out",
+      "types": [
+        23
+      ],
+      "n": [
+        5120
+      ],
+      "k": 1536,
+      "layer_count": 16,
+      "config": [
+        4,
+        2,
+        1
+      ],
+      "variants": {
+        "original": {
+          "best5_us": 10.11199951171875,
+          "abba_us": [
+            10.078207969665527,
+            10.084351539611816,
+            10.085375785827637,
+            10.078207969665527
+          ],
+          "relative_l2": 0.00033978105057030916,
+          "ab_relative_l2": null,
+          "bytes": 4423680,
+          "copies": 10,
+          "mean_us": 10.081535816192627,
+          "effective_gbs": 438.7902875765052,
+          "quantized_and_packed_operand_bytes": 4423680,
+          "all_weight_operand_bytes": 4423680
+        },
+        "ordinary_wheel": {
+          "best5_us": 9.943040013313293,
+          "abba_us": [
+            9.990655899047852,
+            9.988096237182617,
+            9.985535621643066,
+            9.984512329101562
+          ],
+          "relative_l2": 0.00033978105057030916,
+          "ab_relative_l2": null,
+          "bytes": 4423680,
+          "copies": 10,
+          "mean_us": 9.987200021743774,
+          "effective_gbs": 442.934955780291,
+          "quantized_and_packed_operand_bytes": 4423680,
+          "all_weight_operand_bytes": 4423680
+        },
+        "existing_main": {
+          "route": "small_output",
+          "bytes": 4177920,
+          "copies": 11,
+          "best5_us": 14.284800399433482,
+          "abba_us": [
+            14.232203743674539,
+            14.227548946033824,
+            14.226153113625266,
+            14.211258454756303
+          ],
+          "mean_us": 14.224291064522482,
+          "effective_gbs": 293.71727427740564,
+          "quantized_and_packed_operand_bytes": 4177920,
+          "all_weight_operand_bytes": 4177920
+        }
+      }
+    },
+    {
+      "role": "ffn_down",
+      "types": [
+        10
+      ],
+      "layer_count": 1,
+      "n": [
+        5120
+      ],
+      "k": 4352,
+      "variants": {
+        "existing_main": {
+          "route": "canonical_linear",
+          "bytes": 11141120,
+          "copies": 4,
+          "rounds_us": [
+            27.091200351715088,
+            27.124478816986084,
+            27.092480659484863,
+            27.12575912475586
+          ],
+          "mean_us": 27.108479738235474,
+          "effective_gbs": 410.9828403355972,
+          "quantized_and_packed_operand_bytes": 11141120,
+          "all_weight_operand_bytes": 11141120
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 11141120,
+          "copies": 4,
+          "rounds_us": [
+            27.091200351715088,
+            27.124478816986084,
+            27.092480659484863,
+            27.12575912475586
+          ],
+          "mean_us": 27.108479738235474,
+          "effective_gbs": 410.9828403355972,
+          "quantized_and_packed_operand_bytes": 11141120,
+          "all_weight_operand_bytes": 11141120
+        }
+      }
+    },
+    {
+      "role": "ffn_down",
+      "types": [
+        17
+      ],
+      "layer_count": 3,
+      "n": [
+        5120
+      ],
+      "k": 4352,
+      "variants": {
+        "existing_main": {
+          "route": "native_linear",
+          "bytes": 6440960,
+          "copies": 7,
+          "rounds_us": [
+            31.112777165004186,
+            28.84242194039481,
+            28.706376211983816,
+            28.598126002720424
+          ],
+          "mean_us": 29.314925330025808,
+          "effective_gbs": 219.7160636599967,
+          "quantized_and_packed_operand_bytes": 6440960,
+          "all_weight_operand_bytes": 6440960
+        },
+        "candidate": {
+          "route": "dmvq",
+          "bytes": 6440960,
+          "copies": 7,
+          "rounds_us": [
+            28.071496146065847,
+            27.694811139787948,
+            25.70313044956752,
+            24.02230943952288
+          ],
+          "mean_us": 26.372936793736052,
+          "effective_gbs": 244.2261190088553,
+          "quantized_and_packed_operand_bytes": 6440960,
+          "all_weight_operand_bytes": 6440960
+        }
+      }
+    },
+    {
+      "role": "ffn_down",
+      "types": [
+        22
+      ],
+      "layer_count": 4,
+      "n": [
+        5120
+      ],
+      "k": 4352,
+      "variants": {
+        "existing_main": {
+          "route": "native_linear",
+          "bytes": 7137280,
+          "copies": 6,
+          "rounds_us": [
+            29.297494888305664,
+            29.270188013712566,
+            29.223254521687824,
+            29.224958419799805
+          ],
+          "mean_us": 29.253973960876465,
+          "effective_gbs": 243.9764255463282,
+          "quantized_and_packed_operand_bytes": 7137280,
+          "all_weight_operand_bytes": 7137280
+        },
+        "candidate": {
+          "route": "dmvq",
+          "bytes": 7137280,
+          "copies": 6,
+          "rounds_us": [
+            25.821866989135742,
+            25.74336051940918,
+            25.755306879679363,
+            25.730560620625813
+          ],
+          "mean_us": 25.762773752212524,
+          "effective_gbs": 277.03849238621075,
+          "quantized_and_packed_operand_bytes": 7137280,
+          "all_weight_operand_bytes": 7137280
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        10,
+        21
+      ],
+      "layer_count": 1,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 16885760,
+          "copies": 4,
+          "rounds_us": [
+            52.014079093933105,
+            51.88864231109619,
+            51.82464122772217,
+            51.87839984893799
+          ],
+          "mean_us": 51.90144062042236,
+          "effective_gbs": 325.3427997017048,
+          "quantized_and_packed_operand_bytes": 16885760,
+          "all_weight_operand_bytes": 16885760
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 16885760,
+          "copies": 4,
+          "rounds_us": [
+            52.014079093933105,
+            51.88864231109619,
+            51.82464122772217,
+            51.87839984893799
+          ],
+          "mean_us": 51.90144062042236,
+          "effective_gbs": 325.3427997017048,
+          "quantized_and_packed_operand_bytes": 16885760,
+          "all_weight_operand_bytes": 16885760
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        16,
+        22
+      ],
+      "layer_count": 1,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 12881920,
+          "copies": 4,
+          "rounds_us": [
+            46.20543956756592,
+            46.160640716552734,
+            46.22079849243164,
+            46.22591972351074
+          ],
+          "mean_us": 46.20319962501526,
+          "effective_gbs": 278.8101279683993,
+          "quantized_and_packed_operand_bytes": 12881920,
+          "all_weight_operand_bytes": 12881920
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 12881920,
+          "copies": 4,
+          "rounds_us": [
+            46.20543956756592,
+            46.160640716552734,
+            46.22079849243164,
+            46.22591972351074
+          ],
+          "mean_us": 46.20319962501526,
+          "effective_gbs": 278.8101279683993,
+          "quantized_and_packed_operand_bytes": 12881920,
+          "all_weight_operand_bytes": 12881920
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        17,
+        16
+      ],
+      "layer_count": 2,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 12185600,
+          "copies": 4,
+          "rounds_us": [
+            42.86719799041748,
+            42.86464214324951,
+            42.880001068115234,
+            42.885122299194336
+          ],
+          "mean_us": 42.87424087524414,
+          "effective_gbs": 284.21727711652716,
+          "quantized_and_packed_operand_bytes": 12185600,
+          "all_weight_operand_bytes": 12185600
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 12185600,
+          "copies": 4,
+          "rounds_us": [
+            42.86719799041748,
+            42.86464214324951,
+            42.880001068115234,
+            42.885122299194336
+          ],
+          "mean_us": 42.87424087524414,
+          "effective_gbs": 284.21727711652716,
+          "quantized_and_packed_operand_bytes": 12185600,
+          "all_weight_operand_bytes": 12185600
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        17,
+        18
+      ],
+      "layer_count": 2,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 14970880,
+          "copies": 4,
+          "rounds_us": [
+            44.942078590393066,
+            44.94336128234863,
+            44.97920036315918,
+            44.99199867248535
+          ],
+          "mean_us": 44.96415972709656,
+          "effective_gbs": 332.9514015354359,
+          "quantized_and_packed_operand_bytes": 14970880,
+          "all_weight_operand_bytes": 14970880
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 14970880,
+          "copies": 4,
+          "rounds_us": [
+            44.942078590393066,
+            44.94336128234863,
+            44.97920036315918,
+            44.99199867248535
+          ],
+          "mean_us": 44.96415972709656,
+          "effective_gbs": 332.9514015354359,
+          "quantized_and_packed_operand_bytes": 14970880,
+          "all_weight_operand_bytes": 14970880
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        18,
+        22
+      ],
+      "layer_count": 2,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 15667200,
+          "copies": 4,
+          "rounds_us": [
+            47.375359535217285,
+            47.25503921508789,
+            47.18719959259033,
+            47.28447914123535
+          ],
+          "mean_us": 47.275519371032715,
+          "effective_gbs": 331.40196466249324,
+          "quantized_and_packed_operand_bytes": 15667200,
+          "all_weight_operand_bytes": 15667200
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 15667200,
+          "copies": 4,
+          "rounds_us": [
+            47.375359535217285,
+            47.25503921508789,
+            47.18719959259033,
+            47.28447914123535
+          ],
+          "mean_us": 47.275519371032715,
+          "effective_gbs": 331.40196466249324,
+          "quantized_and_packed_operand_bytes": 15667200,
+          "all_weight_operand_bytes": 15667200
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        21,
+        22
+      ],
+      "layer_count": 1,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 16711680,
+          "copies": 4,
+          "rounds_us": [
+            44.94847774505615,
+            44.958720207214355,
+            44.8908805847168,
+            44.89215850830078
+          ],
+          "mean_us": 44.92255926132202,
+          "effective_gbs": 372.0108621324393,
+          "quantized_and_packed_operand_bytes": 16711680,
+          "all_weight_operand_bytes": 16711680
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 16711680,
+          "copies": 4,
+          "rounds_us": [
+            44.94847774505615,
+            44.958720207214355,
+            44.8908805847168,
+            44.89215850830078
+          ],
+          "mean_us": 44.92255926132202,
+          "effective_gbs": 372.0108621324393,
+          "quantized_and_packed_operand_bytes": 16711680,
+          "all_weight_operand_bytes": 16711680
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        22,
+        17
+      ],
+      "layer_count": 1,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 13578240,
+          "copies": 4,
+          "rounds_us": [
+            45.85728168487549,
+            45.736961364746094,
+            45.736961364746094,
+            45.89824199676514
+          ],
+          "mean_us": 45.8073616027832,
+          "effective_gbs": 296.4204775150159,
+          "quantized_and_packed_operand_bytes": 13578240,
+          "all_weight_operand_bytes": 13578240
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 13578240,
+          "copies": 4,
+          "rounds_us": [
+            45.85728168487549,
+            45.736961364746094,
+            45.736961364746094,
+            45.89824199676514
+          ],
+          "mean_us": 45.8073616027832,
+          "effective_gbs": 296.4204775150159,
+          "quantized_and_packed_operand_bytes": 13578240,
+          "all_weight_operand_bytes": 13578240
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        22,
+        18
+      ],
+      "layer_count": 1,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 15667200,
+          "copies": 4,
+          "rounds_us": [
+            47.46367931365967,
+            47.47392177581787,
+            47.38175868988037,
+            47.36256122589111
+          ],
+          "mean_us": 47.420480251312256,
+          "effective_gbs": 330.38889351118377,
+          "quantized_and_packed_operand_bytes": 15667200,
+          "all_weight_operand_bytes": 15667200
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 15667200,
+          "copies": 4,
+          "rounds_us": [
+            47.46367931365967,
+            47.47392177581787,
+            47.38175868988037,
+            47.36256122589111
+          ],
+          "mean_us": 47.420480251312256,
+          "effective_gbs": 330.38889351118377,
+          "quantized_and_packed_operand_bytes": 15667200,
+          "all_weight_operand_bytes": 15667200
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        22,
+        21
+      ],
+      "layer_count": 2,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 16711680,
+          "copies": 4,
+          "rounds_us": [
+            45.51424026489258,
+            45.428481101989746,
+            45.3056001663208,
+            45.39519786834717
+          ],
+          "mean_us": 45.41087985038757,
+          "effective_gbs": 368.0104868053414,
+          "quantized_and_packed_operand_bytes": 16711680,
+          "all_weight_operand_bytes": 16711680
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 16711680,
+          "copies": 4,
+          "rounds_us": [
+            45.51424026489258,
+            45.428481101989746,
+            45.3056001663208,
+            45.39519786834717
+          ],
+          "mean_us": 45.41087985038757,
+          "effective_gbs": 368.0104868053414,
+          "quantized_and_packed_operand_bytes": 16711680,
+          "all_weight_operand_bytes": 16711680
+        }
+      }
+    },
+    {
+      "role": "gate_up",
+      "types": [
+        29,
+        22
+      ],
+      "layer_count": 1,
+      "n": [
+        4352,
+        4352
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_pair",
+          "bytes": 12011520,
+          "copies": 4,
+          "rounds_us": [
+            58.75584125518799,
+            58.577919006347656,
+            58.39360237121582,
+            58.28479766845703
+          ],
+          "mean_us": 58.503040075302124,
+          "effective_gbs": 205.31445860829427,
+          "quantized_and_packed_operand_bytes": 12011520,
+          "all_weight_operand_bytes": 12011520
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 12011520,
+          "copies": 4,
+          "rounds_us": [
+            58.75584125518799,
+            58.577919006347656,
+            58.39360237121582,
+            58.28479766845703
+          ],
+          "mean_us": 58.503040075302124,
+          "effective_gbs": 205.31445860829427,
+          "quantized_and_packed_operand_bytes": 12011520,
+          "all_weight_operand_bytes": 12011520
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        10,
+        18
+      ],
+      "layer_count": 1,
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 10219520,
+          "copies": 4,
+          "rounds_us": [
+            31.07327938079834,
+            31.07327938079834,
+            31.066880226135254,
+            31.04383945465088
+          ],
+          "mean_us": 31.064319610595703,
+          "effective_gbs": 328.97936050446225,
+          "quantized_and_packed_operand_bytes": 10219520,
+          "all_weight_operand_bytes": 10219520
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 10219520,
+          "copies": 4,
+          "rounds_us": [
+            31.07327938079834,
+            31.07327938079834,
+            31.066880226135254,
+            31.04383945465088
+          ],
+          "mean_us": 31.064319610595703,
+          "effective_gbs": 328.97936050446225,
+          "quantized_and_packed_operand_bytes": 10219520,
+          "all_weight_operand_bytes": 10219520
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        16,
+        23
+      ],
+      "layer_count": 1,
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 8212480,
+          "copies": 5,
+          "rounds_us": [
+            32.15155029296875,
+            32.1525764465332,
+            32.163841247558594,
+            32.18329620361328
+          ],
+          "mean_us": 32.16281604766846,
+          "effective_gbs": 255.34082549949284,
+          "quantized_and_packed_operand_bytes": 8212480,
+          "all_weight_operand_bytes": 8212480
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 8212480,
+          "copies": 5,
+          "rounds_us": [
+            32.15155029296875,
+            32.1525764465332,
+            32.163841247558594,
+            32.18329620361328
+          ],
+          "mean_us": 32.16281604766846,
+          "effective_gbs": 255.34082549949284,
+          "quantized_and_packed_operand_bytes": 8212480,
+          "all_weight_operand_bytes": 8212480
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        17,
+        18
+      ],
+      "layer_count": 1,
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 7454720,
+          "copies": 6,
+          "rounds_us": [
+            29.712212880452473,
+            29.7216002146403,
+            29.71306800842285,
+            29.70197359720866
+          ],
+          "mean_us": 29.712213675181072,
+          "effective_gbs": 250.8974956055532,
+          "quantized_and_packed_operand_bytes": 7454720,
+          "all_weight_operand_bytes": 7454720
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 7454720,
+          "copies": 6,
+          "rounds_us": [
+            29.712212880452473,
+            29.7216002146403,
+            29.71306800842285,
+            29.70197359720866
+          ],
+          "mean_us": 29.712213675181072,
+          "effective_gbs": 250.8974956055532,
+          "quantized_and_packed_operand_bytes": 7454720,
+          "all_weight_operand_bytes": 7454720
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        18,
+        10
+      ],
+      "layer_count": 3,
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 9605120,
+          "copies": 4,
+          "rounds_us": [
+            31.091198921203613,
+            31.071999073028564,
+            31.056640148162842,
+            31.04896068572998
+          ],
+          "mean_us": 31.06719970703125,
+          "effective_gbs": 309.1723776387266,
+          "quantized_and_packed_operand_bytes": 9605120,
+          "all_weight_operand_bytes": 9605120
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 9605120,
+          "copies": 4,
+          "rounds_us": [
+            31.091198921203613,
+            31.071999073028564,
+            31.056640148162842,
+            31.04896068572998
+          ],
+          "mean_us": 31.06719970703125,
+          "effective_gbs": 309.1723776387266,
+          "quantized_and_packed_operand_bytes": 9605120,
+          "all_weight_operand_bytes": 9605120
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        18,
+        22
+      ],
+      "layer_count": 1,
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 8192000,
+          "copies": 5,
+          "rounds_us": [
+            31.24224090576172,
+            31.249408721923828,
+            31.254528045654297,
+            31.255552291870117
+          ],
+          "mean_us": 31.25043249130249,
+          "effective_gbs": 262.1403720502098,
+          "quantized_and_packed_operand_bytes": 8192000,
+          "all_weight_operand_bytes": 8192000
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 8192000,
+          "copies": 5,
+          "rounds_us": [
+            31.24224090576172,
+            31.249408721923828,
+            31.254528045654297,
+            31.255552291870117
+          ],
+          "mean_us": 31.25043249130249,
+          "effective_gbs": 262.1403720502098,
+          "quantized_and_packed_operand_bytes": 8192000,
+          "all_weight_operand_bytes": 8192000
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        21,
+        10
+      ],
+      "layer_count": 1,
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 10219520,
+          "copies": 4,
+          "rounds_us": [
+            29.802238941192627,
+            29.78816032409668,
+            29.79072093963623,
+            29.78048086166382
+          ],
+          "mean_us": 29.79040026664734,
+          "effective_gbs": 343.0474216031781,
+          "quantized_and_packed_operand_bytes": 10219520,
+          "all_weight_operand_bytes": 10219520
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 10219520,
+          "copies": 4,
+          "rounds_us": [
+            29.802238941192627,
+            29.78816032409668,
+            29.79072093963623,
+            29.78048086166382
+          ],
+          "mean_us": 29.79040026664734,
+          "effective_gbs": 343.0474216031781,
+          "quantized_and_packed_operand_bytes": 10219520,
+          "all_weight_operand_bytes": 10219520
+        }
+      }
+    },
+    {
+      "role": "qkvz_ab",
+      "types": [
+        21,
+        22
+      ],
+      "layer_count": 1,
+      "n": [
+        2560,
+        1536
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkvz",
+          "bytes": 8806400,
+          "copies": 5,
+          "rounds_us": [
+            32.535552978515625,
+            32.535552978515625,
+            32.5294075012207,
+            32.551937103271484
+          ],
+          "mean_us": 32.53811264038086,
+          "effective_gbs": 270.6487649523645,
+          "quantized_and_packed_operand_bytes": 8806400,
+          "all_weight_operand_bytes": 8806400
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 8806400,
+          "copies": 5,
+          "rounds_us": [
+            32.535552978515625,
+            32.535552978515625,
+            32.5294075012207,
+            32.551937103271484
+          ],
+          "mean_us": 32.53811264038086,
+          "effective_gbs": 270.6487649523645,
+          "quantized_and_packed_operand_bytes": 8806400,
+          "all_weight_operand_bytes": 8806400
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        16,
+        21,
+        21
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 5181440,
+          "copies": 9,
+          "rounds_us": [
+            28.7755372789171,
+            28.745956420898438,
+            28.767005072699654,
+            28.776675330268013
+          ],
+          "mean_us": 28.7662935256958,
+          "effective_gbs": 180.1219192653938,
+          "quantized_and_packed_operand_bytes": 5181440,
+          "all_weight_operand_bytes": 5181440
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 5181440,
+          "copies": 9,
+          "rounds_us": [
+            28.7755372789171,
+            28.745956420898438,
+            28.767005072699654,
+            28.776675330268013
+          ],
+          "mean_us": 28.7662935256958,
+          "effective_gbs": 180.1219192653938,
+          "quantized_and_packed_operand_bytes": 5181440,
+          "all_weight_operand_bytes": 5181440
+        }
+      }
+    },
+    {
+      "role": "attn_o",
+      "types": [
+        21
+      ],
+      "layer_count": 10,
+      "n": [
+        5120
+      ],
+      "k": 1536,
+      "variants": {
+        "existing_main": {
+          "route": "small_output",
+          "bytes": 3379200,
+          "copies": 14,
+          "rounds_us": [
+            13.343086242675781,
+            13.373805454799108,
+            13.369782311575753,
+            13.344182968139648
+          ],
+          "mean_us": 13.357714244297572,
+          "effective_gbs": 252.97741351538383,
+          "quantized_and_packed_operand_bytes": 3379200,
+          "all_weight_operand_bytes": 3379200
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 3440640,
+          "copies": 13,
+          "rounds_us": [
+            9.70043109013484,
+            9.661833689762997,
+            9.672861832838793,
+            9.696886356060322
+          ],
+          "mean_us": 9.683003242199238,
+          "effective_gbs": 355.3277752717709,
+          "quantized_and_packed_operand_bytes": 3440640,
+          "all_weight_operand_bytes": 3440640
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        10,
+        23,
+        21
+      ],
+      "layer_count": 2,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 9123840,
+          "copies": 5,
+          "rounds_us": [
+            29.093887329101562,
+            29.107200622558594,
+            29.139968872070312,
+            29.081600189208984
+          ],
+          "mean_us": 29.105664253234863,
+          "effective_gbs": 313.4730037637247,
+          "quantized_and_packed_operand_bytes": 9123840,
+          "all_weight_operand_bytes": 9123840
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 9123840,
+          "copies": 5,
+          "rounds_us": [
+            29.093887329101562,
+            29.107200622558594,
+            29.139968872070312,
+            29.081600189208984
+          ],
+          "mean_us": 29.105664253234863,
+          "effective_gbs": 313.4730037637247,
+          "quantized_and_packed_operand_bytes": 9123840,
+          "all_weight_operand_bytes": 9123840
+        }
+      }
+    },
+    {
+      "role": "attn_o",
+      "types": [
+        18
+      ],
+      "layer_count": 1,
+      "n": [
+        5120
+      ],
+      "k": 1536,
+      "variants": {
+        "existing_main": {
+          "route": "small_output",
+          "bytes": 3010560,
+          "copies": 15,
+          "rounds_us": [
+            13.16693369547526,
+            13.158400217692057,
+            13.156351725260416,
+            13.178197224934896
+          ],
+          "mean_us": 13.164970715840658,
+          "effective_gbs": 228.67958197412207,
+          "quantized_and_packed_operand_bytes": 3010560,
+          "all_weight_operand_bytes": 3010560
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 3194880,
+          "copies": 15,
+          "rounds_us": [
+            9.1146240234375,
+            9.11564826965332,
+            9.121450424194336,
+            9.085269292195639
+          ],
+          "mean_us": 9.1092480023702,
+          "effective_gbs": 350.72928074509576,
+          "quantized_and_packed_operand_bytes": 3194880,
+          "all_weight_operand_bytes": 3194880
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        10,
+        22,
+        18
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 8785920,
+          "copies": 5,
+          "rounds_us": [
+            28.199935913085938,
+            28.16819190979004,
+            28.211200714111328,
+            28.16819190979004
+          ],
+          "mean_us": 28.186880111694336,
+          "effective_gbs": 311.7024645929099,
+          "quantized_and_packed_operand_bytes": 8785920,
+          "all_weight_operand_bytes": 8785920
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 8785920,
+          "copies": 5,
+          "rounds_us": [
+            28.199935913085938,
+            28.16819190979004,
+            28.211200714111328,
+            28.16819190979004
+          ],
+          "mean_us": 28.186880111694336,
+          "effective_gbs": 311.7024645929099,
+          "quantized_and_packed_operand_bytes": 8785920,
+          "all_weight_operand_bytes": 8785920
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        10,
+        12,
+        21
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 9246720,
+          "copies": 5,
+          "rounds_us": [
+            27.0960636138916,
+            27.15545654296875,
+            27.201536178588867,
+            27.16979217529297
+          ],
+          "mean_us": 27.155712127685547,
+          "effective_gbs": 340.50736568874095,
+          "quantized_and_packed_operand_bytes": 9246720,
+          "all_weight_operand_bytes": 9246720
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 9246720,
+          "copies": 5,
+          "rounds_us": [
+            27.0960636138916,
+            27.15545654296875,
+            27.201536178588867,
+            27.16979217529297
+          ],
+          "mean_us": 27.155712127685547,
+          "effective_gbs": 340.50736568874095,
+          "quantized_and_packed_operand_bytes": 9246720,
+          "all_weight_operand_bytes": 9246720
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        10,
+        18,
+        21
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 8929280,
+          "copies": 5,
+          "rounds_us": [
+            27.36844825744629,
+            27.38585662841797,
+            27.388927459716797,
+            27.404287338256836
+          ],
+          "mean_us": 27.386879920959473,
+          "effective_gbs": 326.0422518289981,
+          "quantized_and_packed_operand_bytes": 8929280,
+          "all_weight_operand_bytes": 8929280
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 8929280,
+          "copies": 5,
+          "rounds_us": [
+            27.36844825744629,
+            27.38585662841797,
+            27.388927459716797,
+            27.404287338256836
+          ],
+          "mean_us": 27.386879920959473,
+          "effective_gbs": 326.0422518289981,
+          "quantized_and_packed_operand_bytes": 8929280,
+          "all_weight_operand_bytes": 8929280
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        21,
+        12,
+        12
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 8396800,
+          "copies": 5,
+          "rounds_us": [
+            28.94540786743164,
+            28.93721580505371,
+            28.96076774597168,
+            28.95462417602539
+          ],
+          "mean_us": 28.949503898620605,
+          "effective_gbs": 290.0498754453645,
+          "quantized_and_packed_operand_bytes": 8396800,
+          "all_weight_operand_bytes": 8396800
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 8519680,
+          "copies": 5,
+          "rounds_us": [
+            20.842496871948242,
+            20.84659194946289,
+            20.85273551940918,
+            20.85171127319336
+          ],
+          "mean_us": 20.848383903503418,
+          "effective_gbs": 408.64942047466474,
+          "quantized_and_packed_operand_bytes": 8519680,
+          "all_weight_operand_bytes": 8519680
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        23,
+        23,
+        12
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 9871360,
+          "copies": 4,
+          "rounds_us": [
+            33.364479541778564,
+            33.32736015319824,
+            33.32479953765869,
+            33.29535961151123
+          ],
+          "mean_us": 33.32799971103668,
+          "effective_gbs": 296.18819267845424,
+          "quantized_and_packed_operand_bytes": 9871360,
+          "all_weight_operand_bytes": 9871360
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 10403840,
+          "copies": 4,
+          "rounds_us": [
+            18.31936001777649,
+            18.32576036453247,
+            18.31552028656006,
+            18.30399990081787
+          ],
+          "mean_us": 18.316160142421722,
+          "effective_gbs": 568.0142518465898,
+          "quantized_and_packed_operand_bytes": 10403840,
+          "all_weight_operand_bytes": 10403840
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        10,
+        23,
+        12
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 9379840,
+          "copies": 5,
+          "rounds_us": [
+            29.247488021850586,
+            29.31609535217285,
+            29.430784225463867,
+            29.452287673950195
+          ],
+          "mean_us": 29.361663818359375,
+          "effective_gbs": 319.4587356502235,
+          "quantized_and_packed_operand_bytes": 9379840,
+          "all_weight_operand_bytes": 9379840
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 9379840,
+          "copies": 5,
+          "rounds_us": [
+            29.247488021850586,
+            29.31609535217285,
+            29.430784225463867,
+            29.452287673950195
+          ],
+          "mean_us": 29.361663818359375,
+          "effective_gbs": 319.4587356502235,
+          "quantized_and_packed_operand_bytes": 9379840,
+          "all_weight_operand_bytes": 9379840
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        21,
+        23,
+        12
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 8273920,
+          "copies": 5,
+          "rounds_us": [
+            29.617151260375977,
+            29.5546875,
+            29.58028793334961,
+            29.57823944091797
+          ],
+          "mean_us": 29.58259153366089,
+          "effective_gbs": 279.6888159911692,
+          "quantized_and_packed_operand_bytes": 8273920,
+          "all_weight_operand_bytes": 8273920
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 8273920,
+          "copies": 5,
+          "rounds_us": [
+            29.617151260375977,
+            29.5546875,
+            29.58028793334961,
+            29.57823944091797
+          ],
+          "mean_us": 29.58259153366089,
+          "effective_gbs": 279.6888159911692,
+          "quantized_and_packed_operand_bytes": 8273920,
+          "all_weight_operand_bytes": 8273920
+        }
+      }
+    },
+    {
+      "role": "attn_o",
+      "types": [
+        23
+      ],
+      "layer_count": 2,
+      "n": [
+        5120
+      ],
+      "k": 1536,
+      "variants": {
+        "existing_main": {
+          "route": "small_output",
+          "bytes": 4177920,
+          "copies": 11,
+          "rounds_us": [
+            14.150748686356978,
+            14.154937917535955,
+            14.151214252818715,
+            14.160989414561879
+          ],
+          "mean_us": 14.154472567818381,
+          "effective_gbs": 295.1660671199379,
+          "quantized_and_packed_operand_bytes": 4177920,
+          "all_weight_operand_bytes": 4177920
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 4423680,
+          "copies": 10,
+          "rounds_us": [
+            9.934335708618164,
+            9.934847831726074,
+            9.93228816986084,
+            9.93331241607666
+          ],
+          "mean_us": 9.933696031570435,
+          "effective_gbs": 445.32065264943014,
+          "quantized_and_packed_operand_bytes": 4423680,
+          "all_weight_operand_bytes": 4423680
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        21,
+        23,
+        23
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 8151040,
+          "copies": 5,
+          "rounds_us": [
+            29.75129508972168,
+            29.726720809936523,
+            29.704191207885742,
+            29.74822425842285
+          ],
+          "mean_us": 29.7326078414917,
+          "effective_gbs": 274.144805711434,
+          "quantized_and_packed_operand_bytes": 8151040,
+          "all_weight_operand_bytes": 8151040
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 8355840,
+          "copies": 5,
+          "rounds_us": [
+            20.694015502929688,
+            20.68889617919922,
+            20.696063995361328,
+            20.701183319091797
+          ],
+          "mean_us": 20.695039749145508,
+          "effective_gbs": 403.76051949090896,
+          "quantized_and_packed_operand_bytes": 8355840,
+          "all_weight_operand_bytes": 8355840
+        }
+      }
+    },
+    {
+      "role": "attn_o",
+      "types": [
+        12
+      ],
+      "layer_count": 3,
+      "n": [
+        5120
+      ],
+      "k": 1536,
+      "variants": {
+        "existing_main": {
+          "route": "canonical",
+          "bytes": 4915200,
+          "copies": 9,
+          "rounds_us": [
+            15.487431420220268,
+            15.49141354031033,
+            15.506772994995117,
+            15.432248645358616
+          ],
+          "mean_us": 15.479466650221081,
+          "effective_gbs": 317.53032007273976,
+          "quantized_and_packed_operand_bytes": 4915200,
+          "all_weight_operand_bytes": 4915200
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 4915200,
+          "copies": 9,
+          "rounds_us": [
+            10.174008475409615,
+            10.176284578111437,
+            10.17287148369683,
+            10.175146526760525
+          ],
+          "mean_us": 10.174577765994602,
+          "effective_gbs": 483.08638579848935,
+          "quantized_and_packed_operand_bytes": 4915200,
+          "all_weight_operand_bytes": 4915200
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        23,
+        12,
+        12
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 9994240,
+          "copies": 4,
+          "rounds_us": [
+            33.15840005874634,
+            33.153278827667236,
+            33.19808006286621,
+            33.18144083023071
+          ],
+          "mean_us": 33.172799944877625,
+          "effective_gbs": 301.2781560979829,
+          "quantized_and_packed_operand_bytes": 9994240,
+          "all_weight_operand_bytes": 9994240
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 10485760,
+          "copies": 4,
+          "rounds_us": [
+            18.666239976882935,
+            18.668800592422485,
+            18.67136001586914,
+            18.670079708099365
+          ],
+          "mean_us": 18.66912007331848,
+          "effective_gbs": 561.6633220430152,
+          "quantized_and_packed_operand_bytes": 10485760,
+          "all_weight_operand_bytes": 10485760
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        18,
+        23,
+        12
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 7536640,
+          "copies": 6,
+          "rounds_us": [
+            30.465707778930664,
+            30.46229362487793,
+            30.46229362487793,
+            30.45376141866048
+          ],
+          "mean_us": 30.46101411183675,
+          "effective_gbs": 247.41920844557046,
+          "quantized_and_packed_operand_bytes": 7536640,
+          "all_weight_operand_bytes": 7536640
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 7536640,
+          "copies": 6,
+          "rounds_us": [
+            30.465707778930664,
+            30.46229362487793,
+            30.46229362487793,
+            30.45376141866048
+          ],
+          "mean_us": 30.46101411183675,
+          "effective_gbs": 247.41920844557046,
+          "quantized_and_packed_operand_bytes": 7536640,
+          "all_weight_operand_bytes": 7536640
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        18,
+        12,
+        12
+      ],
+      "layer_count": 2,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 7659520,
+          "copies": 6,
+          "rounds_us": [
+            30.217386881510418,
+            30.209706624348957,
+            30.223360061645508,
+            30.219093958536785
+          ],
+          "mean_us": 30.217386881510418,
+          "effective_gbs": 253.48055508687116,
+          "quantized_and_packed_operand_bytes": 7659520,
+          "all_weight_operand_bytes": 7659520
+        },
+        "candidate": {
+          "route": "dmv11",
+          "bytes": 8028160,
+          "copies": 5,
+          "rounds_us": [
+            19.977216720581055,
+            19.979263305664062,
+            19.979263305664062,
+            19.985408782958984
+          ],
+          "mean_us": 19.98028802871704,
+          "effective_gbs": 401.8040174626801,
+          "quantized_and_packed_operand_bytes": 8028160,
+          "all_weight_operand_bytes": 8028160
+        }
+      }
+    },
+    {
+      "role": "attn_qkv",
+      "types": [
+        12,
+        23,
+        21
+      ],
+      "layer_count": 1,
+      "n": [
+        3072,
+        256,
+        256
+      ],
+      "k": 5120,
+      "variants": {
+        "existing_main": {
+          "route": "native_qkv",
+          "bytes": 11089920,
+          "copies": 4,
+          "rounds_us": [
+            30.510079860687256,
+            30.48703908920288,
+            30.519039630889893,
+            30.464000701904297
+          ],
+          "mean_us": 30.49503982067108,
+          "effective_gbs": 363.6630765270453,
+          "quantized_and_packed_operand_bytes": 11089920,
+          "all_weight_operand_bytes": 11089920
+        },
+        "candidate": {
+          "route": "unchanged_fallback",
+          "bytes": 11089920,
+          "copies": 4,
+          "rounds_us": [
+            30.510079860687256,
+            30.48703908920288,
+            30.519039630889893,
+            30.464000701904297
+          ],
+          "mean_us": 30.49503982067108,
+          "effective_gbs": 363.6630765270453,
+          "quantized_and_packed_operand_bytes": 11089920,
+          "all_weight_operand_bytes": 11089920
+        }
+      }
+    }
+  ]
+}

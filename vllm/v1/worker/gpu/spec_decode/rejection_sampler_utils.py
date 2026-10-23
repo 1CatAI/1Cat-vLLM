@@ -586,8 +586,12 @@ def _dflash2_sparse_topk_rejection_kernel(
     DRAFT_TOP_K: tl.constexpr,
     DRAFT_BLOCK_K: tl.constexpr,
     USE_FP64: tl.constexpr,
+    GREEDY_DRAFT: tl.constexpr = False,
 ):
     """DFlash2 chain rejection on compact target/draft supports.
+
+    GREEDY_DRAFT: the proposal is the drafted token with probability one
+    (argmax drafts, e.g. MTP); the draft tensors are not read.
 
     The target distribution is zero outside its top-k/top-p support and the
     DFlash2 proposal is zero outside selector top-k. Therefore both the
@@ -636,34 +640,41 @@ def _dflash2_sparse_topk_rejection_kernel(
                 axis=0,
             )
 
-            draft_base = (
-                draft_logits_ptr
-                + req_state_idx * draft_stride_0
-                + step * draft_stride_1
-            )
-            draft_id_base = (
-                draft_ids_ptr + req_state_idx * draft_stride_0 + step * draft_stride_1
-            )
-            draft_ids = tl.load(
-                draft_id_base + draft_offsets,
-                mask=draft_mask,
-                other=0,
-            ).to(tl.int64)
-            draft_logits = tl.load(
-                draft_base + draft_offsets,
-                mask=draft_mask,
-                other=float("-inf"),
-            ).to(tl.float32)
-            draft_max, draft_sumexp = _compute_block_max_and_sumexp(draft_logits)
-            draft_lse = draft_max + tl.log(draft_sumexp)
-            draft_proposed_logit = tl.max(
-                tl.where(
-                    draft_mask & (draft_ids == proposed),
-                    draft_logits,
-                    float("-inf"),
-                ),
-                axis=0,
-            )
+            if GREEDY_DRAFT:
+                # log q(proposed) = 0 for a one-hot proposal.
+                draft_proposed_logit = 0.0
+                draft_lse = 0.0
+            else:
+                draft_base = (
+                    draft_logits_ptr
+                    + req_state_idx * draft_stride_0
+                    + step * draft_stride_1
+                )
+                draft_id_base = (
+                    draft_ids_ptr
+                    + req_state_idx * draft_stride_0
+                    + step * draft_stride_1
+                )
+                draft_ids = tl.load(
+                    draft_id_base + draft_offsets,
+                    mask=draft_mask,
+                    other=0,
+                ).to(tl.int64)
+                draft_logits = tl.load(
+                    draft_base + draft_offsets,
+                    mask=draft_mask,
+                    other=float("-inf"),
+                ).to(tl.float32)
+                draft_max, draft_sumexp = _compute_block_max_and_sumexp(draft_logits)
+                draft_lse = draft_max + tl.log(draft_sumexp)
+                draft_proposed_logit = tl.max(
+                    tl.where(
+                        draft_mask & (draft_ids == proposed),
+                        draft_logits,
+                        float("-inf"),
+                    ),
+                    axis=0,
+                )
 
             pos = tl.load(pos_ptr + row)
             uniform = tl_rand32(seed, pos, includes_zero=False)
@@ -691,7 +702,17 @@ def _dflash2_sparse_topk_rejection_kernel(
     )
     is_bonus = resample_row == end_idx - 1
     residual_logits = target_logits
-    if not is_bonus:
+    if GREEDY_DRAFT:
+        if not is_bonus:
+            # relu(p - onehot(d)) is p without d (p(d) <= 1).
+            rejected = tl.load(draft_sampled_ptr + resample_row + 1).to(tl.int64)
+            target_log_probs = target_logits - target_lse
+            residual_logits = tl.where(
+                target_keep & (target_ids != rejected),
+                target_log_probs,
+                float("-inf"),
+            )
+    elif not is_bonus:
         draft_base = (
             draft_logits_ptr
             + req_state_idx * draft_stride_0
@@ -753,6 +774,78 @@ def _dflash2_sparse_topk_rejection_kernel(
         selected_token,
     )
     tl.store(num_sampled_ptr + req_idx, resample_step + 1)
+
+
+def greedy_draft_sparse_topk_rejection_sample(
+    target_topk_ids: torch.Tensor,
+    target_topk_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    pos: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    num_speculative_steps: int,
+    use_fp64: bool = False,
+    target_top_k: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact rejection of argmax drafts against compact target supports.
+
+    Same target contract as the compact-support chain rejection below; the
+    proposal is one-hot on the drafted token, so no draft scores are needed.
+    """
+    if target_topk_ids.ndim != 2 or target_topk_ids.shape != target_topk_logits.shape:
+        raise ValueError("target top-k ids/logits must be matching 2-D tensors")
+    if target_topk_ids.shape[0] != draft_sampled.shape[0]:
+        raise ValueError("target rows and sampled-token rows must match")
+    if not 0 < target_topk_ids.shape[1] <= 64:
+        raise ValueError("target top-k width must be in [1, 64]")
+    if target_top_k is None:
+        target_top_k = target_topk_ids.shape[1]
+    if not 0 < target_top_k <= target_topk_ids.shape[1]:
+        raise ValueError("target cutoff must be within the candidate width")
+    if (
+        target_topk_ids.stride(-1) != 1
+        or target_topk_logits.stride(-1) != 1
+        or target_topk_ids.stride(0) != target_topk_logits.stride(0)
+    ):
+        target_topk_ids = target_topk_ids.contiguous()
+        target_topk_logits = target_topk_logits.contiguous()
+    num_reqs = cu_num_logits.shape[0] - 1
+    sampled = draft_sampled.new_empty(
+        num_reqs, num_speculative_steps + 1, dtype=torch.int64
+    )
+    num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
+    _dflash2_sparse_topk_rejection_kernel[(num_reqs,)](
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        target_topk_ids,
+        target_topk_logits,
+        target_topk_ids.stride(0),
+        target_topk_ids,  # draft tensors are not read with GREEDY_DRAFT
+        target_topk_logits,
+        0,
+        0,
+        draft_sampled,
+        cu_num_logits,
+        idx_mapping,
+        temperature,
+        top_p,
+        seed,
+        pos,
+        num_speculative_steps=num_speculative_steps,
+        TARGET_TOP_K=target_topk_ids.shape[1],
+        TARGET_BLOCK_K=triton.next_power_of_2(target_topk_ids.shape[1]),
+        TARGET_LIMIT_K=target_top_k,
+        DRAFT_TOP_K=1,
+        DRAFT_BLOCK_K=1,
+        USE_FP64=use_fp64,
+        GREEDY_DRAFT=True,
+        num_warps=1,
+    )
+    return sampled, num_sampled
 
 
 def dflash2_sparse_topk_rejection_sample(

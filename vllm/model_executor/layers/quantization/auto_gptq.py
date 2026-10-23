@@ -9,7 +9,6 @@ from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from transformers import PretrainedConfig
 
 import vllm.model_executor.layers.fused_moe  # noqa
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MPLinearLayerConfig,
@@ -453,7 +452,7 @@ class AutoGPTQLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if sm70_tm.should_prepare_turbomind(
             layer.qweight,
-            envs.VLLM_SM70_GPTQ_TURBOMIND,
+            sm70_tm.layer_policy().value("gptq_turbomind"),
         ):
             unsupported = []
             if self.quant_config.weight_bits != 4:

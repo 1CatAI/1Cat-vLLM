@@ -17,8 +17,9 @@
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-bool sm70_profile_trace_enabled() {
-  const char* value = std::getenv("VLLM_SM70_PROFILE_TRACE");
+bool sm70_profile_trace_enabled(const vllm::CustomAllreduce& owner) {
+  const char* value =
+      owner.policy_.raw(vllm::CollectivePolicyField::sm70_profile_trace);
   return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
@@ -48,9 +49,10 @@ const char* capture_status_name(cudaStreamCaptureStatus status) {
   }
 }
 
-fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
-                      torch::Tensor& rank_data, int64_t rank,
-                      bool fully_connected) {
+static fptr_t init_custom_ar_impl(const std::vector<fptr_t>& fake_ipc_ptrs,
+                                  torch::Tensor& rank_data, int64_t rank,
+                                  bool fully_connected,
+                                  const vllm::CollectivePolicy& policy) {
   int world_size = fake_ipc_ptrs.size();
   if (world_size > 8)
     throw std::invalid_argument("world size > 8 is not supported");
@@ -65,7 +67,22 @@ fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
   }
   return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data.data_ptr(),
                                             rank_data.numel(), rank, world_size,
-                                            fully_connected);
+                                            fully_connected, policy);
+}
+
+fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
+                      torch::Tensor& rank_data, int64_t rank,
+                      bool fully_connected) {
+  return init_custom_ar_impl(fake_ipc_ptrs, rank_data, rank, fully_connected,
+                             vllm::CollectivePolicy::legacy());
+}
+
+fptr_t init_custom_ar_configured(const std::vector<fptr_t>& fake_ipc_ptrs,
+                                 torch::Tensor& rank_data, int64_t rank,
+                                 bool fully_connected,
+                                 const std::vector<std::string>& policy) {
+  return init_custom_ar_impl(fake_ipc_ptrs, rank_data, rank, fully_connected,
+                             vllm::CollectivePolicy(policy));
 }
 
 /**
@@ -545,7 +562,8 @@ void sm70_all_reduce_gemma_rms_norm_impl(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t _reg_buffer,
-    int64_t reg_buffer_sz_bytes, double epsilon) {
+    int64_t reg_buffer_sz_bytes, double epsilon,
+    bool benchmark_reference = false) {
   constexpr int64_t kHiddenSize = vllm::kSm70GemmaRmsNormHiddenSize;
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
@@ -611,14 +629,12 @@ void sm70_all_reduce_gemma_rms_norm_impl(
   const float epsilon_f = static_cast<float>(epsilon);
 
   if constexpr (kWorldSize == 4) {
-    static const bool trace_enabled = sm70_profile_trace_enabled();
-    static std::atomic<bool> logged_route{false};
-    if (trace_enabled) {
+    if (sm70_profile_trace_enabled(*fa)) {
       cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
       AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
       bool expected = false;
       if (capture_status == cudaStreamCaptureStatusActive &&
-          logged_route.compare_exchange_strong(expected, true)) {
+          fa->logged_norm_route_.compare_exchange_strong(expected, true)) {
         std::cerr << "SM70 TP4 all_reduce_gemma_rms_norm op reached"
                   << " rank=" << fa->rank_ << " num_tokens=" << num_tokens
                   << " residual=" << scalar_type_name(residual.scalar_type())
@@ -638,12 +654,14 @@ void sm70_all_reduce_gemma_rms_norm_impl(
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, float>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     } else {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, half>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     }
   } else if constexpr (kWorldSize == 2) {
     auto residual_ptr = reinterpret_cast<const half*>(residual.data_ptr());
@@ -651,12 +669,14 @@ void sm70_all_reduce_gemma_rms_norm_impl(
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, half, float>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     } else {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, half, half>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     }
   }
 }
@@ -681,6 +701,16 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
   sm70_all_reduce_gemma_rms_norm_impl<4>(
       _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
       reg_buffer_sz_bytes, epsilon);
+}
+
+void sm70_tp4_all_reduce_gemma_rms_norm_reference(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon) {
+  sm70_all_reduce_gemma_rms_norm_impl<4>(
+      _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
+      reg_buffer_sz_bytes, epsilon, true);
 }
 
 void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
@@ -776,10 +806,9 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
   TORCH_CHECK(_is_weak_contiguous(inp_b));
   TORCH_CHECK(_is_weak_contiguous(out));
 
-  static std::atomic<bool> logged_sum2_route{false};
   bool expected = false;
-  if (sm70_profile_trace_enabled() &&
-      logged_sum2_route.compare_exchange_strong(expected, true)) {
+  if (sm70_profile_trace_enabled(*fa) &&
+      fa->logged_sum2_route_.compare_exchange_strong(expected, true)) {
     std::cerr << "SM70 custom all_reduce_sum2 op reached"
               << " rank=" << fa->rank_ << " world_size=" << fa->world_size_
               << " numel=" << out.numel()
@@ -818,13 +847,142 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
   }
 }
 
+void sm70_qwen38_hc_down_local(torch::Tensor input, torch::Tensor packed,
+                               torch::Tensor partials, torch::Tensor output,
+                               int64_t rank) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(input.is_cuda() && rank >= 0 && rank < 4,
+              "Local batch HC requires CUDA and a TP4 rank");
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
+                  input.dim() == 2 && input.size(0) >= 2 &&
+                  input.size(0) <= 16 && input.size(1) == 10240,
+              "Local batch HC requires SM70 [2..16, 10240] input");
+  const int m = input.size(0);
+  for (const auto& tensor : {input, packed, output})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == input.device() &&
+                    tensor.scalar_type() == at::kHalf &&
+                    tensor.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "Local batch HC requires aligned contiguous FP16 tensors");
+  TORCH_CHECK(packed.sizes() == at::IntArrayRef({3, 640, 2, 32, 8}) &&
+                  output.sizes() == at::IntArrayRef({m, 336}) &&
+                  partials.is_cuda() && partials.device() == input.device() &&
+                  partials.scalar_type() == at::kFloat &&
+                  partials.is_contiguous() &&
+                  partials.sizes() == at::IntArrayRef({20, m, 96}),
+              "Invalid local batch HC down geometry");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  vllm::qwen38_hc_batch::hc_down_partials<false, 1, false, 96>
+      <<<dim3(3, (m + 7) / 8, 20), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(input.data_ptr()),
+          reinterpret_cast<const half*>(packed.data_ptr()),
+          partials.data_ptr<float>(), m);
+  vllm::qwen38_hc_batch::
+      down_local_packet<<<(m * 336 + 127) / 128, 128, 0, stream>>>(
+          partials.data_ptr<float>(),
+          reinterpret_cast<half*>(output.data_ptr()), rank, m);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qwen38_hc_up_local(torch::Tensor lora, torch::Tensor packed,
+                             torch::Tensor branches, torch::Tensor output,
+                             int64_t rank) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(branches.is_cuda() && rank >= 0 && rank < 4,
+              "Local batch HC requires CUDA and a TP4 rank");
+  const at::cuda::OptionalCUDAGuard guard(device_of(branches));
+  TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
+                  branches.dim() == 2 && branches.size(0) >= 2 &&
+                  branches.size(0) <= 16 && branches.size(1) == 10240,
+              "Local batch HC requires SM70 [2..16, 10240] input");
+  const int m = branches.size(0);
+  for (const auto& tensor : {lora, packed, branches, output})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == branches.device() &&
+                    tensor.scalar_type() == at::kHalf &&
+                    tensor.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "Local batch HC requires aligned contiguous FP16 tensors");
+  TORCH_CHECK(lora.sizes() == at::IntArrayRef({m, 320}) &&
+                  packed.sizes() == at::IntArrayRef({80, 20, 2, 4, 8, 8}) &&
+                  output.sizes() == at::IntArrayRef({m, 2560}),
+              "Invalid local batch HC up geometry");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  CUDACHECK(cudaMemsetAsync(output.data_ptr(), 0, output.numel() * sizeof(half),
+                            stream));
+  vllm::qwen38_hc_batch::hc_up_batch<false, 1, 4, true, true>
+      <<<dim3(80, (m + 7) / 8), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(lora.data_ptr()),
+          reinterpret_cast<const half*>(packed.data_ptr()),
+          reinterpret_cast<const half*>(branches.data_ptr()),
+          reinterpret_cast<half*>(output.data_ptr()), m, 640, rank * 640);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qwen38_hc_replicated(torch::Tensor input, torch::Tensor packed_down,
+                               torch::Tensor packed_up, torch::Tensor partials,
+                               torch::Tensor lora, torch::Tensor output,
+                               torch::Tensor injection) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(input.is_cuda(), "Replicated batch HC requires CUDA");
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
+                  input.dim() == 2 && input.size(0) >= 2 &&
+                  input.size(0) <= 20 && input.size(1) == 10240,
+              "Replicated batch HC requires SM70 [2..20, 10240] input");
+  const int m = input.size(0);
+  for (const auto& tensor :
+       {input, packed_down, packed_up, lora, output, injection})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == input.device() &&
+                    tensor.scalar_type() == at::kHalf &&
+                    tensor.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "Replicated batch HC requires aligned contiguous FP16 tensors");
+  TORCH_CHECK(packed_down.sizes() == at::IntArrayRef({11, 640, 2, 32, 8}) &&
+                  packed_up.sizes() == at::IntArrayRef({320, 20, 2, 4, 8, 8}) &&
+                  lora.sizes() == at::IntArrayRef({m, 320}) &&
+                  output.sizes() == at::IntArrayRef({m, 2560}) &&
+                  injection.sizes() == at::IntArrayRef({m, 4}) &&
+                  partials.is_cuda() && partials.device() == input.device() &&
+                  partials.scalar_type() == at::kFloat &&
+                  partials.is_contiguous() &&
+                  partials.sizes() == at::IntArrayRef({20, m, 352}),
+              "Invalid replicated batch HC geometry");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  vllm::qwen38_hc_batch::hc_down_partials<false, 1, false, 352>
+      <<<dim3(11, (m + 7) / 8, 20), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(input.data_ptr()),
+          reinterpret_cast<const half*>(packed_down.data_ptr()),
+          partials.data_ptr<float>(), m);
+  vllm::qwen38_hc_batch::
+      down_replicated_reduce<<<(m * 324 + 127) / 128, 128, 0, stream>>>(
+          partials.data_ptr<float>(), reinterpret_cast<half*>(lora.data_ptr()),
+          reinterpret_cast<half*>(injection.data_ptr()), m);
+  vllm::qwen38_hc_batch::hc_up_batch<false, 1, 4, true>
+      <<<dim3(320, (m + 7) / 8), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(lora.data_ptr()),
+          reinterpret_cast<const half*>(packed_up.data_ptr()),
+          reinterpret_cast<const half*>(input.data_ptr()),
+          reinterpret_cast<half*>(output.data_ptr()), m, 2560, 0);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
 void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
                           torch::Tensor packed_down, torch::Tensor packed_up,
                           torch::Tensor partials, torch::Tensor lora,
                           torch::Tensor local_output, torch::Tensor output,
                           torch::Tensor injection, bool round_down_partials,
-                          bool cooperative, bool full_unroll,
-                          bool fused_chain) {
+                          bool cooperative, bool full_unroll, bool fused_chain,
+                          int64_t cta_split_warps) {
 #if defined(USE_ROCM)
   TORCH_CHECK(false, "SM70 Qwen3.8 batch HC is unavailable on ROCm");
 #else
@@ -871,7 +1029,7 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
       reinterpret_cast<half*>(output.data_ptr()),
       reinterpret_cast<half*>(injection.data_ptr()), m, round_down_partials,
       cooperative, full_unroll, c10::cuda::getCurrentCUDAStream().stream(),
-      fused_chain);
+      fused_chain, cta_split_warps);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
 }
@@ -1050,8 +1208,9 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
 
   TORCH_CHECK(input_pair.scalar_type() == at::ScalarType::Float);
   TORCH_CHECK(output.scalar_type() == at::ScalarType::Long);
-  TORCH_CHECK(input_pair.numel() == 2);
-  TORCH_CHECK(output.numel() == 1);
+  TORCH_CHECK(input_pair.numel() >= 2 && input_pair.numel() <= 256 &&
+              input_pair.numel() % 2 == 0);
+  TORCH_CHECK(output.numel() == input_pair.numel() / 2);
   TORCH_CHECK(_is_weak_contiguous(input_pair));
   TORCH_CHECK(_is_weak_contiguous(output));
 
@@ -1066,7 +1225,8 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
   }
 
   fa->top1_argmax(stream, reinterpret_cast<float*>(reg_buffer),
-                  reinterpret_cast<int64_t*>(output.data_ptr()));
+                  reinterpret_cast<int64_t*>(output.data_ptr()),
+                  input_pair.numel() / 2);
 }
 
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,

@@ -1199,10 +1199,16 @@ void validate_same_device(const torch::Tensor& tensor,
               " must be on the same CUDA device as q");
 }
 
+// Only the explicit immutable policy adapter installs this thread-local value.
+// -2 is an independent legacy call; -1 keeps the original dynamic shape rule.
+thread_local int active_column_groups = -2;
+
 int get_column_groups_per_block(int tokens,
                                 int q_heads,
                                 int v_heads) {
-  const char* raw = std::getenv("FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK");
+  const char* raw = active_column_groups == -2
+      ? std::getenv("FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK") : nullptr;
+  if (active_column_groups > 0) return active_column_groups;
   if (raw == nullptr || raw[0] == '\0') {
     // Real Qwen3.5/Qwen3.6 SM70 shapes are dominated by Hv=8/12/16/24/32
     // after TP. Keep this as a shape heuristic; the env above remains the
@@ -1902,7 +1908,41 @@ void gdn_decode_mixed_qkv_ddtree_state(torch::Tensor mixed_qkv,
   check_cuda(cudaGetLastError(), "gdn_decode_mixed_qkv_ddtree_state launch");
 }
 
+// Versioned policy binding shares the numerical bodies and legacy signatures.
+// There are no workspace tensors in this owner; output/state lifetimes remain
+// with the calling engine. RAII restores nested/failed host dispatch correctly.
+struct GdnPolicy {
+  const int column_groups;
+  explicit GdnPolicy(int groups) : column_groups(groups) {
+    TORCH_CHECK(groups == -1 || groups == 1 || groups == 2 || groups == 4 || groups == 8,
+                "FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK must be one of 1, 2, 4, 8");
+  }
+};
+
+struct GdnPolicyScope {
+  int previous;
+  explicit GdnPolicyScope(int groups) : previous(active_column_groups) {
+    active_column_groups = groups;
+  }
+  ~GdnPolicyScope() { active_column_groups = previous; }
+};
+
+template <typename Return, typename... Args>
+auto configured_gdn(Return (*function)(Args...)) {
+  return [function](const GdnPolicy& policy, Args... args) -> Return {
+    GdnPolicyScope scope(policy.column_groups);
+    return function(std::forward<Args>(args)...);
+  };
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("gdn_policy_abi_version", []() { return 1; });
+  pybind11::class_<GdnPolicy>(m, "GdnPolicy")
+      .def(pybind11::init<int>())
+      .def("gdn_forward", configured_gdn(&gdn_forward))
+      .def("gdn_forward_vlk_varlen", configured_gdn(&gdn_forward_vlk_varlen))
+      .def("gdn_decode_mixed_qkv_global_state", configured_gdn(&gdn_decode_mixed_qkv_global_state))
+      .def("resolve_column_groups_per_block", configured_gdn(&resolve_column_groups_per_block));
   m.def("gdn_forward", &gdn_forward, "SM70/SM75 FlashQLA GDN forward");
   m.def("gdn_forward_vlk_varlen",
         &gdn_forward_vlk_varlen,

@@ -174,9 +174,12 @@ class _RejectionGraph:
     def _probe(self):
         from .sparse_rejection import _compact_target_reference_flags
 
-        self.ids, self.values, self.fallback = (
-            self.model.get_topk_tokens_and_logits_with_fallback(self.hidden, 64)
+        probe = getattr(
+            self.model,
+            "get_compact_target_probe_with_fallback",
+            self.model.get_topk_tokens_and_logits_with_fallback,
         )
+        self.ids, self.values, self.fallback = probe(self.hidden, 64)
         if self.fallback is None:
             return False
         states = self.rejection.sampler.sampling_states

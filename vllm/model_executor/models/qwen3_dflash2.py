@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Callable
 from functools import cache
 
@@ -28,6 +27,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.sm70_topk_gather import gather_topk_pairs
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
@@ -58,8 +58,10 @@ def _use_sm70_bf16_emulation(config) -> bool:
         "bf16",
         "torch.bfloat16",
     }
-    enabled = os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION", "1").strip().lower()
-    enabled = enabled in ("1", "true", "yes", "on")
+    policy = capture_sm70_dflash2_config()
+    from vllm.config.sm70_dflash2 import dflash2_bf16_emulation
+
+    enabled = dflash2_bf16_emulation(policy)
     if not (enabled and is_bf16 and current_platform.is_cuda()):
         return False
     # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the
@@ -228,6 +230,32 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
                 config.rms_norm_eps,
                 runtime_dtype,
             )
+        self.self_attn._sm70_dflash2_qk_rope = bool(
+            self.use_sm70_bf16_emulation
+            and config.hidden_size == 5120
+            and vllm_config.speculative_config is not None
+            and get_dflash_model_draft_tokens(vllm_config.speculative_config) == 7
+            and vllm_config.model_config.dtype == torch.float16
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+            and self.self_attn.q_size == 1024
+            and self.self_attn.kv_size == 256
+            and self.self_attn.head_dim == 128
+            and self.self_attn.is_neox_style
+            and self.self_attn.rotary_emb.rotary_dim == 128
+            and self.self_attn.attn.attn_backend.get_name() == "FLASH_ATTN_V100"
+        )
+        if self.self_attn._sm70_dflash2_qk_rope:
+            # Import registers the cache-aware opaque op before model tracing.
+            from vllm.model_executor.layers.attention import (
+                sm70_dflash2_qk_rope,  # noqa: F401
+            )
+
+            logger.info_once(
+                "SM70 DFlash2 fused Q/K norm, RoPE and KV publication enabled."
+            )
         draft_config = config.dflash_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
@@ -264,6 +292,9 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             ):
                 if isinstance(projection.quant_method, UnquantizedLinearMethod):
                     projection._sm70_dflash2_fp16_m8 = True
+                    projection._sm70_dflash2_fp8_m8 = (
+                        get_dflash_model_draft_tokens(speculative_config) == 7
+                    )
 
     def forward(
         self,
@@ -479,6 +510,10 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._packed_topk_enabled = vllm_config.kernel_config.sm70_packed_topk_gather
+        self._packed_topk_selections = (
+            vllm_config.kernel_config.collective_kernel_selections
+        )
         self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
         draft_config = self.config.dflash_config
         self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
@@ -535,8 +570,18 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             values, ids = local_candidates
 
         if get_tensor_model_parallel_world_size() > 1:
-            values = tensor_model_parallel_all_gather(values, dim=-1)
-            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            packed = gather_topk_pairs(
+                values,
+                ids,
+                vocab_size=self.lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
+            )
+            if packed is None:
+                values = tensor_model_parallel_all_gather(values, dim=-1)
+                ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            else:
+                values, ids = packed
 
         if values.shape[-1] > selector.top_k:
             values, selected = _topk(values, selector.top_k)

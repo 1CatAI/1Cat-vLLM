@@ -1,0 +1,3058 @@
+{
+  "prototype_source": "b003cd2d29ffd1a8f6783a450cb97586ac78eb3d",
+  "installed_source": "2f0ef058ed6180c8c744b468a5abced2c2a73c71",
+  "prototype": {
+    "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
+    "rank": 0,
+    "cases": [
+      {
+        "layer": 3,
+        "source_types": [
+          16,
+          21,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 5181440,
+        "candidate_weight_stream_bytes": 5181440,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.00031813004170544446,
+              0.000316439603921026,
+              0.00031441275496035814
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.00032502730027772486,
+              0.00030878919642418623,
+              0.00032558367820456624
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0003239000798203051,
+              0.0003202927764505148,
+              0.0003160549676977098
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 68.60800087451935,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 68.60800087451935,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 7,
+        "source_types": [
+          10,
+          23,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6420480,
+        "candidate_weight_stream_bytes": 9123840,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0006023046444170177,
+              0.0003108703822363168,
+              0.0002994658425450325
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0006121181068010628,
+              0.00032094574999064207,
+              0.00032210320932790637
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005930702318437397,
+              0.0003224132815375924,
+              0.0003278390795458108
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 92.16000139713287,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 92.67200157046318,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 11,
+        "source_types": [
+          10,
+          22,
+          18
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6082560,
+        "candidate_weight_stream_bytes": 8785920,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0005944760632701218,
+              0.00030187328229658306,
+              0.0003232397430110723
+            ],
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0006113219424150884,
+              0.0003304637793917209,
+              0.00032499711960554123
+            ],
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005909265601076186,
+              0.0003184055385645479,
+              0.0003240466758143157
+            ],
+            "max_abs": 0.0078125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 99.32799637317657,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 99.32799637317657,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 15,
+        "source_types": [
+          10,
+          12,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6461440,
+        "candidate_weight_stream_bytes": 9246720,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0005899177631363273,
+              0.0007508639246225357,
+              0.0003318673116154969
+            ],
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0006077585276216269,
+              0.0007834602729417384,
+              0.0003322556149214506
+            ],
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005975217209197581,
+              0.0007705147727392614,
+              0.0003250849840696901
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 87.0399996638298,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 36.86400130391121,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 36.86400130391121,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 87.0399996638298,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 19,
+        "source_types": [
+          10,
+          18,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6225920,
+        "candidate_weight_stream_bytes": 8929280,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0006047101924195886,
+              0.0003243324172217399,
+              0.000340644852258265
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0006066368077881634,
+              0.00033221463672816753,
+              0.00032074048067443073
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005970256170257926,
+              0.00032444135285913944,
+              0.0003237255150452256
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 95.23200243711472,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 36.86400130391121,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 36.86400130391121,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 95.23200243711472,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 23,
+        "source_types": [
+          21,
+          12,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 8232960,
+        "candidate_weight_stream_bytes": 8396800,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.000329628586769104,
+              0.0007873620488680899,
+              0.0007353660766966641
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.00031766187748871744,
+              0.0008118572877719998,
+              0.0007543517276644707
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0003222773957531899,
+              0.0007988016004674137,
+              0.0007706446340307593
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 61.95199862122536,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 61.43999844789505,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 27,
+        "source_types": [
+          23,
+          23,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 9789440,
+        "candidate_weight_stream_bytes": 9871360,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0003158462350256741,
+              0.00032421297510154545,
+              0.0007476588361896574
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0003224214306101203,
+              0.0003265075501985848,
+              0.0007631011540070176
+            ],
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.00031836648122407496,
+              0.0003047131176572293,
+              0.0007392249535769224
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 60.416001826524734,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 60.416001826524734,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 31,
+        "source_types": [
+          10,
+          23,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6594560,
+        "candidate_weight_stream_bytes": 9379840,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0006045112386345863,
+              0.00033791514579206705,
+              0.0007832429837435484
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.000606207933742553,
+              0.0003339321701787412,
+              0.0007990001467987895
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005919474642723799,
+              0.0003223998355679214,
+              0.0007535353070124984
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 84.99199897050858,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 84.99199897050858,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 35,
+        "source_types": [
+          21,
+          23,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 8192000,
+        "candidate_weight_stream_bytes": 8273920,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0003213438321836293,
+              0.00031538106850348413,
+              0.0007298120763152838
+            ],
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0003153531870339066,
+              0.0003153209399897605,
+              0.0007613657508045435
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0003165643138345331,
+              0.00030102761229500175,
+              0.0007491856813430786
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 89.08800035715103,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 89.08800035715103,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 39,
+        "source_types": [
+          21,
+          23,
+          23
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 8151040,
+        "candidate_weight_stream_bytes": 8151040,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0003212305891793221,
+              0.00034548481926321983,
+              0.00031096386373974383
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0003231703885830939,
+              0.00031846656929701567,
+              0.0003175672027282417
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0003281678364146501,
+              0.0003249393485020846,
+              0.00031074442085810006
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 67.58400052785873,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 67.58400052785873,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 43,
+        "source_types": [
+          23,
+          12,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 9830400,
+        "candidate_weight_stream_bytes": 9994240,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.00032433823798783123,
+              0.0007533156895078719,
+              0.0007615720387548208
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.000325286848237738,
+              0.0007805055356584489,
+              0.000760416965931654
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.00032229992211796343,
+              0.0007087787962518632,
+              0.0007490148418582976
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 59.39200147986412,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 59.39200147986412,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 47,
+        "source_types": [
+          18,
+          23,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 7454720,
+        "candidate_weight_stream_bytes": 7536640,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.00031584149110130966,
+              0.0003190325805917382,
+              0.0007252132054418325
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0003183606022503227,
+              0.0003244730760343373,
+              0.0007612414774484932
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.00031600805232301354,
+              0.0003079556627199054,
+              0.0007267011096701026
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 87.0399996638298,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 87.0399996638298,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 51,
+        "source_types": [
+          18,
+          12,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 7495680,
+        "candidate_weight_stream_bytes": 7659520,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.000321088737109676,
+              0.0007799463346600533,
+              0.0007738349959254265
+            ],
+            "max_abs": 0.00439453125
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.00031774872331880033,
+              0.0007765686605125666,
+              0.0007615966023877263
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.00032214896054938436,
+              0.000758716429118067,
+              0.0007660418632440269
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 60.92800013720989,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 61.43999844789505,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 63,
+        "source_types": [
+          12,
+          23,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 10106880,
+        "candidate_weight_stream_bytes": 11089920,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0007760245352983475,
+              0.0003197230107616633,
+              0.0002992384834215045
+            ],
+            "max_abs": 0.0048828125
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0007672733627259731,
+              0.00032042921520769596,
+              0.00032669599750079215
+            ],
+            "max_abs": 0.005615234375
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0007471863063983619,
+              0.0003138151078019291,
+              0.0003003654128406197
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 89.08800035715103,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 89.08800035715103,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      }
+    ],
+    "complete": true
+  },
+  "installed_wiring": {
+    "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
+    "rank": 0,
+    "cases": [
+      {
+        "layer": 3,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            16,
+            21,
+            21
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_XXS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          16,
+          21,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 5181440,
+        "candidate_weight_stream_bytes": 5181440,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.00031813004170544446,
+              0.000316439603921026,
+              0.00031441275496035814
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.00032502730027772486,
+              0.00030878919642418623,
+              0.00032558367820456624
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0003239000798203051,
+              0.0003202927764505148,
+              0.0003160549676977098
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 68.60800087451935,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 69.12000104784966,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 7,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            10,
+            23,
+            21
+          ],
+          "operators": [
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          10,
+          23,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6420480,
+        "candidate_weight_stream_bytes": 9123840,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0006023046444170177,
+              0.0003108703822363168,
+              0.0002994658425450325
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0006121181068010628,
+              0.00032094574999064207,
+              0.00032210320932790637
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005930702318437397,
+              0.0003224132815375924,
+              0.0003278390795458108
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 92.16000139713287,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 92.16000139713287,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 11,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            10,
+            22,
+            18
+          ],
+          "operators": [
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ2_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          10,
+          22,
+          18
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6082560,
+        "candidate_weight_stream_bytes": 8785920,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0005944760632701218,
+              0.00030187328229658306,
+              0.0003232397430110723
+            ],
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0006113219424150884,
+              0.0003304637793917209,
+              0.00032499711960554123
+            ],
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005909265601076186,
+              0.0003184055385645479,
+              0.0003240466758143157
+            ],
+            "max_abs": 0.0078125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 97.28000313043594,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 98.30400347709656,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 15,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            10,
+            12,
+            21
+          ],
+          "operators": [
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          10,
+          12,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6461440,
+        "candidate_weight_stream_bytes": 9246720,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0005899177631363273,
+              0.0007508639246225357,
+              0.0003318673116154969
+            ],
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0006077585276216269,
+              0.0007834602729417384,
+              0.0003322556149214506
+            ],
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005975217209197581,
+              0.0007705147727392614,
+              0.0003250849840696901
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 87.0399996638298,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 35.840000957250595,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 35.840000957250595,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 87.0399996638298,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 19,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            10,
+            18,
+            21
+          ],
+          "operators": [
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          10,
+          18,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6225920,
+        "candidate_weight_stream_bytes": 8929280,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0006047101924195886,
+              0.0003243324172217399,
+              0.000340644852258265
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0006066368077881634,
+              0.00033221463672816753,
+              0.00032074048067443073
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005970256170257926,
+              0.00032444135285913944,
+              0.0003237255150452256
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 93.18400174379349,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 36.86400130391121,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 93.18400174379349,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 23,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            21,
+            12,
+            12
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          21,
+          12,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 8232960,
+        "candidate_weight_stream_bytes": 8396800,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.000329628586769104,
+              0.0007873620488680899,
+              0.0007353660766966641
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.00031766187748871744,
+              0.0008118572877719998,
+              0.0007543517276644707
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0003222773957531899,
+              0.0007988016004674137,
+              0.0007706446340307593
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 61.43999844789505,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 37.88800165057182,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 61.43999844789505,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 27,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            23,
+            23,
+            12
+          ],
+          "operators": [
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          23,
+          23,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 9789440,
+        "candidate_weight_stream_bytes": 9871360,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0003158462350256741,
+              0.00032421297510154545,
+              0.0007476588361896574
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0003224214306101203,
+              0.0003265075501985848,
+              0.0007631011540070176
+            ],
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.00031836648122407496,
+              0.0003047131176572293,
+              0.0007392249535769224
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 59.39200147986412,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 45.05600035190582,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 45.05600035190582,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 59.39200147986412,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 31,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            10,
+            23,
+            12
+          ],
+          "operators": [
+            {
+              "family": "affine_integer",
+              "source_type": "Q2_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          10,
+          23,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 6594560,
+        "candidate_weight_stream_bytes": 9379840,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0006045112386345863,
+              0.00033791514579206705,
+              0.0007832429837435484
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.000606207933742553,
+              0.0003339321701787412,
+              0.0007990001467987895
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0005919474642723799,
+              0.0003223998355679214,
+              0.0007535353070124984
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 83.96799862384796,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 83.96799862384796,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 35,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            21,
+            23,
+            12
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          21,
+          23,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 8192000,
+        "candidate_weight_stream_bytes": 8273920,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0003213438321836293,
+              0.00031538106850348413,
+              0.0007298120763152838
+            ],
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0003153531870339066,
+              0.0003153209399897605,
+              0.0007613657508045435
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0003165643138345331,
+              0.00030102761229500175,
+              0.0007491856813430786
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 89.08800035715103,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 89.08800035715103,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 39,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            21,
+            23,
+            23
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          21,
+          23,
+          23
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 8151040,
+        "candidate_weight_stream_bytes": 8151040,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0003212305891793221,
+              0.00034548481926321983,
+              0.00031096386373974383
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0003231703885830939,
+              0.00031846656929701567,
+              0.0003175672027282417
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0003281678364146501,
+              0.0003249393485020846,
+              0.00031074442085810006
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 67.58400052785873,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 66.56000018119812,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 43,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            23,
+            12,
+            12
+          ],
+          "operators": [
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          23,
+          12,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 9830400,
+        "candidate_weight_stream_bytes": 9994240,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.00032433823798783123,
+              0.0007533156895078719,
+              0.0007615720387548208
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.000325286848237738,
+              0.0007805055356584489,
+              0.000760416965931654
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.00032229992211796343,
+              0.0007087787962518632,
+              0.0007490148418582976
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 58.89600142836571,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 44.03200000524521,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 58.36800113320351,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 47,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            18,
+            23,
+            12
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          18,
+          23,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 7454720,
+        "candidate_weight_stream_bytes": 7536640,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.00031584149110130966,
+              0.0003190325805917382,
+              0.0007252132054418325
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0003183606022503227,
+              0.0003244730760343373,
+              0.0007612414774484932
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.00031600805232301354,
+              0.0003079556627199054,
+              0.0007267011096701026
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 87.0399996638298,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 87.0399996638298,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 51,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            18,
+            12,
+            12
+          ],
+          "operators": [
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_XXS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          18,
+          12,
+          12
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 7495680,
+        "candidate_weight_stream_bytes": 7659520,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.000321088737109676,
+              0.0007799463346600533,
+              0.0007738349959254265
+            ],
+            "max_abs": 0.00439453125
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.00031774872331880033,
+              0.0007765686605125666,
+              0.0007615966023877263
+            ],
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.00032214896054938436,
+              0.000758716429118067,
+              0.0007660418632440269
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 61.43999844789505,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 61.43999844789505,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 63,
+        "admission": {
+          "operator": "gguf_qkv_sm70_out",
+          "source_types": [
+            12,
+            23,
+            21
+          ],
+          "operators": [
+            {
+              "family": "affine_integer",
+              "source_type": "Q4_K",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lut4",
+              "source_type": "IQ4_XS",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            },
+            {
+              "family": "lattice_codebook",
+              "source_type": "IQ3_S",
+              "operator": "gguf_qkv_sm70_out",
+              "graph_safe": true,
+              "min_m": 8,
+              "max_m": 8,
+              "reason": null
+            }
+          ],
+          "min_m": 8,
+          "max_m": 8,
+          "n": 3584,
+          "k": 5120,
+          "graph_safe": true,
+          "reason": null,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "source_types": [
+          12,
+          23,
+          21
+        ],
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "source_bytes": 10106880,
+        "candidate_weight_stream_bytes": 11089920,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2_by_source": [
+              0.0007760245352983475,
+              0.0003197230107616633,
+              0.0002992384834215045
+            ],
+            "max_abs": 0.0048828125
+          },
+          {
+            "seed": 132,
+            "relative_l2_by_source": [
+              0.0007672733627259731,
+              0.00032042921520769596,
+              0.00032669599750079215
+            ],
+            "max_abs": 0.005615234375
+          },
+          {
+            "seed": 133,
+            "relative_l2_by_source": [
+              0.0007471863063983619,
+              0.0003138151078019291,
+              0.0003003654128406197
+            ],
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 88.06400001049042,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 88.06400001049042,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      }
+    ],
+    "complete": true
+  },
+  "counterparts": [
+    {
+      "role": "attention_qkv",
+      "m": 8,
+      "n": 3584,
+      "k": 5120,
+      "weight_stream_bytes": 18357248,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2,
+        "fast_decoder": true,
+        "relative_l2": 0.00020985465380363166
+      },
+      "timings": [
+        {
+          "median_us": 34.81600061058998,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 31.74399957060814,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    }
+  ],
+  "layer_counts": [
+    {
+      "source_types": [
+        16,
+        21,
+        21
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        10,
+        23,
+        21
+      ],
+      "layers": 2
+    },
+    {
+      "source_types": [
+        10,
+        22,
+        18
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        10,
+        12,
+        21
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        10,
+        18,
+        21
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        21,
+        12,
+        12
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        23,
+        23,
+        12
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        10,
+        23,
+        12
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        21,
+        23,
+        12
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        21,
+        23,
+        23
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        23,
+        12,
+        12
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        18,
+        23,
+        12
+      ],
+      "layers": 1
+    },
+    {
+      "source_types": [
+        18,
+        12,
+        12
+      ],
+      "layers": 2
+    },
+    {
+      "source_types": [
+        12,
+        23,
+        21
+      ],
+      "layers": 1
+    }
+  ]
+}

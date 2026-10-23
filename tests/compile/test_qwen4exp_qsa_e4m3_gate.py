@@ -19,9 +19,7 @@ REQUIRED = {
 
 @pytest.fixture(autouse=True)
 def _unit_scales(monkeypatch):
-    from vllm import envs
-
-    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", False)
+    monkeypatch.setenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "0")
 
 
 def test_uncalibrated_checkpoint_degrades_to_a_warning():
@@ -30,9 +28,7 @@ def test_uncalibrated_checkpoint_degrades_to_a_warning():
 
 
 def test_strict_mode_keeps_the_hard_failure(monkeypatch):
-    from vllm import envs
-
-    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", True)
+    monkeypatch.setenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "1")
     with pytest.raises(ValueError, match="refusing to start"):
         _validate_qsa_e4m3_scale_load(REQUIRED, set(), "fp8_e4m3")
 

@@ -324,6 +324,7 @@ def test_zeroer_supports_heterogeneous_page_sizes() -> None:
         ),
         torch.tensor([8, 20], dtype=torch.int64, device=device),
         torch.tensor([8, 20], dtype=torch.int64, device=device),
+        torch.tensor([3, 3], dtype=torch.int64, device=device),
         3,
         8,
         2,
@@ -349,6 +350,7 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight() -> None:
         torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
         torch.tensor([4], dtype=torch.int64, device=device),
         torch.tensor([4], dtype=torch.int64, device=device),
+        torch.tensor([4], dtype=torch.int64, device=device),
         1,
         4,
         1,
@@ -367,3 +369,82 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight() -> None:
     torch.testing.assert_close(storage[1], torch.zeros_like(storage[1]))
     torch.testing.assert_close(storage[2], torch.zeros_like(storage[2]))
     torch.testing.assert_close(storage[3], torch.ones_like(storage[3]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_bounded_state_pool_ignores_block_ids_past_its_pages() -> None:
+    """Block IDs carry no group identity. With a bounded recurrent-state pool
+    (fewer pages than the scheduler's ID range), zeroing a history-range ID
+    must not write past the state tensor into the adjacent allocation."""
+    device = torch.device("cuda")
+    page_el, state_pages = 8, 3
+    # One allocation: a 3-page state tensor followed by a guard region that
+    # stands in for whatever the allocator placed next (e.g. a hot cache).
+    backing = torch.ones((state_pages + 4) * page_el, dtype=torch.int32, device=device)
+    state = backing[: state_pages * page_el].view(state_pages, page_el)
+    guard = backing[state_pages * page_el :]
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.int32,),
+        page_size_padded=page_el * 4,
+    )
+    group = SimpleNamespace(
+        kv_cache_spec=spec, kv_cache_group_id=0, layer_names=["state"], backend=None
+    )
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[16],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context={"state": SimpleNamespace(kv_cache=[state])},
+    )
+
+    # 1 is a state block; 3 and 5 belong to other (history) groups.
+    zeroer.zero_block_ids([1, 3, 5])
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(state[0], torch.ones_like(state[0]))
+    torch.testing.assert_close(state[1], torch.zeros_like(state[1]))
+    torch.testing.assert_close(state[2], torch.ones_like(state[2]))
+    torch.testing.assert_close(guard, torch.ones_like(guard))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_host_backed_layers_are_not_zeroed() -> None:
+    device = torch.device("cuda")
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    names = ["attn.device", "attn.host"]
+    caches = {
+        name: torch.ones(N_BLOCKS, 16, 1, 8, dtype=torch.float16, device=device)
+        for name in names
+    }
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=names,
+        backend=_BlockFirstAttentionBackend,
+    )
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[spec.block_size],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context={
+            name: SimpleNamespace(kv_cache=cache) for name, cache in caches.items()
+        },
+        host_backed_layers={"attn.host"},
+    )
+    zeroer.zero_block_ids([1])
+    torch.accelerator.synchronize()
+
+    zeroed = caches["attn.device"].flatten(1).eq(0).all(1).tolist()
+    assert zeroed == [False, True, False, False]
+    assert bool(caches["attn.host"].eq(1).all())

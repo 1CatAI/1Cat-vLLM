@@ -10,6 +10,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #endif
 
 #include <iostream>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -22,6 +23,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <type_traits>
 
 #include "cub_helpers.h"
+#include "custom_all_reduce_policy.h"
 #include "sm70_tile_runtime_signal.cuh"
 
 namespace vllm {
@@ -136,7 +138,8 @@ constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
     kSm70Qwen38HcUpFusedEpochOffset +
     kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
-constexpr size_t kSm70Qwen38HcBatchCounterBytes = 256;
+// Full-K down finish owns 44 column-pair counters per eight-token tile.
+constexpr size_t kSm70Qwen38HcBatchCounterBytes = 512;
 constexpr size_t kSm70Qwen38HcBatchDownOffset =
     kSm70Qwen38HcUpFusedPacketOffset +
     kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
@@ -156,39 +159,55 @@ constexpr size_t kSm70Tp4PushAllreduceLegacyBufferBytes =
 // Private packets keep norm collectives separate from ordinary/HC push traffic.
 constexpr int kSm70PushNormRows = 8;
 constexpr int kSm70PushNormParts = 5;
-struct Sm70PushNormMeta {
+struct alignas(8) Sm70PushNormMeta {
+  uint32_t generation[kSm70PushNormRows];
+  float partial[kSm70Tp4PushAllreduceEpochs][kSm70PushNormRows]
+               [kSm70PushNormParts];
+  uint64_t inverse_packet[kSm70PushNormRows];
+};
+struct alignas(8) Sm70PushNormPacketMeta {
+  uint32_t generation[kSm70PushNormRows];
+  uint64_t partial[kSm70PushNormRows][kSm70PushNormParts];
+};
+struct Sm70PushNormReferenceMeta {
   uint32_t generation[kSm70PushNormRows];
   uint32_t ready[kSm70PushNormRows][kSm70PushNormParts];
   uint32_t normalized[kSm70PushNormRows];
   float partial[kSm70PushNormRows][kSm70PushNormParts];
   float inverse[kSm70PushNormRows];
 };
-constexpr size_t kSm70PushNormMetaBytes =
-    ((sizeof(Sm70PushNormMeta) + 127) / 128) * 128;
+// Preserve IPC payload offsets and buffer capacity for both norm routes.
+constexpr size_t kSm70PushNormMetaBytes = 512;
+static_assert(sizeof(Sm70PushNormMeta) <= kSm70PushNormMetaBytes);
+static_assert(sizeof(Sm70PushNormReferenceMeta) <= kSm70PushNormMetaBytes);
+static_assert(sizeof(Sm70PushNormPacketMeta) <= kSm70PushNormMetaBytes);
 constexpr size_t kSm70PushNormOffset =
     ((kSm70Tp4PushAllreduceLegacyBufferBytes + 127) / 128) * 128;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70PushNormPacketOffset =
     kSm70PushNormOffset + kSm70PushNormMetaBytes +
     kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
         kSm70Tp4PushAllreduceM8Bytes;
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70PushNormPacketOffset + kSm70PushNormMetaBytes;
 
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
-inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
+inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
+                                          size_t bytes,
                                           bool allow_generic = false) {
   // Experimental message-size admission, independent of model or batch shape.
   // Each thread handles one 16-byte pack. Use the smallest covering grid,
   // bounded by the existing persistent buffer, including for known payloads.
   const char* small =
-      std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES");
+      policy.raw(CollectivePolicyField::sm70_tp4_push_allreduce_small_messages);
   if (allow_generic && small != nullptr && std::strcmp(small, "1") == 0 &&
       bytes > 0 && bytes <= kSm70Tp4PushAllreduceM8Bytes && bytes % 16 == 0) {
     return static_cast<int>((bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
                             (kSm70Tp4PushAllreduceThreads * 16));
   }
   const char* concurrency =
-      std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY");
+      policy.raw(CollectivePolicyField::sm70_tp4_push_allreduce_concurrency);
   if (bytes == kSm70Tp4PushAllreduceM8Bytes ||
       (concurrency != nullptr && std::strcmp(concurrency, "1") == 0 &&
        (bytes == kSm70Tp4PushAllreduceM16Bytes ||
@@ -201,17 +220,19 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
   if (bytes == kSm70Tp4PushAllreduceQwen4ExpBytes) {
     return 3;
   }
-  const char* batch = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
+  const char* batch =
+      policy.raw(CollectivePolicyField::sm70_tp4_push_allreduce_qwen38_batch);
   const bool batch_enabled = batch == nullptr || std::strcmp(batch, "1") == 0;
-  const char* fastpath = std::getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH");
+  const char* fastpath =
+      policy.raw(CollectivePolicyField::sm70_qwen38_batch_fastpath);
   const bool m2_enabled =
       fastpath != nullptr && std::strcmp(fastpath, "1") == 0;
   if (batch_enabled &&
       ((m2_enabled && bytes == kSm70Tp4PushAllreduceQwen38M2Bytes) ||
        bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
        bytes == kSm70Tp4PushAllreduceQwen38M8Bytes)) {
-    const char* blocks =
-        std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS");
+    const char* blocks = policy.raw(
+        CollectivePolicyField::sm70_tp4_push_allreduce_qwen38_batch_blocks);
     if (blocks != nullptr) {
       const int parsed = std::atoi(blocks);
       const int min_blocks = (bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
@@ -224,15 +245,17 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
     }
     return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
   }
-  const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
+  const char* mtp5 =
+      policy.raw(CollectivePolicyField::sm70_tp4_push_allreduce_mtp5);
   return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes &&
                  (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0)
              ? 13
              : 0;
 }
 
-inline int sm70_gemma_rms_norm_threads() {
-  const char* raw = std::getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS");
+inline int sm70_gemma_rms_norm_threads(const CollectivePolicy& policy) {
+  const char* raw =
+      policy.raw(CollectivePolicyField::sm70_tp2_ar_gemma_rms_threads);
   if (raw == nullptr) return kSm70GemmaRmsNormThreads;
   const int threads = std::atoi(raw);
   return threads == 256 || threads == 512 || threads == 1024
@@ -240,15 +263,17 @@ inline int sm70_gemma_rms_norm_threads() {
              : kSm70GemmaRmsNormThreads;
 }
 
-inline int sm70_tp4_long_fused_norm_threads() {
-  const char* raw = std::getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS");
+inline int sm70_tp4_long_fused_norm_threads(const CollectivePolicy& policy) {
+  const char* raw =
+      policy.raw(CollectivePolicyField::sm70_tp4_long_fused_norm_threads);
   if (raw == nullptr) return 512;
   const int threads = std::atoi(raw);
   return threads == 256 || threads == 512 || threads == 1024 ? threads : 512;
 }
 
-inline int sm70_tp4_long_fused_norm_blocks() {
-  const char* raw = std::getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS");
+inline int sm70_tp4_long_fused_norm_blocks(const CollectivePolicy& policy) {
+  const char* raw =
+      policy.raw(CollectivePolicyField::sm70_tp4_long_fused_norm_blocks);
   if (raw == nullptr) return 80;
   const int blocks = std::atoi(raw);
   return blocks >= 1 && blocks <= kSm70LongPrefillSignalBlocks ? blocks : 80;
@@ -275,9 +300,10 @@ inline bool custom_allreduce_current_device_is_sm70() {
 #endif
 }
 
-inline bool sm70_tp8_hierarchical_custom_ar_enabled(int world_size,
-                                                    bool fully_connected) {
-  const char* raw = std::getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR");
+inline bool sm70_tp8_hierarchical_custom_ar_enabled(
+    const CollectivePolicy& policy, int world_size, bool fully_connected) {
+  const char* raw =
+      policy.raw(CollectivePolicyField::sm70_tp8_hierarchical_custom_ar);
   return raw != nullptr && std::atoi(raw) != 0 && world_size == 8 &&
          !fully_connected && custom_allreduce_current_device_is_sm70();
 }
@@ -291,10 +317,12 @@ inline bool sm70_tp8_hierarchical_allreduce_size(size_t bytes) {
          bytes == kSm70Tp8HierarchicalAllreduce64KiBBytes;
 }
 
-inline int sm70_tp8_hierarchical_push_blocks(size_t bytes) {
+inline int sm70_tp8_hierarchical_push_blocks(const CollectivePolicy& policy,
+                                             size_t bytes) {
   const int default_blocks =
       bytes == kSm70Tp8HierarchicalAllreduce64KiBBytes ? 16 : 4;
-  const char* raw = std::getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS");
+  const char* raw =
+      policy.raw(CollectivePolicyField::sm70_tp8_hierarchical_push_blocks);
   if (raw == nullptr || raw[0] == '\0') return default_blocks;
   char* end = nullptr;
   const long parsed = std::strtol(raw, &end, 10);
@@ -308,16 +336,19 @@ inline int sm70_tp8_hierarchical_push_blocks(size_t bytes) {
   return static_cast<int>(parsed);
 }
 
-inline int custom_allreduce_block_limit(int default_limit, int world_size,
+inline int custom_allreduce_block_limit(const CollectivePolicy& policy,
+                                        int default_limit, int world_size,
                                         bool fully_connected, size_t bytes,
                                         bool tune_sm70_tp4_mtp) {
-  const char* raw = std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+  const char* raw =
+      policy.raw(CollectivePolicyField::custom_allreduce_block_limit);
   if (raw == nullptr || raw[0] == '\0') {
     if (world_size == 2 && bytes <= kSm70Tp2SmallAllreduceBytes &&
         custom_allreduce_current_device_is_sm70()) {
       return 1;
     }
-    const char* tune_raw = std::getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING");
+    const char* tune_raw =
+        policy.raw(CollectivePolicyField::sm70_tp4_mtp_ar_block_tuning);
     const bool tuning_enabled =
         tune_raw != nullptr && tune_raw[0] != '\0' && std::atoi(tune_raw) != 0;
     if (tune_sm70_tp4_mtp && tuning_enabled &&
@@ -344,9 +375,10 @@ inline int custom_allreduce_block_limit(int default_limit, int world_size,
   return static_cast<int>(parsed);
 }
 
-inline int sm70_tp4_m5_allreduce_threads(int world_size, bool fully_connected,
+inline int sm70_tp4_m5_allreduce_threads(const CollectivePolicy& policy,
+                                         int world_size, bool fully_connected,
                                          size_t bytes) {
-  const char* raw = std::getenv("VLLM_SM70_TP4_M5_AR_THREADS");
+  const char* raw = policy.raw(CollectivePolicyField::sm70_tp4_m5_ar_threads);
   if (raw == nullptr || raw[0] == '\0') return 512;
 
   char* end = nullptr;
@@ -365,10 +397,11 @@ inline int sm70_tp4_m5_allreduce_threads(int world_size, bool fully_connected,
   return static_cast<int>(parsed);
 }
 
-inline bool sm70_tp4_small_allreduce_pack32(int world_size,
+inline bool sm70_tp4_small_allreduce_pack32(const CollectivePolicy& policy,
+                                            int world_size,
                                             bool fully_connected,
                                             size_t bytes) {
-  const char* raw = std::getenv("VLLM_SM70_TP4_SMALL_AR_PACK32");
+  const char* raw = policy.raw(CollectivePolicyField::sm70_tp4_small_ar_pack32);
   return raw != nullptr && std::atoi(raw) != 0 && world_size == 4 &&
          fully_connected && bytes == 5120 * sizeof(half) &&
          custom_allreduce_current_device_is_sm70();
@@ -1674,24 +1707,31 @@ __global__ void __launch_bounds__(512, 1)
 template <int ngpus>
 __global__ void cross_device_top1_argmax(RankData* _dp, RankSignals sg,
                                          Signal* self_sg, int64_t* output,
-                                         int rank) {
+                                         int rank, int rows) {
   barrier_at_start<ngpus>(sg, self_sg, rank);
 
-  if (threadIdx.x == 0) {
+  const int row = threadIdx.x;
+  if (row < rows) {
     float best_value = -std::numeric_limits<float>::infinity();
     int64_t best_index = std::numeric_limits<int64_t>::max();
 
 #pragma unroll
     for (int i = 0; i < ngpus; ++i) {
       const float* pair = reinterpret_cast<const float*>(_dp->ptrs[i]);
-      const float value = pair[0];
-      const int64_t index = static_cast<int64_t>(llrintf(pair[1]));
-      if (value > best_value || (value == best_value && index < best_index)) {
+      const float value = pair[2 * row];
+      const int64_t index = static_cast<int64_t>(llrintf(pair[2 * row + 1]));
+      // Match full-vocabulary argmax: NaNs precede finite values, and the
+      // first original vocabulary ID wins among NaNs or equal logits.
+      const bool value_nan = isnan(value), best_nan = isnan(best_value);
+      if ((value_nan && (!best_nan || index < best_index)) ||
+          (!value_nan && !best_nan &&
+           (value > best_value ||
+            (value == best_value && index < best_index)))) {
         best_value = value;
         best_index = index;
       }
     }
-    output[0] = best_index;
+    output[row] = best_index;
   }
 
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
@@ -1703,11 +1743,11 @@ static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 
 // All 40 CTAs fit on SM70. The row leader waits only for four local
 // partial reductions; no grid-wide synchronization is required.
-template <typename WeightT>
+template <typename WeightT, bool Reference = false>
 __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
     vllm::RankData buffers, const half* input, const float* residual,
     const WeightT* weight, half* output, float* residual_out, int rank,
-    float epsilon) {
+    const void* local_buffer, float epsilon) {
   constexpr int Threads = 128, Parts = kSm70PushNormParts;
   constexpr int Width = kSm70GemmaRmsNormHiddenSize;
   constexpr int Elements = kSm70PushNormRows * Width;
@@ -1718,10 +1758,13 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
   static_assert(PacksPerPart <= Threads);
   const int row = blockIdx.x / Parts, part = blockIdx.x % Parts;
   const int tid = threadIdx.x;
-  char* local =
-      const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
-      kSm70PushNormOffset;
-  auto* meta = reinterpret_cast<volatile Sm70PushNormMeta*>(local);
+  char* local = const_cast<char*>(reinterpret_cast<const char*>(local_buffer)) +
+                kSm70PushNormOffset;
+  using Meta = std::conditional_t<Reference, Sm70PushNormReferenceMeta,
+                                  Sm70PushNormPacketMeta>;
+  auto* meta = reinterpret_cast<volatile Meta*>(
+      Reference ? local
+                : local + kSm70PushNormPacketOffset - kSm70PushNormOffset);
   const uint32_t generation = meta->generation[row] + 1;
   const int epoch_offset = (generation & 1) * 4 * (Elements / P::size);
   const int pack = row * (Width / P::size) + part * PacksPerPart + tid;
@@ -1794,28 +1837,63 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
   __shared__ float inverse;
   variance = Reduce(storage).Reduce(variance, CubAddOp{}, Threads);
   __syncthreads();
-  if (tid == 0) {
-    meta->partial[row][part] = variance;
-    __threadfence();
-    meta->ready[row][part] = generation;
-    if (part == 0) {
+  if constexpr (Reference) {
+    if (tid == 0) {
+      meta->partial[row][part] = variance;
+      __threadfence();
+      meta->ready[row][part] = generation;
+      if (part == 0) {
 #pragma unroll
-      for (int p = 0; p < Parts; ++p)
-        while (meta->ready[row][p] != generation) {
+        for (int p = 0; p < Parts; ++p)
+          while (meta->ready[row][p] != generation) {
+          }
+        float total = 0;
+#pragma unroll
+        for (int p = 0; p < Parts; ++p) total += meta->partial[row][p];
+        meta->inverse[row] = rsqrtf(total / Width + epsilon);
+        __threadfence();
+        meta->normalized[row] = generation;
+        // Every part has read generation before publishing its partial.
+        meta->generation[row] = generation;
+      } else {
+        while (meta->normalized[row] != generation) {
         }
+      }
+      inverse = meta->inverse[row];
+    }
+  } else {
+    if (tid == 0) {
+      const uint64_t packet =
+          (uint64_t(generation) << 32) | __float_as_uint(variance);
+      asm volatile(
+          "st.volatile.global.u64 [%0], %1;" ::"l"(&meta->partial[row][part]),
+          "l"(packet)
+          : "memory");
+    }
+    __syncwarp();
+    if (tid < 32) {
+      float own_partial = 0;
+      if (tid < Parts) {
+        uint64_t packet;
+        do {
+          asm volatile("ld.volatile.global.u64 %0, [%1];"
+                       : "=l"(packet)
+                       : "l"(&meta->partial[row][tid])
+                       : "memory");
+        } while (uint32_t(packet >> 32) != generation);
+        own_partial = __uint_as_float(uint32_t(packet));
+      }
+      __syncwarp();
       float total = 0;
 #pragma unroll
-      for (int p = 0; p < Parts; ++p) total += meta->partial[row][p];
-      meta->inverse[row] = rsqrtf(total / Width + epsilon);
-      __threadfence();
-      meta->normalized[row] = generation;
-      // Every part has read generation before publishing its partial.
-      meta->generation[row] = generation;
-    } else {
-      while (meta->normalized[row] != generation) {
+      for (int p = 0; p < Parts; ++p)
+        total += __shfl_sync(0xffffffff, own_partial, p);
+      if (tid == 0) {
+        inverse = rsqrtf(total / Width + epsilon);
+        // All producers read generation before their packets are observed.
+        if (part == 0) meta->generation[row] = generation;
       }
     }
-    inverse = meta->inverse[row];
   }
   __syncthreads();
   if (tid < PacksPerPart) {
@@ -1855,6 +1933,9 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
 
 class CustomAllreduce {
  public:
+  const CollectivePolicy policy_;
+  std::atomic<bool> logged_norm_route_{false};
+  std::atomic<bool> logged_sum2_route_{false};
   int rank_;
   int world_size_;
   // Full NVLink or xGMI connection between GPUs.
@@ -1902,8 +1983,10 @@ class CustomAllreduce {
    * are passed in from the constructor.
    */
   CustomAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz,
-                  int rank, int world_size, bool fully_connected = true)
-      : rank_(rank),
+                  int rank, int world_size, bool fully_connected = true,
+                  CollectivePolicy policy = CollectivePolicy::legacy())
+      : policy_(std::move(policy)),
+        rank_(rank),
         world_size_(world_size),
         fully_connected_(fully_connected),
         self_sg_(signals[rank]),
@@ -2002,11 +2085,17 @@ class CustomAllreduce {
         hc_up, 0,
         kSm70Tp4PushAllreduceBufferBytes - kSm70Qwen38HcUpFusedEpochOffset));
     auto* norm_meta = static_cast<char*>(ptrs[rank_]) + kSm70PushNormOffset;
-    CUDACHECK(cudaMemset(norm_meta, 0, kSm70PushNormMetaBytes));
+    Sm70PushNormMeta initial_norm{};
+    for (int epoch = 0; epoch < kSm70Tp4PushAllreduceEpochs; ++epoch)
+      for (int row = 0; row < kSm70PushNormRows; ++row)
+        for (int part = 0; part < kSm70PushNormParts; ++part)
+          initial_norm.partial[epoch][row][part] = -1.0f;
+    CUDACHECK(cudaMemcpy(norm_meta, &initial_norm, sizeof(initial_norm),
+                         cudaMemcpyHostToDevice));
     CUDACHECK(cudaMemset(norm_meta + kSm70PushNormMetaBytes,
                          kSm70Tp4PushAllreduceSentinelByte,
-                         kSm70Tp4PushAllreduceBufferBytes -
-                             kSm70PushNormOffset - kSm70PushNormMetaBytes));
+                         kSm70PushNormPacketOffset - kSm70PushNormOffset -
+                             kSm70PushNormMetaBytes));
     sm70_tp4_push_buffers_registered_ = true;
   }
 
@@ -2072,7 +2161,7 @@ class CustomAllreduce {
       auto& rd = rank_data[i];
       for (int j = 0; j < world_size_; j++) {
         if (j != rank_) {
-          if (sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
+          if (sm70_tp8_hierarchical_custom_ar_enabled(policy_, world_size_,
                                                       fully_connected_) &&
               !sm70_tp8_hierarchical_peer(rank_, j)) {
             rd.ptrs[j] = nullptr;
@@ -2107,7 +2196,7 @@ class CustomAllreduce {
   void allreduce(cudaStream_t stream, T* input, T* output, int size,
                  int threads = 512, int block_limit = defaultBlockLimit) {
     block_limit = custom_allreduce_block_limit(
-        block_limit, world_size_, fully_connected_,
+        policy_, block_limit, world_size_, fully_connected_,
         static_cast<size_t>(size) * sizeof(T), true);
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
@@ -2146,7 +2235,8 @@ class CustomAllreduce {
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes, true);
+        const int push_blocks =
+            sm70_tp4_push_allreduce_blocks(policy_, bytes, true);
         if (push_blocks > 0) {
           sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
               <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
@@ -2156,17 +2246,18 @@ class CustomAllreduce {
       }
       if (sm70_tp8_hierarchical_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
-          sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
+          sm70_tp8_hierarchical_custom_ar_enabled(policy_, world_size_,
                                                   fully_connected_) &&
           sm70_tp8_hierarchical_allreduce_size(bytes)) {
-        const int push_blocks = sm70_tp8_hierarchical_push_blocks(bytes);
+        const int push_blocks =
+            sm70_tp8_hierarchical_push_blocks(policy_, bytes);
         sm70_tp8_hierarchical_reduce_push<false>
             <<<push_blocks, kSm70Tp8HierarchicalPushThreads, 0, stream>>>(
                 sm70_tp8_hierarchical_push_buffers_, input, nullptr, output,
                 rank_, size);
         return;
       }
-      if (sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
+      if (sm70_tp8_hierarchical_custom_ar_enabled(policy_, world_size_,
                                                   fully_connected_) &&
           sm70_tp8_hierarchical_allreduce_size(bytes)) {
         sm70_tp8_hierarchical_reduce<<<1, 512, 0, stream>>>(
@@ -2176,30 +2267,33 @@ class CustomAllreduce {
     }
     if constexpr (std::is_same_v<T, half>) {
       const char* blocks_override =
-          std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+          policy_.raw(CollectivePolicyField::custom_allreduce_block_limit);
       if (world_size_ == 4 && fully_connected_ && bytes >= 384 * 1024 &&
           bytes < 512 * 1024 && block_limit == defaultBlockLimit &&
           (blocks_override == nullptr || blocks_override[0] == '\0') &&
-          std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
-          std::getenv("VLLM_SM70_TP4_M5_AR_THREADS") == nullptr &&
+          policy_.raw(CollectivePolicyField::custom_allreduce_algo) ==
+              nullptr &&
+          policy_.raw(CollectivePolicyField::sm70_tp4_m5_ar_threads) ==
+              nullptr &&
           custom_allreduce_current_device_is_sm70()) {
         cross_device_reduce_2stage<T, 4, true>
             <<<20, 256, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
         return;
       }
     }
-    threads =
-        sm70_tp4_m5_allreduce_threads(world_size_, fully_connected_, bytes);
+    threads = sm70_tp4_m5_allreduce_threads(policy_, world_size_,
+                                            fully_connected_, bytes);
     if constexpr (std::is_same_v<T, half>) {
       // Medium TP4 messages benefit from fewer participating warps/CTAs.
       // Keep the two-stage partition, rank order and visibility protocol;
       // explicit diagnostic dispatch overrides retain their existing launch.
       const char* blocks_override =
-          std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+          policy_.raw(CollectivePolicyField::custom_allreduce_block_limit);
       if (world_size_ == 4 && fully_connected_ && bytes >= 512 * 1024 &&
           bytes <= 768 * 1024 && block_limit == defaultBlockLimit &&
           (blocks_override == nullptr || blocks_override[0] == '\0') &&
-          std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
+          policy_.raw(CollectivePolicyField::custom_allreduce_algo) ==
+              nullptr &&
           custom_allreduce_current_device_is_sm70()) {
         threads = 256;
         block_limit = 20;
@@ -2209,8 +2303,8 @@ class CustomAllreduce {
 
     if constexpr (std::is_same_v<T, half>) {
       if (blocks == 1 && threads == 512 &&
-          sm70_tp4_small_allreduce_pack32(world_size_, fully_connected_,
-                                          bytes)) {
+          sm70_tp4_small_allreduce_pack32(policy_, world_size_,
+                                          fully_connected_, bytes)) {
         sm70_cross_device_reduce_1stage_pack32<4><<<1, 512, 0, stream>>>(
             ptrs, sg_, self_sg_, output, rank_, bytes / 32);
         return;
@@ -2218,7 +2312,8 @@ class CustomAllreduce {
     }
 
     // Check environment variable once
-    const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
+    const char* env_algo =
+        policy_.raw(CollectivePolicyField::custom_allreduce_algo);
     bool force_1stage = false;
     bool force_2stage = false;
     if (env_algo != nullptr) {
@@ -2281,7 +2376,8 @@ class CustomAllreduce {
                                      const WeightT* weight,
                                      half* normalized_out, float* residual_out,
                                      int num_tokens, int hidden_size,
-                                     float epsilon) {
+                                     float epsilon,
+                                     bool benchmark_reference = false) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2302,9 +2398,17 @@ class CustomAllreduce {
     if constexpr (ngpus == 4 && std::is_same_v<ResidualT, float>) {
       if (num_tokens == kSm70PushNormRows && fully_connected_ &&
           sm70_tp4_push_buffers_registered_) {
-        sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
-            sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
-            residual_out, rank_, epsilon);
+        if (benchmark_reference) {
+          sm70_push_allreduce_gemma_rms_norm<WeightT, true>
+              <<<40, 128, 0, stream>>>(
+                  sm70_tp4_push_buffers_, input, residual, weight,
+                  normalized_out, residual_out, rank_,
+                  sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
+        } else {
+          sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
+              sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
+              residual_out, rank_, sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
+        }
         return;
       }
     }
@@ -2323,7 +2427,7 @@ class CustomAllreduce {
       return;
     }
 
-    const int threads = sm70_gemma_rms_norm_threads();
+    const int threads = sm70_gemma_rms_norm_threads(policy_);
 #define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                          \
   sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT>     \
       <<<num_tokens, THREADS, 0, stream>>>(ptrs, sg_, self_sg_, residual, \
@@ -2370,9 +2474,9 @@ class CustomAllreduce {
         rank_data_for_buffer(stream, input, "long-prefill fused norm input");
     RankData* output_ptrs = rank_data_for_buffer(
         stream, shared_output, "long-prefill fused norm output");
-    const int threads = sm70_tp4_long_fused_norm_threads();
+    const int threads = sm70_tp4_long_fused_norm_threads(policy_);
     const int blocks =
-        std::min(tokens_per_rank, sm70_tp4_long_fused_norm_blocks());
+        std::min(tokens_per_rank, sm70_tp4_long_fused_norm_blocks(policy_));
 #define VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(THREADS)                          \
   sm70_peer_reduce_scatter_gemma_rms_norm_all_gather<THREADS, ngpus,           \
                                                      ResidualT, WeightT>       \
@@ -2398,7 +2502,7 @@ class CustomAllreduce {
                       int size, int threads = 512,
                       int block_limit = defaultBlockLimit) {
     block_limit = custom_allreduce_block_limit(
-        block_limit, world_size_, fully_connected_,
+        policy_, block_limit, world_size_, fully_connected_,
         static_cast<size_t>(size) * sizeof(T), false);
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
@@ -2433,35 +2537,37 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     if constexpr (std::is_same_v<T, half>) {
-      const char* batch =
-          std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
+      const char* batch = policy_.raw(
+          CollectivePolicyField::sm70_tp4_push_allreduce_qwen38_batch);
       const bool qwen38_batch =
           (batch == nullptr || std::strcmp(batch, "1") == 0) &&
           (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
            bytes == kSm70Tp4PushAllreduceBytes);
       const char* batch_fastpath =
-          std::getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH");
+          policy_.raw(CollectivePolicyField::sm70_qwen38_batch_fastpath);
       const bool qwen38_m2 = bytes == kSm70Tp4PushAllreduceQwen38M2Bytes &&
                              batch_fastpath != nullptr &&
                              std::strcmp(batch_fastpath, "1") == 0 &&
                              (batch == nullptr || std::strcmp(batch, "1") == 0);
-      const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
+      const char* mtp5 =
+          policy_.raw(CollectivePolicyField::sm70_tp4_push_allreduce_mtp5);
       const bool qwen38_mtp5 =
           (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0) &&
           bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes;
       const char* qwen4_exp_m1 =
-          std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1");
+          policy_.raw(CollectivePolicyField::sm70_tp4_push_allreduce_sum2_m1);
       const bool qwen4_exp_m1_enabled =
           bytes == kSm70Tp4PushAllreduceQwen4ExpBytes &&
           (qwen4_exp_m1 == nullptr || std::strcmp(qwen4_exp_m1, "1") == 0);
 
       if (sm70_tp8_hierarchical_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
-          sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
+          sm70_tp8_hierarchical_custom_ar_enabled(policy_, world_size_,
                                                   fully_connected_) &&
           sm70_tp8_hierarchical_allreduce_size(bytes)) {
-        const int push_blocks = sm70_tp8_hierarchical_push_blocks(bytes);
+        const int push_blocks =
+            sm70_tp8_hierarchical_push_blocks(policy_, bytes);
         sm70_tp8_hierarchical_reduce_push<true>
             <<<push_blocks, kSm70Tp8HierarchicalPushThreads, 0, stream>>>(
                 sm70_tp8_hierarchical_push_buffers_, input_a, input_b, output,
@@ -2473,7 +2579,7 @@ class CustomAllreduce {
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           (qwen38_batch || qwen38_m2 || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
+        const int push_blocks = sm70_tp4_push_allreduce_blocks(policy_, bytes);
         if (push_blocks > 0) {
           sm70_cross_device_reduce_sum2_1stage_push<
               kSm70Tp4PushAllreduceWorldSize>
@@ -2486,7 +2592,8 @@ class CustomAllreduce {
     }
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
-    const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
+    const char* env_algo =
+        policy_.raw(CollectivePolicyField::custom_allreduce_algo);
     bool force_1stage = false;
     bool force_2stage = false;
     if (env_algo != nullptr) {
@@ -2741,7 +2848,8 @@ class CustomAllreduce {
 #undef TILE_RUNTIME_WAIT_REDUCE_CASE
   }
 
-  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output) {
+  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output,
+                   int rows) {
     RankData* ptrs;
     cudaStreamCaptureStatus status;
     CUDACHECK(cudaStreamIsCapturing(stream, &status));
@@ -2758,11 +2866,11 @@ class CustomAllreduce {
       ptrs = it->second;
     }
 
-#define TOP1_CASE(ngpus)                                            \
-  case ngpus: {                                                     \
-    cross_device_top1_argmax<ngpus>                                 \
-        <<<1, 32, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_); \
-    break;                                                          \
+#define TOP1_CASE(ngpus)                                                   \
+  case ngpus: {                                                            \
+    cross_device_top1_argmax<ngpus>                                        \
+        <<<1, 128, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, rows); \
+    break;                                                                 \
   }
 
     switch (world_size_) {

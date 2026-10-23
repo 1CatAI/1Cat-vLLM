@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm.config.execution_policy import layer_policy
 from vllm.config.model import LogprobsMode
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -36,6 +37,7 @@ class Sampler:
         if logprobs_mode not in ("processed_logprobs", "raw_logprobs"):
             raise NotImplementedError(f"Unsupported logprobs_mode: {logprobs_mode}")
         self.logprobs_mode = logprobs_mode
+        self.greedy_token_fastpath = layer_policy().greedy_token_fastpath
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
         self.use_fp64_gumbel = use_fp64_gumbel
 
@@ -64,7 +66,7 @@ class Sampler:
 
     def can_use_sm70_greedy_token_fastpath(self, input_batch: InputBatch) -> bool:
         """Whether TP-local argmax is equivalent to the full MRv2 sampler."""
-        if not envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH or self.compute_nans:
+        if not self.greedy_token_fastpath or self.compute_nans:
             return False
 
         req_indices = input_batch.idx_mapping_np

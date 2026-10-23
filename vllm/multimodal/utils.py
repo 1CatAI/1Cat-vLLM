@@ -213,6 +213,7 @@ def group_and_batch_mm_kwargs(
     *,
     device: torch.types.Device = None,
     pin_memory: bool = False,
+    max_batch_size: int = 0,
 ) -> Generator[tuple[str, int, BatchedTensorInputs], None, None]:
     """
     Group consecutive items (possibly from different requests) into batches.
@@ -229,6 +230,7 @@ def group_and_batch_mm_kwargs(
         mm_kwargs: List of `(modality, item)`.
         device: The device to place the grouped tensors on.
         pin_memory: Whether to pin memory for faster host-to-device transfer.
+        max_batch_size: Maximum items transferred and encoded at once; 0 is unlimited.
 
     Yields:
         A tuple `(modality, num_items, grouped_kwargs)`, where:
@@ -236,15 +238,16 @@ def group_and_batch_mm_kwargs(
         - `kwargs` is a dictionary of keyword arguments to pass to the model;
         - `num_items` is the corresponding number of items.
     """
+    if max_batch_size < 0:
+        raise ValueError("max_batch_size must be nonnegative")
     for modality, group in groupby(mm_kwargs, key=lambda x: x[0]):
         items_lst = [item for _, item in group]
-
-        for num_items, mm_kwargs_batch in group_and_batch_mm_items(
-            items_lst,
-            device=device,
-            pin_memory=pin_memory,
-        ):
-            yield modality, num_items, mm_kwargs_batch
+        size = max_batch_size or len(items_lst)
+        for start in range(0, len(items_lst), size):
+            for num_items, mm_kwargs_batch in group_and_batch_mm_items(
+                items_lst[start : start + size], device=device, pin_memory=pin_memory
+            ):
+                yield modality, num_items, mm_kwargs_batch
 
 
 @deprecated(

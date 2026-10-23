@@ -1373,6 +1373,14 @@ def marlin_int4_fp8_preprocess(
     return torch.ops._C.marlin_int4_fp8_preprocess(qweight, qzeros_or_none, inplace)
 
 
+def prepare_marlin_workspace_policy(device: torch.device) -> None:
+    """Initialize the selected native Marlin provider with its workspace."""
+    if sm70_marlin_available():
+        from vllm._sm70.marlin import bind_marlin_workspace
+
+        bind_marlin_workspace(device)
+
+
 def marlin_gemm(
     a: torch.Tensor,
     c: torch.Tensor | None,
@@ -2994,9 +3002,18 @@ def init_custom_ar(
     rank: int,
     fully_connected: bool,
 ) -> int:
-    return _custom_ar_op("init_custom_ar")(
-        ipc_tensors, rank_data, rank, fully_connected
-    )
+    owner = _custom_ar_owner_namespace()
+    if hasattr(owner, "init_custom_ar_configured"):
+        # Preserve the historical Python defaults without publishing them to
+        # the process environment. This compatibility entry is initialization.
+        from vllm.config.collective import CollectiveNativeConfig
+
+        policy = CollectiveNativeConfig()
+        policy.resolve()
+        return owner.init_custom_ar_configured(
+            ipc_tensors, rank_data, rank, fully_connected, list(policy.values)
+        )
+    return owner.init_custom_ar(ipc_tensors, rank_data, rank, fully_connected)
 
 
 def all_reduce(
@@ -3096,6 +3113,36 @@ def supports_sm70_qwen38_hc_batch() -> bool:
     return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_batch")
 
 
+def supports_sm70_qwen38_hc_local() -> bool:
+    owner = _custom_ar_owner_namespace()
+    return all(
+        hasattr(owner, name)
+        for name in ("sm70_qwen38_hc_down_local", "sm70_qwen38_hc_up_local")
+    )
+
+
+def sm70_qwen38_hc_down_local(input, packed, partials, output, rank) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_down_local(
+        input, packed, partials, output, rank
+    )
+
+
+def sm70_qwen38_hc_up_local(lora, packed, branches, output, rank) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_up_local(
+        lora, packed, branches, output, rank
+    )
+
+
+def supports_sm70_qwen38_hc_replicated() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_replicated")
+
+
+def sm70_qwen38_hc_replicated(x, down, up, partials, lora, output, injection) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_replicated(
+        x, down, up, partials, lora, output, injection
+    )
+
+
 def sm70_qwen38_hc_batch(
     fa: int,
     inp: torch.Tensor,
@@ -3110,8 +3157,15 @@ def sm70_qwen38_hc_batch(
     cooperative: bool = False,
     full_unroll: bool = False,
     fused_chain: bool = False,
+    cta_split_warps: int = 0,
 ) -> None:
-    _custom_ar_owner_namespace().sm70_qwen38_hc_batch(
+    op = _custom_ar_owner_namespace().sm70_qwen38_hc_batch
+    # Retain the ordinary route with extensions predating CTA split support.
+    supports_split = any(
+        "cta_split_warps" in str(schema) for schema in op._schemas.values()
+    )
+    extra = (cta_split_warps,) if supports_split else ()
+    op(
         fa,
         inp,
         packed_down,
@@ -3125,6 +3179,7 @@ def sm70_qwen38_hc_batch(
         cooperative,
         full_unroll,
         fused_chain,
+        *extra,
     )
 
 

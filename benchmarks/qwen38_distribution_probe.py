@@ -34,6 +34,47 @@ def distribution_metrics(reference, candidate):
     }
 
 
+# Shared admission for no-MTP, target verification and draft distributions.
+DISTRIBUTION_LIMITS = {
+    "mean_kl": 0.001,
+    "p99_kl": 0.01,
+    "max_kl": 0.05,
+    "top1_agreement": 0.99,
+}
+
+
+def summarize_distribution(rows):
+    import numpy as np
+
+    if not rows:
+        raise ValueError("Cannot admit an empty distribution probe")
+    kl = [r["kl"] for r in rows]
+    error = [r["max_logit_error"] for r in rows]
+    result = {
+        "rows": len(rows),
+        "mean_kl": float(np.mean(kl)),
+        "p99_kl": float(np.quantile(kl, 0.99)),
+        "max_kl": max(kl),
+        "top1_agreement": float(np.mean([r["top1_agreement"] for r in rows])),
+        "max_logit_error": max(error),
+        "median_logit_error": float(np.median(error)),
+        "p95_logit_error": float(np.quantile(error, 0.95)),
+        "p99_logit_error": float(np.quantile(error, 0.99)),
+        "centered_max_logit_error": max(r["centered_max_logit_error"] for r in rows),
+        "top1_disagreements": sum(not r["top1_agreement"] for r in rows),
+        "mean_reverse_kl": float(np.mean([r["reverse_kl"] for r in rows])),
+    }
+    result["limits"] = DISTRIBUTION_LIMITS.copy()
+    result["checks"] = {
+        name: result[name] >= limit
+        if name == "top1_agreement"
+        else result[name] <= limit
+        for name, limit in DISTRIBUTION_LIMITS.items()
+    }
+    result["passed"] = all(result["checks"].values())
+    return result
+
+
 class DistributionProbeWorkerExtension:
     """Observe the current MRv2 sampler without switching model runners.
 

@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -55,11 +54,11 @@ def test_max_in_flight_tokens_matches_executor_concurrency(
     queue_depth: int,
     expected_batches: int,
 ):
-    monkeypatch.setattr(envs, "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH", queue_depth)
     config = object.__new__(VllmConfig)
     config.parallel_config = SimpleNamespace(pipeline_parallel_size=pp_size)
     config.scheduler_config = SimpleNamespace(
         async_scheduling=async_scheduling,
+        sm70_queue_depth=lambda: queue_depth,
         max_num_batched_tokens=1024,
     )
 

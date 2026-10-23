@@ -2,14 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 
-import json
 import os
 import time
 from collections.abc import Callable
 
 import torch
 
-from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
+from vllm.config.diagnostic_dump import (
+    parse_margin_steps as _parse_step_filter,  # noqa: F401 - legacy import
+)
+from vllm.config.diagnostic_dump import (
+    parse_token_probe as _parse_token_probe,  # noqa: F401 - legacy import
+)
+from vllm.config.execution_policy import communication_policy
+from vllm.diagnostics import diagnostic_channel, diagnostics_for
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -18,6 +25,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.sm70_topk_gather import gather_topk_pairs
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.platforms import current_platform
 
@@ -66,78 +74,33 @@ def _cuda_stage_ms(
     return start_event.elapsed_time(end_event)
 
 
-def _parse_step_filter(raw: str | None) -> set[int] | None:
-    if raw is None:
-        return None
-    steps: set[int] = set()
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "-" in item:
-            start_text, end_text = item.split("-", 1)
-            start = int(start_text)
-            end = int(end_text)
-            if start < 0 or end < start:
-                raise ValueError(f"invalid top-token margin step range: {item}")
-            steps.update(range(start, end + 1))
-            continue
-        step = int(item)
-        if step < 0:
-            raise ValueError(f"invalid top-token margin step: {item}")
-        steps.add(step)
-    return steps
-
-
-def _parse_token_probe(raw: str | None) -> list[int]:
-    if raw is None:
-        return []
-    token_ids: list[int] = []
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        token_id = int(item)
-        if token_id < 0:
-            raise ValueError(f"invalid top-token margin probe token: {item}")
-        token_ids.append(token_id)
-    return token_ids
+def _logits_channel(module, name):
+    return diagnostic_channel(name, owner=getattr(module, "_diagnostics", None))
 
 
 def _top_token_margin_dump_step(module: torch.nn.Module) -> int | None:
-    out_dir = envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR
-    if not out_dir:
+    channel = _logits_channel(module, "top_token_margin")
+    policy = channel.policy
+    if not policy.can_save():
         return None
-    enable_file = envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE
-    if enable_file and not os.path.exists(enable_file):
+    key = str(id(module))
+    step = channel.advance(key)
+    if not policy.allows("steps", step):
         return None
-    step = int(getattr(module, "_sm70_top_token_margin_step", 0))
-    module._sm70_top_token_margin_step = step + 1
-    steps = _parse_step_filter(envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS)
-    if steps is not None and step not in steps:
+    if not channel.take(key, policy.value("max_dumps"), unlimited=True):
         return None
-    reports = int(getattr(module, "_sm70_top_token_margin_reports", 0))
-    max_reports = envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS
-    if max_reports > 0 and reports >= max_reports:
-        return None
-    module._sm70_top_token_margin_reports = reports + 1
     return step
 
 
-def _write_top_token_margin_record(record: dict[str, object]) -> None:
-    out_dir = envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR
-    if not out_dir:
+def _write_top_token_margin_record(record: dict[str, object], *, channel=None) -> None:
+    if channel is None:
+        channel = diagnostic_channel("top_token_margin")
+    if not channel.policy.directory:
         return
-    os.makedirs(out_dir, exist_ok=True)
     device = (
         torch.accelerator.current_device_index() if torch.cuda.is_available() else "cpu"
     )
-    path = os.path.join(
-        out_dir,
-        f"top_token_margin_pid{os.getpid()}_cuda{device}.jsonl",
-    )
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, sort_keys=True) + "\n")
+    channel.append_json(f"top_token_margin_pid{os.getpid()}_cuda{device}.jsonl", record)
 
 
 def _cuda_graph_capture_active() -> bool:
@@ -155,19 +118,19 @@ def _cuda_graph_capture_active() -> bool:
 def _maybe_sync_top1_all_gather(
     module: torch.nn.Module, local_pair: torch.Tensor
 ) -> None:
-    raw_steps = envs.VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS
+    channel = _logits_channel(module, "top1_sync")
+    policy = channel.policy
+    raw_steps = policy.steps
     if not raw_steps or not local_pair.is_cuda:
         return
     if torch.compiler.is_compiling() or _cuda_graph_capture_active():
         return
 
-    step = int(getattr(module, "_sm70_top1_allgather_sync_step", 0)) + 1
-    module._sm70_top1_allgather_sync_step = step
-    target_steps = _parse_step_filter(raw_steps)
-    if target_steps is not None and step not in target_steps:
+    step = channel.advance(str(id(module)), start=1)
+    if not policy.allows("steps", step):
         return
 
-    mode = envs.VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE.strip().lower()
+    mode = policy.mode.strip().lower()
     if mode == "d2h":
         _ = local_pair.detach().cpu()
     elif mode == "device":
@@ -202,6 +165,7 @@ class LogitsProcessor(PluggableLayer):
             scale: A scaling factor to apply to the logits.
         """
         super().__init__()
+        self._communication_policy = communication_policy()
         self.scale = scale
         self.vocab_size = vocab_size
         # Whether the input is logits (default is hidden states).
@@ -212,6 +176,17 @@ class LogitsProcessor(PluggableLayer):
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
+        cfg = get_current_vllm_config_or_none()
+        self._diagnostics = diagnostics_for(cfg)
+        self._top1_exchange = (
+            cfg.kernel_config.top1_exchange_callback() if cfg else None
+        )
+        self._packed_topk_enabled = (
+            cfg is not None and cfg.kernel_config.sm70_packed_topk_gather
+        )
+        self._packed_topk_selections = (
+            cfg.kernel_config.collective_kernel_selections if cfg is not None else None
+        )
 
     def forward(
         self,
@@ -322,41 +297,57 @@ class LogitsProcessor(PluggableLayer):
             )
         tp_size = get_tensor_model_parallel_world_size()
 
-        local_top1 = lm_head.maybe_get_sm70_lm_head_top1(hidden_states, embedding_bias)
-        if local_top1 is None:
-            logits = lm_head.quant_method.apply(
-                lm_head, hidden_states, bias=embedding_bias
+        local_pair = None
+        pair_getter = getattr(lm_head, "maybe_get_sm70_lm_head_top1_pair", None)
+        if (
+            pair_getter is not None
+            and tp_size > 1
+            and self.soft_cap is None
+            and self.scale == 1.0
+        ):
+            local_pair = pair_getter(hidden_states, embedding_bias)
+        if local_pair is None:
+            local_top1 = lm_head.maybe_get_sm70_lm_head_top1(
+                hidden_states, embedding_bias
             )
-            if self.soft_cap is not None:
-                logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
-            if self.scale != 1.0:
-                logits = logits * self.scale
+            if local_top1 is None:
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states, bias=embedding_bias
+                )
+                if self.soft_cap is not None:
+                    logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+                if self.scale != 1.0:
+                    logits = logits * self.scale
 
-            # Mask out padding entries beyond org_vocab_size on this shard.
-            num_pad = lm_head.shard_indices.num_org_vocab_padding
-            if num_pad > 0:
-                logits[..., -num_pad:] = -float("inf")
+                # Mask out padding entries beyond org_vocab_size on this shard.
+                num_pad = lm_head.shard_indices.num_org_vocab_padding
+                if num_pad > 0:
+                    logits[..., -num_pad:] = -float("inf")
 
-            local_max_vals, local_max_indices = logits.max(dim=-1)
+                local_max_vals, local_max_indices = logits.max(dim=-1)
 
-            # Convert shard-local indices to global vocab indices.
-            vocab_start = lm_head.shard_indices.org_vocab_start_index
-            global_indices = local_max_indices + vocab_start
-        else:
-            local_max_vals, global_indices = local_top1
+                # Convert shard-local indices to global vocab indices.
+                vocab_start = lm_head.shard_indices.org_vocab_start_index
+                global_indices = local_max_indices + vocab_start
+            else:
+                local_max_vals, global_indices = local_top1
 
-        if tp_size == 1:
-            self._maybe_dump_top_token_margin(
-                lm_head, hidden_states, embedding_bias, global_indices
+            if tp_size == 1:
+                self._maybe_dump_top_token_margin(
+                    lm_head, hidden_states, embedding_bias, global_indices
+                )
+                return global_indices
+
+            # All-gather (value, index) pairs, then reduce to global argmax.
+            # Use float32 to avoid bf16 precision loss on large vocab indices.
+            local_pair = torch.stack(
+                [local_max_vals.float(), global_indices.float()], dim=-1
             )
-            return global_indices
-
-        # All-gather (value, index) pairs, then reduce to global argmax.
-        # Use float32 to avoid bf16 precision loss on large vocab indices.
-        local_pair = torch.stack(
-            [local_max_vals.float(), global_indices.float()], dim=-1
-        )
         _maybe_sync_top1_all_gather(self, local_pair)
+        if self._top1_exchange is not None:
+            exchanged_tokens = self._top1_exchange(local_pair)
+            if exchanged_tokens is not None:
+                return exchanged_tokens
         custom_top_tokens = self._maybe_custom_top1_argmax(local_pair)
         if custom_top_tokens is not None:
             self._maybe_dump_top_token_margin(
@@ -548,6 +539,22 @@ class LogitsProcessor(PluggableLayer):
             logits = logits[..., : self.org_vocab_size]
         return self._apply_logits_transforms(logits)
 
+    def get_compact_target_probe_with_fallback(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        """Select a target probe whose caller restores ties and guards cutoffs."""
+        return self._get_topk_tokens_and_logits(
+            lm_head,
+            hidden_states,
+            top_k,
+            None,
+            retain_local_logits=True,
+            compact_target_probe=True,
+        )
+
     def _get_topk_tokens_and_logits(
         self,
         lm_head: VocabParallelEmbedding,
@@ -556,6 +563,7 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
         *,
         retain_local_logits: bool,
+        compact_target_probe: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
         """Vocab-parallel global top-k logits without gathering full vocab."""
         if top_k <= 0:
@@ -602,23 +610,33 @@ class LogitsProcessor(PluggableLayer):
                     logits = logits.clone()
                 logits[..., -num_pad:] = -float("inf")
 
-            logits_float = logits.float()
+            logits_float = logits.float() if not compact_target_probe else None
             postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
-            local_k = min(top_k, logits_float.shape[-1])
+            local_k = min(top_k, logits.shape[-1])
             stage_start = _cuda_stage_start(profile_enabled)
-            local_vals, local_indices = torch.topk(
-                logits_float,
-                k=local_k,
-                dim=-1,
-            )
+            selected = None
+            if compact_target_probe and local_k == 64:
+                from vllm.model_executor.layers.sm70_compact_topk import (
+                    compact_half_topk,
+                )
+
+                selected = compact_half_topk(logits)
+            if selected is None:
+                local_vals, local_indices = torch.topk(
+                    logits.float() if logits_float is None else logits_float,
+                    k=local_k,
+                    dim=-1,
+                )
+            else:
+                local_vals, local_indices = selected
             local_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
             stage_start = _cuda_stage_start(profile_enabled)
             vocab_start = lm_head.shard_indices.org_vocab_start_index
             local_global_indices = local_indices + vocab_start
             local_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
-            local_vocab_size = int(logits_float.shape[-1])
+            local_vocab_size = int(logits.shape[-1])
         else:
             local_vals, local_global_indices = local_candidates
             local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
@@ -642,15 +660,24 @@ class LogitsProcessor(PluggableLayer):
         merge_topk_ms = 0.0
         if tp_size > 1:
             stage_start = _cuda_stage_start(profile_enabled)
-            gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
-            gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
-
-            stage_start = _cuda_stage_start(profile_enabled)
-            gathered_indices = tensor_model_parallel_all_gather(
+            packed = gather_topk_pairs(
+                local_vals,
                 local_global_indices,
-                dim=-1,
+                vocab_size=lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
             )
-            gather_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            if packed is None:
+                gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
+                gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
+                stage_start = _cuda_stage_start(profile_enabled)
+                gathered_indices = tensor_model_parallel_all_gather(
+                    local_global_indices, dim=-1
+                )
+                gather_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            else:
+                gathered_vals, gathered_indices = packed
+                gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
             effective_k = min(top_k, gathered_vals.shape[-1])
             stage_start = _cuda_stage_start(profile_enabled)
@@ -727,8 +754,8 @@ class LogitsProcessor(PluggableLayer):
             selected_tokens = selected_tokens.to(logits.device).view(-1, 1)
             selected_vals = logits.gather(dim=-1, index=selected_tokens).squeeze(-1)
             margins = top_vals[:, 0] - top_vals[:, 1] if top_k > 1 else top_vals[:, 0]
-            probe_token_ids = _parse_token_probe(
-                os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS")
+            probe_token_ids = _logits_channel(self, "top_token_margin").policy.parsed(
+                "probes"
             )
             if probe_token_ids:
                 valid_probe_token_ids = [
@@ -776,16 +803,24 @@ class LogitsProcessor(PluggableLayer):
                 "top1_top2_margins": margins.detach().float().cpu().tolist(),
                 "probe_token_ids": valid_probe_token_ids,
                 "probe_values": probe_values,
-            }
+            },
+            channel=_logits_channel(self, "top_token_margin"),
         )
 
     def _maybe_custom_top1_argmax(
         self,
         local_pair: torch.Tensor,
     ) -> torch.Tensor | None:
-        if not envs.VLLM_SM70_TOP1_CUSTOM_AR:
+        if (
+            not self._communication_policy.top1_custom_ar
+            or not current_platform.is_device_capability(70)
+        ):
             return None
-        if local_pair.numel() != 2 or local_pair.dtype != torch.float32:
+        if (
+            local_pair.dtype != torch.float32
+            or not 2 <= local_pair.numel() <= 256
+            or local_pair.numel() % 2 != 0
+        ):
             return None
         try:
             communicator = get_tp_group().device_communicator

@@ -1,0 +1,76 @@
+{
+  "version": "1.5.2.dev1082+g18f93e087",
+  "core_sha256": "92e8de1c1c3447d5ba874c15175990efc52896b6d98092ca0335db476d92440f",
+  "shape": [
+    512,
+    160,
+    2560
+  ],
+  "source_types": [
+    23,
+    23,
+    20
+  ],
+  "layer": 47,
+  "lanes_per_row": 8,
+  "routing": "seeded synthetic random top10; real weights",
+  "cache": "32MiB eviction before each timed operation",
+  "cases": [
+    {
+      "m": 5,
+      "active_experts": 49,
+      "relative_l2": 0.010602133348584175,
+      "timings": [
+        {
+          "arm": "canonical",
+          "us": 239.6160066127777
+        },
+        {
+          "arm": "candidate",
+          "us": 66.56000018119812
+        },
+        {
+          "arm": "candidate",
+          "us": 66.56000018119812
+        },
+        {
+          "arm": "canonical",
+          "us": 212.99199759960175
+        }
+      ],
+      "unique_weight_bytes": 33868800.0,
+      "candidate_effective_gbs": [
+        508.84615246090794,
+        508.84615246090794
+      ]
+    },
+    {
+      "m": 20,
+      "active_experts": 163,
+      "relative_l2": 0.011010373011231422,
+      "timings": [
+        {
+          "arm": "canonical",
+          "us": 309.2480003833771
+        },
+        {
+          "arm": "candidate",
+          "us": 185.34399569034576
+        },
+        {
+          "arm": "candidate",
+          "us": 185.34399569034576
+        },
+        {
+          "arm": "canonical",
+          "us": 308.22399258613586
+        }
+      ],
+      "unique_weight_bytes": 112665600.0,
+      "candidate_effective_gbs": [
+        607.8729423111738,
+        607.8729423111738
+      ]
+    }
+  ]
+}

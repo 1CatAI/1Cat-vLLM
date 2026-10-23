@@ -1,0 +1,769 @@
+{
+  "source": "aa275f045988bd3977c2ba3c5ba275269ae843dc",
+  "wheel_sha256": "80d87a17081723199eed97ee352d04e2350341b31741da5aba92736d55e837b9",
+  "native_sha256": "81a508b95642a8709fd8eb39a0c839b5999927a19dea32257f629c8fbbc5ff26",
+  "focused_tests": 156,
+  "output_bits_match": true,
+  "installed_cold_bank_mean_us": {
+    "current": 38.80527973175049,
+    "clocked": 37.91696220636368
+  },
+  "contract": {
+    "gpu": "V100-SXM2-32GB",
+    "sm": 70,
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "sm_clock_mhz": 1290,
+    "memory_clock_mhz": 877,
+    "m": 8,
+    "n": 4352,
+    "k": 5120,
+    "cold_banks": 16
+  },
+  "qualification": "Diagnostic calibration only; no model speedup claim.",
+  "model_diagnostic": [
+    {
+      "input_len": 1024,
+      "rank": 0,
+      "roles": {
+        "in_proj_qkvz": {
+          "count": 39,
+          "warp_envelope_ms": 1.1735039999999999,
+          "mean_us": 30.089846153846153,
+          "weight_stream_mb": 384.86016,
+          "effective_GBs": 327.9581151832461
+        },
+        "out_proj": {
+          "count": 48,
+          "warp_envelope_ms": 0.702464,
+          "mean_us": 14.634666666666666,
+          "weight_stream_mb": 188.74368,
+          "effective_GBs": 268.68804664723035
+        },
+        "gate_up_proj": {
+          "count": 62,
+          "warp_envelope_ms": 2.79552,
+          "mean_us": 45.08903225806451,
+          "weight_stream_mb": 1316.74112,
+          "effective_GBs": 471.01831501831504
+        },
+        "down_proj": {
+          "count": 63,
+          "warp_envelope_ms": 1.568768,
+          "mean_us": 24.901079365079365,
+          "weight_stream_mb": 712.33536,
+          "effective_GBs": 454.0731070496084
+        },
+        "o_proj": {
+          "count": 16,
+          "warp_envelope_ms": 0.27648,
+          "mean_us": 17.28,
+          "weight_stream_mb": 61.19424,
+          "effective_GBs": 221.33333333333331
+        },
+        "qkv_proj": {
+          "count": 9,
+          "warp_envelope_ms": 0.264192,
+          "mean_us": 29.354666666666667,
+          "weight_stream_mb": 81.34656,
+          "effective_GBs": 307.906976744186
+        }
+      },
+      "total_projection_envelope_ms": 6.780928,
+      "projection_span_ms": 12.859392,
+      "total_between_projection_ms": 6.078464,
+      "inter_projection": {
+        "in_proj_qkvz -> out_proj": {
+          "count": 39,
+          "total_ms": 1.241088,
+          "mean_us": 31.822769230769232,
+          "max_us": 40.96
+        },
+        "out_proj -> gate_up_proj": {
+          "count": 46,
+          "total_ms": 0.84992,
+          "mean_us": 18.476521739130433,
+          "max_us": 25.6
+        },
+        "gate_up_proj -> down_proj": {
+          "count": 61,
+          "total_ms": 0.152576,
+          "mean_us": 2.5012459016393445,
+          "max_us": 9.216
+        },
+        "down_proj -> in_proj_qkvz": {
+          "count": 38,
+          "total_ms": 0.5601280000000001,
+          "mean_us": 14.740210526315789,
+          "max_us": 27.648
+        },
+        "down_proj -> o_proj": {
+          "count": 7,
+          "total_ms": 1.014784,
+          "mean_us": 144.96914285714286,
+          "max_us": 147.456
+        },
+        "o_proj -> gate_up_proj": {
+          "count": 16,
+          "total_ms": 0.247808,
+          "mean_us": 15.488,
+          "max_us": 21.504
+        },
+        "down_proj -> out_proj": {
+          "count": 8,
+          "total_ms": 0.6973440000000001,
+          "mean_us": 87.168,
+          "max_us": 95.232
+        },
+        "out_proj -> down_proj": {
+          "count": 2,
+          "total_ms": 0.187392,
+          "mean_us": 93.696,
+          "max_us": 95.232
+        },
+        "gate_up_proj -> out_proj": {
+          "count": 1,
+          "total_ms": 0.11980800000000001,
+          "mean_us": 119.808,
+          "max_us": 119.808
+        },
+        "down_proj -> qkv_proj": {
+          "count": 9,
+          "total_ms": 0.14233600000000002,
+          "mean_us": 15.815111111111111,
+          "max_us": 22.528
+        },
+        "qkv_proj -> o_proj": {
+          "count": 9,
+          "total_ms": 0.8652799999999999,
+          "mean_us": 96.14222222222222,
+          "max_us": 102.4
+        }
+      },
+      "largest_intervals": [
+        {
+          "before": "model.layers.18.mlp.down_proj",
+          "after": "model.layers.19.self_attn.o_proj",
+          "us": 147.456
+        },
+        {
+          "before": "model.layers.58.mlp.down_proj",
+          "after": "model.layers.59.self_attn.o_proj",
+          "us": 147.456
+        },
+        {
+          "before": "model.layers.30.mlp.down_proj",
+          "after": "model.layers.31.self_attn.o_proj",
+          "us": 146.432
+        },
+        {
+          "before": "model.layers.2.mlp.down_proj",
+          "after": "model.layers.3.self_attn.o_proj",
+          "us": 144.384
+        },
+        {
+          "before": "model.layers.6.mlp.down_proj",
+          "after": "model.layers.7.self_attn.o_proj",
+          "us": 144.384
+        },
+        {
+          "before": "model.layers.14.mlp.down_proj",
+          "after": "model.layers.15.self_attn.o_proj",
+          "us": 143.36
+        },
+        {
+          "before": "model.layers.10.mlp.down_proj",
+          "after": "model.layers.11.self_attn.o_proj",
+          "us": 141.312
+        },
+        {
+          "before": "model.layers.16.mlp.gate_up_proj",
+          "after": "model.layers.17.linear_attn.out_proj",
+          "us": 119.808
+        },
+        {
+          "before": "model.layers.43.self_attn.qkv_proj",
+          "after": "model.layers.43.self_attn.o_proj",
+          "us": 102.4
+        },
+        {
+          "before": "model.layers.51.self_attn.qkv_proj",
+          "after": "model.layers.51.self_attn.o_proj",
+          "us": 100.352
+        },
+        {
+          "before": "model.layers.55.self_attn.qkv_proj",
+          "after": "model.layers.55.self_attn.o_proj",
+          "us": 98.304
+        },
+        {
+          "before": "model.layers.35.self_attn.qkv_proj",
+          "after": "model.layers.35.self_attn.o_proj",
+          "us": 96.256
+        }
+      ],
+      "qualification": "Last replay warp envelopes; not trace service, HBM measurement or qualified E2E. Between-projection intervals include intervening operators and waits."
+    },
+    {
+      "input_len": 1024,
+      "rank": 1,
+      "roles": {
+        "in_proj_qkvz": {
+          "count": 39,
+          "warp_envelope_ms": 1.175552,
+          "mean_us": 30.142358974358974,
+          "weight_stream_mb": 384.86016,
+          "effective_GBs": 327.38675958188156
+        },
+        "out_proj": {
+          "count": 48,
+          "warp_envelope_ms": 0.70656,
+          "mean_us": 14.72,
+          "weight_stream_mb": 188.74368,
+          "effective_GBs": 267.1304347826087
+        },
+        "gate_up_proj": {
+          "count": 62,
+          "warp_envelope_ms": 2.812928,
+          "mean_us": 45.3698064516129,
+          "weight_stream_mb": 1316.74112,
+          "effective_GBs": 468.1033855114671
+        },
+        "down_proj": {
+          "count": 63,
+          "warp_envelope_ms": 1.55648,
+          "mean_us": 24.706031746031748,
+          "weight_stream_mb": 712.33536,
+          "effective_GBs": 457.6578947368421
+        },
+        "o_proj": {
+          "count": 16,
+          "warp_envelope_ms": 0.279552,
+          "mean_us": 17.472,
+          "weight_stream_mb": 61.19424,
+          "effective_GBs": 218.9010989010989
+        },
+        "qkv_proj": {
+          "count": 9,
+          "warp_envelope_ms": 0.263168,
+          "mean_us": 29.24088888888889,
+          "weight_stream_mb": 81.34656,
+          "effective_GBs": 309.10505836575874
+        }
+      },
+      "total_projection_envelope_ms": 6.794239999999999,
+      "projection_span_ms": 12.86144,
+      "total_between_projection_ms": 6.0672,
+      "inter_projection": {
+        "in_proj_qkvz -> out_proj": {
+          "count": 39,
+          "total_ms": 1.2288,
+          "mean_us": 31.50769230769231,
+          "max_us": 38.912
+        },
+        "out_proj -> gate_up_proj": {
+          "count": 46,
+          "total_ms": 0.851968,
+          "mean_us": 18.521043478260868,
+          "max_us": 25.6
+        },
+        "gate_up_proj -> down_proj": {
+          "count": 61,
+          "total_ms": 0.151552,
+          "mean_us": 2.484459016393443,
+          "max_us": 11.264
+        },
+        "down_proj -> in_proj_qkvz": {
+          "count": 38,
+          "total_ms": 0.54784,
+          "mean_us": 14.416842105263157,
+          "max_us": 28.672
+        },
+        "down_proj -> o_proj": {
+          "count": 7,
+          "total_ms": 1.033216,
+          "mean_us": 147.6022857142857,
+          "max_us": 153.6
+        },
+        "o_proj -> gate_up_proj": {
+          "count": 16,
+          "total_ms": 0.24371199999999998,
+          "mean_us": 15.232,
+          "max_us": 20.48
+        },
+        "down_proj -> out_proj": {
+          "count": 8,
+          "total_ms": 0.699392,
+          "mean_us": 87.424,
+          "max_us": 97.28
+        },
+        "out_proj -> down_proj": {
+          "count": 2,
+          "total_ms": 0.18944,
+          "mean_us": 94.72,
+          "max_us": 95.232
+        },
+        "gate_up_proj -> out_proj": {
+          "count": 1,
+          "total_ms": 0.123904,
+          "mean_us": 123.904,
+          "max_us": 123.904
+        },
+        "down_proj -> qkv_proj": {
+          "count": 9,
+          "total_ms": 0.134144,
+          "mean_us": 14.90488888888889,
+          "max_us": 20.48
+        },
+        "qkv_proj -> o_proj": {
+          "count": 9,
+          "total_ms": 0.863232,
+          "mean_us": 95.91466666666666,
+          "max_us": 99.328
+        }
+      },
+      "largest_intervals": [
+        {
+          "before": "model.layers.18.mlp.down_proj",
+          "after": "model.layers.19.self_attn.o_proj",
+          "us": 153.6
+        },
+        {
+          "before": "model.layers.30.mlp.down_proj",
+          "after": "model.layers.31.self_attn.o_proj",
+          "us": 151.552
+        },
+        {
+          "before": "model.layers.58.mlp.down_proj",
+          "after": "model.layers.59.self_attn.o_proj",
+          "us": 151.552
+        },
+        {
+          "before": "model.layers.6.mlp.down_proj",
+          "after": "model.layers.7.self_attn.o_proj",
+          "us": 147.456
+        },
+        {
+          "before": "model.layers.2.mlp.down_proj",
+          "after": "model.layers.3.self_attn.o_proj",
+          "us": 145.408
+        },
+        {
+          "before": "model.layers.10.mlp.down_proj",
+          "after": "model.layers.11.self_attn.o_proj",
+          "us": 143.36
+        },
+        {
+          "before": "model.layers.14.mlp.down_proj",
+          "after": "model.layers.15.self_attn.o_proj",
+          "us": 140.288
+        },
+        {
+          "before": "model.layers.16.mlp.gate_up_proj",
+          "after": "model.layers.17.linear_attn.out_proj",
+          "us": 123.904
+        },
+        {
+          "before": "model.layers.23.self_attn.qkv_proj",
+          "after": "model.layers.23.self_attn.o_proj",
+          "us": 99.328
+        },
+        {
+          "before": "model.layers.27.self_attn.qkv_proj",
+          "after": "model.layers.27.self_attn.o_proj",
+          "us": 97.28
+        },
+        {
+          "before": "model.layers.47.mlp.down_proj",
+          "after": "model.layers.48.linear_attn.out_proj",
+          "us": 97.28
+        },
+        {
+          "before": "model.layers.63.self_attn.qkv_proj",
+          "after": "model.layers.63.self_attn.o_proj",
+          "us": 97.28
+        }
+      ],
+      "qualification": "Last replay warp envelopes; not trace service, HBM measurement or qualified E2E. Between-projection intervals include intervening operators and waits."
+    },
+    {
+      "input_len": 1024,
+      "rank": 2,
+      "roles": {
+        "in_proj_qkvz": {
+          "count": 39,
+          "warp_envelope_ms": 1.174528,
+          "mean_us": 30.116102564102565,
+          "weight_stream_mb": 384.86016,
+          "effective_GBs": 327.6721883173496
+        },
+        "out_proj": {
+          "count": 48,
+          "warp_envelope_ms": 0.702464,
+          "mean_us": 14.634666666666666,
+          "weight_stream_mb": 188.74368,
+          "effective_GBs": 268.68804664723035
+        },
+        "gate_up_proj": {
+          "count": 62,
+          "warp_envelope_ms": 2.798592,
+          "mean_us": 45.13858064516129,
+          "weight_stream_mb": 1316.74112,
+          "effective_GBs": 470.501280643981
+        },
+        "down_proj": {
+          "count": 63,
+          "warp_envelope_ms": 1.565696,
+          "mean_us": 24.85231746031746,
+          "weight_stream_mb": 712.33536,
+          "effective_GBs": 454.9640287769784
+        },
+        "o_proj": {
+          "count": 16,
+          "warp_envelope_ms": 0.27136,
+          "mean_us": 16.96,
+          "weight_stream_mb": 61.19424,
+          "effective_GBs": 225.50943396226413
+        },
+        "qkv_proj": {
+          "count": 9,
+          "warp_envelope_ms": 0.267264,
+          "mean_us": 29.696,
+          "weight_stream_mb": 81.34656,
+          "effective_GBs": 304.367816091954
+        }
+      },
+      "total_projection_envelope_ms": 6.779903999999999,
+      "projection_span_ms": 12.860416,
+      "total_between_projection_ms": 6.080512,
+      "inter_projection": {
+        "in_proj_qkvz -> out_proj": {
+          "count": 39,
+          "total_ms": 1.2789760000000001,
+          "mean_us": 32.79425641025641,
+          "max_us": 39.936
+        },
+        "out_proj -> gate_up_proj": {
+          "count": 46,
+          "total_ms": 0.8110080000000001,
+          "mean_us": 17.630608695652175,
+          "max_us": 25.6
+        },
+        "gate_up_proj -> down_proj": {
+          "count": 61,
+          "total_ms": 0.149504,
+          "mean_us": 2.4508852459016395,
+          "max_us": 11.264
+        },
+        "down_proj -> in_proj_qkvz": {
+          "count": 38,
+          "total_ms": 0.569344,
+          "mean_us": 14.982736842105263,
+          "max_us": 28.672
+        },
+        "down_proj -> o_proj": {
+          "count": 7,
+          "total_ms": 1.038336,
+          "mean_us": 148.33371428571428,
+          "max_us": 155.648
+        },
+        "o_proj -> gate_up_proj": {
+          "count": 16,
+          "total_ms": 0.2304,
+          "mean_us": 14.4,
+          "max_us": 18.432
+        },
+        "down_proj -> out_proj": {
+          "count": 8,
+          "total_ms": 0.6973440000000001,
+          "mean_us": 87.168,
+          "max_us": 95.232
+        },
+        "out_proj -> down_proj": {
+          "count": 2,
+          "total_ms": 0.181248,
+          "mean_us": 90.624,
+          "max_us": 92.16
+        },
+        "gate_up_proj -> out_proj": {
+          "count": 1,
+          "total_ms": 0.124928,
+          "mean_us": 124.928,
+          "max_us": 124.928
+        },
+        "down_proj -> qkv_proj": {
+          "count": 9,
+          "total_ms": 0.132096,
+          "mean_us": 14.677333333333333,
+          "max_us": 21.504
+        },
+        "qkv_proj -> o_proj": {
+          "count": 9,
+          "total_ms": 0.867328,
+          "mean_us": 96.36977777777778,
+          "max_us": 98.304
+        }
+      },
+      "largest_intervals": [
+        {
+          "before": "model.layers.58.mlp.down_proj",
+          "after": "model.layers.59.self_attn.o_proj",
+          "us": 155.648
+        },
+        {
+          "before": "model.layers.30.mlp.down_proj",
+          "after": "model.layers.31.self_attn.o_proj",
+          "us": 151.552
+        },
+        {
+          "before": "model.layers.2.mlp.down_proj",
+          "after": "model.layers.3.self_attn.o_proj",
+          "us": 150.528
+        },
+        {
+          "before": "model.layers.6.mlp.down_proj",
+          "after": "model.layers.7.self_attn.o_proj",
+          "us": 145.408
+        },
+        {
+          "before": "model.layers.10.mlp.down_proj",
+          "after": "model.layers.11.self_attn.o_proj",
+          "us": 145.408
+        },
+        {
+          "before": "model.layers.18.mlp.down_proj",
+          "after": "model.layers.19.self_attn.o_proj",
+          "us": 145.408
+        },
+        {
+          "before": "model.layers.14.mlp.down_proj",
+          "after": "model.layers.15.self_attn.o_proj",
+          "us": 144.384
+        },
+        {
+          "before": "model.layers.16.mlp.gate_up_proj",
+          "after": "model.layers.17.linear_attn.out_proj",
+          "us": 124.928
+        },
+        {
+          "before": "model.layers.51.self_attn.qkv_proj",
+          "after": "model.layers.51.self_attn.o_proj",
+          "us": 98.304
+        },
+        {
+          "before": "model.layers.27.self_attn.qkv_proj",
+          "after": "model.layers.27.self_attn.o_proj",
+          "us": 97.28
+        },
+        {
+          "before": "model.layers.47.self_attn.qkv_proj",
+          "after": "model.layers.47.self_attn.o_proj",
+          "us": 97.28
+        },
+        {
+          "before": "model.layers.35.self_attn.qkv_proj",
+          "after": "model.layers.35.self_attn.o_proj",
+          "us": 96.256
+        }
+      ],
+      "qualification": "Last replay warp envelopes; not trace service, HBM measurement or qualified E2E. Between-projection intervals include intervening operators and waits."
+    },
+    {
+      "input_len": 1024,
+      "rank": 3,
+      "roles": {
+        "in_proj_qkvz": {
+          "count": 39,
+          "warp_envelope_ms": 1.1776,
+          "mean_us": 30.194871794871794,
+          "weight_stream_mb": 384.86016,
+          "effective_GBs": 326.81739130434784
+        },
+        "out_proj": {
+          "count": 48,
+          "warp_envelope_ms": 0.7096319999999999,
+          "mean_us": 14.783999999999999,
+          "weight_stream_mb": 188.74368,
+          "effective_GBs": 265.974025974026
+        },
+        "gate_up_proj": {
+          "count": 62,
+          "warp_envelope_ms": 2.812928,
+          "mean_us": 45.3698064516129,
+          "weight_stream_mb": 1316.74112,
+          "effective_GBs": 468.1033855114671
+        },
+        "down_proj": {
+          "count": 63,
+          "warp_envelope_ms": 1.560576,
+          "mean_us": 24.771047619047618,
+          "weight_stream_mb": 712.33536,
+          "effective_GBs": 456.4566929133858
+        },
+        "o_proj": {
+          "count": 16,
+          "warp_envelope_ms": 0.27648,
+          "mean_us": 17.28,
+          "weight_stream_mb": 61.19424,
+          "effective_GBs": 221.33333333333331
+        },
+        "qkv_proj": {
+          "count": 9,
+          "warp_envelope_ms": 0.265216,
+          "mean_us": 29.468444444444444,
+          "weight_stream_mb": 81.34656,
+          "effective_GBs": 306.71814671814667
+        }
+      },
+      "total_projection_envelope_ms": 6.802432,
+      "projection_span_ms": 12.860416,
+      "total_between_projection_ms": 6.057984,
+      "inter_projection": {
+        "in_proj_qkvz -> out_proj": {
+          "count": 39,
+          "total_ms": 1.2544000000000002,
+          "mean_us": 32.16410256410256,
+          "max_us": 40.96
+        },
+        "out_proj -> gate_up_proj": {
+          "count": 46,
+          "total_ms": 0.8437760000000001,
+          "mean_us": 18.34295652173913,
+          "max_us": 25.6
+        },
+        "gate_up_proj -> down_proj": {
+          "count": 61,
+          "total_ms": 0.161792,
+          "mean_us": 2.652327868852459,
+          "max_us": 11.264
+        },
+        "down_proj -> in_proj_qkvz": {
+          "count": 38,
+          "total_ms": 0.535552,
+          "mean_us": 14.093473684210526,
+          "max_us": 29.696
+        },
+        "down_proj -> o_proj": {
+          "count": 7,
+          "total_ms": 1.0209279999999998,
+          "mean_us": 145.84685714285712,
+          "max_us": 148.48
+        },
+        "o_proj -> gate_up_proj": {
+          "count": 16,
+          "total_ms": 0.24371199999999998,
+          "mean_us": 15.232,
+          "max_us": 20.48
+        },
+        "down_proj -> out_proj": {
+          "count": 8,
+          "total_ms": 0.6840320000000001,
+          "mean_us": 85.504,
+          "max_us": 96.256
+        },
+        "out_proj -> down_proj": {
+          "count": 2,
+          "total_ms": 0.186368,
+          "mean_us": 93.184,
+          "max_us": 97.28
+        },
+        "gate_up_proj -> out_proj": {
+          "count": 1,
+          "total_ms": 0.124928,
+          "mean_us": 124.928,
+          "max_us": 124.928
+        },
+        "down_proj -> qkv_proj": {
+          "count": 9,
+          "total_ms": 0.13312000000000002,
+          "mean_us": 14.791111111111112,
+          "max_us": 21.504
+        },
+        "qkv_proj -> o_proj": {
+          "count": 9,
+          "total_ms": 0.8693759999999999,
+          "mean_us": 96.59733333333334,
+          "max_us": 98.304
+        }
+      },
+      "largest_intervals": [
+        {
+          "before": "model.layers.2.mlp.down_proj",
+          "after": "model.layers.3.self_attn.o_proj",
+          "us": 148.48
+        },
+        {
+          "before": "model.layers.58.mlp.down_proj",
+          "after": "model.layers.59.self_attn.o_proj",
+          "us": 147.456
+        },
+        {
+          "before": "model.layers.6.mlp.down_proj",
+          "after": "model.layers.7.self_attn.o_proj",
+          "us": 146.432
+        },
+        {
+          "before": "model.layers.30.mlp.down_proj",
+          "after": "model.layers.31.self_attn.o_proj",
+          "us": 145.408
+        },
+        {
+          "before": "model.layers.10.mlp.down_proj",
+          "after": "model.layers.11.self_attn.o_proj",
+          "us": 144.384
+        },
+        {
+          "before": "model.layers.14.mlp.down_proj",
+          "after": "model.layers.15.self_attn.o_proj",
+          "us": 144.384
+        },
+        {
+          "before": "model.layers.18.mlp.down_proj",
+          "after": "model.layers.19.self_attn.o_proj",
+          "us": 144.384
+        },
+        {
+          "before": "model.layers.16.mlp.gate_up_proj",
+          "after": "model.layers.17.linear_attn.out_proj",
+          "us": 124.928
+        },
+        {
+          "before": "model.layers.39.self_attn.qkv_proj",
+          "after": "model.layers.39.self_attn.o_proj",
+          "us": 98.304
+        },
+        {
+          "before": "model.layers.51.self_attn.qkv_proj",
+          "after": "model.layers.51.self_attn.o_proj",
+          "us": 98.304
+        },
+        {
+          "before": "model.layers.13.linear_attn.out_proj",
+          "after": "model.layers.13.mlp.down_proj",
+          "us": 97.28
+        },
+        {
+          "before": "model.layers.43.self_attn.qkv_proj",
+          "after": "model.layers.43.self_attn.o_proj",
+          "us": 97.28
+        }
+      ],
+      "qualification": "Last replay warp envelopes; not trace service, HBM measurement or qualified E2E. Between-projection intervals include intervening operators and waits."
+    }
+  ],
+  "model_contract": {
+    "input_len": 1024,
+    "max_tokens": 96,
+    "max_model_len": 32768,
+    "tp": 4,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 20,
+    "seed": 123,
+    "kv": "FP16",
+    "recurrent_state": "FP32",
+    "natural_eos_health": "passed",
+    "token_prefix_match": true,
+    "qualification": "Short diagnostic; ordinary matched sixteen-prompt speed baseline unchanged."
+  }
+}

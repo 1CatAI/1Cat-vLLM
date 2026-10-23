@@ -7,13 +7,18 @@
 // Both layouts use E2M1 nibbles ordered [0,2,4,6,1,3,5,7] per K=8.
 // TurboMind SM70 HMMA884 B/Pack1 stores [N/32, K/8, column, word].
 // QPN2 stores [N/32, K/16, lane, uint2]. Only the word addresses differ.
-template <bool TurboMindLayout, bool CacheCodes = false>
+template <bool TurboMindLayout, bool CacheCodes = false,
+          bool BundledScales = false>
 struct Nvfp4Qpn2CodeReader {
+  static_assert(!(TurboMindLayout && BundledScales),
+                "Bundled scales require native QPN2 codes");
   const uint8_t* base;
 
   __device__ __forceinline__ Nvfp4Qpn2CodeReader(const uint8_t* codes, int tile,
                                                  int groups_k16, int lane) {
-    if constexpr (TurboMindLayout) {
+    if constexpr (BundledScales) {
+      base = codes + static_cast<size_t>(tile) * groups_k16 * 288 + lane * 8;
+    } else if constexpr (TurboMindLayout) {
       const int col =
           ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
       base = codes + (static_cast<size_t>(tile) * groups_k16 * 64 + col) * 4;
@@ -23,7 +28,9 @@ struct Nvfp4Qpn2CodeReader {
   }
 
   __device__ __forceinline__ uint2 load(int group) const {
-    if constexpr (TurboMindLayout) {
+    if constexpr (BundledScales) {
+      return __ldcs(reinterpret_cast<const uint2*>(base + group * 288));
+    } else if constexpr (TurboMindLayout) {
       const auto* ptr = reinterpret_cast<const uint32_t*>(base) +
                         static_cast<size_t>(group) * 64;
       if constexpr (CacheCodes) {

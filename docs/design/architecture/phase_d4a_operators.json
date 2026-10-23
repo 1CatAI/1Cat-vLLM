@@ -1,0 +1,761 @@
+{
+  "baseline": "649dbd63a3d45384a8225252336747318ba210a0",
+  "scope": "D4a standalone Flash-V100 configured binding; no model loaded",
+  "contract": {
+    "host": "54633",
+    "gpu": "Tesla V100-SXM2-32GB",
+    "gpu_index": 2,
+    "driver": "580.173.02",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "tensor_parallel": 1,
+    "gpu_timing": "100 calls per graph, 15 event samples; median of three process medians",
+    "host_timing": "5 samples of 100 eager enqueues; median of three process medians",
+    "shapes": {
+      "xqa_fp16": "q[1,6,256], paged kv[8,256,1,256], seq1537",
+      "scalar_e4m3": "same geometry, E4M3 storage, partition1024",
+      "dense_prefill": "q[1,32,6,256], kv[1,128,1,256], causal"
+    },
+    "native_build": "Normal flash-attention-v100/setup.py build_ext --inplace, arch 7.0, MAX_JOBS=2; no private DSO/preload"
+  },
+  "source_archives": {
+    "baseline.tar": "e8315c9baac3a0a488d3528e9fac0806165e5e792640d6af1f32290b4e803102",
+    "candidate.tar": "dbc0c3a8f5964773b29ae28deddb79f8d6df7c5826caa542ecaa97d06cf7f7e1",
+    "attention-native.tar": "47406c091a11d032f595be83aca97e3f3430b84094fbe87c21de82c1a23f001d"
+  },
+  "native_sha256": {
+    "baseline": "c6d0e7ff3bb9daed3b7aa487925e62fa5799f9e37419f1d0e9414c62537e478f",
+    "candidate": "7862c1384501a0ddbc33573aa6f5252b6e0ecf00bfd5a4e49baedd40b107ea31"
+  },
+  "summary": {
+    "xqa_fp16": {
+      "baseline": {
+        "gpu_us": 47.462401390075684,
+        "host_enqueue_us": 91.10537,
+        "peak_temporary_bytes": 0
+      },
+      "candidate": {
+        "gpu_us": 47.370238304138184,
+        "host_enqueue_us": 81.75993,
+        "peak_temporary_bytes": 0
+      },
+      "bitwise_equal": true
+    },
+    "scalar_e4m3": {
+      "baseline": {
+        "gpu_us": 146.66751861572266,
+        "host_enqueue_us": 86.14048,
+        "peak_temporary_bytes": 0
+      },
+      "candidate": {
+        "gpu_us": 146.44224166870117,
+        "host_enqueue_us": 82.7758,
+        "peak_temporary_bytes": 0
+      },
+      "bitwise_equal": true
+    },
+    "dense_prefill": {
+      "baseline": {
+        "gpu_us": 42.28096008300781,
+        "host_enqueue_us": 176.03547,
+        "peak_temporary_bytes": 295936
+      },
+      "candidate": {
+        "gpu_us": 42.239999771118164,
+        "host_enqueue_us": 182.33683,
+        "peak_temporary_bytes": 295936
+      },
+      "bitwise_equal": true
+    }
+  },
+  "rounds": [
+    {
+      "lane": "baseline",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "native": "/home/ymzx/arch-ws/phase-d4-20261009/baseline/flash-attention-v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+      "results": {
+        "xqa_fp16": {
+          "gpu_us": 47.462401390075684,
+          "host_enqueue_us": 84.19347,
+          "peak_temporary_bytes": 0,
+          "sha256": "e0492fbb3af72c13b53d65cb41315bdc4b696942370d35732c620ed6fdf5bca0",
+          "gpu_samples": [
+            47.431678771972656,
+            47.48288154602051,
+            47.472639083862305,
+            47.45215892791748,
+            47.44192123413086,
+            47.462401390075684,
+            47.462401390075684,
+            47.462401390075684,
+            47.45215892791748,
+            47.472639083862305,
+            47.472639083862305,
+            47.48288154602051,
+            47.431678771972656,
+            47.45215892791748,
+            47.44192123413086
+          ],
+          "host_samples": [
+            85.78081,
+            84.45016,
+            81.87219999999999,
+            83.52863,
+            84.19347
+          ]
+        },
+        "scalar_e4m3": {
+          "gpu_us": 146.66751861572266,
+          "host_enqueue_us": 80.29512,
+          "peak_temporary_bytes": 0,
+          "sha256": "1c8929ab688fd16faab8e3456b06c25596e1fe73dee7f212bb48f3ea182e60ac",
+          "gpu_samples": [
+            146.58559799194336,
+            146.7289638519287,
+            146.60608291625977,
+            146.6470432281494,
+            146.65727615356445,
+            146.66751861572266,
+            146.6368007659912,
+            146.7289638519287,
+            146.66751861572266,
+            146.65727615356445,
+            146.65727615356445,
+            146.84160232543945,
+            146.67776107788086,
+            146.6982364654541,
+            146.66751861572266
+          ],
+          "host_samples": [
+            80.29512,
+            80.91998,
+            80.90476,
+            78.6695,
+            79.17264999999999
+          ]
+        },
+        "dense_prefill": {
+          "gpu_us": 42.28096008300781,
+          "host_enqueue_us": 165.59872000000001,
+          "peak_temporary_bytes": 295936,
+          "sha256": "e5367fdc08b9d2a957804b4115c6da70a3db9c0e80ed4bcad00ac5df59c61dd7",
+          "gpu_samples": [
+            42.21951961517334,
+            42.291197776794434,
+            42.31167793273926,
+            42.291197776794434,
+            42.28096008300781,
+            42.291197776794434,
+            42.26047992706299,
+            42.28096008300781,
+            42.27071762084961,
+            42.27071762084961,
+            42.28096008300781,
+            42.28096008300781,
+            42.28096008300781,
+            42.291197776794434,
+            42.28096008300781
+          ],
+          "host_samples": [
+            165.59872000000001,
+            164.08112,
+            166.54504,
+            172.87073999999998,
+            165.59182
+          ]
+        }
+      }
+    },
+    {
+      "lane": "candidate",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "native": "/home/ymzx/arch-ws/phase-d4-20261009/candidate/flash-attention-v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+      "results": {
+        "xqa_fp16": {
+          "gpu_us": 47.36000061035156,
+          "host_enqueue_us": 81.75993,
+          "peak_temporary_bytes": 0,
+          "sha256": "e0492fbb3af72c13b53d65cb41315bdc4b696942370d35732c620ed6fdf5bca0",
+          "gpu_samples": [
+            47.30879783630371,
+            47.45215892791748,
+            47.370238304138184,
+            47.34975814819336,
+            47.36000061035156,
+            47.370238304138184,
+            47.34975814819336,
+            47.34975814819336,
+            47.33952045440674,
+            47.34975814819336,
+            47.34975814819336,
+            47.370238304138184,
+            47.54432201385498,
+            47.38048076629639,
+            47.38048076629639
+          ],
+          "host_samples": [
+            81.60944,
+            83.50453,
+            80.94774000000001,
+            81.75993,
+            83.76388
+          ]
+        },
+        "scalar_e4m3": {
+          "gpu_us": 146.44224166870117,
+          "host_enqueue_us": 83.38678999999999,
+          "peak_temporary_bytes": 0,
+          "sha256": "1c8929ab688fd16faab8e3456b06c25596e1fe73dee7f212bb48f3ea182e60ac",
+          "gpu_samples": [
+            146.31936073303223,
+            146.47295951843262,
+            146.43199920654297,
+            146.41152381896973,
+            146.44224166870117,
+            146.41152381896973,
+            146.4627170562744,
+            146.4627170562744,
+            146.44224166870117,
+            146.44224166870117,
+            146.56512260437012,
+            146.43199920654297,
+            146.43199920654297,
+            146.44224166870117,
+            146.4627170562744
+          ],
+          "host_samples": [
+            85.87525,
+            85.06042,
+            82.4847,
+            83.38678999999999,
+            82.2388
+          ]
+        },
+        "dense_prefill": {
+          "gpu_us": 42.239999771118164,
+          "host_enqueue_us": 182.33683,
+          "peak_temporary_bytes": 295936,
+          "sha256": "e5367fdc08b9d2a957804b4115c6da70a3db9c0e80ed4bcad00ac5df59c61dd7",
+          "gpu_samples": [
+            42.188801765441895,
+            42.28096008300781,
+            42.239999771118164,
+            42.22976207733154,
+            42.21951961517334,
+            42.25024223327637,
+            42.25024223327637,
+            42.239999771118164,
+            42.25024223327637,
+            42.25024223327637,
+            42.239999771118164,
+            42.239999771118164,
+            42.22976207733154,
+            42.239999771118164,
+            42.26047992706299
+          ],
+          "host_samples": [
+            183.19826,
+            183.0907,
+            182.02116,
+            182.07434,
+            182.33683
+          ]
+        }
+      }
+    },
+    {
+      "lane": "baseline",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "native": "/home/ymzx/arch-ws/phase-d4-20261009/baseline/flash-attention-v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+      "results": {
+        "xqa_fp16": {
+          "gpu_us": 47.44192123413086,
+          "host_enqueue_us": 94.15928,
+          "peak_temporary_bytes": 0,
+          "sha256": "e0492fbb3af72c13b53d65cb41315bdc4b696942370d35732c620ed6fdf5bca0",
+          "gpu_samples": [
+            47.38048076629639,
+            47.48288154602051,
+            47.472639083862305,
+            47.44192123413086,
+            47.431678771972656,
+            47.44192123413086,
+            47.45215892791748,
+            47.44192123413086,
+            47.431678771972656,
+            47.41119861602783,
+            47.44192123413086,
+            47.44192123413086,
+            47.44192123413086,
+            47.431678771972656,
+            47.431678771972656
+          ],
+          "host_samples": [
+            95.60244,
+            94.05842,
+            94.15928,
+            93.15805999999999,
+            95.45948
+          ]
+        },
+        "scalar_e4m3": {
+          "gpu_us": 146.6470432281494,
+          "host_enqueue_us": 91.33277000000001,
+          "peak_temporary_bytes": 0,
+          "sha256": "1c8929ab688fd16faab8e3456b06c25596e1fe73dee7f212bb48f3ea182e60ac",
+          "gpu_samples": [
+            146.6163158416748,
+            146.68800354003906,
+            146.626558303833,
+            146.65727615356445,
+            146.7801570892334,
+            146.6368007659912,
+            146.66751861572266,
+            146.66751861572266,
+            146.59584045410156,
+            146.58559799194336,
+            146.67776107788086,
+            146.6470432281494,
+            146.60608291625977,
+            146.57535552978516,
+            146.67776107788086
+          ],
+          "host_samples": [
+            92.87019000000001,
+            91.33277000000001,
+            90.22950999999999,
+            91.30167999999999,
+            92.52175
+          ]
+        },
+        "dense_prefill": {
+          "gpu_us": 42.28096008300781,
+          "host_enqueue_us": 180.53613,
+          "peak_temporary_bytes": 295936,
+          "sha256": "e5367fdc08b9d2a957804b4115c6da70a3db9c0e80ed4bcad00ac5df59c61dd7",
+          "gpu_samples": [
+            42.20928192138672,
+            42.27071762084961,
+            42.26047992706299,
+            42.30144023895264,
+            42.28096008300781,
+            42.28096008300781,
+            42.26047992706299,
+            42.28096008300781,
+            42.27071762084961,
+            42.291197776794434,
+            42.28096008300781,
+            42.291197776794434,
+            42.30144023895264,
+            42.291197776794434,
+            42.25024223327637
+          ],
+          "host_samples": [
+            182.2271,
+            180.53613,
+            177.79282,
+            181.25334,
+            180.0778
+          ]
+        }
+      }
+    },
+    {
+      "lane": "candidate",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "native": "/home/ymzx/arch-ws/phase-d4-20261009/candidate/flash-attention-v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+      "results": {
+        "xqa_fp16": {
+          "gpu_us": 47.370238304138184,
+          "host_enqueue_us": 78.29171000000001,
+          "peak_temporary_bytes": 0,
+          "sha256": "e0492fbb3af72c13b53d65cb41315bdc4b696942370d35732c620ed6fdf5bca0",
+          "gpu_samples": [
+            47.28831768035889,
+            47.38048076629639,
+            47.36000061035156,
+            47.36000061035156,
+            47.39071846008301,
+            47.370238304138184,
+            47.38048076629639,
+            47.38048076629639,
+            47.41119861602783,
+            47.34975814819336,
+            47.370238304138184,
+            47.370238304138184,
+            47.36000061035156,
+            47.33952045440674,
+            47.34975814819336
+          ],
+          "host_samples": [
+            80.26286999999999,
+            79.42144,
+            78.29171000000001,
+            77.38164,
+            77.92555
+          ]
+        },
+        "scalar_e4m3": {
+          "gpu_us": 146.44224166870117,
+          "host_enqueue_us": 82.10889999999999,
+          "peak_temporary_bytes": 0,
+          "sha256": "1c8929ab688fd16faab8e3456b06c25596e1fe73dee7f212bb48f3ea182e60ac",
+          "gpu_samples": [
+            146.38079643249512,
+            146.44224166870117,
+            146.42175674438477,
+            146.48320198059082,
+            146.4627170562744,
+            146.44224166870117,
+            146.4627170562744,
+            146.49344444274902,
+            146.44224166870117,
+            146.4627170562744,
+            146.45248413085938,
+            146.49344444274902,
+            146.44224166870117,
+            146.44224166870117,
+            146.42175674438477
+          ],
+          "host_samples": [
+            80.95797999999999,
+            82.27534,
+            82.10889999999999,
+            82.62128,
+            81.78822
+          ]
+        },
+        "dense_prefill": {
+          "gpu_us": 42.239999771118164,
+          "host_enqueue_us": 181.74915,
+          "peak_temporary_bytes": 295936,
+          "sha256": "e5367fdc08b9d2a957804b4115c6da70a3db9c0e80ed4bcad00ac5df59c61dd7",
+          "gpu_samples": [
+            42.16832160949707,
+            42.25024223327637,
+            42.25024223327637,
+            42.25024223327637,
+            42.239999771118164,
+            42.239999771118164,
+            42.21951961517334,
+            42.25024223327637,
+            42.25024223327637,
+            42.239999771118164,
+            42.239999771118164,
+            42.25024223327637,
+            42.239999771118164,
+            42.25024223327637,
+            42.239999771118164
+          ],
+          "host_samples": [
+            180.46166,
+            180.57768,
+            182.35701,
+            182.68535,
+            181.74915
+          ]
+        }
+      }
+    },
+    {
+      "lane": "baseline",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "native": "/home/ymzx/arch-ws/phase-d4-20261009/baseline/flash-attention-v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+      "results": {
+        "xqa_fp16": {
+          "gpu_us": 47.626237869262695,
+          "host_enqueue_us": 91.10537,
+          "peak_temporary_bytes": 0,
+          "sha256": "e0492fbb3af72c13b53d65cb41315bdc4b696942370d35732c620ed6fdf5bca0",
+          "gpu_samples": [
+            47.564802169799805,
+            47.60575771331787,
+            47.64671802520752,
+            47.616000175476074,
+            47.861762046813965,
+            47.616000175476074,
+            47.64671802520752,
+            47.6364803314209,
+            47.616000175476074,
+            47.67744064331055,
+            47.626237869262695,
+            47.6364803314209,
+            47.626237869262695,
+            47.616000175476074,
+            47.64671802520752
+          ],
+          "host_samples": [
+            91.10537,
+            91.66842999999999,
+            91.14669,
+            90.10011,
+            89.95261
+          ]
+        },
+        "scalar_e4m3": {
+          "gpu_us": 147.24096298217773,
+          "host_enqueue_us": 86.14048,
+          "peak_temporary_bytes": 0,
+          "sha256": "1c8929ab688fd16faab8e3456b06c25596e1fe73dee7f212bb48f3ea182e60ac",
+          "gpu_samples": [
+            147.22047805786133,
+            147.28192329406738,
+            147.24096298217773,
+            147.25119590759277,
+            147.24096298217773,
+            147.31264114379883,
+            147.23072052001953,
+            147.26143836975098,
+            147.22047805786133,
+            147.29215621948242,
+            147.2000026702881,
+            147.24096298217773,
+            147.22047805786133,
+            147.24096298217773,
+            147.29215621948242
+          ],
+          "host_samples": [
+            87.28013,
+            85.21351,
+            86.14048,
+            86.05281,
+            86.65257000000001
+          ]
+        },
+        "dense_prefill": {
+          "gpu_us": 42.45503902435303,
+          "host_enqueue_us": 176.03547,
+          "peak_temporary_bytes": 295936,
+          "sha256": "e5367fdc08b9d2a957804b4115c6da70a3db9c0e80ed4bcad00ac5df59c61dd7",
+          "gpu_samples": [
+            42.495999336242676,
+            42.71103858947754,
+            42.444801330566406,
+            42.46528148651123,
+            42.444801330566406,
+            42.45503902435303,
+            42.444801330566406,
+            42.485761642456055,
+            42.45503902435303,
+            42.46528148651123,
+            42.45503902435303,
+            42.444801330566406,
+            42.45503902435303,
+            42.45503902435303,
+            42.444801330566406
+          ],
+          "host_samples": [
+            184.01104999999998,
+            174.93695000000002,
+            176.03547,
+            179.17167999999998,
+            174.9278
+          ]
+        }
+      }
+    },
+    {
+      "lane": "candidate",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "native": "/home/ymzx/arch-ws/phase-d4-20261009/candidate/flash-attention-v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+      "results": {
+        "xqa_fp16": {
+          "gpu_us": 47.370238304138184,
+          "host_enqueue_us": 84.08977,
+          "peak_temporary_bytes": 0,
+          "sha256": "e0492fbb3af72c13b53d65cb41315bdc4b696942370d35732c620ed6fdf5bca0",
+          "gpu_samples": [
+            47.319040298461914,
+            47.39071846008301,
+            47.370238304138184,
+            47.39071846008301,
+            47.370238304138184,
+            47.38048076629639,
+            47.370238304138184,
+            47.38048076629639,
+            47.370238304138184,
+            47.36000061035156,
+            47.38048076629639,
+            47.33952045440674,
+            47.370238304138184,
+            47.370238304138184,
+            47.370238304138184
+          ],
+          "host_samples": [
+            84.28026,
+            84.08977,
+            82.60072,
+            82.44947,
+            85.17984
+          ]
+        },
+        "scalar_e4m3": {
+          "gpu_us": 146.45248413085938,
+          "host_enqueue_us": 82.7758,
+          "peak_temporary_bytes": 0,
+          "sha256": "1c8929ab688fd16faab8e3456b06c25596e1fe73dee7f212bb48f3ea182e60ac",
+          "gpu_samples": [
+            146.41152381896973,
+            146.44224166870117,
+            146.4627170562744,
+            146.4627170562744,
+            146.45248413085938,
+            146.4627170562744,
+            146.42175674438477,
+            146.50367736816406,
+            146.40128135681152,
+            146.41152381896973,
+            146.48320198059082,
+            146.43199920654297,
+            146.44224166870117,
+            146.48320198059082,
+            146.4627170562744
+          ],
+          "host_samples": [
+            83.43035,
+            84.40750999999999,
+            82.7758,
+            81.74557,
+            80.61966000000001
+          ]
+        },
+        "dense_prefill": {
+          "gpu_us": 42.239999771118164,
+          "host_enqueue_us": 191.5779,
+          "peak_temporary_bytes": 295936,
+          "sha256": "e5367fdc08b9d2a957804b4115c6da70a3db9c0e80ed4bcad00ac5df59c61dd7",
+          "gpu_samples": [
+            42.16832160949707,
+            42.27071762084961,
+            42.239999771118164,
+            42.25024223327637,
+            42.239999771118164,
+            42.239999771118164,
+            42.37311840057373,
+            42.41407871246338,
+            42.239999771118164,
+            42.25024223327637,
+            42.239999771118164,
+            42.22976207733154,
+            42.352638244628906,
+            42.26047992706299,
+            42.22976207733154
+          ],
+          "host_samples": [
+            193.6798,
+            191.5779,
+            194.01663,
+            190.97275,
+            189.55459
+          ]
+        }
+      }
+    }
+  ],
+  "artifacts": "/home/ymzx/arch-ws/tmp/phase-d4",
+  "remote": "/home/ymzx/arch-ws/phase-d4-20261009",
+  "notes": [
+    "Native final formatter changed whitespace only after the native source archive; the normal artifact contains all new policy registrations.",
+    "Later changes preserve numerical/native dispatch and add backend cache ownership, capture buffer retention, canonical partition parsing, effective-policy hashes and diagnostic output ownership; final focused tests are recorded separately.",
+    "Dense-prefill host median increases within overlapping baseline timing variation; no host-prefill speedup claim.",
+    "The separate normal FA2/79T policy and native resource migration remains D4b."
+  ],
+  "artifact_validation": {
+    "extension": "/home/ymzx/arch-ws/phase-d4-20261009/candidate/flash-attention-v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+    "sha256": "7862c1384501a0ddbc33573aa6f5252b6e0ecf00bfd5a4e49baedd40b107ea31",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "policy_abi": 1,
+    "policy_fields": 66,
+    "configured_exports": [
+      "bwd_configured",
+      "decode_paged_fwd_configured",
+      "decode_paged_wmma_fwd_configured",
+      "decode_paged_xqa_fwd_configured",
+      "decode_paged_xqa_staged_fwd_configured",
+      "decode_qk_scores_fwd_configured",
+      "decode_turboquant_paged_fwd_configured",
+      "dflash2_paged_bmhd_fwd_configured",
+      "fwd_configured",
+      "grouped_e4m3_fp32_paged_fwd_configured",
+      "grouped_sparse_page4_fwd_configured",
+      "grouped_sparse_page4_plan_fwd_configured",
+      "grouped_verify_paged_fwd_configured",
+      "prefill_paged_bfla_fwd_configured",
+      "prefill_paged_d256_bm32_allp_pair_scratch_fwd_configured",
+      "prefill_paged_d256_bm32_allp_pair_scratch_splitkv3_fwd_configured",
+      "prefill_paged_fwd_configured",
+      "prefill_paged_splitkv_fwd_configured",
+      "qk_scores_fwd_configured",
+      "tp2_e4m3_scalar_fast_launch_count_configured"
+    ],
+    "loaded_native_libraries": [
+      "/home/ymzx/arch-ws/phase-d4-20261009/candidate/flash-attention-v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/nvidia/cublas/lib/libcublas.so.12",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/nvidia/cublas/lib/libcublasLt.so.12",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/torch/lib/libc10.so",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/torch/lib/libc10_cuda.so",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/torch/lib/libtorch.so",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/torch/lib/libtorch_global_deps.so",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/torch/lib/libtorch_nvshmem.so",
+      "/home/ymzx/codex-worktrees/gguf-dflash2-iq3s-20261004/qpn-final-runtime/lib/python3.12/site-packages/torch/lib/libtorch_python.so"
+    ],
+    "ld_preload": null,
+    "needed_libraries": [
+      "libc10.so",
+      "libtorch_cpu.so",
+      "libtorch_python.so",
+      "libcudart.so.12",
+      "libc10_cuda.so",
+      "libtorch_cuda.so",
+      "libstdc++.so.6",
+      "libgcc_s.so.1",
+      "libc.so.6",
+      "ld-linux-x86-64.so.2"
+    ],
+    "rpath_or_runpath": [],
+    "raw_dependency_report": "native-artifact.json in the retained artifact directory"
+  },
+  "validation": {
+    "gpu_host_suite": {
+      "passed": 227,
+      "log": "gpu-final-v3.log",
+      "xml": "gpu-final-v3.xml",
+      "includes_bound_runtime_cases": 22
+    },
+    "cpu_suites": {
+      "configuration_and_worker": 198,
+      "prefill_and_resource": 69,
+      "focused_configuration_report": 58,
+      "final_policy_metadata": 24,
+      "worker_owner_transfer": 20
+    },
+    "counts_overlap": true,
+    "checks": "all applicable changed-file pre-commit hooks passed",
+    "limitations": [
+      "Legacy atexit logger emits a closed-pytest-stream logging error after the successful suite; exit status remains zero.",
+      "FA2/79T native policy/workspaces remain the next delivery."
+    ]
+  }
+}

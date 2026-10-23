@@ -30,7 +30,6 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -231,8 +230,11 @@ def _sm70_materialize_qwen35_gdn_splits(
     return z, b, a
 
 
-def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
-    raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
+def _parse_sm70_moe_dense_allowlist(policy=None) -> set[str] | None:
+    from vllm.config.execution_policy import layer_policy
+
+    policy = layer_policy() if policy is None else policy
+    raw = policy.moe_dense_allowlist
     if raw is None:
         return None
     suffixes = {item.strip() for item in raw.split(",") if item.strip()}
@@ -540,7 +542,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
         )
-        if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+        if self.gdn_policy.projection.mixed_qkv_contiguous:
             mixed_qkv = mixed_qkv.contiguous()
         z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
         z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
@@ -584,9 +586,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.sm70_dflash2_direct_attention_output = bool(
             current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
-            and vllm_config.parallel_config.tensor_parallel_size == 4
+            and vllm_config.parallel_config.tensor_parallel_size in (2, 4)
             and model_config.dtype == torch.float16
-            and model_config.quantization == "compressed-tensors"
+            and model_config.quantization in ("compressed-tensors", "gguf")
             and config.hidden_size == 5120
             and config.model_type == "qwen3_5_text"
         )
@@ -687,9 +689,18 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.vocab_size = config.vocab_size
 
+        quant_config = vllm_config.quant_config
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=(
+                quant_config
+                if quant_config is not None
+                and quant_config.get_name() == "gguf"
+                and not config.tie_word_embeddings
+                else None
+            ),
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):
@@ -1081,6 +1092,15 @@ class Qwen3_5ForCausalLMBase(
             self.lm_head, hidden_states, top_k
         )
 
+    def get_compact_target_probe_with_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.logits_processor.get_compact_target_probe_with_fallback(
+            self.lm_head, hidden_states, top_k
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1104,14 +1124,16 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
         # Qwen3.5 MoE variants have not accepted the generic dense FP16
         # TurboMind path for all projections. Keep the 0.0.3 safety default:
         # forbid it unless an explicit MoE-only suffix allowlist is provided.
-        allowlist = _parse_sm70_moe_dense_allowlist()
+        allowlist = _parse_sm70_moe_dense_allowlist(
+            vllm_config.kernel_config.layer_execution
+        )
         for module in self.modules():
             module._sm70_f16_forbidden = True
             if allowlist:
                 module_prefix = getattr(module, "prefix", "")
                 if module_prefix and module_prefix.rsplit(".", 1)[-1] in allowlist:
                     module._sm70_f16_forbidden = False
-        if envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH or allowlist is not None:
+        if vllm_config.kernel_config.layer_execution.dense_f16 or allowlist is not None:
             logger.info_once(
                 "SM70 dense fp16 fast path is disabled for Qwen3.5 MoE "
                 "modules except VLLM_SM70_MOE_DENSE_ALLOWLIST=%s.",
@@ -1274,6 +1296,15 @@ class Qwen3_5ForConditionalGeneration(
         top_k: int,
     ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
         return self.language_model.get_topk_tokens_and_logits_with_fallback(
+            hidden_states, top_k
+        )
+
+    def get_compact_target_probe_with_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.language_model.get_compact_target_probe_with_fallback(
             hidden_states, top_k
         )
 

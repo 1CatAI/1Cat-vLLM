@@ -23,16 +23,20 @@ never maps the complete embedding table.
 import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from cuda.bindings import driver as cuda_driver
-from cuda.bindings.driver import CUstreamWaitValue_flags
 from torch import nn
 
-import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.config.execution_policy import ple_policy
+from vllm.utils.import_utils import LazyLoader
 from vllm.utils.torch_utils import direct_register_custom_op
+
+if TYPE_CHECKING:
+    from cuda.bindings import driver as cuda_driver
+else:
+    cuda_driver = LazyLoader("cuda_driver", globals(), "cuda.bindings.driver")
 
 # Module-level flag set to True inside the offload subprocess.
 # Because the offload process and GPU worker processes are separate OS
@@ -43,7 +47,7 @@ _offload_worker_flag = False
 
 def ple_offload_enabled(config=None) -> bool:
     """Use the engine's resolved cascade, retaining legacy explicit offload."""
-    if envs.VLLM_PLE_CPU_OFFLOAD:
+    if ple_policy(config).cpu:
         return True
     if config is None:
         from vllm.config import get_current_vllm_config_or_none
@@ -149,7 +153,7 @@ class CpuGpuSemaphore:
                 cuda_driver.CUstream(stream.cuda_stream),
                 cuda_driver.CUdeviceptr(self._flag_tensor.data_ptr()),
                 self.RESET_VALUE,
-                CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+                cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
             ),
             "CpuGpuSemaphore.wait_reset",
         )
@@ -181,7 +185,7 @@ def _ple_offload_wait_impl(
             cuda_stream,
             dev_ptr,
             CpuGpuSemaphore.DONE_VALUE,
-            CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+            cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
         ),
         "cuStreamWaitValue32(done)",
     )
@@ -251,7 +255,7 @@ class PleOffloadLayer(nn.Module, ABC):
         ) -> None:
             if (
                 ple_offload_enabled()
-                and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                and not ple_policy().hybrid
                 and not self.offload_keeps_local_tables()
                 and not is_offload_process()
             ):
@@ -275,9 +279,7 @@ class PleOffloadLayer(nn.Module, ABC):
     @classmethod
     def get_target_device(cls) -> torch.device:
         """Return CPU for the offload process and the active GPU otherwise."""
-        keeps_gpu_tables = (
-            envs.VLLM_SM70_QWEN38_HYBRID_PLE or cls.offload_keeps_local_tables()
-        )
+        keeps_gpu_tables = ple_policy().hybrid or cls.offload_keeps_local_tables()
         if ple_offload_enabled() and not (
             keeps_gpu_tables and not is_offload_process()
         ):
@@ -298,6 +300,19 @@ class PleOffloadLayer(nn.Module, ABC):
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
         """Return the dtype used by cross-process output buffers."""
         return default_dtype
+
+    def get_offload_output_dim(self, default_dim: int) -> int:
+        """Return the transport width, which may differ from decoded width."""
+        return default_dim
+
+    def offload_result_layout(self) -> dict[str, Any] | None:
+        """Describe an encoded result to the separately spawned CPU owner."""
+        return None
+
+    def bind_offload_result_layout(self, layout: dict[str, Any] | None) -> None:
+        """Validate the consumers' result geometry against loaded CPU rows."""
+        if layout is not None:
+            raise ValueError("This PLE layer does not support encoded result layouts")
 
     def setup_cross_process_offload(
         self,
@@ -323,6 +338,10 @@ class PleOffloadLayer(nn.Module, ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not serve tiered PLE placements"
         )
+
+    def needs_weight_prefault(self) -> bool:
+        """Whether this worker serves any table rows after registration."""
+        return True
 
     def wait_offloaded_output(
         self, hidden_states: torch.Tensor, num_tokens: int
@@ -352,8 +371,11 @@ class PleOffloadLayer(nn.Module, ABC):
     ) -> torch.Tensor:
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
-            if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_sm70_decode_graph_semantics():
+            pinned = getattr(self, "_pinned_decode", False)
+            if (ple_policy().hybrid or pinned) and use_sm70_decode_graph_semantics():
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
+            if pinned:
+                return self.wait_offloaded_output(hidden_states, input_ids.shape[0])
             if self.offload_keeps_local_tables():
                 # The layer gathers its resident rows itself and merges the
                 # worker's rows through wait_offloaded_output.

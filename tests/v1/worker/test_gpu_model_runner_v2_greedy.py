@@ -59,6 +59,11 @@ def test_sm70_v2_decode_uses_model_top_tokens(
         can_use_sm70_greedy_token_fastpath=lambda _input_batch: True
     )
     runner.device = torch.device("cuda")
+    runner.rejection_sampler = None
+    runner._sm70_greedy_capability = True
+    runner.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(sm70_greedy_verify=False)
+    )
     runner.req_states = SimpleNamespace(prefill_len=SimpleNamespace(gpu=None))
     input_batch = SimpleNamespace(
         logits_indices=torch.tensor([0]),
@@ -69,11 +74,6 @@ def test_sm70_v2_decode_uses_model_top_tokens(
         seq_lens=torch.tensor([17], dtype=torch.int32),
         cu_num_logits=None,
         idx_mapping=None,
-    )
-    monkeypatch.setattr(
-        model_runner_module.current_platform,
-        "is_device_capability",
-        lambda _capability: True,
     )
     monkeypatch.setattr(
         model_runner_module,
@@ -93,6 +93,7 @@ def test_sm70_v2_decode_uses_model_top_tokens(
     assert num_rejected.tolist() == [0]
 
     runner.lora_config = object()
+    runner._sm70_greedy_capability = False
     with pytest.raises(AssertionError, match="full logits must not run"):
         GPUModelRunner.sample(runner, torch.zeros(1, 4), input_batch, None)
 

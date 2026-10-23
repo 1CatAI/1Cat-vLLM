@@ -381,6 +381,7 @@ def test_token_matching_path_is_used_for_safe_mtp_stochastic_sampling(
     """
 
     monkeypatch.setenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "1")
+    rejection_sampler = RejectionSampler(rejection_sampler.sampler)
     expected = torch.tensor([[11, 12, 99]], dtype=torch.int32, device=DEVICE_TYPE)
     calls = {"expand": 0, "token_match": 0}
 
@@ -506,14 +507,16 @@ def test_combined_bonus_fast_path_matches_legacy_sampling(monkeypatch):
     # token by token. Where FlashInfer runs (sm75 and newer) the regular
     # sampler would draw the legacy bonus token from FlashInfer's own one.
     monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    rejection_sampler = RejectionSampler(Sampler())
-
     if DEVICE_TYPE == "cuda":
         rng_state = torch.cuda.get_rng_state(device)
     else:
         rng_state = torch.random.get_rng_state()
 
     monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "0")
+    rejection_sampler = RejectionSampler(Sampler())
+    legacy_combined = Mock(wraps=rejection_sampler._forward_combined_bonus)
+    monkeypatch.setattr(rejection_sampler, "_forward_combined_bonus", legacy_combined)
+    monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1")
     legacy = rejection_sampler(
         spec_decode_metadata,
         draft_probs=draft_probs,
@@ -526,7 +529,12 @@ def test_combined_bonus_fast_path_matches_legacy_sampling(monkeypatch):
     else:
         torch.random.set_rng_state(rng_state)
 
+    legacy_combined.assert_not_called()
     monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1")
+    rejection_sampler = RejectionSampler(Sampler())
+    new_combined = Mock(wraps=rejection_sampler._forward_combined_bonus)
+    monkeypatch.setattr(rejection_sampler, "_forward_combined_bonus", new_combined)
+    monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "0")
     combined = rejection_sampler(
         spec_decode_metadata,
         draft_probs=draft_probs,
@@ -534,6 +542,7 @@ def test_combined_bonus_fast_path_matches_legacy_sampling(monkeypatch):
         sampling_metadata=sampling_metadata,
     ).sampled_token_ids
 
+    new_combined.assert_called_once()
     assert torch.equal(combined, legacy)
 
 

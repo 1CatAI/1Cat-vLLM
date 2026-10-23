@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <torch/library.h>
 #include <torch/types.h>
+#include <type_traits>
 
 namespace {
 #define GDN_MMA(C, A0, A1, B0, B1)                                  \
@@ -150,7 +151,7 @@ __global__ __launch_bounds__(32, 8) void dense_batch_kernel(const half* x,
     }
   }
 }
-template <int Unroll>
+template <int Unroll, bool RowMajor = false>
 __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
                                                                   const half* w,
                                                                   half* out,
@@ -160,10 +161,14 @@ __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
   float acc[8] = {};
 #pragma unroll Unroll
   for (int g = 0; g < 40; ++g) {
-    const half* weights =
-        w + (blockIdx.x * 40 * 64 + g * 64 + split * 8 + r) * 8;
+    const half* weights;
+    if constexpr (RowMajor)
+      weights = w + (blockIdx.x * 8 + r) * 2560 + split * 640 + g * 16;
+    else
+      weights = w + (blockIdx.x * 40 * 64 + g * 64 + split * 8 + r) * 8;
     const uint4 lo = *reinterpret_cast<const uint4*>(weights);
-    const uint4 hi = *reinterpret_cast<const uint4*>(weights + 32 * 8);
+    const uint4 hi =
+        *reinterpret_cast<const uint4*>(weights + (RowMajor ? 8 : 32 * 8));
     uint4 a = {}, b = {};
     if (row < m) {
       const half* input = x + row * 2560 + split * 640 + g * 16;
@@ -191,11 +196,11 @@ __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
 }
 
 // The shared expert's original cuBLASLt projection uses eight K320
-// partitions. Preserve each FP16 partial before the ordered FP32 reduction.
-__global__ __launch_bounds__(32, 8) void shared_up_batch_kernel(const half* x,
-                                                                const half* w,
-                                                                half* partial,
-                                                                int m) {
+// partitions. Keep the legacy FP16 partial schedule and support FP32
+// partials when reduced-precision reduction is disabled.
+template <typename Partial>
+__global__ __launch_bounds__(32, 8) void shared_up_batch_kernel(
+    const half* x, const half* w, Partial* partial, int m) {
   const int lane = threadIdx.x, quad = (lane >> 2) & 3;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int row = blockIdx.y * 8 + r, col = quad * 8 + r;
@@ -222,21 +227,32 @@ __global__ __launch_bounds__(32, 8) void shared_up_batch_kernel(const half* x,
         blockIdx.y * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
     const int cc = blockIdx.x * 32 + quad * 8 +
                    ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
-    if (rr < m) partial[(split * m + rr) * 320 + cc] = __float2half_rn(acc[i]);
+    if (rr < m) {
+      if constexpr (std::is_same_v<Partial, half>)
+        partial[(split * m + rr) * 320 + cc] = __float2half_rn(acc[i]);
+      else
+        partial[(split * m + rr) * 320 + cc] = acc[i];
+    }
   }
 }
 
-__global__ void shared_up_reduce_silu_kernel(const half* partial, half* out,
+__device__ __forceinline__ float partial_float(half value) {
+  return __half2float(value);
+}
+__device__ __forceinline__ float partial_float(float value) { return value; }
+
+template <typename Partial>
+__global__ void shared_up_reduce_silu_kernel(const Partial* partial, half* out,
                                              int m) {
   const int k = blockIdx.x * 128 + threadIdx.x;
   if (k >= m * 160) return;
   const int r = k / 160, c = k % 160, index = r * 320 + c;
-  float gate = __half2float(partial[index]);
-  float up = __half2float(partial[index + 160]);
+  float gate = partial_float(partial[index]);
+  float up = partial_float(partial[index + 160]);
 #pragma unroll
   for (int s = 1; s < 8; ++s) {
-    gate = __fadd_rn(gate, __half2float(partial[s * m * 320 + index]));
-    up = __fadd_rn(up, __half2float(partial[s * m * 320 + index + 160]));
+    gate = __fadd_rn(gate, partial_float(partial[s * m * 320 + index]));
+    up = __fadd_rn(up, partial_float(partial[s * m * 320 + index + 160]));
   }
   const half g = __float2half_rn(gate), u = __float2half_rn(up);
   const float value = __half2float(g);
@@ -335,8 +351,8 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
 }
 void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 &&
-                  x.size(0) <= 16 && x.size(1) == 2560,
-              "SM70 batch router requires M2..16, K2560");
+                  x.size(0) <= 40 && x.size(1) == 2560,
+              "SM70 batch router requires M2..40, K2560");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -345,11 +361,15 @@ void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
                     t.scalar_type() == at::kHalf &&
                     reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
                 "Batch router requires aligned contiguous FP16 storage");
-  TORCH_CHECK(packed.sizes() == at::IntArrayRef({64, 40, 2, 4, 8, 8}) &&
-                  output.sizes() == at::IntArrayRef({x.size(0), 512}),
-              "Invalid batch router geometry");
-  router_split_quad_kernel<40><<<dim3(64, (x.size(0) + 7) / 8), 32, 0,
-                                 at::cuda::getCurrentCUDAStream()>>>(
+  const bool row_major = packed.sizes() == at::IntArrayRef({512, 2560});
+  TORCH_CHECK(
+      (row_major || packed.sizes() == at::IntArrayRef({64, 40, 2, 4, 8, 8})) &&
+          output.sizes() == at::IntArrayRef({x.size(0), 512}),
+      "Invalid batch router geometry");
+  const auto kernel = row_major ? router_split_quad_kernel<40, true>
+                                : router_split_quad_kernel<40, false>;
+  kernel<<<dim3(64, (x.size(0) + 7) / 8), 32, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const half*>(x.data_ptr()),
       reinterpret_cast<const half*>(packed.data_ptr()),
       reinterpret_cast<half*>(output.data_ptr()), x.size(0));
@@ -358,39 +378,60 @@ void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
 
 void shared_up_batch(torch::Tensor output, torch::Tensor partial,
                      torch::Tensor x, torch::Tensor packed) {
-  TORCH_CHECK(x.is_cuda() && x.dim() == 2 &&
-                  (x.size(0) == 5 || x.size(0) == 10) && x.size(1) == 2560,
-              "Shared expert batch projection requires M5/M10, K2560");
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) % 5 == 0 &&
+                  x.size(0) >= 5 && x.size(0) <= 40 && x.size(1) == 2560,
+              "Shared expert batch projection requires M5..40 (x5), K2560");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
-  for (const auto& t : {output, partial, x, packed})
+  for (const auto& t : {output, x, packed})
     TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous() &&
                     t.scalar_type() == at::kHalf &&
                     reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
                 "Shared expert batch requires aligned contiguous FP16 storage");
+  TORCH_CHECK(partial.is_cuda() && partial.device() == x.device() &&
+                  partial.is_contiguous() &&
+                  (partial.scalar_type() == at::kHalf ||
+                   partial.scalar_type() == at::kFloat) &&
+                  reinterpret_cast<uintptr_t>(partial.data_ptr()) % 16 == 0,
+              "Shared expert partials require aligned FP16 or FP32 storage");
   const int m = x.size(0);
   TORCH_CHECK(packed.sizes() == at::IntArrayRef({10, 160, 2, 32, 8}) &&
                   partial.sizes() == at::IntArrayRef({8, m, 320}) &&
                   output.sizes() == at::IntArrayRef({m, 160}),
               "Invalid shared expert batch geometry");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  shared_up_batch_kernel<<<dim3(10, (m + 7) / 8, 8), 32, 0, stream>>>(
-      reinterpret_cast<const half*>(x.data_ptr()),
-      reinterpret_cast<const half*>(packed.data_ptr()),
-      reinterpret_cast<half*>(partial.data_ptr()), m);
-  shared_up_reduce_silu_kernel<<<(m * 160 + 127) / 128, 128, 0, stream>>>(
-      reinterpret_cast<const half*>(partial.data_ptr()),
-      reinterpret_cast<half*>(output.data_ptr()), m);
+  const auto* input = reinterpret_cast<const half*>(x.data_ptr());
+  const auto* weight = reinterpret_cast<const half*>(packed.data_ptr());
+  auto* out = reinterpret_cast<half*>(output.data_ptr());
+  if (partial.scalar_type() == at::kFloat) {
+    auto* p = reinterpret_cast<float*>(partial.data_ptr());
+    shared_up_batch_kernel<float>
+        <<<dim3(10, (m + 7) / 8, 8), 32, 0, stream>>>(input, weight, p, m);
+    shared_up_reduce_silu_kernel<float>
+        <<<(m * 160 + 127) / 128, 128, 0, stream>>>(p, out, m);
+  } else {
+    auto* p = reinterpret_cast<half*>(partial.data_ptr());
+    shared_up_batch_kernel<half>
+        <<<dim3(10, (m + 7) / 8, 8), 32, 0, stream>>>(input, weight, p, m);
+    shared_up_reduce_silu_kernel<half>
+        <<<(m * 160 + 127) / 128, 128, 0, stream>>>(p, out, m);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void shared_up_batch_fp32(torch::Tensor output, torch::Tensor partial,
+                          torch::Tensor x, torch::Tensor packed) {
+  TORCH_CHECK(partial.scalar_type() == at::kFloat, "FP32 partials required");
+  shared_up_batch(output, partial, x, packed);
 }
 
 void shared_gate_mul(torch::Tensor output, torch::Tensor logits,
                      torch::Tensor source) {
   TORCH_CHECK(source.is_cuda() && source.dim() == 2 &&
-                  (source.size(0) == 5 || source.size(0) == 10) &&
-                  source.size(1) == 2560,
-              "Shared gate epilogue requires M5/M10, N2560");
+                  source.size(0) % 5 == 0 && source.size(0) >= 5 &&
+                  source.size(0) <= 40 && source.size(1) == 2560,
+              "Shared gate epilogue requires M5..40 (x5), N2560");
   const c10::cuda::CUDAGuard guard(source.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -417,6 +458,10 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
       "qwen38_shared_up_batch_sm70_out(Tensor(a!) out, Tensor(b!) partial, "
       "Tensor x, Tensor packed) -> ()");
   m.def(
+      "qwen38_shared_up_batch_fp32_sm70_out(Tensor(a!) out, Tensor(b!) "
+      "partial, "
+      "Tensor x, Tensor packed) -> ()");
+  m.def(
       "qwen38_shared_gate_mul_sm70_out(Tensor(a!) out, Tensor logits, "
       "Tensor source) -> ()");
   m.def(
@@ -431,6 +476,7 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("qwen38_shared_up_batch_sm70_out", &shared_up_batch);
+  m.impl("qwen38_shared_up_batch_fp32_sm70_out", &shared_up_batch_fp32);
   m.impl("qwen38_shared_gate_mul_sm70_out", &shared_gate_mul);
   m.impl("qwen38_router_batch_sm70_out", &router_batch);
   m.impl("qwen38_dense_batch_sm70_out", &dense_batch);

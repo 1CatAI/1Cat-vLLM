@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #pragma once
 
-#include <cstdlib>
+#include "sm70_policy.h"
 
 namespace turbomind::gemm {
 
@@ -17,8 +17,8 @@ inline bool UseSm70DflashContextFcStableReduction(int m, int n, int k) {
   if (m < 1 || m > kSm70DflashContextStableMaxM || n != 1280 || k != 25600) {
     return false;
   }
-  const char* enabled = std::getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC");
-  return enabled && std::atoi(enabled) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::dflash_sharded_context_fc, 0, true) != 0;
 }
 
 }  // namespace turbomind::gemm

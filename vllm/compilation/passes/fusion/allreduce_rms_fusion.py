@@ -11,7 +11,6 @@ import torch.fx as fx
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
-import vllm.envs as envs
 import vllm.ir.ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.passes.fusion.rms_quant_fusion import (
@@ -596,10 +595,22 @@ class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
         )
 
 
-class Sm70Tp4PushGemmaRMSNormPattern(BasePattern):
-    def __init__(self, dtype: torch.dtype, device: str | None) -> None:
+class Sm70PushGemmaRMSNormPattern(BasePattern):
+    def __init__(
+        self,
+        dtype: torch.dtype,
+        device: str | None,
+        epsilon: float = 1e-6,
+        tp_size: int = 4,
+    ) -> None:
         super().__init__(dtype, device)
         self.group_name = get_tp_group().unique_name
+        self.epsilon = epsilon
+        self.collective = (
+            torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm
+            if tp_size == 2
+            else torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm
+        )
 
     def get_inputs(self) -> list[torch.Tensor]:
         return [self.empty(8, 5120), self.empty_f32(8, 5120), self.empty(5120)]
@@ -608,12 +619,12 @@ class Sm70Tp4PushGemmaRMSNormPattern(BasePattern):
         def pattern(input, residual, weight):
             reduced = tensor_model_parallel_all_reduce(input)
             return torch.ops.vllm.sm70_dflash2_gemma_fused_add_rms_norm(
-                reduced, residual, weight, 1e-6
+                reduced, residual, weight, self.epsilon
             )
 
         def replacement(input, residual, weight):
-            return torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm(
-                input, residual, weight, 1e-6, group_name=self.group_name
+            return self.collective(
+                input, residual, weight, self.epsilon, group_name=self.group_name
             )
 
         pm.register_replacement(
@@ -1065,34 +1076,37 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             )
             return
         self.hidden_dim = config.model_config.get_hidden_size()
+        # GGUF metadata stores epsilon as float32. Preserve the config value:
+        # its Python float differs from the literal 1e-6 used by HF configs,
+        # and a literal mismatch prevents otherwise valid graph fusion.
+        self.sm70_norm_epsilon = getattr(
+            config.model_config.hf_text_config, "rms_norm_eps", 1e-6
+        )
         self.group = get_tp_group().device_group
         rank = get_tensor_model_parallel_rank()
         self.rank = rank
-        sm70_common = (
-            self.hidden_dim == 5120
-            and self.model_dtype == torch.float16
-            and current_platform.is_device_capability(70)
+        from vllm.distributed.device_communicators.collective_provider import (
+            gemma_fusion_modes,
         )
-        self.sm70_tp2_mode = (
-            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION and self.tp_size == 2 and sm70_common
-        )
-        self.sm70_tp4_long_mode = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
-            and self.tp_size == 4
-            and sm70_common
-            and config.parallel_config.pipeline_parallel_size == 1
-            and config.speculative_config is None
-        )
+
         device_comm = get_tp_group().device_communicator
         ca_comm = None if device_comm is None else getattr(device_comm, "ca_comm", None)
-        self.sm70_tp4_push_mode = (
-            self.tp_size == 4
-            and sm70_common
-            and isinstance(ca_comm, CustomAllreduce)
-            and not ca_comm.disabled
-            and ca_comm.fully_connected
-            and ca_comm.sm70_tp4_push_buffer_ptrs is not None
-            and not self.sm70_tp4_long_mode
+        capabilities = (
+            ca_comm.capabilities
+            if isinstance(ca_comm, CustomAllreduce) and not ca_comm.disabled
+            else None
+        )
+        self.sm70_tp2_mode, self.sm70_tp4_long_mode, self.sm70_tp4_push_mode = (
+            gemma_fusion_modes(
+                capabilities=capabilities,
+                tp_size=self.tp_size,
+                hidden_size=self.hidden_dim,
+                dtype=self.model_dtype,
+                sm70=current_platform.is_device_capability(70),
+                long_requested=config.parallel_config.communication.long_prefill_norm,
+                pp_size=config.parallel_config.pipeline_parallel_size,
+                speculative=config.speculative_config is not None,
+            )
         )
         self.sm70_tp4_model_expected_patterns = (
             2 * config.model_config.get_num_layers(config.parallel_config) - 1
@@ -1207,13 +1221,13 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
 
     @enable_fake_mode
     def register_sm70_patterns(self) -> None:
-        if self.sm70_tp4_push_mode:
+        if self.sm70_tp4_push_mode or self.sm70_tp2_mode:
             # Import registers the norm boundary even when the model is traced later.
             import vllm.model_executor.layers.layernorm  # noqa: F401
 
-            Sm70Tp4PushGemmaRMSNormPattern(self.model_dtype, self.device).register(
-                self.patterns
-            )
+            Sm70PushGemmaRMSNormPattern(
+                self.model_dtype, self.device, self.sm70_norm_epsilon, self.tp_size
+            ).register(self.patterns)
             self.disabled = False
             return
         if self.sm70_tp4_long_mode:
@@ -1226,7 +1240,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             return
         for residual_dtype in (torch.float16, torch.float32):
             Sm70AllReduceGemmaRMSNormPattern(
-                1e-6,
+                self.sm70_norm_epsilon,
                 self.model_dtype,
                 self.device,
                 residual_dtype,
@@ -1285,7 +1299,9 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         if self.disabled:
             logger.warning_once("AllReduce fusion pass is disabled.")
             return False
-        if getattr(self, "sm70_tp4_push_mode", False):
+        if getattr(self, "sm70_tp4_push_mode", False) or getattr(
+            self, "sm70_tp2_mode", False
+        ):
             # The SM70 replacement checks M=8 at runtime and preserves the
             # original collective/norm for other row counts. It is safe for
             # the mixed prefill/decode range, including the extra capture row.

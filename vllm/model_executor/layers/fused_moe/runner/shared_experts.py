@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import IntEnum
+from itertools import chain
 
 import torch
 
@@ -80,6 +81,13 @@ class SharedExperts:
                 )
             else:
                 logger.debug_once("Disabling MoE shared_experts cuda stream")
+            self._stream = None
+        elif not any(
+            tensor.device.type not in ("cpu", "meta")
+            for tensor in chain(layer.parameters(), layer.buffers())
+        ):
+            # Meta discovery and CPU offload do not execute this MoE. Creating
+            # a stream here would initialize a persistent CUDA context.
             self._stream = None
         else:
             # TODO(rob): enable shared expert overlap with non-cuda-alike.

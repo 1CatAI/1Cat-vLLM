@@ -90,7 +90,13 @@ def snapshot_layer(
     native_ops = (
         NS(awq_sm70_prepare=True, awq_sm70_dequantize_out=True) if native else NS()
     )
+    # This is a selector/call-order simulation. Native ABI compatibility is
+    # tested with real extensions separately; mocked operators take no policy.
     with (
+        patch(
+            "vllm.config.sm70_native.capture_linear_native_config",
+            return_value=NS(values=()),
+        ),
         patch.object(linear, "current_platform", NS(_enum=PlatformEnum.CUDA)),
         patch.object(
             module, "get_current_vllm_config_or_none", lambda: cfg, create=True

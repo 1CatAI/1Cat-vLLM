@@ -217,6 +217,9 @@ class FullAttentionSpec(AttentionSpec):
 
     head_size_v: int = None  # type: ignore[assignment]
 
+    host_backed: bool = False
+    """Allocate authoritative attention pages in pinned host memory."""
+
     sliding_window: int | None = None
     """
     Default to None for not using sliding window attention.
@@ -272,6 +275,7 @@ class FullAttentionSpec(AttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            host_backed=specs[0].host_backed,
             dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
@@ -972,6 +976,11 @@ class KVCacheTensor:
     interleaved one kernel block at a time in this order. ``None`` means at
     most one attention layer owns each block."""
 
+    host_backed: bool = False
+    """Pinned host allocation exposed through a lifetime-owning CUDA view."""
+    physical_num_blocks: int | None = None
+    """A fixed physical state pool independent of logical history capacity."""
+
 
 @dataclass
 class KVCacheGroupSpec:
@@ -1006,6 +1015,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    device_state_blocks: int = 0
+    device_state_group_ids: tuple[int, ...] = ()
 
     @property
     def has_mamba_layers(self) -> bool:

@@ -39,6 +39,8 @@ _LAYERS = {
 
 
 class DFlashAdapter(Qwen35Adapter):
+    packed_embeddings = False
+
     def __init__(self, config, tp_size=1):
         self.config = config
         self.tp_size = tp_size

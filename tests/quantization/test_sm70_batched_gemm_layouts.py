@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 
 import pytest
 import torch
 
+from tests.config.runtime_policy_utils import make_policy_defaults
 from vllm.config.vllm import (
     _SM70_BATCH_GEMM_DEFAULTS,
     _apply_sm70_batch_gemm_defaults,
@@ -25,12 +25,19 @@ def test_batched_layout_policy_does_not_require_a_service_contract(monkeypatch):
     for name in _SM70_BATCH_GEMM_DEFAULTS:
         monkeypatch.delenv(name, raising=False)
 
-    assert set(_apply_sm70_batch_gemm_defaults(is_sm70=True)) == set(
+    defaults = make_policy_defaults()
+    assert set(_apply_sm70_batch_gemm_defaults(is_sm70=True, defaults=defaults)) == set(
         _SM70_BATCH_GEMM_DEFAULTS
     )
 
+    monkeypatch.setattr(
+        sm70_tm, "layer_policy", lambda: defaults.cfg.kernel_config.layer_execution
+    )
     assert sm70_tm.use_batched_gemm_layouts()
+    # A later environment change cannot alter a prepared engine.
     monkeypatch.setenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "0")
+    assert sm70_tm.use_batched_gemm_layouts()
+    defaults.cfg.kernel_config.layer_execution.batch_gemm_layouts = False
     assert not sm70_tm.use_batched_gemm_layouts()
 
 
@@ -40,21 +47,23 @@ def test_batch_defaults_preserve_explicit_overrides(monkeypatch, overridden_name
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(overridden_name, "0")
 
-    applied = _apply_sm70_batch_gemm_defaults(is_sm70=True)
+    defaults = make_policy_defaults()
+    applied = _apply_sm70_batch_gemm_defaults(is_sm70=True, defaults=defaults)
 
     assert overridden_name not in applied
-    assert os.environ[overridden_name] == "0"
+    assert defaults[overridden_name] == "0"
     assert set(applied) == set(_SM70_BATCH_GEMM_DEFAULTS) - {overridden_name}
     for name in applied:
-        assert os.environ[name] == _SM70_BATCH_GEMM_DEFAULTS[name]
-    assert _apply_sm70_batch_gemm_defaults(is_sm70=True) == ()
+        assert defaults[name] == _SM70_BATCH_GEMM_DEFAULTS[name]
+    assert _apply_sm70_batch_gemm_defaults(is_sm70=True, defaults=defaults) == ()
 
 
 def test_batch_defaults_and_layouts_reject_non_sm70(monkeypatch):
     for name in _SM70_BATCH_GEMM_DEFAULTS:
         monkeypatch.delenv(name, raising=False)
-    assert _apply_sm70_batch_gemm_defaults(is_sm70=False) == ()
-    assert all(name not in os.environ for name in _SM70_BATCH_GEMM_DEFAULTS)
+    defaults = make_policy_defaults()
+    assert _apply_sm70_batch_gemm_defaults(is_sm70=False, defaults=defaults) == ()
+    assert all(name not in defaults for name in _SM70_BATCH_GEMM_DEFAULTS)
 
     monkeypatch.setenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "1")
     monkeypatch.setattr(sm70_tm, "is_exact_sm70_cuda_platform", lambda: False)

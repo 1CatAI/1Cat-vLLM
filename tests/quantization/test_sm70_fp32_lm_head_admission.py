@@ -6,44 +6,53 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.model_executor.layers import vocab_parallel_embedding as vocab
+from vllm.config.execution_policy import LayerExecutionPolicy
+from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+from vllm.config.sm70_runtime import RuntimeTraceConfig
+from vllm.model_executor.kernels.lm_head import sm70 as vocab
+
+
+def make_state(weight, *, fp32, rerank=False):
+    return vocab.Sm70LMHeadState(
+        weight,
+        vocab.VocabShard(),
+        is_lm_head=True,
+        policy=LayerExecutionPolicy(
+            lm_head_dense=False, lm_head_top1=False, lm_head_top1_tc=False
+        ),
+        dflash=Sm70DFlash2Config(
+            fp32_logits=fp32, qpn8_rerank=rerank, qpn8_rerank_shadow=False
+        ),
+        trace=RuntimeTraceConfig(profile_trace=False, greedy_token_trace=False),
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_explicit_fp32_flag_independent_of_other_head_fastpaths(monkeypatch, enabled):
-    layer = SimpleNamespace(
-        prefix="language_model.lm_head",
-        weight=SimpleNamespace(
+    state = make_state(
+        SimpleNamespace(
             dtype=torch.float16,
             is_cuda=True,
             device=torch.device("cuda", 0),
             ndim=2,
             shape=(124160, 5120),
         ),
+        fp32=enabled,
     )
-    monkeypatch.setattr(vocab, "_sm70_env_bool", lambda *args: False)
-    monkeypatch.setattr(vocab, "_sm70_dflash2_qpn8_rerank_requested", lambda: False)
     monkeypatch.setattr(vocab.current_platform, "is_cuda_alike", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
-    monkeypatch.setattr(vocab.envs, "VLLM_SM70_DFLASH2_FP32_LOGITS", enabled)
-    assert vocab._is_sm70_lm_head_fastpath_eligible(layer) == enabled
+    assert vocab._is_sm70_lm_head_fastpath_eligible(state) == enabled
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_fp32_head_admission_without_qpn8_layout(monkeypatch, tp, enabled):
-    layer = SimpleNamespace(
-        tp_size=tp,
-        weight=torch.empty((248320 // tp, 5120), device="meta"),
-    )
+    state = make_state(torch.empty((248320 // tp, 5120), device="meta"), fp32=enabled)
     monkeypatch.setattr(vocab, "_is_sm70_lm_head_fastpath_eligible", lambda _: True)
-    monkeypatch.setattr(
-        vocab, "_sm70_lm_head_packed_layout_requested", lambda *args: False
-    )
-    monkeypatch.setattr(vocab.envs, "VLLM_SM70_DFLASH2_FP32_LOGITS", enabled)
-    assert vocab.maybe_prepare_sm70_lm_head_top1(layer)
-    assert getattr(layer, "_sm70_dflash2_fp32_logits", False) == enabled
-    assert not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False)
+    assert vocab.maybe_prepare_sm70_lm_head_top1(state)
+    assert getattr(state, "_sm70_dflash2_fp32_logits", False) == enabled
+    assert not getattr(state, "_sm70_dflash2_qpn8_rerank_prepared", False)
+    assert not getattr(state, "_sm70_f16_prepared", False)
 
 
 @pytest.mark.parametrize(
@@ -60,12 +69,15 @@ def test_fp32_head_admission_without_qpn8_layout(monkeypatch, tp, enabled):
     ],
 )
 def test_rerank_local_layout_contract(monkeypatch, rows, hidden, fp32, expected):
-    layer = SimpleNamespace(
-        weight=SimpleNamespace(shape=(rows, hidden)),
-        shard_indices=SimpleNamespace(num_org_vocab_padding=0),
-    )
-    monkeypatch.setattr(vocab, "_sm70_dflash2_qpn8_rerank_requested", lambda: True)
-    monkeypatch.setattr(vocab.envs, "VLLM_SM70_DFLASH2_FP32_LOGITS", fp32)
-    assert vocab._is_sm70_dflash2_qpn8_rerank_eligible(layer) == expected
-    layer.shard_indices.num_org_vocab_padding = 1
-    assert not vocab._is_sm70_dflash2_qpn8_rerank_eligible(layer)
+    state = make_state(SimpleNamespace(shape=(rows, hidden)), fp32=fp32, rerank=True)
+    for name in (
+        "fp8_qpn8_prepare_sm70",
+        "fp8_qpn8_gemm_sm70_out",
+        "sm70_f16_indexed_rerank_packed_out",
+        "sm70_f16_rerank_keys_out",
+        "sm70_f16_rerank_topk_out",
+    ):
+        monkeypatch.setattr(torch.ops._C, name, object(), raising=False)
+    assert vocab._is_sm70_dflash2_qpn8_rerank_eligible(state) == expected
+    state.shard_indices = vocab.VocabShard(num_org_vocab_padding=1)
+    assert not vocab._is_sm70_dflash2_qpn8_rerank_eligible(state)

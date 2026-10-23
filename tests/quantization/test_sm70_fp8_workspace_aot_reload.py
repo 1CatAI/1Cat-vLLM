@@ -157,3 +157,36 @@ def test_bind_rejects_a_second_workspace_for_one_layer():
     assert layer.sm70_fp8_prefill_exact_dense_workspace_ptr == workspace.data_ptr()
     with pytest.raises(RuntimeError, match="already bound"):
         fp8._bind_sm70_fp8_prefill_workspace(layer, torch.ones(4))
+
+
+def test_online_hc_export_reload_resolves_current_workspace(monkeypatch):
+    first = torch.ones(32)
+    fp8._bind_sm70_fp8_prefill_workspace(_Layer(_LAYER), first)
+    pointers = []
+
+    def native(block_out, injection_out, down, lora, gate, partials, pointer, *args):
+        pointers.append(pointer)
+        workspace = ws._layer_workspaces[_LAYER]
+        assert pointer == workspace.data_ptr()
+        block_out.fill_(workspace[0].item())
+
+    monkeypatch.setattr(fp8.sm70_ops, "fp8_qpn8_hc_dispatch_sm70_out", native)
+
+    class Projection(torch.nn.Module):
+        def forward(self, x, codes, scales):
+            outputs = [torch.empty_like(x) for _ in range(6)]
+            torch.ops.vllm.sm70_online_qpn8_hc_dispatch(
+                *outputs, _LAYER, x, codes, scales, codes, scales
+            )
+            return outputs[0]
+
+    inputs = (torch.zeros(2, 4), torch.zeros(4, 4, dtype=torch.uint8), torch.ones(1, 4))
+    library = _cpu_impl(
+        "sm70_online_qpn8_hc_dispatch", ws._sm70_online_qpn8_hc_dispatch
+    )
+    try:
+        second = _export_save_rebind_reload(Projection(), inputs, 1.0, 2.0)
+        assert pointers == [first.data_ptr(), second.data_ptr()]
+    finally:
+        if library is not None:
+            library._destroy()

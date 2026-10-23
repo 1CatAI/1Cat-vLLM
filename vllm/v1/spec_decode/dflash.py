@@ -770,7 +770,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
         has_num_rejected = num_rejected_tokens_gpu is not None
         start_event = None
         end_event = None
-        if envs.VLLM_DFLASH_PROFILE and self.device.type == "cuda":
+        if (
+            self._diagnostics.trace.dflash.value("profile")
+            and self.device.type == "cuda"
+        ):
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
@@ -871,7 +874,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             effective_seq_lens=effective_seq_lens,
             num_rejected_tokens_gpu=num_rejected_tokens_gpu,
         )
-        if envs.VLLM_DFLASH_PROFILE:
+        if self._diagnostics.trace.dflash.value("profile"):
             self._profile_rounds += 1
             self._profile_context_tokens += num_context
             self._profile_query_tokens += num_query_total
@@ -964,10 +967,13 @@ class DFlashProposer(SpecDecodeBaseProposer):
             num_input_tokens=num_input_tokens,
         )
         pad_ms = (time.perf_counter() - profile_t0) * 1000.0 if profile_enabled else 0.0
-        if envs.VLLM_DFLASH_PROFILE:
+        if self._diagnostics.trace.dflash.value("profile"):
             self._profile_padded_query_tokens += num_input_tokens
             rounds = self._profile_rounds
-            if rounds > 0 and rounds % envs.VLLM_DFLASH_PROFILE_LOG_INTERVAL == 0:
+            if (
+                rounds > 0
+                and rounds % self._diagnostics.trace.dflash.value("interval") == 0
+            ):
                 avg_context_tokens = self._profile_context_tokens / rounds
                 avg_query_tokens = self._profile_query_tokens / rounds
                 avg_padded_query_tokens = self._profile_padded_query_tokens / rounds

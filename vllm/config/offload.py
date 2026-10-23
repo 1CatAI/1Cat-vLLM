@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from vllm.config.execution_policy import PlePlacementPolicy
 from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch"]
@@ -83,6 +84,9 @@ class PrefetchOffloadConfig:
 class OffloadConfig:
     """Configuration for model weight offloading to reduce GPU memory usage."""
 
+    ple: PlePlacementPolicy = Field(default_factory=PlePlacementPolicy)
+    """Per-engine execution decisions and initialization provenance."""
+
     offload_backend: OffloadBackend = "auto"
     """The backend for weight offloading. Options:
     - "auto": Selects based on which sub-config has non-default values
@@ -152,5 +156,6 @@ class OffloadConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors=set())
+        factors["ple"] = self.ple.compute_hash()
         hash_str = hash_factors(factors)
         return hash_str

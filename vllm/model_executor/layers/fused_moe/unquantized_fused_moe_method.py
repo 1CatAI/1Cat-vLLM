@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 
 import vllm.envs as envs
+from vllm.config.sm70_moe import unquantized_moe_policy
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
@@ -200,7 +201,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
-            if envs.VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE:
+            if unquantized_moe_policy().value("disable_inplace"):
                 logger.info_once(
                     "VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE is "
                     "upstream-replaced by the latest modular unquantized "

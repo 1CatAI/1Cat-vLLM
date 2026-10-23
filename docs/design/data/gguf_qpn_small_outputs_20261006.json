@@ -1,0 +1,1468 @@
+{
+  "prototype_source": "ab9eb0c084e2096849612920a9a2f0bec56ec2e6",
+  "wired_source": "5255e0d1b62db3e1230d944c33bebd32feff74c1",
+  "prototype": {
+    "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
+    "rank": 0,
+    "cases": [
+      {
+        "tensor": "blk.0.ssm_out.weight",
+        "role": "gdn_out",
+        "source_type": 23,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 4177920,
+        "candidate_weight_stream_bytes": 4177920,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.00032079851371236145,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 131,
+            "split": 2,
+            "relative_l2": 0.00032081647077575326,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.0003297539078630507,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 132,
+            "split": 2,
+            "relative_l2": 0.00032987489248625934,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.0003405007300898433,
+            "max_abs": 0.015625
+          },
+          {
+            "seed": 133,
+            "split": 2,
+            "relative_l2": 0.00034098021569661796,
+            "max_abs": 0.015625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 26.623999699950218,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 26.623999699950218,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 26.623999699950218,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 26.623999699950218,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.1.ssm_out.weight",
+        "role": "gdn_out",
+        "source_type": 12,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 4423680,
+        "candidate_weight_stream_bytes": 4915200,
+        "candidate_source": "canonical_u4",
+        "canonical_input_layout_restored": true,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 2,
+            "relative_l2": 0.0007686961907893419,
+            "max_abs": 0.0234375
+          },
+          {
+            "seed": 132,
+            "split": 2,
+            "relative_l2": 0.0008323371293954551,
+            "max_abs": 0.0234375
+          },
+          {
+            "seed": 133,
+            "split": 2,
+            "relative_l2": 0.0007807086803950369,
+            "max_abs": 0.015625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.3.attn_output.weight",
+        "role": "attention_o",
+        "source_type": 21,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 3379200,
+        "candidate_weight_stream_bytes": 3379200,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.00032780133187770844,
+            "max_abs": 0.0048828125
+          },
+          {
+            "seed": 131,
+            "split": 2,
+            "relative_l2": 0.0003279245283920318,
+            "max_abs": 0.0048828125
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.00031659845262765884,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 2,
+            "relative_l2": 0.0003166723472531885,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.0003168550319969654,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "split": 2,
+            "relative_l2": 0.0003167628310620785,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 25.599999353289604,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.99199965596199,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 25.599999353289604,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 25.599999353289604,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 25.599999353289604,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.4.ssm_out.weight",
+        "role": "gdn_out",
+        "source_type": 21,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 3379200,
+        "candidate_weight_stream_bytes": 3379200,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.0003182542568538338,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 131,
+            "split": 2,
+            "relative_l2": 0.0003181427891831845,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.00032001896761357784,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 2,
+            "relative_l2": 0.00031988148111850023,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.00031898426823318005,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "split": 2,
+            "relative_l2": 0.0003189753624610603,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 20.99199965596199,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.7.attn_output.weight",
+        "role": "attention_o",
+        "source_type": 18,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 3010560,
+        "candidate_weight_stream_bytes": 3010560,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.0003167100658174604,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 131,
+            "split": 2,
+            "relative_l2": 0.00031661681714467704,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.00032185742747969925,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 132,
+            "split": 2,
+            "relative_l2": 0.00032173850922845304,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.0003184892702847719,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 133,
+            "split": 2,
+            "relative_l2": 0.0003183378139510751,
+            "max_abs": 0.0078125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 24.57600086927414,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 24.57600086927414,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 24.57600086927414,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 24.57600086927414,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.8.ssm_out.weight",
+        "role": "gdn_out",
+        "source_type": 18,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 3010560,
+        "candidate_weight_stream_bytes": 3010560,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.0003204387903679162,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 131,
+            "split": 2,
+            "relative_l2": 0.0003204048261977732,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.000323557440424338,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 2,
+            "relative_l2": 0.0003235896001569927,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.00031887638033367693,
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 133,
+            "split": 2,
+            "relative_l2": 0.00031868985388427973,
+            "max_abs": 0.0029296875
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 27.648000046610832,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 27.648000046610832,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 27.648000046610832,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.35.attn_output.weight",
+        "role": "attention_o",
+        "source_type": 23,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 4177920,
+        "candidate_weight_stream_bytes": 4177920,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.0003205491229891777,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 131,
+            "split": 2,
+            "relative_l2": 0.00032057613134384155,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.0003181543725077063,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 132,
+            "split": 2,
+            "relative_l2": 0.00031818271963857114,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.0003174854791723192,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "split": 2,
+            "relative_l2": 0.0003175206365995109,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 23.552000522613525,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 23.552000522613525,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 23.552000522613525,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 23.552000522613525,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.39.attn_output.weight",
+        "role": "attention_o",
+        "source_type": 12,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 4423680,
+        "candidate_weight_stream_bytes": 4915200,
+        "candidate_source": "canonical_u4",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 2,
+            "relative_l2": 0.0007479975465685129,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 2,
+            "relative_l2": 0.0008074635406956077,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "split": 2,
+            "relative_l2": 0.0007580400560982525,
+            "max_abs": 0.0020751953125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 19.45599913597107,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 2,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 2,
+            "us": 19.45599913597107,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      }
+    ],
+    "complete": true
+  },
+  "installed_wiring": {
+    "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
+    "rank": 0,
+    "cases": [
+      {
+        "tensor": "blk.0.ssm_out.weight",
+        "role": "gdn_out",
+        "source_type": 23,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 4177920,
+        "admission": {
+          "family": "lut4",
+          "source_type": "IQ4_XS",
+          "operator": "gguf_small_output_sm70_out",
+          "graph_safe": true,
+          "min_m": 8,
+          "max_m": 8,
+          "reason": null,
+          "role": "gdn_out",
+          "n": 5120,
+          "k": 1536,
+          "split_k": 1,
+          "input_head_tiling": true,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "candidate_weight_stream_bytes": 4177920,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.00032079851371236145,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.0003297539078630507,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.0003405007300898433,
+            "max_abs": 0.015625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 26.623999699950218,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 26.623999699950218,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.3.attn_output.weight",
+        "role": "attention_o",
+        "source_type": 21,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 3379200,
+        "admission": {
+          "family": "lattice_codebook",
+          "source_type": "IQ3_S",
+          "operator": "gguf_small_output_sm70_out",
+          "graph_safe": true,
+          "min_m": 8,
+          "max_m": 8,
+          "reason": null,
+          "role": "attention_o",
+          "n": 5120,
+          "k": 1536,
+          "split_k": 1,
+          "input_head_tiling": false,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "candidate_weight_stream_bytes": 3379200,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.00032780133187770844,
+            "max_abs": 0.0048828125
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.00031659845262765884,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.0003168550319969654,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 25.599999353289604,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 25.599999353289604,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.4.ssm_out.weight",
+        "role": "gdn_out",
+        "source_type": 21,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 3379200,
+        "admission": {
+          "family": "lattice_codebook",
+          "source_type": "IQ3_S",
+          "operator": "gguf_small_output_sm70_out",
+          "graph_safe": true,
+          "min_m": 8,
+          "max_m": 8,
+          "reason": null,
+          "role": "gdn_out",
+          "n": 5120,
+          "k": 1536,
+          "split_k": 1,
+          "input_head_tiling": true,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "candidate_weight_stream_bytes": 3379200,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.0003182542568538338,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.00032001896761357784,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.00031898426823318005,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.7.attn_output.weight",
+        "role": "attention_o",
+        "source_type": 18,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 3010560,
+        "admission": {
+          "family": "lattice_codebook",
+          "source_type": "IQ3_XXS",
+          "operator": "gguf_small_output_sm70_out",
+          "graph_safe": true,
+          "min_m": 8,
+          "max_m": 8,
+          "reason": null,
+          "role": "attention_o",
+          "n": 5120,
+          "k": 1536,
+          "split_k": 1,
+          "input_head_tiling": false,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "candidate_weight_stream_bytes": 3010560,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.0003167100658174604,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.00032185742747969925,
+            "max_abs": 0.0078125
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.0003184892702847719,
+            "max_abs": 0.0078125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 24.57600086927414,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 19.45599913597107,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 19.45599913597107,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 24.57600086927414,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.8.ssm_out.weight",
+        "role": "gdn_out",
+        "source_type": 18,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 3010560,
+        "admission": {
+          "family": "lattice_codebook",
+          "source_type": "IQ3_XXS",
+          "operator": "gguf_small_output_sm70_out",
+          "graph_safe": true,
+          "min_m": 8,
+          "max_m": 8,
+          "reason": null,
+          "role": "gdn_out",
+          "n": 5120,
+          "k": 1536,
+          "split_k": 1,
+          "input_head_tiling": true,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "candidate_weight_stream_bytes": 3010560,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.0003204387903679162,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.000323557440424338,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.00031887638033367693,
+            "max_abs": 0.0029296875
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 20.479999482631683,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 28.672000393271446,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "tensor": "blk.35.attn_output.weight",
+        "role": "attention_o",
+        "source_type": 23,
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "source_bytes": 4177920,
+        "admission": {
+          "family": "lut4",
+          "source_type": "IQ4_XS",
+          "operator": "gguf_small_output_sm70_out",
+          "graph_safe": true,
+          "min_m": 8,
+          "max_m": 8,
+          "reason": null,
+          "role": "attention_o",
+          "n": 5120,
+          "k": 1536,
+          "split_k": 1,
+          "input_head_tiling": false,
+          "fallback": "canonical"
+        },
+        "compiled": true,
+        "runtime_checks": [
+          {
+            "m": 512,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          },
+          {
+            "m": 1,
+            "bitwise_graph": true
+          },
+          {
+            "m": 5,
+            "bitwise_graph": true
+          },
+          {
+            "m": 16,
+            "bitwise_graph": true
+          },
+          {
+            "m": 20,
+            "bitwise_graph": true
+          },
+          {
+            "m": 32,
+            "bitwise_graph": true
+          },
+          {
+            "m": 8,
+            "bitwise_graph": true
+          }
+        ],
+        "candidate_weight_stream_bytes": 4177920,
+        "candidate_source": "original",
+        "canonical_input_layout_restored": false,
+        "checks": [
+          {
+            "seed": 131,
+            "split": 1,
+            "relative_l2": 0.0003205491229891777,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 132,
+            "split": 1,
+            "relative_l2": 0.0003181543725077063,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "split": 1,
+            "relative_l2": 0.0003174854791723192,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 22.52800017595291,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "split": 1,
+            "us": 21.503999829292297,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "split": 1,
+            "us": 23.552000522613525,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      }
+    ],
+    "complete": true
+  },
+  "counterparts": [
+    {
+      "role": "GDN_out",
+      "m": 8,
+      "n": 5120,
+      "k": 1536,
+      "weight_stream_bytes": 7874560,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 1,
+        "fast_decoder": true,
+        "relative_l2": 0.00019928715482819825
+      },
+      "timings": [
+        {
+          "median_us": 18.432000651955605,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 18.432000651955605,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "attention_o",
+      "m": 8,
+      "n": 5120,
+      "k": 1536,
+      "weight_stream_bytes": 7874560,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 1,
+        "fast_decoder": true,
+        "relative_l2": 0.00020659450092352927
+      },
+      "timings": [
+        {
+          "median_us": 19.45599913597107,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 18.432000651955605,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    }
+  ],
+  "measured_layer_counts": [
+    {
+      "role": "gdn_out",
+      "type": 23,
+      "layers": 16
+    },
+    {
+      "role": "gdn_out",
+      "type": 21,
+      "layers": 22
+    },
+    {
+      "role": "gdn_out",
+      "type": 18,
+      "layers": 4
+    },
+    {
+      "role": "attention_o",
+      "type": 21,
+      "layers": 10
+    },
+    {
+      "role": "attention_o",
+      "type": 18,
+      "layers": 1
+    },
+    {
+      "role": "attention_o",
+      "type": 23,
+      "layers": 2
+    }
+  ]
+}

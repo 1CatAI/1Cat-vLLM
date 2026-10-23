@@ -32,16 +32,22 @@ def _conv_gate_zero_kernel(
     STATE_DIM: tl.constexpr,
     STATE_TOKEN: tl.constexpr,
     CACHE_LINES: tl.constexpr,
+    TOKENS: tl.constexpr,
+    STATE_LENGTH: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    NP2_STATE: tl.constexpr,
     CHANNEL_TILE: tl.constexpr,
 ):
     feature = tl.program_id(1) * CHANNEL_TILE + tl.arange(0, CHANNEL_TILE)
-    token = tl.arange(0, 8)
+    token = tl.arange(0, BLOCK_TOKENS)
     # The old allocation zeroes padded output rows too. Keep that contract,
     # including invalid state slots, before the convolution's early returns.
     tl.store(
-        Core + token[:, None] * 1536 + feature[None, :], 0, feature[None, :] < 1536
+        Core + token[:, None] * 1536 + feature[None, :],
+        0,
+        (token[:, None] < TOKENS) & (feature[None, :] < 1536),
     )
-    if tl.program_id(1) < 8:
+    if tl.program_id(1) < TOKENS:
         head = tl.arange(0, 16)
         mask = head < 12
         offset = tl.program_id(1) * 12 + head
@@ -69,8 +75,8 @@ def _conv_gate_zero_kernel(
         X,
         1,
         2560,
-        8,
-        10,
+        TOKENS,
+        STATE_LENGTH,
         CACHE_LINES,
         0,
         1,
@@ -91,7 +97,7 @@ def _conv_gate_zero_kernel(
         IS_VARLEN=True,
         IS_APC_ENABLED=False,
         IS_SPEC_DECODING=True,
-        NP2_STATELEN=16,
+        NP2_STATELEN=NP2_STATE,
         USE_PAD_SLOT=True,
         BLOCK_N=CHANNEL_TILE,
     )
@@ -113,14 +119,19 @@ def conv_gate_zero(
     num_warps=2,
 ):
     """Exact-shape entry; dispatch proves the verifier and state layouts."""
-    assert qkv.shape == (8, 2560) and qkv.stride(1) == 1
+    tokens = qkv.shape[0]
+    assert tokens in (5, 8) and qkv.shape == (tokens, 2560) and qkv.stride(1) == 1
     assert qkv.dtype == state.dtype == weight.dtype == torch.float16
     assert weight.shape == (2560, 4)
-    assert core_out.shape == (8, 12, 128) and core_out.is_contiguous()
-    assert state.shape[1] == 2560 and state.shape[2] >= 10
-    assert a.shape == b.shape == (8, 12) and a.is_contiguous() and b.is_contiguous()
+    assert core_out.shape == (tokens, 12, 128) and core_out.is_contiguous()
+    assert state.shape[1] == 2560 and state.shape[2] >= tokens + 2
+    assert (
+        a.shape == b.shape == (tokens, 12) and a.is_contiguous() and b.is_contiguous()
+    )
     assert state_indices.shape == accepted.shape == (1,) and cu.shape == (2,)
-    g = torch.empty((1, 8, 12), dtype=torch.float32, device=qkv.device)
+    # Match causal_conv1d_update: speculative history uses width-1 plus
+    # tokens-1 entries even when the physical cache has a longer stride.
+    g = torch.empty((1, tokens, 12), dtype=torch.float32, device=qkv.device)
     beta = torch.empty_like(g)
     _conv_gate_zero_kernel[(1, triton.cdiv(2560, channel_tile))](
         qkv,
@@ -140,6 +151,10 @@ def conv_gate_zero(
         *weight.stride(),
         *state.stride(),
         state.shape[0],
+        tokens,
+        tokens + 2,
+        triton.next_power_of_2(tokens),
+        triton.next_power_of_2(tokens + 2),
         channel_tile,
         num_warps=num_warps,
     )
