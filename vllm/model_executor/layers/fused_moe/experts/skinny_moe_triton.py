@@ -9,7 +9,7 @@ W[gids[g]].T`` for the slots of every expert group (``perm``, ``gids``,
 decodes every weight tile again for each 8-row block; here one program takes
 BLOCK_M rows of one expert group and BLOCK_N packed columns, so a decoded tile
 serves BLOCK_M rows. That pays off once a prefill chunk gives the experts more
-than 16 rows on average. Programs map to row blocks, not to groups, so a
+than 13 rows on average. Programs map to row blocks, not to groups, so a
 popular expert spreads over as many programs as it has blocks instead of
 leaving one program as the straggler; routing is skewed, so each group takes
 the row tile that fits its size (one launch per tile size).
@@ -24,8 +24,11 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-# More rows per expert than this take the Triton kernel (hand kernel below).
-TRITON_MIN_ROWS_PER_EXPERT = 16
+# More rows per expert on average than this take the Triton kernel, the hand
+# kernel the rest. Measured against the hand kernel on DeepSeek-V4-Flash layer 5
+# (W13 + W2, Zipf skew 0 / 0.8 / 1.2): Triton is 0.3-1.5 % slower at 12.9 rows,
+# 0.7-5.9 % faster at 13.8 and 16-23 % faster at 23.9.
+TRITON_MIN_ROWS_PER_EXPERT = 13
 # Groups by size: (more than, at most) rows, and the tile (BLOCK_M, BLOCK_N,
 # BLOCK_K, warps) for W13 (token-major x) and W2 (slot-major x). Measured on the
 # M8N8K4 cards with a DeepSeek-V4-Flash layer (256 experts, top-6) under uniform and
@@ -94,24 +97,40 @@ def _skinny_moe_e8m0_m8n8k4_kernel(
     perm_ptr,
     gids_ptr,
     goff_ptr,
-    block_group_ptr,
-    block_row_ptr,
     y_ptr,
     N,
     K,
     TOP_K,
     x_stride,
     y_stride,
+    GROUPS,
+    LOW,
+    HIGH,
+    GROUPS_P2: tl.constexpr,
     X_SLOT_MAJOR: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     tl.static_assert(BLOCK_K % 32 == 0, "whole E8M0 scale groups per K step")
-    group = tl.load(block_group_ptr + tl.program_id(0))
-    if group < 0:
+    # This program's row block among the groups of its tier (more than LOW, at
+    # most HIGH rows), each cut into BLOCK_M-row blocks in group order. Every
+    # program derives it from goff itself; a separate list build cost about 80
+    # small kernels per layer and chunk (1.6 s of a 150k-token DeepSeek-V4
+    # prefill on one pipeline stage).
+    g = tl.arange(0, GROUPS_P2)
+    g_ok = g < GROUPS
+    sizes = tl.load(goff_ptr + g + 1, mask=g_ok, other=0) - tl.load(
+        goff_ptr + g, mask=g_ok, other=0
+    )
+    sizes = tl.where((sizes > LOW) & (sizes <= HIGH), sizes, 0)
+    block_end = tl.cumsum((sizes + BLOCK_M - 1) // BLOCK_M, axis=0)
+    passed = block_end <= tl.program_id(0)
+    group = tl.sum(passed.to(tl.int32), axis=0)
+    if group >= GROUPS:
         return
-    row_start = tl.load(block_row_ptr + tl.program_id(0))
+    first_block = tl.max(tl.where(passed, block_end, 0), axis=0)
+    row_start = (tl.program_id(0) - first_block) * BLOCK_M
     begin = tl.load(goff_ptr + group)
     count = tl.load(goff_ptr + group + 1) - begin
     expert = tl.load(gids_ptr + group)
@@ -180,29 +199,6 @@ def _skinny_moe_e8m0_m8n8k4_kernel(
     )
 
 
-def _row_blocks(
-    goff: torch.Tensor, block_m: int, slots: int, low: int, high: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Group and first row of every BLOCK_M row block of the groups with more
-    than ``low`` and at most ``high`` rows; -1 past the last block.
-
-    Fixed size, built on the device without a host synchronization (the group
-    sizes live on the device).
-    """
-    groups = goff.numel() - 1
-    counts = (goff[1:] - goff[:-1]).clamp_min(0)
-    counts = torch.where((counts > low) & (counts <= high), counts, 0)
-    blocks = (counts + block_m - 1) // block_m
-    block_end = torch.cumsum(blocks, 0)
-    capacity = min(groups, slots // (low + 1)) + slots // block_m
-    block_ids = torch.arange(capacity, device=goff.device, dtype=block_end.dtype)
-    group = torch.searchsorted(block_end, block_ids, right=True)
-    valid = group < groups
-    group = group.clamp_max(groups - 1)
-    row = (block_ids - (block_end - blocks)[group]) * block_m
-    return torch.where(valid, group, -1).to(torch.int32), row.to(torch.int32)
-
-
 def skinny_moe_e8m0_m8n8k4_triton(
     x: torch.Tensor,
     codes: torch.Tensor,
@@ -218,6 +214,7 @@ def skinny_moe_e8m0_m8n8k4_triton(
     """The hand-written skinny QPN MoE op for E8M0 scales in the M8N8K4 order,
     on tensor cores (needs the ``triton_sm7x_tensor_cores`` Triton)."""
     n, k = y.shape[1], x.shape[1]
+    slots = y.shape[0]
     # At most one group per expert.
     groups = min(goff.numel() - 1, global_scales.numel())
     for low, high, tiles in _TIERS:
@@ -227,10 +224,13 @@ def skinny_moe_e8m0_m8n8k4_triton(
                 f"Triton skinny MoE tiles N by {block_n} and K by {block_k}, "
                 f"got N={n}, K={k}"
             )
-        block_group, block_row = _row_blocks(
-            goff[: groups + 1], block_m, y.shape[0], low, high
-        )
-        _skinny_moe_e8m0_m8n8k4_kernel[(block_group.numel(), n // block_n)](
+        # Row blocks of the tier, bounded without reading the group sizes: one
+        # per group (each has more than `low` rows), plus slots / block_m for
+        # groups that take several.
+        capacity = min(groups, slots // (low + 1))
+        if high > block_m:
+            capacity += slots // block_m
+        _skinny_moe_e8m0_m8n8k4_kernel[(capacity, n // block_n)](
             x,
             codes,
             scales,
@@ -238,14 +238,16 @@ def skinny_moe_e8m0_m8n8k4_triton(
             perm,
             gids,
             goff,
-            block_group,
-            block_row,
             y,
             n,
             k,
             top_k,
             x.stride(0),
             y.stride(0),
+            groups,
+            low,
+            high,
+            GROUPS_P2=triton.next_power_of_2(groups),
             X_SLOT_MAJOR=x_slot_major,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
