@@ -134,6 +134,7 @@ def chunk_gated_delta_rule_fwd_sm70_tilelang(
     state_layout_vlk: bool = False,
     output: torch.Tensor | None = None,
     inplace_final_state: bool = False,
+    sm70_threads: int = 128,
 ):
     target_compute_version = _get_tensor_compute_version(q)
     if target_compute_version not in ("7.0", "7.5"):
@@ -209,6 +210,7 @@ def chunk_gated_delta_rule_fwd_sm70_tilelang(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
         inplace_final_state=inplace_final_state,
+        sm70_threads=sm70_threads,
     )
     return g, A, o, h, final_state
 

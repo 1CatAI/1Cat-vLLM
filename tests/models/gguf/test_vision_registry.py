@@ -104,3 +104,40 @@ def test_text_draft_with_inherited_vision_config_skips_wrapper(monkeypatch):
         "output.weight": "model.layers.45.shared_head.head.weight"
     }
     assert loader._native_vision_adapter is None
+
+
+def test_explicit_companion_skips_mmproj_and_keeps_language_scope(monkeypatch):
+    text = SimpleNamespace(model_type="glm5_next_text")
+    config = SimpleNamespace(get_text_config=lambda: text, vision_config=object())
+    model_config = SimpleNamespace(hf_config=config, multimodal_config=None)
+    adapter = SimpleNamespace(
+        language_model_prefix="language_model",
+        build_name_map=lambda tensors: {"output.weight": "lm_head.weight"},
+    )
+    monkeypatch.setattr(gguf_adapters, "get_gguf_adapter", lambda *a, **kw: adapter)
+    monkeypatch.setattr(gguf_files, "gguf_shard_paths", lambda p: [Path(p)])
+    monkeypatch.setattr(gguf_files, "gguf_tensor_index", lambda paths: {})
+    monkeypatch.setattr(
+        gguf_loader,
+        "detect_gguf_multimodal",
+        lambda *a: pytest.fail("Explicit companion must not discover mmproj"),
+    )
+    loader = GGUFModelLoader(LoadConfig(load_format="gguf"))
+    loader.multimodal_weights = object()
+    monkeypatch.setattr(loader, "_prepare_weights", lambda c: "model.gguf")
+    assert loader._get_gguf_weights_map(model_config) == {
+        "output.weight": "lm_head.weight"
+    }
+    assert adapter.language_model_prefix == "language_model"
+    assert loader._native_vision_adapter is None
+
+
+def test_glm_target_and_draft_keep_independent_language_scopes():
+    from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+
+    target = Glm5NextConfig(architectures=["Glm5NextForConditionalGeneration"])
+    assert (
+        gguf_adapters.get_gguf_adapter(target).language_model_prefix == "language_model"
+    )
+    draft = target.get_mtp_draft_config()
+    assert gguf_adapters.get_gguf_adapter(draft).language_model_prefix == ""

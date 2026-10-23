@@ -108,5 +108,7 @@ def create_step_profiler(
         interval=policy.interval,
         report=_REPORTS[role],
         logger=logger,
-        report_rank=is_last_pp_first_tp_rank,
+        # V2 verification timings must retain TP stragglers. Worker log
+        # prefixes identify each rank; ordinary inference has no context.
+        report_rank=(lambda: True) if role == "runner_v2" else is_last_pp_first_tp_rank,
     )

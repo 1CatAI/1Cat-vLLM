@@ -54,6 +54,9 @@ CHECK_IMPORTS = {
             "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
             "benchmarks/cutlass_benchmarks/w8a8_benchmarks.py",
             "benchmarks/cutlass_benchmarks/sparse_benchmarks.py",
+            # Pickling round trips are the subject of these tests.
+            "tests/tokenizers_/test_gguf_bpe_encode.py",
+            "tests/config/test_gguf_prefill_prepare.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",

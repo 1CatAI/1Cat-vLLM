@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import sys
+import weakref
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
@@ -530,6 +531,7 @@ def test_chunked_selection_allocates_scratch_only_for_generic_topk(monkeypatch, 
     output = torch.empty(rows, 2051, dtype=torch.int32)
     events = []
     scratch = []
+    previous_scores: list[weakref.ReferenceType[torch.Tensor]] = []
     allocate = torch.empty
 
     def record_allocation(shape, **kwargs):
@@ -539,9 +541,13 @@ def test_chunked_selection_allocates_scratch_only_for_generic_topk(monkeypatch, 
         return tensor
 
     def score(query, *args, **kwargs):
+        assert all(ref() is None for ref in previous_scores)
         events.append("score")
         n = query.shape[0]
-        return torch.ones(n, columns), torch.full((n,), columns, dtype=torch.int32)
+        logits = torch.ones(n, columns)
+        visible = torch.full((n,), columns, dtype=torch.int32)
+        previous_scores.extend((weakref.ref(logits), weakref.ref(visible)))
+        return logits, visible
 
     def select(logits, lengths, indices, *args):
         events.append("select")
@@ -580,3 +586,91 @@ def test_chunked_selection_allocates_scratch_only_for_generic_topk(monkeypatch, 
     assert torch.all(output == -1)
     assert len(scratch) == (0 if exact else 1)
     assert events == ["score", "select", "expand"] * 3
+
+
+def test_qsa_cublas_releases_scores_between_column_tiles(monkeypatch):
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 1)
+    query = torch.randn(512, 4, 16)
+    keys = torch.randn(600, 16)
+    valid = torch.ones(600, dtype=torch.uint8)
+    visible = torch.full((512,), 600, dtype=torch.int32)
+    previous: list[weakref.ReferenceType[torch.Tensor]] = []
+    original_mm = torch.mm
+
+    def multiply(left, right, *, out_dtype):
+        assert out_dtype == torch.float32
+        assert all(ref() is None for ref in previous)
+        result = original_mm(left, right)
+        previous.append(weakref.ref(result))
+        return result
+
+    class Epilogue:
+        def __getitem__(self, grid):
+            def apply(scores, visibility, mask, logits, *args, **kwargs):
+                width, column = args[3:5]
+                heads = kwargs["NUM_HEADS"]
+                logits[:, column : column + width].copy_(
+                    scores.reshape(query.shape[0], heads, width).relu().sum(dim=1)
+                )
+
+            return apply
+
+    expected = original_mm(query.reshape(-1, 16), keys.T)
+    expected = expected.reshape(512, 4, 600).relu().sum(dim=1)
+    monkeypatch.setattr(torch, "mm", multiply)
+    monkeypatch.setattr(qsa_ops, "_qsa_relu_headsum_visible_kernel", Epilogue())
+    actual, actual_visible = qsa_ops._qsa_mqa_cublas(query, keys, valid, visible)
+    torch.testing.assert_close(actual, expected)
+    assert actual_visible is visible
+    assert len(previous) == 3
+    assert all(ref() is None for ref in previous)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qsa_cublas_tiled_scores_preserve_graph_replay(monkeypatch):
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 1)
+    query = torch.randn(512, 4, 128, device="cuda", dtype=torch.float16)
+    keys = torch.randn(600, 128, device="cuda", dtype=torch.float16)
+    valid = torch.ones(600, dtype=torch.uint8, device="cuda")
+    visible = torch.full((512,), 600, dtype=torch.int32, device="cuda")
+
+    def reference():
+        # Same tile shapes and arithmetic as the previous retained-score path.
+        out = torch.empty(512, 600, dtype=torch.float32, device="cuda")
+        scores = None
+        for first in range(0, 600, 256):
+            last = min(first + 256, 600)
+            width = last - first
+            scores = torch.mm(
+                query.reshape(-1, 128), keys[first:last].T, out_dtype=torch.float32
+            )
+            qsa_ops._qsa_relu_headsum_visible_kernel[(512, 1)](
+                scores,
+                visible,
+                valid,
+                out,
+                scores.stride(0),
+                scores.stride(1),
+                out.stride(0),
+                width,
+                first,
+                128**0.5,
+                NUM_HEADS=4,
+                BLOCK_N=256,
+                num_warps=4,
+            )
+        return out
+
+    qsa_ops._qsa_mqa_cublas(query, keys, valid, visible)
+    expected = reference()
+    actual, _ = qsa_ops._qsa_mqa_cublas(query, keys, valid, visible)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured, _ = qsa_ops._qsa_mqa_cublas(query, keys, valid, visible)
+    for _ in range(3):
+        query.normal_()
+        keys.normal_()
+        graph.replay()
+        torch.testing.assert_close(captured, reference(), rtol=0, atol=0)
+        assert torch.isfinite(captured).all()

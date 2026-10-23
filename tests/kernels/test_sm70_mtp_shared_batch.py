@@ -9,7 +9,7 @@ import vllm.envs as envs
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as batch
 
 
-@pytest.mark.parametrize("rows", [1, 2, 5, 10, 17])
+@pytest.mark.parametrize("rows", [1, 2, 5, 10, 17, 20, 40])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_changed_input_graph(rows, enabled, monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
@@ -30,7 +30,10 @@ def test_changed_input_graph(rows, enabled, monkeypatch):
     expected = x.new_empty((rows, 160))
 
     def run():
-        torch.mm(x, weight.t(), out=raw)
+        # Concurrent batches keep the five-row arithmetic of each request.
+        step = 5 if enabled and rows % 5 == 0 else rows
+        for start in range(0, rows, step):
+            torch.mm(x[start : start + step], weight.t(), out=raw[start : start + step])
         torch.ops._C.silu_and_mul(expected, raw)
         actual = batch._qwen38_sm70_shared_up(x, weight, packed)
         gated = batch._qwen38_sm70_shared_gate_mul(logits, x)
@@ -53,7 +56,7 @@ def test_changed_input_graph(rows, enabled, monkeypatch):
         envs.disable_envs_cache()
 
 
-@pytest.mark.parametrize("rows", [5, 10])
+@pytest.mark.parametrize("rows", [5, 10, 20, 40])
 def test_fp32_partials_changed_graph_with_exact_linear_oracle(rows, monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("Requires SM70")

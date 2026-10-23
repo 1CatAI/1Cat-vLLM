@@ -125,12 +125,12 @@ def _dump_prefill_inputs(
     logger.info("Dumped QSA prefill reader inputs of target layer %d.", order)
 
 
-def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens):
+def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens, stage_slots=2):
     """After target layer `order`'s attention: mark its buffer free and stage
-    the next target layer's prefix pages into the other buffer."""
+    the next target layer's prefix pages into a released buffer."""
     free = torch.cuda.Event()
     free.record()
-    _PREFETCH["free"][order % 2] = free
+    _PREFETCH["free"][order % stage_slots] = free
     if order + 1 >= len(_TARGET_HOST_KV):
         return
     nxt = _TARGET_HOST_KV[order + 1]
@@ -138,7 +138,7 @@ def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens):
         return
     if _PREFETCH["stream"] is None:
         _PREFETCH["stream"] = torch.cuda.Stream()
-    slot = (order + 1) % 2
+    slot = (order + 1) % stage_slots
     done, prefix = nxt.prefetch_prefix(
         plan,
         new_tokens,
@@ -154,15 +154,43 @@ def _qsa_rope_cache_length(config, model_config) -> int:
     """Bound fixed-frequency text RoPE by the engine's position limit."""
     mm_config = model_config.multimodal_config
     text_only = mm_config is None or mm_config.language_model_only
-    if not text_only or config.rope_parameters.get("rope_type", "default") != "default":
+    # Image MRoPE positions advance by at most one per token, so they stay
+    # below max_model_len like text; only video time indices can exceed it.
+    bounded = text_only or mm_config.get_limit_per_prompt("video") == 0
+    if not bounded or config.rope_parameters.get("rope_type", "default") != "default":
         return config.max_position_embeddings
     limit = min(config.max_position_embeddings, model_config.max_model_len)
     if config.rope_parameters.get("mrope_section"):
-        # MRotaryEmbedding enlarges its cache 4x for video positions. Text-only
-        # positions stay below max_model_len, so a quarter covers every row;
+        # MRotaryEmbedding enlarges its cache 4x for video positions. Text and
+        # image positions stay below max_model_len, so a quarter covers every row;
         # each row's values do not depend on the table length.
         return -(-limit // 4)
     return limit
+
+
+def _bound_scaled_rope_cache(rotary_emb, config, model_config) -> None:
+    """Trim a scaled (YaRN) RoPE table to the engine's position limit.
+
+    Scaled tables span original_max_position * factor rows, and MRoPE enlarges
+    that 4x for video time indices. Text and image positions stay below
+    max_model_len and each row depends only on its own position, so the
+    trimmed table is exact. Stock RoPE is already bounded at construction.
+    """
+    if config.rope_parameters.get("rope_type", "default") == "default":
+        return
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    if not (text_only or mm_config.get_limit_per_prompt("video") == 0):
+        return
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    # A draft serves its target's window; the scaled config spans it.
+    limit = max(
+        int(model_config.max_model_len),
+        int(getattr(model_config, "spec_target_max_model_len", None) or 0),
+        int(config.max_position_embeddings),
+    )
+    if cache is not None and cache.shape[0] > limit:
+        rotary_emb.cos_sin_cache = cache[:limit].clone()
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -671,6 +699,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             max_position=_qsa_rope_cache_length(config, model_config),
             rope_parameters=config.rope_parameters,
         )
+        _bound_scaled_rope_cache(self.rotary_emb, config, model_config)
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
@@ -720,8 +749,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
         self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
         self.host_kv_staging_rows = vllm_config.kernel_config.qsa_host_kv_staging_rows
+        # Verification batches (every concurrent request with its drafts)
+        # stay on the graph-capturable decode reader.
+        spec = vllm_config.speculative_config
+        self.host_kv_decode_rows = vllm_config.scheduler_config.max_num_seqs * (
+            1 + ((spec.num_speculative_tokens or 0) if spec is not None else 0)
+        )
         self.host_kv_prefill_stage_tokens = (
             vllm_config.kernel_config.qsa_host_kv_prefill_stage_tokens
+        )
+        self.host_kv_prefill_stage_slots = (
+            vllm_config.kernel_config.qsa_host_kv_prefill_stage_slots
         )
         self.host_kv_device_reference = (
             vllm_config.kernel_config.qsa_host_kv_device_reference
@@ -729,6 +767,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # Cache binding runs under the target worker's config, also for draft
         # layers. Retain each owner's policy from model construction.
         self.host_kv_is_draft = vllm_config.is_speculative_draft
+        if self.host_kv_is_draft:
+            self.host_kv_hot_tokens = (
+                vllm_config.kernel_config.qsa_host_kv_draft_hot_tokens
+                or self.host_kv_hot_tokens
+            )
+        self.host_kv_hot_fp8 = (
+            not self.host_kv_is_draft
+            and vllm_config.kernel_config.qsa_host_kv_hot_dtype == "fp8_e4m3"
+        )
         self.host_kv_direct_device = vllm_config.kernel_config.sm70_qsa_device_history
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
@@ -912,19 +959,88 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 device_reference=self.host_kv_device_reference,
                 direct_device=self.host_kv_direct_device,
                 is_speculative_draft=self.host_kv_is_draft,
+                hot_fp8=self.host_kv_hot_fp8,
             )
             if not self.host_kv_is_draft:
                 _TARGET_HOST_KV.append(self.host_kv)
             logger.info_once(
                 "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
                 "direct device M1..20/H6/D256=%s, fallback_reason=%s; "
-                "other shapes use protected FP16 hot pages and miss staging.",
+                "other shapes use protected hot pages and FP16 miss staging.",
                 "device_reference" if self.host_kv_device_reference else "host",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
                 self.host_kv.device_history_workspace is not None,
                 self.host_kv.device_history_reason,
             )
+
+    def _windowed_rows(
+        self,
+        windows,
+        query,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        output,
+        gate,
+        workspace,
+    ) -> None:
+        from .ops.device_kv_attention import PREFILL_ROWS
+        from .ops.host_kv import merge_windows
+
+        state = self.host_kv
+        rows = query.shape[0]
+        acc = torch.empty((rows, 6, 256), dtype=torch.float32, device=query.device)
+        part = torch.empty_like(acc)
+        acc_state = torch.empty((rows, 6, 2), dtype=torch.float32, device=query.device)
+        part_state = torch.empty_like(acc_state)
+        gate_rows = gate.view_as(query) if gate is not None else None
+        for number, plan in enumerate(windows):
+            history, scales, staged_table = state.stage_history(
+                table, lengths, self.host_kv_prefill_stage_tokens, plan
+            )
+            first = number == 0
+            if history.dtype == torch.uint8:
+                torch.ops.vllm_sm70_qsa_device.run_rows_window(
+                    query,
+                    history,
+                    scales,
+                    indices,
+                    staged_table,
+                    requests,
+                    positions,
+                    lengths,
+                    acc if first else part,
+                    acc_state if first else part_state,
+                    12,
+                )
+            else:
+                torch.ops.vllm_sm70_qsa_device.run_tiled_window(
+                    query,
+                    history,
+                    scales,
+                    indices,
+                    staged_table,
+                    requests,
+                    positions,
+                    lengths,
+                    *workspace,
+                    acc if first else part,
+                    acc_state if first else part_state,
+                    PREFILL_ROWS,
+                )
+            if not first:
+                last = number == len(windows) - 1
+                merge_windows(
+                    acc,
+                    acc_state,
+                    part,
+                    part_state,
+                    output if last else None,
+                    gate_rows if last else None,
+                )
 
     def host_kv_forward(
         self,
@@ -944,7 +1060,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         workspace = None
         if (
             self.host_kv_prefill_stage_tokens
-            and query.shape[0] > state.resolve_rows
+            and query.shape[0] > max(state.resolve_rows, self.host_kv_decode_rows)
             and query.shape[1:] == (6, 256)
             and indices.shape[1] <= state.width
         ):
@@ -970,7 +1086,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     table, lengths, self.host_kv_prefill_stage_tokens
                 )
             plan = plans[plan_key]
-            # Target layers alternate between two stage buffers. The previous
+            # Target layers reuse the configured stage buffers. The previous
             # layer staged this layer's prefix pages (written before this
             # step) on a side stream; only the rest is copied here, after
             # this step's writes.
@@ -979,7 +1095,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 if not self.host_kv_is_draft and state in _TARGET_HOST_KV
                 else -1
             )
-            slot = order % 2 if order >= 0 else 0
+            stage_slots = getattr(self, "host_kv_prefill_stage_slots", 2)
+            slot = order % stage_slots if order >= 0 else 0
             staged_pages = 0
             pending = _PREFETCH["pending"].pop(id(state), None)
             if plan and pending is not None and pending[0] is plan:
@@ -1048,6 +1165,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                         plan,
                         query.shape[0],
                         self.host_kv_prefill_stage_tokens,
+                        stage_slots,
                     )
                 if _QSA_DUMP_DIR and order in (0, 5, 11):
                     _dump_prefill_inputs(
@@ -1068,6 +1186,34 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     self.host_kv_is_draft,
                 )
                 return
+            if plan is None and query.shape[0] > 0:
+                # Longer than the stage buffer: stage it window by window and
+                # merge the windows' softmax states instead of falling back to
+                # per-row host reads.
+                window_key = plan_key + ("windows",)
+                if window_key not in plans:
+                    plans[window_key] = state.stage_window_plans(
+                        table, lengths, self.host_kv_prefill_stage_tokens
+                    )
+                windows = plans[window_key]
+                if windows:
+                    self._windowed_rows(
+                        windows,
+                        query,
+                        indices,
+                        table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate,
+                        workspace,
+                    )
+                    logger.info_once(
+                        "QSA prefill stages host history in %d windows.",
+                        len(windows),
+                    )
+                    return
         if (
             state.device_history_workspace is not None
             and state.device_history_hot
@@ -1301,8 +1447,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         num_tokens = hidden_states.shape[0]
         side = getattr(self, "sm70_side_projection", None)
         indexer_input = hidden_states
-        if side is not None and 1 <= num_tokens <= 8:
+        if side is not None:
             # The indexer receives its projected q/k instead of hidden states.
+            # The opaque op fuses both projections for small batches; a
+            # Python bound here would be frozen for the whole compiled range.
             qkv, indexer_input = side(hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)

@@ -829,6 +829,17 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    def limit_allocator_headroom(
+        cls, headroom_bytes: int, device: torch.types.Device | None = None
+    ) -> int:
+        """Bound cached device reservation, returning the allocator byte limit.
+
+        Must retain active tensors and captured pools. Unsupported platforms
+        explicitly reject this requested resource limit.
+        """
+        raise NotImplementedError
+
+    @classmethod
     def get_punica_wrapper(cls) -> str:
         """
         Return the punica wrapper for current platform.

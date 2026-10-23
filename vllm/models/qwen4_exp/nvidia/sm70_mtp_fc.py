@@ -6,7 +6,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
-from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     UnquantizedLinearMethod,
@@ -58,3 +58,38 @@ def maybe_combine_fc(model, embedding, hidden):
     # Addition commutes with the feature gather, with exactly the same FP16
     # rounding per element. Norms/projections and TP ownership are unchanged.
     return tensor_model_parallel_all_gather(el.unsqueeze(-2) + hl).flatten(-2)
+
+
+def maybe_sequence_rows_fc(model, embedding, hidden):
+    """Project owned prefill rows without gathering the full HC activation.
+
+    Borrow the existing column shards only for this call. The small weight
+    gathers replace activation gathers whose size grows with the query. The
+    caller already qualified TP4 HC prefill; other linear methods keep their
+    original forward and row-shard fallback.
+    """
+    if envs.VLLM_BATCH_INVARIANT or not all(
+        type(layer) is ColumnParallelLinear
+        and type(layer.quant_method) is UnquantizedLinearMethod
+        and layer.tp_size == 4
+        and layer.gather_output
+        and not layer.return_bias
+        and layer.bias is None
+        and layer.weight.shape == (640, 2560)
+        and layer.weight.dtype == torch.float16
+        for layer in (model.fc_embedding, model.fc_hidden)
+    ):
+        return None
+    from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+
+    group = get_tp_group()
+    embedding = hc_sequence_shard_rows(embedding)
+    hidden = hc_sequence_shard_rows(hidden)
+    embedding = model.pre_fc_norm_embedding(embedding)
+    hidden = model.pre_fc_norm_hidden(hidden).view(-1, 4, 2560)
+    weight = group.all_gather(model.fc_embedding.weight, dim=0)
+    embedding = torch.nn.functional.linear(embedding, weight)
+    del weight
+    weight = group.all_gather(model.fc_hidden.weight, dim=0)
+    hidden = torch.nn.functional.linear(hidden, weight)
+    return (embedding.unsqueeze(-2) + hidden).flatten(-2)

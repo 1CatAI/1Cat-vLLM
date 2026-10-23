@@ -266,6 +266,7 @@ class GdnExecutionPlan:
     indexed_prefill: bool
     direct_prefill_output: bool
     fallback_reason: str | None
+    original_prefill_threads: int = 128
 
     @property
     def needs_native_flashqla(self) -> bool:
@@ -290,4 +291,5 @@ def select_gdn_execution(vllm_config: VllmConfig) -> GdnExecutionPlan:
         "requested backend does not satisfy the retained device/dtype/package contract"
         if requested not in ("auto", selected)
         else None,
+        original_prefill_threads=policy.original_prefill_threads,
     )

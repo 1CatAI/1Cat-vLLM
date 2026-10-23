@@ -45,7 +45,9 @@ def assert_bits(actual, expected):
     )
 
 
-@pytest.mark.parametrize("rows", [1, 12, 24, 48, 60, 96, 120, 192])
+@pytest.mark.parametrize(
+    "rows", [1, 12, 24, 48, 60, 96, 120, 192, 240, 480, 768, 960, 1920, 3072]
+)
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
 def test_changed_graph_inputs_and_canaries(
     rows, activation, monkeypatch, default_vllm_config

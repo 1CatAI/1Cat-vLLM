@@ -36,10 +36,22 @@ def get_gguf_adapter(config, tp_size=1):
         ),
         None,
     )
+    is_draft = entry is not None
     if entry is None:
         entry = _TEXT_ADAPTERS.get(text.model_type)
     if entry is None:
         return None
     module, name = entry
     adapter = getattr(import_module(f"{__name__}.{module}"), name)
-    return adapter(text, tp_size=tp_size)
+    instance = adapter(text, tp_size=tp_size)
+    from .vision import get_vision_adapter_spec
+
+    vision = get_vision_adapter_spec(text.model_type)
+    instance.language_model_prefix = ""
+    if (
+        not is_draft
+        and vision is not None
+        and getattr(config, "vision_config", None) is not None
+    ):
+        instance.language_model_prefix = vision.language_prefix.removesuffix(".")
+    return instance

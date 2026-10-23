@@ -59,3 +59,20 @@ def test_glm53_mtp_override_is_idempotent() -> None:
     assert config.model_type == "glm5_next_mtp"
     assert config.architectures == ["Glm5NextMTPModel"]
     assert config.hc_mult == 1
+
+
+def test_config_import_does_not_import_model_implementation():
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig; "
+            "assert 'vllm.models.glm5next.nvidia.model' not in sys.modules; "
+            "assert Glm5NextConfig().get_text_config().hidden_size == 4096",
+        ],
+        check=True,
+    )

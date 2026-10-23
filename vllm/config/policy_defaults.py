@@ -281,6 +281,10 @@ def finalize_runtime_policy_hashes(cfg):
         )
     elif not pre_ampere:
         layers.hash_fields += ("mtp_share_io_weights", "mtp_keep_quant")
+    if pre_ampere and layers.hc_prefill_sequence_parallel:
+        layers.hash_fields += ("hc_prefill_sequence_parallel",)
+        if layers.hc_prefill_peer_norm:
+            layers.hash_fields += ("hc_prefill_peer_norm",)
     from vllm.model_executor.models.config import effective_layer_policy_hash_fields
 
     layers.hash_fields = effective_layer_policy_hash_fields(
