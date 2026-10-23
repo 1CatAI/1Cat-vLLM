@@ -30,6 +30,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
+from vllm.v1.attention.ops.canonical_topk import canonicalize_selected_indices
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -419,6 +420,10 @@ def sparse_attn_indexer_kpool(
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
+        config = get_current_vllm_config_or_none()
+        canonical_prefill_order = bool(
+            config is not None and config.kernel_config.canonical_prefill_topk_order
+        )
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
@@ -557,6 +562,11 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+
+            if canonical_prefill_order:
+                # Order selected logical IDs before any pool expansion. The
+                # same call covers native/XPU selection and pool size one.
+                topk_dst.copy_(canonicalize_selected_indices(topk_dst))
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)

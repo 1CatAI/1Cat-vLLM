@@ -759,6 +759,14 @@ class KernelConfig:
     )
     """Observed per-group collective capabilities and rejection reasons."""
 
+    canonical_prefill_topk_order: bool = False
+    """Order selected logical IDs in participating sparse-indexer prefill paths.
+
+    Preserve each negative slot and the selected multiset. This does not change
+    TopK selection, guarantee membership for tied scores, or affect decode.
+    Applies independently of device-specific sparse-kernel qualification.
+    """
+
     sm70_sparse: Sm70SparseConfig = Field(default_factory=Sm70SparseConfig)
     """SM70 sparse attention policy; admission uses actual tensor capabilities."""
 
