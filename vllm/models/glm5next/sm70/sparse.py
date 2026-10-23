@@ -17,8 +17,10 @@ from vllm.diagnostics import diagnostic_history
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.sparse_fp16_gemm import (
     sparse_attention_fp16_gemm,
+    sparse_attention_fp16_gemm_chunked,
 )
 from vllm.models.deepseek_v4.common.portable_sparse import (
+    can_use_sparse_fp16_gemm_prefill,
     portable_sparse_mla_config_error,
     sparse_fp16_gemm_max_tokens,
     supports_portable_sparse,
@@ -51,6 +53,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _FP8_GEMM_MAX_TOKENS = 8
+_FP16_GEMM_PREFILL_CHUNK_TOKENS = 16
 
 
 class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
@@ -187,6 +190,17 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             if not self.use_fp8_cache
             else 0
         )
+        self.fp16_gemm_workspace_tokens = (
+            min(max_tokens, _FP16_GEMM_PREFILL_CHUNK_TOKENS)
+            if self.fp16_gemm_max_tokens
+            else 0
+        )
+        speculative_config = getattr(config, "speculative_config", None)
+        self.max_decode_query_len = 1 + (
+            (speculative_config.num_speculative_tokens or 0)
+            if speculative_config
+            else 0
+        )
         workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_tokens, num_heads, self.kv_lora_rank), torch.float16),
         ]
@@ -216,18 +230,18 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 (
                     (
                         (
-                            self.fp16_gemm_max_tokens,
+                            self.fp16_gemm_workspace_tokens,
                             self.index_width,
                             self.kv_lora_rank,
                         ),
                         torch.float16,
                     ),
                     (
-                        (self.fp16_gemm_max_tokens, num_heads, self.index_width),
+                        (self.fp16_gemm_workspace_tokens, num_heads, self.index_width),
                         torch.float32,
                     ),
                     (
-                        (self.fp16_gemm_max_tokens, num_heads, self.index_width),
+                        (self.fp16_gemm_workspace_tokens, num_heads, self.index_width),
                         torch.float16,
                     ),
                 )
@@ -240,6 +254,11 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 "FP32 scores and per-token reduction geometry.",
                 self.fp16_gemm_max_tokens,
                 self.index_width,
+            )
+            logger.info_once(
+                "Sparse FP16 single-request prefill uses bounded %d-token "
+                "batched GEMM chunks; decode retains per-token GEMM.",
+                self.fp16_gemm_workspace_tokens,
             )
         logger.info_once(
             "GLM-5.3-Flash route: portable FP16 sparse MLA with %s KV%s.",
@@ -417,6 +436,30 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 ((num_tokens, self.num_heads, self.index_width), torch.float16),
             )
             sparse_attention_fp16_gemm(
+                q,
+                kv_c_and_k_pe_cache,
+                global_indices,
+                valid_counts,
+                self.softmax_scale,
+                out,
+                gathered_kv,
+                scores,
+                probs,
+            )
+        elif self.fp16_gemm_workspace_tokens and can_use_sparse_fp16_gemm_prefill(
+            num_tokens,
+            attn_metadata.num_reqs,
+            attn_metadata.max_query_len,
+            self.max_decode_query_len,
+        ):
+            chunk_tokens = min(num_tokens, self.fp16_gemm_workspace_tokens)
+            out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(
+                ((num_tokens, self.num_heads, self.kv_lora_rank), torch.float16),
+                ((chunk_tokens, self.index_width, self.kv_lora_rank), torch.float16),
+                ((chunk_tokens, self.num_heads, self.index_width), torch.float32),
+                ((chunk_tokens, self.num_heads, self.index_width), torch.float16),
+            )
+            sparse_attention_fp16_gemm_chunked(
                 q,
                 kv_c_and_k_pe_cache,
                 global_indices,

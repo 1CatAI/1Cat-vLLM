@@ -76,12 +76,13 @@ def test_fp16_gemm_workspace_is_reserved_before_capture(monkeypatch, width):
         kv_lora_rank=512,
     )
     assert impl.fp16_gemm_max_tokens == 15
+    assert impl.fp16_gemm_workspace_tokens == 16
     manager.lock()
     buffers = manager.get_simultaneous(
-        ((15, 64, 512), torch.float16),
-        ((15, width, 512), torch.float16),
-        ((15, 64, width), torch.float32),
-        ((15, 64, width), torch.float16),
+        ((16, 64, 512), torch.float16),
+        ((16, width, 512), torch.float16),
+        ((16, 64, width), torch.float32),
+        ((16, 64, width), torch.float16),
     )
     assert buffers[2].dtype == torch.float32
 

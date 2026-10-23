@@ -88,12 +88,14 @@ def sparse_attention_fp16_gemm(
     gathered_kv: torch.Tensor,
     scores: torch.Tensor,
     probs: torch.Tensor,
+    *,
+    use_batched_gemm: bool = False,
 ) -> None:
     """NoPE sparse attention; caller owns all scratch buffers before capture.
 
-    Keep QK and PV on per-token GEMM geometries: changing the speculative batch
-    size must not silently select a different batched reduction order. QK stays
-    FP32 through softmax; reducing scores to FP16 can overflow for finite inputs.
+    Default to per-token GEMM geometries so speculative batch size does not
+    change the reduction order. Explicit prefill callers may batch the GEMMs.
+    QK stays FP32 through softmax to avoid overflowing finite inputs in FP16.
     """
     tokens, heads, dim = q.shape
     kv = kv.reshape(-1, dim)
@@ -127,13 +129,21 @@ def sparse_attention_fp16_gemm(
         BLOCK_K=8,
         num_warps=4,
     )
-    for token in range(tokens):
-        torch.mm(
-            q[token],
-            gathered_kv[token].t(),
+    if use_batched_gemm:
+        torch.bmm(
+            q,
+            gathered_kv.transpose(1, 2),
             out_dtype=torch.float32,
-            out=scores[token],
+            out=scores,
         )
+    else:
+        for token in range(tokens):
+            torch.mm(
+                q[token],
+                gathered_kv[token].t(),
+                out_dtype=torch.float32,
+                out=scores[token],
+            )
     _sparse_fp32_scores_softmax_kernel[(tokens, heads)](
         scores,
         indices,
@@ -147,5 +157,43 @@ def sparse_attention_fp16_gemm(
         BLOCK_K=triton.next_power_of_2(width),
         num_warps=8,
     )
-    for token in range(tokens):
-        torch.mm(probs[token], gathered_kv[token], out=out[token])
+    if use_batched_gemm:
+        torch.bmm(probs, gathered_kv, out=out)
+    else:
+        for token in range(tokens):
+            torch.mm(probs[token], gathered_kv[token], out=out[token])
+
+
+def sparse_attention_fp16_gemm_chunked(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    scale: float,
+    out: torch.Tensor,
+    gathered_kv: torch.Tensor,
+    scores: torch.Tensor,
+    probs: torch.Tensor,
+) -> None:
+    """Bound prefill scratch space while batching the per-query GEMMs.
+
+    Keep the default per-token geometry for speculative decode. The caller must
+    establish a single prefill request before selecting this batched route.
+    """
+    capacity = gathered_kv.shape[0]
+    assert capacity > 0 and out.shape == q.shape
+    for start in range(0, q.shape[0], capacity):
+        end = min(start + capacity, q.shape[0])
+        count = end - start
+        sparse_attention_fp16_gemm(
+            q[start:end],
+            kv,
+            indices[start:end],
+            lengths[start:end],
+            scale,
+            out[start:end],
+            gathered_kv[:count],
+            scores[:count],
+            probs[:count],
+            use_batched_gemm=True,
+        )

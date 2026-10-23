@@ -63,6 +63,20 @@ def sparse_fp16_gemm_max_tokens(
     return 0
 
 
+def can_use_sparse_fp16_gemm_prefill(
+    num_tokens: int,
+    num_reqs: int,
+    max_query_len: int,
+    max_decode_query_len: int,
+) -> bool:
+    """Exclude decode, mixed batches and padding using host-side metadata."""
+    return (
+        num_reqs == 1
+        and max_query_len == num_tokens
+        and max_query_len > max_decode_query_len
+    )
+
+
 def portable_sparse_mla_config_error(
     *,
     head_size: int,
