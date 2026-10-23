@@ -640,7 +640,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             self._glm5_hf_processor = proc
         return proc
 
-    def _processor_pixel_budget(self, proc) -> tuple[int, int]:
+    def _processor_pixel_budget(self, proc, *, modality: str) -> tuple[int, int]:
         from vllm.transformers_utils.processors.glm5next import (
             _pixel_budget,
             _reject_pixel_budget_kwargs,
@@ -648,6 +648,13 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
 
         kwargs = self.ctx.get_merged_mm_kwargs({})
         _reject_pixel_budget_kwargs(kwargs)
+        # ProcessorMixin applies modality-specific options after common kwargs.
+        # Profiling must use the same limits as the real image/video processor.
+        nested_key = f"{modality}s_kwargs"
+        nested_kwargs = kwargs.get(nested_key, {})
+        if not isinstance(nested_kwargs, Mapping):
+            raise TypeError(f"{nested_key} must be a mapping")
+        kwargs = {**kwargs, **nested_kwargs}
 
         return _pixel_budget(
             kwargs.get("min_image_tokens", proc.min_image_tokens),
@@ -658,19 +665,27 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         )
 
     def _get_image_max_pixels(self) -> int:
-        return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
+        return self._processor_pixel_budget(
+            self.get_hf_processor().image_processor, modality="image"
+        )[1]
 
     def _get_video_max_pixels(self) -> int:
-        return self._processor_pixel_budget(self.get_hf_processor().video_processor)[1]
+        return self._processor_pixel_budget(
+            self.get_hf_processor().video_processor, modality="video"
+        )[1]
 
     def get_num_video_tokens(
         self, *, image_width: int, image_height: int, num_frames: int
     ) -> int:
+        min_pixels, max_pixels = self._processor_pixel_budget(
+            self.get_hf_processor().video_processor, modality="video"
+        )
         _, tokens = self._get_vision_info(
             image_width=image_width,
             image_height=image_height,
             num_frames=num_frames,
-            max_image_pixels=self._get_video_max_pixels(),
+            min_image_pixels=min_pixels,
+            max_image_pixels=max_pixels,
         )
         return tokens
 
@@ -699,6 +714,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         image_height: int,
         num_frames: int = 16,
         do_resize: bool = True,
+        min_image_pixels: int | None = None,
         max_image_pixels: int = 28 * 28 * 2 * 30000,
     ) -> tuple[ImageSize, int]:
         """GLM-5.3-Flash canvas geometry for token budgeting and dummy inputs.
@@ -718,6 +734,10 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         temporal_patch_size = vision_config.temporal_patch_size
 
         image_processor = self.get_hf_processor().image_processor
+        if min_image_pixels is None:
+            min_image_pixels = self._processor_pixel_budget(
+                image_processor, modality="image"
+            )[0]
         factor = patch_size * merge_size * image_processor.patch_expand_factor
         # Keep the profiling search viable when the caller's budget is below
         # one aligned canvas of the requested duration.
@@ -732,9 +752,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
                 t_factor=temporal_patch_size,
                 h_factor=factor,
                 w_factor=factor,
-                min_pixels=min(
-                    self._processor_pixel_budget(image_processor)[0], max_image_pixels
-                ),
+                min_pixels=min(min_image_pixels, max_image_pixels),
                 max_pixels=max_image_pixels,
             )
             preprocessed_size = ImageSize(width=resized_width, height=resized_height)

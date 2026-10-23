@@ -47,6 +47,38 @@ def test_profile_matches_image_preprocessing(limit, size):
     assert not torch.cuda.is_initialized()
 
 
+@pytest.mark.parametrize("image_min,video_min", [(16, 64), (64, 16)])
+def test_separate_minimum_budgets_match_small_inputs(image_min, video_min):
+    info, image, video = processing_info(
+        {
+            "max_image_tokens": 1024,
+            "images_kwargs": {"min_image_tokens": image_min},
+            "videos_kwargs": {"min_image_tokens": video_min},
+        }
+    )
+    image_data = image(
+        Image.new("RGB", (7, 9)),
+        min_image_tokens=image_min,
+        max_image_tokens=1024,
+        return_tensors="pt",
+    )
+    video_data = video(
+        videos=torch.zeros(4, 3, 9, 7, dtype=torch.uint8),
+        min_image_tokens=video_min,
+        max_image_tokens=1024,
+        do_sample_frames=False,
+        return_tensors="pt",
+    )
+    assert (
+        info.get_num_image_tokens(image_width=7, image_height=9)
+        == int(image_data["image_grid_thw"].prod()) // 4
+    )
+    assert (
+        info.get_num_video_tokens(image_width=7, image_height=9, num_frames=4)
+        == int(video_data["video_grid_thw"].prod()) // 4
+    )
+
+
 @pytest.mark.parametrize("limit", [None, 256])
 def test_profile_matches_video_preprocessing(limit):
     overrides = {} if limit is None else {"max_image_tokens": limit}
@@ -67,6 +99,57 @@ def test_profile_matches_video_preprocessing(limit):
 def test_capped_video_budget_terminates_profile_frame_search():
     info, _, _ = processing_info({"max_image_tokens": 256})
     assert info._get_max_video_frames(8192) == 512
+
+
+@pytest.mark.parametrize(
+    "overrides,image_limit,video_limit",
+    [
+        (
+            {
+                "images_kwargs": {"max_image_tokens": 128},
+                "videos_kwargs": {"max_image_tokens": 1024},
+            },
+            128,
+            1024,
+        ),
+        (
+            {"max_image_tokens": 256, "videos_kwargs": {"max_image_tokens": 1024}},
+            256,
+            1024,
+        ),
+        (
+            {"max_image_tokens": 1024, "images_kwargs": {"max_image_tokens": 256}},
+            256,
+            1024,
+        ),
+    ],
+)
+def test_separate_modality_budgets_match_real_patch_counts(
+    overrides, image_limit, video_limit
+):
+    info, image, video = processing_info(overrides)
+    image_data = image(
+        Image.new("RGB", (768, 512)),
+        max_image_tokens=image_limit,
+        return_tensors="pt",
+    )
+    video_data = video(
+        videos=torch.zeros(4, 3, 512, 768, dtype=torch.uint8),
+        max_image_tokens=video_limit,
+        do_sample_frames=False,
+        return_tensors="pt",
+    )
+    assert (
+        info.get_num_image_tokens(image_width=768, image_height=512)
+        == int(image_data["image_grid_thw"].prod()) // 4
+    )
+    assert (
+        info.get_num_video_tokens(image_width=768, image_height=512, num_frames=4)
+        == int(video_data["video_grid_thw"].prod()) // 4
+    )
+    assert info._get_image_max_pixels() == image_limit * 1568
+    assert info._get_video_max_pixels() == video_limit * 1568
+    assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.parametrize(
