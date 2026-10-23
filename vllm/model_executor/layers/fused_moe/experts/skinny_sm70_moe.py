@@ -28,7 +28,7 @@ from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
     Nvfp4QuantizationEmulationTritonExperts,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
-from vllm.model_executor.layers.fused_moe.sm70.reduction import weighted_reduce_rows
+from vllm.model_executor.layers.fused_moe.sm70.reduction import _mtp_weighted_reduce
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
@@ -608,7 +608,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         top_k = topk_ids.size(1)
         if not 0 < top_k <= _CUDA_GRID_Y_LIMIT:
             raise ValueError("routing width exceeds the native CUDA grid-y limit")
-        bytes_per_token = top_k * (2 * (w1.size(1) + w2.size(1)) + 4 * w2.size(1))
+        bytes_per_token = top_k * 2 * (w1.size(1) + w2.size(1))
         chunk = min(_CUDA_GRID_Y_LIMIT // top_k, max(1, (128 << 20) // bytes_per_token))
         for start in range(0, hidden_states.size(0), chunk):
             end = start + chunk
@@ -736,13 +736,10 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             self._scale_mode,
             self._fragment_order,
         )
-        output.copy_(
-            weighted_reduce_rows(
-                y2.view(num_tokens, top_k, -1),
-                topk_weights,
-                output.dtype,
-            )
-        )
+        # One pass over the slot rows straight into the output (the reduction
+        # moe_unpermute computes) instead of writing and re-reading two FP32
+        # copies of y2.
+        _mtp_weighted_reduce(y2, topk_weights, output)
 
 
 class Mxfp4SkinnySm70Experts(Nvfp4SkinnySm70Experts):
