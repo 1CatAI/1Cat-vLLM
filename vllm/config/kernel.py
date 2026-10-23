@@ -854,6 +854,10 @@ class KernelConfig:
         and Mamba layers."""
         return self.sm70_gdn_spec_replay
 
+    sm70_round_cost_diagnostics: bool = False
+    """Record bounded decode routing histories for a byte/instruction cost
+    ledger. Extra diagnostic kernels invalidate latency measurements."""
+
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
