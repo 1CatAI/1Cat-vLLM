@@ -1831,16 +1831,23 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # different hidden size that cannot be aligned by using different block size
+    # Non-integral page sizes use physical padding, preserving logical blocks.
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": new_sliding_window_spec(head_size=96),
     }
 
-    with pytest.raises(NotImplementedError):
-        get_kv_cache_configs(
-            vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
-        )[0]
+    padded_config = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
+    )[0]
+    assert {
+        group.kv_cache_spec.page_size_bytes for group in padded_config.kv_cache_groups
+    } == {kv_cache_specs_hybrid["layer_2"].page_size_bytes}
+    assert all(
+        group.kv_cache_spec.block_size
+        == kv_cache_specs_hybrid[group.layer_names[0]].block_size
+        for group in padded_config.kv_cache_groups
+    )
 
     # Test num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = 16

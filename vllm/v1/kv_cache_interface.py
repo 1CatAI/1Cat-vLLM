@@ -168,6 +168,22 @@ class AttentionSpec(KVCacheSpec):
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
 
+    def layout_cache_dtype(self, configured_dtype: str) -> str:
+        """Bind carrier shape to this spec's declared quantization layout.
+
+        Target and draft share an allocator but may use different codecs. This
+        compatibility spelling is only for backend shape/block-dim APIs; each
+        attention implementation retains its independently bound reader codec.
+        """
+        if get_kv_quant_mode(configured_dtype) == self.kv_quant_mode:
+            return configured_dtype
+        return {
+            KVQuantMode.NONE: "auto",
+            KVQuantMode.FP8_PER_TENSOR: "fp8",
+            KVQuantMode.INT8_PER_TOKEN_HEAD: "int8_per_token_head",
+            KVQuantMode.FP8_PER_TOKEN_HEAD: "fp8_per_token_head",
+        }[self.kv_quant_mode]
+
     @property
     def page_size_bytes(self) -> int:
         real_page_size = self.real_page_size_bytes
