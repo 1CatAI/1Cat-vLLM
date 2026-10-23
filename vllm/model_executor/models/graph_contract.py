@@ -33,9 +33,13 @@ class GraphModelContract:
         short = self.index_topk * min(self.compress_ratios)
         if short <= 0 or self.max_model_len <= short:
             return ()
-        return tuple(
+        buckets = tuple(
             short * m for m in (1, 2, 8, 32, 64) if short * m < self.max_model_len
         )
+        # Above the largest bucket a decode graph would be bound by the model's
+        # maximum length, which keeps the indexer off its cuBLAS decode route;
+        # a last bucket at the maximum length keeps it on.
+        return (*buckets, self.max_model_len)
 
 
 def model_graph_contract(cfg):
