@@ -916,7 +916,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "paged_prefill_attention_sm75(Tensor(a!) out, Tensor q, Tensor k_cache, "
       "Tensor v_cache, Tensor cu_seqlens_q, Tensor seqused_k, "
-      "Tensor block_table, int max_seqlen_q, float softmax_scale) -> ()");
+      "Tensor block_table, int max_seqlen_q, float softmax_scale, "
+      "int num_kv_splits) -> ()");
   ops.impl("paged_prefill_attention_sm75", torch::kCUDA,
            &paged_prefill_attention_sm75);
 

@@ -19,6 +19,12 @@
 // token r / group, head kv_head * group + r % group), so every tile serves
 // all of them. Online softmax as in FlashAttention-2: fp32 scores and
 // accumulators, probabilities rounded to fp16 for the P.V product.
+//
+// One CTA fills an SM (64 KB of shared memory), so a grid of a few waves
+// loses up to a whole wave to its last one: 150 CTAs on 72 SMs take three.
+// Splitting each CTA's keys into ranges (split-KV) evens the waves out; the
+// splits write unnormalized fp32 partial outputs with their row maxima and
+// sums, and a second kernel merges them by log-sum-exp.
 
 #include <torch/all.h>
 
@@ -99,6 +105,15 @@ struct TileFetch {
   }
 };
 
+// Split-KV partials: unnormalized outputs [split][token][head][256] and the
+// row maximum (log2 units) and sum [split][token][head][2].
+struct Partials {
+  float* o;
+  float2* ml;
+  int heads;
+  int64_t split_stride;  // tokens * heads
+};
+
 template <int kPageSize>
 __global__ void __launch_bounds__(kThreads, 1) paged_prefill_attention_kernel(
     const half* __restrict__ q, const half* __restrict__ k_cache,
@@ -107,11 +122,13 @@ __global__ void __launch_bounds__(kThreads, 1) paged_prefill_attention_kernel(
     const int* __restrict__ block_table, int block_table_stride,
     int64_t q_token_stride, int64_t q_head_stride, int64_t out_token_stride,
     int64_t out_head_stride, int cache_block_stride, int cache_slot_stride,
-    int cache_head_stride, int group, float scale_log2) {
+    int cache_head_stride, int group, float scale_log2, int num_splits,
+    Partials partials) {
   extern __shared__ __align__(16) unsigned char smem[];
   uint4* stages = reinterpret_cast<uint4*>(smem);
 
-  const int batch = blockIdx.z, kv_head = blockIdx.y;
+  const int batch = blockIdx.z / num_splits, split = blockIdx.z % num_splits;
+  const int kv_head = blockIdx.y;
   const int q_begin = cu_seqlens_q[batch];
   const int q_len = cu_seqlens_q[batch + 1] - q_begin;
   const int rows = q_len * group;
@@ -177,12 +194,17 @@ __global__ void __launch_bounds__(kThreads, 1) paged_prefill_attention_kernel(
   const int kv_end = min(seqlen_k, context + last_row / group + 1);
   // Keys up to the block's first query position need no causal mask.
   const int unmasked_end = context + row0 / group + 1;
+  // This split's whole key tiles of the CTA's range [0, kv_end).
+  const int tiles = (kv_end + kBlockN - 1) / kBlockN;
+  const int split_tiles = (tiles + num_splits - 1) / num_splits;
+  const int k_begin = split * split_tiles * kBlockN;
+  const int k_end = min(kv_end, k_begin + split_tiles * kBlockN);
 
   __syncthreads();  // Q fragments read before tile 0 overwrites the stage
 #pragma unroll
   for (int s = 0; s < kSlices; s++) {
     uint4 k, v;
-    fetch.load(0, s, k, v);
+    fetch.load(k_begin, s, k, v);
     fetch.store(stages, s, k, v);
   }
   __syncthreads();
@@ -199,11 +221,11 @@ __global__ void __launch_bounds__(kThreads, 1) paged_prefill_attention_kernel(
   const int s_row = ((lane >> 4) * 8) + (lane & 7), s_chunk = (lane >> 3) & 1;
   const int v_row = lane & 7, v_chunk = lane >> 3;
 
-  for (int j0 = 0, stage = 0; j0 < kv_end; j0 += kBlockN, stage ^= 1) {
+  for (int j0 = k_begin, stage = 0; j0 < k_end; j0 += kBlockN, stage ^= 1) {
     const uint4* k_tile = stages + stage * kStageChunks;
     const uint4* v_tile = k_tile + kTileChunks;
     uint4* next = stages + (stage ^ 1) * kStageChunks;
-    const bool prefetch = j0 + kBlockN < kv_end;
+    const bool prefetch = j0 + kBlockN < k_end;
     uint4 pk[2], pv[2];
     if (prefetch) {
 #pragma unroll
@@ -323,15 +345,79 @@ __global__ void __launch_bounds__(kThreads, 1) paged_prefill_attention_kernel(
     if (qpos[h] >= 0) {
       const int row = row0 + warp * 16 + (lane >> 2) + 8 * h;
       const int token = row / group, head = kv_head * group + row % group;
-      half* dst = out + (int64_t)(q_begin + token) * out_token_stride +
-                  (int64_t)head * out_head_stride + 2 * quad;
-      const float inv = 1.f / l_run[h];
+      if (num_splits == 1) {
+        half* dst = out + (int64_t)(q_begin + token) * out_token_stride +
+                    (int64_t)head * out_head_stride + 2 * quad;
+        const float inv = 1.f / l_run[h];
 #pragma unroll
-      for (int dn = 0; dn < kChunks; dn++)
-        *reinterpret_cast<half2*>(dst + 8 * dn) =
-            __floats2half2_rn(o[dn][2 * h] * inv, o[dn][2 * h + 1] * inv);
+        for (int dn = 0; dn < kChunks; dn++)
+          *reinterpret_cast<half2*>(dst + 8 * dn) =
+              __floats2half2_rn(o[dn][2 * h] * inv, o[dn][2 * h + 1] * inv);
+      } else {
+        // A split without visible keys leaves m = -inf, l = 0 and o = 0.
+        const int64_t index = split * partials.split_stride +
+                              (int64_t)(q_begin + token) * partials.heads +
+                              head;
+        float* dst = partials.o + index * kHeadDim + 2 * quad;
+#pragma unroll
+        for (int dn = 0; dn < kChunks; dn++)
+          *reinterpret_cast<float2*>(dst + 8 * dn) =
+              make_float2(o[dn][2 * h], o[dn][2 * h + 1]);
+        if (quad == 0) partials.ml[index] = make_float2(m_run[h], l_run[h]);
+      }
     }
   }
+}
+
+// out[token][head] = sum_s 2^(m_s - M) o_s / sum_s 2^(m_s - M) l_s, M the
+// largest m_s; split 0 always holds key 0, so M is finite.
+__global__ void __launch_bounds__(64)
+    merge_splits_kernel(const float4* __restrict__ o,
+                        const float2* __restrict__ ml, half* __restrict__ out,
+                        int heads, int64_t split_stride, int num_splits,
+                        int64_t out_token_stride, int64_t out_head_stride) {
+  const int64_t index = blockIdx.x;  // token * heads + head
+  const int token = static_cast<int>(index / heads);
+  const int head = static_cast<int>(index % heads);
+  float m_max = -INFINITY;
+  for (int s = 0; s < num_splits; s++)
+    m_max = fmaxf(m_max, ml[s * split_stride + index].x);
+  float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+  float l_sum = 0.f;
+  for (int s = 0; s < num_splits; s++) {
+    const float2 m_l = ml[s * split_stride + index];
+    const float w = exp2f(m_l.x - m_max);  // exp2(-inf) = 0 for empty splits
+    l_sum += w * m_l.y;
+    const float4 v =
+        o[(s * split_stride + index) * (kHeadDim / 4) + threadIdx.x];
+    acc.x += w * v.x;
+    acc.y += w * v.y;
+    acc.z += w * v.z;
+    acc.w += w * v.w;
+  }
+  const float inv = 1.f / l_sum;
+  half2* dst = reinterpret_cast<half2*>(out + token * out_token_stride +
+                                        head * out_head_stride) +
+               2 * threadIdx.x;
+  dst[0] = __floats2half2_rn(acc.x * inv, acc.y * inv);
+  dst[1] = __floats2half2_rn(acc.z * inv, acc.w * inv);
+}
+
+constexpr int kMaxSplits = 4;
+
+// The split count that finishes the CTAs in the fewest full-CTA times: with
+// s splits a CTA takes 1/s of the time, and ceil(ctas * s / slots) waves run.
+int splits_by_waves(int64_t ctas, int64_t slots) {
+  int best = 1;
+  double best_time = static_cast<double>((ctas + slots - 1) / slots);
+  for (int s = 2; s <= kMaxSplits; s++) {
+    const double time = static_cast<double>((ctas * s + slots - 1) / slots) / s;
+    if (time < best_time) {
+      best = s;
+      best_time = time;
+    }
+  }
+  return best;
 }
 
 }  // namespace
@@ -341,7 +427,8 @@ void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
                                   torch::Tensor cu_seqlens_q,
                                   torch::Tensor seqused_k,
                                   torch::Tensor block_table,
-                                  int64_t max_seqlen_q, double softmax_scale) {
+                                  int64_t max_seqlen_q, double softmax_scale,
+                                  int64_t num_kv_splits) {
   const c10::cuda::CUDAGuard device_guard(q.device());
   const cudaDeviceProp* props = at::cuda::getDeviceProperties(q.get_device());
   TORCH_CHECK(props->major * 10 + props->minor >= 75,
@@ -375,14 +462,37 @@ void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
   TORCH_CHECK(
       max_offset <= INT32_MAX,
       "32-bit cache offsets: the cache view spans 2^31 elements or more");
+  TORCH_CHECK(num_kv_splits >= 0 && num_kv_splits <= kMaxSplits,
+              "num_kv_splits must be 0 (by waves) to ", kMaxSplits);
   const int64_t group = heads / kv_heads;
-  const dim3 grid((unsigned)((max_seqlen_q * group + kBlockM - 1) / kBlockM),
-                  (unsigned)kv_heads, (unsigned)batch);
+  const int64_t ctas =
+      (max_seqlen_q * group + kBlockM - 1) / kBlockM * kv_heads * batch;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  int num_splits = 1;
+  Partials partials{nullptr, nullptr, (int)heads, q.size(0) * heads};
+  torch::Tensor partial_o, partial_ml;
   // Both stages take Turing's whole 64 KB of shared memory.
   auto launch = [&](auto kernel) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    kernel<<<grid, kThreads, kSmemBytes, at::cuda::getCurrentCUDAStream()>>>(
+    int occupancy = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occupancy, kernel, kThreads, kSmemBytes));
+    num_splits = num_kv_splits > 0
+                     ? static_cast<int>(num_kv_splits)
+                     : splits_by_waves(ctas, props->multiProcessorCount *
+                                                 (int64_t)occupancy);
+    if (num_splits > 1) {
+      partial_o = torch::empty({num_splits, q.size(0), heads, kHeadDim},
+                               q.options().dtype(torch::kFloat));
+      partial_ml = torch::empty({num_splits, q.size(0), heads, 2},
+                                q.options().dtype(torch::kFloat));
+      partials.o = partial_o.data_ptr<float>();
+      partials.ml = reinterpret_cast<float2*>(partial_ml.data_ptr<float>());
+    }
+    const dim3 grid((unsigned)((max_seqlen_q * group + kBlockM - 1) / kBlockM),
+                    (unsigned)kv_heads, (unsigned)(batch * num_splits));
+    kernel<<<grid, kThreads, kSmemBytes, stream>>>(
         reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(k_cache.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(v_cache.data_ptr<at::Half>()),
@@ -391,7 +501,7 @@ void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
         block_table.data_ptr<int>(), (int)block_table.stride(0), q.stride(0),
         q.stride(1), out.stride(0), out.stride(1), (int)k_cache.stride(0),
         (int)k_cache.stride(1), (int)k_cache.stride(2), (int)group,
-        (float)(softmax_scale * M_LOG2E));
+        (float)(softmax_scale * M_LOG2E), num_splits, partials);
   };
   switch (k_cache.size(1)) {
     case 16:
@@ -410,4 +520,12 @@ void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
                   k_cache.size(1));
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (num_splits > 1 && q.size(0) > 0) {
+    merge_splits_kernel<<<(unsigned)(q.size(0) * heads), kHeadDim / 4, 0,
+                          stream>>>(
+        reinterpret_cast<const float4*>(partials.o), partials.ml,
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()), (int)heads,
+        partials.split_stride, num_splits, out.stride(0), out.stride(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
