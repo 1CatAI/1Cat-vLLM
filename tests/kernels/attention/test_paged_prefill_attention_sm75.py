@@ -77,7 +77,12 @@ def _reference(q, key_cache, value_cache, table, q_lens, kv_lens, scale):
         ((200, 64), (1000, 64), 16, 24, 4),
     ],
 )
-def test_matches_the_fp32_reference(q_lens, kv_lens, page_size, heads, kv_heads):
+# 0 picks the split count by waves; 2 and 4 force split-KV with its merge,
+# including splits without visible keys (short contexts).
+@pytest.mark.parametrize("num_kv_splits", [0, 1, 2, 4])
+def test_matches_the_fp32_reference(
+    q_lens, kv_lens, page_size, heads, kv_heads, num_kv_splits
+):
     device = _turing_device()
     generator = torch.Generator(device=device).manual_seed(0)
     key_cache, value_cache, table = _paged_cache(
@@ -113,6 +118,7 @@ def test_matches_the_fp32_reference(q_lens, kv_lens, page_size, heads, kv_heads)
         table,
         max(q_lens),
         scale,
+        num_kv_splits,
     )
 
     reference = _reference(q, key_cache, value_cache, table, q_lens, kv_lens, scale)

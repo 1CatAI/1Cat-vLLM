@@ -897,6 +897,7 @@ class FlashAttentionImpl(AttentionImpl):
                     block_table,
                     max_seqlen_q,
                     self.scale,
+                    0,  # split-KV count by the waves of this device
                 )
                 return output
             else:
