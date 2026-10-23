@@ -537,6 +537,32 @@ _ORIGINAL_MOE_PREFILL_RANGES = {
 }
 
 
+def original_moe_prefill_block_size(
+    source_types: tuple[int, int, int],
+    hidden_size: int,
+    intermediate_size: int,
+    experts: int,
+    top_k: int,
+    dtype: torch.dtype,
+    compute_capability: int | None,
+) -> int:
+    """Shared route alignment for measured original-bank prefill layouts.
+
+    Types are gate/up/down. Admission does not change the existing MMQ row
+    bounds: the executor must require all three prepared MMQ capabilities to
+    admit the batch. In particular, decode and MMVQ-sized tails keep their
+    original activation quantization and accumulation order.
+    """
+    if (
+        compute_capability in (70, 86, 89)
+        and dtype == torch.float16
+        and source_types == (21, 21, 23)
+        and (hidden_size, intermediate_size, experts, top_k) == (4096, 2048, 288, 8)
+    ):
+        return 16
+    return 0
+
+
 def original_moe_prefill_capability(
     source_type: int,
     k: int,

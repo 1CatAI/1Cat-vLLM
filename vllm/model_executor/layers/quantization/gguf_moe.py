@@ -16,6 +16,7 @@ from vllm.model_executor.kernels.gguf import (
     admit_moe_fallback,
     decoder_family,
     moe_mmq_supported,
+    original_moe_prefill_block_size,
     original_moe_prefill_capability,
 )
 from vllm.model_executor.layers.fused_moe import (
@@ -379,6 +380,16 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 "shape": list(weight.shape),
                 "activation_padding": list(self.input_padding.get(shard, (0, 0))),
             }
+        self.prefill_block_size = original_moe_prefill_block_size(
+            (self.weight_types["w1"], self.weight_types["w3"], self.weight_types["w2"]),
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_experts,
+            getattr(layer, "top_k", 10),
+            self.params_dtype,
+            device_capability.to_int() if device_capability is not None else None,
+        )
+        self.native_admission["prefill_block_size"] = self.prefill_block_size
         self.dp4a_admitted = bool(
             self.small_m_dp4a
             and self.params_dtype == torch.float16
@@ -480,29 +491,67 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         if cache is not None:
             w1, w3, w2, ids = cache.prefill(self.cache_layer, ids)
         native = torch.ops._C_gguf
+        alignment = None
+        block_size = getattr(self, "prefill_block_size", 0)
+        if block_size and cache is None and layer.expert_map is None:
+            # Reuse one GPU route plan across all projections. Requiring the
+            # original per-projection bounds preserves MMVQ tails and decode.
+            caps = self.prefill_capabilities
+            if all(
+                caps[shard].reason is None
+                and caps[shard].operator == "ggml_moe_mmq"
+                and caps[shard].supports_m(tokens * top_k if shard == "w2" else tokens)
+                for shard in ("w1", "w3", "w2")
+            ):
+                from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+                    moe_align_block_size,
+                )
 
-        def projection(shard):
+                alignment = moe_align_block_size(
+                    ids, block_size, self.num_experts, pad_sorted_ids=True
+                )
+
+        def projection(shard, inputs, weight, rows, routes, count):
+            if alignment is not None:
+                sorted_ids, expert_ids, padded_count = alignment
+                return native.ggml_moe_mmq(
+                    inputs,
+                    weight,
+                    sorted_ids,
+                    self.weight_types[shard],
+                    rows,
+                    routes,
+                    count,
+                    expert_ids,
+                    padded_count,
+                )
             capability = self.projection_capabilities[shard]
             prefill = getattr(self, "prefill_capabilities", {}).get(shard)
             m = tokens * top_k if shard == "w2" else tokens
             if prefill is not None and prefill.reason is None and prefill.supports_m(m):
                 capability = prefill
-            return getattr(native, capability.operator)
+            return getattr(native, capability.operator)(
+                inputs,
+                weight,
+                ids.reshape(-1, 1) if shard == "w2" else ids,
+                self.weight_types[shard],
+                rows,
+                routes,
+                count,
+            )
 
-        gate = projection("w1")(
+        gate = projection(
+            "w1",
             x.contiguous(),
             w1,
-            ids,
-            self.weight_types["w1"],
             self.intermediate_size,
             top_k,
             tokens,
         )
-        up = projection("w3")(
+        up = projection(
+            "w3",
             x.contiguous(),
             w3,
-            ids,
-            self.weight_types["w3"],
             self.intermediate_size,
             top_k,
             tokens,
@@ -522,12 +571,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             hidden = torch.nn.functional.pad(
                 hidden, (left, physical_k - left - self.intermediate_size)
             )
-        routed_ids = ids.reshape(-1, 1)
-        down = projection("w2")(
+        down = projection(
+            "w2",
             hidden.contiguous(),
             w2,
-            routed_ids,
-            self.weight_types["w2"],
             self.hidden_size,
             1,
             tokens * top_k,
