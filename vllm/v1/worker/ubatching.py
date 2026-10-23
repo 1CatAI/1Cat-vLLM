@@ -17,6 +17,10 @@ _NUM_UBATCHES: int = 2
 _CURRENT_CONTEXTS: list["UBatchContext | None"] = []
 
 
+class MicroBatchAborted(RuntimeError):
+    """Raised in a micro-batch thread because another micro-batch failed."""
+
+
 class UBatchContext:
     """
     Context manager for micro-batching synchronization using threading events.
@@ -33,7 +37,9 @@ class UBatchContext:
         cpu_signal_event: threading.Event,
         gpu_comm_done_event: torch.Event,
         gpu_compute_done_event: torch.Event,
+        abort_event: threading.Event,
         schedule: str = "default",
+        overlap_collectives: bool = False,
     ):
         self.id = id
         self.comm_stream = comm_stream
@@ -45,7 +51,12 @@ class UBatchContext:
         self.current_stream = compute_stream
         self.gpu_comm_done_event = gpu_comm_done_event
         self.gpu_compute_done_event = gpu_compute_done_event
+        # Shared by all micro-batches of one run: a failing micro-batch sets it
+        # before waking the next one, which would otherwise wait forever for a
+        # thread that is gone.
+        self.abort_event = abort_event
         self.schedule = schedule
+        self.overlap_collectives = overlap_collectives
         self.recv_hook = None
 
     def __enter__(self):
@@ -57,6 +68,7 @@ class UBatchContext:
 
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
+        self._raise_if_aborted()
         self._restore_context()
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
@@ -66,7 +78,10 @@ class UBatchContext:
         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _CURRENT_CONTEXTS[self.id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
-        self.maybe_run_recv_hook()
+        if exc_type is not None:
+            self.abort_event.set()
+        else:
+            self.maybe_run_recv_hook()
         self.cpu_signal_event.set()
         self.cpu_wait_event.clear()
         return False
@@ -99,10 +114,18 @@ class UBatchContext:
         assert current_stream() == self.current_stream
         assert not self.cpu_wait_event.is_set()
 
+        self._raise_if_aborted()
         self.cpu_signal_event.set()
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
+        self._raise_if_aborted()
         self._restore_context()
+
+    def _raise_if_aborted(self):
+        if self.abort_event.is_set():
+            raise MicroBatchAborted(
+                f"micro-batch {self.id} stops because another micro-batch failed"
+            )
 
     def switch_to_comm(self):
         self.update_stream(self.comm_stream)
@@ -146,6 +169,16 @@ class UBatchContext:
         self.update_stream(self.compute_stream)
         self._wait_comm_done()
 
+    def run_collective_overlapped(self, collective, *args) -> torch.Tensor:
+        """Run this micro-batch's collective on the comm stream while the other
+        micro-batch computes; return once the result is ready for compute."""
+        self.switch_to_comm_sync()
+        output = collective(*args)
+        # Allocated on the comm stream, consumed and freed on the compute stream.
+        output.record_stream(self.compute_stream)
+        self.yield_and_switch_from_comm_to_compute()
+        return output
+
 
 def dbo_enabled() -> bool:
     return len(_THREAD_ID_TO_CONTEXT) > 0
@@ -183,6 +216,37 @@ dbo_switch_to_compute_sync = _register_ubatch_function(
 )
 
 
+def dbo_overlaps_collectives() -> bool:
+    ctx_idx = _THREAD_ID_TO_CONTEXT.get(threading.get_ident())
+    if ctx_idx is None:
+        return False
+    ctx = _CURRENT_CONTEXTS[ctx_idx]
+    return ctx is not None and ctx.overlap_collectives
+
+
+def dbo_run_collective_overlapped(collective, *args) -> torch.Tensor:
+    ctx = _CURRENT_CONTEXTS[_THREAD_ID_TO_CONTEXT[threading.get_ident()]]
+    assert ctx is not None and ctx.overlap_collectives
+    return ctx.run_collective_overlapped(collective, *args)
+
+
+def cat_ubatch_outputs(
+    sorted_results: list,
+) -> "torch.Tensor | tuple[torch.Tensor, ...]":
+    """Concatenate per-ubatch model outputs along the batch dim.
+
+    Most models return a single hidden-states tensor per ubatch. Target
+    models running with auxiliary output (e.g. EAGLE3 speculative decoding,
+    which collects aux hidden states for the drafter) return a tuple of
+    tensors instead. Fan out over tuple components so `torch.cat` sees
+    matching shapes and the caller receives the same structure the model
+    produced for a single ubatch (#40769).
+    """
+    if sorted_results and isinstance(sorted_results[0], tuple):
+        return tuple(torch.cat(parts, dim=0) for parts in zip(*sorted_results))
+    return torch.cat(sorted_results, dim=0)
+
+
 def dbo_register_recv_hook(recv_hook):
     if len(_THREAD_ID_TO_CONTEXT) > 0:
         ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
@@ -206,6 +270,7 @@ def make_ubatch_contexts(
     forward_contexts: list[ForwardContext],
     ready_barrier: threading.Barrier,
     schedule: str = "default",
+    overlap_collectives: bool = False,
 ) -> list[UBatchContext]:
     global _NUM_UBATCHES, _CURRENT_CONTEXTS
     assert num_micro_batches > 1, "num_micro_batches must be greater than 1"
@@ -219,6 +284,7 @@ def make_ubatch_contexts(
     Create a context manager for micro-batching synchronization.
     """
     cpu_events = [threading.Event() for _ in range(num_micro_batches)]
+    abort_event = threading.Event()
     gpu_comm_done_events = [torch.Event() for _ in range(num_micro_batches)]
     gpu_compute_done_events = [torch.Event() for _ in range(num_micro_batches)]
 
@@ -234,7 +300,9 @@ def make_ubatch_contexts(
             cpu_signal_event=cpu_events[(i + 1) % num_micro_batches],
             gpu_comm_done_event=gpu_comm_done_events[i],
             gpu_compute_done_event=gpu_compute_done_events[i],
+            abort_event=abort_event,
             schedule=schedule,
+            overlap_collectives=overlap_collectives,
         )
         ctxs.append(ctx)
 
