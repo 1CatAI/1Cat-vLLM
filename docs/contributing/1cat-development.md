@@ -6,6 +6,82 @@ owner. Use the component contracts for behavior, the
 declarations, and phase reports for historical evidence. Update the primary
 source of each fact and link to it from other documents.
 
+## Runtime acceptance contract
+
+This contract is required for changes to runtime behavior, model integration,
+dispatch, configuration or native loading/builds. Record it in the existing PR
+template and component tests; do not create a second capability registry.
+Documentation-only changes use the checks below. Reviewers must resolve missing
+evidence within the claimed scope before marking a runtime change ready.
+
+1. **Find the cause that determines the next change.** Reuse the reproducer and
+   existing profile; rank likely causes and critical-path benefit before tuning.
+   Each new experiment must distinguish hypotheses or decide implement, reject
+   or promote. Prefer the cheapest useful measurement, fix and rerun the failing
+   case. Stop disproven or immaterial candidates; broaden only for remaining
+   uncertainty. Record the conclusion in the existing worklog to avoid repeats.
+2. **Declare coverage.** Separate correctness support, accelerated subsets and
+   measured cases. Name affected device/model, dtype/layout, shape/context,
+   TP/EP/PP, speculation, graph and launch conditions. Distinguish live tokens,
+   compressed score columns, page capacity and graph padding; a 32K measurement
+   proves no other length.
+3. **Extend a family path.** Map new models to existing attention, MoE, linear
+   and GDN stages, providers and resource owners. Identify the missing capability
+   before adding code. Keep tiling/fusion behind the family selector; a new
+   provider needs an algorithm/layout/numerical reason and explicit bindings.
+   Do not copy a model's complete fast path or add another dispatcher/policy
+   store. Fewer files or one giant kernel does not establish a performance gain.
+4. **Separate admission, qualification and tuning.** Hardware/layout decides
+   executability, model/state evidence decides qualification, and measurements
+   choose among eligible implementations. Explain each shape restriction and
+   its fallback. Changed arithmetic/precision needs an explicit numerical and
+   quality contract under item 5, rather than a blanket exact-output veto.
+5. **Admit bounded numerical differences.** Bitwise tensor, logit or generated
+   token equality is not the default gate for floating-point changes. Choose
+   operation/dtype-aware error metrics and limits before candidate runs, plus a
+   paired task-quality allowance relative to a trusted baseline and its normal
+   variation. Bounded error with no material quality regression can qualify,
+   including documented precision changes. Keep memory/index/mask validity,
+   request isolation and state commit/rollback semantics strict. Check non-finite
+   values and recurrent/long-output drift; numerical state values use tolerances.
+   Use affected representative tasks to check correctness, instruction/format
+   adherence and repetition/EOS health. Fluency alone is insufficient; different
+   wording/tokens alone is not failure. Expand inconclusive comparisons only
+   enough to decide. Do not move limits after failure merely to pass; explicit
+   bit-exact API/storage contracts remain exact and numerical tests must state
+   their rationale. Update affected contracts/tests together when qualifying a
+   new arithmetic policy; historical bitwise-only rejection is not a quality test.
+6. **Define startup equivalence.** Equivalent effective inputs must resolve the
+   same computation/worker policy and hashes, with outputs/state satisfying the
+   same quality contract. Check affected defaults/overrides, CLI/`LLM`, legacy/
+   typed inputs, process initialization and warm/AOT reuse. Graph/eager may use
+   different kernels. Developer shells, import order or stale libraries must not
+   be hidden requirements; follow the configuration/native recipes below.
+7. **Make boundaries safe and visible.** Admitted inputs need a valid path;
+   outside specialization retain a qualified fallback and rejection reason, or
+   reject unsupported inputs at the earliest informed boundary. Never silently
+   change precision. Check endpoints, an interior case, valid threshold
+   neighbors, page/tile tails and capacity growth, including different live
+   lengths sharing padded capacity. Account for gaps between fast ranges.
+8. **Test affected interactions.** Start with cheap selector/config cases, then
+   minimal GPU computation/fallback cases. Cover affected mixed lengths, batch,
+   prefill/decode/verification, replay and state interactions. Startup changes
+   need paired fresh-process entries; packaging changes need the clean artifact.
+   Reuse still-applicable evidence. After the reproducer and affected regression
+   pass, stop unless changes, failures or unresolved risks justify more testing.
+   Keep regressions in their owning suite; avoid unrelated Cartesian sweeps.
+9. **Keep evidence distinct.** Separate selection, native execution, correctness
+   and performance. Record source/binary identities and match baseline/candidate
+   inputs/configuration except for the declared change. Measure the real path,
+   including conversion, allocation, synchronization and launch costs; separate
+   TTFT/prefill from pure decode. Model-reuse claims need a second compatible
+   model's evidence. Retain the separate 27B and 35B AWQ/FP8 migration targets.
+10. **Bound incomplete work.** Narrow optimizations may qualify with explicit
+    coverage and correct fallback. Record gaps, responsible component and next
+    decision in existing component/migration records. Missing evidence remains
+    unverified; default promotion or broader support claims need matching
+    evidence. Broad quality sweeps belong to qualification, not every edit.
+
 ## Choose the extension point
 
 The following recipes retain existing selectors, initialization order and
@@ -27,7 +103,8 @@ DDTree work is deferred; INT8-G64 is a design proposal, not a supported codec.
    do not duplicate an entire attention executor or MoE `apply`.
 4. Regenerate the architecture reference. Run the component's minimal tests,
    then writer/reader and capture/replay tests on the supported hardware for an
-   actual implementation. Compare deterministic outputs and state exactly.
+   actual implementation. Check encoded bytes/metadata against their contract;
+   qualify floating-point outputs/state under the acceptance contract above.
 
 ```bash
 .venv/bin/python -m pytest -q tests/v1/attention/test_kv_codecs.py \
