@@ -1244,12 +1244,20 @@ class Worker(WorkerBase):
             from vllm.profiler.scheduler import scheduler_step_annotation
 
             annotation += " scheduler=" + scheduler_step_annotation(scheduler_output)
+            if scheduler_output.total_num_scheduled_tokens:
+                self._profile_sample_annotation: str | None = "sample_" + annotation
         return self.profiler.annotate_context_manager(annotation)
 
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        if self.profiler and envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
+            annotation = getattr(self, "_profile_sample_annotation", None)
+            self._profile_sample_annotation = None
+            if annotation is not None:
+                with self.profiler.annotate_context_manager(annotation):
+                    return self.model_runner.sample_tokens(grammar_output)
         return self.model_runner.sample_tokens(grammar_output)
 
     def _use_sm70_static_pp_hidden_transfer(self, num_tokens: int) -> bool:
