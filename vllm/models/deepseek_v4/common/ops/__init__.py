@@ -19,6 +19,7 @@ from .save_partial_states import (
 from .sparse_decode_bmm import sparse_attn_decode_bmm, sparse_decode_bmm_workspace_specs
 from .sparse_prefill_bmm import (
     sparse_attn_prefill_bmm,
+    sparse_attn_prefill_tensor_cores,
     sparse_prefill_bmm_workspace_specs,
 )
 
@@ -37,6 +38,7 @@ __all__ = [
     "save_partial_states_to_ring",
     "sparse_attn_decode_bmm",
     "sparse_attn_prefill_bmm",
+    "sparse_attn_prefill_tensor_cores",
     "sparse_decode_bmm_workspace_specs",
     "sparse_prefill_bmm_workspace_specs",
     "stage_partial_states_from_ring",
