@@ -155,3 +155,30 @@ def test_static_pp_receive_buffer_skips_self_copy() -> None:
 
     assert hidden_states._version == version
     assert result["hidden_states"].data_ptr() == hidden_states.data_ptr()
+
+
+def test_only_eager_pp_sends_overlap_the_next_step() -> None:
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(max_cudagraph_capture_size=8)
+        )
+    )
+    # A graph-sized step sends graph outputs that the next replay overwrites.
+    assert not Worker._pp_send_overlaps(worker, 8, False)
+    assert Worker._pp_send_overlaps(worker, 9, False)
+    assert not Worker._pp_send_overlaps(worker, 9, True)
+    worker.vllm_config.compilation_config.max_cudagraph_capture_size = None
+    assert Worker._pp_send_overlaps(worker, 1, False)
+
+
+def test_waiting_pp_sends_waits_each_and_clears_them() -> None:
+    waited: list[int] = []
+    worker = SimpleNamespace(
+        _pp_send_work=[
+            SimpleNamespace(wait=lambda index=index: waited.append(index))
+            for index in range(2)
+        ]
+    )
+    Worker._wait_pp_sends(worker)
+    assert waited == [0, 1]
+    assert worker._pp_send_work == []
