@@ -9,11 +9,18 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.gguf_multimodal import (
+    GGUFMultiModalWeights,
+    native_gguf_language_model,
+    qualify_native_gguf_names,
+)
 from vllm.model_executor.model_loader.utils import (
+    get_model_architecture,
     initialize_model,
     process_weights_after_loading,
 )
@@ -46,10 +53,16 @@ class GGUFModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
+        extra = load_config.model_loader_extra_config or {}
+        if set(extra) - {"multimodal_safetensors"}:
             raise ValueError(
                 f"Model loader extra config is not supported for "
                 f"load format {load_config.load_format}"
+            )
+        self.multimodal_weights: GGUFMultiModalWeights | None = None
+        if "multimodal_safetensors" in extra:
+            self.multimodal_weights = GGUFMultiModalWeights(
+                extra["multimodal_safetensors"]
             )
 
     def _prepare_weights(self, model_config: ModelConfig):
@@ -379,7 +392,11 @@ class GGUFModelLoader(BaseModelLoader):
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
         is_multimodal = hasattr(model_config.hf_config, "vision_config")
-        if is_multimodal:
+        if (
+            is_multimodal
+            and getattr(self, "_native_adapter", None) is None
+            and getattr(self, "multimodal_weights", None) is None
+        ):
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
@@ -452,18 +469,66 @@ class GGUFModelLoader(BaseModelLoader):
             gguf_weights_map = self._get_gguf_weights_map(model_config)
             self._gguf_prepared_model_config = model_config
             self._gguf_prepared_weights_map = gguf_weights_map
+        adapter = getattr(self, "_native_adapter", None)
+        language_prefix = getattr(adapter, "language_model_prefix", "")
+        weight_prefix = ""
+        if (
+            language_prefix
+            and model is not None
+            and any(name == language_prefix for name, _ in model.named_modules())
+        ):
+            weight_prefix = language_prefix + "."
         if skip_weight is not None:
             gguf_weights_map = {
                 raw: name
                 for raw, name in gguf_weights_map.items()
-                if not skip_weight(name)
+                if not skip_weight(weight_prefix + name)
             }
-        yield from self._get_weights_iterator(
+        for name, tensor in self._get_weights_iterator(
             model_config, local_model_path, gguf_weights_map
-        )
+        ):
+            yield weight_prefix + name, tensor
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         model.load_weights(self.get_all_weights(model_config, model))
+
+    @staticmethod
+    def _start_load_sampler():
+        """Diagnostic (VLLM_GGUF_LOAD_PROFILE=1): sample the loading thread's
+        stack every 50 ms and log where the load time goes."""
+        import collections
+        import sys
+        import threading
+
+        if not envs.VLLM_GGUF_LOAD_PROFILE:
+            return None
+        target = threading.get_ident()
+        counts: collections.Counter[tuple[str, str]] = collections.Counter()
+        stop = threading.Event()
+
+        def run():
+            while not stop.wait(0.05):
+                frame = sys._current_frames().get(target)
+                seen = set()
+                while frame is not None:
+                    code = frame.f_code
+                    if "site-packages/torch" not in code.co_filename:
+                        key = (code.co_filename.split("vllm/")[-1], code.co_name)
+                        if key not in seen:
+                            seen.add(key)
+                            counts[key] += 1
+                    frame = frame.f_back
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+
+        def finish():
+            stop.set()
+            thread.join()
+            for (path, name), n in counts.most_common(40):
+                logger.info("load profile %6.1f s  %s:%s", n * 0.05, path, name)
+
+        return finish
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
@@ -476,9 +541,11 @@ class GGUFModelLoader(BaseModelLoader):
         self._gguf_prepared_weights_map = gguf_weights_map
         # we can only know if tie word embeddings after mapping weights
         gguf_files = self._get_all_gguf_files(local_model_path)
-        all_extra_names = []
+        all_extra_names = set(gguf_weights_map.values())
         for f in gguf_files:
-            all_extra_names.extend(get_gguf_extra_tensor_names(f, gguf_weights_map))
+            all_extra_names.intersection_update(
+                get_gguf_extra_tensor_names(f, gguf_weights_map)
+            )
         if "lm_head.weight" in all_extra_names:
             model_config.hf_config.update({"tie_word_embeddings": True})
 
@@ -487,6 +554,13 @@ class GGUFModelLoader(BaseModelLoader):
         )
         # filter out unquantized modules to skip
         adapter = getattr(self, "_native_adapter", None)
+        if adapter is not None:
+            adapter.packed_embeddings = (
+                getattr(
+                    vllm_config.kernel_config.sm70_gguf, "embedding_storage", "dense"
+                )
+                == "original"
+            )
         unquant_names = [
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()
@@ -498,32 +572,76 @@ class GGUFModelLoader(BaseModelLoader):
             quant_config = cast("GGUFConfig", vllm_config.quant_config)
             for raw, name in gguf_weights_map.items():
                 adapter.needs_dense_fallback(name, self._native_tensors[raw])
-            quant_config.fallback_reasons = adapter.fallback_reasons
-            quant_config.linear_layouts = adapter.linear_layouts(gguf_weights_map)
+            quant_config.fallback_reasons = qualify_native_gguf_names(
+                adapter.fallback_reasons, adapter
+            )
+            quant_config.linear_layouts = qualify_native_gguf_names(
+                adapter.linear_layouts(gguf_weights_map), adapter
+            )
             quant_config.native_expert_storage = getattr(
                 adapter, "native_expert_storage", False
             )
             quant_config.canonical_expert_storage = (
                 quant_config.native_expert_storage
                 and vllm_config.kernel_config.sm70_gguf.enabled
+                and getattr(
+                    vllm_config.kernel_config.sm70_gguf,
+                    "expert_storage",
+                    "canonical",
+                )
+                == "canonical"
                 and model_config.dtype == torch.float16
                 and current_platform.get_device_capability() == (7, 0)
                 and hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out")
             )
             adapter.canonical_expert_storage = quant_config.canonical_expert_storage
+            adapter.preserve_expert_blocks = quant_config.native_expert_storage
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
+        multimodal_weights = getattr(self, "multimodal_weights", None)
+        if multimodal_weights is not None:
+            model_class, _ = get_model_architecture(model_config)
+            unquant_names.extend(
+                multimodal_weights.unquantized_modules(
+                    getattr(model_class, "hf_to_vllm_mapper", None)
+                )
+            )
+        elif (
+            adapter is not None
+            and bool(getattr(adapter, "language_model_prefix", ""))
+            and model_config.multimodal_config is not None
+            and any(
+                model_config.multimodal_config.get_limit_per_prompt(modality) > 0
+                for modality in ("image", "video")
+            )
+        ):
+            raise ValueError(
+                "This native GGUF checkpoint contains language weights only; "
+                "provide multimodal_safetensors or enable language_model_only"
+            )
         logger.debug("GGUF unquantized modules: %s", unquant_names)
         if TYPE_CHECKING:
             vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(unquant_names)
 
         if adapter is not None:
+            language_prefix = getattr(adapter, "language_model_prefix", "")
+            transport_names = {
+                raw: f"{language_prefix}.{name}" if language_prefix else name
+                for raw, name in gguf_weights_map.items()
+            }
             from vllm.model_executor.kernels.ple.gguf_pinned import (
                 prepare_pinned_gguf_ple,
             )
 
-            prepare_pinned_gguf_ple(vllm_config, self._native_tensors, gguf_weights_map)
+            prepare_pinned_gguf_ple(vllm_config, self._native_tensors, transport_names)
+            from vllm.model_executor.kernels.ple.gguf_packed_result import (
+                prepare_packed_gguf_results,
+            )
+
+            prepare_packed_gguf_results(
+                vllm_config, self._native_tensors, transport_names
+            )
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
@@ -532,7 +650,39 @@ class GGUFModelLoader(BaseModelLoader):
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
                 )
             model._gguf_model_path = local_model_path
-            self.load_weights(model, model_config)
+            weight_model = native_gguf_language_model(model, adapter)
+            weight_model._gguf_model_path = local_model_path
+            if (
+                adapter is not None
+                and quant_config.native_expert_storage
+                and not quant_config.canonical_expert_storage
+                and vllm_config.kernel_config.sm70_gguf.expert_arena
+            ):
+                from vllm.model_executor.layers.quantization import (
+                    gguf_expert_storage,
+                )
+
+                adapter.bulk_experts = (
+                    gguf_expert_storage.prepare_original_expert_arena(
+                        weight_model,
+                        gguf_weights_map,
+                        self._native_tensors,
+                        target_device,
+                    )
+                    or {}
+                )
+                # Expert banks are read in the background while dense weights
+                # load, in the order the adapter yields them.
+                gguf_expert_storage.start_prefetch(
+                    adapter.bulk_experts, self._native_tensors
+                )
+            finish = self._start_load_sampler()
+            self.load_weights(weight_model, model_config)
+            if multimodal_weights is not None:
+                loaded = multimodal_weights.load(model)
+                logger.info("Loaded %d multimodal safetensors weights", len(loaded))
 
             process_weights_after_loading(model, model_config, target_device)
+            if finish is not None:
+                finish()
         return model

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // MTP4 PLE convolution: rollback, four dilated taps, SiLU, state commit.
+// One CTA row per speculative request; rows past the last request are zero.
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -20,8 +21,10 @@ __global__ void ple_conv(const half* x, State* state, const half* weight,
                          int64_t s1, int64_t s2) {
   int c = blockIdx.x * 128 + threadIdx.x;
   if (c >= hidden) return;
-  int sid = ids[0], count = starts[1] - starts[0],
-      rollback = sid ? max(0, min(4, accepted[0] - 1)) : 0;
+  const int j = blockIdx.y, first = starts[j];
+  const int count = max(0, min(5, min(starts[j + 1] - first, rows - first)));
+  const int sid = ids[j], rollback = sid ? max(0, min(4, accepted[j] - 1)) : 0;
+  x += static_cast<int64_t>(first) * hidden;
   half h[14];
 #pragma unroll
   for (int t = 0; t < 9; ++t)
@@ -40,11 +43,13 @@ __global__ void ple_conv(const half* x, State* state, const half* weight,
     for (int k = 0; k < 4; ++k)
       v = __fmaf_rn(__half2float(h[r + k * 3]), __half2float(w[k]), v);
     v = __half2float(__float2half_rn(v));
-    out[r * hidden + c] = r < count
-                              ? __float2half_rn(v / __fadd_rn(1.f, expf(-v)))
-                              : __float2half_rn(0.f);
+    if (r < count)
+      out[(first + r) * hidden + c] =
+          __float2half_rn(v / __fadd_rn(1.f, expf(-v)));
   }
-  for (int r = 5; r < rows; ++r) out[r * hidden + c] = __float2half_rn(0.f);
+  if (j == gridDim.y - 1)
+    for (int r = max(0, first + count); r < rows; ++r)
+      out[r * hidden + c] = __float2half_rn(0.f);
   if (sid) {
 #pragma unroll
     for (int t = 0; t < 13; ++t)
@@ -57,8 +62,8 @@ void ple_spec_conv(torch::Tensor output, torch::Tensor state, torch::Tensor x,
                    torch::Tensor weight, torch::Tensor ids,
                    torch::Tensor starts, torch::Tensor accepted) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 10240 &&
-                  (x.size(0) == 5 || x.size(0) == 10),
-              "SM70 PLE MTP4 requires M5/M10 and H10240");
+                  x.size(0) >= 1 && x.size(0) <= 40,
+              "SM70 PLE MTP4 requires M1..40 and H10240");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -72,8 +77,10 @@ void ple_spec_conv(torch::Tensor output, torch::Tensor state, torch::Tensor x,
     TORCH_CHECK(
         t.scalar_type() == at::kInt && t.dim() == 1 && t.is_contiguous(),
         "PLE MTP4 metadata must be contiguous int32 vectors");
-  TORCH_CHECK(ids.numel() == 1 && starts.numel() >= 2 && accepted.numel() >= 1,
-              "PLE MTP4 fast path requires one speculative request");
+  TORCH_CHECK(ids.numel() >= 1 && ids.numel() <= 8 &&
+                  starts.numel() >= ids.numel() + 1 &&
+                  accepted.numel() >= ids.numel(),
+              "PLE MTP4 fast path requires 1..8 speculative requests");
   TORCH_CHECK(state.dim() == 3 && state.size(0) > 0 && state.size(1) == 10240 &&
                   state.size(2) == 13 &&
                   (state.scalar_type() == at::kHalf ||
@@ -90,7 +97,7 @@ void ple_spec_conv(torch::Tensor output, torch::Tensor state, torch::Tensor x,
               "Invalid PLE MTP4 weight/output geometry");
   const auto stream = at::cuda::getCurrentCUDAStream();
 #define LAUNCH(T)                                                            \
-  ple_conv<T><<<80, 128, 0, stream>>>(                                       \
+  ple_conv<T><<<dim3(80, ids.numel()), 128, 0, stream>>>(                    \
       reinterpret_cast<const half*>(x.data_ptr()),                           \
       reinterpret_cast<T*>(state.data_ptr()),                                \
       reinterpret_cast<const half*>(weight.data_ptr()), ids.data_ptr<int>(), \

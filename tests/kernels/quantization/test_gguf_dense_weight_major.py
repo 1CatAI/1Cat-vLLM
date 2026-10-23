@@ -24,7 +24,7 @@ def _raw(source, n, k):
 @pytest.mark.parametrize(
     "sources", [(8,), (12,), (13,), (14,), (20,), (23,), (12, 14), (23, 14, 13)]
 )
-@pytest.mark.parametrize("m", [5, 20])
+@pytest.mark.parametrize("m", [5, 10, 15, 20, 24, 30, 40])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_actual_k_changed_graph(sources, m):
     if torch.cuda.get_device_capability() != (7, 0):

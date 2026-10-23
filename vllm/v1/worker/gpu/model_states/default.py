@@ -55,6 +55,9 @@ class DefaultModelState(ModelState):
                 encoder_cache=encoder_cache,
                 dtype=self.dtype,
                 device=self.device,
+                max_batch_size=getattr(
+                    self.model_config.multimodal_config, "mm_encoder_batch_size", 0
+                ),
             )
 
         self.rope_state = get_rope_state(

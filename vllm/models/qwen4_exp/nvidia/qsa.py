@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import ClassVar, cast
 
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -68,6 +70,127 @@ from ..common.qsa_cache import (
 from .indexer_qsa import QSAIndexer
 
 logger = init_logger(__name__)
+
+# Target-model QSA host histories in layer order (prefill staging prefetch).
+_TARGET_HOST_KV: list = []
+# Prefix staging prefetch: side stream, per-buffer "free" events (after the
+# last attention that read it) and pending prefetches by owner.
+_PREFETCH: dict = {"stream": None, "free": [None, None], "pending": {}}
+
+# Diagnostics: real prefill reader inputs (TP rank 0, one long-context step
+# per selected target layer) for offline kernel work. Off unless set.
+_QSA_DUMP_DIR = envs.VLLM_QSA_DUMP_DIR
+_QSA_DUMPED: set[int] = set()
+
+
+def _dump_prefill_inputs(
+    order,
+    query,
+    history,
+    scales,
+    indices,
+    table,
+    requests,
+    positions,
+    lengths,
+    output,
+    gate,
+):
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    if (
+        order in _QSA_DUMPED
+        or get_tensor_model_parallel_rank() != 0
+        or query.shape[0] < 8000
+        or int(lengths.max()) < 24000
+    ):
+        return
+    _QSA_DUMPED.add(order)
+    tensors = {
+        "query": query,
+        "history": history,
+        "scales": scales,
+        "indices": indices,
+        "table": table,
+        "requests": requests,
+        "positions": positions,
+        "lengths": lengths,
+        "output": output,
+        "gate": gate,
+    }
+    torch.save(
+        {k: v.detach().cpu() if v is not None else None for k, v in tensors.items()},
+        os.path.join(str(_QSA_DUMP_DIR), f"qsa_prefill_{order}.pt"),
+    )
+    logger.info("Dumped QSA prefill reader inputs of target layer %d.", order)
+
+
+def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens, stage_slots=2):
+    """After target layer `order`'s attention: mark its buffer free and stage
+    the next target layer's prefix pages into a released buffer."""
+    free = torch.cuda.Event()
+    free.record()
+    _PREFETCH["free"][order % stage_slots] = free
+    if order + 1 >= len(_TARGET_HOST_KV):
+        return
+    nxt = _TARGET_HOST_KV[order + 1]
+    if nxt.prefix_pages(plan, new_tokens) <= 0:
+        return
+    if _PREFETCH["stream"] is None:
+        _PREFETCH["stream"] = torch.cuda.Stream()
+    slot = (order + 1) % stage_slots
+    done, prefix = nxt.prefetch_prefix(
+        plan,
+        new_tokens,
+        capacity_tokens,
+        slot,
+        _PREFETCH["stream"],
+        _PREFETCH["free"][slot],
+    )
+    _PREFETCH["pending"][id(nxt)] = (plan, done, prefix)
+
+
+def _qsa_rope_cache_length(config, model_config) -> int:
+    """Bound fixed-frequency text RoPE by the engine's position limit."""
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    # Image MRoPE positions advance by at most one per token, so they stay
+    # below max_model_len like text; only video time indices can exceed it.
+    bounded = text_only or mm_config.get_limit_per_prompt("video") == 0
+    if not bounded or config.rope_parameters.get("rope_type", "default") != "default":
+        return config.max_position_embeddings
+    limit = min(config.max_position_embeddings, model_config.max_model_len)
+    if config.rope_parameters.get("mrope_section"):
+        # MRotaryEmbedding enlarges its cache 4x for video positions. Text and
+        # image positions stay below max_model_len, so a quarter covers every row;
+        # each row's values do not depend on the table length.
+        return -(-limit // 4)
+    return limit
+
+
+def _bound_scaled_rope_cache(rotary_emb, config, model_config) -> None:
+    """Trim a scaled (YaRN) RoPE table to the engine's position limit.
+
+    Scaled tables span original_max_position * factor rows, and MRoPE enlarges
+    that 4x for video time indices. Text and image positions stay below
+    max_model_len and each row depends only on its own position, so the
+    trimmed table is exact. Stock RoPE is already bounded at construction.
+    """
+    if config.rope_parameters.get("rope_type", "default") == "default":
+        return
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    if not (text_only or mm_config.get_limit_per_prompt("video") == 0):
+        return
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    # A draft serves its target's window; the scaled config spans it.
+    limit = max(
+        int(model_config.max_model_len),
+        int(getattr(model_config, "spec_target_max_model_len", None) or 0),
+        int(config.max_position_embeddings),
+    )
+    if cache is not None and cache.shape[0] > limit:
+        rotary_emb.cos_sin_cache = cache[:limit].clone()
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -296,6 +419,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 sequence_lengths,
                 output[:num_tokens],
                 output_gate,
+                attn_metadata,
             )
             return output
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
@@ -572,9 +696,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=_qsa_rope_cache_length(config, model_config),
             rope_parameters=config.rope_parameters,
         )
+        _bound_scaled_rope_cache(self.rotary_emb, config, model_config)
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
@@ -623,12 +748,34 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
         self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
+        self.host_kv_staging_rows = vllm_config.kernel_config.qsa_host_kv_staging_rows
+        # Verification batches (every concurrent request with its drafts)
+        # stay on the graph-capturable decode reader.
+        spec = vllm_config.speculative_config
+        self.host_kv_decode_rows = vllm_config.scheduler_config.max_num_seqs * (
+            1 + ((spec.num_speculative_tokens or 0) if spec is not None else 0)
+        )
+        self.host_kv_prefill_stage_tokens = (
+            vllm_config.kernel_config.qsa_host_kv_prefill_stage_tokens
+        )
+        self.host_kv_prefill_stage_slots = (
+            vllm_config.kernel_config.qsa_host_kv_prefill_stage_slots
+        )
         self.host_kv_device_reference = (
             vllm_config.kernel_config.qsa_host_kv_device_reference
         )
         # Cache binding runs under the target worker's config, also for draft
         # layers. Retain each owner's policy from model construction.
         self.host_kv_is_draft = vllm_config.is_speculative_draft
+        if self.host_kv_is_draft:
+            self.host_kv_hot_tokens = (
+                vllm_config.kernel_config.qsa_host_kv_draft_hot_tokens
+                or self.host_kv_hot_tokens
+            )
+        self.host_kv_hot_fp8 = (
+            not self.host_kv_is_draft
+            and vllm_config.kernel_config.qsa_host_kv_hot_dtype == "fp8_e4m3"
+        )
         self.host_kv_direct_device = vllm_config.kernel_config.sm70_qsa_device_history
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
@@ -806,16 +953,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.head_dim,
                 kv_cache.device,
                 hot_tokens=self.host_kv_hot_tokens,
+                rows=self.host_kv_staging_rows,
                 history=kv_cache,
                 width=self.indexer.output_width,
                 device_reference=self.host_kv_device_reference,
                 direct_device=self.host_kv_direct_device,
                 is_speculative_draft=self.host_kv_is_draft,
+                hot_fp8=self.host_kv_hot_fp8,
             )
+            if not self.host_kv_is_draft:
+                _TARGET_HOST_KV.append(self.host_kv)
             logger.info_once(
                 "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
                 "direct device M1..20/H6/D256=%s, fallback_reason=%s; "
-                "other shapes use protected FP16 hot pages and miss staging.",
+                "other shapes use protected hot pages and FP16 miss staging.",
                 "device_reference" if self.host_kv_device_reference else "host",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
@@ -823,25 +974,287 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.host_kv.device_history_reason,
             )
 
+    def _windowed_rows(
+        self,
+        windows,
+        query,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        output,
+        gate,
+        workspace,
+    ) -> None:
+        from .ops.device_kv_attention import PREFILL_ROWS
+        from .ops.host_kv import merge_windows
+
+        state = self.host_kv
+        rows = query.shape[0]
+        acc = torch.empty((rows, 6, 256), dtype=torch.float32, device=query.device)
+        part = torch.empty_like(acc)
+        acc_state = torch.empty((rows, 6, 2), dtype=torch.float32, device=query.device)
+        part_state = torch.empty_like(acc_state)
+        gate_rows = gate.view_as(query) if gate is not None else None
+        for number, plan in enumerate(windows):
+            history, scales, staged_table = state.stage_history(
+                table, lengths, self.host_kv_prefill_stage_tokens, plan
+            )
+            first = number == 0
+            if history.dtype == torch.uint8:
+                torch.ops.vllm_sm70_qsa_device.run_rows_window(
+                    query,
+                    history,
+                    scales,
+                    indices,
+                    staged_table,
+                    requests,
+                    positions,
+                    lengths,
+                    acc if first else part,
+                    acc_state if first else part_state,
+                    12,
+                )
+            else:
+                torch.ops.vllm_sm70_qsa_device.run_tiled_window(
+                    query,
+                    history,
+                    scales,
+                    indices,
+                    staged_table,
+                    requests,
+                    positions,
+                    lengths,
+                    *workspace,
+                    acc if first else part,
+                    acc_state if first else part_state,
+                    PREFILL_ROWS,
+                )
+            if not first:
+                last = number == len(windows) - 1
+                merge_windows(
+                    acc,
+                    acc_state,
+                    part,
+                    part_state,
+                    output if last else None,
+                    gate_rows if last else None,
+                )
+
     def host_kv_forward(
-        self, query, indices, table, requests, positions, lengths, output, gate
+        self,
+        query,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        output,
+        gate,
+        metadata=None,
     ) -> None:
         from .ops.host_kv_attention import host_qsa_attention
 
         state = self.host_kv
-        for start in range(0, query.shape[0], state.rows):
-            stop = min(start + state.rows, query.shape[0])
-            host_qsa_attention(
-                query[start:stop],
-                state,
-                indices[start:stop],
-                table,
-                requests[start:stop],
-                positions[start:stop],
-                lengths,
-                output[start:stop],
-                gate[start:stop] if gate is not None else None,
+        workspace = None
+        if (
+            self.host_kv_prefill_stage_tokens
+            and query.shape[0] > max(state.resolve_rows, self.host_kv_decode_rows)
+            and query.shape[1:] == (6, 256)
+            and indices.shape[1] <= state.width
+        ):
+            from .ops.device_kv_attention import (
+                PREFILL_ROWS,
+                prefill_history_workspace,
             )
+
+            workspace = prefill_history_workspace(state)
+        if workspace is not None:
+            # Prefill: one DMA of the whole history per layer, then device
+            # reads, instead of re-reading host history for every query row.
+            # Every layer of a step shares the block table: plan the copies
+            # (one host sync) once per step and geometry.
+            plans = getattr(metadata, "_qsa_stage_plans", None)
+            if plans is None:
+                plans = {}
+                if metadata is not None:
+                    metadata._qsa_stage_plans = plans
+            plan_key = (state.page_size, state.blocks, state.history.dtype)
+            if plan_key not in plans:
+                plans[plan_key] = state.stage_plan(
+                    table, lengths, self.host_kv_prefill_stage_tokens
+                )
+            plan = plans[plan_key]
+            # Target layers reuse the configured stage buffers. The previous
+            # layer staged this layer's prefix pages (written before this
+            # step) on a side stream; only the rest is copied here, after
+            # this step's writes.
+            order = (
+                _TARGET_HOST_KV.index(state)
+                if not self.host_kv_is_draft and state in _TARGET_HOST_KV
+                else -1
+            )
+            stage_slots = getattr(self, "host_kv_prefill_stage_slots", 2)
+            slot = order % stage_slots if order >= 0 else 0
+            staged_pages = 0
+            pending = _PREFETCH["pending"].pop(id(state), None)
+            if plan and pending is not None and pending[0] is plan:
+                torch.cuda.current_stream().wait_event(pending[1])
+                staged_pages = pending[2]
+            # One request: pages holding only this step's tokens are written
+            # into the stage buffer directly (write_staged) instead of being
+            # copied back from the host they were just written to.
+            new_kv = getattr(self, "_host_kv_new", None)
+            self._host_kv_new: tuple[torch.Tensor, ...] | None = None
+            upto = None
+            if plan and new_kv is not None and len(plan[4]) == 1:
+                old_tokens = max(0, plan[4][0] - query.shape[0])
+                upto = -(-old_tokens // state.page_size)
+            staged = plan and state.stage_history(
+                table,
+                lengths,
+                self.host_kv_prefill_stage_tokens,
+                plan,
+                slot=slot,
+                staged_pages=staged_pages,
+                upto=upto,
+            )
+            if staged is not None:
+                history, scales, staged_table = staged
+                if upto is not None and new_kv is not None:
+                    new_key, new_value, new_slots = new_kv
+                    state.write_staged(
+                        new_key, new_value, new_slots, plan, history, scales
+                    )
+                gate_rows = gate.view_as(query) if gate is not None else None
+                if history.dtype == torch.uint8:
+                    # One CTA per row over all its keys (tensor-core QK/PV,
+                    # 2 CTAs per SM): no partial workspace, no merge pass.
+                    torch.ops.vllm_sm70_qsa_device.run_rows(
+                        query,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate_rows,
+                        12,
+                    )
+                else:
+                    torch.ops.vllm_sm70_qsa_device.run_tiled(
+                        query,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate_rows,
+                        *workspace,
+                        PREFILL_ROWS,
+                    )
+                if order >= 0:
+                    _prefetch_next_prefix(
+                        order,
+                        plan,
+                        query.shape[0],
+                        self.host_kv_prefill_stage_tokens,
+                        stage_slots,
+                    )
+                if _QSA_DUMP_DIR and order in (0, 5, 11):
+                    _dump_prefill_inputs(
+                        order,
+                        query,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate,
+                    )
+                logger.info_once(
+                    "QSA prefill reads host history staged on device (draft=%s).",
+                    self.host_kv_is_draft,
+                )
+                return
+            if plan is None and query.shape[0] > 0:
+                # Longer than the stage buffer: stage it window by window and
+                # merge the windows' softmax states instead of falling back to
+                # per-row host reads.
+                window_key = plan_key + ("windows",)
+                if window_key not in plans:
+                    plans[window_key] = state.stage_window_plans(
+                        table, lengths, self.host_kv_prefill_stage_tokens
+                    )
+                windows = plans[window_key]
+                if windows:
+                    self._windowed_rows(
+                        windows,
+                        query,
+                        indices,
+                        table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate,
+                        workspace,
+                    )
+                    logger.info_once(
+                        "QSA prefill stages host history in %d windows.",
+                        len(windows),
+                    )
+                    return
+        if (
+            state.device_history_workspace is not None
+            and state.device_history_hot
+            and indices.shape[1] == state.width
+        ):
+            # The native reader needs no staging: one resolve and one launch per
+            # resolve_rows slice. Rows are independent, so slicing does not
+            # change the arithmetic.
+            step = state.resolve_rows
+            for start in range(0, query.shape[0], step):
+                stop = min(start + step, query.shape[0])
+                host_qsa_attention(
+                    query[start:stop],
+                    state,
+                    indices[start:stop],
+                    table,
+                    requests[start:stop],
+                    positions[start:stop],
+                    lengths,
+                    output[start:stop],
+                    gate[start:stop] if gate is not None else None,
+                )
+            return
+        # Preserve the default 32-row grouping and its arithmetic while
+        # subdividing only the shared host-miss staging allocation.
+        for base in range(0, query.shape[0], 32):
+            end = min(base + 32, query.shape[0])
+            for start in range(base, end, state.rows):
+                stop = min(start + state.rows, end)
+                host_qsa_attention(
+                    query[start:stop],
+                    state,
+                    indices[start:stop],
+                    table,
+                    requests[start:stop],
+                    positions[start:stop],
+                    lengths,
+                    output[start:stop],
+                    gate[start:stop] if gate is not None else None,
+                    launch_rows=end - base,
+                )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size, _, dcp_sharded = qsa_dcp_block_geometry(
@@ -976,6 +1389,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         if self.host_kv_enabled:
             self.host_kv.write(key, value, main_metadata.slot_mapping)
+            # A staged prefill writes these rows into its stage buffer too.
+            self._host_kv_new = (key, value, main_metadata.slot_mapping)
         elif query.dim() == 2:
             # SM70 prep: raw qkv rows -> normalized/rotated query + cache write.
             key_cache, value_cache = self.kv_cache.unbind(1)
@@ -1032,8 +1447,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         num_tokens = hidden_states.shape[0]
         side = getattr(self, "sm70_side_projection", None)
         indexer_input = hidden_states
-        if side is not None and 1 <= num_tokens <= 8:
+        if side is not None:
             # The indexer receives its projected q/k instead of hidden states.
+            # The opaque op fuses both projections for small batches; a
+            # Python bound here would be frozen for the whole compiled range.
             qkv, indexer_input = side(hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)

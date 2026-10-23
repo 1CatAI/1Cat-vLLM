@@ -7,6 +7,7 @@
 #include "src/turbomind/kernels/gemm/types.h"
 
 #include <cstdlib>
+#include <type_traits>
 
 namespace turbomind::gemm {
 
@@ -16,6 +17,19 @@ using S = cache_policy::Stream;
 using D = cache_policy::Default;
 
 namespace {
+
+// Reuse the existing decoder and indexed grouped layout, with the padded
+// activation supply already used by the quantized batch family.
+template <class Config>
+struct PaddedActivationConfig;
+
+template <class A, class TransformA, class U, class B, class TransformB,
+          class V, Order order_C, class Tc, Order raster_order, int group_axis>
+struct PaddedActivationConfig<Sm70_s884<A, TransformA, U, B, TransformB, V,
+                                      order_C, Tc, raster_order, group_axis>> {
+  using type = Sm70_s884<Operand_A_BatchPadded<half>, TransformA, U, B,
+                        TransformB, V, order_C, Tc, raster_order, group_axis>;
+};
 
 // Keep shape-specific small-N tactics out of prefill and unrelated CUDA graph
 // shapes.
@@ -43,6 +57,18 @@ class GgufLatticeNarrowKernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
     return desc.n <= 256 && (desc.m <= 64 || desc.m >= 512) &&
+           KernelImpl<Gemm>::is_feasible(desc);
+  }
+};
+
+// Prefill expert projections with N = 160 (gate/up) or 320 (interleaved
+// gate|up): N64 tiles avoid the N128 padding. Prefill-sized batches only, so
+// decode and verify descriptors keep their measured candidates.
+template <class Gemm>
+class GgufPrefillNarrowKernelImpl final : public KernelImpl<Gemm> {
+ public:
+  bool is_feasible(const GemmDesc& desc) const noexcept override {
+    return desc.n <= 512 && desc.n % 64 == 0 && desc.m >= 512 &&
            KernelImpl<Gemm>::is_feasible(desc);
   }
 };
@@ -103,6 +129,40 @@ void Registry::sm70_884_4() {
             GgufLatticeNarrowKernelImpl<typename Grouped16::Kernel>>());
       }
 
+      if constexpr (Type == 18 || Type == 21 || Type == 22) {
+        // Like the type-17 narrow candidate: CTA_K equals the group size
+        // (a K16 tile under a 32-value group produced wrong results).
+        using Prefill128x64 =
+            typename G::template Type<128, 64, Group, 2, 1, 1, D, D, 2, true,
+                                      1, Group, 64, 64>;
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Prefill128x64::Kernel>>());
+        // Ragged expert batches often have fewer than 128 rows. Halving M
+        // reduces both masked MMA work and the accumulator register demand;
+        // retain the existing quantization-group-sized K iteration.
+        using Prefill64x64 =
+            typename G::template Type<64, 64, Group, 2, 1, 1, D, D, 2, true,
+                                      1, Group, 64, 64>;
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Prefill64x64::Kernel>>());
+        using P = typename PaddedActivationConfig<G>::type;
+        // K32/K64 unpadded activation rows repeat shared-memory banks across
+        // the four distinct rows read by each eight-lane MMA load group.
+        // Eight half values of row padding spread those accesses apart.
+        // A full-width epilogue is required: N64 subtiles of an N128 CTA
+        // are smaller than the epilogue thread map's horizontal span.
+        // K64 also distinguishes these tactics in serialized tuning caches.
+        using Padded32x64K64 =
+            typename P::template Type<32, 64, 64, 2, 2, 1, D, D, 2, true,
+                                      1, Group, 32, 64>;
+        using Padded64x64K64 =
+            typename P::template Type<64, 64, 64, 2, 2, 1, D, D, 2, true,
+                                      1, Group, 64, 64>;
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Padded32x64K64::Kernel>>());
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Padded64x64K64::Kernel>>());
+      }
       Add<typename C::template Type<128, 256, Group, 2, 4, 1, D, D, 2, true, 1,
                                     Group, 128, 128>>();
       Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
@@ -130,6 +190,30 @@ void Registry::sm70_884_4() {
     add_lattice.template operator()<22, 16>();
     add_lattice.template operator()<29, 16>();
     auto add_lut = [this]<class C, class G, int GroupSize>() {
+      if constexpr (GroupSize == 32 &&
+                    std::is_same_v<C, Config_GgufLut4_IQ<kColMajor>>) {
+        using Prefill128x64 =
+            typename G::template Type<128, 64, 32, 2, 1, 1, D, D, 2, true, 1,
+                                      GroupSize, 64, 64>;
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Prefill128x64::Kernel>>());
+        using Prefill64x64 =
+            typename G::template Type<64, 64, 32, 2, 1, 1, D, D, 2, true, 1,
+                                      GroupSize, 64, 64>;
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Prefill64x64::Kernel>>());
+        using P = typename PaddedActivationConfig<G>::type;
+        using Padded32x64K64 =
+            typename P::template Type<32, 64, 64, 2, 2, 1, D, D, 2, true,
+                                      1, GroupSize, 32, 64>;
+        using Padded64x64K64 =
+            typename P::template Type<64, 64, 64, 2, 2, 1, D, D, 2, true,
+                                      1, GroupSize, 64, 64>;
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Padded32x64K64::Kernel>>());
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Padded64x64K64::Kernel>>());
+      }
       Add<typename C::template Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1,
                                     GroupSize, 128, 128>>();
       Add<typename G::template Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1,

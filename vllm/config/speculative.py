@@ -124,6 +124,35 @@ def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
     )
 
 
+def match_target_rope_scaling(target, draft) -> bool:
+    """Rotate MTP draft positions exactly like a window-extended target.
+
+    The stock MTP checkpoint ships its target's native RoPE. When the target
+    serves a longer window with scaled RoPE (YaRN), the draft attends over the
+    same positions and must use the same scaling and position range. Returns
+    whether the draft config was changed.
+    """
+    if target is None or draft is None:
+        return False
+    target_text, draft_text = target.hf_text_config, draft.hf_text_config
+    target_rope = dict(getattr(target_text, "rope_parameters", None) or {})
+    draft_rope = dict(getattr(draft_text, "rope_parameters", None) or {})
+    if target_rope.get("rope_type", "default") == "default":
+        return False
+    if draft_rope.get("rope_type", "default") != "default":
+        return False
+    if target_rope.get("rope_theta") != draft_rope.get("rope_theta"):
+        return False
+    draft_text.rope_parameters = target_rope
+    draft_text.max_position_embeddings = target_text.max_position_embeddings
+    logger.info(
+        "MTP draft RoPE follows the target's %s scaling over %d positions.",
+        target_rope.get("rope_type"),
+        target_text.max_position_embeddings,
+    )
+    return True
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
@@ -1103,6 +1132,14 @@ class SpeculativeConfig:
                     )
                 )
 
+                if self.method == "mtp" and match_target_rope_scaling(
+                    self.target_model_config, self.draft_model_config
+                ):
+                    # The draft now covers the target's extended positions.
+                    self.draft_model_config.max_model_len = max(
+                        self.draft_model_config.max_model_len,
+                        self.target_model_config.max_model_len,
+                    )
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,

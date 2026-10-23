@@ -51,7 +51,9 @@ def native_available() -> bool:
     return hasattr(torch.ops._C_gguf, "ggml_dense_upstream_capabilities")
 
 
-def pad_weight_tail(weight: torch.Tensor, weight_type: int) -> torch.Tensor:
+def pad_weight_tail(
+    weight: torch.Tensor, weight_type: int, *, storage_has_zero_tail: bool = False
+) -> torch.Tensor:
     """Preserve logical rows, with the upstream MATRIX_ROW_PADDING storage tail.
 
     The storage contract follows vllm-gguf-plugin PR #141 (Apache-2.0); it pads
@@ -70,6 +72,11 @@ def pad_weight_tail(weight: torch.Tensor, weight_type: int) -> torch.Tensor:
     contiguous = weight.contiguous()
     if tail_bytes == 0:
         return contiguous
+    if storage_has_zero_tail:
+        available = contiguous.untyped_storage().nbytes() - contiguous.storage_offset()
+        if contiguous is not weight or available < contiguous.numel() + tail_bytes:
+            raise ValueError("GGUF guarded weight does not own its zero storage tail")
+        return contiguous
     # Extra storage can belong to the next merged projection. Do not assume
     # it is a zero tail or overwrite it: NaN scales there can contaminate even
     # a zero-padded activation. Give this projection its own guarded allocation.
@@ -81,11 +88,49 @@ def pad_weight_tail(weight: torch.Tensor, weight_type: int) -> torch.Tensor:
     return logical
 
 
+def empty_guarded_weight(shape, weight_type: int, device) -> torch.Tensor:
+    """Allocate one packed bank and a zero safety tail before filling its rows."""
+    block, size = quant_size(weight_type)
+    if weight_type not in NATIVE_TYPES or shape[-1] % size:
+        raise ValueError(
+            "GGUF guarded bank requires complete native quantization blocks"
+        )
+    k = shape[-1] // size * block
+    tail_bytes = ((-k) % 512) // block * size
+    elements = 1
+    for dimension in shape:
+        elements *= dimension
+    storage = torch.empty(elements + tail_bytes, dtype=torch.uint8, device=device)
+    storage[elements:].zero_()
+    return storage[:elements].view(shape)
+
+
+def packed_tp_span(
+    full_k: int, weight_type: int, tp_size: int, tp_rank: int
+) -> tuple[int, int, int, int]:
+    """Cover a TP slice with whole original blocks and zero activation margins.
+
+    Return packed byte bounds, left activation padding and physical K. Boundary
+    blocks may be shared between ranks; each rank uses only its logical inputs.
+    """
+    block, size = quant_size(weight_type)
+    if full_k <= 0 or tp_size <= 0 or full_k % tp_size or full_k % block:
+        raise ValueError("GGUF TP span requires complete source rows and equal slices")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError("GGUF TP rank is outside the group")
+    local_k = full_k // tp_size
+    start = tp_rank * local_k
+    first = start // block
+    last = (start + local_k + block - 1) // block
+    return first * size, last * size, start - first * block, (last - first) * block
+
+
 def native_dense(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_type: int,
     prefill_min_m: int = 8,
+    max_dequant_bytes: int = 0,
 ) -> torch.Tensor | None:
     if weight_type not in NATIVE_TYPES or not native_available():
         return None
@@ -102,12 +147,30 @@ def native_dense(
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     volta = current_platform.is_device_capability((7, 0), device_id=device_index)
-    if (capabilities & 16) and volta and x.shape[0] >= prefill_min_m:
+
+    def blas():
+        if max_dequant_bytes:
+            block, size = quant_size(weight_type)
+            k = weight.shape[-1] // size * block
+            rows = max(1, max_dequant_bytes // (k * x.element_size()))
+            if rows < weight.shape[0]:
+                output = x.new_empty((x.shape[0], weight.shape[0]))
+                for start in range(0, weight.shape[0], rows):
+                    end = min(start + rows, weight.shape[0])
+                    output[:, start:end].copy_(
+                        native.ggml_dense_blas(
+                            weight[start:end], x, weight_type, end - start
+                        )
+                    )
+                return output
         return native.ggml_dense_blas(weight, x, weight_type, weight.shape[0])
+
+    if (capabilities & 16) and volta and x.shape[0] >= prefill_min_m:
+        return blas()
     if capabilities & 4:
         return native.ggml_dense_mmvq(weight, x, weight_type, weight.shape[0])
     if capabilities & 16:
-        return native.ggml_dense_blas(weight, x, weight_type, weight.shape[0])
+        return blas()
     if (capabilities & 8) and not volta:
         return native.ggml_dense_mmq(weight, x, weight_type, weight.shape[0])
     return None

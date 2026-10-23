@@ -248,7 +248,10 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import (
+    allocate_host_kv_cache_pool,
+    is_residual_scattered_for_sp,
+)
 from vllm.v1.worker.workspace import lock_workspace
 
 from .utils import (
@@ -1109,6 +1112,9 @@ class GPUModelRunner(
         self.vllm_config = vllm_config
         self._diagnostics = bind_diagnostics(vllm_config)
         self.model_config = vllm_config.model_config
+        self.mm_encoder_batch_size = getattr(
+            self.model_config.multimodal_config, "mm_encoder_batch_size", 0
+        )
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
         self.compilation_config = vllm_config.compilation_config
@@ -2012,6 +2018,12 @@ class GPUModelRunner(
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=(self.compilation_config.static_forward_context),
+            host_backed_layers={
+                name
+                for tensor in self.kv_cache_config.kv_cache_tensors
+                if tensor.host_backed
+                for name in tensor.shared_by
+            },
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
@@ -6089,6 +6101,7 @@ class GPUModelRunner(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,
+            max_batch_size=getattr(self, "mm_encoder_batch_size", 0),
         ):
             batch_outputs: MultiModalEmbeddings
 
@@ -12363,20 +12376,13 @@ class GPUModelRunner(
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        kv_cache_raw_tensors = allocate_host_kv_cache_pool(kv_cache_config, self.device)
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             if kv_cache_tensor.host_backed:
-                from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
-
-                with torch.accelerator.device_index(self.device.index):
-                    host = torch.zeros(
-                        kv_cache_tensor.size, dtype=torch.int8, pin_memory=True
-                    )
-                    tensor = get_accelerator_view_from_cpu_tensor(host)
-            else:
-                tensor = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
-                )
+                continue
+            tensor = torch.zeros(
+                kv_cache_tensor.size, dtype=torch.int8, device=self.device
+            )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
@@ -12436,7 +12442,17 @@ class GPUModelRunner(
                     # Compressed MLA is split into physical pool pages instead
                     # of the scheduler's attention-kernel blocks.
                     if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = compressed_kernel_block_size(kv_cache_spec)
+                        # QSA side caches consume physical block tables; paged
+                        # MQA indexers consume smaller virtual pages. Match the
+                        # metadata builder and the V2 cache layout in each case.
+                        uses_physical_block_table = (
+                            attn_backend.get_builder_cls().uses_physical_block_table
+                        )
+                        shape_block_size = (
+                            kv_cache_spec.storage_block_size
+                            if uses_physical_block_table
+                            else compressed_kernel_block_size(kv_cache_spec)
+                        )
                         kernel_num_blocks = num_blocks * (
                             kv_cache_spec.storage_block_size // shape_block_size
                         )

@@ -318,6 +318,8 @@ set(VLLM_EXT_SRC
   "csrc/custom_all_reduce.cu"
   "csrc/torch_bindings.cpp"
   "csrc/ple_disk_rows.cpp"
+  "csrc/ple_fast_lane.cpp"
+  "csrc/gguf_dmv13_pack.cpp"
   "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
@@ -427,6 +429,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_decode_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_grouped_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_raw_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_prefill_transcode_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dp4a_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_shared_expert_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_iq3_signed_pair_sm70.cu"
@@ -843,6 +846,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     _sm70_qsa_device_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/qsa_device_history_sm70.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  # Host-side expert-cache lane (C++ with the CUDA runtime); prebuilt so
+  # installed wheels do not need the source tree or a JIT toolchain.
+  define_extension_target(
+    _gguf_expert_cache_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/gguf_expert_cache.cpp"
     ARCHITECTURES "70"
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)

@@ -92,6 +92,7 @@ class Qwen35MoeAdapter(Qwen35Adapter):
             repack = (
                 int(tensor.tensor_type) == 42
                 and not getattr(self, "canonical_expert_storage", False)
+                and not getattr(self, "preserve_expert_blocks", False)
                 and projection == "down_proj"
                 and int(tensor.shape[0]) % (64 * self.tp_size) != 0
             )
@@ -115,9 +116,22 @@ class Qwen35MoeAdapter(Qwen35Adapter):
                 )
             # Keep one type per logical gate/up/down projection. The expert
             # method handles local expert admission and TP storage boundaries.
-            for expert in range(self.config.num_experts):
+            # Whole-bank loads record it once (the method keeps one type per
+            # projection); per-expert payloads announce it for every expert.
+            bulk = getattr(self, "bulk_experts", {}).get(raw)
+            if bulk is not None and (floating or repack):
+                bulk = None
+            for expert in range(1 if bulk is not None else self.config.num_experts):
                 module = f"{prefix}.{expert}.{projection}"
                 yield module + ".qweight_type", torch.tensor(storage_type)
+            if bulk is not None:
+                from vllm.model_executor.layers.quantization.gguf_expert_storage import (  # noqa: E501
+                    load_expert_bank,
+                )
+
+                bank_layer, bank_method, bank_shard = bulk
+                load_expert_bank(bank_layer, bank_method, bank_shard, tensor, raw)
+                continue
             packed = (
                 self._dense(tensor, dtype)
                 if floating

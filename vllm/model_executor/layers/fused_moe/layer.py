@@ -907,6 +907,9 @@ class FusedMoE(PluggableLayer):
 
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if (packed_loader := getattr(param, "packed_expert_loader", None)) is not None:
+            packed_loader(self, param, loaded_weight, shard_id, expert_id)
+            return True if return_success else None
         if (gguf_loader := getattr(param, "gguf_expert_loader", None)) is not None:
             gguf_loader(self, param, loaded_weight, shard_id, expert_id)
             return True if return_success else None
@@ -1357,6 +1360,14 @@ class FusedMoE(PluggableLayer):
             router_logits,
             input_ids,
         )
+
+    def forward_partials(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.runner.forward_partials(hidden_states, router_logits, input_ids)
 
     @property
     def expert_map(self) -> torch.Tensor | None:

@@ -19,7 +19,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.execution_policy import layer_policy
 from vllm.config.gdn_projection import projection_policy
 from vllm.config.speculative_sampling import mtp_batch_enabled
@@ -277,12 +277,31 @@ def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _router_batch_storage(weight: torch.Tensor, storage: str) -> torch.Tensor:
+    if storage == "row_major":
+        if weight.shape != (512, 2560) or not weight.is_contiguous():
+            raise ValueError("Router storage requires contiguous [512,2560] weights")
+        return weight.detach()
+    if storage != "dual":
+        raise ValueError(f"Unknown router weight storage: {storage}")
+    return _pack_router_batch_weight(weight)
+
+
+def _verify_rows(rows: int) -> bool:
+    """MTP4 verification batches of one to eight requests (five rows each).
+
+    The router and shared-expert batch kernels compute rows independently, so
+    one launch covers every request with per-row results unchanged.
+    """
+    return rows % 5 == 0 and 5 <= rows <= 40
+
+
 def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     return bool(
         mtp_batch_enabled("shared_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and x.shape[0] in (5, 10)
+        and _verify_rows(x.shape[0])
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -292,9 +311,35 @@ def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     )
 
 
+_BATCH_PIECE = 10  # verification rows per batch-kernel launch (2 requests)
+
+
+def _in_pieces(x: torch.Tensor, width: int, fn) -> torch.Tensor:
+    """Apply a 2..16-row batch kernel to concurrent verification batches
+    in 10-row pieces (rows are independent)."""
+    out = x.new_empty((x.shape[0], width))
+    for start in range(0, x.shape[0], _BATCH_PIECE):
+        stop = min(start + _BATCH_PIECE, x.shape[0])
+        out[start:stop] = fn(x[start:stop])
+    return out
+
+
+def _batch_piecewise(x: torch.Tensor) -> bool:
+    return bool(
+        x.ndim == 2
+        and 10 < x.shape[0] <= 64
+        and x.shape[0] % 5 == 0
+        and x.is_contiguous()
+    )
+
+
 def _qwen38_sm70_shared_up(
     x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
 ) -> torch.Tensor:
+    if packed is not None and _batch_piecewise(x) and x.shape[0] > 40:
+        return _in_pieces(
+            x, 160, lambda piece: _qwen38_sm70_shared_up(piece, weight, packed)
+        )
     if _shared_batch_runtime_ok(x) and packed is not None:
         out = x.new_empty((x.shape[0], 160))
         reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
@@ -364,14 +409,14 @@ def _router_batch_runtime_ok(x, packed) -> bool:
         mtp_batch_enabled("router_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and x.shape[0] in (5, 10)
+        and _verify_rows(x.shape[0])
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
         and x.is_contiguous()
         and x.data_ptr() % 16 == 0
         and packed is not None
-        and packed.shape == (64, 40, 2, 4, 8, 8)
+        and tuple(packed.shape) in ((64, 40, 2, 4, 8, 8), (512, 2560))
         and packed.device == x.device
         and packed.dtype == x.dtype
         and packed.is_contiguous()
@@ -394,6 +439,19 @@ def _qwen38_sm70_fp16_gemv(
         torch.ops._C.qwen38_dense_batch_sm70_out(out, x, weight)
         logger.info_once("SM70 Qwen3.8 exact small-batch dense projections enabled.")
         return out
+    if (
+        role.endswith(_ROUTER_SUFFIX)
+        and packed_router is not None
+        and _batch_piecewise(x)
+        and x.shape[0] > 40
+    ):
+        return _in_pieces(
+            x,
+            512,
+            lambda piece: _qwen38_sm70_fp16_gemv(
+                piece, weight, role, packed_router, dense_batch
+            ),
+        )
     if role.endswith(_ROUTER_SUFFIX) and _router_batch_runtime_ok(x, packed_router):
         out = x.new_empty((x.shape[0], 512))
         torch.ops._C.qwen38_router_batch_sm70_out(out, x, packed_router)
@@ -541,6 +599,21 @@ def _qwen38_sm70_fp16_gdn_input(
     packed_qkvz: torch.Tensor | None = None,
     packed_ba: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (
+        packed_qkvz is not None
+        and packed_ba is not None
+        and _batch_piecewise(x)
+        and x.shape[0] > 16
+    ):
+        qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
+        for start in range(0, x.shape[0], _BATCH_PIECE):
+            stop = min(start + _BATCH_PIECE, x.shape[0])
+            parts = _qwen38_sm70_fp16_gdn_input(
+                x[start:stop], qkvz_weight, ba_weight, packed_qkvz, packed_ba
+            )
+            for dst, src in zip((qkv, z, b, a), parts):
+                dst[start:stop] = src
+        return qkv, z, b, a
     if _can_use_packed_gdn_input(x, packed_qkvz, packed_ba):
         qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
         torch.ops._C.qwen38_gdn_input_batch_sm70_out(
@@ -677,9 +750,15 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
             if weight.is_cuda and weight.dtype == torch.float16:
                 if not hasattr(torch.ops._C, "qwen38_router_batch_sm70_out"):
                     raise RuntimeError("Rebuild the SM70 extension for batch router")
+                config = get_current_vllm_config_or_none()
+                storage = (
+                    config.kernel_config.sm70_router_weight_storage
+                    if config is not None
+                    else "dual"
+                )
                 layer.register_buffer(
                     "_sm70_mtp_router_packed",
-                    _pack_router_batch_weight(weight),
+                    _router_batch_storage(weight, storage),
                     persistent=False,
                 )
         if not getattr(layer, "_sm70_qwen38_prepare_gdn_batch", False):

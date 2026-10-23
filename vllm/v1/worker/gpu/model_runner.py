@@ -57,7 +57,12 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.mem_utils import (
+    DeviceMemoryProfiler,
+    format_gib,
+    loaded_cuda_model_storage,
+    reclaim_cpu_allocator_pages,
+)
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -326,6 +331,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
         self._ple_offload_connector: Any | None = None
+        self._ple_draft_ring: Any | None = None
         self._sm70_v2_mtp_profile_pending: dict[str, Any] | None = None
 
         # Expert parallelism load balancer.
@@ -377,6 +383,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_source=query_start_loc_source,
             ngram_context_source=ngram_context_source,
         )
+        ring = self._ple_offload_connector.draft_ring
+        speculator = self.speculator
+        if (
+            ring is not None
+            and speculator is not None
+            and hasattr(speculator, "draft_step_listener")
+        ):
+            # Set before graph capture so every draft graph publishes.
+            speculator.draft_step_listener = ring.publish_draft_step
+            self._ple_draft_ring = ring
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
@@ -400,11 +416,47 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if self.speculator is not None:
+                # Checkpoint conversion can leave cycles holding replaced tensor
+                # banks. Reclaim them before allocating the independent draft.
+                allocated_before = torch.accelerator.memory_allocated()
+                gc.collect()
+                torch.accelerator.empty_cache()
+                if self.vllm_config.kernel_config.qsa_host_kv_active:
+                    before, after = reclaim_cpu_allocator_pages()
+                    logger.info(
+                        "Checkpoint CPU allocator RSS: %d -> %d bytes", before, after
+                    )
+                logger.info(
+                    "Target loading cleanup: allocated %d -> %d bytes, "
+                    "reserved %d bytes",
+                    allocated_before,
+                    torch.accelerator.memory_allocated(),
+                    torch.accelerator.memory_reserved(),
+                )
+                logger.info(
+                    "Target CUDA storage before speculative loading: %s",
+                    loaded_cuda_model_storage({"target": self.model}),
+                )
                 self.speculator.load_model(self.model)
+                if self.vllm_config.kernel_config.qsa_host_kv_active:
+                    before, after = reclaim_cpu_allocator_pages()
+                    logger.info(
+                        "Draft checkpoint CPU allocator RSS: %d -> %d bytes",
+                        before,
+                        after,
+                    )
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
         time_after_load = time.perf_counter()
+        # Pinned expert staging is only needed while converting checkpoints.
+        from vllm.model_executor.layers.quantization.gguf_turbomind_moe import (
+            release_staging_pool,
+        )
+
+        released = release_staging_pool()
+        if released:
+            logger.info("Released %.2f GiB of pinned loading staging", released / 2**30)
 
         self.model_memory_usage = m.consumed_memory
         logger.info(
@@ -576,7 +628,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
         elif self.speculator is not None:
             # Preserve the existing Eagle initialization order.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            self.speculator.init_cudagraph_manager(
+                cudagraph_mode,
+                capture_context=(
+                    self.cudagraph_manager.get_capture_context()
+                    if cudagraph_mode
+                    else None
+                ),
+            )
             # HACK(woosuk)
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables
@@ -606,6 +665,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=set(),
             static_forward_context=self.compilation_config.static_forward_context,
+            host_backed_layers={
+                name
+                for tensor in self.kv_cache_config.kv_cache_tensors
+                if tensor.host_backed
+                for name in tensor.shared_by
+            },
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
@@ -807,6 +872,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.compilation_config.cudagraph_mode
         )
 
+    def _check_graph_capture_headroom(self, free_bytes: int) -> None:
+        """Fail before compiling capture graphs when the reserve is not free.
+
+        Capture-time compilation, autotuning and graph pools run after the KV
+        cache is allocated. With an explicit VLLM_V2_CUDAGRAPH_MEM_MIB reserve,
+        report the ledger and stop here instead of at a late out-of-memory.
+        """
+        reserve = get_explicit_cudagraph_memory_reserve(
+            self.compilation_config.cudagraph_mode
+        )
+        allocated = torch.accelerator.memory_allocated()
+        reserved = torch.accelerator.memory_reserved()
+        logger.info(
+            "Graph capture headroom: driver_free=%.0f MiB reserve=%.0f MiB "
+            "allocated=%.0f MiB reserved=%.0f MiB",
+            free_bytes / 2**20,
+            reserve / 2**20,
+            allocated / 2**20,
+            reserved / 2**20,
+        )
+        if reserve and free_bytes < reserve:
+            raise RuntimeError(
+                f"CUDA graph capture needs {reserve / 2**20:.0f} MiB "
+                f"(VLLM_V2_CUDAGRAPH_MEM_MIB) but only {free_bytes / 2**20:.0f} "
+                "MiB is free after KV allocation; reduce KV/state pools or "
+                "weights before capture."
+            )
+
     @torch.inference_mode()
     def capture_model(self) -> int:
         assert self.cudagraph_manager is not None
@@ -823,6 +916,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         gc.collect()
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        self._check_graph_capture_headroom(start_free_gpu_memory)
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
@@ -844,6 +938,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
             )
             if self.speculator is not None:
+                # Target warmup leaves eager allocator blocks outside its graph
+                # pool. Release them before allocating the draft's separate
+                # pool; captured tensors and live workspaces remain owned.
+                torch.accelerator.synchronize()
+                gc.collect()
+                free_before = torch.cuda.mem_get_info()[0]
+                torch.accelerator.empty_cache()
+                logger.info(
+                    "Draft graph capture allocator cleanup: freed=%d "
+                    "driver_free=%d allocated=%d reserved=%d bytes",
+                    torch.cuda.mem_get_info()[0] - free_before,
+                    torch.cuda.mem_get_info()[0],
+                    torch.accelerator.memory_allocated(),
+                    torch.accelerator.memory_reserved(),
+                )
                 if isinstance(self.speculator, DraftModelSpeculator):
                     self.speculator.capture()
                 else:
@@ -1783,6 +1892,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             mtp_draft_start = self._step_profiler.start_context(mtp_profile_ctx)
+            if self._ple_draft_ring is not None:
+                # The committed state now ends at each request's bonus token.
+                self._ple_draft_ring.publish_round(
+                    input_batch.idx_mapping,
+                    input_batch.num_reqs,
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.num_computed_tokens.gpu,
+                    self.model_state.ngram_eos_token_id,
+                )
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1916,6 +2034,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.close()
             self._ple_offload_connector = None
+        self._ple_draft_ring = None
+        speculator = getattr(self, "speculator", None)
+        if speculator is not None and getattr(speculator, "draft_step_listener", None):
+            speculator.draft_step_listener = None
 
         target_model = getattr(self, "model", None)
         speculator = getattr(self, "speculator", None)

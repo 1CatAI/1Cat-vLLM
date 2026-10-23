@@ -116,6 +116,9 @@ _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
+# Offload-worker batches up to this size (four MTP4 verify requests = 20) hash
+# n-grams in plain Python instead of many small Torch CPU ops.
+_CPU_SMALL_NGRAM_TOKENS = 64
 
 logger = init_logger(__name__)
 _PLE_DIAGNOSTIC_BUFFERS: dict[str, torch.Tensor] = {}
@@ -792,6 +795,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         row_bytes = getattr(self, "_storage_dim", self.embedding_dim)
         total_rows = self._meta_weight_shape[0]
         table_bytes = total_rows * row_bytes
+        runtime = get_current_vllm_config_or_none()
+        if runtime and runtime.kernel_config.ple_disk_only:
+            return plan_ple_placement(
+                total_rows=total_rows,
+                row_bytes=row_bytes,
+                host_budget_bytes=row_bytes,
+                vram_budget_bytes=0,
+                disk_allowed=True,
+            )
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
         from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
@@ -1342,6 +1354,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_segments = disk_segments
         self._remote_placements = bound
 
+    def needs_weight_prefault(self) -> bool:
+        # Until placements arrive, retain the full CPU-table contract. A bound
+        # empty disk tier only publishes zero rows; resident pinned/device rows
+        # are already owned by the GPU workers and need no second RAM copy.
+        return not self._remote_placements or bool(self._disk_segments)
+
     def _remote_lookup(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Fill the worker's output with the rows the ranks left to it.
 
@@ -1454,6 +1472,28 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             output.extend(mixed3 % sizes[h] + offsets[h] for h in range(8, 16))
         return torch.tensor(output, dtype=torch.long).reshape(num_tokens, 16)
 
+    def draft_prefetch_row_ids(
+        self, tokens: list[int], context: list[int]
+    ) -> np.ndarray:
+        """Table rows of consecutive tokens following two context tokens.
+
+        Used only to warm storage for drafted tokens; it shares the verify
+        path's hashing, so prefetched rows are exactly the rows it will read.
+        """
+        if (
+            not tokens
+            or self.ngram_size != 3
+            or self.heads_per_ngram != 8
+            or self.ngram_heads != 16
+        ):
+            return np.empty(0, dtype=np.int64)
+        rows = self._compute_ngram_ids_cpu_small(
+            torch.tensor(tokens, dtype=torch.int64),
+            torch.tensor([0, len(tokens)], dtype=torch.int64),
+            torch.tensor([context], dtype=torch.int64),
+        )
+        return rows.numpy().reshape(-1)
+
     def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
@@ -1544,7 +1584,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         if (
             is_offload_process()
-            and num_tokens <= 16
+            and num_tokens <= _CPU_SMALL_NGRAM_TOKENS
             and self.ngram_size == 3
             and self.heads_per_ngram == 8
             and self.ngram_heads == 16
@@ -1815,6 +1855,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             getattr(self, "_sm70_hcx_diagnostics", False),
         )
         if output_buffer is not None:
+            if getattr(self, "_packed_result_layout", None) is not None:
+                reader = self.ngram_embedding._cpu_reader
+                if reader is None or not is_offload_process():
+                    raise RuntimeError("Packed PLE result requires the CPU row owner")
+                packed = reader.lookup_packed_iq4nl(ngram_ids.numpy())
+                output = output_buffer[:num_tokens]
+                output.copy_(torch.from_numpy(packed.reshape(num_tokens, -1)))
+                return output
             output = output_buffer[:num_tokens, : self.embedding_dim]
             # Cross-process FP8 results travel as raw bytes. Keeping the IPC
             # buffers uint8 prevents TorchInductor from treating their graph
@@ -1855,6 +1903,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
         """Transport quantized lookup results as opaque E4M3FN bytes."""
+        if getattr(self, "_packed_result_layout", None) is not None:
+            return torch.uint8
         embedding = getattr(self, "ngram_embedding", None)
         if getattr(self, "_packed_gguf", False):
             assert embedding is not None
@@ -1867,6 +1917,68 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if weight is not None:
             return weight.dtype
         return default_dtype
+
+    def get_offload_output_dim(self, default_dim: int) -> int:
+        layout = getattr(self, "_packed_result_layout", None)
+        return layout["packed_width"] if layout is not None else default_dim
+
+    def offload_result_layout(self):
+        return getattr(self, "_packed_result_layout", None)
+
+    def bind_offload_result_layout(self, layout):
+        if layout is None:
+            self._packed_result_layout = None
+            return
+        reader = getattr(getattr(self, "ngram_embedding", None), "_cpu_reader", None)
+        if (
+            reader is None
+            or not layout.get("enabled")
+            or layout.get("operator") != "ple_decode_iq4nl_result_out"
+            or layout.get("source_type") != 20
+            or reader.source_type != 20
+            or reader.hidden_size != layout.get("row_width")
+            or self.head_dim != layout.get("row_width")
+            or self.ngram_heads != layout.get("heads")
+            or layout.get("packed_width") != self.ngram_heads * reader.data.shape[1]
+            or layout.get("output_dtype") != "float16"
+            or self.ngram_embedding._output_dtype != torch.float16
+        ):
+            raise ValueError("CPU PLE row storage disagrees with result decoder")
+        self._packed_result_layout = dict(layout)
+
+    def wait_offloaded_output(
+        self, hidden_states: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        layout = getattr(self, "_packed_result_layout", None)
+        if layout is None:
+            return super().wait_offloaded_output(hidden_states, num_tokens)
+        import vllm.model_executor.kernels.ple.gguf_packed_result  # noqa: F401
+
+        workspace = self._packed_result_output
+        cpu_output = getattr(self, "_cpu_output_buffer", None)
+        if cpu_output is None:
+            torch.ops.vllm.ple_offload_wait_decode_iq4nl(
+                self._sem.flag_tensor,
+                self._gpu_output_buffer,
+                workspace,
+                hidden_states,
+                self._packed_result_codebook,
+                layout["row_width"],
+                None,
+                num_tokens,
+            )
+        else:
+            torch.ops.vllm.ple_offload_wait_decode_iq4nl(
+                self._sem.flag_tensor,
+                self._gpu_output_buffer,
+                workspace,
+                hidden_states,
+                self._packed_result_codebook,
+                layout["row_width"],
+                cpu_output,
+                num_tokens,
+            )
+        return workspace[:num_tokens]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -2011,6 +2123,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 row_bytes=self.head_dim,
                 file_backed=bool(self._disk_mapped_paths),
                 enabled=self._disk_row_gather,
+                cache_bytes=getattr(self._kernel_config, "ple_row_cache_mib", 0) << 20,
             )
             if self._kernel_config is not None:
                 self._kernel_config.ple_disk_row_readers[self.layer_name] = (
@@ -2064,6 +2177,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_kernel_size = int(config.ple_conv_kernel_size)
         self.short_conv_dilation = int(config.ngram_size)
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
+        self._prefill_short_conv = (
+            vllm_config.kernel_config.layer_execution.ple_prefill_conv
+        )
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
         # The offload subprocess constructs the surrounding model on meta, but
@@ -2090,6 +2206,35 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # workers, so preserve the model-dtype scale contract explicitly for
         # its checkpoint-only load path.
         self.ple_embedding._offload_model_dtype = model_config.dtype
+        from vllm.model_executor.kernels.ple.gguf_packed_result import (
+            packed_result_layout,
+        )
+
+        self.ple_embedding._packed_result_layout = packed_result_layout(
+            f"{prefix}.ple_embedding"
+        )
+        if (
+            self.ple_embedding._packed_result_layout is not None
+            and not is_offload_process()
+        ):
+            import gguf
+
+            self.ple_embedding.register_buffer(
+                "_packed_result_codebook",
+                torch.tensor(gguf.quants.IQ4_NL.kvalues, dtype=torch.float32),
+                persistent=False,
+            )
+            self.ple_embedding.register_buffer(
+                "_packed_result_output",
+                torch.empty(
+                    (
+                        vllm_config.scheduler_config.max_num_batched_tokens,
+                        int(config.ple_embed_dim),
+                    ),
+                    dtype=torch.float16,
+                ),
+                persistent=False,
+            )
         self._sm70_hcx_diagnostics = vllm_config.kernel_config.sm70_hcx_diagnostics
         self.ple_embedding._sm70_hcx_diagnostics = self._sm70_hcx_diagnostics
         self.key_proj = ReplicatedLinear(
@@ -2346,6 +2491,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         num_prefills: int,
         num_decode_tokens: int,
         num_prefill_tokens: int,
+        *,
+        output_start: int = 0,
+        output_rows: int | None = None,
     ) -> torch.Tensor:
         # ``non_spec_query_start_loc`` covers the non-spec (decode + prefill)
         # requests and equals ``query_start_loc`` when spec-decode is inactive.
@@ -2376,16 +2524,68 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"need >= {num_prefills}."
             )
         if num_prefills == 0 or x_p.numel() == 0:
-            return torch.empty_like(x_p)
+            result = torch.empty_like(x_p)
+            return _ple_output_rows(result, output_start, output_rows)
         lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
         if max_len <= 0:
-            return torch.empty_like(x_p)
+            result = torch.empty_like(x_p)
+            return _ple_output_rows(result, output_start, output_rows)
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
+        if (
+            getattr(self, "_prefill_short_conv", False)
+            and current_platform.is_device_capability(70)
+            and hidden_size == 10240
+            and state_len == 9
+            and self.short_conv_dilation == 3
+            and conv_weights.shape == (hidden_size, 4)
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == hidden_size
+            and conv_state.shape[2] >= state_len
+            and x_p.stride(1) == 1
+            and all(
+                t.is_cuda and t.dtype == torch.float16
+                for t in (x_p, conv_state, conv_weights)
+            )
+            and all(
+                t.device == x_p.device
+                for t in (
+                    conv_state,
+                    conv_weights,
+                    q_starts,
+                    state_indices_tensor_p,
+                    has_initial_states_p,
+                )
+            )
+            and state_indices_tensor_p.is_contiguous()
+            and has_initial_states_p.is_contiguous()
+        ):
+            from vllm.model_executor.kernels.ple.short_conv import (
+                dilated_prefill_short_conv,
+            )
+
+            logger.info_once(
+                "Using SM70 PLE prefill convolution without padded history."
+            )
+            return dilated_prefill_short_conv(
+                x_p,
+                conv_state,
+                conv_weights,
+                q_starts,
+                state_indices_tensor_p[:num_prefills],
+                has_initial_states_p[:num_prefills],
+                max_len,
+                0,
+                self.short_conv_dilation,
+                NULL_BLOCK_ID,
+                token_tile=16,
+                output_start=output_start,
+                output_rows=output_rows,
+            )
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
@@ -2402,6 +2602,26 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         has_initial = has_initial_states_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.bool
         )
+
+        chunk = self._short_conv_prefill_channel_chunk(
+            num_prefills, max_len, num_prefill_tokens, hidden_size
+        )
+        if chunk is not None:
+            result = self._short_conv_dilated_prefill_channel_chunks(
+                x_p=x_p,
+                conv_state=conv_state,
+                conv_weights=conv_weights,
+                state_indices=state_indices,
+                valid_state=valid_state,
+                has_initial=has_initial,
+                lengths=lengths,
+                req_indices=req_indices,
+                col_indices=col_indices,
+                num_prefills=num_prefills,
+                max_len=max_len,
+                chunk=chunk,
+            )
+            return _ple_output_rows(result, output_start, output_rows)
 
         # Every [num_prefills, hidden, max_len] buffer here is as large as the
         # whole prefill batch, and a batched step runs max_num_seqs full state
@@ -2463,6 +2683,106 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
             existing_state[..., :state_len] = safe_next_state
             conv_state.index_copy_(0, state_indices, existing_state)
+        return _ple_output_rows(output, output_start, output_rows)
+
+    def _short_conv_prefill_channel_chunk(
+        self,
+        num_prefills: int,
+        max_len: int,
+        num_prefill_tokens: int,
+        hidden_size: int,
+    ) -> int | None:
+        """Channel chunk width for the batched prefill short-conv, or None.
+
+        Padding every prefill to the longest one can make the packed history
+        several times larger than the step itself, e.g. long chunked prefills
+        next to short prompts. The profiling run never takes that shape, so at
+        max_num_seqs=8 one such step ran out of memory. Keep each padded buffer
+        at most half of one unpadded step by splitting channels; the
+        convolution is depthwise, so per-channel arithmetic is unchanged.
+        Long single prefills also need headroom: keep each temporary at most
+        a quarter of the step instead of retaining two full-sized buffers.
+        """
+        if num_prefills <= 0 or (num_prefills == 1 and max_len < 4096):
+            return None
+        per_channel = num_prefills * (self.conv_state_len + max_len)
+        divisor = 4 if num_prefills == 1 else 2
+        budget = (num_prefill_tokens + self.conv_state_len) * hidden_size // divisor
+        if per_channel * hidden_size <= budget:
+            return None
+        chunk = max(64, (budget // per_channel) // 64 * 64)
+        return chunk if chunk < hidden_size else None
+
+    def _short_conv_dilated_prefill_channel_chunks(
+        self,
+        x_p: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        state_indices: torch.Tensor,
+        valid_state: torch.Tensor,
+        has_initial: torch.Tensor,
+        lengths: torch.Tensor,
+        req_indices: torch.Tensor,
+        col_indices: torch.Tensor,
+        num_prefills: int,
+        max_len: int,
+        chunk: int,
+    ) -> torch.Tensor:
+        """Same result as the packed prefill path, ``chunk`` channels at a time."""
+        hidden_size = x_p.shape[1]
+        state_len = self.conv_state_len
+        output = torch.empty_like(x_p)
+        have_state = state_len > 0 and conv_state.shape[0] > 0
+        if have_state:
+            # Snapshot before any write-back; also the base of the write-back.
+            existing_state = conv_state.index_select(0, state_indices)
+            use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
+            state_starts = lengths.to(device=x_p.device, dtype=torch.int64).view(
+                num_prefills, 1, 1
+            )
+            state_offsets = torch.arange(
+                state_len, device=x_p.device, dtype=torch.int64
+            ).view(1, 1, state_len)
+            next_state = x_p.new_empty((num_prefills, hidden_size, state_len))
+        invalid_rows = ~valid_state.to(device=x_p.device).view(num_prefills, 1, 1)
+        weights = conv_weights.unsqueeze(1).contiguous()
+        for c0 in range(0, hidden_size, chunk):
+            c1 = min(hidden_size, c0 + chunk)
+            width = c1 - c0
+            history = x_p.new_zeros((num_prefills, width, state_len + max_len))
+            history[..., state_len:].transpose(1, 2)[req_indices, col_indices] = x_p[
+                :, c0:c1
+            ]
+            if have_state:
+                state = existing_state[:, c0:c1, :state_len].to(x_p.dtype)
+                history[..., :state_len] = torch.where(
+                    use_initial_mask, state, torch.zeros_like(state)
+                )
+                next_state[:, c0:c1] = history.gather(
+                    dim=2,
+                    index=(state_starts + state_offsets).expand(-1, width, -1),
+                )
+            conv_output = F.conv1d(
+                history,
+                weights[c0:c1],
+                groups=width,
+                dilation=self.short_conv_dilation,
+            )
+            del history
+            F.silu(conv_output, inplace=True)
+            conv_output.masked_fill_(invalid_rows, 0)
+            output[:, c0:c1] = conv_output.transpose(1, 2)[req_indices, col_indices]
+            del conv_output
+        if have_state:
+            existing_base_state = existing_state[..., :state_len]
+            update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
+            safe_next_state = torch.where(
+                update_mask.view(num_prefills, 1, 1),
+                next_state.to(conv_state.dtype),
+                existing_base_state,
+            )
+            existing_state[..., :state_len] = safe_next_state
+            conv_state.index_copy_(0, state_indices, existing_state)
         return output
 
     def _short_conv_dilated_spec_batched(
@@ -2492,11 +2812,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         hidden_size = x_spec.size(-1)
         if (
             layer_policy().value("ple_spec_conv")
-            and num_reqs == 1
+            and 1 <= num_reqs <= 8
             and spec_query_len == 5
             and self.conv_state_len == 9
             and self.short_conv_dilation == 3
-            and x_spec.shape in ((5, 10240), (10, 10240))
+            and 1 <= x_spec.shape[0] <= 40
+            and x_spec.shape[1] == 10240
             and x_spec.is_cuda
             and x_spec.dtype == torch.float16
             and x_spec.is_contiguous()
@@ -2756,11 +3077,19 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             return x
         return conv_out_non_spec
 
-    def _short_conv(self, inputs: torch.Tensor) -> torch.Tensor:
+    def _short_conv(
+        self,
+        inputs: torch.Tensor,
+        *,
+        output_start: int = 0,
+        output_rows: int | None = None,
+    ) -> torch.Tensor:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return self._short_conv_fallback(inputs)
+            return _ple_output_rows(
+                self._short_conv_fallback(inputs), output_start, output_rows
+            )
 
         if not isinstance(attn_metadata, dict):
             raise RuntimeError(
@@ -2795,12 +3124,32 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                     f"expect at least {state_capacity}."
                 )
             conv_state = conv_state[..., -state_capacity:]
-        return self._short_conv_dilated_dispatch(
+        if (
+            output_rows is not None
+            and layer_attn_metadata.num_prefills > 0
+            and layer_attn_metadata.num_decodes == 0
+            and layer_attn_metadata.spec_sequence_masks is None
+        ):
+            assert layer_attn_metadata.state_indices_tensor is not None
+            return self._short_conv_dilated_prefill_batched(
+                inputs[: layer_attn_metadata.num_actual_tokens],
+                layer_attn_metadata,
+                conv_state,
+                conv_weights.to(dtype=inputs.dtype),
+                layer_attn_metadata.state_indices_tensor,
+                layer_attn_metadata.num_prefills,
+                0,
+                layer_attn_metadata.num_prefill_tokens,
+                output_start=output_start,
+                output_rows=output_rows,
+            )
+        result = self._short_conv_dilated_dispatch(
             inputs,
             layer_attn_metadata,
             conv_state,
             conv_weights.to(dtype=inputs.dtype),
         )
+        return _ple_output_rows(result, output_start, output_rows)
 
     def forward(
         self,
@@ -2808,17 +3157,23 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        hc_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         diagnostic = self._sm70_hcx_diagnostics
         input_ids = input_ids.reshape(-1)
         input_ids = snapshot_ple_diagnostic(
             input_ids, self.prefix + ":02_input_ids", diagnostic
         )
-        if input_ids.shape[0] != hidden_states.shape[0]:
+        expected_rows = (
+            (input_ids.shape[0] + 3) // 4
+            if hc_sequence_parallel
+            else input_ids.shape[0]
+        )
+        if expected_rows != hidden_states.shape[0]:
             raise ValueError(
-                "PLE expects input_ids and hidden_states to have the same "
-                f"token length, got {input_ids.shape[0]} and "
-                f"{hidden_states.shape[0]}"
+                f"PLE expects {expected_rows} hidden rows for "
+                f"{input_ids.shape[0]} query tokens, got {hidden_states.shape[0]}"
             )
         embeddings = self.ple_embedding(
             hidden_states,
@@ -2830,6 +3185,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             embeddings, self.prefix + ":02_embeddings", diagnostic
         )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+        if hc_sequence_parallel:
+            from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+
+            # Lookup/offload keeps its full-row ABI. Projection, gate and
+            # grouped norms are row independent and need only this TP owner.
+            embeddings = hc_sequence_shard_rows(embeddings)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
@@ -2850,12 +3211,28 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         normalized = snapshot_ple_diagnostic(
             normalized, self.prefix + ":07_conv_input", diagnostic
         )
-        conv_output = torch.zeros_like(normalized)
-        torch.ops.vllm.qwen4_exp_ple_short_conv(
-            normalized,
-            conv_output,
-            self.prefix,
-        )
+        if hc_sequence_parallel:
+            from vllm.distributed import get_tp_group
+
+            # Convolution and its commit retain the original complete query,
+            # segment metadata, causal history and state owner. Padding is not
+            # committed; the returned residual is local again.
+            normalized = get_tp_group().all_gather(normalized, dim=0)[
+                : input_ids.shape[0]
+            ]
+        if hc_sequence_parallel:
+            # Each TP owner emits only its residual rows. The existing family
+            # still reads the full causal input and commits every base state.
+            conv_output = torch.ops.vllm.qwen4_exp_ple_short_conv_rows(
+                normalized, self.prefix, get_tp_group().rank_in_group, 4
+            )
+        else:
+            conv_output = torch.zeros_like(normalized)
+            torch.ops.vllm.qwen4_exp_ple_short_conv(
+                normalized,
+                conv_output,
+                self.prefix,
+            )
         conv_output = snapshot_ple_diagnostic(
             conv_output, self.prefix + ":08_conv_output", diagnostic
         )
@@ -2878,6 +3255,62 @@ def qwen4_exp_ple_short_conv_fake(
     layer_name: str,
 ) -> None:
     return
+
+
+def qwen4_exp_ple_short_conv_result(
+    inputs: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    result = layer._short_conv(inputs)
+    if result.shape == inputs.shape:
+        return result
+    # Keep the old initialized-padding contract for padded or profiling calls.
+    output = torch.zeros_like(inputs)
+    output[: result.shape[0]].copy_(result)
+    return output
+
+
+def qwen4_exp_ple_short_conv_result_fake(inputs, layer_name):
+    return torch.empty_like(inputs)
+
+
+def _ple_output_rows(result, start, rows):
+    if rows is None:
+        return result
+    output = result.new_zeros((rows, result.shape[1]))
+    count = max(0, min(rows, result.shape[0] - start))
+    output[:count].copy_(result[start : start + count])
+    return output
+
+
+def qwen4_exp_ple_short_conv_rows(
+    inputs: torch.Tensor, layer_name: str, rank: int, parts: int
+) -> torch.Tensor:
+    if parts < 1 or not 0 <= rank < parts:
+        raise ValueError("PLE output owner must be inside its partition range")
+    rows = (inputs.shape[0] + parts - 1) // parts
+    layer = get_forward_context().no_compile_layers[layer_name]
+    return layer._short_conv(inputs, output_start=rank * rows, output_rows=rows)
+
+
+def qwen4_exp_ple_short_conv_rows_fake(inputs, layer_name, rank, parts):
+    if parts < 1 or not 0 <= rank < parts:
+        raise ValueError("PLE output owner must be inside its partition range")
+    return inputs.new_empty(((inputs.shape[0] + parts - 1) // parts, inputs.shape[1]))
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_short_conv_rows",
+    op_func=qwen4_exp_ple_short_conv_rows,
+    fake_impl=qwen4_exp_ple_short_conv_rows_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_short_conv_result",
+    op_func=qwen4_exp_ple_short_conv_result,
+    fake_impl=qwen4_exp_ple_short_conv_result_fake,
+)
 
 
 def qwen4_exp_compute_ple_ngram_ids(

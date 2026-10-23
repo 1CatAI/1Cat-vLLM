@@ -505,6 +505,72 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    expert_storage: Literal["canonical", "original"] = "canonical"
+    """Keep canonical expert banks or use the packaged original-block fallback.
+
+    Original storage avoids retaining both canonical and original expert banks.
+    It trades the calibrated TurboMind expert schedules for the native fallback
+    and covers TP boundaries with original blocks and zero activation padding.
+    """
+
+    expert_arena: bool = False
+    """Allocate original expert banks together before transient dense weights.
+    This avoids interleaving permanent expert banks with loading temporaries.
+    """
+
+    expert_trace_tokens: int = Field(default=0, ge=0)
+    """Diagnostic: record decode routing in a per-layer ring of this many
+    tokens (and prefill expert histograms) for sizing an expert cache. Off at 0."""
+
+    expert_cache_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Keep only this fraction of each layer's routed experts in GPU slots and
+    the rest in pinned host memory (requires ``expert_arena``). Decode misses
+    are copied in by a native host thread while the step waits in-graph; LRU
+    keeps the slots hot. Prefill assembles each layer's full bank. Off at 0."""
+
+    expert_cache_spare_slots: int = Field(default=8, ge=1, le=64)
+    """Free GPU slots kept per layer so decode misses never wait on eviction."""
+
+    expert_cache_host_slack: float = Field(default=0.1, ge=0.0, le=1.0)
+    """Extra host slots per layer, as a fraction of experts, that keep copies
+    of resident experts so evicting them needs no device-to-host copy."""
+
+    expert_cache_profile: str | None = None
+    """Optional ``[layers, experts]`` routing-count tensor (torch.save) that
+    picks the initially resident experts; otherwise the lowest expert ids."""
+
+    expert_cache_prefill: Literal["turbomind", "mmq"] = "turbomind"
+    """Prefill with an expert cache: ``turbomind`` transcodes each layer's
+    experts (GPU slots and host arena) into canonical banks on side streams,
+    one layer ahead, and runs TurboMind grouped GEMMs with fused gate/up SiLU;
+    ``mmq`` assembles the original bank and runs the upstream MMQ kernels."""
+
+    expert_cache_prefill_tokens: int = Field(default=4096, ge=256)
+    """Tokens per TurboMind MoE sub-batch within a prefill chunk. The layer's
+    banks are transcoded once per chunk; sub-batches bound the routed
+    activations (about 50 KiB per token at top-10)."""
+    expert_load_prefetch_banks: int = Field(default=4, ge=1, le=4)
+    """Banks queued in pinned host memory during original expert loading.
+    One reduces startup transient reservation; runtime expert placement,
+    weights and computation remain unchanged."""
+
+    expert_cache_prefill_prepare: Literal["all", "predict", "predict_resident"] = "all"
+    """TurboMind preparation: ``predict`` prefetches a previous pass's active
+    experts and completes all current-route misses from mapped host memory.
+    Eager SM70 batches of4096--8192 rows and at most512 experts qualify;
+    capture and other inputs retain complete-bank preparation. Expert bytes
+    and arithmetic are unchanged. ``predict_resident`` additionally admits
+    completed routing hints into the existing LRU slots through DMA, retaining
+    the configured GPU/host budget. Default ``all`` retains full DMA."""
+
+    dense_storage: Literal["canonical", "original"] = "canonical"
+    """Keep calibrated canonical projections or dispatch original packed rows."""
+
+    embedding_storage: Literal["dense", "original"] = "dense"
+    """Keep a dense token embedding or decode its original GGUF rows on lookup."""
+    dequant_workspace_bytes: int = Field(default=32 * 1024**2, ge=1024**2)
+    """Bound dequantized matrix chunks for the original dense storage policy."""
+
     projection_planes: bool = True
     """Use measured M8 shared-activation projection planes with canonical fallback."""
 
@@ -684,6 +750,10 @@ class KernelConfig:
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
+    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
+    sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
+    """Read the FP16 checkpoint router directly or retain its packed duplicate."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -727,9 +797,22 @@ class KernelConfig:
     order) spread evenly across TP ranks; 0 keeps the full vocabulary. Only
     the draft proposal changes; verification still uses the full head."""
 
+    sm70_draft_hot_vocab_ids: str = ""
+    """Optional file of token ids ranked most frequent first (.npy or one id
+    per line). With ``sm70_draft_hot_vocab`` > 0, the draft keeps the first
+    that many ranked ids, each rank reading its own vocabulary shard."""
+
     sm70_draft_single_graph: bool = False
     """Capture all MTP draft decode steps, including their slot mappings and
     attention metadata, as one CUDA graph instead of one replay per step."""
+    sm70_mtp_lossless_storage: bool = False
+    """Store BF16-origin FP16 MTP expert values in exact 13-bit planes on SM70
+    TP4. Preserve subnormals, signed zero and FP32 accumulation; reject weights
+    outside the lossless representation instead of requantizing."""
+
+    sm70_mtp_q8_0_experts: bool = False
+    """Store MTP draft experts as GGUF Q8_0 (about half of FP16). Drafts only
+    propose tokens, so this can change acceptance but never verified output."""
 
     sm70_top1x: bool = False
     """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
@@ -739,13 +822,48 @@ class KernelConfig:
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
     gathering full-vocabulary logits for the rejection sampler."""
 
+    sm70_sparse_target_sampling: bool = False
+    """Verify argmax drafts of top-k 20 sampled requests from TP-local target
+    candidates (merged global top-k) instead of full-vocabulary logits and the
+    dense sampler. Exact: requests with an ambiguous top-k/top-p cutoff fall
+    back to the full-vocabulary sampler."""
+
+    sm70_sparse_target_reference_check: bool = True
+    """With sparse target sampling, copy the candidates to the host each round
+    and send requests with an ambiguous cutoff (score ties at top-k, a top-p
+    boundary within rounding) to the full-vocabulary sampler, for bit-exact
+    agreement with it. Off: no host synchronization; those rare boundary cases
+    are decided on the compact candidates (ties within the 64-candidate probe
+    are kept in vocabulary order), still a valid top-k/top-p sample."""
+
     sm70_gdn_verify: bool = False
     """Run single-request MTP GDN verification with the SM70 sequential CUDA
     recurrence instead of the Triton fused kernel."""
+    sm70_gdn_spec_replay: bool = False
+    """Commit speculative GDN states by replay (MTP on SM70).
+
+    The native verifier reads each request's committed recurrent state,
+    replays the previous round's accepted tokens and stores no per-position
+    states, so requests hold no speculative state blocks. Requires
+    sm70_gdn_verify and mamba_cache_mode='align'. Results are identical to
+    per-position state storage."""
+
+    @property
+    def gdn_spec_replay(self) -> bool:
+        """Platform-neutral view of ``sm70_gdn_spec_replay`` for generic GDN
+        and Mamba layers."""
+        return self.sm70_gdn_spec_replay
 
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
+
+    sm70_hcx_local_schedule: bool = False
+    """Experimentally delay HC up-weight prefetch and distribute gate-mix for
+    full-mesh TP4 HCX, including fused Q4_K/Q6_K output projection when its
+    input normalization is already complete. Keeps the reference arithmetic
+    order. Opt in before graph capture; full-model quality
+    qualification remains pending."""
 
     sm70_hcx_output_projection: bool = True
     """Fuse eligible output projections into HCX when HCX is enabled. Disable
@@ -759,6 +877,13 @@ class KernelConfig:
     """Attend densely, without index selection, in context-bucketed decode graphs
     whose bucket does not exceed the indexer budget (where QSA selects every
     visible token)."""
+
+    sm70_turbomind_workspace_bytes: int = Field(
+        default=32 * 1024**2, ge=1024**2, le=32 * 1024**2, multiple_of=256
+    )
+    """Per-stream FP32 split-K scratch bound in the engine-owned TurboMind
+    runtime. Candidate selection respects the available scratch capacity.
+    """
 
     qsa_auto_e4m3: bool = True
     """Default eligible calibrated QSA caches to E4M3 without speculation."""
@@ -780,8 +905,55 @@ class KernelConfig:
     """Preserve speculative cache precision independently of target storage."""
     qsa_host_kv_device_reference: bool = False
     """Keep identical encoded history on device for controlled placement A/B."""
+    sm70_qsa_host_native: bool = True
+    """With host-authoritative QSA history, run the native SM70 attention:
+    selected pages resolve into the device hot cache, hot tokens are read on
+    device and the remainder directly from mapped host history."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_hot_dtype: Literal["float16", "fp8_e4m3"] = "float16"
+    """Target hot storage; encoded E4M3 requires E4M3 authoritative history.
+    Encoded hot reads round to the same FP16 operands as the decoded cache."""
+    qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
+    """Optional independent draft hot capacity; None preserves target capacity."""
+    qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
+    """Shared host-miss staging capacity; larger batches use bounded row chunks."""
+    qsa_host_kv_share_replicas: bool = True
+    """TP ranks holding the same replicated KV head share one host history pool
+    (shared memory) instead of keeping identical copies."""
+    qsa_host_kv_prefill_stage_tokens: int = Field(default=0, ge=0)
+    """Prefill with host KV: copy each request's whole history for a layer to
+    one shared device buffer (DMA, once per layer and chunk) and read it there,
+    instead of resolving every query row's selection through the hot cache and
+    mapped host memory (re-reading the same history per row over PCIe).
+    Byte budget in E4M3-equivalent K/V tokens (0.5 KiB each at D256), shared
+    by all layers and rounded down to complete pages. FP16 draft history fits
+    half as many tokens in the same buffer; scales use additional storage.
+    Histories exceeding that capacity keep the hot-cache path. 0 disables it."""
+    qsa_host_kv_prefill_stage_slots: int = Field(default=2, ge=1, le=2)
+    """Shared prefix staging buffers. One slot reuses the current layer's
+    buffer after its attention completion event; prefetch still overlaps the
+    following non-QSA computation. Two preserves the alternating layout."""
+    qsa_host_kv_trim_warmup_cache: bool = False
+    """Return unused allocator pages once after host-QSA kernel/graph warmup.
+    Active tensors and captured private pools remain owned; inference does
+    not trim pages. This initialization resource policy does not change
+    compiled model computation."""
+    qsa_host_kv_allocator_headroom_mib: int = Field(default=0, ge=0, le=4096)
+    """Device bytes kept outside the Torch allocator after host-QSA warmup.
+    MiB units; zero retains the existing allocator policy. This reservation
+    limit preserves active tensors and graph pools and may reject workloads
+    whose retained allocations cannot fit. It does not change computation."""
+    qsa_host_indexer_history: bool = False
+    """Keep the FP16 compressed indexer history and its co-owned compressor
+    state in mapped host storage when QSA host KV is active. Exact score
+    readers retain their arithmetic; host traffic is measured separately."""
+    qsa_host_kv_state_blocks: int = Field(default=0, ge=0)
+    """Bound the recurrent-state ID range with authoritative host KV.
+
+    Zero retains the shared capacity. A nonzero pool retains active states and
+    bounded prefix checkpoints while history IDs use a separate range.
+    """
     qsa_host_kv_active: bool = Field(default=False, init=False)
     """Whether the host QSA cache geometry has been admitted."""
     qsa_host_kv_reason: str | None = Field(default=None, init=False)
@@ -793,6 +965,8 @@ class KernelConfig:
     """Release file-backed PLE mappings after gathers to reduce resident RAM."""
     ple_disk_row_gather: bool = True
     """Admit byte-preserving native CPU gathers for retained mapped PLE rows."""
+    ple_disk_only: bool = False
+    """Keep PLE tables on disk with only a sentinel row in each rank's staging."""
     ple_disk_row_readers: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
@@ -802,6 +976,14 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_fast_lane: bool = True
+    """Serve eligible CPU PLE requests from a native owner thread."""
+    ple_draft_prefetch: bool = True
+    """Read PLE table pages of drafted tokens into page cache while drafting."""
+    ple_row_cache_mib: int = Field(default=1536, ge=0)
+    """Packed-row cache (MiB) for CPU-owned GGUF PLE: the native fast lane's
+    cache when it serves requests, otherwise the mapped row reader's."""
+
     ple_pinned_decode: bool = True
     """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
     ple_pinned_decode_active: bool = Field(default=False, init=False)
@@ -810,6 +992,13 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed pinned row decoder admission, capacity and fallback reasons."""
+
+    ple_packed_gguf_results: bool = True
+    """Transfer eligible CPU-owned GGUF PLE rows without CPU dequantization."""
+    ple_packed_result_decoders: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed packed result geometry and decoder fallback reasons."""
 
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
@@ -918,19 +1107,30 @@ class KernelConfig:
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
             "collective_kernel_selections",
+            "sm70_hcx_local_schedule",  # Native dispatch inside the opaque HC op.
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
             "ple_pinned_decoders",
+            "ple_packed_result_decoders",
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
+            "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
+            "ple_draft_prefetch",  # Page-cache readahead; results unchanged
+            "ple_fast_lane",  # Same packed rows through a native owner thread
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",
+            "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
+            "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
         }
+        if not self.qsa_host_kv_prefill_stage_tokens or not (
+            self.qsa_host_kv or self.qsa_host_kv_active
+        ):
+            ignored_factors.add("qsa_host_kv_prefill_stage_slots")
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
         if not self.fused_fp16_aux_gemv_applicable:
@@ -980,6 +1180,14 @@ class KernelConfig:
                 entries.pop("active", None)
                 entries.pop("sources", None)
                 entries.pop("legacy", None)
+                if family == "gguf":
+                    entries.pop("expert_load_prefetch_banks", None)
+                if family == "gguf" and (
+                    self.sm70_gguf.expert_cache_fraction <= 0
+                    or self.sm70_gguf.expert_cache_prefill != "turbomind"
+                    or self.sm70_gguf.expert_cache_prefill_prepare == "all"
+                ):
+                    entries.pop("expert_cache_prefill_prepare", None)
                 for field, alias in getattr(
                     getattr(self, name), "loader_aliases", {}
                 ).items():

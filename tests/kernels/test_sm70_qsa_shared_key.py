@@ -64,22 +64,58 @@ def test_causal_scores_selection_and_changed_input_graph(rows, strided, position
             assert torch.equal(got_ids.sort().values, ref_ids.sort().values)
 
 
-def test_c4_falls_back_without_changing_scores():
+@pytest.mark.parametrize(
+    "counts", [(5, 5), (5, 5, 5, 5), (5,) * 8, (1, 12, 5), (3, 9, 0, 2)]
+)
+def test_multi_request_scores_match_and_graph_replay(counts):
+    """Each request scores only its own pages and causal prefix."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 required")
-    q = torch.randn(20, 4, 128, device="cuda", dtype=torch.float16)
-    cache = torch.randn(128, 16, 1, 128, device="cuda", dtype=torch.float16)
-    table = torch.arange(128, device="cuda", dtype=torch.int32).view(4, 32)
-    req = torch.arange(20, device="cuda", dtype=torch.int32) // 5
-    pos = torch.full((20,), 1024, device="cuda", dtype=torch.int64)
-    lengths = torch.full((4,), 1025, device="cuda", dtype=torch.int32)
+    assert load_operator()
+    torch.manual_seed(77 + len(counts))
+    nreq, rows, width = len(counts), sum(counts), 64
+    q = torch.randn(rows + 2, 4, 128, device="cuda", dtype=torch.float16)
+    cache = torch.randn(nreq * width, 16, 1, 128, device="cuda", dtype=torch.float16)
+    table = torch.randperm(nreq * width, device="cuda", dtype=torch.int32)
+    table = table.view(nreq, width).contiguous()
+    owners = [r for r, c in enumerate(counts) for _ in range(c)]
+    req = torch.tensor(owners + [-1, -1], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor(
+        [700 + 97 * r for r in range(nreq)], device="cuda", dtype=torch.int32
+    )
+    starts = [int(lengths[r]) - counts[r] for r in owners]
+    pos = torch.tensor(
+        [s + i for s, i in zip(starts, _ranks(owners))] + [-1, -1],
+        device="cuda",
+        dtype=torch.int64,
+    )
     args = (q, cache, table, req, pos, lengths, 4)
-    assert shared_key_reason(*args[:6]) == "requires_M2_8_H4_D128"
-    expected, ev = qsa_mqa_paged(*args)
-    actual, av = qsa_mqa_paged(*args, shared_key_scoring=True)
-    assert torch.equal(av, ev)
-    mask = torch.arange(actual.shape[1], device="cuda")[None, :] < ev[:, None]
-    assert torch.equal(actual[mask], expected[mask])
+    assert shared_key_reason(*args[:6]) is None
+    qsa_mqa_paged(*args, shared_key_scoring=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual, visible = qsa_mqa_paged(*args, shared_key_scoring=True)
+    for case in range(3):
+        q.normal_()
+        if case == 1:
+            lengths.add_(37)
+            pos[: len(owners)].add_(37)
+        if case == 2:
+            table[0, 3] = -1
+        graph.replay()
+        expected, ev = qsa_mqa_paged(*args)
+        assert torch.equal(visible, ev)
+        mask = torch.arange(actual.shape[1], device="cuda")[None, :] < ev[:, None]
+        torch.testing.assert_close(actual[mask], expected[mask], rtol=2e-6, atol=2e-6)
+
+
+def _ranks(owners):
+    seen: dict[int, int] = {}
+    out = []
+    for o in owners:
+        out.append(seen.get(o, 0))
+        seen[o] = out[-1] + 1
+    return out
 
 
 def test_truncated_score_width_retains_causal_lengths():

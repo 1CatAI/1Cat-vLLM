@@ -163,3 +163,105 @@ def test_inspection_reads_final_kernel_and_preparation_flags():
     assert preparations["variants"]["0"]["flags"] == {"_sm70_qwen38_dense_batch": True}
     assert preparations["variants"]["0"]["prepared_buffers"] == ["_sm70_test_packed"]
     assert preparations["packed_buffer_bytes"] == 0  # CPU buffers are not VRAM.
+
+
+def test_native_gguf_report_reads_prepared_admission():
+    import torch
+
+    from vllm.sm70_profiles.acceleration import loaded_gguf_layers
+
+    method = type("GGUFNativeMoEMethod", (), {})()
+    method.weight_types = {"w1": 21, "w3": 21, "w2": 42}
+    method.dp4a_admitted = True
+    method.native_admission = {
+        "projections": {"w1": {"operator": "ggml_moe_mmvq"}},
+        "small_m_dp4a": {"enabled": True, "storage": "original"},
+    }
+    layer = torch.nn.Module()
+    layer.quant_method = method
+    row = loaded_gguf_layers(layer)[""]
+    assert row["weight_types"] == [21, 21, 42]
+    assert row["original_expert_projections"] == method.native_admission["projections"]
+    assert row["small_m_dp4a"] == method.native_admission["small_m_dp4a"]
+    assert row["acceleration_fallback_reason"] is None
+
+
+def test_cuda_storage_deduplicates_target_draft_and_partial_views():
+    import torch
+
+    from vllm.sm70_profiles.acceleration import loaded_cuda_model_storage
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA storage inspection requires CUDA")
+    weight = torch.empty(64, device="cuda", dtype=torch.float16)
+    target, draft = torch.nn.Module(), torch.nn.Module()
+    target.register_parameter("weight", torch.nn.Parameter(weight))
+    target.register_buffer("partial_view", weight[16:32])
+    target.register_buffer("cpu_metadata", torch.empty(100))
+    draft.register_parameter("shared_weight", target.weight)
+    draft.register_buffer(
+        "own_weight", torch.empty(32, device="cuda", dtype=torch.uint8)
+    )
+    report = loaded_cuda_model_storage({"target": target, "draft": draft})
+    assert report["bytes"] == 160
+    assert len(report["storages"]) == 2
+    assert report["storages"][0]["bytes"] == 128
+    assert report["storages"][0]["names"] == [
+        "target.weight",
+        "target.partial_view",
+        "draft.shared_weight",
+    ]
+
+
+def test_cache_storage_deduplicates_shared_staging_and_owner_aliases():
+    import torch
+
+    from vllm.sm70_profiles.acceleration import loaded_qsa_cache_storage
+
+    shared = torch.empty(64, dtype=torch.uint8)
+    owners = []
+    for reference in (False, True):
+        hot = {
+            key: torch.empty(4, dtype=torch.int32)
+            for key in (
+                "hot_values",
+                "tags",
+                "stamps",
+                "hands",
+                "page_slots",
+                "epoch",
+                "_stats",
+            )
+        }
+        workspace = {
+            key: shared[8:24]
+            for key in (
+                "staging",
+                "remapped",
+                "requests",
+                "positions",
+                "lengths",
+                "initial",
+                "resolved",
+            )
+        }
+        owners.append(
+            NS(
+                host_kv=NS(
+                    **hot,
+                    **workspace,
+                    device_reference=reference,
+                    device_history_workspace=(shared,),
+                    history=torch.empty(32, dtype=torch.uint8),
+                    scales=torch.empty(2),
+                )
+            )
+        )
+    report = loaded_qsa_cache_storage(
+        {"target": owners[0], "alias": owners[0], "draft": owners[1]}
+    )
+    assert report == {
+        "hot_bytes": 224,
+        "workspace_bytes": 64,
+        "device_history_bytes": 40,
+    }

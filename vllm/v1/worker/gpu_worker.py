@@ -516,6 +516,36 @@ class Worker(WorkerBase):
         self.model_runner.reload_weights(*args, **kwargs)
 
     @torch.inference_mode()
+    def _prefill_graph_reserve(self, activation_peak: int) -> int:
+        """Graph pool bytes to keep out of the KV budget without the estimator.
+
+        Graph pools are allocated at capture, after the KV cache. Decode-width
+        pools are small, but capturing prefill sizes (piecewise) needs about a
+        prefill forward's activations; reserve them first so the KV cache only
+        takes what is left. An explicit VLLM_V2_CUDAGRAPH_MEM_MIB wins.
+        """
+        compilation = self.vllm_config.compilation_config
+        if compilation.cudagraph_mode == CUDAGraphMode.NONE:
+            return 0
+        if "VLLM_V2_CUDAGRAPH_MEM_MIB" in os.environ:
+            from vllm.v1.worker.gpu.cudagraph_utils import (
+                get_explicit_cudagraph_memory_reserve,
+            )
+
+            return get_explicit_cudagraph_memory_reserve(compilation.cudagraph_mode)
+        spec = self.vllm_config.speculative_config
+        decode_width = self.vllm_config.scheduler_config.max_num_seqs * (
+            1 + (spec.num_speculative_tokens if spec is not None else 0)
+        )
+        if max(compilation.cudagraph_capture_sizes or [0]) <= decode_width:
+            return 0
+        logger.info(
+            "Reserving %.2f GiB (profiled activation peak) for prefill-size "
+            "CUDA graph pools before sizing the KV cache.",
+            activation_peak / 2**30,
+        )
+        return max(0, activation_peak)
+
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
@@ -590,7 +620,14 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            snapshot_path = os.environ.get("PROFILE_MEMSNAP_PATH")
+            if snapshot_path and self.rank == 0:
+                # Diagnostics: allocation history of the profiling forward.
+                torch.cuda.memory._record_memory_history(max_entries=400000)
             self.model_runner.profile_run()
+            if snapshot_path and self.rank == 0:
+                torch.cuda.memory._dump_snapshot(snapshot_path)
+                torch.cuda.memory._record_memory_history(enabled=None)
 
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
@@ -629,8 +666,8 @@ class Worker(WorkerBase):
         )
         warmup_torch_residual = max(
             0,
-            profile_result.before_profile.torch_memory
-            - self.init_snapshot.torch_memory
+            profile_result.before_profile.torch_allocated_memory
+            - self.init_snapshot.torch_allocated_memory
             - profile_result.weights_memory,
         )
         profile_result.non_kv_cache_memory = (
@@ -645,7 +682,7 @@ class Worker(WorkerBase):
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
             if graph_policy(self.vllm_config).estimate_graph_memory
-            else 0
+            else self._prefill_graph_reserve(profile_result.torch_peak_increase)
         )
 
         self.non_torch_memory = profile_result.non_torch_increase
@@ -687,6 +724,22 @@ class Worker(WorkerBase):
         logger.info_once(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),
+        )
+        logger.info(
+            "GPU startup budget bytes: requested=%d weights=%d activation_peak=%d "
+            "warmup_live=%d idle_reserved=%d non_torch=%d graph=%d kv=%d",
+            self.requested_memory,
+            profile_result.weights_memory,
+            profile_result.torch_peak_increase,
+            warmup_torch_residual,
+            max(
+                0,
+                profile_result.before_profile.torch_memory
+                - profile_result.before_profile.torch_allocated_memory,
+            ),
+            profile_result.non_torch_increase,
+            cudagraph_memory_estimate_applied,
+            self.available_kv_cache_memory_bytes,
         )
 
         if cudagraph_memory_estimate > 0:
@@ -831,6 +884,7 @@ class Worker(WorkerBase):
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+        self.cudagraph_memory_bytes = cuda_graph_memory_bytes
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -945,10 +999,68 @@ class Worker(WorkerBase):
 
         activate_triton_jit_monitor()
 
+        self._trim_qsa_warmup_cache()
+        self._release_compile_artifact_records()
+
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    @staticmethod
+    def _release_compile_artifact_records() -> int:
+        """Drop torch's in-memory copies of loaded compile artifacts.
+
+        Torch records every loaded FX-graph artifact (pickled bytes) for
+        ``torch.compiler.save_cache_artifacts``; vLLM keeps its own compile
+        cache and never calls it, so after warmup the records only hold host
+        memory (~140 MiB per worker on Flash-Next).
+        """
+        try:
+            from torch.compiler._cache import CacheArtifactManager
+        except ImportError:
+            return 0
+        released = sum(
+            len(getattr(artifact, "content", b"") or b"")
+            for artifact in CacheArtifactManager._seen_artifacts
+        )
+        CacheArtifactManager.clear()
+        if released:
+            logger.info(
+                "Released %.1f MiB of recorded compile artifacts.", released / 2**20
+            )
+        return released
+
+    def _trim_qsa_warmup_cache(self) -> bool:
+        """Release unused warmup pages after all active buffers are prepared."""
+        policy = self.vllm_config.kernel_config
+        if not (
+            policy.qsa_host_kv_trim_warmup_cache
+            or policy.qsa_host_kv_allocator_headroom_mib
+        ):
+            return False
+        if not any(
+            getattr(module, "host_kv", None) is not None
+            for module in self.compilation_config.static_forward_context.values()
+        ):
+            return False
+        if policy.qsa_host_kv_trim_warmup_cache:
+            torch.accelerator.empty_cache()
+            logger.info(
+                "Returned unused host-QSA warmup allocator pages; "
+                "active buffers and captured private pools remain owned."
+            )
+        if policy.qsa_host_kv_allocator_headroom_mib:
+            limit = current_platform.limit_allocator_headroom(
+                policy.qsa_host_kv_allocator_headroom_mib * 1024**2, self.device
+            )
+            logger.info(
+                "Host-QSA Torch allocator limit=%d bytes; requested "
+                "headroom=%d MiB beyond measured non-Torch use.",
+                limit,
+                policy.qsa_host_kv_allocator_headroom_mib,
+            )
+        return True
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
@@ -959,8 +1071,11 @@ class Worker(WorkerBase):
     def get_sm70_acceleration_report(self) -> dict:
         """Read local selector decisions without rerunning capability probes."""
         from vllm.sm70_profiles.acceleration import (
+            loaded_cuda_model_storage,
             loaded_gguf_layers,
             loaded_linear_kernels,
+            loaded_native_workspace,
+            loaded_qsa_cache_storage,
             loaded_sm70_preparations,
         )
 
@@ -977,6 +1092,8 @@ class Worker(WorkerBase):
             if manager is None
             else manager.cudagraph_mode
         )
+        snapshot = MemorySnapshot(device=self.device)
+        cache = self.model_runner.kv_cache_config
         report = {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
@@ -991,6 +1108,9 @@ class Worker(WorkerBase):
             "ple_result_transports": transports,
             "ple_disk_row_readers": row_readers,
             "ple_pinned_decoders": self.vllm_config.kernel_config.ple_pinned_decoders,
+            "ple_packed_result_decoders": (
+                self.vllm_config.kernel_config.ple_packed_result_decoders
+            ),
             "ple_pinned_tables": [
                 {
                     "layer": name,
@@ -1003,6 +1123,43 @@ class Worker(WorkerBase):
             ],
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),
+            "registered_model_storage": loaded_cuda_model_storage(
+                {
+                    "target": self.model_runner.model,
+                    "draft": getattr(
+                        getattr(self.model_runner, "speculator", None)
+                        or getattr(self.model_runner, "drafter", None),
+                        "model",
+                        None,
+                    ),
+                }
+            ),
+            "memory_accounting": {
+                "torch_allocated_bytes": torch.accelerator.memory_allocated(
+                    self.device
+                ),
+                "torch_reserved_bytes": snapshot.torch_memory,
+                "driver_used_bytes": snapshot.cuda_memory,
+                "driver_non_torch_bytes": snapshot.non_torch_memory,
+                "model_load_delta_bytes": self.model_runner.model_memory_usage,
+                "device_cache_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if not t.host_backed
+                ),
+                "host_cache_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if t.host_backed
+                ),
+                "recurrent_state_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if t.physical_num_blocks
+                ),
+                "graph_capture_delta_bytes": getattr(
+                    self, "cudagraph_memory_bytes", None
+                ),
+                "turbomind_workspace": loaded_native_workspace(self.vllm_config),
+                "qsa": loaded_qsa_cache_storage(
+                    self.compilation_config.static_forward_context
+                ),
+                "scope": "post_warmup; graph_delta_may_overlap_registered_workspaces",
+            },
             "model_input_preparation": {
                 "scope": "model_state_capability",
                 "full_graph_phase": (

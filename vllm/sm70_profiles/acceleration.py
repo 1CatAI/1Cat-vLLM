@@ -14,6 +14,7 @@ from vllm import envs
 from vllm.config.execution_policy import graph_policy, layer_policy
 from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
+from vllm.utils.mem_utils import loaded_cuda_model_storage as loaded_cuda_model_storage
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -129,12 +130,15 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "GGUFLinearMethod",
             "GGUFEmbeddingMethod",
             "GGUFMoEMethod",
+            "GGUFNativeMoEMethod",
         ):
             continue
         descriptor = getattr(layer, "qweight_type", None)
         types = list(getattr(descriptor, "shard_weight_type", {}).values())
         if descriptor is not None and not types:
             types = [getattr(descriptor, "weight_type", None)]
+        if not types:
+            types = list(getattr(method, "weight_types", {}).values())
         layout = getattr(method, "layout", None)
         candidates = getattr(method, "native_admission", {}).get(
             "canonical_projections", ()
@@ -172,6 +176,13 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "single_projection": getattr(method, "native_admission", {}).get(
                 "single_projection"
             ),
+            "original_expert_projections": getattr(method, "native_admission", {}).get(
+                "projections"
+            ),
+            "original_prefill_projections": getattr(method, "native_admission", {}).get(
+                "prefill_projections"
+            ),
+            "small_m_dp4a": getattr(method, "native_admission", {}).get("small_m_dp4a"),
             "canonical_projections": [
                 projection.admission()
                 for projection in getattr(method, "canonical_projections", ())
@@ -179,6 +190,7 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "acceleration_fallback_reason": (
                 None
                 if getattr(method, "canonical_projections", ())
+                or getattr(method, "dp4a_admitted", False)
                 else next(
                     (p["reason"] for p in candidates if p.get("reason")),
                     "gguf_turbomind_repack_not_integrated",
@@ -187,6 +199,54 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "scope": "prepared_gguf_storage_and_operator_capability",
         }
     return result
+
+
+def loaded_qsa_cache_storage(forward_context: Mapping[str, Any]) -> dict[str, int]:
+    """Read actual QSA cache backing, deduplicating shared staging buffers."""
+    seen = set()
+    totals = {"hot_bytes": 0, "workspace_bytes": 0, "device_history_bytes": 0}
+    for module in forward_context.values():
+        state = getattr(module, "host_kv", None)
+        if state is None:
+            continue
+        categories = {
+            "hot_bytes": [
+                getattr(state, key)
+                for key in (
+                    "hot_values",
+                    "tags",
+                    "stamps",
+                    "hands",
+                    "page_slots",
+                    "epoch",
+                    "_stats",
+                )
+            ],
+            "workspace_bytes": [
+                getattr(state, key)
+                for key in (
+                    "staging",
+                    "remapped",
+                    "requests",
+                    "positions",
+                    "lengths",
+                    "initial",
+                    "resolved",
+                )
+            ]
+            + list(state.device_history_workspace or ()),
+            "device_history_bytes": [state.history, state.scales]
+            if state.device_reference
+            else [],
+        }
+        for category, tensors in categories.items():
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                identity = (str(tensor.device), storage.data_ptr())
+                if storage.nbytes() and identity not in seen:
+                    seen.add(identity)
+                    totals[category] += storage.nbytes()
+    return totals
 
 
 def loaded_sm70_preparations(model) -> dict[str, Any]:
@@ -577,6 +637,13 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
         "attention_staging_dtype": "float16",
         "recurrent_state_storage": "device",
+        "compressed_indexer_history_storage": (
+            "host"
+            if cfg.kernel_config.qsa_host_indexer_history
+            and cfg.kernel_config.qsa_host_kv_active
+            and not cfg.kernel_config.qsa_host_kv_device_reference
+            else "device"
+        ),
     }
     device_history_reason = None
     if not cfg.kernel_config.sm70_qsa_device_history:
@@ -957,3 +1024,26 @@ def log_and_validate(cfg: VllmConfig) -> dict[str, Any]:
             "SM70 profile acceleration requirement failed: " + "; ".join(failures)
         )
     return report
+
+
+def loaded_native_workspace(config) -> dict | None:
+    """Read scratch allocations under the worker's native resource owner."""
+    import torch
+
+    from vllm._sm70.runtime import bind_native_runtime
+    from vllm.config import set_current_vllm_config
+
+    query = getattr(torch.ops._C, "sm70_gemm_workspace_storage", None)
+    if query is None:
+        return None
+    with set_current_vllm_config(config):
+        owner = bind_native_runtime()
+        if owner is None:
+            return None
+        with owner.activate():
+            streams, partials, total = query()
+    return {
+        "streams": streams,
+        "partials_bytes_per_stream": partials,
+        "total_bytes": total,
+    }

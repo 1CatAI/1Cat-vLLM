@@ -222,7 +222,7 @@ def fused_topk(
     if scoring_func == "softmax":
         if (
             moe_routing_policy().value("exact_topk")
-            and 1 <= M <= 16
+            and 1 <= M <= 64
             and gating_output.shape == (M, 512)
             and gating_output.dtype == torch.float16
             and gating_output.is_contiguous()

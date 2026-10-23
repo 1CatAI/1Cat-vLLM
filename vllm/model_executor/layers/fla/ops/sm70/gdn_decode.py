@@ -25,7 +25,9 @@ class FlashQlaDecodeAdmission:
     device_index: int | None = None
 
     @classmethod
-    def bind(cls, heads, enabled):
+    def bind(cls, heads, enabled, *, device=None):
+        if not enabled or (device is not None and device.type != "cuda"):
+            return cls(heads, False, None)
         capability = (
             torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         )

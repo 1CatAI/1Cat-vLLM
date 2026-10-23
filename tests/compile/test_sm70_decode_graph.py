@@ -105,10 +105,9 @@ def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper() -> Non
 
     assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
 
+    # The vision tower only feeds prefill; decode keeps the same lane.
     model_config.multimodal_config.language_model_only = False
-    assert not _is_sm70_qwen38_decode_compile_contract(
-        model_config, None, parallel_config
-    )
+    assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
 
     model_config.multimodal_config = None
     assert not _is_sm70_qwen38_decode_compile_contract(
@@ -173,7 +172,7 @@ def test_qwen38_exact_gated_norm_preserves_explicit_override(monkeypatch):
         "device",
         "model",
         "dtype",
-        "multimodal",
+        "no_multimodal_config",
     ],
 )
 def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch):
@@ -183,8 +182,8 @@ def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch
         cfg.model_config.architectures = ("LlamaForCausalLM",)
     elif mismatch == "dtype":
         cfg.model_config.dtype = torch.bfloat16
-    elif mismatch == "multimodal":
-        cfg.model_config.multimodal_config.language_model_only = False
+    elif mismatch == "no_multimodal_config":
+        cfg.model_config.multimodal_config = None
     defaults = make_policy_defaults()
     assert (
         _apply_sm70_qwen38_decode_defaults(
