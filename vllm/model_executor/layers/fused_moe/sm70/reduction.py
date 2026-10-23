@@ -103,7 +103,7 @@ def weighted_reduce_rows(
     topk_weights: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """GGUF/skinny slot-major reduction with their existing FP32 semantics.
+    """GGUF slot-major reduction with its existing FP32 semantics.
 
     Keep multiply before sum and cast only the final sum; this is deliberately
     separate from the ordered Triton and FP16 per-expert index-add paths.
