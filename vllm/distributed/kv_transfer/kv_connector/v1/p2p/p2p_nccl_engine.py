@@ -414,8 +414,21 @@ class P2pNcclEngine:
                             dtype=getattr(torch, data["dtype"]),
                             device=self.device,
                         )
+                    _cr = self.comms.get(remote_address.decode())
+                    if _cr is None:
+                        # The peer restarted and lost its NCCL comm; reply
+                        # with an error so the sender can move on instead of
+                        # blocking forever, and do not kill this listener.
+                        self.router_socket.send_multipart([remote_address, b"1"])
+                        logger.warning(
+                            "PUT from unknown comm %s (peer restarted?),"
+                            " replied error", remote_address.decode())
+                        with self.recv_store_cv:
+                            self.recv_store[tensor_id] = None
+                            self.recv_store_cv.notify()
+                        continue
                     self.router_socket.send_multipart([remote_address, b"0"])
-                    comm, rank = self.comms[remote_address.decode()]
+                    comm, rank = _cr
                     self.recv(comm, tensor, rank ^ 1, self.recv_stream)
                     tensor_size = tensor.element_size() * tensor.numel()
                     if self.buffer_size + tensor_size > self.buffer_size_threshold:
