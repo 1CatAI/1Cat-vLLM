@@ -1,0 +1,604 @@
+{
+ "vllm/_custom_ops.py": {
+  "env": 1
+ },
+ "vllm/_sm70/loader.py": {
+  "env": 11
+ },
+ "vllm/benchmarks/startup.py": {
+  "env": 4
+ },
+ "vllm/compilation/breakable_cudagraph.py": {
+  "platform": 4
+ },
+ "vllm/compilation/cuda_graph.py": {
+  "platform": 4
+ },
+ "vllm/compilation/passes/fusion/allreduce_rms_fusion.py": {
+  "model": 1,
+  "platform": 83
+ },
+ "vllm/compilation/passes/fusion/sequence_parallelism.py": {
+  "platform": 6
+ },
+ "vllm/compilation/passes/utility/fix_functionalization.py": {
+  "platform": 18
+ },
+ "vllm/config/attention.py": {
+  "platform": 2
+ },
+ "vllm/config/cache.py": {
+  "platform": 3
+ },
+ "vllm/config/compilation.py": {
+  "model": 3
+ },
+ "vllm/config/observability.py": {
+  "platform": 1
+ },
+ "vllm/config/parallel.py": {
+  "env": 1
+ },
+ "vllm/config/speculative.py": {
+  "model": 140,
+  "platform": 16
+ },
+ "vllm/config/vllm.py": {
+  "env": 16,
+  "model": 171,
+  "platform": 314
+ },
+ "vllm/distributed/communication_op.py": {
+  "platform": 6
+ },
+ "vllm/distributed/device_communicators/cpu_communicator.py": {
+  "env": 1
+ },
+ "vllm/distributed/device_communicators/cuda_communicator.py": {
+  "model": 2,
+  "platform": 60
+ },
+ "vllm/distributed/device_communicators/custom_all_reduce.py": {
+  "model": 22,
+  "platform": 83
+ },
+ "vllm/distributed/parallel_state.py": {
+  "platform": 57
+ },
+ "vllm/engine/arg_utils.py": {
+  "model": 14,
+  "platform": 31
+ },
+ "vllm/entrypoints/cli/video.py": {
+  "model": 2,
+  "platform": 4
+ },
+ "vllm/entrypoints/openai/api_server.py": {
+  "env": 1,
+  "platform": 1
+ },
+ "vllm/entrypoints/serve/__init__.py": {
+  "platform": 3
+ },
+ "vllm/entrypoints/utils.py": {
+  "env": 1
+ },
+ "vllm/env_override.py": {
+  "env": 2
+ },
+ "vllm/kernels/helion/utils.py": {
+  "platform": 9
+ },
+ "vllm/model_executor/kernels/linear/__init__.py": {
+  "platform": 30
+ },
+ "vllm/model_executor/kernels/linear/fp16_gemv_silu.py": {
+  "platform": 4
+ },
+ "vllm/model_executor/kernels/mhc/tilelang.py": {
+  "model": 1,
+  "platform": 70
+ },
+ "vllm/model_executor/kernels/mhc/tilelang_kernels.py": {
+  "platform": 2
+ },
+ "vllm/model_executor/kernels/mhc/triton.py": {
+  "model": 1,
+  "platform": 36
+ },
+ "vllm/model_executor/kernels/ple/ngram.py": {
+  "platform": 7
+ },
+ "vllm/model_executor/layers/attention/attention.py": {
+  "model": 1,
+  "platform": 14
+ },
+ "vllm/model_executor/layers/attention/mla_attention.py": {
+  "model": 3,
+  "platform": 2
+ },
+ "vllm/model_executor/layers/batch_invariant.py": {
+  "env": 2
+ },
+ "vllm/model_executor/layers/fla/ops/chunk_delta_h.py": {
+  "env": 1,
+  "platform": 10
+ },
+ "vllm/model_executor/layers/fla/ops/chunk_o.py": {
+  "env": 1,
+  "platform": 9
+ },
+ "vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py": {
+  "env": 1,
+  "platform": 8
+ },
+ "vllm/model_executor/layers/fla/ops/fused_recurrent.py": {
+  "env": 1,
+  "platform": 50
+ },
+ "vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py": {
+  "env": 1,
+  "model": 22,
+  "platform": 45
+ },
+ "vllm/model_executor/layers/fla/ops/kda.py": {
+  "env": 1,
+  "platform": 7
+ },
+ "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py": {
+  "platform": 1
+ },
+ "vllm/model_executor/layers/fused_moe/fused_moe.py": {
+  "model": 1,
+  "platform": 29
+ },
+ "vllm/model_executor/layers/fused_moe/modular_kernel.py": {
+  "platform": 10
+ },
+ "vllm/model_executor/layers/fused_moe/oracle/mxfp4.py": {
+  "platform": 15
+ },
+ "vllm/model_executor/layers/fused_moe/oracle/nvfp4.py": {
+  "platform": 15
+ },
+ "vllm/model_executor/layers/fused_moe/router/fused_topk_router.py": {
+  "model": 7,
+  "platform": 8
+ },
+ "vllm/model_executor/layers/fused_moe/router/gate_linear.py": {
+  "platform": 7
+ },
+ "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
+  "env": 9,
+  "model": 4,
+  "platform": 61
+ },
+ "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": {
+  "platform": 1
+ },
+ "vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py": {
+  "platform": 2
+ },
+ "vllm/model_executor/layers/layernorm.py": {
+  "model": 33,
+  "platform": 99
+ },
+ "vllm/model_executor/layers/linear.py": {
+  "model": 20,
+  "platform": 88
+ },
+ "vllm/model_executor/layers/logits_processor.py": {
+  "env": 2,
+  "model": 12,
+  "platform": 24
+ },
+ "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
+  "env": 47,
+  "model": 239,
+  "platform": 650
+ },
+ "vllm/model_executor/layers/mamba/mamba_utils.py": {
+  "platform": 1
+ },
+ "vllm/model_executor/layers/mamba/ops/causal_conv1d.py": {
+  "model": 6
+ },
+ "vllm/model_executor/layers/mhc.py": {
+  "platform": 5
+ },
+ "vllm/model_executor/layers/ple_offload_layer.py": {
+  "model": 3,
+  "platform": 6
+ },
+ "vllm/model_executor/layers/quantization/auto_gptq.py": {
+  "platform": 10
+ },
+ "vllm/model_executor/layers/quantization/awq.py": {
+  "platform": 44
+ },
+ "vllm/model_executor/layers/quantization/awq_marlin.py": {
+  "platform": 44
+ },
+ "vllm/model_executor/layers/quantization/base_config.py": {
+  "platform": 1
+ },
+ "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py": {
+  "platform": 2
+ },
+ "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_nvfp4.py": {
+  "platform": 3
+ },
+ "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_nvfp4.py": {
+  "platform": 8
+ },
+ "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxfp4.py": {
+  "platform": 13
+ },
+ "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py": {
+  "platform": 21
+ },
+ "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py": {
+  "model": 4,
+  "platform": 151
+ },
+ "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py": {
+  "platform": 13
+ },
+ "vllm/model_executor/layers/quantization/fp8.py": {
+  "platform": 66
+ },
+ "vllm/model_executor/layers/quantization/modelopt.py": {
+  "platform": 89
+ },
+ "vllm/model_executor/layers/quantization/mxfp4.py": {
+  "platform": 25
+ },
+ "vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py": {
+  "env": 1
+ },
+ "vllm/model_executor/layers/quantization/utils/marlin_utils.py": {
+  "platform": 4
+ },
+ "vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py": {
+  "platform": 9
+ },
+ "vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py": {
+  "platform": 1
+ },
+ "vllm/model_executor/layers/sm70_attention.py": {
+  "env": 1
+ },
+ "vllm/model_executor/layers/sm70_sparse_attention.py": {
+  "env": 1
+ },
+ "vllm/model_executor/layers/sparse_attn_indexer.py": {
+  "platform": 18
+ },
+ "vllm/model_executor/layers/sparse_attn_indexer_kpool.py": {
+  "env": 4,
+  "model": 8,
+  "platform": 17
+ },
+ "vllm/model_executor/layers/utils.py": {
+  "platform": 6
+ },
+ "vllm/model_executor/layers/vocab_parallel_embedding.py": {
+  "model": 124,
+  "platform": 231
+ },
+ "vllm/model_executor/models/qwen2_moe.py": {
+  "env": 1
+ },
+ "vllm/model_executor/models/qwen3_5_mtp.py": {
+  "env": 2
+ },
+ "vllm/model_executor/models/qwen3_dflash2.py": {
+  "env": 1
+ },
+ "vllm/model_executor/models/qwen3_next.py": {
+  "env": 14
+ },
+ "vllm/model_executor/warmup/kernel_warmup.py": {
+  "platform": 3
+ },
+ "vllm/models/deepseek_v4/sm70/indexer.py": {
+  "env": 6
+ },
+ "vllm/models/glm5next/nvidia/kda.py": {
+  "env": 5
+ },
+ "vllm/models/glm5next/nvidia/model.py": {
+  "env": 7
+ },
+ "vllm/models/glm5next/sm70/sparse.py": {
+  "env": 2
+ },
+ "vllm/models/qwen4_exp/nvidia/ops/qsa.py": {
+  "env": 5
+ },
+ "vllm/models/qwen4_exp/nvidia/qsa.py": {
+  "env": 1
+ },
+ "vllm/platforms/cpu.py": {
+  "env": 5
+ },
+ "vllm/platforms/cuda.py": {
+  "model": 1,
+  "platform": 7
+ },
+ "vllm/platforms/rocm.py": {
+  "env": 1
+ },
+ "vllm/platforms/xpu.py": {
+  "env": 1
+ },
+ "vllm/third_party/pynvml.py": {
+  "platform": 2
+ },
+ "vllm/transformers_utils/config.py": {
+  "env": 1,
+  "model": 10
+ },
+ "vllm/transformers_utils/configs/__init__.py": {
+  "model": 18
+ },
+ "vllm/transformers_utils/configs/eagle.py": {
+  "model": 6
+ },
+ "vllm/transformers_utils/configs/glm5_next.py": {
+  "model": 13
+ },
+ "vllm/transformers_utils/configs/speculators/algos.py": {
+  "model": 10
+ },
+ "vllm/transformers_utils/model_arch_config_convertor.py": {
+  "model": 2
+ },
+ "vllm/transformers_utils/processors/__init__.py": {
+  "model": 3
+ },
+ "vllm/transformers_utils/processors/glm5next.py": {
+  "model": 20
+ },
+ "vllm/utils/ompmultiprocessing.py": {
+  "env": 1
+ },
+ "vllm/utils/system_utils.py": {
+  "env": 2
+ },
+ "vllm/v1/attention/backends/fa_utils.py": {
+  "platform": 3
+ },
+ "vllm/v1/attention/backends/flex_attention.py": {
+  "model": 25
+ },
+ "vllm/v1/attention/backends/gdn_attn.py": {
+  "env": 17,
+  "model": 181,
+  "platform": 41
+ },
+ "vllm/v1/attention/backends/mla/flashmla_sparse.py": {
+  "platform": 1
+ },
+ "vllm/v1/attention/backends/mla/prefill/flash_attn.py": {
+  "platform": 55
+ },
+ "vllm/v1/attention/backends/mla/prefill/selector.py": {
+  "platform": 1
+ },
+ "vllm/v1/attention/backends/mla/sparse_swa.py": {
+  "model": 1
+ },
+ "vllm/v1/attention/backends/registry.py": {
+  "model": 3,
+  "platform": 9
+ },
+ "vllm/v1/attention/backends/rocm_attn.py": {
+  "model": 1
+ },
+ "vllm/v1/attention/backends/triton_attn.py": {
+  "platform": 7
+ },
+ "vllm/v1/attention/backends/turboquant_attn.py": {
+  "env": 6,
+  "platform": 79
+ },
+ "vllm/v1/attention/ops/prefix_prefill.py": {
+  "model": 1
+ },
+ "vllm/v1/attention/ops/sm70_grouped.py": {
+  "env": 1
+ },
+ "vllm/v1/attention/ops/triton_decode_attention.py": {
+  "platform": 9
+ },
+ "vllm/v1/attention/ops/triton_prefill_attention.py": {
+  "platform": 1
+ },
+ "vllm/v1/attention/ops/triton_unified_attention.py": {
+  "platform": 78
+ },
+ "vllm/v1/core/kv_cache_utils.py": {
+  "model": 31,
+  "platform": 6
+ },
+ "vllm/v1/core/sched/output.py": {
+  "model": 8
+ },
+ "vllm/v1/core/sched/scheduler.py": {
+  "env": 2,
+  "model": 136
+ },
+ "vllm/v1/cudagraph_dispatcher.py": {
+  "env": 3,
+  "platform": 76
+ },
+ "vllm/v1/engine/core.py": {
+  "env": 2,
+  "model": 33,
+  "platform": 9
+ },
+ "vllm/v1/executor/multiproc_executor.py": {
+  "model": 3,
+  "platform": 4
+ },
+ "vllm/v1/executor/ray_executor.py": {
+  "env": 1,
+  "platform": 1
+ },
+ "vllm/v1/executor/uniproc_executor.py": {
+  "model": 3,
+  "platform": 4
+ },
+ "vllm/v1/kv_cache_interface.py": {
+  "model": 1
+ },
+ "vllm/v1/outputs.py": {
+  "model": 8
+ },
+ "vllm/v1/ple_offload/connector.py": {
+  "model": 2,
+  "platform": 2
+ },
+ "vllm/v1/sample/ops/topk_topp_triton.py": {
+  "platform": 7
+ },
+ "vllm/v1/sample/rejection_sampler.py": {
+  "env": 6,
+  "platform": 5
+ },
+ "vllm/v1/sample/sampler.py": {
+  "env": 3,
+  "platform": 48
+ },
+ "vllm/v1/spec_decode/ddtree_payload.py": {
+  "env": 2
+ },
+ "vllm/v1/spec_decode/ddtree_sampler.py": {
+  "env": 7
+ },
+ "vllm/v1/spec_decode/dflash.py": {
+  "env": 2
+ },
+ "vllm/v1/spec_decode/dspark.py": {
+  "model": 4
+ },
+ "vllm/v1/spec_decode/llm_base_proposer.py": {
+  "env": 3,
+  "model": 43,
+  "platform": 44
+ },
+ "vllm/v1/spec_decode/profiling.py": {
+  "model": 4,
+  "platform": 3
+ },
+ "vllm/v1/spec_decode/static_draft_vocab.py": {
+  "platform": 36
+ },
+ "vllm/v1/spec_decode/utils.py": {
+  "model": 20
+ },
+ "vllm/v1/worker/cpu_worker.py": {
+  "env": 1
+ },
+ "vllm/v1/worker/gpu/cudagraph_utils.py": {
+  "model": 13,
+  "platform": 33
+ },
+ "vllm/v1/worker/gpu/mamba_align.py": {
+  "model": 2
+ },
+ "vllm/v1/worker/gpu/model_runner.py": {
+  "env": 2,
+  "model": 15,
+  "platform": 8
+ },
+ "vllm/v1/worker/gpu/model_states/mamba_hybrid.py": {
+  "model": 82,
+  "platform": 28
+ },
+ "vllm/v1/worker/gpu/pp_utils.py": {
+  "model": 1
+ },
+ "vllm/v1/worker/gpu/sample/sampler.py": {
+  "platform": 2
+ },
+ "vllm/v1/worker/gpu/shutdown.py": {
+  "platform": 11
+ },
+ "vllm/v1/worker/gpu/spec_decode/__init__.py": {
+  "model": 16
+ },
+ "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py": {
+  "env": 3
+ },
+ "vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py": {
+  "env": 2
+ },
+ "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py": {
+  "model": 6
+ },
+ "vllm/v1/worker/gpu/spec_decode/eagle/speculator.py": {
+  "model": 1,
+  "platform": 7
+ },
+ "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": {
+  "platform": 1
+ },
+ "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py": {
+  "model": 9
+ },
+ "vllm/v1/worker/gpu/spec_decode/speculator.py": {
+  "model": 2
+ },
+ "vllm/v1/worker/gpu/spec_decode/utils.py": {
+  "model": 5
+ },
+ "vllm/v1/worker/gpu_input_batch.py": {
+  "platform": 1
+ },
+ "vllm/v1/worker/gpu_model_runner.py": {
+  "env": 41,
+  "model": 665,
+  "platform": 277
+ },
+ "vllm/v1/worker/gpu_worker.py": {
+  "model": 3,
+  "platform": 27
+ },
+ "vllm/v1/worker/mamba_utils.py": {
+  "env": 1,
+  "model": 41,
+  "platform": 1
+ },
+ "vllm/video/benchmark.py": {
+  "model": 2,
+  "platform": 1
+ },
+ "vllm/video/engine.py": {
+  "model": 6
+ },
+ "vllm/video/fastpath.py": {
+  "platform": 4
+ },
+ "vllm/video/gpu.py": {
+  "platform": 3
+ },
+ "vllm/video/metrics.py": {
+  "model": 3,
+  "platform": 2
+ },
+ "vllm/video/protocol.py": {
+  "model": 11
+ },
+ "vllm/video/server.py": {
+  "model": 2
+ },
+ "vllm/video/vsa_acceptance.py": {
+  "model": 2,
+  "platform": 1
+ },
+ "vllm/vllm_flash_attn/flash_attn_interface.py": {
+  "platform": 2
+ }
+}

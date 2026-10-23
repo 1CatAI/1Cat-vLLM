@@ -22,7 +22,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.attention.backends.flash_attn_v100 import (
+from vllm.v1.attention.backends.flash_v100 import (
     DFlash2SmallQGroupDescriptor,
     DFlash2SmallQPreparedMetadata,
     FlashAttnV100MetadataBuilder,

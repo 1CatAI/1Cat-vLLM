@@ -452,6 +452,10 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        # Configs that define their own MTP draft form rewrite themselves.
+        get_mtp_draft_config = getattr(hf_config, "get_mtp_draft_config", None)
+        if callable(get_mtp_draft_config):
+            return get_mtp_draft_config()
         initial_architecture = hf_config.architectures[0]
         if hf_config.model_type in (
             "deepseek_v3",
@@ -912,7 +916,7 @@ class SpeculativeConfig:
                     self.method = "mlp_speculator"
                 elif self.draft_model_config.hf_config.model_type in get_args(
                     MTPModelTypes
-                ):
+                ) or getattr(self.draft_model_config.hf_config, "is_mtp_draft", False):
                     self.method = "mtp"
                     self._inherit_target_rope_for_extended_native_mtp()
                     if (

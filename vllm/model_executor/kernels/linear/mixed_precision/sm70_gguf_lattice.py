@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm._sm70.policy import NativeBindings
+from vllm.config.sm70_native import capture_linear_native_config
 from vllm.model_executor.kernels.gguf import GGUFDecoderFamily, GGUFOperatorCapability
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import LATTICE_TYPES
 from vllm.model_executor.layers.quantization.utils import replace_parameter
@@ -63,6 +65,7 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.native_ops = NativeBindings(capture_linear_native_config("gguf").values)
         if getattr(layer, "_gguf_tm_lattice_prepared", False):
             return
         codes, scales, _, _ = self._get_weight_params(layer)
@@ -127,7 +130,7 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
                 self.config.group_size,
             )
         else:
-            torch.ops._C.gguf_lattice_gemm_sm70_out(
+            self.native_ops.gguf_lattice_gemm_sm70_out(
                 output,
                 rows,
                 getattr(layer, self.w_q_name),

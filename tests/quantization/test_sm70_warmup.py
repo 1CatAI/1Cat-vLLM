@@ -235,7 +235,9 @@ def test_fp8_grouped_bmm_decode_uses_one_dispatch(monkeypatch):
     )
     x = torch.empty((1, 2, 128), dtype=torch.float16)
 
-    out = object.__new__(TurboMindFp8LinearKernel).apply_weights(layer, x)
+    kernel = object.__new__(TurboMindFp8LinearKernel)
+    kernel.native_ops = warmup.sm70_ops
+    out = kernel.apply_weights(layer, x)
 
     assert tuple(out.shape) == (1, 2, 64)
     assert len(calls) == 1
@@ -274,7 +276,9 @@ def test_fp8_grouped_bmm_decode_retains_multirow_fallback(monkeypatch):
     )
     x = torch.empty((2, 2, 128), dtype=torch.float16)
 
-    out = object.__new__(TurboMindFp8LinearKernel).apply_weights(layer, x)
+    kernel = object.__new__(TurboMindFp8LinearKernel)
+    kernel.native_ops = warmup.sm70_ops
+    out = kernel.apply_weights(layer, x)
 
     assert tuple(out.shape) == (2, 2, 64)
     assert [call[:2] for call in dense_calls] == [
@@ -319,6 +323,7 @@ def test_fp8_warmup_supports_modelopt_turbomind_layout(monkeypatch):
 @pytest.mark.parametrize("compact", [False, True])
 def test_nvfp4_warmup_uses_converter_padded_output_size(monkeypatch, compact):
     state = SimpleNamespace(
+        native_ops=warmup.sm70_ops,
         weight=torch.empty((32, 4), dtype=torch.int32),
         scales=torch.empty((2, 32), dtype=torch.float16),
         group_size=16,
@@ -363,6 +368,7 @@ def test_nvfp4_warmup_uses_converter_padded_output_size(monkeypatch, compact):
 @pytest.mark.parametrize("gated_silu", [False, True])
 def test_nvfp4_warmup_preserves_batch_scale_format(monkeypatch, gated_silu):
     state = SimpleNamespace(
+        native_ops=warmup.sm70_ops,
         weight=torch.empty((32, 4), dtype=torch.int32),
         scales=torch.empty((2, 32), dtype=torch.float16),
         group_size=16,
@@ -485,7 +491,7 @@ def test_nvfp4_moe_warmup_discovers_and_uses_compact_decode_shapes(monkeypatch):
 
 
 def test_nvfp4_moe_warmup_includes_opted_in_cuda_graph_shapes(monkeypatch):
-    monkeypatch.setattr(warmup.envs, "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", 640)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "640")
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(

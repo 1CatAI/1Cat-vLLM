@@ -8,7 +8,9 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm._sm70.policy import NativeBindings, call_gguf_native, register_policy_op
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.sm70_native import capture_linear_native_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
@@ -22,6 +24,7 @@ from vllm.model_executor.kernels.gguf import (
     select_lattice_grouped_capability,
     small_grouped_vector_capabilities,
 )
+from vllm.model_executor.layers.fused_moe.sm70.reduction import weighted_reduce_rows
 from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
     SM70_SMALL_ROUTING,
 )
@@ -66,6 +69,7 @@ def _expert_gate_up(
     top_k: int,
     raw_batches: list[int],
     vector_bands: list[int],
+    native_policy: list[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Resolve original M inside the opaque op. Range compilation must not
     # freeze the prefill choice for subsequent MTP verification batches.
@@ -97,7 +101,9 @@ def _expert_gate_up(
             (gate, gate_ptrs, gate_stats),
             (up, up_ptrs, up_stats),
         ):
-            op(
+            call_gguf_native(
+                op,
+                native_policy,
                 out,
                 x,
                 offsets,
@@ -127,16 +133,22 @@ def _expert_gate_up_fake(
     top_k,
     raw_batches,
     vector_bands,
+    native_policy: list[str] | None = None,
 ):
     return x.new_empty((x.shape[0], output_size)), x.new_empty(
         (x.shape[0], output_size)
     )
 
 
-direct_register_custom_op(
-    op_name="gguf_expert_gate_up",
-    op_func=_expert_gate_up,
-    fake_impl=_expert_gate_up_fake,
+register_policy_op(
+    "gguf_expert_gate_up",
+    "(Tensor x, Tensor offsets, Tensor ids, Tensor raw_gate, Tensor raw_up,"
+    " Tensor gate_ptrs, Tensor gate_stats, Tensor up_ptrs, Tensor up_stats,"
+    " int source_type, int experts, int group, int output_size, int top_k, "
+    "int[] raw_batches, int[] vector_bands, str[]? native_policy=None) -> "
+    "(Tensor, Tensor)",
+    _expert_gate_up,
+    _expert_gate_up_fake,
 )
 
 
@@ -151,6 +163,7 @@ def _expert_down(
     experts: int,
     group: int,
     vector_batches: list[int],
+    native_policy: list[str] | None = None,
 ) -> None:
     # Inspect actual routed rows inside the opaque boundary, including graph
     # capture. Range compilation must not freeze the prefill fallback.
@@ -169,7 +182,18 @@ def _expert_down(
             if source_type == 20
             else torch.ops._C.gguf_affine_grouped_gemm_sm70_out
         )
-        op(out, x, offsets, weight_ptrs, stat_ptrs, decoder, experts, group)
+        call_gguf_native(
+            op,
+            native_policy,
+            out,
+            x,
+            offsets,
+            weight_ptrs,
+            stat_ptrs,
+            decoder,
+            experts,
+            group,
+        )
 
 
 def _expert_down_fake(
@@ -183,15 +207,18 @@ def _expert_down_fake(
     experts,
     group,
     vector_batches,
+    native_policy: list[str] | None = None,
 ):
     return None
 
 
-direct_register_custom_op(
-    op_name="gguf_expert_down",
-    op_func=_expert_down,
-    mutates_args=["out"],
-    fake_impl=_expert_down_fake,
+register_policy_op(
+    "gguf_expert_down",
+    "(Tensor(a!) out, Tensor x, Tensor offsets, Tensor weight_ptrs, Tensor "
+    "stat_ptrs, int source_type, int decoder, int experts, int group, int[]"
+    " vector_batches, str[]? native_policy=None) -> ()",
+    _expert_down,
+    _expert_down_fake,
 )
 
 
@@ -218,6 +245,7 @@ def _expert_dp4a(
     down_vector_batches: list[int],
     dp4a_batches: list[int],
     q8_intermediate_batches: list[int],
+    native_policy: list[str] | None = None,
 ) -> torch.Tensor:
     # Resolve actual M inside the opaque boundary so range compilation cannot
     # freeze a prefill choice into an MTP verification graph.
@@ -299,6 +327,7 @@ def _expert_dp4a(
         top_k,
         raw_batches,
         vector_bands,
+        native_policy,
     )
     hidden = (torch.nn.functional.silu(gate) * up).contiguous()
     down = x.new_empty((m * top_k, x.shape[1]))
@@ -313,6 +342,7 @@ def _expert_dp4a(
         experts,
         32,
         down_vector_batches,
+        native_policy,
     )
     return torch.ops.vllm.sm70_small_expert_unroute(down, inverse, probabilities)
 
@@ -340,14 +370,22 @@ def _expert_dp4a_fake(
     down_vector_batches,
     dp4a_batches,
     q8_intermediate_batches,
+    native_policy: list[str] | None = None,
 ):
     return torch.empty_like(x)
 
 
-direct_register_custom_op(
-    op_name="gguf_expert_dp4a",
-    op_func=_expert_dp4a,
-    fake_impl=_expert_dp4a_fake,
+register_policy_op(
+    "gguf_expert_dp4a",
+    "(Tensor x, Tensor ids, Tensor probabilities, Tensor raw_gate, Tensor "
+    "raw_up, Tensor gate_ptrs, Tensor gate_stats, Tensor up_ptrs, Tensor "
+    "up_stats, Tensor down_ptrs, Tensor down_stats, int source_type, int "
+    "down_type, int down_decoder, int experts, int group, int intermediate,"
+    " int[] raw_batches, int[] vector_bands, int[] down_vector_batches, "
+    "int[] dp4a_batches, int[] q8_intermediate_batches, str[]? "
+    "native_policy=None) -> Tensor",
+    _expert_dp4a,
+    _expert_dp4a_fake,
 )
 
 
@@ -457,6 +495,7 @@ def _expert_planes(raw: torch.Tensor, source_type: int, n: int, k: int):
 class GGUFExpertBank(torch.nn.Module):
     def __init__(self, source_type, experts, device, dtype, retain_raw=False):
         super().__init__()
+        self.native_ops = NativeBindings(capture_linear_native_config("gguf").values)
         self.source_type = source_type
         self.experts = experts
         self.device = device
@@ -634,6 +673,7 @@ class GGUFExpertBank(torch.nn.Module):
                 self.experts,
                 self.group,
                 self.down_vector_batches,
+                self.native_ops.arguments,
             )
             return output
         capability = (
@@ -648,7 +688,9 @@ class GGUFExpertBank(torch.nn.Module):
             if self.family == GGUFDecoderFamily.LATTICE
             else self.decoder
         )
-        getattr(torch.ops._C, capability.operator)(
+        call_gguf_native(
+            getattr(torch.ops._C, capability.operator),
+            self.native_ops.arguments,
             output,
             x,
             offsets,
@@ -664,6 +706,7 @@ class GGUFExpertBank(torch.nn.Module):
 class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
     def __init__(self, quant_config, moe):
         super().__init__(quant_config, moe)
+        self.native_ops = NativeBindings(capture_linear_native_config("gguf").values)
         self.builders: dict[str, GGUFExpertBank] = {}
         config = get_current_vllm_config_or_none()
         self.dp4a_enabled = self.native_enabled and (
@@ -971,6 +1014,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 down.down_vector_batches,
                 self.dp4a_batches,
                 self.q8_intermediate_batches,
+                self.native_ops.arguments,
             )
         ids = topk_ids
         mask = None
@@ -1012,6 +1056,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 top_k,
                 self.raw_batches,
                 self.vector_bands,
+                self.native_ops.arguments,
             )
         else:
             gate = bank["w1"](routed, offsets, sorted_ids)
@@ -1023,4 +1068,4 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
         restored = down[order.argsort()].view(tokens, top_k, self.hidden_size)
         if mask is not None:
             restored = torch.where(mask[..., None], restored, 0)
-        return (restored.float() * topk_weights[..., None].float()).sum(1).to(x.dtype)
+        return weighted_reduce_rows(restored, topk_weights, x.dtype)

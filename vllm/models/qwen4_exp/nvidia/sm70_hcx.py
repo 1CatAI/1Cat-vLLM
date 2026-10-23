@@ -406,3 +406,21 @@ def get_hcx_runtime(device: torch.device) -> Sm70HcxRuntime:
 
         _RUNTIME = Sm70HcxRuntime(get_tp_group().cpu_group, device)
     return _RUNTIME
+
+
+def partial_moe_output(name, shared, routed, hidden_dim):
+    return torch.ops.vllm.qwen38_sm70_hcx_moe_output(shared, routed, name, hidden_dim)
+
+
+def partial_projection(name, hidden):
+    return torch.ops.vllm.qwen38_sm70_hcx_output_projection(hidden, name)
+
+
+def maybe_top1_exchange(local_pair):
+    runtime = current_hcx_runtime()
+    if runtime is None or not getattr(runtime, "top1_enabled", False):
+        return None
+    tokens = runtime.top1(local_pair)
+    if tokens is not None:
+        logger.info_once("SM70 two-hop top1 exchange enabled.")
+    return tokens

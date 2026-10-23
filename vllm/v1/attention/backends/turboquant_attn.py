@@ -49,7 +49,7 @@ from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
-from vllm.v1.attention.backends.flash_attn_v100 import (
+from vllm.v1.attention.backends.flash_v100 import (
     flash_v100_dense_prefill,
     flash_v100_dense_prefill_available,
     flash_v100_turboquant_decode,

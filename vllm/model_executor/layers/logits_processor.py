@@ -10,6 +10,7 @@ from collections.abc import Callable
 import torch
 
 from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -18,6 +19,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.sm70_topk_gather import gather_topk_pairs
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.platforms import current_platform
 
@@ -176,18 +178,6 @@ def _maybe_sync_top1_all_gather(
         torch.cuda.current_stream(local_pair.device).synchronize()
 
 
-def _maybe_sm70_top1x(local_pair: torch.Tensor) -> torch.Tensor | None:
-    from vllm.models.qwen4_exp.nvidia.sm70_hcx import current_hcx_runtime
-
-    runtime = current_hcx_runtime()
-    if runtime is None or not getattr(runtime, "top1_enabled", False):
-        return None
-    tokens = runtime.top1(local_pair)
-    if tokens is not None:
-        logger.info_once("SM70 two-hop top1 exchange enabled.")
-    return tokens
-
-
 # --8<-- [start:logits_processor]
 @PluggableLayer.register("logits_processor")
 class LogitsProcessor(PluggableLayer):
@@ -224,6 +214,16 @@ class LogitsProcessor(PluggableLayer):
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
+        cfg = get_current_vllm_config_or_none()
+        self._top1_exchange = (
+            cfg.kernel_config.top1_exchange_callback() if cfg else None
+        )
+        self._packed_topk_enabled = (
+            cfg is not None and cfg.kernel_config.sm70_packed_topk_gather
+        )
+        self._packed_topk_selections = (
+            cfg.kernel_config.collective_kernel_selections if cfg is not None else None
+        )
 
     def forward(
         self,
@@ -381,9 +381,10 @@ class LogitsProcessor(PluggableLayer):
                 [local_max_vals.float(), global_indices.float()], dim=-1
             )
         _maybe_sync_top1_all_gather(self, local_pair)
-        top1x_tokens = _maybe_sm70_top1x(local_pair)
-        if top1x_tokens is not None:
-            return top1x_tokens
+        if self._top1_exchange is not None:
+            exchanged_tokens = self._top1_exchange(local_pair)
+            if exchanged_tokens is not None:
+                return exchanged_tokens
         custom_top_tokens = self._maybe_custom_top1_argmax(local_pair)
         if custom_top_tokens is not None:
             self._maybe_dump_top_token_margin(
@@ -696,15 +697,24 @@ class LogitsProcessor(PluggableLayer):
         merge_topk_ms = 0.0
         if tp_size > 1:
             stage_start = _cuda_stage_start(profile_enabled)
-            gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
-            gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
-
-            stage_start = _cuda_stage_start(profile_enabled)
-            gathered_indices = tensor_model_parallel_all_gather(
+            packed = gather_topk_pairs(
+                local_vals,
                 local_global_indices,
-                dim=-1,
+                vocab_size=lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
             )
-            gather_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            if packed is None:
+                gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
+                gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
+                stage_start = _cuda_stage_start(profile_enabled)
+                gathered_indices = tensor_model_parallel_all_gather(
+                    local_global_indices, dim=-1
+                )
+                gather_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            else:
+                gathered_vals, gathered_indices = packed
+                gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
             effective_k = min(top_k, gathered_vals.shape[-1])
             stage_start = _cuda_stage_start(profile_enabled)

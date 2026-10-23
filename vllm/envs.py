@@ -18525,7 +18525,7 @@ def validate_environ(hard_fail: bool) -> None:
                 logger.warning("Unknown vLLM environment variable detected: %s", env)
 
 
-def compile_factors() -> dict[str, object]:
+def compile_factors(kernel_config=None) -> dict[str, object]:
     """Return env vars used for torch.compile cache keys.
 
     Start with every known vLLM env var; drop entries in `ignored_factors`;
@@ -18598,6 +18598,11 @@ def compile_factors() -> dict[str, object]:
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
     }
+
+    if kernel_config is not None:
+        from vllm.config.sm70_native import compile_ignored_aliases
+
+        ignored_factors.update(compile_ignored_aliases(kernel_config))
 
     from vllm.config.utils import normalize_value
 

@@ -687,9 +687,18 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.vocab_size = config.vocab_size
 
+        quant_config = vllm_config.quant_config
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=(
+                quant_config
+                if quant_config is not None
+                and quant_config.get_name() == "gguf"
+                and not config.tie_word_embeddings
+                else None
+            ),
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):

@@ -1812,6 +1812,10 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
         def _forward_core(self, **kwargs) -> None:
             raise AssertionError("pure spec_commit should not use metadata fallback")
 
+        def _can_use_sm70_gdn_preprocess(self, *args) -> bool:
+            # This case covers the existing convolution/gating path.
+            return False
+
     def fake_conv_update(
         x,
         conv_state,

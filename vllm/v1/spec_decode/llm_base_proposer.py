@@ -19,7 +19,6 @@ from vllm.config import (
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
-    is_last_pp_first_tp_rank,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -48,6 +47,7 @@ from vllm.v1.sample.rejection_sampler import (
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.profiling import create_step_profiler
 from vllm.v1.spec_decode.static_draft_vocab import (
     DynamicDraftVocabRuntime,
     StaticDraftVocabRuntime,
@@ -75,16 +75,8 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
-def _sm70_mtp_profile_env_enabled() -> bool:
-    return envs.VLLM_SM70_MTP_PROFILE
-
-
 def _dflash_ddtree_worker_profile_enabled() -> bool:
     return os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "0") == "1"
-
-
-def _sm70_mtp_profile_interval() -> int:
-    return envs.VLLM_SM70_MTP_PROFILE_INTERVAL
 
 
 def _sm70_mtp_moe_warmup_sizes(
@@ -223,6 +215,9 @@ class SpecDecodeBaseProposer:
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
 
         self.device = device
+        self._step_profiler = create_step_profiler(
+            vllm_config, device, role="proposer", logger=logger
+        )
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -782,102 +777,6 @@ class SpecDecodeBaseProposer:
             model_kwargs.setdefault("intermediate_tensors", None)
         return model_kwargs
 
-    def _sm70_mtp_profile_enabled(self) -> bool:
-        device_type = self.device.type if hasattr(self.device, "type") else self.device
-        return (
-            (self.method == "mtp" or _is_dflash_method(self.method))
-            and device_type == "cuda"
-            and _sm70_mtp_profile_env_enabled()
-        )
-
-    def _sm70_mtp_profile_start(
-        self,
-        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
-    ) -> torch.cuda.Event | None:
-        if events is None:
-            return None
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
-        return event
-
-    def _sm70_mtp_profile_finish(
-        self,
-        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
-        name: str,
-        start: torch.cuda.Event | None,
-    ) -> None:
-        if events is None or start is None:
-            return
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-        events.append((name, start, end))
-
-    def _sm70_mtp_profile_add_cpu_ms(
-        self,
-        cpu_ms: dict[str, float],
-        name: str,
-        start: float,
-    ) -> None:
-        cpu_ms[name] = cpu_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000.0
-
-    def _sm70_mtp_profile_report(
-        self,
-        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
-        cpu_ms: dict[str, float],
-        batch_size: int,
-        num_tokens: int,
-    ) -> None:
-        if events is None:
-            return
-        if events:
-            events[-1][2].synchronize()
-
-        timings: dict[str, float] = {}
-        for name, start, end in events:
-            timings[name] = timings.get(name, 0.0) + start.elapsed_time(end)
-        timings.update(cpu_ms)
-
-        totals = getattr(self, "_sm70_mtp_profile_totals", None)
-        if totals is None:
-            totals = {}
-            self._sm70_mtp_profile_totals = totals
-        calls = getattr(self, "_sm70_mtp_profile_calls", 0) + 1
-        self._sm70_mtp_profile_calls = calls
-        for name, value in timings.items():
-            totals[name] = totals.get(name, 0.0) + value
-
-        if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
-            return
-        # The drafter lives on the last PP stage; the global first rank
-        # never runs it when PP > 1.
-        if not is_last_pp_first_tp_rank():
-            return
-
-        preferred = [
-            "total_gpu",
-            "total_wall_cpu",
-            "first_setup_cpu",
-            "first_forward",
-            "first_sample",
-            "loop_metadata_cpu",
-            "loop0_forward",
-            "loop0_sample",
-            "loop1_forward",
-            "loop1_sample",
-            "loop2_forward",
-            "loop2_sample",
-        ]
-        keys = [key for key in preferred if key in totals]
-        keys.extend(sorted(key for key in totals if key not in keys))
-        summary = " ".join(f"{key}={totals[key] / calls:.3f}" for key in keys)
-        logger.info(
-            "SM70 MTP proposer profile avg_ms calls=%d batch=%d tokens=%d %s",
-            calls,
-            batch_size,
-            num_tokens,
-            summary,
-        )
-
     def _warmup_sm70_mtp_hotpath_batch(
         self, batch_size: int, vocab_size: int, warm_draft_topk: bool
     ) -> None:
@@ -1013,7 +912,9 @@ class SpecDecodeBaseProposer:
 
         try:
             vocab_size = max(2, self.draft_model_config.get_vocab_size())
-            expanded_warmup = envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP
+            expanded_warmup = bool(
+                self.vllm_config.kernel_config.sm70_runtime.mtp_concurrency_warmup
+            )
             for batch_size in _sm70_mtp_hotpath_warmup_batch_sizes(
                 self.max_batch_size, include_alternate=expanded_warmup
             ):
@@ -1031,7 +932,7 @@ class SpecDecodeBaseProposer:
             "mtp_rejection_expand",
             "mtp_step_slot_mapping",
         ]
-        if envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP:
+        if self.vllm_config.kernel_config.sm70_runtime.mtp_concurrency_warmup:
             warmed_kernels.append("mtp_draft_topk")
         return tuple(warmed_kernels)
 
@@ -1151,11 +1052,11 @@ class SpecDecodeBaseProposer:
         batch_size = common_attn_metadata.batch_size()
         common_attn_metadata = _clone_drafter_mutable_metadata(common_attn_metadata)
         profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = (
-            [] if self._sm70_mtp_profile_enabled() else None
+            [] if self._step_profiler.enabled else None
         )
         profile_cpu_ms: dict[str, float] = {}
         profile_wall_start = time.perf_counter() if profile_events is not None else 0.0
-        profile_total_start = self._sm70_mtp_profile_start(profile_events)
+        profile_total_start = self._step_profiler.start(profile_events)
 
         setup_stage_start = time.perf_counter() if profile_events is not None else 0.0
         if self.method == "eagle3" or _is_dflash_method(self.method):
@@ -1172,7 +1073,7 @@ class SpecDecodeBaseProposer:
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_combine_cpu", setup_stage_start
             )
 
@@ -1189,7 +1090,7 @@ class SpecDecodeBaseProposer:
             )
         )
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_set_inputs_cpu", setup_stage_start
             )
 
@@ -1198,7 +1099,7 @@ class SpecDecodeBaseProposer:
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_attn_metadata_cpu", setup_stage_start
             )
 
@@ -1210,7 +1111,7 @@ class SpecDecodeBaseProposer:
             batch_descriptor,
         ) = self._determine_batch_execution_and_padding(num_tokens)
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_batch_exec_cpu", setup_stage_start
             )
 
@@ -1221,12 +1122,12 @@ class SpecDecodeBaseProposer:
         model_kwargs = self._add_spec_step_idx(model_kwargs, 0)
         batch_descriptor = self._batch_descriptor_for_spec_step(batch_descriptor, 0)
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_model_inputs_cpu", setup_stage_start
             )
 
         if profile_events is not None:
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "first_setup_cpu", profile_wall_start
             )
         ddtree_worker_profile = (
@@ -1240,7 +1141,7 @@ class SpecDecodeBaseProposer:
             torch.cuda.current_stream(self.device).synchronize()
             pre_forward_stream_wait_ms = (time.perf_counter() - sync_t0) * 1000.0
         forward_enqueue_t0 = time.perf_counter() if ddtree_worker_profile else 0.0
-        first_forward_start = self._sm70_mtp_profile_start(profile_events)
+        first_forward_start = self._step_profiler.start(profile_events)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -1258,9 +1159,7 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
-        self._sm70_mtp_profile_finish(
-            profile_events, "first_forward", first_forward_start
-        )
+        self._step_profiler.finish(profile_events, "first_forward", first_forward_start)
         if ddtree_worker_profile:
             forward_enqueue_ms = (time.perf_counter() - forward_enqueue_t0) * 1000.0
             sync_t0 = time.perf_counter()
@@ -1343,14 +1242,14 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            first_sample_start = self._sm70_mtp_profile_start(profile_events)
+            first_sample_start = self._step_profiler.start(profile_events)
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 sample_hidden_states,
                 sampling_metadata,
                 debug_logits,
                 spec_step_idx=0,
             )
-            self._sm70_mtp_profile_finish(
+            self._step_profiler.finish(
                 profile_events, "first_sample", first_sample_start
             )
             if draft_probs is not None:
@@ -1372,13 +1271,11 @@ class SpecDecodeBaseProposer:
                 logger.warning(
                     "Saved %s draft logits debug to %s", self.method, dump_path
                 )
-            self._sm70_mtp_profile_finish(
-                profile_events, "total_gpu", profile_total_start
-            )
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.finish(profile_events, "total_gpu", profile_total_start)
+            self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "total_wall_cpu", profile_wall_start
             )
-            self._sm70_mtp_profile_report(
+            self._step_profiler.report_proposal(
                 profile_events, profile_cpu_ms, batch_size, num_tokens
             )
             if isinstance(self._static_draft_vocab, DynamicDraftVocabRuntime):
@@ -1397,16 +1294,14 @@ class SpecDecodeBaseProposer:
             # (which read via _get_positions) use the correct values.
             self.positions[:batch_size] = positions
 
-        first_sample_start = self._sm70_mtp_profile_start(profile_events)
+        first_sample_start = self._step_profiler.start(profile_events)
         draft_token_ids, draft_probs = self._sample_draft_tokens(
             sample_hidden_states,
             sampling_metadata,
             debug_logits,
             spec_step_idx=0,
         )
-        self._sm70_mtp_profile_finish(
-            profile_events, "first_sample", first_sample_start
-        )
+        self._step_profiler.finish(profile_events, "first_sample", first_sample_start)
         draft_probs_list = None if draft_probs is None else [draft_probs]
         if (
             _spec_dump_draft_logits_enabled(self.method)
@@ -1516,7 +1411,7 @@ class SpecDecodeBaseProposer:
 
             if profile_events is not None:
                 metadata_name = f"loop{token_index}_metadata_cpu"
-                self._sm70_mtp_profile_add_cpu_ms(
+                self._step_profiler.add_cpu_ms(
                     profile_cpu_ms, metadata_name, loop_cpu_start
                 )
                 profile_cpu_ms["loop_metadata_cpu"] = (
@@ -1524,7 +1419,7 @@ class SpecDecodeBaseProposer:
                     + profile_cpu_ms[metadata_name]
                 )
 
-            loop_forward_start = self._sm70_mtp_profile_start(profile_events)
+            loop_forward_start = self._step_profiler.start(profile_events)
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -1542,18 +1437,18 @@ class SpecDecodeBaseProposer:
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
-            self._sm70_mtp_profile_finish(
+            self._step_profiler.finish(
                 profile_events, f"loop{token_index}_forward", loop_forward_start
             )
 
             hidden_states = hidden_states[:batch_size]
-            loop_sample_start = self._sm70_mtp_profile_start(profile_events)
+            loop_sample_start = self._step_profiler.start(profile_events)
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 last_hidden_states[:batch_size],
                 sampling_metadata,
                 spec_step_idx=spec_step_idx,
             )
-            self._sm70_mtp_profile_finish(
+            self._step_profiler.finish(
                 profile_events, f"loop{token_index}_sample", loop_sample_start
             )
             if draft_probs is not None:
@@ -1565,11 +1460,11 @@ class SpecDecodeBaseProposer:
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
-        self._sm70_mtp_profile_finish(profile_events, "total_gpu", profile_total_start)
-        self._sm70_mtp_profile_add_cpu_ms(
+        self._step_profiler.finish(profile_events, "total_gpu", profile_total_start)
+        self._step_profiler.add_cpu_ms(
             profile_cpu_ms, "total_wall_cpu", profile_wall_start
         )
-        self._sm70_mtp_profile_report(
+        self._step_profiler.report_proposal(
             profile_events, profile_cpu_ms, batch_size, num_tokens
         )
         if isinstance(self._static_draft_vocab, DynamicDraftVocabRuntime):

@@ -1,3 +1,4 @@
+#include "sm70_policy.h"
 // Copyright (c) OpenMMLab. All rights reserved.
 
 #include "src/turbomind/kernels/gemm/arch/config_sm70_s884.h"
@@ -55,7 +56,7 @@ class Qwen38Nvfp4W2CacheBKernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
     const char* enabled =
-        std::getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL");
+        vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill);
     return (!enabled || std::atoi(enabled) != 0) && desc.m >= 1280 &&
            desc.num == 512 && desc.n == 2560 && desc.k == 160 &&
            KernelImpl<Gemm>::is_feasible(desc);
@@ -70,7 +71,7 @@ class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
     const char* enabled =
-        std::getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL");
+        vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill);
     return (!enabled || std::atoi(enabled) != 0) && desc.m >= 1280 &&
            desc.num == 512 && desc.n == 64 && desc.k == 2560 &&
            KernelImpl<Gemm>::is_feasible(desc);

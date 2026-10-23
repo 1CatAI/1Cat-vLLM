@@ -336,6 +336,8 @@ def test_runner_does_not_dispatch_short_prefill_as_tail(
     runner.is_encoder_decoder = False
     runner.dp_size = 1
     runner.dp_rank = 0
+    # Off the CUDA device, execute_model skips the mixed-prefill timer.
+    runner.device = torch.device("cpu")
     scheduler = SimpleNamespace(
         new_block_ids_to_zero=[],
         total_num_scheduled_tokens=query_len,

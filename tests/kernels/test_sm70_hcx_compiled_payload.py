@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 def _worker_run(rank, port, results):
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
+        graph_capture,
         init_distributed_environment,
         initialize_model_parallel,
         tensor_model_parallel_all_reduce_sum2,
@@ -119,7 +120,13 @@ def _worker_run(rank, port, results):
             materialize(x, hidden, injection)
             torch.accelerator.synchronize()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            # Register peer buffers just as the model's graph manager does.
+            # A bare CUDA capture leaves custom all-reduce graph pointers
+            # unresolved when the communication fallback is selected.
+            with (
+                graph_capture(device=torch.device("cuda", rank)) as context,
+                torch.cuda.graph(graph, stream=context.stream),
+            ):
                 outputs, scratch = compiled(x, hidden, injection)
                 combined, final_outputs, final_scratch = materialize(
                     x, hidden, injection

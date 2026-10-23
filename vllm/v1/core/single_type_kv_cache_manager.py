@@ -1252,9 +1252,11 @@ class MambaManager(SingleTypeKVCacheManager):
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         if self.mamba_cache_mode == "align":
-            # Mapping from request ID to the index of the block
-            # allocated in the previous step
-            self.last_state_block_idx: dict[str, int] = {}
+            # Mapping from request ID to the indices of the state blocks that
+            # were superseded by a later allocation and still await release.
+            # Usually one entry; under async scheduling a second one can be
+            # pending because the previous step has not been processed yet.
+            self.last_state_block_idx: dict[str, list[int]] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
 
@@ -1325,23 +1327,33 @@ class MambaManager(SingleTypeKVCacheManager):
             request_id, processed_computed_tokens, num_prompt_tokens
         )
         if self.mamba_cache_mode == "align":
-            # `last_state_block_idx` refers to the block index allocated two steps ago.
-            # The block allocated in the previous step is used to copy Mamba states
-            # into the block allocated in the current step; the earlier block is
-            # no longer needed and should be freed here.
-            last_state_block_idx = self.last_state_block_idx.get(request_id)
+            # `last_state_block_idx` lists the indices of the state blocks that
+            # were superseded by a later allocation. The block allocated in the
+            # previous step is used to copy Mamba states into the block
+            # allocated in the current step; the earlier blocks are no longer
+            # needed and should be freed here.
+            pending = self.last_state_block_idx.get(request_id)
+            if not pending:
+                return
             # Blocks allocated during prefill may be non-contiguous. Use
-            # `last_state_block_idx` to free the appropriate block and replace it
-            # with a null block.
-            if (
-                last_state_block_idx is not None
-                and last_state_block_idx
-                < cdiv(processed_computed_tokens, self.block_size) - 1
-            ):
-                blocks = self.req_to_blocks[request_id]
-                if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
-                    blocks[last_state_block_idx] = self._null_block
+            # `last_state_block_idx` to free the appropriate blocks and replace
+            # them with null blocks. Under async scheduling the step scheduled
+            # just before this one is still in flight, so
+            # `processed_computed_tokens` lags by one more step and the block
+            # recorded last is still the copy source of that step: keep it
+            # pending (a later call frees it) instead of forgetting it, which
+            # would leak one block per prefill chunk until the request ends.
+            release_before = cdiv(processed_computed_tokens, self.block_size) - 1
+            blocks = self.req_to_blocks[request_id]
+            keep: list[int] = []
+            for idx in pending:
+                if idx < release_before:
+                    if blocks[idx] != self._null_block:
+                        self.block_pool.free_blocks([blocks[idx]])
+                        blocks[idx] = self._null_block
+                else:
+                    keep.append(idx)
+            self.last_state_block_idx[request_id] = keep
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1454,13 +1466,15 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks_allocated:
                     # We always save the running state at the last
                     # (1 + num_speculative_blocks) block
-                    self.last_state_block_idx[request_id] = (
+                    self.last_state_block_idx.setdefault(request_id, []).append(
                         prev_block_len - 1 - self.num_speculative_blocks
                     )
                 elif prev_block_len > 0:
                     # When a new request hits the prefix cache, the last block
                     # saves the hit state.
-                    self.last_state_block_idx[request_id] = prev_block_len - 1
+                    self.last_state_block_idx.setdefault(request_id, []).append(
+                        prev_block_len - 1
+                    )
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1

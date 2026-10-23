@@ -1,3 +1,4 @@
+#include "sm70_policy.h"
 // Copyright (c) OpenMMLab. All rights reserved.
 
 #include "src/turbomind/core/check.h"
@@ -46,17 +47,17 @@ std::vector<int> ArgSort(size_t size, const Cmp& cmp) {
 }
 
 bool GemmTraceEnabled() {
-  const char* raw = std::getenv("TM_GEMM_TRACE");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_trace);
   return raw && std::atoi(raw) != 0;
 }
 
 int GemmTraceLimit() {
-  const char* raw = std::getenv("TM_GEMM_TRACE_LIMIT");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_trace_limit);
   return raw ? std::max(std::atoi(raw), 0) : 256;
 }
 
 bool GemmTraceFilterAllows(const std::string& desc) {
-  const char* raw = std::getenv("TM_GEMM_TRACE_FILTER");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_trace_filter);
   return !raw || !*raw || desc.find(raw) != std::string::npos;
 }
 
@@ -92,50 +93,50 @@ bool SameSm70SplitKPartition(const LaunchSpec& control,
 }
 
 bool Sm70AwqTp2FastSelectorEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_tp2_fast_selector);
   return !raw || std::atoi(raw) != 0;
 }
 
 // Keep the accepted QKVZ route enabled by default, while allowing an isolated
 // end-to-end A/B comparison without disabling the other exact small-M routes.
 bool Sm70AwqTp4QkvCta64Enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TP4_QKV_CTA64");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_tp4_qkv_cta64);
   return !raw || std::atoi(raw) != 0;
 }
 
 // Default-on A/B gate for the exact TP4 MTP verifier M=5 routes.
 bool Sm70AwqMtpM5FastSelectorEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_mtp_m5_fast_selector);
   return !raw || std::atoi(raw) != 0;
 }
 
 bool Sm70Mxfp4MoeGroupedM8FastSelectorEnabled() {
-  const char* grouped = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
+  const char* grouped = vllm::sm70::policy_value(vllm::sm70::PolicyField::mxfp4_moe_grouped_m8);
   if (!grouped || std::atoi(grouped) == 0) {
     return false;
   }
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::mxfp4_moe_grouped_m8_fast_selector);
   return !raw || std::atoi(raw) != 0;
 }
 
 bool Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qwen38_tp4_m1_fast_selector);
   return !raw || std::atoi(raw) != 0;
 }
 
 bool Sm70Nvfp4Qwen38MoeFastPrefillEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill);
   return !raw || std::atoi(raw) != 0;
 }
 
 // Default-on gate for exact block-FP8 8K prefill GEMM descriptors.
 bool Sm70Fp8BlockPrefillFastSelectorEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_prefill_fast_selector);
   return !raw || std::atoi(raw) != 0;
 }
 
 bool Sm70Fp8GroupedBmmDecodeEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_grouped_bmm_decode);
   return !raw || std::atoi(raw) != 0;
 }
 
@@ -175,7 +176,7 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70DflashContextFcFastTarget(
 
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(
     const GemmDesc& desc, const std::string_view desc_str) {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_TARGETS");
+  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_tp2_fast_targets);
   if (!raw || !*raw) {
     return std::nullopt;
   }
@@ -282,9 +283,9 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(
       return target;
     }
   }
-  const char* selector_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
+  const char* selector_rerank = vllm::sm70::policy_value(vllm::sm70::PolicyField::dflash2_qpn8_rerank);
   const char* selector_shadow =
-      std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");
+      vllm::sm70::policy_value(vllm::sm70::PolicyField::dflash2_qpn8_rerank_shadow);
   const bool exact_selector_rerank =
       (selector_rerank && std::atoi(selector_rerank) != 0) ||
       (selector_shadow && std::atoi(selector_shadow) != 0);
@@ -566,7 +567,7 @@ struct Gemm::Impl {
       tuning_.max_iter = 20;
       tuning_.max_time = 2.f;
     }
-    if (auto str = std::getenv("TM_GEMM_TUNE")) {
+    if (auto str = vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_tune)) {
       try {
         ParseTuningParams(tuning_, str);
       } catch (...) {
@@ -574,9 +575,6 @@ struct Gemm::Impl {
                      "will be used.\n";
         tuning_ = {};
       }
-    }
-    if (std::getenv("TM_GEMM_WARN_CACHE_MISS")) {
-      warn_cache_miss_ = true;
     }
     measurer_.emplace(CreateStoppingCriterion(
         tuning_.min_iter, tuning_.max_iter, tuning_.max_time));
@@ -752,7 +750,7 @@ struct Gemm::Impl {
           }
         }
       }
-      if (warn_cache_miss_ && (policy & DispatchPolicy::kReuse)) {
+      if (vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_warn_cache_miss) && (policy & DispatchPolicy::kReuse)) {
         std::cerr << "Failed to find a feasible kernel in the cache, will "
                      "dispatch by heuristic: "
                   << to_string(ctx.desc()) << std::endl;
@@ -998,8 +996,6 @@ struct Gemm::Impl {
   Registry registry_;
 
   TuningParams tuning_;
-
-  bool warn_cache_miss_{};
 
   std::optional<Measurer> measurer_;
 

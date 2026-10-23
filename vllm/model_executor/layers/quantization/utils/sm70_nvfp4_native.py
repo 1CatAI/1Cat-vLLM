@@ -5,14 +5,14 @@
 import torch
 
 from vllm import _sm70_ops as sm70_ops
-from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+from vllm._sm70.policy import register_policy_op
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
     _get_sm70_fp8_prefill_exact_dense_workspace,
 )
-from vllm.model_executor.layers.quantization.utils.nvfp4_qpn2_dequant import (
+from vllm.model_executor.kernels.linear.qpn.nvfp4_dequant import (
     _e4m3_value,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
 
 _scale_workspaces: dict[int, torch.Tensor] = {}
 _code_workspaces: dict[tuple[int, int], torch.Tensor] = {}
@@ -85,7 +85,10 @@ def _dispatch(
     split_k: int,
     accumulator_chains: int,
     gated_silu: bool,
+    native_policy: list[str] | None = None,
 ) -> None:
+    from vllm._sm70.policy import call_native
+
     # Keep M dispatch opaque: compiled token ranges include both decode and
     # prefill. Native QPN2 codes and E4M3 scales are the only resident layout.
     if x.shape[0] <= 32:
@@ -103,7 +106,17 @@ def _dispatch(
             if gated_silu
             else sm70_ops.nvfp4_qpn2_gemm_sm70_out
         )
-        op(out, x, codes, scales, global_scale, split_k, accumulator_chains)
+        call_native(
+            op,
+            native_policy,
+            out,
+            x,
+            codes,
+            scales,
+            global_scale,
+            split_k,
+            accumulator_chains,
+        )
         return
     k = x.shape[1]
     n = out.shape[1] * (2 if gated_silu else 1)
@@ -139,7 +152,9 @@ def _dispatch(
         )
     # Resolve the pointer inside the operator, never in an AOT artifact. The
     # serialized layer chain shares FP8's bounded per-device FP16 scratch.
-    sm70_ops.nvfp4_qpn4_prefill_sm70_out(
+    call_native(
+        sm70_ops.nvfp4_qpn4_prefill_sm70_out,
+        native_policy,
         out,
         workspace.data_ptr(),
         x,
@@ -160,13 +175,16 @@ def _dispatch_fake(
     split_k: int,
     accumulator_chains: int,
     gated_silu: bool,
+    native_policy: list[str] | None = None,
 ) -> None:
     return None
 
 
-direct_register_custom_op(
+register_policy_op(
     "sm70_nvfp4_native_dispatch",
+    "(Tensor(a!) out, Tensor x, Tensor codes, Tensor scales, float global_scale, "
+    "int split_k, int accumulator_chains, bool gated_silu, "
+    "str[]? native_policy=None) -> ()",
     _dispatch,
-    mutates_args=["out"],
-    fake_impl=_dispatch_fake,
+    _dispatch_fake,
 )

@@ -139,10 +139,10 @@ def test_explicit_config_and_two_engine_isolation(monkeypatch):
 def test_unused_fp8_policy_preserves_nvfp4_fingerprint():
     config = KernelConfig()
     config.sm70_nvfp4.resolve(qualified=True)
-    assert (
-        config.compute_hash()
-        == "46cb3b268de0c6d2ffb4dcfa9d3ba3e7184be6b73126717691b8d114ccca523b"
-    )
+    initial = config.compute_hash()
+    config.sm70_fp8.qpn8 = True
+    config.sm70_fp8.native.fp8_dense_tune_max_m = 8
+    assert config.compute_hash() == initial
     # The new Turing routing policy participates in compilation identity.
     before = config.compute_hash()
     config.sm70_nvfp4.dense_qpn2 = False

@@ -778,7 +778,9 @@ class DFlashQwen3Model(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ) = None,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -841,19 +843,24 @@ class DFlashQwen3Model(nn.Module):
         self,
         all_k: torch.Tensor,
         all_v: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ),
     ) -> None:
         """Write only the accepted, resident context slots."""
         if context_slot_mapping is None:
             return
         per_layer = isinstance(context_slot_mapping, (list, tuple))
         for i in range(self._num_attn_layers):
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
-            )
+            attn = self._attn_layers[i]
+            if isinstance(context_slot_mapping, dict):
+                slot_mapping = context_slot_mapping[attn.layer_name]
+            else:
+                slot_mapping = (
+                    context_slot_mapping[i] if per_layer else context_slot_mapping
+                )
             if slot_mapping is None:
                 continue  # dummy run: skip cache ops
-            attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,
@@ -1047,7 +1054,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ) = None,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(

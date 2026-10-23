@@ -95,6 +95,11 @@ class SchedulerConfig:
     The prefill token budget adapts to completed GPU measurements. Pure prefill
     keeps the normal token budget. Zero disables latency control."""
 
+    mixed_prefill_min_tokens: int = Field(default=0, ge=0)
+    """Lower bound on the adaptive mixed-prefill token budget. Zero keeps the
+    purely adaptive budget. Actual scheduled chunks remain subject to the
+    existing token and recurrent-state limits."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.

@@ -1041,7 +1041,7 @@ class VllmBackend:
 
         # Minimal hashing here with existing utilities, reused below.
 
-        env_factors = envs.compile_factors()
+        env_factors = envs.compile_factors(vllm_config.kernel_config)
         env_hash = hash_factors(env_factors)
         # Compute config/compiler/code hashes once and reuse
         config_hash = vllm_config.compute_hash()

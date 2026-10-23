@@ -125,17 +125,16 @@ def _warmup_sm70_qwen_gdn_causal_conv1d(
     the non-speculative causal-conv variant to JIT on the first structured
     request.
     """
-    if (
-        not envs.VLLM_SM70_AUX_KERNEL_WARMUP
-        or not current_platform.is_device_capability(70)
-    ):
-        return False
+    from vllm.config.sm70_runtime import capture_runtime_config
+    from vllm.model_executor.warmup.sm70_runtime import warmup_bound_convolution
 
-    for layer in forward_context.values():
-        warmup = getattr(layer, "_warmup_sm70_causal_conv1d_real_state", None)
-        if warmup is not None and warmup():
-            return True
-    return False
+    return warmup_bound_convolution(
+        forward_context,
+        enabled=bool(
+            capture_runtime_config().auxiliary_warmup
+            and current_platform.is_device_capability(70)
+        ),
+    )
 
 
 @triton.jit
@@ -2438,10 +2437,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 1 + int(vllm_config.speculative_config.num_speculative_state_tokens()),
             )
         _cfg = get_current_vllm_config_or_none()
-        self.sm70_gdn_verify_enabled = bool(
-            _cfg is not None
-            and _cfg.kernel_config.sm70_gdn_verify
-            and hasattr(torch.ops._C, "sm70_gdn_verify_out")
+        self.verification_update = (
+            _cfg.kernel_config.gdn_verification_callback() if _cfg is not None else None
         )
         self.enable_sm70_gdn_rmsnorm_onepass = (
             _sm70_gdn_rmsnorm_onepass_enabled()
@@ -4047,11 +4044,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        hcx_projection = getattr(self, "sm70_hcx_projection_name", None)
-        if hcx_projection is not None and output is None:
-            proj_out = torch.ops.vllm.qwen38_sm70_hcx_output_projection(
-                core_attn_out, hcx_projection
-            )
+        projection_override = getattr(self, "output_projection_override", None)
+        if projection_override is not None and output is None:
+            proj_out = projection_override(core_attn_out)
         elif output is None:
             proj_out, _ = self.out_proj(core_attn_out)
         else:
@@ -4307,7 +4302,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:
-            side = getattr(self, "sm70_side_projection", None)
+            side = getattr(self, "input_projection_override", None)
             if side is not None and 1 <= hidden_states.shape[0] <= 8:
                 mixed_qkvz, ba = side(hidden_states)
             else:
@@ -6109,48 +6104,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     and core_attn_out.is_contiguous()
                     and core_attn_out.dtype == mixed_qkv_spec.dtype
                 )
-                use_cuda_verify = bool(
-                    self.sm70_gdn_verify_enabled
-                    and attn_metadata.num_spec_decodes == 1
-                    and mixed_qkv_spec.dtype == torch.float16
-                    and mixed_qkv_spec.stride(1) == 1
-                    and mixed_qkv_spec.shape[0] <= 8
-                    and ssm_state.dtype == torch.float32
-                    and self.head_k_dim == 128
-                    and self.head_v_dim == 128
-                )
-                if use_cuda_verify:
-                    _log_runtime_route_once(
-                        "SM70 CUDA GDN single-request verification route hit."
-                    )
-                    tokens = mixed_qkv_spec.shape[0]
-                    hv = self.num_v_heads // self.tp_size
-                    verify_out = (
-                        core_attn_out[:num_actual_tokens].unsqueeze(0)
-                        if direct_verify_out
-                        else mixed_qkv_spec.new_empty((1, tokens, hv, 128))
-                    )
-                    torch.ops._C.sm70_gdn_verify_out(
+                verified = (
+                    self.verification_update(
+                        self,
+                        attn_metadata.num_spec_decodes,
                         mixed_qkv_spec,
                         a_spec,
                         b_spec,
-                        self.A_log,
-                        self.dt_bias,
                         ssm_state,
-                        verify_out.view(-1, hv, 128),
-                        spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
+                        core_attn_out,
+                        num_actual_tokens,
+                        direct_verify_out,
+                        spec_query_start_loc,
                         spec_state_indices_tensor,
                         spec_state_slot_selectors,
-                        self.num_k_heads // self.tp_size,
-                        hv,
-                        self.head_k_dim**-0.5,
-                        1,
-                        None,
-                        None,
-                        None,
-                        tokens,
                     )
-                    core_attn_out_spec, last_recurrent_state = verify_out, ssm_state
+                    if self.verification_update is not None
+                    else None
+                )
+                if verified is not None:
+                    core_attn_out_spec, last_recurrent_state = verified
                 else:
                     core_attn_out_spec, last_recurrent_state = (
                         fused_sigmoid_gating_delta_rule_update_mixed_qkv(
