@@ -159,3 +159,46 @@ def test_compact_draft_preserves_prefix_grid_with_scale_overhead(cache_dtype, he
     assert {s.page_size_bytes for s in unified.values()} == {target.page_size_bytes}
     assert specs["draft"] == draft
     assert kv_cache_utils.unify_kv_cache_spec_page_size(unified, config) == unified
+
+
+def test_compact_draft_fills_its_padded_page():
+    """A fitting divisor must not pad away most of the block.
+
+    With a 1664-token target page and a 1648-token FP16 draft page the shared
+    grid is 16, so the largest divisor that merely fits is 16 tokens. The
+    padded page is charged per block, so that layout would cost 212992 B/token
+    for a 4096 B/token cache. The compaction must leave such a spec for the
+    round-up path, which sizes the block from the byte budget (832 tokens).
+    """
+    full = FullAttentionSpec(
+        block_size=1664, num_kv_heads=4, head_size=256, dtype=torch.uint8
+    )
+    draft = SlidingWindowSpec(
+        block_size=1648,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=2048,
+    )
+    mamba = MambaSpec(
+        block_size=8192,
+        shapes=((10, 2560), (48, 128, 128)),
+        dtypes=(torch.float16, torch.float32),
+        num_speculative_blocks=7,
+        mamba_cache_mode="align",
+    )
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=AttentionBackendEnum.FLASH_ATTN_V100),
+        speculative_config=SimpleNamespace(
+            attention_backend=AttentionBackendEnum.FLASH_ATTN_V100
+        ),
+        cache_config=SimpleNamespace(user_specified_mamba_block_size=False),
+    )
+    compact = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {"full": full, "draft": draft, "mamba": mamba}, config
+    )
+    page = compact["full"].page_size_bytes
+    assert {spec.page_size_bytes for spec in compact.values()} == {page}
+    assert compact["draft"].block_size == 832
+    # The draft page must carry its payload, not a fraction of it.
+    assert compact["draft"].real_page_size_bytes == page
