@@ -43,7 +43,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.config.execution_policy import graph_policy
-from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.config.sm70_runtime import RuntimeTraceConfig, capture_runtime_trace
 from vllm.diagnostics import bind_diagnostics, diagnostic_channel, flush_runner_graphs
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -405,13 +405,13 @@ def _dflash_ddtree_metadata_profile_enabled() -> bool:
     return os.getenv("VLLM_DFLASH_DDTREE_METADATA_PROFILE", "0") == "1"
 
 
-def _dflash_ddtree_target_forward_nvtx_enabled() -> bool:
-    return capture_runtime_trace().spec_target_nvtx
+def _dflash_ddtree_target_forward_nvtx_enabled(trace: RuntimeTraceConfig) -> bool:
+    return trace.value("spec_target_nvtx")
 
 
-def _dflash_ddtree_target_forward_profiler_step() -> int:
+def _dflash_ddtree_target_forward_profiler_step(trace: RuntimeTraceConfig) -> int:
     # Compatibility name; initialized engines borrow their diagnostic policy.
-    return capture_runtime_trace().spec_target_profiler_step
+    return trace.value("spec_target_profiler_step")
 
 
 def _maybe_dump_sm70_mtp_step(
@@ -1066,8 +1066,12 @@ class GPUModelRunner(
             yield
             return
 
-        nvtx_enabled = _dflash_ddtree_target_forward_nvtx_enabled()
-        profiler_step = _dflash_ddtree_target_forward_profiler_step()
+        # The scope opens before the forward context, so the module-level
+        # lookup would rebuild a standalone trace config on every step; the
+        # runner borrows its engine's own diagnostic owner instead.
+        trace = self.vllm_config.observability_config.runtime_trace
+        nvtx_enabled = _dflash_ddtree_target_forward_nvtx_enabled(trace)
+        profiler_step = _dflash_ddtree_target_forward_profiler_step(trace)
         if not nvtx_enabled and profiler_step <= 0:
             yield
             return
