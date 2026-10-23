@@ -75,6 +75,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -265,6 +266,7 @@ class Glm5NextMoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=self.router_dtype,
+            force_fp32_compute=self.router_dtype == torch.float32,
             prefix=f"{prefix}.gate",
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -1248,6 +1250,19 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                if (
+                    weight_name == ".weights_proj"
+                    and loaded_weight.dtype == torch.float32
+                ):
+                    # Preserve the checkpoint's FP32 indexer head gates before
+                    # merging a model-dtype copy with WK. Casting that fused
+                    # copy back to FP32 in forward cannot recover these bits.
+                    indexer = self.get_submodule(name.rsplit(".wk_weights_proj", 1)[0])
+                    indexer._wp_fp32 = (
+                        loaded_weight.to(device=param.device, dtype=torch.float32)
+                        .t()
+                        .contiguous()
+                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1493,24 +1508,26 @@ class Glm5NextForConditionalGeneration(
             multimodal_config.is_multimodal_pruning_enabled()
         )
 
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Glm5NextVisionTransformer(
-                config.text_config,
-                config.vision_config,
-                # Read eps from the VISION sub-config, not the top-level
-                # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__ mirrors
-                # the latter onto text_config (1e-5), silently ignoring the
-                # vision tower's own (1e-6) rms_norm_eps.
-                norm_eps=config.vision_config.rms_norm_eps,
-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
-                # weight_scale_inv for visual.*), so it must NOT inherit the
-                # global fp8 quant_config -- doing so incorrectly quantizes
-                # the tower
-                # and yields NaN image features. Mirrors the MLA/KDA proj
-                # pattern (quant_config=None for BF16 submodules).
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+        # V2 merges image features into input embeddings on the first PP rank.
+        # Downstream ranks consume those embeddings through intermediate states;
+        # they must not allocate or load another copy of the vision tower.
+        if multimodal_config.language_model_only or (
+            not multimodal_config.mm_encoder_only and not get_pp_group().is_first_rank
+        ):
+            self.visual = StageMissingLayer("vision_tower")
+            self._tower_model_names = []
+        else:
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.visual = Glm5NextVisionTransformer(
+                    config.text_config,
+                    config.vision_config,
+                    # Use the vision subconfig, not the mirrored text epsilon.
+                    norm_eps=config.vision_config.rms_norm_eps,
+                    # Dense BF16/F16 vision weights must not inherit the text
+                    # model's FP8 or GGUF quantization configuration.
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
@@ -1522,6 +1539,20 @@ class Glm5NextForConditionalGeneration(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded = AutoWeightsLoader(self).load_weights(
+            weights, mapper=self.hf_to_vllm_mapper
+        )
+        if self.model_config.quantization == "gguf":
+            expected = {f"visual.{name}" for name, _ in self.visual.named_parameters()}
+            missing = expected - loaded
+            if missing:
+                raise ValueError(
+                    "GGUF checkpoint did not load GLM5Next vision parameters: "
+                    + ", ".join(sorted(missing))
+                )
+        return loaded
 
     def get_encoder_cudagraph_config(self):
         # The forked vision tower (multimodal.py) has no abs-pos embeddings, so its

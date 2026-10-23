@@ -42,6 +42,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         quant_config = vllm_config.quant_config
+        gguf = vllm_config.model_config.quantization == "gguf"
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -63,7 +64,9 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             device=current_platform.device_type,
         )
         self.shared_head = SharedHead(
-            config=config, prefix=prefix, quant_config=quant_config
+            config=config,
+            prefix=maybe_prefix(prefix, "shared_head") if gguf else prefix,
+            quant_config=quant_config,
         )
         # MTP layers sit past the base model's hidden layers; parse the index
         # from the prefix (e.g. "...layers.32") so the decoder builds an MLA
@@ -73,7 +76,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             vllm_config=vllm_config,
             config=config,
             layer_idx=layer_idx,
-            prefix=prefix,
+            prefix=maybe_prefix(prefix, "mtp_block") if gguf else prefix,
             topk_indices_buffer=topk_indices_buffer,
             is_mtp_layer=True,
         )
@@ -259,6 +262,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
+        if name.startswith(f"model.layers.{spec_layer}.mtp_block."):
+            return name
         spec_layer_weight_names = [
             "embed_tokens",
             "enorm",
@@ -317,6 +322,12 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            if name == "model.embed_tokens.weight":
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -362,6 +373,16 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                if (
+                    weight_name == "weights_proj"
+                    and loaded_weight.dtype == torch.float32
+                ):
+                    indexer = self.get_submodule(name.rsplit(".wk_weights_proj", 1)[0])
+                    indexer._wp_fp32 = (
+                        loaded_weight.to(device=param.device, dtype=torch.float32)
+                        .t()
+                        .contiguous()
+                    )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:

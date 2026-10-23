@@ -4,6 +4,8 @@
 
 import json
 import math
+from collections.abc import Mapping
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -295,6 +297,22 @@ def _resize_or_pad(
         padding=[0, 0, target_width - content_width, target_height - content_height],
         fill=0,
     )
+
+
+def _reject_pixel_budget_kwargs(kwargs: Mapping[str, object]) -> None:
+    for section in (
+        kwargs,
+        kwargs.get("images_kwargs", {}),
+        kwargs.get("videos_kwargs", {}),
+    ):
+        if (
+            isinstance(section, Mapping)
+            and {"min_pixels", "max_pixels"} & section.keys()
+        ):
+            raise ValueError(
+                "This processor uses min_image_tokens/max_image_tokens; "
+                "min_pixels/max_pixels are not supported processor options"
+            )
 
 
 def _pixel_budget(
@@ -843,6 +861,10 @@ class Glm5NextProcessor(ProcessorMixin):
         from transformers import AutoTokenizer
 
         model_path = pretrained_model_name_or_path
+        local_path = Path(model_path)
+        if local_path.suffix.lower() == ".gguf" and local_path.is_file():
+            # GGUF shards carry weights; processor/tokenizer assets are siblings.
+            model_path = str(local_path.parent)
         tokenizer = AutoTokenizer.from_pretrained(model_path, **kwargs)
 
         def _cap_cfg(cfg: dict, *, is_video: bool) -> dict:
@@ -904,6 +926,7 @@ class Glm5NextProcessor(ProcessorMixin):
         videos: VideoInput | None = None,
         **kwargs: Unpack[Glm5NextProcessorKwargs],
     ) -> BatchFeature:
+        _reject_pixel_budget_kwargs(kwargs)
         output_kwargs = self._merge_kwargs(
             Glm5NextProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
@@ -916,11 +939,38 @@ class Glm5NextProcessor(ProcessorMixin):
         else:
             image_inputs = {}
 
+        video_timestamps = None
         if videos is not None:
+            # Preserve the indices actually used by BaseVideoProcessor. Replaying
+            # another model's sampling policy during prompt expansion can produce
+            # a different number of temporal groups for the same clip.
+            output_kwargs["videos_kwargs"]["return_metadata"] = True
             videos_inputs = self.video_processor(
                 videos=videos, **output_kwargs["videos_kwargs"]
             )
-            if "return_metadata" not in kwargs:
+            video_timestamps = []
+            for metadata, grid in zip(
+                videos_inputs["video_metadata"],
+                videos_inputs["video_grid_thw"],
+                strict=True,
+            ):
+                if metadata.fps is None or metadata.fps <= 0:
+                    raise ValueError("Video timestamps require a positive source fps.")
+                indices = metadata.frames_indices
+                if indices is None or len(indices) == 0:
+                    raise ValueError("Video timestamps require sampled frame indices.")
+                # The checkpoint's prompt contract keeps fractional seconds and
+                # formats them to one decimal place only when inserting text.
+                timestamps = metadata.timestamps[
+                    :: self.video_processor.temporal_patch_size
+                ]
+                if len(timestamps) != int(grid[0]):
+                    raise ValueError(
+                        "Sampled video timestamps do not match the temporal grid: "
+                        f"{len(timestamps)} timestamps for grid {grid}."
+                    )
+                video_timestamps.append(torch.tensor(timestamps, dtype=torch.float64))
+            if not kwargs.get("return_metadata", False):
                 videos_inputs.pop("video_metadata")
         else:
             videos_inputs = {}
@@ -940,10 +990,15 @@ class Glm5NextProcessor(ProcessorMixin):
             mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
             mm_token_type_ids[array_ids == self.image_token_id] = 1
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
-        return BatchFeature(
+        features = BatchFeature(
             data={**text_inputs, **image_inputs, **videos_inputs},
             tensor_type=return_tensors,
         )
+        if video_timestamps is not None:
+            # Different clips may have different temporal lengths. Keep the batch
+            # as a list of vectors instead of forcing it into a rectangular tensor.
+            features["timestamps"] = video_timestamps
+        return features
 
     def _get_num_multimodal_tokens(self, image_sizes=None, video_sizes=None, **kwargs):
         vision_data = {}

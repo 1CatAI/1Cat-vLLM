@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""GLM-5.3-Flash sparse MLA backend for exact SM70 CUDA devices."""
+"""GLM-5.3-Flash sparse MLA using portable FP16 and software E4M3 kernels.
+
+The backend name remains GLM5_SM70_SPARSE for existing configurations.
+"""
 
 from typing import TYPE_CHECKING, ClassVar
 
@@ -12,6 +15,10 @@ from vllm.config.cache import CacheDType
 from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
 from vllm.diagnostics import diagnostic_history
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4.common.portable_sparse import (
+    portable_sparse_mla_config_error,
+    supports_portable_sparse,
+)
 from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_gathered,
 )
@@ -77,7 +84,7 @@ class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 7 and capability.minor in (0, 2)
+        return supports_portable_sparse(capability)
 
     @classmethod
     def supports_combination(
@@ -91,18 +98,19 @@ class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
         use_sparse: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        del head_size, dtype, kv_cache_dtype, block_size, use_mla, has_sink
+        del block_size, use_mla, has_sink
         del use_sparse, device_capability
         config = get_current_vllm_config_or_none()
         if config is None or config.model_config is None:
             return None
         text_config = config.model_config.hf_text_config
-        if (
-            getattr(text_config, "qk_rope_head_dim", None) != 0
-            or getattr(text_config, "kv_lora_rank", None) != 512
-        ):
-            return "GLM5_SM70_SPARSE requires NoPE MLA with kv_lora_rank=512"
-        return None
+        return portable_sparse_mla_config_error(
+            head_size=head_size,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_lora_rank=getattr(text_config, "kv_lora_rank", -1),
+            qk_rope_head_dim=getattr(text_config, "qk_rope_head_dim", -1),
+        )
 
 
 class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
@@ -184,7 +192,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             )
         current_workspace_manager().get_simultaneous(*workspace_specs)
         logger.info_once(
-            "GLM-5.3-Flash route: SM70 FP16 sparse MLA with %s KV%s.",
+            "GLM-5.3-Flash route: portable FP16 sparse MLA with %s KV%s.",
             "packed E4M3FN" if self.use_fp8_cache else "FP16",
             (
                 " and B1/M2-M8 dequant + tensor-core GEMM decode"

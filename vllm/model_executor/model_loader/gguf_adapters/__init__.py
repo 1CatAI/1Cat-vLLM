@@ -2,6 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Architecture adapters, independent of Transformers model construction."""
 
+from importlib import import_module
+
+# Values remain lazy so adding an architecture does not import its kernels or
+# model implementation while another model's loader is being configured.
+_TEXT_ADAPTERS = {
+    "qwen4_exp_text": ("qwen4exp", "Qwen4ExpAdapter"),
+    "qwen3_5_moe_text": ("qwen35_moe", "Qwen35MoeAdapter"),
+    "qwen3_5_text": ("qwen35", "Qwen35Adapter"),
+    "glm5_next_text": ("glm5next", "Glm5NextAdapter"),
+}
+
+# Drafts can share the target's config model_type while owning a different
+# module tree and checkpoint subset. Resolve their explicit architecture first.
+_DRAFT_ADAPTERS = {
+    "Glm5NextMTPModel": ("glm5next", "Glm5NextMTPAdapter"),
+}
+
 
 def get_gguf_adapter(config, tp_size=1):
     text = config.get_text_config()
@@ -11,16 +28,18 @@ def get_gguf_adapter(config, tp_size=1):
         from .dflash import DFlashAdapter
 
         return DFlashAdapter(text, tp_size=tp_size)
-    if config.get_text_config().model_type == "qwen4_exp_text":
-        from .qwen4exp import Qwen4ExpAdapter
-
-        return Qwen4ExpAdapter(config.get_text_config(), tp_size=tp_size)
-    if config.get_text_config().model_type == "qwen3_5_moe_text":
-        from .qwen35_moe import Qwen35MoeAdapter
-
-        return Qwen35MoeAdapter(config.get_text_config(), tp_size=tp_size)
-    if config.get_text_config().model_type == "qwen3_5_text":
-        from .qwen35 import Qwen35Adapter
-
-        return Qwen35Adapter(config.get_text_config(), tp_size=tp_size)
-    return None
+    entry = next(
+        (
+            _DRAFT_ADAPTERS[arch]
+            for arch in (getattr(config, "architectures", None) or [])
+            if arch in _DRAFT_ADAPTERS
+        ),
+        None,
+    )
+    if entry is None:
+        entry = _TEXT_ADAPTERS.get(text.model_type)
+    if entry is None:
+        return None
+    module, name = entry
+    adapter = getattr(import_module(f"{__name__}.{module}"), name)
+    return adapter(text, tp_size=tp_size)

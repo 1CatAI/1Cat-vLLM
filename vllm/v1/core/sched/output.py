@@ -216,11 +216,19 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
-    # Nonzero only for a latency-controlled mixed step. Pure decode incurs no
-    # GPU timing events and retains its uniform FULL-graph route.
+    # Counts for latency-controlled mixed steps and PP prefill observations.
+    # Pure decode incurs no timing events and retains its FULL-graph route.
     mixed_prefill_tokens: int = 0
     mixed_decode_tokens: int = 0
-    mixed_prefill_budget: int = 0
+    mixed_prefill_budget: int = 0  # Zero: observe without training the controller.
+
+    # PP also protects resident decoders awaiting an earlier batch's feedback.
+    # Such a controlled prefill batch can have zero local decode rows. Its
+    # latency is measured by the engine, not by the last stage's CUDA events.
+    mixed_prefill_is_pp: bool = False
+    # Engine-owned, bound to this output/queued batch. Workers never read the
+    # host timestamp. Cleared when this batch's result is consumed.
+    mixed_prefill_started_at: float | None = None
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

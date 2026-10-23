@@ -69,6 +69,126 @@ def test_arena_views_are_disjoint_and_keep_zero_guards():
     assert all(bank.min() == 255 for bank in banks)
 
 
+def _pipeline_arena(rank, *, wrapped=False, count=7):
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    local = torch.nn.Module()
+    local.mlp = torch.nn.Module()
+    local.mlp.experts = torch.nn.Module()
+    experts = local.mlp.experts
+    method = object.__new__(GGUFNativeMoEMethod)
+    method.hidden_size = method.intermediate_size = 256
+    method.num_experts = 2
+    method.guarded_shards = set()
+    experts.quant_method, experts.tp_size, experts.tp_rank = method, 1, 0
+    root = torch.nn.Module()
+    root.model = torch.nn.Module()
+    root.model.layers = torch.nn.ModuleList(
+        local if index == rank else PPMissingLayer() for index in range(count)
+    )
+    prefix = "model.layers"
+    if wrapped:
+        wrapper = torch.nn.Module()
+        wrapper.language_model = root
+        root = wrapper
+        prefix = "language_model." + prefix
+    mapping, tensors = {}, {}
+    for index in range(count):
+        for projection, kind in (("gate_proj", 21), ("up_proj", 21), ("down_proj", 23)):
+            raw = f"blk.{index}.{projection}.weight"
+            mapping[raw] = f"{prefix}.{index}.mlp.experts.{projection}.weight"
+            # An absent stage must be filtered before its tensor is inspected,
+            # even if no local tensor handle exists for that checkpoint entry.
+            if index == rank:
+                tensors[raw] = SimpleNamespace(shape=(256, 256, 2), tensor_type=kind)
+    return root, experts, mapping, tensors
+
+
+@pytest.fixture
+def isolated_pp_arena(monkeypatch):
+    from vllm.model_executor.layers.quantization import gguf_expert_storage as storage
+    from vllm.model_executor.models import utils
+
+    # Each test constructs a distinct model; isolate the existing ID-keyed PP
+    # cache so CPython object ID reuse between cases cannot affect ownership.
+    monkeypatch.setattr(utils, "_model_to_pp_missing_layer_names", {})
+    monkeypatch.setattr(storage, "_expert_cache_config", lambda: None)
+    return storage
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("rank", range(7))
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_arena_preallocates_and_prefetches_only_local_pp_experts(
+    isolated_pp_arena, rank, wrapped
+):
+    root, layer, mapping, tensors = _pipeline_arena(rank, wrapped=wrapped)
+    targets = prepare_original_expert_arena(root, mapping, tensors, "cpu")
+    assert set(targets) == set(tensors)
+    assert {entry[2] for entry in targets.values()} == {"w1", "w3", "w2"}
+    assert all(entry[:2] == (layer, layer.quant_method) for entry in targets.values())
+    banks = [layer.gguf_w1, layer.gguf_w3, layer.gguf_w2]
+    assert len({bank.untyped_storage().data_ptr() for bank in banks}) == 1
+    assert all(
+        bank.dtype == torch.uint8 and bank.shape[:2] == (2, 256) for bank in banks
+    )
+    assert layer.quant_method.guarded_shards == {"w1", "w3", "w2"}
+
+
+@pytest.mark.cpu_test
+def test_arena_pp_layer_prefix_has_component_boundary(isolated_pp_arena):
+    root, layer, mapping, tensors = _pipeline_arena(10, count=11)
+    targets = prepare_original_expert_arena(root, mapping, tensors, "cpu")
+    assert set(targets) == set(tensors)
+    assert layer.gguf_w1.shape[0] == 2
+
+
+@pytest.mark.cpu_test
+def test_arena_cache_receives_only_admitted_local_banks(isolated_pp_arena, monkeypatch):
+    root, layer, mapping, tensors = _pipeline_arena(3, wrapped=True)
+    calls = []
+    config = object()
+    monkeypatch.setattr(isolated_pp_arena, "_expert_cache_config", lambda: config)
+    monkeypatch.setattr(
+        isolated_pp_arena,
+        "_prepare_expert_cache",
+        lambda banks, settings, device: calls.append((banks, settings, device)),
+    )
+    targets = prepare_original_expert_arena(root, mapping, tensors, "cpu")
+    assert set(targets) == set(tensors)
+    assert len(calls) == 1
+    banks, settings, device = calls[0]
+    assert len(banks) == 3 and all(bank[0] is layer for bank in banks)
+    assert settings is config and device == "cpu"
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("stage_missing", [False, True])
+def test_arena_skips_an_entire_missing_model(
+    isolated_pp_arena, monkeypatch, stage_missing
+):
+    from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
+
+    root = StageMissingLayer("language_model") if stage_missing else PPMissingLayer()
+    monkeypatch.setattr(
+        isolated_pp_arena.torch,
+        "empty",
+        lambda *args, **kwargs: pytest.fail("missing stage allocated an arena"),
+    )
+    mapping = {"raw": "model.layers.0.mlp.experts.gate_proj.weight"}
+    assert prepare_original_expert_arena(root, mapping, {}, "cpu") == {}
+
+
+@pytest.mark.cpu_test
+def test_arena_does_not_hide_invalid_local_expert_path(isolated_pp_arena):
+    root, _, mapping, tensors = _pipeline_arena(0)
+    mapping["blk.0.gate_proj.weight"] = (
+        "model.layers.0.missing.experts.gate_proj.weight"
+    )
+    with pytest.raises(AttributeError, match="missing"):
+        prepare_original_expert_arena(root, mapping, tensors, "cpu")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("m", [5, 20])
 def test_native_dense_reads_arena_offsets_exactly_and_replays(m):

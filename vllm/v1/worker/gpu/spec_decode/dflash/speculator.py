@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Mapping
+from copy import copy
 from typing import Any, cast
 
 import numpy as np
@@ -269,12 +270,19 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
+        # The complete draft runs locally on the target's final PP rank.
+        # Its attention config must not inherit the target executor's
+        # multi-stage queue depth. Copy rather than mutate that scheduler;
+        # its constructor InitVars are not retained for config.replace.
+        scheduler_config = copy(self.vllm_config.scheduler_config)
+        scheduler_config.pp_async_queue_depth = None
         # The draft's attention differs from the target's in causality.
         return replace(
             self.vllm_config,
             is_speculative_draft=True,
             model_config=self.draft_model_config,
             parallel_config=self.speculative_config.draft_parallel_config,
+            scheduler_config=scheduler_config,
             attention_config=replace(
                 self.vllm_config.attention_config,
                 use_non_causal=self.requires_non_causal,
@@ -698,6 +706,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self.max_num_tokens,
                     self.max_model_len,
                     self.sample_from_anchor,
+                    blocks_per_kv_block=self.block_tables.blocks_per_kv_block[gid],
                 )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
@@ -876,6 +885,7 @@ def _prepare_dflash_inputs_kernel(
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_KV_BLOCK: tl.constexpr = 1,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -916,10 +926,10 @@ def _prepare_dflash_inputs_kernel(
         mask=is_valid_ctx,
         other=0,
     ).to(tl.int64)
-    # Block 0 is the null block. Old sliding-window context positions can map
-    # to it after eviction; rejected suffix rows are invalid context as well.
-    # Neither kind of row may write draft KV into physical block 0.
-    ctx_resident = is_valid_ctx & (ctx_block_id != 0)
+    # Physical block 0 is null. Virtual splitting expands it to kernel block
+    # IDs [0, BLOCKS_PER_KV_BLOCK), all of which must remain unwritable.
+    # Rejected suffix rows and evicted sliding-window context are invalid too.
+    ctx_resident = is_valid_ctx & (ctx_block_id >= BLOCKS_PER_KV_BLOCK)
     local_ctx_slot = cp_local_slot(
         ctx_pos, ctx_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID
     )
@@ -949,9 +959,8 @@ def _prepare_dflash_inputs_kernel(
         mask=is_query,
         other=0,
     ).to(tl.int64)
-    # A null block is never a writable cache slot. This can occur when a
-    # sliding-window block table contains evicted/global padding entries.
-    q_resident = is_query & (q_block_id != 0)
+    # Exclude every virtual subpage of the null physical block here as well.
+    q_resident = is_query & (q_block_id >= BLOCKS_PER_KV_BLOCK)
     local_q_slot = cp_local_slot(
         query_pos,
         q_block_id,
@@ -1069,7 +1078,10 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    blocks_per_kv_block: int = 1,
 ) -> None:
+    if blocks_per_kv_block < 1:
+        raise ValueError("blocks_per_kv_block must be positive")
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
     # Cover the longest possible per-request span (ctx + query). Use the max
@@ -1115,4 +1127,5 @@ def prepare_dflash_inputs(
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+        BLOCKS_PER_KV_BLOCK=blocks_per_kv_block,
     )

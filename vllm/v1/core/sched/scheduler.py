@@ -132,8 +132,25 @@ class Scheduler(SchedulerInterface):
             self.max_num_scheduled_tokens,
             self.scheduler_config.mixed_prefill_step_latency_ms,
             self.scheduler_config.mixed_prefill_min_tokens,
+            initial_tokens=32
+            if self.parallel_config.pipeline_parallel_size > 1
+            else 512,
         )
         self.mixed_prefill_enabled = current_platform.device_type == "cuda"
+        if (
+            self.mixed_prefill_enabled
+            and self.parallel_config.pipeline_parallel_size > 1
+            and self.scheduler_config.mixed_prefill_step_latency_ms > 0
+            and self.scheduler_config.enable_chunked_prefill
+            and not self.scheduler_config.disable_chunked_mm_input
+            and not self.is_encoder_decoder
+        ):
+            logger.info(
+                "PP mixed-prefill latency control: engine-observed target=%.1f ms, "
+                "initial budget=%d tokens; includes in-flight decode protection",
+                self.scheduler_config.mixed_prefill_step_latency_ms,
+                self.mixed_prefill_budget.tokens,
+            )
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -268,6 +285,16 @@ class Scheduler(SchedulerInterface):
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
 
+        verified_mtp_prefill_cache = bool(
+            isinstance(vllm_config.additional_config, dict)
+            and vllm_config.additional_config.get("verified_mtp_prefill_cache", False)
+        )
+        if verified_mtp_prefill_cache and (
+            speculative_config is None
+            or speculative_config.method != "mtp"
+            or not vllm_config.use_v2_model_runner
+        ):
+            raise ValueError("verified_mtp_prefill_cache requires MRV2 native MTP")
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -284,6 +311,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
+            verified_mtp_prefill_cache=verified_mtp_prefill_cache,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -617,13 +645,22 @@ class Scheduler(SchedulerInterface):
             and self.current_step >= r.next_decode_eligible_step
         }
         resident_tokens = {rid: n for rid, n in resident_tokens.items() if n > 0}
+        is_pp = self.parallel_config.pipeline_parallel_size > 1
+        # A resident decoder remains latency-sensitive while its result is in
+        # flight. Do not reserve execution tokens or advance its eligibility:
+        # MTP/recurrent state must still wait for the normal PP feedback cadence.
+        has_inflight_decode = is_pp and any(
+            prefill_remaining[r.request_id] == 0
+            and (r.num_output_tokens > 0 or r.num_output_placeholders > 0)
+            and r.request_id not in resident_tokens
+            for r in self.running
+        )
         control_mixed_prefill = (
             self.mixed_prefill_enabled
-            and bool(resident_tokens)
+            and (bool(resident_tokens) or has_inflight_decode)
             and self.scheduler_config.mixed_prefill_step_latency_ms > 0
             and self.scheduler_config.enable_chunked_prefill
             and not self.scheduler_config.disable_chunked_mm_input
-            and self.parallel_config.pipeline_parallel_size == 1
             and not self.is_encoder_decoder
         )
 
@@ -1339,7 +1376,7 @@ class Scheduler(SchedulerInterface):
                     min(n, prefill_remaining.get(rid, 0))
                     for rid, n in num_scheduled_tokens.items()
                 )
-                if control_mixed_prefill
+                if control_mixed_prefill or is_pp
                 else 0
             ),
             mixed_decode_tokens=(
@@ -1348,12 +1385,13 @@ class Scheduler(SchedulerInterface):
                     for rid, n in num_scheduled_tokens.items()
                     if rid in resident_tokens
                 )
-                if control_mixed_prefill
+                if control_mixed_prefill or is_pp
                 else 0
             ),
             mixed_prefill_budget=(
                 self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
             ),
+            mixed_prefill_is_pp=is_pp,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,

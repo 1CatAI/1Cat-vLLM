@@ -19,7 +19,10 @@ import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from tests.config.runtime_policy_utils import make_policy_defaults
+from tools.sm70.flash_v100_trace import Recorder, cpu_cuda, install_ops
 from vllm import envs
+from vllm.config import SchedulerConfig
+from vllm.config.diagnostic_dump import TensorDumpConfig
 from vllm.config.sm70_dflash2 import SM70_DFLASH2_LEGACY_FIELDS, Sm70DFlash2Config
 from vllm.config.speculative import (
     SpeculativeConfig,
@@ -33,6 +36,7 @@ from vllm.config.vllm import (
     _configure_sm70_glm5_dflash_tp8_pp1_verifier_path,
     _is_sm70_dflash2_verifier_contract,
 )
+from vllm.diagnostics import DiagnosticChannel
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -1080,6 +1084,9 @@ def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):
         self.vocab_size = 31
         self.draft_tokens = torch.empty((2, 7), dtype=torch.int64, device=device)
         self.draft_logits = draft_logits
+        self._tensor_dump = DiagnosticChannel(
+            TensorDumpConfig(directory=None, max_dumps=0)
+        )
         self._draft_logits_init = (
             None if draft_logits is None else (torch.float32, -float("inf"))
         )
@@ -1096,8 +1103,8 @@ def test_selector_leaves_greedy_without_proposal_logits(monkeypatch):
 def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch):
     allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", False)
-    monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0")
+    monkeypatch.setenv("VLLM_SPEC_DUMP_ALIGNMENT", "0")
     speculator = DFlash2Speculator(None, torch.device("cpu"))
     assert speculator.draft_logits is allocated
     assert torch.isneginf(speculator.draft_logits).all()
@@ -1122,11 +1129,12 @@ def test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice(monkeypatc
     allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "1")
-    monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", True)
+    monkeypatch.setenv("VLLM_SPEC_DUMP_ALIGNMENT", "1")
 
     speculator = DFlash2Speculator(None, torch.device("cpu"))
     shadow = speculator.get_selector_alignment_shadow()
 
+    assert speculator._trace.value("alignment") is True
     assert shadow is not None
     candidate_ids, unary_logits, lattice_scores = shadow
     assert candidate_ids.shape == (2, 7, 16)
@@ -1868,18 +1876,38 @@ def test_selector_tail_split_is_sm70_only(monkeypatch, capability, num_steps, ex
     assert _requires_sm70_tail(torch.device("cuda:0"), num_steps) is expected
 
 
-def test_noncausal_draft_cannot_enter_flash_v100_small_query_fast_path():
-    impl = SimpleNamespace(
-        use_flash_v100_decode=True,
-        smallq_decode_max_query_len=8,
-        smallq_decode_max_model_len=4096,
-    )
+@pytest.fixture
+def cpu_flash_v100_impl(monkeypatch):
+    # Initialize the real policy, validation, and executor interfaces. Only
+    # native operators and CUDA services are replaced by CPU test adapters.
+    with cpu_cuda(monkeypatch, False):
+        install_ops(monkeypatch, Recorder(), flash_v100, {})
+        yield FlashAttnV100Impl(
+            num_heads=1,
+            head_size=128,
+            scale=1.0,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+        )
+
+
+def test_noncausal_draft_cannot_enter_flash_v100_small_query_fast_path(
+    cpu_flash_v100_impl,
+):
+    impl = cpu_flash_v100_impl
+    impl.use_flash_v100_decode = True
+    impl.smallq_decode_max_query_len = 8
+    impl.smallq_decode_max_model_len = 4096
     metadata = SimpleNamespace(
         causal=False,
         query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
         max_model_len=128,
     )
     assert not FlashAttnV100Impl._small_query_decode_enabled(impl, metadata)
+    metadata.causal = True
+    assert FlashAttnV100Impl._small_query_decode_enabled(impl, metadata)
 
 
 def test_dflash_attention_builders_receive_the_draft_model_config(monkeypatch):
@@ -1892,11 +1920,19 @@ def test_dflash_attention_builders_receive_the_draft_model_config(monkeypatch):
     attention_config = object()
     target_parallel_config = object()
     draft_parallel_config = object()
+    scheduler_config = SchedulerConfig(
+        max_model_len=128,
+        is_encoder_decoder=False,
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+        pp_async_queue_depth=2,
+    )
     speculator = SimpleNamespace(
         vllm_config=SimpleNamespace(
             model_config=target_model_config,
             attention_config=attention_config,
             parallel_config=target_parallel_config,
+            scheduler_config=scheduler_config,
         ),
         speculative_config=SimpleNamespace(draft_parallel_config=draft_parallel_config),
         draft_model_config=draft_model_config,
@@ -1909,6 +1945,9 @@ def test_dflash_attention_builders_receive_the_draft_model_config(monkeypatch):
     assert config.parallel_config is draft_parallel_config
     assert config.attention_config.source is attention_config
     assert config.attention_config.use_non_causal is True
+    assert config.scheduler_config is not scheduler_config
+    assert config.scheduler_config.pp_async_queue_depth is None
+    assert scheduler_config.pp_async_queue_depth == 2
 
 
 def test_dflash_disables_aot_schedule_only_for_sliding_draft_groups(monkeypatch):
@@ -1992,6 +2031,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
         slot_mappings=[torch.zeros(8, dtype=torch.int64)],
         input_block_tables=[torch.zeros(1, 8, dtype=torch.int32)],
         kernel_block_sizes=[1],
+        blocks_per_kv_block=[1],
         cp_rank=0,
         cp_size=1,
         cp_interleave=1,
@@ -2028,6 +2068,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     )
 
     prepare_inputs.assert_called_once()
+    assert prepare_inputs.call_args.kwargs["blocks_per_kv_block"] == 1
     speculator.model.precompute_and_store_context_kv.assert_called_once()
     torch.testing.assert_close(
         speculator.hidden_states[:4],
@@ -2036,24 +2077,18 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     assert output.tolist() == [[-1] * 7]
 
 
-def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):
+def test_noncausal_dflash_capture_binds_paged_prefix_attention(
+    monkeypatch, cpu_flash_v100_impl
+):
     monkeypatch.setattr(flash_v100, "_is_cuda_graph_capturing", lambda _query: True)
-    output = torch.empty(8, 1, 1)
+    output = torch.empty(8, 1, 128)
     paged_prefix = Mock(return_value=output)
-    impl = SimpleNamespace(
-        _supports_flash_v100_path=lambda: True,
-        _validate_dflash_attention_contract=lambda _layer, _metadata: None,
-        _layer_debug_info=lambda _layer: {
-            "layer_name": "draft",
-            "is_dflash_draft_attn": True,
-        },
-        use_triton_prefill=False,
-        use_decode_scalar_paged=True,
-        use_decode_paged_prefill=False,
-        use_flash_v100_prefill_paged=True,
-        _small_query_decode_enabled=lambda _metadata: False,
-        _flash_v100_prefill_with_prefix=paged_prefix,
-    )
+    impl = cpu_flash_v100_impl
+    impl.use_triton_prefill = False
+    impl.use_decode_scalar_paged = True
+    impl.use_decode_paged_prefill = False
+    impl.use_flash_v100_prefill_paged = True
+    monkeypatch.setattr(impl, "_flash_v100_prefill_with_prefix", paged_prefix)
     metadata = SimpleNamespace(
         max_query_len=8,
         max_seq_len=1024,
@@ -2067,8 +2102,14 @@ def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):
         seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
         block_table=torch.tensor([[0]], dtype=torch.int32),
     )
-    query = torch.empty(8, 1, 1)
-    layer = SimpleNamespace(is_dflash_draft_attn=True)
+    query = torch.empty(8, 1, 128)
+    layer = SimpleNamespace(
+        layer_name="draft",
+        is_dflash_draft_attn=True,
+        dflash_expected_causal=False,
+        dflash_expected_sliding_window=None,
+        dflash_rope_is_neox_style=True,
+    )
 
     result = FlashAttnV100Impl.forward(
         impl,

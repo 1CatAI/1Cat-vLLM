@@ -666,9 +666,9 @@ def get_config(
     # Native GGUF metadata parsing precedes HF repository/config discovery.
     # Explicit --hf-config-path reaches this function as a normal HF reference.
     from .gguf_config import (
-        _ARCHITECTURES,
         gguf_config_from_metadata,
         read_gguf_metadata,
+        supports_native_gguf_config,
     )
     from .gguf_files import resolve_gguf_file
 
@@ -681,7 +681,7 @@ def get_config(
             token=kwargs.get("token"),
         )
         metadata = read_gguf_metadata(local_gguf)
-        if metadata.get("general.architecture") in _ARCHITECTURES:
+        if supports_native_gguf_config(metadata.get("general.architecture")):
             config = gguf_config_from_metadata(metadata)
             if hf_overrides_kw:
                 config.update(hf_overrides_kw)

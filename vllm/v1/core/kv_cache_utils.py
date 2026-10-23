@@ -136,6 +136,9 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Set only for known prompt inputs; cleared on every eviction/reuse.
+    prefill_boundary_hash: BlockHash | None = None
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -150,6 +153,7 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+        self.prefill_boundary_hash = None
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -1617,6 +1621,11 @@ def _get_kv_cache_groups_glm5_next(
     tail_group = None
     if tail_specs:
         idx_page = next(iter(idx_pages))
+        if any(s.real_page_size_bytes > idx_page for s in tail_specs.values()):
+            raise ValueError(
+                "KPool tail history exceeds the shared indexer page capacity; "
+                "reduce the speculative query length or increase the cache block size"
+            )
         padded_tail_specs: dict[str, KVCacheSpec] = {
             name: replace(s, page_size_padded=idx_page)
             for name, s in tail_specs.items()

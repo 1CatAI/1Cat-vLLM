@@ -126,6 +126,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_cache_retention_interval: int | None = None,
+        verified_mtp_prefill_cache: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -154,6 +155,10 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+        )
+        self.coordinator.verified_mtp_prefill_cache = verified_mtp_prefill_cache
+        self.coordinator.block_pool.enable_verified_mtp_prefill = (
+            verified_mtp_prefill_cache
         )
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
@@ -231,6 +236,13 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        if getattr(self.coordinator, "verified_mtp_prefill_cache", False):
+            verified = self.coordinator.find_verified_prefill_cache_hit(
+                request, max_cache_hit_length, num_new_computed_tokens
+            )
+            if verified is not None:
+                computed_blocks, num_new_computed_tokens = verified
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
         # synchronous coordinator exposes the junction from this lookup only.

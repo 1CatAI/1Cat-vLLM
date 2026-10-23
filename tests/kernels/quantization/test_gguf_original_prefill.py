@@ -96,6 +96,8 @@ def test_projection_dispatch_counts_routed_down_rows(monkeypatch, m, selected):
     )
     method = object.__new__(GGUFNativeMoEMethod)
     method.dp4a_admitted = False
+    method.expert_trace_tokens = 0
+    method.expert_cache = None
     method.hidden_size, method.intermediate_size = 8, 4
     method.input_padding = {}
     method.weight_types = {"w1": 21, "w3": 21, "w2": 20}

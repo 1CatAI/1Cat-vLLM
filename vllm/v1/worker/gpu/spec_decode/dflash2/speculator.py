@@ -459,7 +459,7 @@ class DFlash2Speculator(DFlashSpeculator):
         self._debug_candidate_ids: torch.Tensor | None = None
         self._debug_unary_logits: torch.Tensor | None = None
         self._debug_lattice_scores: torch.Tensor | None = None
-        if getattr(self, "_debug_tensor_dump_dir", ""):
+        if self._tensor_dump.policy.directory:
             packed_shape = (
                 self.max_num_reqs,
                 self.draft_block,

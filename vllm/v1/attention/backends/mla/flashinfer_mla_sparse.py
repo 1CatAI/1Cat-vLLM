@@ -312,6 +312,10 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         # for query and kv_cache (mixed bf16+fp8 is not supported).
         self.supports_quant_query_input = True
 
+    def reserve_profile_workspace(self, device: torch.device) -> None:
+        if self._workspace_buffer is None:
+            self._workspace_buffer = _get_workspace_buffer(device)
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -336,8 +340,7 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
             return_valid_counts=True,
         )
 
-        if self._workspace_buffer is None:
-            self._workspace_buffer = _get_workspace_buffer(q.device)
+        self.reserve_profile_workspace(q.device)
 
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale

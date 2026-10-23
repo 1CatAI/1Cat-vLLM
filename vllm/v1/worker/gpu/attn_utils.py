@@ -289,7 +289,11 @@ def _reshape_kv_cache(
                         stride=tuple(strides),
                         storage_offset=kernel_block_numel * member_index,
                     )
-                elif kv_cache_spec.page_size_padded is not None:
+                elif (
+                    kv_cache_spec.page_size_padded is not None
+                    and kv_cache_spec.page_size_bytes
+                    != kv_cache_spec.real_page_size_bytes
+                ):
                     if kernel_num_blocks != num_blocks:
                         raise ValueError(
                             "Virtually split compressed KV caches cannot use "
@@ -312,7 +316,10 @@ def _reshape_kv_cache(
                         stride=tuple(strides),
                     )
                 else:
-                    # No padding — safe to use a contiguous view.
+                    # An explicit padded size can equal the real page size
+                    # when attention pages fit shared allocation slots exactly.
+                    # There is no gap in that case, including between virtual
+                    # kernel blocks; view also verifies the complete byte size.
                     kv_cache = kv_tensor.view(kv_cache_shape)
                 kv_caches[layer_name] = kv_cache.permute(*inv_order)
 

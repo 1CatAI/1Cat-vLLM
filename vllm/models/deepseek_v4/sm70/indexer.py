@@ -286,25 +286,27 @@ def _paged_index_logits_kernel(
     cache_block_size,
     head_dim: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
 ):
     """Index logits straight out of the paged FP8 cache, no gather buffer.
 
     `_dequant_paged_index_k_kernel` + bmm has a grid and a GEMM shape derived
     from `max_seq_len`, and under a captured decode CUDA Graph that is frozen
-    at `max_model_len` forever. Here the grid is static -- (rows, NUM_SPLITS),
+    at `max_model_len` forever. Here the grid is static -- (rows, splits),
     sized from `max_seq_len` on the host -- and only each program's trip count
     follows the live `seq_len`, so one captured graph serves any context while
     a short context costs almost nothing.
     """
     row_idx = tl.program_id(0)
     split_id = tl.program_id(1)
+    # The launch grid already carries the split count. Keeping it
+    # dynamic avoids compiling a new kernel for each mixed-batch shape.
+    num_splits = tl.num_programs(1)
     dim_offsets = tl.arange(0, head_dim)
     q = tl.load(q_ptr + row_idx * q_stride0 + dim_offsets).to(tl.float32)
 
     seq_len = tl.load(seq_lens_ptr + row_idx)
     chunks = (seq_len + BLOCK_N - 1) // BLOCK_N
-    chunks_per_split = (chunks + NUM_SPLITS - 1) // NUM_SPLITS
+    chunks_per_split = (chunks + num_splits - 1) // num_splits
     lo = split_id * chunks_per_split * BLOCK_N
     hi = tl.minimum(lo + chunks_per_split * BLOCK_N, seq_len)
 
@@ -427,16 +429,18 @@ def _paged_index_logits_relu_kernel(
     head_dim: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
 ):
     """Decode counterpart of `_contiguous_index_logits_relu_kernel`.
 
     Same static-grid property as `_paged_index_logits_kernel`: the grid is
-    (rows, NUM_SPLITS) and only the trip count follows the live `seq_len`, so
+    (rows, splits) and only the trip count follows the live `seq_len`, so
     one captured CUDA graph serves any context length.
     """
     row_idx = tl.program_id(0)
     split_id = tl.program_id(1)
+    # The launch grid already carries the split count. Keeping it
+    # dynamic avoids compiling a new kernel for each mixed-batch shape.
+    num_splits = tl.num_programs(1)
     head_offsets = tl.arange(0, NUM_HEADS)
     dim_offsets = tl.arange(0, head_dim)
     q = tl.load(
@@ -449,7 +453,7 @@ def _paged_index_logits_relu_kernel(
 
     seq_len = tl.load(seq_lens_ptr + row_idx)
     chunks = (seq_len + BLOCK_N - 1) // BLOCK_N
-    chunks_per_split = (chunks + NUM_SPLITS - 1) // NUM_SPLITS
+    chunks_per_split = (chunks + num_splits - 1) // num_splits
     lo = split_id * chunks_per_split * BLOCK_N
     hi = tl.minimum(lo + chunks_per_split * BLOCK_N, seq_len)
 
@@ -828,8 +832,10 @@ def _decode_cublas_blocker(
     requirements = (
         (
             "a CUDA pre-Ampere device",
-            lambda: current_platform.is_cuda()
-            and current_platform.is_device_capability_family(70),
+            lambda: (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability_family(70)
+            ),
         ),
         (
             f"a key bound of at least {policy.value('indexer_decode_min_keys')}",
@@ -837,68 +843,86 @@ def _decode_cublas_blocker(
         ),
         (
             "whole requests in the block table",
-            lambda: table_rows_per_request > 0
-            and block_table.ndim == 2
-            and block_table.shape[0] > 0
-            and block_table.shape[0] % table_rows_per_request == 0
-            and total_rows % (block_table.shape[0] // table_rows_per_request) == 0,
+            lambda: (
+                table_rows_per_request > 0
+                and block_table.ndim == 2
+                and block_table.shape[0] > 0
+                and block_table.shape[0] % table_rows_per_request == 0
+                and total_rows % (block_table.shape[0] // table_rows_per_request) == 0
+            ),
         ),
         (
             "query rows that share one gather per request",
-            lambda: (native_rows or total_rows == 1 or table_rows_per_request > 1)
-            and rows_per_request() > 0,
+            lambda: (
+                (native_rows or total_rows == 1 or table_rows_per_request > 1)
+                and rows_per_request() > 0
+            ),
         ),
         (
             f"float16 q [rows, heads % {_EPILOGUE_BLOCK_H} == 0, {_INDEX_HEAD_DIM}]",
-            lambda: q.ndim == 3
-            and q.dtype == torch.float16
-            and q.shape[2] == _INDEX_HEAD_DIM
-            and q.shape[1] > 0
-            and q.shape[1] % _EPILOGUE_BLOCK_H == 0,
+            lambda: (
+                q.ndim == 3
+                and q.dtype == torch.float16
+                and q.shape[2] == _INDEX_HEAD_DIM
+                and q.shape[1] > 0
+                and q.shape[1] % _EPILOGUE_BLOCK_H == 0
+            ),
         ),
         (
             "float32 weights [rows, heads]",
-            lambda: weights.ndim == 2
-            and weights.shape == q.shape[:2]
-            and weights.dtype == torch.float32,
+            lambda: (
+                weights.ndim == 2
+                and weights.shape == q.shape[:2]
+                and weights.dtype == torch.float32
+            ),
         ),
         (
             "shared gather and FP32 scores within the indexer workspace budget",
-            lambda: max_seq_len
-            * (_INDEX_HEAD_DIM * 2 + rows_per_request() * q.shape[1] * 4)
-            <= policy.value("indexer_prefill_tile_mb") * 2**20,
+            lambda: (
+                max_seq_len
+                * (_INDEX_HEAD_DIM * 2 + rows_per_request() * q.shape[1] * 4)
+                <= policy.value("indexer_prefill_tile_mb") * 2**20
+            ),
         ),
         (
             f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
             "contiguous blocks",
-            lambda: cache.ndim == 3
-            and cache.dtype == torch.uint8
-            and cache.shape[1] > 0
-            and cache.shape[2] == _INDEX_CACHE_BYTES
-            and cache.stride(1) == _INDEX_CACHE_BYTES
-            and cache.stride(2) == 1,
+            lambda: (
+                cache.ndim == 3
+                and cache.dtype == torch.uint8
+                and cache.shape[1] > 0
+                and cache.shape[2] == _INDEX_CACHE_BYTES
+                and cache.stride(1) == _INDEX_CACHE_BYTES
+                and cache.stride(2) == 1
+            ),
         ),
         (
             "an int32 block table that covers the key bound",
-            lambda: block_table.ndim == 2
-            and block_table.dtype == torch.int32
-            and triton.cdiv(max_seq_len, cache.shape[1]) <= block_table.shape[1],
+            lambda: (
+                block_table.ndim == 2
+                and block_table.dtype == torch.int32
+                and triton.cdiv(max_seq_len, cache.shape[1]) <= block_table.shape[1]
+            ),
         ),
         ("int32 row lengths", lambda: flat_lens.dtype == torch.int32),
         (
             "all tensors on one device",
-            lambda: q.device
-            == cache.device
-            == weights.device
-            == flat_lens.device
-            == block_table.device,
+            lambda: (
+                q.device
+                == cache.device
+                == weights.device
+                == flat_lens.device
+                == block_table.device
+            ),
         ),
         (
             "contiguous q, weights, row lengths and block table",
-            lambda: q.is_contiguous()
-            and weights.is_contiguous()
-            and flat_lens.is_contiguous()
-            and block_table.is_contiguous(),
+            lambda: (
+                q.is_contiguous()
+                and weights.is_contiguous()
+                and flat_lens.is_contiguous()
+                and block_table.is_contiguous()
+            ),
         ),
     )
     for name, met in requirements:
@@ -1005,7 +1029,6 @@ def sm70_indexer_decode_logits(
             head_dim=_INDEX_HEAD_DIM,
             NUM_HEADS=q.shape[1],
             BLOCK_N=_RELU_BLOCK_N,
-            NUM_SPLITS=splits,
             num_warps=8,
         )
         # Positions >= seq_len are left uninitialised; every consumer masks by
@@ -1031,7 +1054,6 @@ def sm70_indexer_decode_logits(
             cache.shape[1],
             head_dim=_INDEX_HEAD_DIM,
             BLOCK_N=_LOGITS_BLOCK_N,
-            NUM_SPLITS=splits,
             num_warps=4,
         )
         # Positions >= seq_len are left uninitialised, exactly as the

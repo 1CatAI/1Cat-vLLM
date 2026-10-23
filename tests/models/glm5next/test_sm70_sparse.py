@@ -8,6 +8,7 @@ import torch
 
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.models.deepseek_v4.common.portable_sparse import use_portable_sparse
 from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_gathered,
 )
@@ -23,7 +24,6 @@ from vllm.models.glm5next.sm70.fp8_kv import (
     sm70_glm5_sparse_attention_paged_fp8_gemm,
 )
 from vllm.models.glm5next.sm70.sparse import Glm5NextSM70SparseBackend
-from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.transformers_utils.model_arch_config_convertor import (
@@ -158,8 +158,8 @@ def test_glm53_sm70_fp8_kv_layout_contract():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.is_device_capability((7, 0)),
-    reason="requires an exact SM70 CUDA device",
+    not torch.accelerator.is_available() or not use_portable_sparse(),
+    reason="requires an admitted portable sparse CUDA device",
 )
 def test_glm53_sm70_sparse_attention_matches_reference():
     torch.manual_seed(7)
@@ -195,8 +195,8 @@ def test_glm53_sm70_sparse_attention_matches_reference():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.is_device_capability((7, 0)),
-    reason="requires an exact SM70 CUDA device",
+    not torch.accelerator.is_available() or not use_portable_sparse(),
+    reason="requires an admitted portable sparse CUDA device",
 )
 def test_glm53_sm70_fp8_kv_sparse_attention_matches_reference():
     torch.manual_seed(20260827)
@@ -237,8 +237,8 @@ def test_glm53_sm70_fp8_kv_sparse_attention_matches_reference():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.is_device_capability((7, 0)),
-    reason="requires an exact SM70 CUDA device",
+    not torch.accelerator.is_available() or not use_portable_sparse(),
+    reason="requires an admitted portable sparse CUDA device",
 )
 def test_glm53_sm70_fp8_kv_gemm_decode_matches_reference():
     torch.manual_seed(20260828)
@@ -299,8 +299,8 @@ def test_glm53_sm70_fp8_kv_gemm_decode_matches_reference():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.is_device_capability((7, 0)),
-    reason="requires an exact SM70 CUDA device",
+    not torch.accelerator.is_available() or not use_portable_sparse(),
+    reason="requires an admitted portable sparse CUDA device",
 )
 def test_glm53_sm70_fp8_kv_batched_gemm_matches_b1_decode():
     torch.manual_seed(20260901)
@@ -410,8 +410,8 @@ def test_glm53_sm70_fp8_kv_batched_gemm_matches_b1_decode():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.is_device_capability((7, 0)),
-    reason="requires an exact SM70 CUDA device",
+    not torch.accelerator.is_available() or not use_portable_sparse(),
+    reason="requires an admitted portable sparse CUDA device",
 )
 def test_glm53_sm70_fp16_fwht_matches_reference():
     torch.manual_seed(11)
@@ -427,8 +427,8 @@ def test_glm53_sm70_fp16_fwht_matches_reference():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.is_device_capability((7, 0)),
-    reason="requires an exact SM70 CUDA device",
+    not torch.accelerator.is_available() or not use_portable_sparse(),
+    reason="requires an admitted portable sparse CUDA device",
 )
 def test_glm53_sm70_fused_q_kv_rmsnorm_matches_reference():
     torch.manual_seed(13)

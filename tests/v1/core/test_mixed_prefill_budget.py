@@ -3,15 +3,36 @@
 from unittest.mock import patch
 
 import pytest
+from transformers import OPTConfig
 
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import MixedPrefillTiming, ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 from vllm.v1.worker.mixed_prefill import MixedPrefillTimer
 
+from . import utils as scheduler_test_utils
 from .utils import create_requests, create_scheduler
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
+
+@pytest.fixture(autouse=True)
+def offline_scheduler_model(tmp_path, monkeypatch):
+    # Only model configuration is needed for these scheduler bookkeeping tests.
+    # Keep them runnable without a cached HF repository or tokenizer download.
+    config = OPTConfig()
+    config.architectures = ["OPTForCausalLM"]
+    config.save_pretrained(tmp_path)
+    model_config = scheduler_test_utils.ModelConfig
+
+    def local_model_config(**kwargs):
+        assert kwargs["model"] == "facebook/opt-125m"
+        kwargs["model"] = str(tmp_path)
+        kwargs["skip_tokenizer_init"] = True
+        return model_config(**kwargs)
+
+    monkeypatch.setattr(scheduler_test_utils, "ModelConfig", local_model_config)
 
 
 def test_budget_adapts_to_gpu_cost_and_ignores_short_boundaries():
@@ -45,6 +66,13 @@ def test_invalid_timing_does_not_change_budget(elapsed):
     budget = MixedPrefillBudget(8192, 250)
     budget.update(MixedPrefillTiming(512, 16, 512, elapsed))
     assert budget.tokens == 512
+
+
+def test_standalone_pp_prefill_observation_does_not_train_mixed_budget():
+    budget = MixedPrefillBudget(768, 250, initial_tokens=32)
+    budget.update(MixedPrefillTiming(768, 0, 0, 8000, is_pipeline=True))
+    assert budget.tokens == 32
+    assert budget.ms_per_token is None
 
 
 def test_timer_never_waits_and_keeps_delayed_sample_token_counts():
@@ -172,3 +200,135 @@ def test_mixed_step_uses_the_budget_floor():
     assert step.num_scheduled_tokens[resident.request_id] == 1
     assert step.num_scheduled_tokens["long"] == 768
     assert step.mixed_prefill_budget == 768
+
+
+def test_small_budget_recovers_after_a_slow_step():
+    budget = MixedPrefillBudget(384, 250, initial_tokens=32)
+    budget.update(MixedPrefillTiming(32, 5, 32, 1000, is_pipeline=True))
+    assert budget.tokens == 16
+    for _ in range(12):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 5, n, n, is_pipeline=True))
+    assert budget.tokens > 32
+
+
+def test_pp_can_learn_from_inflight_decode_and_other_prefill_caps():
+    budget = MixedPrefillBudget(384, 250)
+    # A fairness cap below 75% of the budget must not hide a PP stall.
+    budget.update(MixedPrefillTiming(192, 0, 384, 1000, is_pipeline=True))
+    assert budget.tokens == 48
+    # Short fast boundaries still cannot inflate the learned budget.
+    budget.update(MixedPrefillTiming(8, 0, 48, 1, is_pipeline=True))
+    assert budget.tokens == 48
+
+
+def _pp_scheduler(monkeypatch, **kwargs):
+    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 7)
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        pipeline_parallel_size=7,
+        max_num_batched_tokens=kwargs.pop("max_num_batched_tokens", 384),
+        max_model_len=4096,
+        **kwargs,
+    )
+    scheduler.mixed_prefill_enabled = True
+    scheduler.use_v2_model_runner = True
+    scheduler.pp_feedback_depth = 2
+    scheduler.num_spec_tokens = 4
+    scheduler._spec_token_placeholders = (-1,) * 4
+    return scheduler
+
+
+def test_pp_limits_aggregate_prefill_without_advancing_mtp_feedback(monkeypatch):
+    scheduler = _pp_scheduler(
+        monkeypatch,
+        long_prefill_token_threshold=128,
+        long_prefill_token_threshold_adaptive=True,
+    )
+    resident = _resident(scheduler)
+    scheduler.current_step = resident.next_decode_eligible_step - 1
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens[resident.request_id] == 5
+    assert len(decode.scheduled_spec_decode_tokens[resident.request_id]) == 4
+    eligible_step = resident.next_decode_eligible_step
+    placeholders = resident.num_output_placeholders
+
+    for req in create_requests(2, num_tokens=2048, req_ids=["long1", "long2"]):
+        scheduler.add_request(req)
+    queued_prefill = scheduler.schedule()
+    assert resident.request_id not in queued_prefill.num_scheduled_tokens
+    assert queued_prefill.mixed_decode_tokens == 0
+    assert queued_prefill.mixed_prefill_is_pp
+    assert queued_prefill.mixed_prefill_tokens == 32
+    assert sum(queued_prefill.num_scheduled_tokens.values()) == 32
+    assert resident.next_decode_eligible_step == eligible_step
+    assert resident.num_output_placeholders == placeholders
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_pp_no_resident_or_disabled_policy_keeps_normal_prefill(monkeypatch, disabled):
+    scheduler = _pp_scheduler(monkeypatch)
+    if disabled:
+        _resident(scheduler)
+        scheduler.scheduler_config.mixed_prefill_step_latency_ms = 0
+    incoming = create_requests(1, num_tokens=2048, req_ids=["long"])[0]
+    scheduler.add_request(incoming)
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens["long"] == 384
+    assert step.mixed_prefill_is_pp
+    assert step.mixed_prefill_tokens == 384
+    assert step.mixed_prefill_budget == 0
+
+
+def test_pp_abort_releases_inflight_decode_protection(monkeypatch):
+    scheduler = _pp_scheduler(monkeypatch)
+    resident = _resident(scheduler)
+    scheduler.current_step = resident.next_decode_eligible_step - 1
+    decode = scheduler.schedule()
+    scheduler.finish_requests(resident.request_id, RequestStatus.FINISHED_ABORTED)
+    # Late feedback must not restore a cancelled decoder or its protection.
+    scheduler.update_from_output(
+        decode,
+        ModelRunnerOutput(
+            req_ids=[resident.request_id],
+            req_id_to_index={resident.request_id: 0},
+            sampled_token_ids=[[43]],
+        ),
+    )
+    scheduler.add_request(create_requests(1, num_tokens=2048, req_ids=["long"])[0])
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens["long"] == 384
+    assert step.mixed_prefill_is_pp
+    assert step.mixed_prefill_budget == 0
+
+
+def test_larger_pp_prefill_capacity_preserves_mtp_decode_reservation(monkeypatch):
+    scheduler = _pp_scheduler(monkeypatch, max_num_batched_tokens=768)
+    incoming = create_requests(1, num_tokens=2048, req_ids=["long"])[0]
+    scheduler.add_request(incoming)
+    standalone = scheduler.schedule()
+    assert standalone.num_scheduled_tokens["long"] == 768
+    assert standalone.mixed_prefill_tokens == 768
+    assert standalone.mixed_prefill_budget == 0
+
+    scheduler = _pp_scheduler(monkeypatch, max_num_batched_tokens=768)
+    resident = _resident(scheduler)
+    scheduler.current_step = resident.next_decode_eligible_step - 1
+    scheduler.add_request(create_requests(1, num_tokens=2048, req_ids=["long"])[0])
+    mixed = scheduler.schedule()
+    assert mixed.num_scheduled_tokens[resident.request_id] == 5
+    assert mixed.num_scheduled_tokens["long"] == 32
+    assert mixed.mixed_prefill_budget == 32
+
+
+def test_pp_does_not_create_last_stage_gpu_timing_events():
+    output = SchedulerOutput.make_empty()
+    output.mixed_prefill_is_pp = True
+    output.mixed_prefill_tokens = output.mixed_prefill_budget = 32
+    output.mixed_decode_tokens = 5
+    timer = MixedPrefillTimer()
+    with patch(
+        "torch.cuda.Event", side_effect=AssertionError("PP must use host timing")
+    ):
+        timer.begin(output)
+        assert timer.finish() is None

@@ -120,10 +120,11 @@ def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
     )
 
 
-def _split_sm70_mtp_manager_capture_sizes(
+def mtp_manager_capture_sizes(
     vllm_config: VllmConfig,
     decode_query_len: int,
 ) -> list[int]:
+    """Derive request-sized draft graphs without changing shared verifier sizes."""
     capture_sizes = sorted(vllm_config.compilation_config.cudagraph_capture_sizes or [])
     if decode_query_len != 1:
         return capture_sizes
@@ -206,6 +207,8 @@ class CudaGraphManager:
         device: torch.device,
         cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
+        *,
+        capture_sizes: list[int] | None = None,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -260,8 +263,10 @@ class CudaGraphManager:
         self._graphs_captured = False
         self._candidates: list[list[BatchExecutionDescriptor]] = []
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
-        if _use_split_sm70_mtp_cudagraphs(vllm_config):
-            self._capture_sizes = _split_sm70_mtp_manager_capture_sizes(
+        if capture_sizes is not None:
+            self._capture_sizes = list(capture_sizes)
+        elif _use_split_sm70_mtp_cudagraphs(vllm_config):
+            self._capture_sizes = mtp_manager_capture_sizes(
                 vllm_config,
                 decode_query_len,
             )

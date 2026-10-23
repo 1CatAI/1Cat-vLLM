@@ -12,6 +12,7 @@ from vllm.model_executor.layers.quantization.gguf_native import (
     NATIVE_TYPES,
     packed_tp_span,
 )
+from vllm.model_executor.models.utils import is_pp_missing_parameter
 from vllm.transformers_utils.gguf_tensor_reader import quant_size
 
 logger = init_logger(__name__)
@@ -43,12 +44,17 @@ def prepare_original_expert_arena(model, name_map, tensors, device):
     """Reserve immutable expert banks before replaceable dense loading storage."""
     shards = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
     banks = []
+    # Raw tensor name -> admitted local (layer, method, shard). The checkpoint
+    # map covers all PP stages; preallocation and prefetch must share ownership.
+    targets = {}
     total = 0
     for raw, name in name_map.items():
         if ".experts." not in name or not name.endswith(".weight"):
             continue
         prefix, projection, _ = name.rsplit(".", 2)
         if projection not in shards:
+            continue
+        if is_pp_missing_parameter(name, model):
             continue
         layer = model.get_submodule(prefix)
         method = layer.quant_method
@@ -80,19 +86,10 @@ def prepare_original_expert_arena(model, name_map, tensors, device):
         banks.append(
             (layer, method, shards[projection], shape, total, elements, tail, source)
         )
+        targets[raw] = (layer, method, shards[projection])
         total += elements + tail
     if not banks:
         return {}
-    # Raw tensor name -> (layer, method, shard) for whole-bank loading.
-    targets = {}
-    for raw, name in name_map.items():
-        if ".experts." not in name or not name.endswith(".weight"):
-            continue
-        prefix, projection, _ = name.rsplit(".", 2)
-        if projection in shards:
-            layer = model.get_submodule(prefix)
-            if any(layer is b[0] and shards[projection] == b[2] for b in banks):
-                targets[raw] = (layer, layer.quant_method, shards[projection])
     cache_config = _expert_cache_config()
     if cache_config is not None:
         _prepare_expert_cache(banks, cache_config, device)

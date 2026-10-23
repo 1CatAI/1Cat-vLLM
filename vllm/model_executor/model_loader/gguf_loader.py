@@ -99,13 +99,22 @@ class GGUFModelLoader(BaseModelLoader):
         return [str(path) for path in gguf_shard_paths(model_path)]
 
     @staticmethod
+    def _uses_multimodal_wrapper(model_config: ModelConfig) -> bool:
+        has_vision = getattr(model_config.hf_config, "vision_config", None) is not None
+        # A text-only draft can inherit a target's vision config. Resolve the
+        # actual model capability before applying wrapper prefixes or mmproj.
+        return has_vision and getattr(model_config, "is_multimodal_model", True)
+
+    @staticmethod
     def _requires_vision_weights(model_config: ModelConfig) -> bool:
         # A text-only run retains the multimodal HF wrapper and its language
         # weight prefixes, but must not discover or open a vision checkpoint.
         multimodal_config = getattr(model_config, "multimodal_config", None)
-        has_vision = getattr(model_config.hf_config, "vision_config", None) is not None
         language_model_only = getattr(multimodal_config, "language_model_only", False)
-        return has_vision and not language_model_only
+        return (
+            GGUFModelLoader._uses_multimodal_wrapper(model_config)
+            and not language_model_only
+        )
 
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
@@ -137,6 +146,7 @@ class GGUFModelLoader(BaseModelLoader):
         )
 
         from .gguf_adapters import get_gguf_adapter
+        from .gguf_adapters.vision import get_vision_adapter_spec
 
         if (
             adapter := get_gguf_adapter(
@@ -148,22 +158,28 @@ class GGUFModelLoader(BaseModelLoader):
             self._native_tensors = gguf_tensor_index(gguf_shard_paths(local))
             names = adapter.build_name_map(self._native_tensors)
             self._native_vision_adapter = None
-            if (
-                text_config.model_type == "qwen4_exp_text"
-                and getattr(config, "vision_config", None) is not None
-            ):
-                from .gguf_adapters.qwen3_vision import Qwen3VisionGGUF
-
+            vision_spec = get_vision_adapter_spec(text_config.model_type)
+            if vision_spec is None and self._requires_vision_weights(model_config):
+                raise ValueError(
+                    "No native GGUF vision adapter registered for "
+                    f"{text_config.model_type!r}"
+                )
+            if vision_spec is not None and self._uses_multimodal_wrapper(model_config):
                 if self._requires_vision_weights(model_config):
                     mmproj = detect_gguf_multimodal(local)
                     if mmproj is None:
-                        raise ValueError("Qwen4Exp multimodal GGUF requires mmproj")
-                    self._native_vision_adapter = Qwen3VisionGGUF(
+                        raise ValueError(
+                            f"{text_config.model_type} multimodal GGUF requires mmproj"
+                        )
+                    self._native_vision_adapter = vision_spec.create(
                         config.vision_config, gguf_tensor_index([mmproj])
                     )
                 # The conditional model wraps the native language model. Keep
                 # these names consistent for quantization, PLE and PP loading.
-                names = {raw: "language_model." + name for raw, name in names.items()}
+                names = {
+                    raw: vision_spec.language_prefix + name
+                    for raw, name in names.items()
+                }
             return names
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
@@ -510,7 +526,11 @@ class GGUFModelLoader(BaseModelLoader):
             yield from native_vision.weights(model_config.dtype, vision_names)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        model.load_weights(self.get_all_weights(model_config, model))
+        loaded = model.load_weights(self.get_all_weights(model_config, model))
+        adapter = getattr(self, "_native_adapter", None)
+        validate = getattr(adapter, "validate_loaded_parameters", None)
+        if validate is not None:
+            validate(model, loaded)
 
     @staticmethod
     def _start_load_sampler():
@@ -645,6 +665,9 @@ class GGUFModelLoader(BaseModelLoader):
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
                 )
             model._gguf_model_path = local_model_path
+            configure = getattr(adapter, "configure_model", None)
+            if configure is not None:
+                configure(model)
             if (
                 adapter is not None
                 and quant_config.native_expert_storage

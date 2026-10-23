@@ -92,9 +92,9 @@ class SchedulerConfig:
     nonzero."""
 
     mixed_prefill_step_latency_ms: float = Field(default=250.0, ge=0)
-    """GPU step latency target when prefill shares a batch with resident decode.
-    The prefill token budget adapts to completed GPU measurements. Pure prefill
-    keeps the normal token budget. Zero disables latency control."""
+    """Soft target: GPU step time (PP=1), engine-observed batch latency (PP>1).
+    PP includes queueing and protects in-flight decode. Pure prefill keeps the
+    normal budget. Zero disables latency control."""
 
     mixed_prefill_min_tokens: int = Field(default=0, ge=0)
     """Lower bound on the adaptive mixed-prefill token budget. Zero keeps the

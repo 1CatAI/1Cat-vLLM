@@ -7,6 +7,7 @@ This module constructs configuration objects only; tensor conversion belongs
 to the model loader's architecture adapters.
 """
 
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,35 @@ _ARCHITECTURES = {
     "dflash": ("qwen3", "DFlash2DraftModel"),
     "qwen4exp": ("qwen4_exp_text", "Qwen4ExpForCausalLM"),
 }
+
+# New architectures can provide a self-contained builder without extending the
+# legacy metadata parser below. Both builders and config classes are lazy.
+_CONFIG_BUILDERS = {
+    "glm5-next": (
+        "vllm.transformers_utils.gguf_configs.glm5next",
+        "glm5next_config_dict",
+    ),
+}
+_CONFIG_CLASSES = {
+    "qwen3_5_text": ("vllm.transformers_utils.configs.qwen3_5", "Qwen3_5TextConfig"),
+    "qwen3_5_moe_text": (
+        "vllm.transformers_utils.configs.qwen3_5_moe",
+        "Qwen3_5MoeTextConfig",
+    ),
+    "qwen4_exp_text": (
+        "vllm.transformers_utils.configs.qwen4_exp",
+        "Qwen4ExpTextConfig",
+    ),
+    "glm5_next_text": (
+        "vllm.transformers_utils.configs.glm5_next",
+        "Glm5NextTextConfig",
+    ),
+}
+
+
+def supports_native_gguf_config(architecture: str | None) -> bool:
+    """Whether a legacy parser or an architecture builder owns this config."""
+    return architecture in _ARCHITECTURES or architecture in _CONFIG_BUILDERS
 
 
 class _MetadataReader(FastFieldsReader):
@@ -46,7 +76,10 @@ def read_gguf_metadata(path: str | Path) -> dict[str, Any]:
 
 def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
     arch = metadata.get("general.architecture")
-    if arch not in _ARCHITECTURES:
+    if isinstance(arch, str) and (entry := _CONFIG_BUILDERS.get(arch)):
+        module, name = entry
+        return getattr(import_module(module), name)(metadata)
+    if not isinstance(arch, str) or arch not in _ARCHITECTURES:
         raise ValueError(
             f"No native GGUF config adapter for architecture {arch!r}. "
             "Provide --hf-config-path with an explicit model config."
@@ -308,18 +341,9 @@ def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
 def gguf_config_from_metadata(metadata: dict[str, Any]) -> PretrainedConfig:
     config_dict = gguf_config_dict(metadata)
     model_type = config_dict.pop("model_type")
-    if model_type == "qwen3_5_text":
-        from .configs.qwen3_5 import Qwen3_5TextConfig
-
-        return Qwen3_5TextConfig(**config_dict)
-    if model_type == "qwen3_5_moe_text":
-        from .configs.qwen3_5_moe import Qwen3_5MoeTextConfig
-
-        return Qwen3_5MoeTextConfig(**config_dict)
-    if model_type == "qwen4_exp_text":
-        from .configs.qwen4_exp import Qwen4ExpTextConfig
-
-        return Qwen4ExpTextConfig(**config_dict)
+    if entry := _CONFIG_CLASSES.get(model_type):
+        module, name = entry
+        return getattr(import_module(module), name)(**config_dict)
     return AutoConfig.for_model(model_type, **config_dict)
 
 

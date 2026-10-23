@@ -20,7 +20,11 @@ class MixedPrefillTimer:
     def begin(self, output: SchedulerOutput) -> None:
         # Abandon an incomplete measurement (e.g. an execute without sampling).
         self.active = None
-        if output.mixed_prefill_tokens <= 0 or output.mixed_decode_tokens <= 0:
+        if (
+            output.mixed_prefill_is_pp
+            or output.mixed_prefill_tokens <= 0
+            or output.mixed_decode_tokens <= 0
+        ):
             return
         # Bound bookkeeping even if a device/connector holds the GPU for long.
         if len(self.pending) >= 8:

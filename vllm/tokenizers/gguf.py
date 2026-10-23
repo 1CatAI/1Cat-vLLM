@@ -33,10 +33,26 @@ _QWEN35_PATTERN = (
 )
 
 
+# GLM4 uses up to three digits per regex match and no Unicode normalization.
+# This profile also serves GLM5-Next exports (tokenizer.ggml.pre = "glm4").
+_GLM4_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
+    r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+# Registry values describe segmentation and normalization independently of
+# model classes, so another GGUF architecture can reuse a tokenizer profile.
+_BPE_PROFILES = {
+    "qwen2": (_QWEN2_PATTERN, False),
+    "qwen35": (_QWEN35_PATTERN, True),
+    "glm4": (_GLM4_PATTERN, False),
+}
+
+
 def tokenizer_from_gguf_metadata(metadata, **kwargs):
     model = metadata.get("tokenizer.ggml.model")
     pre = metadata.get("tokenizer.ggml.pre")
-    if model != "gpt2" or pre not in ("qwen2", "qwen35"):
+    if model != "gpt2" or pre not in _BPE_PROFILES:
         raise ValueError(
             f"No native GGUF tokenizer for model={model!r}, pre={pre!r}. "
             "Provide --tokenizer with a tokenizer repository or local directory."
@@ -46,17 +62,18 @@ def tokenizer_from_gguf_metadata(metadata, **kwargs):
     if len(vocab) != len(tokens):
         raise ValueError("Duplicate vocabulary strings in GGUF tokenizer")
     merges = [tuple(merge.split(" ")) for merge in metadata["tokenizer.ggml.merges"]]
+    pattern, normalize_nfc = _BPE_PROFILES[pre]
     backend = Tokenizer(models.BPE(vocab, merges, fuse_unk=False, byte_fallback=False))
     backend.pre_tokenizer = pre_tokenizers.Sequence(
         [
             pre_tokenizers.Split(
-                Regex(_QWEN35_PATTERN if pre == "qwen35" else _QWEN2_PATTERN),
+                Regex(pattern),
                 behavior="isolated",
             ),
             pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
         ]
     )
-    if pre == "qwen35":
+    if normalize_nfc:
         backend.normalizer = normalizers.NFC()
     backend.decoder = decoders.ByteLevel()
     types = metadata.get("tokenizer.ggml.token_type", [1] * len(tokens))
@@ -79,12 +96,12 @@ def tokenizer_from_gguf_metadata(metadata, **kwargs):
                 raise ValueError(f"GGUF {key}_token_id is outside vocabulary")
             target = {"padding": "pad", "unknown": "unk"}.get(key, key)
             tokenizer_kwargs[f"{target}_token"] = tokens[token_id]
-    # Qwen tokenizers do not wrap prompts in BOS/EOS. Refuse an export that
+    # These profiles do not wrap prompts in BOS/EOS. Refuse an export that
     # requests another policy until its postprocessor has a token parity gate.
     if metadata.get("tokenizer.ggml.add_bos_token", False) or metadata.get(
         "tokenizer.ggml.add_eos_token", False
     ):
-        raise ValueError("GGUF Qwen tokenizer requests unsupported BOS/EOS insertion")
+        raise ValueError("GGUF tokenizer requests unsupported BOS/EOS insertion")
     return PreTrainedTokenizerFast(
         tokenizer_object=backend,
         additional_special_tokens=special,

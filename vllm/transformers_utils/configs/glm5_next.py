@@ -8,10 +8,29 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _mtp_draft_config(config: PretrainedConfig) -> PretrainedConfig:
+    if not getattr(config, "is_mtp_draft", False):
+        config.model_type = "glm5_next_mtp"
+        config.update(
+            {
+                "architectures": ["Glm5NextMTPModel"],
+                "n_predict": config.num_nextn_predict_layers,
+                "hc_mult": 1,
+                "is_mtp_draft": True,
+                "mtp_draft_pipeline_parallel_size": 1,
+            }
+        )
+    return config
+
+
 class Glm5NextTextConfig(PretrainedConfig):
     model_type = "glm5_next_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
+
+    def get_mtp_draft_config(self) -> PretrainedConfig:
+        # Native GGUF config builders return a flat text config.
+        return _mtp_draft_config(self)
 
     def __init__(
         self,
@@ -281,11 +300,7 @@ class Glm5NextVisionConfig(PretrainedConfig):
         self.in_channels = in_channels
         self.initializer_range = initializer_range
         self.patch_size = patch_size
-        # GLM-5.3-Flash checkpoints ship vision_config.rms_norm_eps = 1e-5,
-        # but the vision tower was trained with 1e-6. Serving with 1e-5 drifts
-        # the RMSNorm and produces repetitive/degraded image descriptions, so
-        # force the trained value regardless of the checkpoint field.
-        self.rms_norm_eps = 1e-6
+        self.rms_norm_eps = rms_norm_eps
         self.spatial_merge_size = spatial_merge_size
         self.temporal_patch_size = temporal_patch_size
         self.attention_dropout = attention_dropout
@@ -345,19 +360,7 @@ class Glm5NextConfig(PretrainedConfig):
         The draft head reads the collapsed post-norm trunk state, not the
         multi-stream hyper-connection residual, so it runs with ``hc_mult=1``.
         """
-        if getattr(self, "is_mtp_draft", False):
-            return self
-        arch = self.architectures[0]
-        self.model_type = f"{self.model_type}_mtp"
-        self.update(
-            {
-                "architectures": [arch[: arch.index("For")] + "MTPModel"],
-                "n_predict": self.num_nextn_predict_layers,
-                "hc_mult": 1,
-                "is_mtp_draft": True,
-            }
-        )
-        return self
+        return _mtp_draft_config(self)
 
     # Config-metadata fields that belong to the top-level (multimodal) config
     # and must NOT be mirrored onto text_config: ``architectures`` /
@@ -373,6 +376,7 @@ class Glm5NextConfig(PretrainedConfig):
         "torch_dtype",
         "architectures",
         "_attn_implementation_internal",
+        "get_mtp_draft_config",
     ]
 
     def __setattr__(self, key, value):

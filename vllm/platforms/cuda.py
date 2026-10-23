@@ -152,7 +152,11 @@ def _get_backend_priorities_cached(
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
-            if device_capability.major == 7 and device_capability.minor in (0, 2):
+            from vllm.models.deepseek_v4.common.portable_sparse import (
+                supports_portable_sparse,
+            )
+
+            if supports_portable_sparse(device_capability):
                 backends.insert(0, AttentionBackendEnum.GLM5_SM70_SPARSE)
             return backends
     else:

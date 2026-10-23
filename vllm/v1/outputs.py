@@ -238,6 +238,9 @@ class MixedPrefillTiming:
     decode_tokens: int
     budget_tokens: int
     elapsed_ms: float
+    # Engine-observed PP latency includes queueing and result consumption.
+    # decode_tokens may be zero when decoders are in other in-flight batches.
+    is_pipeline: bool = False
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.

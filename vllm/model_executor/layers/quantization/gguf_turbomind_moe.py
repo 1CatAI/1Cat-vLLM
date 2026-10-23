@@ -1179,8 +1179,10 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             )
         if x.shape[0] == 0:
             return torch.empty_like(x)
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
         if (
-            self.mma_planes
+            swiglu_limit is None
+            and self.mma_planes
             and layer.expert_map is None
             and x.shape[0] <= MMA_MAX_TOKENS
             and topk_ids.shape[1] == MMA_TOP_K
@@ -1208,7 +1210,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 MMA_PLANE_KW,
                 self.q8_intermediate_batches,
             )
-        if self.dp4a_batches and layer.expert_map is None:
+        if swiglu_limit is None and self.dp4a_batches and layer.expert_map is None:
             bank = layer.gguf_expert_banks
             gate, up, down = bank["w1"], bank["w3"], bank["w2"]
             return torch.ops.vllm.gguf_expert_dp4a(
@@ -1281,6 +1283,9 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
         else:
             gate = bank["w1"](routed, offsets, sorted_ids)
             up = bank["w3"](routed, offsets, sorted_ids)
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         hidden = torch.nn.functional.silu(gate) * up
         down = bank["w2"](hidden.contiguous(), offsets, sorted_ids)
         if small_routing:

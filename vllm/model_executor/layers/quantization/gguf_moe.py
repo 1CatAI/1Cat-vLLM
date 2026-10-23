@@ -283,6 +283,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         self.projection_capabilities = {}
         self.prefill_capabilities = {}
         self.native_admission["prefill_projections"] = {}
+        device_capability = current_platform.get_device_capability()
         for shard in ("w1", "w3", "w2"):
             if self.loaded_experts[shard] != set(range(self.num_experts)):
                 raise ValueError(f"Incomplete GGUF {shard} expert payloads")
@@ -312,6 +313,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 enabled=self.native_enabled,
                 mmq_supported=moe_mmq_supported(prepared, value, self.params_dtype),
                 top_k=getattr(layer, "top_k", 10),
+                compute_capability=(
+                    device_capability.to_int()
+                    if device_capability is not None
+                    else None
+                ),
             )
             self.prefill_capabilities[shard] = prefill
             self.native_admission["prefill_projections"][shard] = asdict(prefill)
@@ -373,9 +379,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             ids = ids.clamp_min(0).contiguous()
         tokens, top_k = ids.shape
         cache = self.expert_cache
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
         w1, w3, w2 = layer.gguf_w1, layer.gguf_w3, layer.gguf_w2
         if (
-            self.dp4a_admitted
+            swiglu_limit is None
+            and self.dp4a_admitted
             and 1 <= tokens <= 20
             and layer.expert_map is None
             and topk_weights.dtype == torch.float32
@@ -396,6 +404,13 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 self.weight_types["w1"] == 21,
             )
         if cache is not None and cache.tm is not None:
+            if swiglu_limit is not None:
+                # TurboMind cache banks do not allocate the raw-MMQ prefill
+                # storage, so falling through to cache.prefill is unsafe.
+                raise ValueError(
+                    "GGUF TurboMind expert cache does not support swiglu_limit; "
+                    "use expert_cache_prefill='mmq' or disable the expert cache"
+                )
             return cache.prefill_moe(
                 self.cache_layer, x.contiguous(), ids, topk_weights
             )
@@ -429,6 +444,9 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             top_k,
             tokens,
         )
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         hidden = torch.nn.functional.silu(gate) * up
         left, physical_k = self.input_padding.get("w2", (0, self.intermediate_size))
         if left or physical_k != self.intermediate_size:

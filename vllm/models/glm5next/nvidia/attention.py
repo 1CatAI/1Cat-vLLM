@@ -31,6 +31,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import maybe_disable_graph_partition
+from vllm.models.deepseek_v4.common.portable_sparse import use_portable_sparse
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     fwht128,
     fwht128_quant_fp8,
@@ -159,10 +160,10 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
 class Glm5NextTailCache(DeepseekV32IndexerCache):
     """Paged circular buffer for the kpool indexer's in-progress (tail) pool.
 
-    Holds the trailing incomplete pool's raw K + gate score: one block of
-    ``index_kpool`` slots per request, overwritten in place by ``pos % kpool``
-    as decode/spec-decode advances. Prefill seeds it (instead of discarding the
-    tail raw K+gate); the connector transfers it across PD; decode reads it to
+    Holds the trailing incomplete pool's raw K + gate score. Speculative
+    verification also retains enough history to survive rejected writes:
+    one block per request, indexed by ``pos % history_size``. Prefill seeds the
+    raw K+gate history; the connector transfers it across PD; decode reads it to
     compress the boundary pool correctly. ``KpoolTailSpec`` /
     ``KpoolTailManager`` provide the no-prune, 1-block/req allocation that lets
     the in-progress pool survive across steps and across transfer.
@@ -188,17 +189,31 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         self._index_kpool = index_kpool
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
+        speculative_config = vllm_config.speculative_config
+        num_spec = (
+            (speculative_config.num_speculative_tokens or 0)
+            if speculative_config is not None
+            else 0
+        )
+        # Verification may write num_spec future tokens before acceptance is
+        # known. Keep those writes disjoint from the preceding incomplete pool
+        # so rejection needs no extra state-copy or feedback-commit operation.
+        history_size = (
+            (self._index_kpool + num_spec + self._index_kpool - 1)
+            // self._index_kpool
+            * self._index_kpool
+        )
         # K + gate score packed into head_size (== 2*head_dim), head_size_v=0:
         # KpoolTailBackend.get_kv_cache_shape only consumes head_size and splits
-        # it into [2, kpool, head_dim] (K | score halves), so the connectors'
+        # it into [2, history_size, head_dim] (K | score halves), so connectors'
         # non-MLA K/V half-split transfers K and score as separate halves.
         return KpoolTailSpec(
-            block_size=self._index_kpool,
+            block_size=history_size,
             num_kv_heads=1,
             head_size=2 * self.head_dim,
             head_size_v=0,
             dtype=self.dtype,
-            sliding_window=self._index_kpool,
+            sliding_window=history_size,
         )
 
     def get_attn_backend(self):
@@ -267,6 +282,7 @@ class Indexer(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.wk_weights_proj",
         )
+        self.register_buffer("_wp_fp32", None, persistent=False)
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
 
@@ -368,10 +384,7 @@ class Indexer(nn.Module):
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        sm70_fp16_indexer = current_platform.is_cuda() and (
-            current_platform.is_device_capability((7, 0))
-        )
-        if sm70_fp16_indexer:
+        if use_portable_sparse():
             assert q.dtype == torch.float16
             q_index = fwht128(q).view(-1, self.n_head, self.head_dim)
             weights = _fused_indexer_weight_only_scale(
