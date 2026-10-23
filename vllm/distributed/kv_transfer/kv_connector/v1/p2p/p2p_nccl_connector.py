@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
     P2pNcclEngine,
+    _kv_key,
 )
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
@@ -195,7 +196,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 layer = kv_cache
 
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
-                    request.request_id + "#" + layer_name, remote_address
+                    _kv_key(request.request_id) + "#" + layer_name, remote_address
                 )
 
                 if kv_cache is None:
@@ -250,7 +251,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
             kv_cache = kv_layer[request.block_ids, ...]
             self.p2p_nccl_engine.send_tensor(
-                request_id + "#" + layer_name, kv_cache, remote_address
+                _kv_key(request_id) + "#" + layer_name, kv_cache, remote_address
             )
 
     def wait_for_save(self):
