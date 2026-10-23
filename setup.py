@@ -1352,6 +1352,9 @@ if _is_cuda():
             CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
         )
         ext_modules.append(
+            CMakeExtension(name="vllm._gguf_expert_cache_C", py_limited_api=False)
+        )
+        ext_modules.append(
             CMakeExtension(name="vllm._h3_w8a16_C", py_limited_api=False)
         )
         ext_modules.append(

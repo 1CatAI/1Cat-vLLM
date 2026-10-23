@@ -108,6 +108,7 @@ def test_mamba_hybrid_passes_seq_lens_cpu_upper_bound(monkeypatch):
     )
     state = object.__new__(MambaHybridModelState)
     state.max_model_len = 4096
+    state._spec_replay = None  # speculative GDN states stored per position
     seq_lens_cpu_upper_bound = torch.tensor([130], dtype=torch.int32)
     input_batch = SimpleNamespace(
         num_reqs=1,
@@ -1821,6 +1822,8 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
             self.gdn_policy = builder.gdn_policy
             self.A_log = torch.empty(1)
             self.dt_bias = torch.empty(1)
+            self._spec_replay = False
+            self._replay_stride = 1
 
         def rearrange_mixed_qkv(
             self,

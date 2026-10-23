@@ -1112,6 +1112,9 @@ class GPUModelRunner(
         self.vllm_config = vllm_config
         self._diagnostics = bind_diagnostics(vllm_config)
         self.model_config = vllm_config.model_config
+        self.mm_encoder_batch_size = getattr(
+            self.model_config.multimodal_config, "mm_encoder_batch_size", 0
+        )
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
         self.compilation_config = vllm_config.compilation_config
@@ -6098,6 +6101,7 @@ class GPUModelRunner(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,
+            max_batch_size=getattr(self, "mm_encoder_batch_size", 0),
         ):
             batch_outputs: MultiModalEmbeddings
 
@@ -12438,7 +12442,17 @@ class GPUModelRunner(
                     # Compressed MLA is split into physical pool pages instead
                     # of the scheduler's attention-kernel blocks.
                     if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = compressed_kernel_block_size(kv_cache_spec)
+                        # QSA side caches consume physical block tables; paged
+                        # MQA indexers consume smaller virtual pages. Match the
+                        # metadata builder and the V2 cache layout in each case.
+                        uses_physical_block_table = (
+                            attn_backend.get_builder_cls().uses_physical_block_table
+                        )
+                        shape_block_size = (
+                            kv_cache_spec.storage_block_size
+                            if uses_physical_block_table
+                            else compressed_kernel_block_size(kv_cache_spec)
+                        )
                         kernel_num_blocks = num_blocks * (
                             kv_cache_spec.storage_block_size // shape_block_size
                         )

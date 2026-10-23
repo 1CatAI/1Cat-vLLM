@@ -31,6 +31,15 @@ class MoERunnerInterface(PluggableLayer, ABC):
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def forward_partials(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return unreduced routed/shared contributions for a qualified consumer."""
+        raise NotImplementedError("This MoE runner does not expose partial outputs")
+
     @abstractmethod
     def is_internal_router(self) -> bool:
         raise NotImplementedError

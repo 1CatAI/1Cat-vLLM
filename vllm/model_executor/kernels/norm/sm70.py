@@ -28,7 +28,7 @@ def _sm70_gated_norm_shape_supported(
     return bool(
         z is not None
         and x.ndim == 2
-        and 1 <= x.shape[0] <= 192
+        and 1 <= x.shape[0] <= 768  # 64 tokens x 12 local heads
         and x.shape[1] == 128
         and z.shape == x.shape
         and weight.shape == (128,)

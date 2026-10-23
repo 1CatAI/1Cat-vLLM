@@ -234,6 +234,11 @@ def test_flashnext_loader_configures_embedding_and_floating_modules(
     )
     monkeypatch.setattr(loader, "_get_gguf_weight_type", lambda *_: types)
     monkeypatch.setattr(gguf_pinned, "prepare_pinned_gguf_ple", lambda *_: None)
+    from vllm.model_executor.kernels.ple import gguf_packed_result
+
+    monkeypatch.setattr(
+        gguf_packed_result, "prepare_packed_gguf_results", lambda *_: None
+    )
 
     class ModelConstructionReached(Exception):
         pass

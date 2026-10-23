@@ -101,13 +101,22 @@ def _prepared_gguf_projection(
         from .gguf_dense_hmma import apply_segments, restore_and_apply
 
         out = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
-        if rows.shape[0] <= 8 or rows.shape[0] == 20:
+        if rows.shape[0] <= 64:
             apply_segments(
                 rows, [codes], [stats], [cache], [decoder], [output_size], out, [out]
             )
         else:
             restore_and_apply(
-                rows, codes, stats, cache, decoder, output_size, out, k_ld, q_ld
+                rows,
+                codes,
+                stats,
+                cache,
+                decoder,
+                output_size,
+                out,
+                k_ld,
+                q_ld,
+                blas_bands=blas_bands,
             )
         return out.reshape(*x.shape[:-1], logical_size)
     if cache is not None and _supports_band(rows.shape[0], cache_bands):
@@ -184,16 +193,6 @@ def _prepared_gguf_mixed_projection(
 ) -> torch.Tensor:
     rows = x.reshape(-1, x.shape[-1]).contiguous()
     specs = [descriptors[i : i + 9] for i in range(0, len(descriptors), 9)]
-    if specs and all(spec[0] == 3 for spec in specs):
-        from .gguf_dense_hmma import apply_segments
-
-        ns = [spec[6] for spec in specs]
-        output = torch.empty((rows.shape[0], sum(ns)), dtype=x.dtype, device=x.device)
-        views = list(output.split(ns, dim=1))
-        apply_segments(
-            rows, codes, stats, caches, [spec[1] for spec in specs], ns, output, views
-        )
-        return output.reshape(*x.shape[:-1], sum(ns))
     cache_offset = blas_offset = 0
     policies = []
     for spec in specs:
@@ -206,6 +205,24 @@ def _prepared_gguf_mixed_projection(
         )
         cache_offset += cache_count
         blas_offset += blas_count
+    if specs and all(spec[0] == 3 for spec in specs):
+        from .gguf_dense_hmma import apply_segments
+
+        ns = [spec[6] for spec in specs]
+        output = torch.empty((rows.shape[0], sum(ns)), dtype=x.dtype, device=x.device)
+        views = list(output.split(ns, dim=1))
+        apply_segments(
+            rows,
+            codes,
+            stats,
+            caches,
+            [spec[1] for spec in specs],
+            ns,
+            output,
+            views,
+            blas_bands=[bb for _, bb in policies],
+        )
+        return output.reshape(*x.shape[:-1], sum(ns))
     # Retain the calibrated per-projection policy outside measured target
     # verification sizes. This decision must use actual M inside the op.
     direct = (
@@ -353,7 +370,7 @@ def prepared_projection_arguments(projections):
             cb = []
         if hasattr(projection, "segment_format"):
             family, decoder = 3, projection.segment_format
-            cb = bb = []
+            cb = []
         caches.append(
             projection.dmv_high
             if family == 4
@@ -703,7 +720,7 @@ class GGUFPreparedProjection(Module):
                 config.partition_weight_shape[1],
                 self.logical_output_size,
                 _admitted_bands(self.cache_capabilities),
-                [] if family == 3 else _admitted_bands(blas),
+                _admitted_bands(blas),
             )
         # Imported lazily because the GGUF method owns fallback dispatch.
         from vllm.model_executor.layers.quantization.gguf import fused_mul_mat_gguf

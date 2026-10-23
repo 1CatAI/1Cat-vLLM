@@ -11,6 +11,8 @@ chain.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import torch
@@ -24,11 +26,36 @@ logger = init_logger(__name__)
 
 HD, KD, LORA, INJ = 2560, 10240, 320, 4
 HCX_MAX_M = 8
+# Concurrent verification batches (up to 8 requests x 5 rows) keep the HCX
+# contract: producers hand over TP partials and the combine runs HCX on row
+# slices of at most HCX_MAX_M (rows are independent).
+HCX_BATCH_M = 40
 _OUTPUT_PROJECTIONS: dict[str, tuple] = {}
 _MOE_RUNNERS: dict[str, Any] = {}
-AR_BYTES = 4 * 80 * 256 * 8
-LORA_BYTES = 8 * 336 * 8
-HB_BYTES = 8 * HD * 4
+_PREFILL_SEQUENCE_PARALLEL: ContextVar[bool] = ContextVar(
+    "qwen4_exp_hc_prefill_sequence_parallel", default=False
+)
+
+
+@contextmanager
+def hc_prefill_sequence_parallel_context(enabled: bool):
+    """Bind one qualified forward call; nested calls and exceptions restore it."""
+    token = _PREFILL_SEQUENCE_PARALLEL.set(enabled)
+    try:
+        yield
+    finally:
+        _PREFILL_SEQUENCE_PARALLEL.reset(token)
+
+
+def hc_prefill_sequence_parallel_active() -> bool:
+    return _PREFILL_SEQUENCE_PARALLEL.get()
+
+
+# One exchange region per 8-row group (HCX_BATCH_M rows per launch).
+HCX_GROUPS = 5
+AR_BYTES = HCX_GROUPS * 4 * 80 * 256 * 8
+LORA_BYTES = HCX_GROUPS * 8 * 336 * 8
+HB_BYTES = HCX_GROUPS * 8 * HD * 4
 TOP1_ROWS = 32
 TOP1_BYTES = 2 * 2 * TOP1_ROWS * 16
 _LANE_R = [(L & 3) + (4 if L & 16 else 0) for L in range(32)]
@@ -47,10 +74,10 @@ def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
     # Resolve actual M inside the opaque op, rather than freezing a decode
     # choice while compiling a range that also includes C4 and prefill.
     layer, defer = _OUTPUT_PROJECTIONS[name]
-    if 0 < x.shape[0] <= HCX_MAX_M and defer:
+    if 0 < x.shape[0] <= HCX_BATCH_M and defer:
         return torch.nn.functional.pad(x, (0, layer.output_size - x.shape[1]))
     projected, _ = layer(x)
-    if x.shape[0] > HCX_MAX_M:
+    if x.shape[0] > HCX_BATCH_M and not hc_prefill_sequence_parallel_active():
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         projected = tensor_model_parallel_all_reduce(projected)
@@ -66,7 +93,7 @@ def _moe_output(
     shared: torch.Tensor | None, fused: torch.Tensor, name: str, trunc_size: int
 ) -> torch.Tensor:
     rows = fused.shape[0]
-    if 0 < rows <= HCX_MAX_M:
+    if 0 < rows <= HCX_BATCH_M:
         # An owned payload makes both contributions explicit to the compiler
         # and graph allocator. Hidden references to producer temporaries are
         # unsafe: the memory planner cannot see those additional consumers.
@@ -74,6 +101,12 @@ def _moe_output(
         second = torch.zeros_like(first) if shared is None else shared[..., :trunc_size]
         return torch.cat((first, second), dim=0)
     runner = _MOE_RUNNERS[name]
+    if hc_prefill_sequence_parallel_active():
+        first = fused[..., :trunc_size]
+        second = torch.zeros_like(first) if shared is None else shared[..., :trunc_size]
+        # Keep both contributions finite until the row owner has received the
+        # FP32 sum. Narrowing each rank's sum before reduction can overflow.
+        return torch.cat((first, second), dim=0)
     reduced = runner._maybe_sm70_moe_sum2_allreduce(shared, fused, trunc_size)
     if reduced is None:
         summed = fused if shared is None else shared + fused
@@ -277,10 +310,12 @@ class Sm70HcxRuntime:
                 p + AR_BYTES + LORA_BYTES + HB_BYTES if p else 0 for p in base
             ]
             self.top1_seq = torch.zeros(1, device=device, dtype=torch.int32)
-            self.xn = torch.zeros(HCX_MAX_M, KD, device=device, dtype=torch.float16)
-            self.sq = torch.zeros(80 * 8 * 4, device=device, dtype=torch.float32)
+            self.xn = torch.zeros(HCX_BATCH_M, KD, device=device, dtype=torch.float16)
+            self.sq = torch.zeros(
+                HCX_GROUPS * 80 * 8 * 4, device=device, dtype=torch.float32
+            )
             self.dpart = torch.zeros(
-                80 * 8 * 96 * 4, device=device, dtype=torch.float32
+                HCX_GROUPS * 80 * 8 * 96 * 4, device=device, dtype=torch.float32
             )
             # Legacy arrival/reset counters and separate local-schedule
             # cumulative counter/base permit alternating graph policies.
@@ -324,6 +359,7 @@ class Sm70HcxRuntime:
         oproj=None,
         secondary=None,
         snapshot_name=None,
+        outputs=None,
     ):
         m = partial.shape[0]
         ox = ocodes = ohigh = oscale = None
@@ -332,9 +368,13 @@ class Sm70HcxRuntime:
             k, ocodes, ohigh, oscale, ofmt = oproj
             # hcxo computes the producer GEMV itself and never reads p0.
             ox = partial[:, :k]
-        hidden_out = torch.empty_like(hidden)
-        block = partial.new_empty((m, HD))
-        injection_out = partial.new_empty((m, INJ))
+        if outputs is None:
+            hidden_out = torch.empty_like(hidden)
+            block = partial.new_empty((m, HD))
+            injection_out = partial.new_empty((m, INJ))
+        else:
+            # Row slices of the caller's contiguous outputs.
+            hidden_out, block, injection_out = outputs
         snapshot = None
         if self.diagnostic and m == 5 and snapshot_name is not None:
             if oproj is not None:

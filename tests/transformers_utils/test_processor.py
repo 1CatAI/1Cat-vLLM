@@ -65,3 +65,42 @@ def test_get_processor_kwargs_from_processor_module_scan_returns_full_union():
     proc = _ProcWithoutUnpack()
     keys = get_processor_kwargs_keys(get_processor_kwargs_type(proc))
     _assert_has_all_expected(keys)
+
+
+class _FakeProcessor:
+    attributes = ["image_processor", "tokenizer"]
+    calls: list[dict] = []
+    tokenizer: object = None
+
+    @classmethod
+    def from_pretrained(cls, name, *args, **kwargs):
+        cls.calls.append(kwargs)
+        if kwargs.get("fail_without_tokenizer") and "tokenizer" not in kwargs:
+            raise OSError("no tokenizer files")
+        processor = cls()
+        processor.tokenizer = kwargs.get("tokenizer", "loaded-from-path")
+        return processor
+
+
+def test_processor_build_attaches_given_tokenizer_without_passing_it():
+    from vllm.transformers_utils.processor import _from_pretrained_with_tokenizer
+
+    _FakeProcessor.calls = []
+    tokenizer = object()
+    processor = _from_pretrained_with_tokenizer(
+        _FakeProcessor, "path", revision="main", tokenizer=tokenizer
+    )
+    assert processor.tokenizer is tokenizer
+    assert "tokenizer" not in _FakeProcessor.calls[0]  # not deep-copied by HF
+
+
+def test_processor_build_falls_back_to_passing_tokenizer():
+    from vllm.transformers_utils.processor import _from_pretrained_with_tokenizer
+
+    _FakeProcessor.calls = []
+    tokenizer = object()
+    processor = _from_pretrained_with_tokenizer(
+        _FakeProcessor, "path", tokenizer=tokenizer, fail_without_tokenizer=True
+    )
+    assert processor.tokenizer is tokenizer
+    assert len(_FakeProcessor.calls) == 2

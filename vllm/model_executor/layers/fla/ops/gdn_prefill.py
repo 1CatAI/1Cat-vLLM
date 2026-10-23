@@ -328,6 +328,7 @@ class GdnPrefill:
             has_initial_state=has_initial_state,
             inplace_final_state=inplace_final_state,
             use_original_tilelang=self.execution_plan.original_prefill,
+            original_prefill_threads=self.execution_plan.original_prefill_threads,
             profiler=self.profiler,
             native_policy=self.native_policy,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,

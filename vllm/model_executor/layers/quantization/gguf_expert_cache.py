@@ -20,10 +20,11 @@ experts) into one of two buffers, prefetching the next layer while this one
 computes, and the routed ids are remapped into that bank.
 """
 
+import importlib
 import os
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
@@ -32,13 +33,18 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
+if TYPE_CHECKING:
+    from .gguf_prefill_prepare import PredictivePrefillPreparation
+
 logger = init_logger(__name__)
 
 SHARDS = ("w1", "w3", "w2")
 _ENTRY_HEADER = 8
 _RING_ENTRIES = 1024
 _MAX_OPS = 256
-_COPY_PROGRAMS = (16, 8)
+# Split both words and projections to expose independent mapped-host
+# transfers for small miss plans. See the paired TP4 copy screen.
+_COPY_PROGRAMS = (4, 32, 3)
 _LAYER = re.compile(r"layers\.(\d+)\.")
 _MEMLOG = envs.VLLM_EXPERT_CACHE_MEMLOG
 
@@ -72,10 +78,17 @@ def _lookup_publish(
     tl.store(entry + 2, count.to(tl.int32))
     tl.store(entry + 3, miss.to(tl.int32))
     tl.debug_barrier()
-    tl.atomic_xchg(entry, seq.to(tl.int32), sem="release", scope="sys")
-    tl.atomic_xchg(published, seq + 1, sem="release", scope="sys")
-    tl.store(counter, seq + 1)
     ops = 0
+    if miss > 0:
+        tl.atomic_xchg(entry, seq.to(tl.int32), sem="release", scope="sys")
+        tl.atomic_xchg(published, seq + 1, sem="release", scope="sys")
+    else:
+        # Nothing waits on a hit: publish without system-scope fences. The
+        # complemented tag tells the lane there is nothing to plan, so a late
+        # body only affects recency. A later miss's release orders it.
+        tl.atomic_xchg(entry, ~seq.to(tl.int32), sem="relaxed", scope="sys")
+        tl.atomic_xchg(published, seq + 1, sem="relaxed", scope="sys")
+    tl.store(counter, seq + 1)
     if miss > 0:
         # The lane answers with this request's sequence number.
         # A failed lane answers every request with no copies.
@@ -109,6 +122,7 @@ def _apply_plan(
     OPS_PROGRAMS: tl.constexpr,
     SPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
+    PARALLEL_SHARDS: tl.constexpr = False,
 ):
     """Write back, then load, the planned experts (int64 words).
 
@@ -121,7 +135,8 @@ def _apply_plan(
         slot = tl.load(plan + 8 + op * 5).to(tl.int64)
         load = tl.load(plan + 9 + op * 5).to(tl.int64)
         back = tl.load(plan + 10 + op * 5).to(tl.int64)
-        for shard in tl.static_range(3):
+        for shard_index in tl.static_range(1 if PARALLEL_SHARDS else 3):
+            shard = tl.program_id(2) if PARALLEL_SHARDS else shard_index
             n = tl.load(words + layer * 3 + shard)
             device = tl.load(device_offsets + layer * 3 + shard) + slot * n
             host_base = tl.load(host_offsets + layer * 3 + shard)
@@ -182,6 +197,12 @@ _NATIVE = None
 def _native():
     global _NATIVE
     if _NATIVE is None:
+        try:
+            _NATIVE = importlib.import_module("vllm._gguf_expert_cache_C")
+            return _NATIVE
+        except ImportError:
+            pass
+        # Source checkouts without the prebuilt module compile it on demand.
         from torch.utils.cpp_extension import load
 
         source = os.path.join(
@@ -222,6 +243,7 @@ class ExpertCache:
         device,
         prefill_mode="mmq",
         prefill_tokens=4096,
+        prefill_prepare="all",
     ):
         """``banks``: [(layer_index, shard, (experts, rows, bytes), tail,
         (gguf_type, logical_k, k_offset))]."""
@@ -271,6 +293,11 @@ class ExpertCache:
         self.shapes, self.sizes = shapes, size
         self.prefill_mode = prefill_mode
         self.prefill_tokens = prefill_tokens
+        if prefill_prepare not in ("all", "predict", "predict_resident"):
+            raise ValueError("Unknown expert-cache prefill preparation")
+        if prefill_prepare != "all" and prefill_mode != "turbomind":
+            raise ValueError("Predictive preparation requires TurboMind prefill")
+        self.prefill_prepare = prefill_prepare
         self.prefill_rows = num_experts + spare
         self.prefill_storage = []
         if prefill_mode == "turbomind":
@@ -519,6 +546,9 @@ class ExpertCache:
             )
 
     def close(self):
+        if self.tm is not None and self.tm.preparation is not None:
+            self.tm.preparation.close()
+            self.tm.preparation = None
         if self.lane is not None:
             self.lane.stop()
             self.lane = None
@@ -547,6 +577,8 @@ class ExpertCache:
     def resolve(self, layer: int, ids: torch.Tensor) -> torch.Tensor:
         """Slot ids for ``ids`` once every routed expert is resident."""
         self.start()
+        if self.tm is not None and self.tm.preparation is not None:
+            self.tm.preparation.wait_decode()
         i = self.index[layer]
         count = ids.numel()
         if count > min(self.resident0, self.ring.shape[1] - _ENTRY_HEADER):
@@ -582,8 +614,9 @@ class ExpertCache:
             i,
             OPS_PROGRAMS=_COPY_PROGRAMS[0],
             SPLIT=_COPY_PROGRAMS[1],
-            BLOCK=1024,
-            num_warps=8,
+            BLOCK=256,
+            PARALLEL_SHARDS=True,
+            num_warps=4,
         )
         out = torch.empty_like(ids)
         _remap[(1,)](
@@ -809,6 +842,8 @@ class TurboMindPrefill:
 
     def __init__(self, cache: "ExpertCache"):
         self.cache = cache
+        self.preparation: PredictivePrefillPreparation | None = None
+        self.prediction_step = False
         experts, device = cache.experts, cache.device
         self.layer = {}
         sizes = {"gu": 0, "dn": 0}
@@ -915,9 +950,16 @@ class TurboMindPrefill:
         split = self.cache.experts * spec[3]
         return buffer[:split], buffer[split : split + self.cache.experts * spec[4]]
 
+    def _prepared(self) -> "PredictivePrefillPreparation":
+        # Only prediction steps reach the preparation hooks.
+        assert self.preparation is not None
+        return self.preparation
+
     def storage_bytes(self) -> int:
-        return sum(t.numel() for ts in self.storage.values() for t in ts) + (
-            self.stage.numel() if self.stage is not None else 0
+        return (
+            sum(t.numel() for ts in self.storage.values() for t in ts)
+            + (self.stage.numel() if self.stage is not None else 0)
+            + (self.preparation.storage_bytes() if self.preparation is not None else 0)
         )
 
     def bind_host(self):
@@ -944,6 +986,15 @@ class TurboMindPrefill:
         self.layer_bases = [
             self.bases[i * 3 : i * 3 + 3] for i in range(len(cache.layers))
         ]
+        if cache.prefill_prepare != "all":
+            from .gguf_prefill_prepare import PredictivePrefillPreparation
+
+            if (
+                self.COLD_DMA
+                and cache.experts <= 512
+                and torch.cuda.get_device_capability(cache.device) == (7, 0)
+            ):
+                self.preparation = PredictivePrefillPreparation(self)
 
     def start(self):
         self.resident_stream = self.cache.copy_stream
@@ -956,6 +1007,8 @@ class TurboMindPrefill:
             event.record()
         self.fresh = torch.cuda.Event()
         self.fresh.record()
+        if self.preparation is not None:
+            self.preparation.start()
 
     # -- transcode ------------------------------------------------------
     def _locate(self, i: int):
@@ -976,6 +1029,8 @@ class TurboMindPrefill:
                 experts,
                 BLOCK=triton.next_power_of_2(experts),
             )
+            if self.prediction_step:
+                self._prepared().filter(i)
 
     def _issue(self, key: str, i: int):
         """Queue layer i's transcode into the `key` bank."""
@@ -1014,17 +1069,11 @@ class TurboMindPrefill:
             # (decode write-backs precede it) and the previous layer's cold
             # transcode (stream order), not the bank: it runs ahead.
             cold.wait_event(self.fresh)
-            rows = self.extent[p]
             for s in (0, 1) if key == "gu" else (2,):
-                shard = SHARDS[s]
-                nbytes = rows * cache.sizes[layer, shard]
-                if nbytes:
-                    _native().copy_h2d(
-                        self.stage_at[s],
-                        cache.host[layer, shard].data_ptr(),
-                        nbytes,
-                        cold.cuda_stream,
-                    )
+                if self.prediction_step:
+                    self._prepared().stage(i, s, self.stage_at[s], cold.cuda_stream)
+                else:
+                    cache.lane.stage_cold(i, s, self.stage_at[s], cold.cuda_stream)
         cold.wait_stream(stream)
         spec = info[key]
         weight, stats = self.bank(key, spec, slot[1])
@@ -1091,6 +1140,10 @@ class TurboMindPrefill:
         out = torch.empty_like(x)
         weights = weights.float().contiguous()
         step = cache.prefill_tokens
+        self.prediction_step = bool(
+            self.preparation is not None and self.preparation.begin(i, x, ids)
+        )
+        route = self._route(ids, 0, experts) if self.prediction_step else None
         self._acquire("gu", i)
         self._tune(layer, info, tables, x)
         if _MEMLOG and i in (0, len(cache.layers) - 1):
@@ -1112,10 +1165,15 @@ class TurboMindPrefill:
             )
         # Gate|up over the whole chunk (its SiLU output is small): experts
         # get full-size row groups. Then the bank is released.
-        route = self._route(ids, 0, experts)
+        if route is None:
+            route = self._route(ids, 0, experts)
+        if self.prediction_step:
+            self._prepared().complete("gu", i, route[0])
         hidden = self._gate_up(info, tables, x, route, False)
         self._release("gu", i)
         self._acquire("dn", i)
+        if self.prediction_step:
+            self._prepared().complete("dn", i, route[0])
         # Down's output is wide: token sub-batches, each reading its routes'
         # gate|up rows from the chunk-wide order.
         if tokens <= step:
@@ -1126,6 +1184,8 @@ class TurboMindPrefill:
                 sub = self._subroute(route, t0, t1)
                 self._down(info, tables, hidden, sub, weights[t0:t1], out[t0:t1], False)
         self._release("dn", i)
+        if self.prediction_step:
+            self._prepared().finish(i)
         return out
 
     def _route(self, ids, t0, experts, outer=None):
@@ -1298,5 +1358,6 @@ def create_cache(banks, num_experts, config, device) -> ExpertCache:
         device,
         prefill_mode=config.expert_cache_prefill,
         prefill_tokens=config.expert_cache_prefill_tokens,
+        prefill_prepare=getattr(config, "expert_cache_prefill_prepare", "all"),
     )
     return _CACHE

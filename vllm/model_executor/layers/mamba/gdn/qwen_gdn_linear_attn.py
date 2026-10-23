@@ -100,7 +100,10 @@ from vllm.model_executor.layers.fla.ops.sm70.gdn_decode import (
     FlashQlaDecodeAdmission,
     flashqla_decode,
 )
-from vllm.model_executor.layers.fla.ops.sm70.gdn_verify import bind_native_verifier
+from vllm.model_executor.layers.fla.ops.sm70.gdn_verify import (
+    bind_native_verifier,
+    commit_replayed,
+)
 from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
@@ -1361,6 +1364,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.gdn_heads,
             enabled=self.gdn_policy.native_verify,
         )
+        from vllm.model_executor.layers.mamba.gdn.spec_replay import (
+            spec_replay_enabled,
+        )
+
+        self._spec_replay = spec_replay_enabled(vllm_config)
+        if self._spec_replay and self.verification_update is None:
+            raise ValueError("GDN speculative replay requires the native verifier.")
+        # Per-request buffer stride of the replayed recurrent rows.
+        speculative = vllm_config.speculative_config
+        self._replay_stride = (
+            1 + speculative.num_speculative_state_tokens()
+            if self._spec_replay and speculative is not None
+            else 1
+        )
         self.enable_sm70_gdn_rmsnorm_onepass = (
             _sm70_gdn_rmsnorm_onepass_enabled(self.gdn_policy.projection)
             and current_platform.is_device_capability(70)
@@ -2385,7 +2402,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_indices=spec_state_indices_tensor[:, 0],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # Replay keeps one state block per request, so the index
+                # width no longer bounds the rows of a verification round.
+                max_query_len=(
+                    self._replay_stride
+                    if self._spec_replay
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
             query_linear, key_linear, value_linear = self.rearrange_mixed_qkv(
@@ -3702,6 +3725,66 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         return out.transpose(0, 1)
 
+    def _spec_replay_args(self):
+        from vllm.model_executor.layers.mamba.gdn.spec_replay import (
+            get_spec_replay_state,
+        )
+
+        state = get_spec_replay_state()
+        assert state is not None, "GDN speculative replay state is not set"
+        group = state.group_of[self.prefix]
+        return (
+            state.layer_buffer(
+                self.prefix,
+                self.num_k_heads // self.tp_size,
+                self.num_v_heads // self.tp_size,
+                self.A_log.device,
+            ),
+            state.spec_replay,
+            state.spec_map,
+            state.spec_ckpt_token,
+            state.spec_ckpt_slot[group],
+            self._replay_stride,
+        )
+
+    def _commit_replayed_decodes(
+        self, ssm_state, attn_metadata, state_indices=None
+    ) -> None:
+        """Commit the previous verification of requests decoding without
+        drafts this step (their rows read the committed state directly).
+
+        Every path that runs non-speculative decode rows must call this
+        first: the step's replay tables already cleared their verified flag.
+        """
+        from vllm.model_executor.layers.mamba.gdn.spec_replay import (
+            get_spec_replay_state,
+        )
+
+        state = get_spec_replay_state()
+        assert state is not None, "GDN speculative replay state is not set"
+        rows = attn_metadata.num_decodes
+        commit_replayed(
+            self.gdn_heads,
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            state.empty_starts[: rows + 1],
+            (
+                attn_metadata.non_spec_state_indices_tensor
+                if state_indices is None
+                else state_indices
+            )[:rows],
+            state.layer_buffer(
+                self.prefix,
+                self.gdn_heads.local_k_heads,
+                self.gdn_heads.local_v_heads,
+                self.A_log.device,
+            ),
+            state.plain_replay,
+            state.plain_map,
+            self._replay_stride,
+        )
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -3728,6 +3811,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata_raw, dict)
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if self._spec_replay and attn_metadata.num_decodes > 0:
+            self._commit_replayed_decodes(kv_cache[1], attn_metadata)
 
         mixed_qkv_decode_requested = (
             self.enable_sm70_fused_sigmoid_mixed_qkv
@@ -3737,7 +3822,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv.is_contiguous()
                 or (
                     attn_metadata.spec_sequence_masks is not None
-                    and mixed_qkv.shape[0] in (5, 20)
+                    and (mixed_qkv.shape[0] in (5, 20) or self._spec_replay)
                     and mixed_qkv.stride(1) == 1
                     and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
                 )
@@ -3892,7 +3977,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # Replay keeps one state block per request, so the index
+                # width no longer bounds the rows of a verification round.
+                max_query_len=(
+                    self._replay_stride
+                    if self._spec_replay
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
 
@@ -4117,12 +4208,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and (
                 mixed_qkv_spec.is_contiguous()
                 or (
-                    mixed_qkv_spec.shape[0] in (5, 20)
+                    (mixed_qkv_spec.shape[0] in (5, 20) or self._spec_replay)
                     and mixed_qkv_spec.stride(1) == 1
                     and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
                 )
             )
-            and (1 < mixed_qkv_spec.shape[0] <= 16 or mixed_qkv_spec.shape[0] == 20)
+            and (
+                1 < mixed_qkv_spec.shape[0] <= 16
+                or mixed_qkv_spec.shape[0] == 20
+                or (self._spec_replay and mixed_qkv_spec.stride(1) == 1)
+            )
         )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
@@ -4288,7 +4383,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 direct_verify_out = bool(
                     spec_rows_are_batch
                     and num_actual_tokens == mixed_qkv_spec.shape[0]
-                    and num_actual_tokens in (5, 20)
+                    and (num_actual_tokens in (5, 20) or self._spec_replay)
                     and core_attn_out.is_contiguous()
                     and core_attn_out.dtype == mixed_qkv_spec.dtype
                 )
@@ -4307,10 +4402,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         spec_query_start_loc,
                         spec_state_indices_tensor,
                         spec_state_slot_selectors,
+                        replay=self._spec_replay_args() if self._spec_replay else None,
                     )
                     if self.verification_update is not None
                     else None
                 )
+                if verified is None and self._spec_replay:
+                    raise RuntimeError(
+                        "GDN speculative replay: the CUDA verifier rejected "
+                        f"{mixed_qkv_spec.shape[0]} rows (requests="
+                        f"{attn_metadata.num_spec_decodes}, dtype="
+                        f"{mixed_qkv_spec.dtype}, strides={mixed_qkv_spec.stride()}, "
+                        f"state={ssm_state.dtype})."
+                    )
                 if verified is not None:
                     core_attn_out_spec, _last_recurrent_state = verified
                 else:
@@ -4345,6 +4449,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     "SM70 mixed-QKV fused GDN target-verification route hit."
                 )
             else:
+                if self._spec_replay:
+                    raise RuntimeError(
+                        "GDN speculative replay requires the mixed-QKV verifier."
+                    )
                 assert query_spec is not None
                 assert key_spec is not None
                 assert value_spec is not None
@@ -4957,6 +5065,10 @@ def qwen_gdn_attention_core_standard_spec(
         and non_spec_query_start_loc.numel() > 0
         and non_spec_state_indices_tensor.numel() > 0
     ):
+        if self._spec_replay:
+            self._commit_replayed_decodes(
+                ssm_state_cache, attn_metadata, non_spec_state_indices_tensor
+            )
         self._forward_core_decode_non_spec_explicit(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -5240,7 +5352,13 @@ def qwen_gdn_attention_core_spec_commit(
                 state_indices=spec_state_indices_tensor[:, 0],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # Replay keeps one state block per request, so the index
+                # width no longer bounds the rows of a verification round.
+                max_query_len=(
+                    self._replay_stride
+                    if self._spec_replay
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
         if isinstance(self, QwenGatedDeltaNetAttention) and (
@@ -5375,6 +5493,10 @@ def qwen_gdn_attention_core_standard(
         and non_spec_query_start_loc.numel() > 0
         and non_spec_state_indices_tensor.numel() > 0
     ):
+        if self._spec_replay:
+            self._commit_replayed_decodes(
+                ssm_state_cache, attn_metadata, non_spec_state_indices_tensor
+            )
         self._forward_core_decode_non_spec_explicit(
             mixed_qkv=mixed_qkv,
             b=b,

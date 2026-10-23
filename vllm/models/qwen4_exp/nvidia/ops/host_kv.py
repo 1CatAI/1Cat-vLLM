@@ -54,6 +54,74 @@ def _stage_pages(
 
 
 @triton.jit
+def _merge_windows(
+    Acc,
+    AccState,
+    Part,
+    PartState,
+    Out,
+    Gate,
+    os0,
+    os1,
+    gs0,
+    gs1,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    FINAL: tl.constexpr,
+    GATED: tl.constexpr,
+):
+    """Fold one window's normalized rows and (max, sum) into the running
+    rows; FINAL also writes the gated FP16 output like rows_fp8."""
+    pid = tl.program_id(0)
+    row, head = pid // H, pid % H
+    m0 = tl.load(AccState + pid * 2)
+    s0 = tl.load(AccState + pid * 2 + 1)
+    m1 = tl.load(PartState + pid * 2)
+    s1 = tl.load(PartState + pid * 2 + 1)
+    m = tl.maximum(m0, m1)
+    w0 = s0 * tl.exp2(m0 - m)
+    w1 = s1 * tl.exp2(m1 - m)
+    total = w0 + w1
+    offs = tl.arange(0, D)
+    a = tl.load(Acc + pid * D + offs)
+    b = tl.load(Part + pid * D + offs)
+    value = tl.where(total > 0, (a * w0 + b * w1) / total, 0.0)
+    if FINAL:
+        if GATED:
+            value = value.to(tl.float16).to(tl.float32)
+            g = tl.load(Gate + row * gs0 + head * gs1 + offs).to(tl.float32)
+            value = value / (1.0 + tl.exp2(-g * 1.4426950408889634))
+        tl.store(Out + row * os0 + head * os1 + offs, value.to(tl.float16))
+    else:
+        tl.store(Acc + pid * D + offs, value)
+        tl.store(AccState + pid * 2, m)
+        tl.store(AccState + pid * 2 + 1, total)
+
+
+def merge_windows(acc, acc_state, part, part_state, out=None, gate=None):
+    rows, heads, dim = acc.shape
+    final = out is not None
+    gated = gate is not None
+    _merge_windows[(rows * heads,)](
+        acc,
+        acc_state,
+        part,
+        part_state,
+        out if final else acc,
+        gate if gated else acc,
+        out.stride(0) if final else 0,
+        out.stride(1) if final else 0,
+        gate.stride(0) if gated else 0,
+        gate.stride(1) if gated else 0,
+        H=heads,
+        D=dim,
+        FINAL=final,
+        GATED=gated,
+        num_warps=2,
+    )
+
+
+@triton.jit
 def _write(
     K,
     V,
@@ -72,6 +140,8 @@ def _write(
     Sets: tl.constexpr,
     FP8: tl.constexpr,
     HOT: tl.constexpr = True,
+    HOT_FP8: tl.constexpr = False,
+    HotScales=None,
 ):
     # HOT=False: a plain history copy (a prefill stage buffer): no epoch,
     # no hot-cache update.
@@ -108,6 +178,13 @@ def _write(
             if FP8:
                 decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, None]).to(
                     tl.float16
+                )
+            if HOT_FP8:
+                decoded = codes
+                tl.store(
+                    HotScales + tl.maximum(resident, 0) * 8 + slot % 4 * 2 + kv,
+                    scales,
+                    (resident >= 0) & (tag == page),
                 )
             tl.store(
                 Hot
@@ -215,6 +292,9 @@ def _gather(
     Sets: tl.constexpr,
     FP8: tl.constexpr,
     STAGE: tl.constexpr,
+    HOT_FP8: tl.constexpr = False,
+    HotScales=None,
+    HANDS: tl.constexpr = 1,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     lanes = tl.arange(0, 16)
@@ -257,6 +337,15 @@ def _gather(
                 initial_hit[:, None, None],
                 other=0,
             )
+            if HOT_FP8:
+                scales = tl.load(
+                    HotScales + tl.maximum(initial, 0)[:, None] * 2 + kv[None, :],
+                    initial_hit[:, None],
+                    other=0,
+                )
+                values = (
+                    fp8_e4m3fn_bits_to_fp32_bitcast(values) * scales[:, :, None]
+                ).to(tl.float16)
             tl.store(
                 Out
                 + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
@@ -315,13 +404,30 @@ def _gather(
     for _ in range(4):
         pending = claim & ~reserved
         if tl.sum(pending.to(tl.int32), 0) > 0:
+            # HANDS independent CLOCK hands, each sweeping its own slot range,
+            # so concurrent misses do not serialize on one counter.
+            lane_hand = (row * tl.cdiv(Width, 16) + tile) % HANDS
+            span: tl.constexpr = (Sets * 4) // HANDS
             hand = tl.atomic_add(
-                Hands + tl.zeros((4,), tl.int32), tl.where(pending, 16, 0)
+                Hands + lane_hand + tl.zeros((4,), tl.int32),
+                tl.where(pending, 16, 0),
             ).to(tl.uint32)
-            candidates = (hand[:, None] + probes[None, :]) % (Sets * 4)
+            base = (lane_hand * span).to(tl.uint32)
+            candidates = base + (hand[:, None] + probes[None, :]) % span
             stamps = tl.load(Stamps + candidates)
-            chosen = tl.min(tl.where(stamps != epoch, probes[None, :], 16), 1)
-            candidate = ((hand + tl.minimum(chosen, 15)) % (Sets * 4)).to(tl.int32)
+            # Evict the least recently selected probe (stamps hold the epoch of
+            # last use); pages selected in this epoch stay pinned.
+            age = tl.where(stamps != epoch, epoch - stamps, -1)
+            oldest = tl.max(age, 1)
+            chosen = tl.min(
+                tl.where(
+                    (age == oldest[:, None]) & (oldest[:, None] >= 0),
+                    probes[None, :],
+                    16,
+                ),
+                1,
+            )
+            candidate = (base + (hand + tl.minimum(chosen, 15)) % span).to(tl.int32)
             observed = tl.load(Stamps + candidate)
             attempt = pending & (chosen < 16) & (observed != epoch)
             won = attempt & (
@@ -343,46 +449,85 @@ def _gather(
     )
     hot_tokens = tl.reshape(slots[:, None] * 4 + page_lanes[None, :], (16,))
     token_hits = tl.reshape(tl.broadcast_to(hit[:, None], (4, 4)), (16,))
-    cached = tl.load(
-        Hot
-        + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
-        + dims[None, None, :],
-        token_hits[:, None, None],
-        other=0,
-    )
-    codes = tl.load(
-        History
-        + (
-            (tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2 + kv[None, :, None])
-            * Page
-            + (tl.maximum(logical, 0) % Page)[:, None, None]
-        )
-        * Dim
-        + dims[None, None, :],
-        (valid & ~token_hits)[:, None, None],
-        other=0,
-    )
-    if FP8:
-        scales = tl.load(
-            Scales + tokens[:, None] * 2 + kv[None, :],
-            (valid & ~token_hits)[:, None],
+    token_installs = tl.reshape(tl.broadcast_to(install[:, None], (4, 4)), (16,))
+    # Direct readers consume existing hot values themselves, and read a
+    # failed installation from authoritative history. Resolve only needs
+    # values that it actually writes to a new hot slot or staging.
+    # A failed direct installation has no values to materialize.
+    if STAGE > 0 or tl.sum(install.to(tl.int32), 0) > 0:
+        need_cached = token_hits & (STAGE > 0)
+        need_history = valid & ~token_hits
+        if STAGE == 0:
+            need_history &= token_installs
+        cached = tl.load(
+            Hot
+            + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
+            + dims[None, None, :],
+            need_cached[:, None, None],
             other=0,
         )
-        decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
-            tl.float16
+        if HOT_FP8:
+            cached_scales = tl.load(
+                HotScales + hot_tokens[:, None] * 2 + kv[None, :],
+                need_cached[:, None],
+                other=0,
+            )
+            cached = (
+                fp8_e4m3fn_bits_to_fp32_bitcast(cached) * cached_scales[:, :, None]
+            ).to(tl.float16)
+        codes = tl.load(
+            History
+            + (
+                (
+                    tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2
+                    + kv[None, :, None]
+                )
+                * Page
+                + (tl.maximum(logical, 0) % Page)[:, None, None]
+            )
+            * Dim
+            + dims[None, None, :],
+            need_history[:, None, None],
+            other=0,
         )
-    else:
-        decoded = codes.to(tl.float16)
-    values = tl.where(token_hits[:, None, None], cached, decoded)
-    token_installs = tl.reshape(tl.broadcast_to(install[:, None], (4, 4)), (16,))
-    tl.store(
-        Hot
-        + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
-        + dims[None, None, :],
-        values,
-        token_installs[:, None, None],
-    )
-    tl.debug_barrier()
+        if FP8:
+            scales = tl.load(
+                Scales + tokens[:, None] * 2 + kv[None, :],
+                need_history[:, None],
+                other=0,
+            )
+            decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
+                tl.float16
+            )
+        else:
+            decoded = codes.to(tl.float16)
+        values = tl.where(token_hits[:, None, None], cached, decoded)
+        tl.store(
+            Hot
+            + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
+            + dims[None, None, :],
+            codes if HOT_FP8 else values,
+            token_installs[:, None, None],
+        )
+        if HOT_FP8:
+            tl.store(
+                HotScales + hot_tokens[:, None] * 2 + kv[None, :],
+                scales,
+                token_installs[:, None],
+            )
+        if STAGE > 0:
+            store_values = columns < Padded
+            if STAGE == 2:
+                store_values &= valid & ~(token_hits | token_installs)
+            tl.store(
+                Out
+                + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
+                * Dim
+                + dims[None, None, :],
+                values,
+                store_values[:, None, None],
+            )
+        tl.debug_barrier()
     tl.atomic_cas(Tags + slots, tl.where(install, old_tag, -2), first, sem="release")
     tl.atomic_cas(PageSlots + first, tl.where(install, -2, -3), slots, sem="release")
     tl.atomic_cas(
@@ -395,17 +540,6 @@ def _gather(
         tl.where(valid, tl.where(token_hits | token_installs, hot_tokens, -1), -2),
         columns < Width,
     )
-    if STAGE > 0:
-        store_values = columns < Padded
-        if STAGE == 2:
-            store_values &= valid & ~(token_hits | token_installs)
-        tl.store(
-            Out
-            + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None]) * Dim
-            + dims[None, None, :],
-            values,
-            store_values[:, None, None],
-        )
     counter = (row * tl.cdiv(Width, 16) + tile) * 3
     counters = tl.arange(0, 4)
     hits = tl.sum((valid & token_hits).to(tl.int64), 0)
@@ -435,6 +569,7 @@ class HostQSAKV:
         direct_device: bool | None = None,
         is_speculative_draft: bool = False,
         resolve_rows: int = 32,
+        hot_fp8: bool = False,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -451,6 +586,9 @@ class HostQSAKV:
         if dtype not in (torch.uint8, torch.float16):
             raise ValueError("Host history requires E4M3 bytes or FP16 values")
         self.fp8 = dtype == torch.uint8
+        if hot_fp8 and not self.fp8:
+            raise ValueError("Encoded hot cache requires E4M3 authoritative history")
+        self.hot_fp8 = hot_fp8
         self.device_reference = device_reference
         self.is_speculative_draft = is_speculative_draft
         self.host = None
@@ -485,12 +623,24 @@ class HostQSAKV:
                 )
                 self.scales = get_accelerator_view_from_cpu_tensor(self.host_scales)
         self.hot_values = torch.empty(
-            (hot_tokens, 2, dim), dtype=torch.float16, device=device
+            (hot_tokens, 2, dim),
+            dtype=torch.uint8 if hot_fp8 else torch.float16,
+            device=device,
+        )
+        self.hot_scales = torch.empty(
+            (hot_tokens, 2) if hot_fp8 else (0,),
+            dtype=torch.float32,
+            device=device,
         )
         self.tags = torch.full((self.sets, 4), -1, dtype=torch.int32, device=device)
         self.stamps = torch.zeros_like(self.tags)
         self.epoch = torch.zeros(1, dtype=torch.int32, device=device)
-        self.hands = torch.zeros(1, dtype=torch.int32, device=device)
+        # Independent CLOCK hands; a power of two that divides the slot count
+        # and leaves each hand at least one probe window of slots.
+        self.num_hands = 1
+        while self.num_hands < 64 and (self.sets * 4) // (self.num_hands * 2) >= 16:
+            self.num_hands *= 2
+        self.hands = torch.zeros(self.num_hands, dtype=torch.int32, device=device)
         self.page_slots = torch.full(
             (blocks * page_size // 4,), -1, dtype=torch.int32, device=device
         )
@@ -528,8 +678,12 @@ class HostQSAKV:
         ) = _WORKSPACES[workspace_key]
         self.table = self.requests.view(-1, 1)
 
-        from .device_kv_attention import initialize_device_history_attention
+        from .device_kv_attention import (
+            host_history_stage_copy,
+            initialize_device_history_attention,
+        )
 
+        self._stage_host_run = host_history_stage_copy()
         self.device_history_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
         self.device_history_reason: str | None = None
         self.device_history_hot = False
@@ -556,6 +710,8 @@ class HostQSAKV:
                 self.dim,
                 self.sets,
                 self.fp8,
+                HOT_FP8=self.hot_fp8,
+                HotScales=self.hot_scales,
                 num_warps=4,
             )
 
@@ -598,6 +754,8 @@ class HostQSAKV:
             self.sets,
             self.fp8,
             HOT=False,
+            HOT_FP8=self.hot_fp8,
+            HotScales=self.hot_scales,
             num_warps=4,
         )
 
@@ -607,13 +765,39 @@ class HostQSAKV:
         Depends only on the step's block table and lengths, so one plan
         (one host sync) serves every layer of a step with this geometry.
         """
-        page = self.page_size
         capacity = self._stage_capacity(capacity_tokens)
+        staged, sources, lengths_host = self._stage_layout(block_table, lengths)
+        if sources.size > capacity or not sources.size:
+            return None
+        return self._make_stage_plan(staged, sources, lengths_host)
+
+    def stage_window_plans(self, block_table, lengths, capacity_tokens):
+        """stage_plan for a history larger than the stage buffer: one plan
+        per buffer-sized window of the staged pages, or [] when the history
+        fits (or is empty). A window's table maps only its own pages (-1
+        elsewhere), so a row reader masks every other window's keys."""
+        capacity = self._stage_capacity(capacity_tokens)
+        staged, sources, lengths_host = self._stage_layout(block_table, lengths)
+        if sources.size <= capacity or not capacity:
+            return []
+        plans = []
+        for first in range(0, sources.size, capacity):
+            last = min(first + capacity, sources.size)
+            window = np.where(
+                (staged >= first) & (staged < last), staged - first, -1
+            ).astype(np.int32)
+            plans.append(
+                self._make_stage_plan(window, sources[first:last], lengths_host)
+            )
+        return plans
+
+    def _stage_layout(self, block_table, lengths):
+        """(staged table, source pages, lengths): every request's valid pages
+        in order, numbered consecutively across requests."""
+        page = self.page_size
         table = block_table.to("cpu", non_blocking=False).numpy()
         lengths_host = [int(n) for n in lengths.tolist()]
         sizes = [(n + page - 1) // page for n in lengths_host]
-        if sum(sizes) > capacity or not sum(sizes):
-            return None
         # Vectorized per request: valid pages keep their order and get
         # consecutive staged indices.
         staged = np.full(table.shape, -1, dtype=np.int32)
@@ -625,7 +809,15 @@ class HostQSAKV:
             staged[request, valid] = np.arange(k, k + valid.size, dtype=np.int32)
             sources.append(row[valid])
             k += valid.size
-        sources = np.concatenate(sources).astype(np.int32)
+        sources = (
+            np.concatenate(sources).astype(np.int32)
+            if sources
+            else np.zeros(0, dtype=np.int32)
+        )
+        return staged, sources, lengths_host
+
+    def _make_stage_plan(self, staged, sources, lengths_host):
+        k = int(sources.size)
         # Runs of consecutive source blocks (first block, first staged, count)
         # for the host-tensor copy path.
         breaks = np.flatnonzero(np.diff(sources) != 1) + 1
@@ -676,6 +868,29 @@ class HostQSAKV:
         page = self.page_size
         source = self.host if self.host is not None else self.history
         if source.is_cuda:
+            # A few host runs can use DMA without occupying SMs. Count only
+            # runs intersecting this transfer: a fragmented full plan may
+            # still have a contiguous historical prefix. Bound submissions
+            # before copying; heavily fragmented plans retain the gather.
+            if (
+                self._stage_host_run is not None
+                and (last - first) * 2 * page * self.dim * source.element_size()
+                >= 512 * 1024
+            ):
+                copies = []
+                for source_block, target, count in runs:
+                    if target >= last:
+                        break
+                    lo, hi = max(target, first), min(target + count, last)
+                    if lo < hi:
+                        copies.append((source_block + lo - target, lo, hi - lo))
+                        if len(copies) > 4:
+                            break
+                if 0 < len(copies) <= 4 and all(
+                    self._stage_host_run(source, self.scales, history, scales, *run)
+                    for run in copies
+                ):
+                    return
             # Device-addressable history (the mapped serving pool): one
             # gather launch for the pages and their scales.
             words = 2 * page * self.dim * source.element_size() // 8
@@ -846,6 +1061,9 @@ class HostQSAKV:
                 self.sets,
                 self.fp8,
                 stage,
+                HOT_FP8=self.hot_fp8,
+                HotScales=self.hot_scales,
+                HANDS=self.num_hands,
                 num_warps=4,
             )
 
