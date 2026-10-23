@@ -70,6 +70,32 @@ AFFINE_U2_TYPES = frozenset((10, 34, 35, 41, 42))
 AFFINE_BITPLANE_TYPES = frozenset((6, 7, 11, 13, 14))
 
 
+def tp_slice_packed(
+    data: np.ndarray, weight_type: int, rank: int, size: int, *, axis: int
+) -> np.ndarray | None:
+    """Slice before decoding when TP boundaries retain whole source blocks.
+
+    A None result requests canonical slicing: its smaller scale groups can
+    support boundaries such as Q2_0 K=640/4 which cut original blocks.
+    """
+    if size <= 0 or not 0 <= rank < size or axis not in (0, 1):
+        raise ValueError("Invalid GGUF TP rank, size or axis")
+    block, block_bytes = quant_size(weight_type)
+    if data.dtype != np.uint8 or data.ndim != 2 or data.shape[1] % block_bytes:
+        raise ValueError("GGUF projection needs complete packed rows [N,bytes]")
+    shape = (data.shape[0], data.shape[1] // block_bytes * block)
+    span, remainder = divmod(shape[axis], size)
+    if remainder:
+        raise ValueError("GGUF TP dimension is not divisible")
+    if axis == 1:
+        if span % block:
+            return None
+        span = span // block * block_bytes
+    selection = [slice(None), slice(None)]
+    selection[axis] = slice(rank * span, (rank + 1) * span)
+    return np.ascontiguousarray(data[tuple(selection)])
+
+
 def transcode_affine(data: np.ndarray, weight_type: int) -> AffineGGUFProjection:
     """Normalize affine and ternary blocks without quantizing code values.
 

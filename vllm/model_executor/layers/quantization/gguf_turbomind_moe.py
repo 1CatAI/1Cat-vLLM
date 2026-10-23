@@ -603,14 +603,20 @@ class GGUFExpertBank(torch.nn.Module):
         if self.device_transcode:
             self._stage(index, source, rank, size, axis)
             return
+        # Slice packed rows before decoding when the TP boundary keeps whole
+        # source blocks; a None result keeps the canonical decode-then-slice
+        # order for boundaries that cut an original block.
+        local_source = tp_slice_packed(source, self.source_type, rank, size, axis=axis)
+        transcode_source = source if local_source is None else local_source
         canonical: LatticeGGUFProjection | Lut4GGUFProjection | AffineGGUFProjection
         if self.source_type in LATTICE_TYPES:
-            canonical = transcode_lattice(source, self.source_type)
+            canonical = transcode_lattice(transcode_source, self.source_type)
         elif self.source_type in LUT4_TYPES:
-            canonical = transcode_lut4(source, self.source_type)
+            canonical = transcode_lut4(transcode_source, self.source_type)
         else:
-            canonical = transcode_affine(source, self.source_type)
-        canonical = canonical.tp_slice(rank, size, axis=axis)
+            canonical = transcode_affine(transcode_source, self.source_type)
+        if local_source is None:
+            canonical = canonical.tp_slice(rank, size, axis=axis)
         self.group = canonical.group_size
         self.n, self.k = (
             canonical.shape
