@@ -21,11 +21,16 @@ from enum import IntEnum
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
     Nvfp4QuantizationEmulationTritonExperts,
+)
+from vllm.model_executor.layers.fused_moe.experts.skinny_moe_triton import (
+    TRITON_MIN_ROWS_PER_EXPERT,
+    skinny_moe_e8m0_m8n8k4_triton,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.sm70.reduction import _mtp_weighted_reduce
@@ -366,6 +371,11 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         self._fragment_order = qpn_fragment_order(
             torch.accelerator.current_device_index()
         )
+        # Prefill chunks with many rows per expert can take the tensor-core
+        # Triton projection; decided once, for this worker's card.
+        self._triton_tensor_cores = (
+            get_current_vllm_config().kernel_config.use_triton_sm7x_tensor_cores()
+        )
         self.quant_config._w1.scale = None
         self.quant_config._w2.scale = None
         self.quantization_emulation = False
@@ -701,7 +711,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         y13 = torch.empty(
             (num_slots, w1.size(1)), dtype=hidden_states.dtype, device=device
         )
-        torch.ops._C.skinny_moe_qpn_sm70(
+        self._grouped_projection(
             hidden_states,
             w1,
             scales.w1_scales_u8,
@@ -713,14 +723,11 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y13,
             False,
             num_tokens,
-            grouped_splitk(hidden_states.size(1), self._fragment_order),
-            self._scale_mode,
-            self._fragment_order,
         )
         inter = torch.empty((num_slots, inter_dim), dtype=y13.dtype, device=device)
         self.activation(activation, inter, y13)
         y2 = torch.empty((num_slots, w2.size(1)), dtype=y13.dtype, device=device)
-        torch.ops._C.skinny_moe_qpn_sm70(
+        self._grouped_projection(
             inter,
             w2,
             scales.w2_scales_u8,
@@ -732,14 +739,56 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y2,
             True,
             num_tokens,
-            grouped_splitk(inter_dim, self._fragment_order),
-            self._scale_mode,
-            self._fragment_order,
         )
         # One pass over the slot rows straight into the output (the reduction
         # moe_unpermute computes) instead of writing and re-reading two FP32
         # copies of y2.
         _mtp_weighted_reduce(y2, topk_weights, output)
+
+    def _grouped_projection(
+        self,
+        x: torch.Tensor,
+        w: torch.Tensor,
+        scales_u8: torch.Tensor,
+        global_scales: torch.Tensor,
+        perm: torch.Tensor,
+        gids: torch.Tensor,
+        goff: torch.Tensor,
+        top_k: int,
+        y: torch.Tensor,
+        x_slot_major: bool,
+        num_tokens: int,
+    ) -> None:
+        """y[slot] = x[row] @ W[expert].T over the expert groups of the slots."""
+        # Volta's hand kernel decodes every weight tile again for each 8-row
+        # block; past 16 rows per expert on average the Triton kernel, which
+        # decodes a tile once per row block, is faster.
+        if (
+            self._triton_tensor_cores
+            and self._fragment_order == QpnFragmentOrder.M8N8K4
+            and self._scale_mode == 1
+            and y.size(0) > TRITON_MIN_ROWS_PER_EXPERT * w.size(0)
+        ):
+            skinny_moe_e8m0_m8n8k4_triton(
+                x, w, scales_u8, global_scales, perm, gids, goff, top_k, y, x_slot_major
+            )
+            return
+        torch.ops._C.skinny_moe_qpn_sm70(
+            x,
+            w,
+            scales_u8,
+            global_scales,
+            perm,
+            gids,
+            goff,
+            top_k,
+            y,
+            x_slot_major,
+            num_tokens,
+            grouped_splitk(x.size(1), self._fragment_order),
+            self._scale_mode,
+            self._fragment_order,
+        )
 
 
 class Mxfp4SkinnySm70Experts(Nvfp4SkinnySm70Experts):

@@ -517,6 +517,7 @@ def _skinny_experts(device, order, w13, s13, w2, s2, g1, g2):
     experts.quant_config = SimpleNamespace(gemm1_clamp_limit=None)
     experts._scale_mode = 0
     experts._fragment_order = order
+    experts._triton_tensor_cores = False
     experts._w1_block_scales = s13
     experts._w2_block_scales = s2
     experts._scale_caches = _ScaleCaches(
