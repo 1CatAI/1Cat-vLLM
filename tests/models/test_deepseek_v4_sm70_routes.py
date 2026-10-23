@@ -504,8 +504,11 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
         (128, 64, 640),
     ]
     # The tensor-core matmuls read the selected rows through the indices, so
-    # no gathered keys.
+    # no gathered keys, and one pass takes up to 1024 tokens.
+    from vllm.models.deepseek_v4.common.ops.sparse_prefill_bmm import tokens_per_pass
+
     layer.sparse_tensor_cores = True
     with patch.object(sparse, "_bmm_blocker", return_value=None):
         specs = impl._prefill_bmm_workspace_specs(layer, q, 640)
-    assert [shape for shape, _ in specs] == [(128, 64, 640), (128, 64, 640)]
+    per_pass = min(2048, tokens_per_pass(True))
+    assert [shape for shape, _ in specs] == [(per_pass, 64, 640), (per_pass, 64, 640)]
