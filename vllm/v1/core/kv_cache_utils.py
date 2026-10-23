@@ -1130,9 +1130,20 @@ def _compact_sm70_hybrid_sliding_window_pages(
                 if block_size >= spec.block_size or block_size % 16:
                     continue
                 compact = replace(spec, block_size=block_size)
-                if compact.page_size_bytes <= target_page:
+                page = compact.page_size_bytes
+                if page > target_page:
+                    continue
+                # A divisor that merely fits pads away most of the block, and
+                # the padded page is charged per block: 1648 tokens/1664-page
+                # has grid 16, so block=16 fits at 1.9% utilization and costs
+                # 212992 B/token instead of 4096. Fall through to the round-up
+                # path below unless this divisor also fills the page.
+                if page * 2 >= target_page:
                     result[name] = replace(compact, page_size_padded=target_page)
-                    break
+                # Divisors descend, so this is the largest that fits; a poorer
+                # one cannot fill the page either. Leave the spec untouched so
+                # the round-up path below can size it from the byte budget.
+                break
             continue
         ratio = spec.page_size_bytes // target_page
         if spec.block_size % (16 * ratio):
