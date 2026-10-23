@@ -7,6 +7,11 @@ token reads the same keys, so gathering them once per token and handing the
 rest to the BLAS library does the same work 5-10x faster on V100 and RTX 8000
 (64 heads, 64-256 query tokens, 384-640 keys) and lands closer to an fp64
 reference than the Triton kernel does.
+
+With a Triton that lowers ``tl.dot`` to tensor cores the two matmuls read the
+selected rows through the indices themselves (`sparse_attn_prefill_tensor_cores`)
+and the gathered-key buffer disappears; scores, softmax and probabilities keep
+the same precision.
 """
 
 import math
@@ -26,6 +31,11 @@ MAX_TOKENS_PER_PASS = 128
 # Slots one gather program copies: eight 1 KiB rows of a 512-wide fp16 key.
 _GATHER_SLOTS = 8
 
+# Tiles of the tensor-core route, one pair for V100 and RTX 8000 (64 heads, 64
+# and 128 query tokens, 640 and 1152 slots); every program covers all heads.
+_TC_SCORES_SLOTS, _TC_SCORES_DIMS, _TC_SCORES_WARPS, _TC_SCORES_STAGES = 128, 64, 8, 2
+_TC_PV_DIMS, _TC_PV_SLOTS, _TC_PV_WARPS, _TC_PV_STAGES = 256, 32, 8, 1
+
 
 def sparse_prefill_bmm_workspace_specs(
     num_tokens: int,
@@ -33,14 +43,19 @@ def sparse_prefill_bmm_workspace_specs(
     head_dim: int,
     width: int,
     dtype: torch.dtype,
+    tensor_cores: bool = False,
 ) -> list[WorkspaceSpec]:
-    """Buffers of `sparse_attn_prefill_bmm`, in its argument order."""
+    """Buffers of `sparse_attn_prefill_bmm`, in its argument order, or with
+    ``tensor_cores`` of `sparse_attn_prefill_tensor_cores`, which needs no
+    gathered keys."""
     num_tokens = min(num_tokens, MAX_TOKENS_PER_PASS)
-    return [
-        ((num_tokens, width, head_dim), dtype),
+    scores_and_probs: list[WorkspaceSpec] = [
         ((num_tokens, num_heads, width), torch.float32),
         ((num_tokens, num_heads, width), dtype),
     ]
+    if tensor_cores:
+        return scores_and_probs
+    return [((num_tokens, width, head_dim), dtype), *scores_and_probs]
 
 
 def _fit(buffer: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
@@ -166,8 +181,7 @@ def sparse_attn_prefill_bmm(
     the denominator."""
     total_tokens, width = indices.shape
     num_heads = q.shape[1]
-    unused = indices < 0
-    unused |= torch.arange(width, device=indices.device)[None, :] >= lengths[:, None]
+    unused = _unused_slots(indices, lengths)
 
     for start in range(0, total_tokens, MAX_TOKENS_PER_PASS):
         stop = min(start + MAX_TOKENS_PER_PASS, total_tokens)
@@ -186,26 +200,25 @@ def sparse_attn_prefill_bmm(
         )
 
 
-def attend_gathered_keys(
-    q: torch.Tensor,
-    keys: torch.Tensor,
+def _unused_slots(indices: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    unused = indices < 0
+    unused |= (
+        torch.arange(indices.shape[1], device=indices.device)[None, :]
+        >= lengths[:, None]
+    )
+    return unused
+
+
+def _sink_softmax(
+    scores: torch.Tensor,
     unused: torch.Tensor,
     scale: float,
     attn_sink: torch.Tensor,
-    output: torch.Tensor,
-    scores: torch.Tensor,
     probs: torch.Tensor,
 ) -> None:
-    """Attention of q [T, H, D] over its own gathered keys [T, W, D]; unused
-    [T, W] marks slots that hold no key, and those must hold zeros (their
-    weight is zero, but 0 * NaN is NaN). Buffers are exactly sized."""
-    num_tokens, num_heads, _ = q.shape
-    width = keys.shape[1]
-    # Preserve the existing FP32 QK score boundary before softmax. Rounding
-    # scores to FP16 here can overflow even when the final attention is finite.
-    torch.bmm(q, keys.transpose(1, 2), out=scores, out_dtype=torch.float32)
     # Scale, mask, sink column and softmax in one pass over the FP32 scores;
     # as separate torch ops they took longer than both matmuls together.
+    num_tokens, num_heads, width = scores.shape
     block_w = triton.next_power_of_2(width)
     _sink_softmax_kernel[(num_tokens * num_heads,)](
         scores,
@@ -219,6 +232,206 @@ def attend_gathered_keys(
         BLOCK_W=block_w,
         num_warps=min(8, max(1, block_w // 256)),
     )
+
+
+def attend_gathered_keys(
+    q: torch.Tensor,
+    keys: torch.Tensor,
+    unused: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+    scores: torch.Tensor,
+    probs: torch.Tensor,
+) -> None:
+    """Attention of q [T, H, D] over its own gathered keys [T, W, D]; unused
+    [T, W] marks slots that hold no key, and those must hold zeros (their
+    weight is zero, but 0 * NaN is NaN). Buffers are exactly sized."""
+    # Preserve the existing FP32 QK score boundary before softmax. Rounding
+    # scores to FP16 here can overflow even when the final attention is finite.
+    torch.bmm(q, keys.transpose(1, 2), out=scores, out_dtype=torch.float32)
+    _sink_softmax(scores, unused, scale, attn_sink, probs)
     # Existing HMMA attention also converts probabilities to the key dtype
     # before PV; keep that precision boundary rather than narrowing QK.
     torch.bmm(probs, keys, out=output)
+
+
+@triton.jit
+def _selected_scores_kernel(
+    q_ptr,
+    kv_ptr,
+    indices_ptr,
+    unused_ptr,
+    scores_ptr,
+    q_stride_t,
+    q_stride_h,
+    kv_stride,
+    indices_stride,
+    unused_stride,
+    num_heads,
+    width,
+    BLOCK_H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # One token's heads against a block of its selected rows, read through the
+    # indices; unused slots read zeros and the softmax masks them.
+    token = tl.program_id(1)
+    heads = tl.arange(0, BLOCK_H)
+    slots = tl.program_id(0) * BLOCK_SLOTS + tl.arange(0, BLOCK_SLOTS)
+    head_ok = heads < num_heads
+    in_width = slots < width
+    skip = tl.load(
+        unused_ptr + token * unused_stride + slots, mask=in_width, other=1
+    ).to(tl.int1)
+    rows = tl.load(
+        indices_ptr + token * indices_stride + slots, mask=in_width & ~skip, other=0
+    ).to(tl.int64)
+    acc = tl.zeros((BLOCK_H, BLOCK_SLOTS), tl.float32)
+    for start in range(0, D, BLOCK_D):
+        dims = start + tl.arange(0, BLOCK_D)
+        keys = tl.load(
+            kv_ptr + rows[:, None] * kv_stride + dims[None, :],
+            mask=(~skip)[:, None],
+            other=0.0,
+        )
+        q = tl.load(
+            q_ptr + token * q_stride_t + heads[:, None] * q_stride_h + dims[None, :],
+            mask=head_ok[:, None],
+            other=0.0,
+        )
+        acc = tl.dot(q, tl.trans(keys), acc)
+    scores = scores_ptr + (token * num_heads + heads[:, None]).to(tl.int64) * width
+    tl.store(scores + slots[None, :], acc, mask=head_ok[:, None] & in_width[None, :])
+
+
+@triton.jit
+def _selected_pv_kernel(
+    probs_ptr,
+    kv_ptr,
+    indices_ptr,
+    unused_ptr,
+    out_ptr,
+    kv_stride,
+    indices_stride,
+    unused_stride,
+    out_stride_t,
+    out_stride_h,
+    num_heads,
+    width,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+):
+    token = tl.program_id(1)
+    heads = tl.arange(0, BLOCK_H)
+    dims = tl.program_id(0) * BLOCK_D + tl.arange(0, BLOCK_D)
+    head_ok = heads < num_heads
+    probs = probs_ptr + (token * num_heads + heads[:, None]).to(tl.int64) * width
+    acc = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
+    for start in range(0, width, BLOCK_SLOTS):
+        slots = start + tl.arange(0, BLOCK_SLOTS)
+        in_width = slots < width
+        skip = tl.load(
+            unused_ptr + token * unused_stride + slots, mask=in_width, other=1
+        ).to(tl.int1)
+        rows = tl.load(
+            indices_ptr + token * indices_stride + slots,
+            mask=in_width & ~skip,
+            other=0,
+        ).to(tl.int64)
+        # Unused slots read zeros: their weight is zero, but 0 * NaN is NaN.
+        values = tl.load(
+            kv_ptr + rows[:, None] * kv_stride + dims[None, :],
+            mask=(~skip)[:, None],
+            other=0.0,
+        )
+        p = tl.load(
+            probs + slots[None, :],
+            mask=head_ok[:, None] & in_width[None, :],
+            other=0.0,
+        )
+        acc = tl.dot(p, values, acc)
+    out = out_ptr + token * out_stride_t + heads[:, None] * out_stride_h
+    tl.store(
+        out + dims[None, :], acc.to(out_ptr.dtype.element_ty), mask=head_ok[:, None]
+    )
+
+
+def sparse_attn_prefill_tensor_cores(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+    scores: torch.Tensor,
+    probs: torch.Tensor,
+) -> None:
+    """`sparse_attn_prefill_bmm` for a Triton that lowers ``tl.dot`` to tensor
+    cores: the scores and PV matmuls read each token's selected kv rows through
+    its indices, so no gathered-key buffer is needed. FP32 scores, the same sink
+    softmax and FP16 probabilities into PV. Buffers come from the workspace
+    specs with ``tensor_cores``."""
+    total_tokens, width = indices.shape
+    num_heads, head_dim = q.shape[1:]
+    if head_dim % _TC_SCORES_DIMS or head_dim % _TC_PV_DIMS:
+        raise ValueError(
+            f"tensor-core sparse prefill tiles {_TC_SCORES_DIMS} and "
+            f"{_TC_PV_DIMS} dimensions, got {head_dim}"
+        )
+    if kv.stride(-1) != 1 or indices.stride(-1) != 1 or q.stride(-1) != 1:
+        raise ValueError("tensor-core sparse prefill needs unit inner strides")
+    # tl.dot needs at least 16 rows: fewer heads are padded and masked.
+    block_h = max(16, triton.next_power_of_2(num_heads))
+    unused = _unused_slots(indices, lengths)
+
+    for start in range(0, total_tokens, MAX_TOKENS_PER_PASS):
+        stop = min(start + MAX_TOKENS_PER_PASS, total_tokens)
+        num_tokens = stop - start
+        pass_scores = _fit(scores, (num_tokens, num_heads, width))
+        pass_probs = _fit(probs, (num_tokens, num_heads, width))
+        pass_q, pass_out = q[start:stop], output[start:stop]
+        pass_indices, pass_unused = indices[start:stop], unused[start:stop]
+        _selected_scores_kernel[(triton.cdiv(width, _TC_SCORES_SLOTS), num_tokens)](
+            pass_q,
+            kv,
+            pass_indices,
+            pass_unused,
+            pass_scores,
+            pass_q.stride(0),
+            pass_q.stride(1),
+            kv.stride(0),
+            pass_indices.stride(0),
+            pass_unused.stride(0),
+            num_heads,
+            width,
+            BLOCK_H=block_h,
+            D=head_dim,
+            BLOCK_SLOTS=_TC_SCORES_SLOTS,
+            BLOCK_D=_TC_SCORES_DIMS,
+            num_warps=_TC_SCORES_WARPS,
+            num_stages=_TC_SCORES_STAGES,
+        )
+        _sink_softmax(pass_scores, pass_unused, scale, attn_sink, pass_probs)
+        _selected_pv_kernel[(head_dim // _TC_PV_DIMS, num_tokens)](
+            pass_probs,
+            kv,
+            pass_indices,
+            pass_unused,
+            pass_out,
+            kv.stride(0),
+            pass_indices.stride(0),
+            pass_unused.stride(0),
+            pass_out.stride(0),
+            pass_out.stride(1),
+            num_heads,
+            width,
+            BLOCK_H=block_h,
+            BLOCK_D=_TC_PV_DIMS,
+            BLOCK_SLOTS=_TC_PV_SLOTS,
+            num_warps=_TC_PV_WARPS,
+            num_stages=_TC_PV_STAGES,
+        )
