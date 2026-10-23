@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -32,6 +33,20 @@ from vllm.utils.torch_utils import current_stream
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEM_POOL_SIZE_GB = 32
+
+
+def _kv_key(request_id: str) -> str:
+    """Normalize a request id for use as a KV tensor-cache key.
+
+    The engine's input processor (``InputProcessor.assign_request_id``)
+    appends a per-request random suffix (``-<8 hex chars>``) to every
+    request id. The suffix is generated independently on each instance,
+    so raw ids must never be used to build tensor keys
+    (``request_id#layer_name``): the prefill and decode sides would derive
+    different keys and the decode side would block forever waiting for
+    tensors that never arrive.
+    """
+    return re.sub(r"-[0-9a-f]{8}$", "", request_id)
 
 
 @contextmanager
@@ -399,8 +414,21 @@ class P2pNcclEngine:
                             dtype=getattr(torch, data["dtype"]),
                             device=self.device,
                         )
+                    _cr = self.comms.get(remote_address.decode())
+                    if _cr is None:
+                        # The peer restarted and lost its NCCL comm; reply
+                        # with an error so the sender can move on instead of
+                        # blocking forever, and do not kill this listener.
+                        self.router_socket.send_multipart([remote_address, b"1"])
+                        logger.warning(
+                            "PUT from unknown comm %s (peer restarted?),"
+                            " replied error", remote_address.decode())
+                        with self.recv_store_cv:
+                            self.recv_store[tensor_id] = None
+                            self.recv_store_cv.notify()
+                        continue
                     self.router_socket.send_multipart([remote_address, b"0"])
-                    comm, rank = self.comms[remote_address.decode()]
+                    comm, rank = _cr
                     self.recv(comm, tensor, rank ^ 1, self.recv_stream)
                     tensor_size = tensor.element_size() * tensor.numel()
                     if self.buffer_size + tensor_size > self.buffer_size_threshold:
@@ -553,16 +581,23 @@ class P2pNcclEngine:
 
         # Clear the buffer upon request completion.
         for request_id in finished_req_ids:
+            norm_id = _kv_key(request_id)
             for layer_name in no_compile_layers:
-                tensor_id = request_id + "#" + layer_name
+                tensor_id = norm_id + "#" + layer_name
                 if tensor_id in self.recv_store:
                     with self.recv_store_cv:
                         tensor = self.recv_store.pop(tensor_id, None)
-                        self.send_request_id_to_tensor_ids.pop(request_id, None)
-                        self.recv_request_id_to_tensor_ids.pop(request_id, None)
                     if isinstance(tensor, tuple):
                         addr, _, _ = tensor
                         self.pool.free(addr)
+                # The per-request bookkeeping dicts are keyed by the
+                # normalized id (see have_sent/received_tensor_id). Pop
+                # them on every layer iteration (idempotent) and
+                # regardless of recv_store contents: on producer
+                # instances recv_store is always empty, so the entries
+                # would otherwise never be removed and grow unbounded.
+                self.send_request_id_to_tensor_ids.pop(norm_id, None)
+                self.recv_request_id_to_tensor_ids.pop(norm_id, None)
 
         # TODO:Retrieve requests that have already sent the KV cache.
         finished_sending: set[str] = set()
