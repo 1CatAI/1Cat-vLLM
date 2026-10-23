@@ -488,6 +488,8 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
 
     layer = MagicMock()
     layer.max_num_batched_tokens = 2048
+    # A MagicMock attribute is truthy and would pick the tensor-core route.
+    layer.sparse_tensor_cores = False
     q = torch.empty((1, 64, 512), dtype=torch.float16)
     impl = sparse.DeepseekV4SM70SparseImpl
 
@@ -501,3 +503,9 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
         (128, 64, 640),
         (128, 64, 640),
     ]
+    # The tensor-core matmuls read the selected rows through the indices, so
+    # no gathered keys.
+    layer.sparse_tensor_cores = True
+    with patch.object(sparse, "_bmm_blocker", return_value=None):
+        specs = impl._prefill_bmm_workspace_specs(layer, q, 640)
+    assert [shape for shape, _ in specs] == [(128, 64, 640), (128, 64, 640)]
