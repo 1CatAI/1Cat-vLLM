@@ -43,6 +43,24 @@ def use_portable_sparse() -> bool:
     )
 
 
+def sparse_fp16_gemm_max_tokens(
+    capability: "DeviceCapability | None",
+    num_heads: int,
+    head_dim: int,
+    index_width: int,
+    dtype: torch.dtype,
+) -> int:
+    """Admit only measured small-batch tensor-core attention geometries."""
+    if (
+        capability is not None
+        and (capability.major, capability.minor) == (7, 0)
+        and (num_heads, head_dim, index_width) == (64, 512, 2048)
+        and dtype == torch.float16
+    ):
+        return 15
+    return 0
+
+
 def portable_sparse_mla_config_error(
     *,
     head_size: int,

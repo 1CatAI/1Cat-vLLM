@@ -15,8 +15,12 @@ from vllm.config.cache import CacheDType
 from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
 from vllm.diagnostics import diagnostic_history
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4.common.ops.sparse_fp16_gemm import (
+    sparse_attention_fp16_gemm,
+)
 from vllm.models.deepseek_v4.common.portable_sparse import (
     portable_sparse_mla_config_error,
+    sparse_fp16_gemm_max_tokens,
     supports_portable_sparse,
 )
 from vllm.models.deepseek_v4.sm70.sparse_kernels import (
@@ -29,6 +33,7 @@ from vllm.models.glm5next.sm70.fp8_kv import (
     sm70_glm5_sparse_attention_paged_fp8_batched_gemm,
     sm70_glm5_sparse_attention_paged_fp8_gemm,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionLayer, SparseMLAAttentionImpl
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -166,6 +171,22 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             raise RuntimeError("GLM-5.3 SM70 sparse MLA requires VllmConfig.")
         max_tokens = config.scheduler_config.max_num_batched_tokens
         self.fp8_gemm_max_tokens = min(max_tokens, _FP8_GEMM_MAX_TOKENS)
+        self.fp16_gemm_max_tokens = (
+            min(
+                max_tokens,
+                sparse_fp16_gemm_max_tokens(
+                    current_platform.get_device_capability()
+                    if current_platform.is_cuda()
+                    else None,
+                    num_heads,
+                    self.kv_lora_rank,
+                    self.index_width,
+                    torch.float16,
+                ),
+            )
+            if not self.use_fp8_cache
+            else 0
+        )
         workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_tokens, num_heads, self.kv_lora_rank), torch.float16),
         ]
@@ -190,7 +211,34 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     ),
                 )
             )
+        elif self.fp16_gemm_max_tokens:
+            workspace_specs.extend(
+                (
+                    (
+                        (
+                            self.fp16_gemm_max_tokens,
+                            self.index_width,
+                            self.kv_lora_rank,
+                        ),
+                        torch.float16,
+                    ),
+                    (
+                        (self.fp16_gemm_max_tokens, num_heads, self.index_width),
+                        torch.float32,
+                    ),
+                    (
+                        (self.fp16_gemm_max_tokens, num_heads, self.index_width),
+                        torch.float16,
+                    ),
+                )
+            )
         current_workspace_manager().get_simultaneous(*workspace_specs)
+        if self.fp16_gemm_max_tokens:
+            logger.info_once(
+                "Sparse FP16 tensor-core GEMM enabled for up to %d tokens; "
+                "FP32 scores and per-token reduction geometry.",
+                self.fp16_gemm_max_tokens,
+            )
         logger.info_once(
             "GLM-5.3-Flash route: portable FP16 sparse MLA with %s KV%s.",
             "packed E4M3FN" if self.use_fp8_cache else "FP16",
@@ -359,6 +407,24 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     self.softmax_scale,
                     out,
                 )
+        elif self.fp16_gemm_max_tokens and num_tokens <= self.fp16_gemm_max_tokens:
+            out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(
+                ((num_tokens, self.num_heads, self.kv_lora_rank), torch.float16),
+                ((num_tokens, self.index_width, self.kv_lora_rank), torch.float16),
+                ((num_tokens, self.num_heads, self.index_width), torch.float32),
+                ((num_tokens, self.num_heads, self.index_width), torch.float16),
+            )
+            sparse_attention_fp16_gemm(
+                q,
+                kv_c_and_k_pe_cache,
+                global_indices,
+                valid_counts,
+                self.softmax_scale,
+                out,
+                gathered_kv,
+                scores,
+                probs,
+            )
         else:
             if kv_c_and_k_pe_cache.dtype != torch.float16:
                 raise TypeError("GLM-5.3 FP16 KV route received a non-FP16 cache.")
