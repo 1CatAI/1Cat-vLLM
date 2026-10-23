@@ -61,7 +61,11 @@ def _sm70_sparse_gathered_kernel(
     valid_len = tl.load(lengths_ptr + query_idx)
     key_offsets = tl.arange(0, BLOCK_K)
 
-    for start in tl.range(0, INDEX_WIDTH, BLOCK_K):
+    # Read the bound from device metadata on every replay: padded index capacity
+    # can greatly exceed the valid prefix for short contexts and prefill rows.
+    # Keep the same block order while avoiding all-invalid trailing blocks.
+    loop_end = tl.minimum(tl.maximum(valid_len, 0), INDEX_WIDTH)
+    for start in tl.range(0, loop_end, BLOCK_K):
         positions = start + key_offsets
         in_range = positions < valid_len
         slots = tl.load(
