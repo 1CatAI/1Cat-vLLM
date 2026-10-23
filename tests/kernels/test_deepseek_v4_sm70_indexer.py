@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from tests.kernels.utils import requires_tensor_core_triton
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.sm70_sparse import sparse_policy
 from vllm.models.deepseek_v4.sm70 import indexer as sm70_indexer
@@ -11,7 +12,6 @@ from vllm.models.deepseek_v4.sm70.indexer import (
     sm70_indexer_decode_logits,
     sm70_indexer_prefill_logits,
 )
-from vllm.triton_utils.mma_probe import lowers_dot_to_mma
 from vllm.utils.torch_utils import current_stream
 
 
@@ -24,21 +24,6 @@ def indexer_engine_config():
 requires_sm70 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7,
     reason="requires a Volta or Turing GPU (SM70/SM75)",
-)
-
-
-def _tensor_core_triton() -> bool:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7:
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return lowers_dot_to_mma(major * 10 + minor)
-
-
-# The tensor-core route's precondition (checked by `triton_sm7x_tensor_cores`):
-# with stock Triton its tiles take the FMA layout, which does not fit Turing.
-requires_tensor_core_triton = pytest.mark.skipif(
-    not _tensor_core_triton(),
-    reason="requires a Triton that lowers tl.dot to tensor cores on this GPU",
 )
 
 _HEAD_DIM = 128
