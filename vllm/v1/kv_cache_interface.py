@@ -177,11 +177,14 @@ class AttentionSpec(KVCacheSpec):
         """
         if get_kv_quant_mode(configured_dtype) == self.kv_quant_mode:
             return configured_dtype
+        # Keep one entry per KVQuantMode: a missing spelling raises KeyError
+        # during KV allocation, far from the mode that was actually requested.
         return {
             KVQuantMode.NONE: "auto",
             KVQuantMode.FP8_PER_TENSOR: "fp8",
             KVQuantMode.INT8_PER_TOKEN_HEAD: "int8_per_token_head",
             KVQuantMode.FP8_PER_TOKEN_HEAD: "fp8_per_token_head",
+            KVQuantMode.NVFP4: "nvfp4",
         }[self.kv_quant_mode]
 
     @property
