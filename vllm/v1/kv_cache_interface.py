@@ -145,8 +145,18 @@ class KVCacheSpec:
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
         Create a new KVCacheSpec from self but replacing the block size.
+
+        A padded physical page is a byte count, not a token count, so growing
+        the logical block grows the payload underneath it. Keep the padding at
+        or above the new payload; otherwise the returned spec fails its own
+        ``page_size_padded >= real_page_size`` invariant the first time
+        ``page_size_bytes`` is read.
         """
-        return replace(self, block_size=block_size)
+        new_spec = replace(self, block_size=block_size)
+        padded = self.page_size_padded
+        if padded is not None and new_spec.real_page_size_bytes > padded:
+            new_spec = replace(new_spec, page_size_padded=new_spec.real_page_size_bytes)
+        return new_spec
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
