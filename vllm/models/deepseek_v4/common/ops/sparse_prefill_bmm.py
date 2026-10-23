@@ -22,19 +22,33 @@ from vllm.triton_utils import tl, tldevice, triton
 
 WorkspaceSpec = tuple[tuple[int, ...], torch.dtype]
 
-# Query tokens attended per pass. The buffers grow with this number, not with
-# the prefill chunk: at 64 heads and 640 keys they take 110 MiB for 128 tokens,
-# and a 256-token chunk reserving twice the former 140 MiB ran the V100 stages
-# of a pipeline out of memory. A second pass costs two more BLAS calls per layer.
+# Query tokens the gather route attends per pass. The buffers grow with this
+# number, not with the prefill chunk: at 64 heads and 640 keys they take 110 MiB
+# for 128 tokens, and a 256-token chunk reserving twice the former 140 MiB ran
+# the V100 stages of a pipeline out of memory. A second pass costs two more
+# BLAS calls per layer.
 MAX_TOKENS_PER_PASS = 128
 
 # Slots one gather program copies: eight 1 KiB rows of a 512-wide fp16 key.
 _GATHER_SLOTS = 8
 
-# Tiles of the tensor-core route, one pair for V100 and RTX 8000 (64 heads, 64
-# and 128 query tokens, 640 and 1152 slots); every program covers all heads.
+
+# Tiles of the tensor-core route, one set for V100 and RTX 8000; every program
+# covers all heads of its token. Measured on whole 1020-token chunks with 64
+# heads and 640 and 1152 slots, neighbouring tokens selecting mostly the same
+# keys as DeepSeek-V4's top-k plus window does: one pass per 1024-token chunk
+# instead of 128-token passes takes RTX 8000 from 2.45 to 2.19 ms at 640 slots
+# and from 4.21 to 3.86 ms at 1152, V100 from 2.20 to 1.92 ms at 640, for
+# 432 MiB of scores and probabilities at 1152 slots. No swept tile beat these.
+_TC_TOKENS_PER_PASS = 1024
 _TC_SCORES_SLOTS, _TC_SCORES_DIMS, _TC_SCORES_WARPS, _TC_SCORES_STAGES = 128, 64, 8, 2
 _TC_PV_DIMS, _TC_PV_SLOTS, _TC_PV_WARPS, _TC_PV_STAGES = 256, 32, 8, 1
+
+
+def tokens_per_pass(tensor_cores: bool) -> int:
+    """Query tokens one pass of the route attends; its buffers are sized for
+    this many."""
+    return _TC_TOKENS_PER_PASS if tensor_cores else MAX_TOKENS_PER_PASS
 
 
 def sparse_prefill_bmm_workspace_specs(
@@ -48,7 +62,7 @@ def sparse_prefill_bmm_workspace_specs(
     """Buffers of `sparse_attn_prefill_bmm`, in its argument order, or with
     ``tensor_cores`` of `sparse_attn_prefill_tensor_cores`, which needs no
     gathered keys."""
-    num_tokens = min(num_tokens, MAX_TOKENS_PER_PASS)
+    num_tokens = min(num_tokens, tokens_per_pass(tensor_cores))
     scores_and_probs: list[WorkspaceSpec] = [
         ((num_tokens, num_heads, width), torch.float32),
         ((num_tokens, num_heads, width), dtype),
@@ -388,8 +402,8 @@ def sparse_attn_prefill_tensor_cores(
     block_h = max(16, triton.next_power_of_2(num_heads))
     unused = _unused_slots(indices, lengths)
 
-    for start in range(0, total_tokens, MAX_TOKENS_PER_PASS):
-        stop = min(start + MAX_TOKENS_PER_PASS, total_tokens)
+    for start in range(0, total_tokens, _TC_TOKENS_PER_PASS):
+        stop = min(start + _TC_TOKENS_PER_PASS, total_tokens)
         num_tokens = stop - start
         pass_scores = _fit(scores, (num_tokens, num_heads, width))
         pass_probs = _fit(probs, (num_tokens, num_heads, width))
