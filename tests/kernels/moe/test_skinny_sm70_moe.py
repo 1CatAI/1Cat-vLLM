@@ -587,7 +587,8 @@ def test_both_serving_paths_match_the_reference(device, order, path, num_tokens)
     )
 
 
-def test_large_mxfp4_dispatch_matches_reference(device, order):
+@pytest.mark.parametrize("skewed", [False, True], ids=["uniform", "skewed"])
+def test_large_mxfp4_dispatch_matches_reference(device, order, skewed):
     generator = torch.Generator().manual_seed(42)
     tokens, experts_count, hidden, intermediate, top_k = 513, 4, 256, 128, 2
     w13 = torch.randint(
@@ -624,7 +625,17 @@ def test_large_mxfp4_dispatch_matches_reference(device, order):
     nv_s2 = _pow2(s2).repeat_interleave(2, -1).to(torch.float8_e4m3fn).view(torch.uint8)
     global_scales = torch.ones(experts_count)
     x = (torch.randn(tokens, hidden, generator=generator) * 0.1).half()
-    ids = torch.randint(experts_count, (tokens, top_k), generator=generator)
+    if skewed:
+        # A popular expert spread over many prefill row blocks next to a rare
+        # one in a single partial block, as real routers skew.
+        popularity = torch.tensor([0.85, 0.12, 0.027, 0.003])
+        ids = torch.multinomial(
+            popularity.expand(tokens, -1), top_k, generator=generator
+        )
+        rows = torch.bincount(ids.reshape(-1), minlength=experts_count)
+        assert rows.max() > 4 * 32 and 0 < rows.min() < 16
+    else:
+        ids = torch.randint(experts_count, (tokens, top_k), generator=generator)
     weights = torch.rand(tokens, top_k, generator=generator)
     reference = _reference_moe(
         x, w13, nv_s13, w2, nv_s2, global_scales, global_scales, weights, ids
