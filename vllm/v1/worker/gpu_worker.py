@@ -1240,6 +1240,10 @@ class Worker(WorkerBase):
                 ")",
             ]
         )
+        if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
+            from vllm.profiler.scheduler import scheduler_step_annotation
+
+            annotation += " scheduler=" + scheduler_step_annotation(scheduler_output)
         return self.profiler.annotate_context_manager(annotation)
 
     @torch.inference_mode()
