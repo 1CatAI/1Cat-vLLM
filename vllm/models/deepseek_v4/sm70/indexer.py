@@ -51,9 +51,8 @@ _RELU_BLOCK_M = 32
 # Route prefill scoring through cuBLAS instead of the Triton MMA. Set 0 for an
 # A/B against the Triton kernel above (which stays as the reference shape and
 # is what the decode path still uses, since decode gathers from a paged cache).
-# Cap (MiB) on the [tokens*heads, key_tile] fp16 score tile. At the default
-# 2048-token prefill chunk and 64 heads this is 128 KiB per key, so the tile
-# is what keeps a long-context chunk from asking for gigabytes in one go.
+# Cap (MiB) on the [tokens*heads, key_tile] FP32 score intermediate.
+# The final logits and gathered keys are separate allocations from this budget.
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
 
@@ -542,15 +541,21 @@ def _relu_weight_headsum_kernel(
     acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
     for head in range(0, num_heads, BLOCK_H):
         h_offsets = head + tl.arange(0, BLOCK_H)
+        if num_heads % BLOCK_H == 0:
+            h_valid = tl.full((BLOCK_H,), True, tl.int1)
+        else:
+            h_valid = h_offsets < num_heads
         s = tl.load(
             s_ptr
             + token * s_stride0
             + h_offsets[:, None] * s_stride1
             + k_offsets[None, :],
-            mask=k_valid[None, :],
+            mask=h_valid[:, None] & k_valid[None, :],
             other=0.0,
         ).to(tl.float32)
-        w = tl.load(w_ptr + token * w_stride0 + h_offsets).to(tl.float32)
+        w = tl.load(w_ptr + token * w_stride0 + h_offsets, mask=h_valid, other=0.0).to(
+            tl.float32
+        )
         acc += tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
 
     scale = tl.load(scale_ptr + k_offsets, mask=k_valid, other=0.0).to(tl.float32)
@@ -596,6 +601,21 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
     policy = sparse_policy()
     num_q, num_heads, head_dim = q.shape
     num_k = k_quant.shape[0]
+    if num_heads < 1:
+        raise ValueError("indexer queries must have at least one head")
+    if num_q == 0 or num_k == 0:
+        return torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
+
+    rows = num_q * num_heads
+    # FP32 C must remain finite before ReLU and the signed head reduction.
+    # Prefer a 64-key tile, but do not exceed a small configured budget just
+    # to align its width. The epilogue already masks partial key tiles.
+    budget_bytes = policy.value("indexer_prefill_tile_mb") * 2**20
+    max_keys = budget_bytes // (rows * 4)
+    if max_keys < 1:
+        raise ValueError("indexer_prefill_tile_mb cannot hold one FP32 score column")
+    aligned_keys = max_keys // _RELU_BLOCK_N * _RELU_BLOCK_N
+    k_tile = min(num_k, aligned_keys or max_keys)
     out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
 
     k_fp16 = torch.empty((num_k, head_dim), dtype=torch.float16, device=q.device)
@@ -612,17 +632,12 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
     if not q2.is_contiguous():
         q2 = q2.contiguous()
 
-    rows = num_q * num_heads
-    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 2))
-    k_tile = max(_RELU_BLOCK_N, min(num_k, budget // _RELU_BLOCK_N * _RELU_BLOCK_N))
-
     for start in range(0, num_k, k_tile):
         stop = min(start + k_tile, num_k)
         width = stop - start
-        # fp16 out with fp32 accumulate: the epilogue reduces in fp32 and only
-        # the top-k *set* is consumed downstream, so the 5e-4 rounding here is
-        # far below the gap between neighbouring index scores.
-        scores = torch.mm(q2, k_fp16[start:stop].t())
+        # An FP16 C can overflow even with finite inputs and FP32 accumulation.
+        # Keep C in FP32 through ReLU, head weighting and key scaling.
+        scores = torch.mm(q2, k_fp16[start:stop].t(), out_dtype=torch.float32)
         _relu_weight_headsum_kernel[(num_q, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
             scores,
             weights,
@@ -638,6 +653,9 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
             BLOCK_H=_EPILOGUE_BLOCK_H,
             num_warps=4,
         )
+        # Do not retain the previous tile during the next torch.mm allocation.
+        # All uses were submitted on the current stream before releasing it.
+        del scores
     return out
 
 
@@ -885,8 +903,10 @@ def _decode_cublas_blocker(
             ),
         ),
         (
-            f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
-            "contiguous blocks",
+            (
+                f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
+                "contiguous blocks"
+            ),
             lambda: (
                 cache.ndim == 3
                 and cache.dtype == torch.uint8
