@@ -103,6 +103,7 @@ def main():
     parser.add_argument("--trace-only", action="store_true")
     parser.add_argument("--trace-width", type=int, choices=(1, 4), default=1)
     parser.add_argument("--round-events", action="store_true")
+    parser.add_argument("--round-cost-ledger", action="store_true")
     input_ab = parser.add_mutually_exclusive_group()
     input_ab.add_argument("--input-phase-ab", action="store_true")
     input_ab.add_argument("--ple-input-ab", action="store_true")
@@ -127,6 +128,12 @@ def main():
     )
     parser.add_argument("--hcx-diagnose", action="store_true")
     args = parser.parse_args()
+    if args.round_cost_ledger:
+        if not args.trace_only:
+            raise ValueError(
+                "Cost recording requires --trace-only; timings are diagnostic"
+            )
+        args.kernel_config["sm70_round_cost_diagnostics"] = True
     if args.hcx_diagnose and (
         not args.kernel_config.get("sm70_hcx")
         or not args.kernel_config.get("sm70_hcx_diagnostics")
@@ -175,7 +182,7 @@ def main():
         compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
         worker_extension_cls=(
             "vllm.sm70_gguf_quality.GGUFTeacherWorkerExtension"
-            if args.teacher_forcing or args.hcx_diagnose
+            if args.teacher_forcing or args.hcx_diagnose or args.round_cost_ledger
             else "vllm.sm70_graph_observer.GraphParityWorkerExtension"
         ),
         kernel_config=args.kernel_config,
@@ -483,6 +490,8 @@ def main():
                     "set_mtp_execution_policy", args=(True, True), timeout=30
                 )
             if args.node_trace:
+                if args.round_cost_ledger:
+                    llm.collective_rpc("reset_round_cost_routes", timeout=30)
                 llm.collective_rpc(
                     "start_graph_parity_observer", args=(True,), timeout=30
                 )
@@ -510,6 +519,10 @@ def main():
                             "read_graph_parity_observer", timeout=30
                         ),
                     )
+                    if args.round_cost_ledger:
+                        report["round_cost"] = llm.collective_rpc(
+                            "read_round_cost_ledger", timeout=60
+                        )
                     # Preserve completed generation and CPU records before
                     # profiler shutdown or optional interval statistics.
                     save()
