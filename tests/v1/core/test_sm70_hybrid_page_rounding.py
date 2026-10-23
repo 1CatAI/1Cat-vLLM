@@ -8,7 +8,12 @@ import torch
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core import kv_cache_utils
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+    get_kv_quant_mode,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -77,3 +82,80 @@ def test_rounded_hybrid_pages_preserve_precision_and_admission(tp, mamba_mode):
         attention_backend=AttentionBackendEnum.TRITON_ATTN
     )
     assert kv_cache_utils.unify_kv_cache_spec_page_size(specs, config) == original
+
+
+@pytest.mark.parametrize("heads", [1, 2, 4])
+def test_non_integral_hybrid_pages_preserve_logical_blocks(heads):
+    target = FullAttentionSpec(
+        block_size=2048,
+        num_kv_heads=heads,
+        head_size=256,
+        dtype=torch.int8,
+        kv_quant_mode=get_kv_quant_mode("int8_per_token_head"),
+    )
+    draft = SlidingWindowSpec(
+        block_size=1024,
+        num_kv_heads=2 * heads,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=2048,
+    )
+    state = MambaSpec(
+        block_size=2048,
+        shapes=((10, 2560 * heads), (12 * heads, 128, 128)),
+        dtypes=(torch.float16, torch.float32),
+        num_speculative_blocks=7,
+        mamba_cache_mode="align",
+        page_size_padded=draft.page_size_bytes,
+    )
+    assert target.page_size_bytes * 64 == draft.page_size_bytes * 65
+    specs = {"target": target, "draft": draft, "state": state}
+    original = dict(specs)
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(specs)
+    page = target.page_size_bytes
+    assert unified == {
+        "target": target,
+        "draft": replace(draft, page_size_padded=page),
+        "state": replace(state, page_size_padded=page),
+    }
+    assert {spec.page_size_bytes for spec in unified.values()} == {page}
+    assert specs == original
+    assert kv_cache_utils.unify_kv_cache_spec_page_size(unified) == unified
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8_e4m3", "int8", "int8_per_token_head"])
+@pytest.mark.parametrize("heads", [1, 2])
+def test_compact_draft_preserves_prefix_grid_with_scale_overhead(cache_dtype, heads):
+    target = FullAttentionSpec(
+        block_size=2048,
+        num_kv_heads=heads,
+        head_size=256,
+        dtype=torch.uint8 if cache_dtype.startswith("fp8") else torch.int8,
+        kv_quant_mode=get_kv_quant_mode(cache_dtype),
+    )
+    draft = SlidingWindowSpec(
+        block_size=2048,
+        num_kv_heads=2 * heads,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=2048,
+    )
+    state = MambaSpec(
+        block_size=2048,
+        shapes=((10, 2560 * heads), (12 * heads, 128, 128)),
+        dtypes=(torch.float16, torch.float32),
+        num_speculative_blocks=7,
+        mamba_cache_mode="align",
+        page_size_padded=target.page_size_bytes,
+    )
+    specs = {"target": target, "draft": draft, "state": state}
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=AttentionBackendEnum.FLASH_ATTN_V100)
+    )
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(specs, config)
+    assert unified["target"] == target
+    assert unified["state"] == state
+    assert unified["draft"].block_size == 1024
+    assert {s.page_size_bytes for s in unified.values()} == {target.page_size_bytes}
+    assert specs["draft"] == draft
+    assert kv_cache_utils.unify_kv_cache_spec_page_size(unified, config) == unified
