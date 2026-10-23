@@ -292,6 +292,10 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
+            # Free this chunk's logits before the next chunk allocates its own:
+            # the rebinding alone frees them only after the new ones exist, so
+            # sub-chunks under the logits budget would still peak at two.
+            del logits
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
