@@ -54,7 +54,9 @@ def sparse_fp16_gemm_max_tokens(
     if (
         capability is not None
         and (capability.major, capability.minor) == (7, 0)
-        and (num_heads, head_dim, index_width) == (64, 512, 2048)
+        and (num_heads, head_dim) == (64, 512)
+        # KPool reserves its incomplete tail before padding to 128 columns.
+        and index_width in (2048, 2176)
         and dtype == torch.float16
     ):
         return 15

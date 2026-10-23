@@ -235,9 +235,11 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         current_workspace_manager().get_simultaneous(*workspace_specs)
         if self.fp16_gemm_max_tokens:
             logger.info_once(
-                "Sparse FP16 tensor-core GEMM enabled for up to %d tokens; "
+                "Sparse FP16 tensor-core GEMM enabled for up to %d tokens "
+                "with %d index columns; "
                 "FP32 scores and per-token reduction geometry.",
                 self.fp16_gemm_max_tokens,
+                self.index_width,
             )
         logger.info_once(
             "GLM-5.3-Flash route: portable FP16 sparse MLA with %s KV%s.",

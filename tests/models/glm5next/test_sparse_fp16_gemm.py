@@ -22,6 +22,7 @@ from vllm.platforms.interface import DeviceCapability
     "capability,heads,dim,width,dtype,expected",
     [
         (DeviceCapability(7, 0), 64, 512, 2048, torch.float16, 15),
+        (DeviceCapability(7, 0), 64, 512, 2176, torch.float16, 15),
         (None, 64, 512, 2048, torch.float16, 0),
         (DeviceCapability(7, 2), 64, 512, 2048, torch.float16, 0),
         (DeviceCapability(8, 6), 64, 512, 2048, torch.float16, 0),
@@ -36,7 +37,8 @@ def test_gemm_admission(capability, heads, dim, width, dtype, expected):
     assert sparse_fp16_gemm_max_tokens(capability, heads, dim, width, dtype) == expected
 
 
-def test_fp16_gemm_workspace_is_reserved_before_capture(monkeypatch):
+@pytest.mark.parametrize("width", [2048, 2176])
+def test_fp16_gemm_workspace_is_reserved_before_capture(monkeypatch, width):
     from vllm.models.glm5next.sm70 import sparse
     from vllm.v1.worker.workspace import WorkspaceManager
 
@@ -69,7 +71,7 @@ def test_fp16_gemm_workspace_is_reserved_before_capture(monkeypatch):
         logits_soft_cap=None,
         attn_type="decoder",
         kv_sharing_target_layer_name=None,
-        indexer=SimpleNamespace(topk_indices_buffer=torch.empty(32, 2048)),
+        indexer=SimpleNamespace(topk_indices_buffer=torch.empty(32, width)),
         qk_rope_head_dim=0,
         kv_lora_rank=512,
     )
@@ -77,9 +79,9 @@ def test_fp16_gemm_workspace_is_reserved_before_capture(monkeypatch):
     manager.lock()
     buffers = manager.get_simultaneous(
         ((15, 64, 512), torch.float16),
-        ((15, 2048, 512), torch.float16),
-        ((15, 64, 2048), torch.float32),
-        ((15, 64, 2048), torch.float16),
+        ((15, width, 512), torch.float16),
+        ((15, 64, width), torch.float32),
+        ((15, 64, width), torch.float16),
     )
     assert buffers[2].dtype == torch.float32
 
@@ -116,14 +118,17 @@ def _reference(q, kv, indices, lengths):
 
 @requires_cuda
 @pytest.mark.parametrize("amplitude", [0.2, 1.0, 4.0])
-def test_sparse_gemm_graph_lengths_and_numerics(amplitude):
+@pytest.mark.parametrize("width", [2048, 2176])
+def test_sparse_gemm_graph_lengths_and_numerics(amplitude, width):
     torch.manual_seed(719)
     q = torch.randn(5, 66, 512, device="cuda", dtype=torch.float16)[:, :64]
     kv = torch.randn(4096, 512, device="cuda", dtype=torch.float16)
-    indices = torch.randint(0, len(kv), (5, 2055), device="cuda", dtype=torch.int32)
-    indices = indices[:, :2048]
+    indices = torch.randint(
+        0, len(kv), (5, width + 7), device="cuda", dtype=torch.int32
+    )
+    indices = indices[:, :width]
     lengths = torch.zeros(5, device="cuda", dtype=torch.int32)
-    buffers = _scratch(q, 2048)
+    buffers = _scratch(q, width)
 
     def run():
         sparse_attention_fp16_gemm(q, kv, indices, lengths, 512**-0.5, *buffers)
@@ -133,7 +138,11 @@ def test_sparse_gemm_graph_lengths_and_numerics(amplitude):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    for counts in ([1, 17, 256, 2048, 0], [2047, 0, -1, 2049, 33]):
+    for counts in (
+        [1, 17, 256, width, 0],
+        [width - 1, 0, -1, width + 1, 33],
+        [2048, 2051, 2049, 2050, 1],
+    ):
         q.normal_(std=amplitude)
         kv.normal_()
         indices.random_(0, len(kv))
@@ -153,21 +162,22 @@ def test_sparse_gemm_graph_lengths_and_numerics(amplitude):
 
 @requires_cuda
 @pytest.mark.parametrize("tokens", [2, 3, 5, 8, 10, 15])
-def test_sparse_gemm_speculation_batch_invariance(tokens):
+@pytest.mark.parametrize("width", [2048, 2176])
+def test_sparse_gemm_speculation_batch_invariance(tokens, width):
     torch.manual_seed(723)
     q = torch.randn(tokens, 64, 512, device="cuda", dtype=torch.float16)
     kv = torch.randn(4096, 512, device="cuda", dtype=torch.float16)
     indices = torch.randint(
-        0, len(kv), (tokens, 2048), device="cuda", dtype=torch.int32
+        0, len(kv), (tokens, width), device="cuda", dtype=torch.int32
     )
     lengths = torch.tensor(
-        ([17, 2048, 257, 0, 2047] * 3)[:tokens], device="cuda", dtype=torch.int32
+        ([17, width, 257, 0, 2051] * 3)[:tokens], device="cuda", dtype=torch.int32
     )
-    buffers = _scratch(q, 2048)
+    buffers = _scratch(q, width)
     sparse_attention_fp16_gemm(q, kv, indices, lengths, 512**-0.5, *buffers)
     batched = buffers[0].clone()
     for row in range(tokens):
-        one = _scratch(q[row : row + 1], 2048)
+        one = _scratch(q[row : row + 1], width)
         sparse_attention_fp16_gemm(
             q[row : row + 1],
             kv,
@@ -180,14 +190,15 @@ def test_sparse_gemm_speculation_batch_invariance(tokens):
 
 
 @requires_cuda
-def test_sparse_gemm_fp32_scores_do_not_overflow_fp16():
+@pytest.mark.parametrize("width", [2048, 2176])
+def test_sparse_gemm_fp32_scores_do_not_overflow_fp16(width):
     # Every input is finite but the unscaled QK product exceeds FP16 range.
     q = torch.full((1, 64, 512), 100.0, device="cuda", dtype=torch.float16)
     kv = torch.full((32, 512), 2.0, device="cuda", dtype=torch.float16)
-    indices = torch.full((1, 2048), -1, device="cuda", dtype=torch.int32)
+    indices = torch.full((1, width), -1, device="cuda", dtype=torch.int32)
     indices[0, :32] = torch.arange(32, device="cuda", dtype=torch.int32)
     lengths = torch.tensor([32], device="cuda", dtype=torch.int32)
-    buffers = _scratch(q, 2048)
+    buffers = _scratch(q, width)
     sparse_attention_fp16_gemm(q, kv, indices, lengths, 512**-0.5, *buffers)
     assert buffers[2][0, 0, 0] > torch.finfo(torch.float16).max
     assert torch.isfinite(buffers[0]).all()
