@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MXFP8 linears on Volta and Turing: QPN8 codes against dequantized weights."""
+"""MXFP8 linears on Volta and Turing: QPN8 codes against dequantized weights.
+
+M <= 8 runs the packed GEMV, M up to 512 on Turing the tensor-core GEMM, the rest
+(and Volta above M=8) the dequantizing cuBLAS route."""
 
 import pytest
 import torch
@@ -26,7 +29,7 @@ def _mxfp8_weight(n: int, k: int, exponents: tuple[int, int]):
     return weight, scale
 
 
-@pytest.mark.parametrize("rows", [1, 4, 8, 33, 512])
+@pytest.mark.parametrize("rows", [1, 4, 8, 9, 33, 64, 300, 512, 777])
 @pytest.mark.parametrize("n,k", [(4096, 8192), (12288, 4096)])
 def test_qpn8_mxfp8_linear_matches_the_dequantized_weight(rows, n, k):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
