@@ -758,9 +758,10 @@ def prepare_fp8_qpn8_channel_linear(
     _prepare_fp8_qpn8_linear(layer, weight, channel_scales)
 
 
-# QPN8 stores each scale times 256 in FP16; E8M0 exponents outside this range
-# would leave the normal FP16 range there and lose precision.
-MXFP8_QPN8_EXPONENT_RANGE = (127 - 14 - 8, 127 + 15 - 8)
+# QPN8 stores each scale times 256 in FP16. A power of two is exact there from
+# the smallest FP16 subnormal (2^-24) to 2^15; the weight is then the exact
+# product rounded once to FP16, as the load-time dequantization produces it.
+MXFP8_QPN8_EXPONENT_RANGE = (127 - 24 - 8, 127 + 15 - 8)
 
 
 def prepare_mxfp8_qpn8_linear(
