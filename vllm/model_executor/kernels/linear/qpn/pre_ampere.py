@@ -15,6 +15,10 @@ from vllm.model_executor.kernels.linear.nvfp4.base import (
     NvFp4LinearKernel,
     NvFp4LinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.qpn.fp8_block import (
+    _QPN8_MAX_M,
+    _SM75_MMA_MAX_M,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     ScaledMMLinearKernel,
@@ -197,11 +201,16 @@ def _turing_fp8_qpn8_linear(
     decode_split_k: int,
     chains: int,
     prefetch: bool,
+    sm75_mma: bool = False,
 ) -> torch.Tensor:
     from vllm import _sm70_ops as ops
 
     out = x.new_empty((x.shape[0], n))
     if x.shape[0] == 0:
+        return out
+    # Same M bounds as the block-FP8 route (qpn/fp8_block.py).
+    if sm75_mma and _QPN8_MAX_M < x.shape[0] <= _SM75_MMA_MAX_M:
+        ops.fp8_qpn8_mma_sm75_out(out, x, codes, scales)
         return out
     # The allocation and its address are resolved inside the opaque operation.
     # Concurrent streams own separate storage; AOT artifacts retain no pointer.
@@ -234,6 +243,7 @@ def _turing_fp8_qpn8_linear_fake(
     decode_split_k: int,
     chains: int,
     prefetch: bool,
+    sm75_mma: bool = False,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], n))
 
