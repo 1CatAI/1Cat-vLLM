@@ -450,6 +450,7 @@ class Glm5NextMLAAttention(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         skip_rope: bool | None = False,
+        projection_quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -495,7 +496,7 @@ class Glm5NextMLAAttention(nn.Module):
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=projection_quant_config,
                 prefix=f"{prefix}.q_b_proj",
             )
         else:
@@ -511,14 +512,14 @@ class Glm5NextMLAAttention(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=quant_config,
+            quant_config=projection_quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=projection_quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
