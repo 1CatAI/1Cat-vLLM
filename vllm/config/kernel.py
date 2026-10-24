@@ -759,6 +759,12 @@ class KernelConfig:
     )
     """Observed per-group collective capabilities and rejection reasons."""
 
+    gguf_moe_packed_down: bool = False
+    """Use the calibrated SM70 FP16 IQ4_XS forty-row expert down route.
+
+    Other shapes and devices retain the existing operator selection.
+    """
+
     canonical_prefill_topk_order: bool = False
     """Order selected logical IDs in participating sparse-indexer prefill paths.
 
