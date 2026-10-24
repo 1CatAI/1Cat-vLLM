@@ -256,7 +256,7 @@ def test_mhc_sm70_fallback_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     ),
     reason="native NVIDIA V100/SM70 mHC CUDA op required",
 )
-@pytest.mark.parametrize("num_tokens", [1, 8])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 8])
 def test_mhc_sm70_native_final_stage_graph_matches_eager_bitwise(
     monkeypatch: pytest.MonkeyPatch,
     num_tokens: int,
@@ -753,3 +753,192 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise(
     torch.testing.assert_close(candidate_residual, baseline_residual, rtol=0, atol=0)
     torch.testing.assert_close(candidate_gemm, baseline_gemm, rtol=0, atol=0)
     torch.testing.assert_close(candidate_sqrsum, baseline_sqrsum, rtol=0, atol=0)
+
+
+def _mhc_final_stage_inputs(num_tokens: int, n_splits: int, device, seed: int = 0):
+    g = torch.Generator(device=device).manual_seed(seed)
+    f32 = dict(device=device, dtype=torch.float32)
+    return dict(
+        gemm_out_mul=torch.randn((n_splits, num_tokens, 24), generator=g, **f32) * 0.1,
+        gemm_out_sqrsum=torch.rand((n_splits, num_tokens), generator=g, **f32) * 1000
+        + 100,
+        hc_scale=torch.tensor([0.1, 0.1, 0.1], **f32),
+        hc_base=torch.randn((24,), generator=g, **f32) * 0.1,
+        residual=(torch.randn((num_tokens, 4, 4096), generator=g, **f32) * 0.5).half(),
+        norm_weight=(1 + 0.1 * torch.randn((4096,), generator=g, **f32)).half(),
+    )
+
+
+def _patch_policy(
+    monkeypatch: pytest.MonkeyPatch, native, threads, source: str
+) -> None:
+    """layer_policy() builds a fresh object per call; replace the factory the
+    dispatcher imported with one returning a fixed policy of known provenance."""
+    import importlib
+    from types import SimpleNamespace
+
+    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
+    policy = SimpleNamespace(
+        mhc_native_verify=native,
+        mhc_pre_threads=threads,
+        sources={"mhc_native_verify": source, "mhc_pre_threads": source},
+    )
+    monkeypatch.setattr(mhc_triton, "layer_policy", lambda cfg=None: policy)
+
+
+def _run_final_stage(native: bool, inputs: dict, monkeypatch: pytest.MonkeyPatch):
+    """Run sm70_mhc_pre_norm_from_staging on the native or the Triton path."""
+    num_tokens = inputs["residual"].shape[0]
+    device = inputs["residual"].device
+    post_mix = torch.empty((num_tokens, 4), device=device, dtype=torch.float32)
+    comb_mix = torch.empty((num_tokens, 4, 4), device=device, dtype=torch.float32)
+    layer_input = torch.empty((num_tokens, 4096), device=device, dtype=torch.float16)
+    _patch_policy(monkeypatch, native, 1024 if native else 256, "typed")
+    sm70_mhc_pre_norm_from_staging(
+        inputs["gemm_out_mul"],
+        inputs["gemm_out_sqrsum"],
+        inputs["hc_scale"],
+        inputs["hc_base"],
+        inputs["residual"],
+        post_mix,
+        comb_mix,
+        layer_input,
+        inputs["norm_weight"],
+        1e-6,
+        1e-6,
+        1e-6,
+        1.0,
+        2,
+        1e-6,
+    )
+    torch.cuda.synchronize()
+    return post_mix, comb_mix, layer_input
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available() and hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out")
+    ),
+    reason="native NVIDIA V100/SM70 mHC CUDA op required",
+)
+@pytest.mark.parametrize("num_tokens", [2, 3, 4, 6, 8])
+def test_mhc_sm70_native_final_stage_matches_triton(
+    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native final stage, now the default for 2..8 tokens, agrees with the
+    Triton program it replaces to FP16 output rounding of the normalized
+    activations, and bitwise on the mixes it stores in FP32."""
+    device = torch.device("cuda")
+    inputs = _mhc_final_stage_inputs(num_tokens, n_splits=8, device=device)
+    native = _run_final_stage(True, inputs, monkeypatch)
+    triton = _run_final_stage(False, inputs, monkeypatch)
+    torch.testing.assert_close(native[0], triton[0], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(native[1], triton[1], rtol=1e-6, atol=1e-6)
+    diff = (native[2].float() - triton[2].float()).abs()
+    scale = triton[2].float().abs().max().item()
+    assert diff.max().item() <= 2.0**-10 * scale + 1e-3, diff.max().item()
+    # mutation guard: a perturbed norm weight is detected by the same bound
+    bad = dict(inputs, norm_weight=inputs["norm_weight"] * 1.01)
+    perturbed = _run_final_stage(True, bad, monkeypatch)
+    assert (
+        perturbed[2].float() - triton[2].float()
+    ).abs().max().item() > 2.0**-10 * scale + 1e-3
+
+
+def test_mhc_sm70_native_final_stage_is_default_for_verify_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the policy field unset, 2..8 tokens route to the native op."""
+    from vllm import _sm70_ops as sm70_ops
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        torch.ops._C, "sm70_glm_mhc_pre_norm_out", lambda *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(
+        sm70_ops,
+        "sm70_glm_mhc_pre_norm_out",
+        lambda gemm_mul, *a, **k: calls.append(
+            (int(gemm_mul.shape[1]), int(k.get("threads", -1)))
+        ),
+    )
+    # environment defaults (off, 256 threads) with "default" provenance
+    _patch_policy(monkeypatch, False, 256, "default")
+    for num_tokens in (1, 2, 4, 8):
+        inputs = _mhc_final_stage_inputs(
+            num_tokens, n_splits=8, device=torch.device("cpu")
+        )
+        sm70_mhc_pre_norm_from_staging(
+            inputs["gemm_out_mul"],
+            inputs["gemm_out_sqrsum"],
+            inputs["hc_scale"],
+            inputs["hc_base"],
+            inputs["residual"],
+            torch.empty((num_tokens, 4)),
+            torch.empty((num_tokens, 4, 4)),
+            torch.empty((num_tokens, 4096), dtype=torch.float16),
+            inputs["norm_weight"],
+            1e-6,
+            1e-6,
+            1e-6,
+            1.0,
+            2,
+            1e-6,
+        )
+    assert calls == [(1, 128), (2, 1024), (4, 1024), (8, 1024)]
+
+
+def test_mhc_sm70_native_final_stage_respects_explicit_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit setting still forces the Triton program for 2-8 tokens."""
+    import importlib
+
+    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
+    calls: list[int] = []
+    monkeypatch.setattr(
+        torch.ops._C, "sm70_glm_mhc_pre_norm_out", lambda *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(
+        mhc_triton.sm70_ops,
+        "sm70_glm_mhc_pre_norm_out",
+        lambda gemm_mul, *a, **k: calls.append(int(gemm_mul.shape[1])),
+    )
+    monkeypatch.setattr(
+        mhc_triton,
+        "_sm70_mhc_pre_norm_kernel",
+        SimpleNamespaceKernel(calls),
+    )
+    _patch_policy(monkeypatch, False, 256, "typed")
+    inputs = _mhc_final_stage_inputs(4, n_splits=8, device=torch.device("cpu"))
+    sm70_mhc_pre_norm_from_staging(
+        inputs["gemm_out_mul"],
+        inputs["gemm_out_sqrsum"],
+        inputs["hc_scale"],
+        inputs["hc_base"],
+        inputs["residual"],
+        torch.empty((4, 4)),
+        torch.empty((4, 4, 4)),
+        torch.empty((4, 4096), dtype=torch.float16),
+        inputs["norm_weight"],
+        1e-6,
+        1e-6,
+        1e-6,
+        1.0,
+        2,
+        1e-6,
+    )
+    assert calls == ["triton"]
+
+
+class SimpleNamespaceKernel:
+    """Stands in for the Triton kernel object: records a launch, runs nothing."""
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            self.calls.append("triton")
+
+        return launch
