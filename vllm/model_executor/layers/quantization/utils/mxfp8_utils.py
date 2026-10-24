@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 import torch
 
@@ -188,6 +188,7 @@ def xpu_mxfp8_quantize(
 def dequantize_mxfp8_weight_pairs(
     weights: Iterable[tuple],
     out_dtype: torch.dtype = torch.bfloat16,
+    keep_quantized: Callable[[str], bool] | None = None,
 ) -> Iterator[tuple]:
     """Yield checkpoint tensors with every MXFP8 weight dequantized.
 
@@ -198,6 +199,9 @@ def dequantize_mxfp8_weight_pairs(
     quantized, and every other tensor passes through too. Items keep any extra
     fields after (name, tensor). For hardware without MXFP8 kernels (before
     SM80).
+
+    ``keep_quantized(module)`` names the modules the model holds as MXFP8: all
+    their tensors pass through unchanged, in stream order.
 
     Every scale is handed on directly after its weight, whatever order the
     shards store them in: model loaders pair the two inside one
@@ -214,6 +218,9 @@ def dequantize_mxfp8_weight_pairs(
         name, tensor = item[0], item[1]
         if name.endswith(".weight"):
             module = name.removesuffix(".weight")
+            if keep_quantized is not None and keep_quantized(module):
+                yield item
+                continue
             scale = pending_scales.pop(module, None)
             if tensor.dtype != MXFP8_VALUE_DTYPE:
                 passed.add(module)
@@ -229,7 +236,11 @@ def dequantize_mxfp8_weight_pairs(
                 yield scale
             continue
         module = _scale_module(name, tensor)
-        if module is None or module in passed:
+        if (
+            module is None
+            or module in passed
+            or (keep_quantized is not None and keep_quantized(module))
+        ):
             yield item
             continue
         weight = pending_weights.pop(module, None)
