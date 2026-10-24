@@ -65,6 +65,7 @@ CONFIGURED_OPERATORS = GGUF_OPERATORS + (
     "fp8_qpn8_prepare_sm70",
     "fp8_sm70_dequantize_out",
     "fp8_sm70_prepare",
+    "gguf_grouped_prefill_gemm_sm70_out",
     "mxfp4_gemm_sm70_out",
     "mxfp4_moe_dense_stage_sm70_out",
     "mxfp4_moe_qpn_m1_sm70_out",
