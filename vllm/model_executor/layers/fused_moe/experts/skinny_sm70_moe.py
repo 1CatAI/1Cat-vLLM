@@ -34,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.experts.skinny_moe_triton import (
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.sm70.reduction import _mtp_weighted_reduce
+from vllm.model_executor.layers.fused_moe.sm70.routing import group_routing
 from vllm.model_executor.layers.quantization.utils.csf32_expand import (
     CsfExpertScales,
     expand_csf32_experts,
@@ -714,28 +715,10 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         num_tokens, top_k = topk_ids.shape
         inter_dim = self.adjust_N_for_activation(w1.size(1), activation)
         device = hidden_states.device
-        # Compact device-side routing (all fixed shapes, CUDA-graph safe):
-        # slots sorted by expert; consecutive equal experts form a group.
-        # gids[g] = group's expert, goff[g]..goff[g+1] = its slot range;
-        # unused group slots stay empty (goff = S); the kernel launches
-        # min(S, experts) group rows and skips the empty ones.
-        flat = topk_ids.reshape(-1).to(torch.int64)
-        num_slots = flat.numel()
-        perm = torch.argsort(flat, stable=True).to(torch.int32)
-        sorted_e = flat[perm.long()]
-        new_group = torch.ones(num_slots, dtype=torch.bool, device=device)
-        new_group[1:] = sorted_e[1:] != sorted_e[:-1]
-        gidx = torch.cumsum(new_group, 0) - 1
-        goff = torch.full((num_slots + 1,), num_slots, dtype=torch.int64, device=device)
-        goff.scatter_reduce_(
-            0,
-            gidx,
-            torch.arange(num_slots, dtype=torch.int64, device=device),
-            reduce="amin",
-        )
-        gids = torch.zeros(num_slots, dtype=torch.int64, device=device)
-        gids.scatter_(0, gidx, sorted_e)
-        gids32, goff32 = gids.to(torch.int32), goff.to(torch.int32)
+        # Compact device-side routing (all fixed shapes, CUDA-graph safe): the
+        # kernel launches min(S, experts) group rows and skips the empty ones.
+        num_slots = topk_ids.numel()
+        perm, gids32, goff32 = group_routing(topk_ids)
         if self._csf_planes is not None:
             w13_planes, w2_planes = self._csf_planes
             expand_csf32_experts(
