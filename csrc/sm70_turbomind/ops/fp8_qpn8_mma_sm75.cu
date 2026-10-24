@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Block-FP8 GEMM on the QPN8 packed codes with Turing's m16n8k8 tensor-core
-// MMA. Turing executes the Volta m8n8k4 MMA of the packed GEMMs at half its
+// Block-FP8 (or MXFP8 row-group) GEMM on the QPN8 packed codes with Turing's
+// m16n8k8 tensor-core MMA. Turing executes the Volta m8n8k4 MMA of the packed GEMMs at half its
 // tensor rate, and above M=8 the block-FP8 route otherwise reconstructs the
 // whole FP16 weight on every call. Here each CTA decodes and block-scales its
 // codes once while staging them into shared memory, exactly as the dense
@@ -45,7 +45,9 @@ __device__ __forceinline__ int swizzled(int row, int chunk) {
   return row * kChunks + (chunk ^ ((row >> 1) & 3));
 }
 
-template <int BlockM, int WarpsM, int MinBlocks>
+// RowGroupScales: MXFP8 scales laid out [K/32, N], one per column and K step
+// (kBlockK == 32); off, the 128 x 128 block scales [K/128, N/32].
+template <int BlockM, int WarpsM, int MinBlocks, bool RowGroupScales>
 __global__ __launch_bounds__(kThreads, MinBlocks) void fp8_qpn8_mma_sm75_kernel(
     const half* __restrict__ input, const uint4* __restrict__ codes,
     const half* __restrict__ group_scales, half* __restrict__ output,
@@ -94,7 +96,8 @@ __global__ __launch_bounds__(kThreads, MinBlocks) void fp8_qpn8_mma_sm75_kernel(
                            k_begin / 16 + b_group) *
                               32 +
                           lane;
-  const half* scale_source = group_scales + n0 / 32 + b_tile;
+  const half* scale_source =
+      RowGroupScales ? group_scales + n0 + b_row : group_scales + n0 / 32 + b_tile;
   const int tiles_n32 = n >> 5;
 
   // One K step held in registers on its way into shared memory. The scale is
@@ -121,7 +124,10 @@ __global__ __launch_bounds__(kThreads, MinBlocks) void fp8_qpn8_mma_sm75_kernel(
     }
     staged.b =
         __ldcs(b_source + static_cast<size_t>(step) * (kBlockK / 16) * 32);
-    staged.scale = scale_source[static_cast<size_t>(k0 / 128) * tiles_n32];
+    staged.scale =
+        RowGroupScales
+            ? scale_source[static_cast<size_t>(k0 / kBlockK) * n]
+            : scale_source[static_cast<size_t>(k0 / 128) * tiles_n32];
   };
 
   auto store_shared = [&](const Staged& staged, int stage) {
@@ -250,7 +256,7 @@ __global__ void fp8_qpn8_split_reduce_sm75_kernel(
   output[index] = __floats2half2_rn(sum.x, sum.y);
 }
 
-template <int BlockM, int WarpsM, int MinBlocks>
+template <int BlockM, int WarpsM, int MinBlocks, bool RowGroupScales>
 void launch_fp8_qpn8_mma_sm75(torch::Tensor& out, const torch::Tensor& input,
                               const torch::Tensor& codes,
                               const torch::Tensor& group_scales, int splits,
@@ -264,7 +270,7 @@ void launch_fp8_qpn8_mma_sm75(torch::Tensor& out, const torch::Tensor& input,
         torch::empty({splits, m, n}, input.options().dtype(torch::kFloat32));
   }
   const dim3 grid((n / kBlockN) * ((m + BlockM - 1) / BlockM), 1, splits);
-  fp8_qpn8_mma_sm75_kernel<BlockM, WarpsM, MinBlocks>
+  fp8_qpn8_mma_sm75_kernel<BlockM, WarpsM, MinBlocks, RowGroupScales>
       <<<grid, kThreads, 0, stream>>>(
           reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
           reinterpret_cast<const uint4*>(codes.data_ptr<uint8_t>()),
@@ -290,8 +296,8 @@ int resident_ctas_per_sm() {
   static const int ctas = [] {
     int blocks = 0;
     AT_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks, fp8_qpn8_mma_sm75_kernel<BlockM, WarpsM, MinBlocks>, kThreads,
-        0));
+        &blocks, fp8_qpn8_mma_sm75_kernel<BlockM, WarpsM, MinBlocks, false>,
+        kThreads, 0));
     return blocks;
   }();
   return ctas;
@@ -373,8 +379,12 @@ void fp8_qpn8_mma_sm75_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_mma_sm75_out: shape mismatch");
   TORCH_CHECK(n > 0 && n % kBlockN == 0 && k > 0 && k % 128 == 0,
               "fp8_qpn8_mma_sm75_out: requires N%128=K%128=0");
-  TORCH_CHECK(group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32,
-              "fp8_qpn8_mma_sm75_out: expected 128 x 128 block scales");
+  const bool row_group_scales =
+      group_scales.size(0) == k / 32 && group_scales.size(1) == n;
+  TORCH_CHECK(row_group_scales || (group_scales.size(0) == k / 128 &&
+                                   group_scales.size(1) == n / 32),
+              "fp8_qpn8_mma_sm75_out: expected 128 x 128 block scales "
+              "[K/128, N/32] or row-group scales [K/32, N]");
   TORCH_CHECK(m * n < (int64_t{1} << 31),
               "fp8_qpn8_mma_sm75_out: output too large");
   if (m == 0) {
@@ -389,23 +399,31 @@ void fp8_qpn8_mma_sm75_out(torch::Tensor out, torch::Tensor input,
   const TileChoice tile = choose_tile(m, n, k, properties->multiProcessorCount);
   const int splits = tile.splits;
 
+#define VLLM_LAUNCH_QPN8_MMA(BLOCK_M, WARPS_M, MIN_BLOCKS)                    \
+  do {                                                                         \
+    if (row_group_scales) {                                                    \
+      launch_fp8_qpn8_mma_sm75<BLOCK_M, WARPS_M, MIN_BLOCKS, true>(            \
+          out, input, codes, group_scales, splits, stream);                    \
+    } else {                                                                   \
+      launch_fp8_qpn8_mma_sm75<BLOCK_M, WARPS_M, MIN_BLOCKS, false>(           \
+          out, input, codes, group_scales, splits, stream);                    \
+    }                                                                          \
+  } while (0)
+
   switch (tile.block_m) {
     case 16:
-      launch_fp8_qpn8_mma_sm75<16, 1, 2>(out, input, codes, group_scales,
-                                         splits, stream);
+      VLLM_LAUNCH_QPN8_MMA(16, 1, 2);
       break;
     case 32:
-      launch_fp8_qpn8_mma_sm75<32, 2, 2>(out, input, codes, group_scales,
-                                         splits, stream);
+      VLLM_LAUNCH_QPN8_MMA(32, 2, 2);
       break;
     case 64:
-      launch_fp8_qpn8_mma_sm75<64, 2, 2>(out, input, codes, group_scales,
-                                         splits, stream);
+      VLLM_LAUNCH_QPN8_MMA(64, 2, 2);
       break;
     default:
-      launch_fp8_qpn8_mma_sm75<128, 2, 2>(out, input, codes, group_scales,
-                                          splits, stream);
+      VLLM_LAUNCH_QPN8_MMA(128, 2, 2);
       break;
   }
+#undef VLLM_LAUNCH_QPN8_MMA
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
