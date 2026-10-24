@@ -578,19 +578,14 @@ class Gemma4DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
 
         # Gemma4 uses different head dimensions for sliding vs full attention.
-        # Set the escape hatch before accessing head_dim (transformers >=5.18
-        # raises AmbiguousGlobalPerLayerAttributeError on global access).
-        try:
-            config.allow_global_per_layer_attribute_access = True
-        except (AttributeError, TypeError):
-            pass
+        # per_layer_config covers full-attention layers only; sliding layers
+        # use base values read via __dict__ (bypasses heterogeneity guard).
         layer_type = config.layer_types[layer_idx]
         self.is_full_attention = layer_type == "full_attention"
         if self.is_full_attention:
-            global_hd = getattr(config, "global_head_dim", None)
-            head_dim = global_hd if global_hd is not None else config.head_dim
+            head_dim = config.per_layer_config[layer_idx].head_dim
         else:
-            head_dim = config.head_dim
+            head_dim = config.__dict__["head_dim"]
 
         # Determine if this full-attention layer uses k_eq_v
         # (laptop variant: no v_proj, K reused as V on full attention layers)
@@ -598,14 +593,15 @@ class Gemma4DecoderLayer(nn.Module):
             config, "attention_k_eq_v", False
         )
 
-        # For k_eq_v full-attention layers, use num_global_key_value_heads
-        # as the KV head count when k_eq_v is enabled.
+        # k_eq_v: KV head count from per-layer config.
         if use_k_eq_v:
+            _plc = config.per_layer_config[layer_idx]
             num_kv_heads = getattr(
-                config, "num_global_key_value_heads", config.num_key_value_heads
+                _plc, "num_key_value_heads",
+                config.__dict__["num_key_value_heads"],
             )
         else:
-            num_kv_heads = config.num_key_value_heads
+            num_kv_heads = config.__dict__["num_key_value_heads"]
 
         self.self_attn = Gemma4Attention(
             config=config,
