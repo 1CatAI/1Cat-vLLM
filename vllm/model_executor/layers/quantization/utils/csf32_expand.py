@@ -13,7 +13,7 @@ Only full CSF tiles are supported (rows % 128 == 0, groups % 4 == 0), which
 covers every routed-expert shape of the GLM-5.3 checkpoints.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import torch
@@ -27,6 +27,10 @@ _BLOCK_SCALES = 64
 _TILE_BLOCKS = 8
 _TILE_SCALES = _TILE_BLOCKS * _BLOCK_SCALES
 _RECORDS_PER_STEP = 256
+# Programs a launch should offer the GPU: a decode launch has one group row per
+# routed expert (8 for one token) and its programs walk 24-64 dependent steps,
+# so it must split that walk until enough programs hide the load latency.
+_TARGET_PROGRAMS = 4096
 
 
 @dataclass
@@ -47,6 +51,10 @@ class CsfExpertScales:
     exceptions: torch.Tensor  # i32 [total records] (u16 widened)
     exception_start: torch.Tensor  # i64 [M]
     exception_count: torch.Tensor  # i32 [M]
+    max_exceptions: int = field(init=False)  # most records of one matrix
+
+    def __post_init__(self) -> None:
+        self.max_exceptions = int(self.exception_count.max())
 
     @property
     def num_blocks(self) -> int:
@@ -193,10 +201,11 @@ def _csf32_expand_kernel(
     ROWS: tl.constexpr,
     GROUPS: tl.constexpr,
     PROJECTIONS: tl.constexpr,
+    PAIRS_PER_PROGRAM: tl.constexpr,
 ):
-    # One program per group and tile row (4 block rows = 128 matrix rows); it
-    # walks the row's tile pairs, so the row bases are loaded once and each
-    # program writes whole 128-byte raster runs.
+    # One program per group, tile row (4 block rows = 128 matrix rows) and run
+    # of PAIRS_PER_PROGRAM tile pairs; it walks the run, so the row bases are
+    # loaded once and each program writes whole 128-byte raster runs.
     slot = tl.program_id(0)
     if tl.load(goff_ptr + slot) >= num_slots:
         return
@@ -224,7 +233,8 @@ def _csf32_expand_kernel(
         + field // 2
     )
     shift = 4 * (field % 2)
-    for tile_pair in range(tile_pairs):
+    first_pair = tl.program_id(2) * PAIRS_PER_PROGRAM
+    for tile_pair in range(first_pair, first_pair + PAIRS_PER_PROGRAM):
         code = tl.load(codes_row + tile_pair * 8 * 32)
         value = (base + ((code.to(tl.int32) >> shift) & 0xF)).to(tl.uint8)
         pair = tile_pair * 2 + at // 4
@@ -251,6 +261,7 @@ def _csf32_exceptions_kernel(
     SEARCH_STEPS: tl.constexpr,
     STEP: tl.constexpr,
 ):
+    # One program per group, projection and run of STEP records.
     slot = tl.program_id(0)
     if tl.load(goff_ptr + slot) >= num_slots:
         return
@@ -264,7 +275,8 @@ def _csf32_exceptions_kernel(
     offsets_row = offsets_ptr + matrix * (num_blocks + NUM_PAGES)
     pages_row = page_bases_ptr + matrix * NUM_PAGES
 
-    for first in range(0, count, STEP):
+    first = tl.program_id(2) * STEP
+    if first < count:
         k = first + tl.arange(0, STEP)
         valid = k < count
         record = tl.load(exceptions_ptr + start + k, mask=valid, other=0)
@@ -297,6 +309,17 @@ def _csf32_exceptions_kernel(
         )
 
 
+def _runs_per_row(tile_pairs: int, programs: int) -> int:
+    """Runs a row's tile pairs split into: the smallest divisor of ``tile_pairs``
+    that lifts a launch of ``programs`` programs to ``_TARGET_PROGRAMS``, or one
+    pair per program where even that stays below it."""
+    wanted = -(-_TARGET_PROGRAMS // programs)
+    return next(
+        (runs for runs in range(wanted, tile_pairs + 1) if tile_pairs % runs == 0),
+        tile_pairs,
+    )
+
+
 def expand_csf32_experts(
     out: torch.Tensor,
     planes: CsfExpertScales,
@@ -324,7 +347,9 @@ def expand_csf32_experts(
     # for 512 tokens x top-8 against 288 experts).
     group_rows = min(num_slots, out.shape[0])
     row_tiles = planes.projections * (planes.rows // 128)
-    _csf32_expand_kernel[(group_rows, row_tiles)](
+    tile_pairs = planes.groups // 4
+    runs = _runs_per_row(tile_pairs, group_rows * row_tiles)
+    _csf32_expand_kernel[(group_rows, row_tiles, runs)](
         out,
         out.stride(0),
         gids,
@@ -336,8 +361,10 @@ def expand_csf32_experts(
         ROWS=planes.rows,
         GROUPS=planes.groups,
         PROJECTIONS=planes.projections,
+        PAIRS_PER_PROGRAM=tile_pairs // runs,
     )
-    _csf32_exceptions_kernel[(group_rows, planes.projections)](
+    record_runs = max(1, -(-planes.max_exceptions // _RECORDS_PER_STEP))
+    _csf32_exceptions_kernel[(group_rows, planes.projections, record_runs)](
         out,
         out.stride(0),
         gids,
