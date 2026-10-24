@@ -93,6 +93,23 @@ __global__ void fp8_qpn8_scale_sm70_kernel(half* __restrict__ group_scales,
       __float2half(scales[(n_tile >> 2) * k_blocks + k_block] * 256.0f);
 }
 
+// MXFP8: float32 [N, K/32] scales into fp16 [K/32, N] (times 256, like the
+// other layouts), so the 32 columns of a tile read one contiguous run.
+__global__ void fp8_qpn8_row_group_scale_sm70_kernel(
+    half* __restrict__ group_scales, const float* __restrict__ scales, int n,
+    int k_groups) {
+  const size_t index =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= static_cast<size_t>(n) * k_groups) {
+    return;
+  }
+  const int k_group = static_cast<int>(index / n);
+  const int col = static_cast<int>(index % n);
+  group_scales[index] =
+      __float2half(scales[static_cast<size_t>(col) * k_groups + k_group] *
+                   256.0f);
+}
+
 __global__ void fp8_qpn8_channel_scale_sm70_kernel(
     half* __restrict__ channel_scales, const float* __restrict__ scales,
     int n) {
@@ -104,7 +121,8 @@ __global__ void fp8_qpn8_channel_scale_sm70_kernel(
 
 __global__ void fp8_qpn8_dequantize_sm70_kernel(
     half* __restrict__ output, const uint8_t* __restrict__ codes,
-    const half* __restrict__ group_scales, int n, int k, bool channel_scales) {
+    const half* __restrict__ group_scales, int n, int k, bool channel_scales,
+    bool row_group_scales) {
   const size_t word_index =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t word_count = static_cast<size_t>(n) * k / 16;
@@ -119,9 +137,12 @@ __global__ void fp8_qpn8_dequantize_sm70_kernel(
   const int tile = static_cast<int>(tile_word / groups_k16);
   const int col = tile * 32 + qpn8_col_from_lane(lane);
   const int tiles_n32 = n >> 5;
-  const half scale = channel_scales
-                         ? group_scales[col]
-                         : group_scales[(group >> 3) * tiles_n32 + tile];
+  const half scale =
+      channel_scales
+          ? group_scales[col]
+          : (row_group_scales
+                 ? group_scales[static_cast<size_t>(group >> 1) * n + col]
+                 : group_scales[(group >> 3) * tiles_n32 + tile]);
   const half2 scale2 = __halves2half2(scale, scale);
   const uint4 packed = reinterpret_cast<const uint4*>(codes)[word_index];
   half2 weights[8];
@@ -192,9 +213,12 @@ __global__ void fp8_qpn8_ba_split_copy_sm70_kernel(
   }
 }
 
+// RowGroupScales: MXFP8 scales, one per column and 32 K, laid out [K/32, N]
+// (see fp8_qpn8_row_group_scale_sm70_kernel). Off, the kernel is the channel /
+// 128x128-block kernel unchanged.
 template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
           bool M1Only = false, bool FusedBA = false, bool SplitOutputs = false,
-          int RowTiles = 1>
+          int RowTiles = 1, bool RowGroupScales = false>
 __global__ void fp8_qpn8_sm70_kernel(
     const uint8_t* __restrict__ codes, const half* __restrict__ group_scales,
     const half* __restrict__ input, half* __restrict__ output,
@@ -206,6 +230,8 @@ __global__ void fp8_qpn8_sm70_kernel(
                 "QPN8 supports one or two 8-row tiles");
   static_assert(!M1Only || RowTiles == 1,
                 "QPN8 M=1 specialization uses one row tile");
+  static_assert(!RowGroupScales || !FusedBA,
+                "QPN8 row-group scales do not combine with the fused B/A rows");
   __shared__ float partials[SplitK][M1Only ? 32 : RowTiles * 256];
 
   const int lane = threadIdx.x & 31;
@@ -271,10 +297,10 @@ __global__ void fp8_qpn8_sm70_kernel(
   const int groups_k16 = k >> 4;
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
-  const int tiles_n32 = n >> 5;
+  [[maybe_unused]] const int tiles_n32 = n >> 5;
   const uint4* code_ptr = reinterpret_cast<const uint4*>(codes) +
                           static_cast<size_t>(tile) * groups_k16 * 32 + lane;
-  const half* scale_ptr = group_scales + tile;
+  [[maybe_unused]] const half* scale_ptr = group_scales + tile;
 
   float accum[RowTiles][NAcc][8];
 #pragma unroll
@@ -300,11 +326,21 @@ __global__ void fp8_qpn8_sm70_kernel(
 #pragma unroll 4
   for (int group = group_begin; group < group_begin + groups_per_warp;
        ++group) {
-    const int scale_group = group >> 3;
-    if (!channel_scales && scale_group != loaded_scale_group) {
-      loaded_scale =
-          __ldg(scale_ptr + static_cast<size_t>(scale_group) * tiles_n32);
-      loaded_scale_group = scale_group;
+    if constexpr (RowGroupScales) {
+      // One scale per column and 32 K, i.e. per two 16-wide code groups.
+      const int scale_group = group >> 1;
+      if (scale_group != loaded_scale_group) {
+        loaded_scale = __ldg(group_scales + static_cast<size_t>(scale_group) * n +
+                             tile * 32 + qpn8_col_from_lane(lane));
+        loaded_scale_group = scale_group;
+      }
+    } else {
+      const int scale_group = group >> 3;
+      if (!channel_scales && scale_group != loaded_scale_group) {
+        loaded_scale =
+            __ldg(scale_ptr + static_cast<size_t>(scale_group) * tiles_n32);
+        loaded_scale_group = scale_group;
+      }
     }
 
     const uint4 packed =
@@ -437,14 +473,15 @@ __global__ void fp8_qpn8_sm70_kernel(
 }
 
 template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
-          bool M1Only = false, int RowTiles = 1>
+          bool M1Only = false, int RowTiles = 1, bool RowGroupScales = false>
 void launch_fp8_qpn8_sm70(const uint8_t* codes, const half* group_scales,
                           const half* input, half* output, int n, int k, int m,
                           bool channel_scales, cudaStream_t stream) {
   fp8_qpn8_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes, M1Only, false,
-                       false, RowTiles><<<(n / 32), (32 * SplitK), 0, stream>>>(
-      codes, group_scales, input, output, nullptr, nullptr, nullptr, nullptr,
-      nullptr, 0, n, n, k, m, channel_scales);
+                       false, RowTiles, RowGroupScales>
+      <<<(n / 32), (32 * SplitK), 0, stream>>>(
+          codes, group_scales, input, output, nullptr, nullptr, nullptr,
+          nullptr, nullptr, 0, n, n, k, m, channel_scales);
 }
 
 struct Fp8PairReader {
@@ -1272,15 +1309,20 @@ std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
   const int64_t n = qweight.size(0);
   const int64_t k = qweight.size(1);
   const bool channel_scales = scales.size(0) == n && scales.size(1) == 1;
+  const bool row_group_scales = !channel_scales && scales.size(0) == n &&
+                                k % 32 == 0 && scales.size(1) == k / 32;
   const bool block_scales =
       scales.size(0) == n / 128 && scales.size(1) == k / 128;
-  TORCH_CHECK(channel_scales ? (n > 0 && n % 32 == 0 && k > 0 && k % 16 == 0)
-                             : (n > 0 && n % 128 == 0 && k > 0 && k % 128 == 0),
-              "fp8_qpn8_prepare_sm70: channel scales require N%32=K%16=0; "
-              "block scales require N%128=K%128=0");
-  TORCH_CHECK(channel_scales || block_scales,
-              "fp8_qpn8_prepare_sm70: expected channel scales [N, 1] or "
-              "block scales [N/128, K/128]");
+  TORCH_CHECK((channel_scales || row_group_scales)
+                  ? (n > 0 && n % 32 == 0 && k > 0 && k % 16 == 0)
+                  : (n > 0 && n % 128 == 0 && k > 0 && k % 128 == 0),
+              "fp8_qpn8_prepare_sm70: channel and row-group scales require "
+              "N%32=K%16=0 (row-group also K%32=0); block scales require "
+              "N%128=K%128=0");
+  TORCH_CHECK(channel_scales || row_group_scales || block_scales,
+              "fp8_qpn8_prepare_sm70: expected channel scales [N, 1], "
+              "row-group (MXFP8) scales [N, K/32] or block scales "
+              "[N/128, K/128]");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(qweight));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -1288,7 +1330,8 @@ std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
       {k, n},
       torch::TensorOptions().device(qweight.device()).dtype(torch::kUInt8));
   auto group_scales = torch::empty(
-      {channel_scales ? 1 : k / 128, channel_scales ? n : n / 32},
+      {channel_scales ? 1 : (row_group_scales ? k / 32 : k / 128),
+       (channel_scales || row_group_scales) ? n : n / 32},
       torch::TensorOptions().device(qweight.device()).dtype(torch::kFloat16));
 
   const int64_t weight_numel = n * k;
@@ -1308,6 +1351,12 @@ std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
                                          stream>>>(
         reinterpret_cast<half*>(group_scales.data_ptr<at::Half>()),
         scales.data_ptr<float>(), static_cast<int>(n));
+  } else if (row_group_scales) {
+    fp8_qpn8_row_group_scale_sm70_kernel<<<scale_blocks, kQpn8PrepareThreads, 0,
+                                           stream>>>(
+        reinterpret_cast<half*>(group_scales.data_ptr<at::Half>()),
+        scales.data_ptr<float>(), static_cast<int>(n),
+        static_cast<int>(k / 32));
   } else {
     fp8_qpn8_scale_sm70_kernel<<<scale_blocks, kQpn8PrepareThreads, 0,
                                  stream>>>(
@@ -1340,15 +1389,20 @@ void fp8_qpn8_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
   const int64_t n = out.size(1);
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
+  const bool row_group_scales = !channel_scales && k % 32 == 0 &&
+                                group_scales.size(0) == k / 32 &&
+                                group_scales.size(1) == n;
   const bool block_scales =
       group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
-  TORCH_CHECK(channel_scales ? (n > 0 && n % 32 == 0 && k > 0 && k % 16 == 0)
-                             : (n > 0 && n % 128 == 0 && k > 0 && k % 128 == 0),
-              "fp8_qpn8_dequantize_sm70_out: channel scales require "
-              "N%32=K%16=0; block scales require N%128=K%128=0");
+  TORCH_CHECK((channel_scales || row_group_scales)
+                  ? (n > 0 && n % 32 == 0 && k > 0 && k % 16 == 0)
+                  : (n > 0 && n % 128 == 0 && k > 0 && k % 128 == 0),
+              "fp8_qpn8_dequantize_sm70_out: channel and row-group scales "
+              "require N%32=K%16=0 (row-group also K%32=0); block scales "
+              "require N%128=K%128=0");
   TORCH_CHECK(codes.numel() == k * n,
               "fp8_qpn8_dequantize_sm70_out: packed code size mismatch");
-  TORCH_CHECK(channel_scales || block_scales,
+  TORCH_CHECK(channel_scales || row_group_scales || block_scales,
               "fp8_qpn8_dequantize_sm70_out: scale shape mismatch");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
@@ -1360,7 +1414,8 @@ void fp8_qpn8_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
       codes.data_ptr<uint8_t>(),
       reinterpret_cast<const half*>(group_scales.data_ptr<at::Half>()),
-      static_cast<int>(n), static_cast<int>(k), channel_scales);
+      static_cast<int>(n), static_cast<int>(k), channel_scales,
+      row_group_scales);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1403,6 +1458,33 @@ void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// MXFP8 row-group scales, M <= 8: the instantiations the launch configuration
+// of a dense linear can pick. M=1 gets the single-row-tile kernel.
+static void launch_fp8_qpn8_row_group_sm70(const uint8_t* codes,
+                                    const half* group_scales,
+                                    const half* input, half* output, int n,
+                                    int k, int m, int split_k,
+                                    cudaStream_t stream) {
+#define VLLM_LAUNCH_QPN8_ROW_GROUP(SPLIT)                                   \
+  do {                                                                      \
+    if (m == 1) {                                                           \
+      launch_fp8_qpn8_sm70<SPLIT, 2, true, false, true, 1, true>(           \
+          codes, group_scales, input, output, n, k, 1, false, stream);      \
+    } else {                                                                \
+      launch_fp8_qpn8_sm70<SPLIT, 2, true, false, false, 1, true>(          \
+          codes, group_scales, input, output, n, k, m, false, stream);      \
+    }                                                                       \
+  } while (0)
+  if (split_k == 8) {
+    VLLM_LAUNCH_QPN8_ROW_GROUP(8);
+  } else if (split_k == 12) {
+    VLLM_LAUNCH_QPN8_ROW_GROUP(12);
+  } else {
+    VLLM_LAUNCH_QPN8_ROW_GROUP(16);
+  }
+#undef VLLM_LAUNCH_QPN8_ROW_GROUP
+}
+
 void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                             torch::Tensor codes, torch::Tensor group_scales,
                             int64_t split_k, int64_t accumulator_chains,
@@ -1437,14 +1519,18 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gemm_sm70_out: N must be a positive multiple of 32");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
+  const bool row_group_scales = !channel_scales && k % 32 == 0 &&
+                                group_scales.size(0) == k / 32 &&
+                                group_scales.size(1) == n;
   const bool block_scales =
       group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
-  TORCH_CHECK(channel_scales ? (k > 0 && k % 16 == 0) : (k > 0 && k % 128 == 0),
-              "fp8_qpn8_gemm_sm70_out: channel scales require K%16=0; "
-              "block scales require K%128=0");
+  TORCH_CHECK((channel_scales || row_group_scales) ? (k > 0 && k % 16 == 0)
+                                                   : (k > 0 && k % 128 == 0),
+              "fp8_qpn8_gemm_sm70_out: channel and row-group scales require "
+              "K%16=0 (row-group also K%32=0); block scales require K%128=0");
   TORCH_CHECK(codes.numel() == n * k,
               "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
-  TORCH_CHECK(channel_scales || block_scales,
+  TORCH_CHECK(channel_scales || row_group_scales || block_scales,
               "fp8_qpn8_gemm_sm70_out: scale shape mismatch");
   TORCH_CHECK(m <= 8 || channel_scales,
               "fp8_qpn8_gemm_sm70_out: M=9..32 requires channel scales");
@@ -1479,6 +1565,20 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   const auto* input_ptr =
       reinterpret_cast<const half*>(input.data_ptr<at::Half>());
   auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+
+  if (row_group_scales) {
+    TORCH_CHECK(accumulator_chains == 2 && fast_decoder && !prefetch_codes &&
+                    (split_k == 8 || split_k == 12 || split_k == 16),
+                "fp8_qpn8_gemm_sm70_out: row-group scales support split_k "
+                "8/12/16 with two accumulator chains, the fast decoder, and "
+                "no prefetch");
+    launch_fp8_qpn8_row_group_sm70(code_ptr, scale_ptr, input_ptr, output_ptr,
+                                   static_cast<int>(n), static_cast<int>(k),
+                                   static_cast<int>(m),
+                                   static_cast<int>(split_k), stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
 
   if (m > 8 && m <= 16 && channel_scales && n >= 2048 && n % 64 == 0 &&
       k >= 1536 && accumulator_chains == 2 && fast_decoder && !prefetch_codes) {
