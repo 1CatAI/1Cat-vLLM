@@ -298,7 +298,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL: int = 128
     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS: int = 4
     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS: int = 0
-    VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
+    VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = False
     VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
     VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
@@ -4732,14 +4732,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         replacement="parallel_config.communication.awq_overlap_kernel_reducer_blocks=0",
     ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "0"))),
         description=(
             "SM70: fp8 tune small shapes. The consumer locations and unset "
             "defaults are listed below."
         ),
         category="configuration",
-        declared_default="True",
-        effective_default="True",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
