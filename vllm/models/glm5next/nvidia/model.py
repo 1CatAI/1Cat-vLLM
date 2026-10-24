@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import ClassVar, Literal
 
+import regex as re
 import torch
 from torch import nn
 
@@ -45,6 +46,7 @@ from vllm.model_executor.layers.mhc import (
     hc_contract,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8LinearMethod
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     arm_dflash_nvfp4_trace,
 )
@@ -1139,6 +1141,39 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             ]
         return hidden_states
 
+    def _kda_projection_mapping(self) -> list[tuple[str, str, int]]:
+        """KDA input projections as the layers were built: q, k, v packed
+        MXFP8 and b, f_a, g_a BF16, or all six merged into one GEMM. One
+        mapping serves every KDA layer of this stage, so the layers must agree."""
+        splits = {
+            module.split_qkv
+            for module in self.modules()
+            if isinstance(module, Glm5NextLinearAttention)
+        }
+        if len(splits) > 1:
+            raise ValueError(
+                "The checkpoint quantizes in_proj_qkv in some KDA layers of this "
+                "pipeline stage only; their input projections cannot share one "
+                "weight mapping."
+            )
+        if splits == {True}:
+            return [
+                (".in_proj_qkv", ".q_proj", 0),
+                (".in_proj_qkv", ".k_proj", 1),
+                (".in_proj_qkv", ".v_proj", 2),
+                (".in_proj_bfg_a", ".b_proj", 0),
+                (".in_proj_bfg_a", ".f_a_proj", 1),
+                (".in_proj_bfg_a", ".g_a_proj", 2),
+            ]
+        return [
+            (".in_proj_qkvbfg_a", ".q_proj", 0),
+            (".in_proj_qkvbfg_a", ".k_proj", 1),
+            (".in_proj_qkvbfg_a", ".v_proj", 2),
+            (".in_proj_qkvbfg_a", ".b_proj", 3),
+            (".in_proj_qkvbfg_a", ".f_a_proj", 4),
+            (".in_proj_qkvbfg_a", ".g_a_proj", 5),
+        ]
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1150,13 +1185,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Indexer: fuse wk and weights_proj
             (".wk_weights_proj", ".wk", 0),
             (".wk_weights_proj", ".weights_proj", 1),
-            # KDA: merge q, k, v, b, f_a, g_a projections into one GEMM
-            (".in_proj_qkvbfg_a", ".q_proj", 0),
-            (".in_proj_qkvbfg_a", ".k_proj", 1),
-            (".in_proj_qkvbfg_a", ".v_proj", 2),
-            (".in_proj_qkvbfg_a", ".b_proj", 3),
-            (".in_proj_qkvbfg_a", ".f_a_proj", 4),
-            (".in_proj_qkvbfg_a", ".g_a_proj", 5),
+            *self._kda_projection_mapping(),
         ]
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1468,9 +1497,15 @@ class Glm5NextForCausalLM(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        # ModelOpt MXFP8 modules (KDA q/k/v/o, dense MLPs, lm_head) are held
-        # unquantized: no kernel serves E8M0-per-32 weights before SM80.
-        return loader.load_weights(dequantize_mxfp8_weight_pairs(weights))
+        # ModelOpt MXFP8 modules the model builds as MXFP8 linears stay
+        # packed (QPN8 serves E8M0-per-32 weights); the others (lm_head) are
+        # dequantized.
+        return loader.load_weights(
+            dequantize_mxfp8_weight_pairs(
+                weights,
+                keep_quantized=_mxfp8_held_modules(self, self.quant_config),
+            )
+        )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1485,6 +1520,7 @@ class Glm5NextForConditionalGeneration(
     # tower stores gate_up_proj fused and matches it directly).
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "in_proj_qkv": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
         "wk_weights_proj": ["wk", "weights_proj"],
@@ -1530,6 +1566,7 @@ class Glm5NextForConditionalGeneration(
 
         self.config = config
         self.model_config = vllm_config.model_config
+        self.quant_config = vllm_config.quant_config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.is_multimodal_pruning_enabled = (
@@ -1586,7 +1623,12 @@ class Glm5NextForConditionalGeneration(
         # Pair weights with their scales over the whole stream: the loader
         # below calls the language model once per run of its prefix, and the
         # shards interleave those runs with visual tensors.
-        return super().load_weights(dequantize_mxfp8_weight_pairs(weights))
+        return super().load_weights(
+            dequantize_mxfp8_weight_pairs(
+                weights,
+                keep_quantized=_mxfp8_held_modules(self, self.quant_config),
+            )
+        )
 
 
 def get_spec_layer_idx_from_weight_name(
@@ -1602,6 +1644,36 @@ def get_spec_layer_idx_from_weight_name(
             ) or weight_name.startswith(f"layers.{layer_idx + i}."):
                 return layer_idx + i
     return None
+
+
+# Checkpoint and model prefix the same module differently
+# (``model.language_model.layers.4.`` against ``language_model.model.layers.4.``);
+# the name from the layer or block index on is common to both.
+_FROM_LAYER_INDEX = re.compile(r"(?:layers|blocks)\.\d+\..*$")
+
+
+def _from_layer_index(name: str) -> str:
+    match = _FROM_LAYER_INDEX.search(name)
+    return match.group(0) if match else name
+
+
+def _mxfp8_held_modules(
+    model: nn.Module, quant_config: QuantizationConfig | None
+) -> Callable[[str], bool]:
+    """Tells which checkpoint modules the built model holds as MXFP8 linears.
+    A fused module counts for each of its checkpoint shards, as the quant
+    config resolved it: the language model, whether it loads on its own or
+    inside the multimodal model, gets the same answer."""
+    packed_modules = quant_config.packed_modules_mapping if quant_config else {}
+    held: set[str] = set()
+    for name, module in model.named_modules():
+        if not isinstance(
+            getattr(module, "quant_method", None), ModelOptMxFp8LinearMethod
+        ):
+            continue
+        parent, _, leaf = _from_layer_index(name).rpartition(".")
+        held.update(f"{parent}.{shard}" for shard in packed_modules.get(leaf, [leaf]))
+    return lambda module: _from_layer_index(module) in held
 
 
 # ModelOpt csf_32x2_v1 routed-expert scales: `<expert proj>.weight_scale.csf32_<part>`.

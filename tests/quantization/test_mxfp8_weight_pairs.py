@@ -108,3 +108,37 @@ def test_pairs_survive_a_split_by_top_level_prefix():
         "model.language_model.layers.11.self_attn.q_b_proj.weight",
         "model.language_model.layers.11.self_attn.q_b_proj.weight_scale",
     ] in runs
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_a_kept_mxfp8_pair_passes_through_in_stream_order(scale_first):
+    weight = ("m.o_proj.weight", _fp8(2, 64))
+    scale = ("m.o_proj.weight_scale", torch.full((2, 2), 128, dtype=torch.uint8))
+    stream = [scale, weight] if scale_first else [weight, scale]
+    out = list(
+        dequantize_mxfp8_weight_pairs(
+            stream, keep_quantized=lambda module: module == "m.o_proj"
+        )
+    )
+    assert len(out) == len(stream)
+    assert all(got is expected for got, expected in zip(out, stream))
+
+
+def test_modules_the_model_does_not_keep_are_still_dequantized():
+    kept_weight = ("m.o_proj.weight", _fp8(2, 64))
+    kept_scale = ("m.o_proj.weight_scale", torch.full((2, 2), 128, dtype=torch.uint8))
+    other_weight = ("m.lm_head.weight", _fp8(2, 64))
+    other_scale = ("m.lm_head.weight_scale", torch.full((2, 2), 128, dtype=torch.uint8))
+    out = list(
+        dequantize_mxfp8_weight_pairs(
+            [kept_weight, other_weight, kept_scale, other_scale],
+            keep_quantized=lambda module: module == "m.o_proj",
+        )
+    )
+    assert _names(out) == [
+        "m.o_proj.weight",
+        "m.o_proj.weight_scale",
+        "m.lm_head.weight",
+    ]
+    assert out[2][1].dtype == torch.bfloat16
+    assert torch.equal(out[2][1], torch.full((2, 64), 3.0, dtype=torch.bfloat16))
