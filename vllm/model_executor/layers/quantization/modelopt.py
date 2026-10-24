@@ -2581,6 +2581,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             activation_scheme="dynamic",
             weight_block_size=[block_size, block_size],
         )
+        # Built only for checkpoints that name MXFP8 layers: the config logs
+        # a "detected MXFP8 checkpoint" warning on construction.
+        self.mxfp8_config: ModelOptMxFp8Config | None = (
+            ModelOptMxFp8Config(
+                is_checkpoint_mxfp8_serialized=True,
+                kv_cache_quant_algo=kv_cache_quant_method,
+                exclude_modules=[],
+            )
+            if any(
+                info.get("quant_algo", "").upper() == "MXFP8"
+                for info in quantized_layers.values()
+            )
+            else None
+        )
 
     def has_blocked_weights(self) -> bool:
         return any(
@@ -2739,6 +2753,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         return None
 
+    def is_quantized(self, prefix: str) -> bool:
+        """Whether ``quantized_layers`` names this module, or the shards of a
+        fused one."""
+        return self._resolve_quant_algo(prefix) is not None
+
     def _resolve_scale_encoding(self, prefix: str) -> str | None:
         """The `weight_scale_encoding` a layer's recipe names, e.g. csf_32x2_v1."""
         for candidate in self._quantized_layer_prefix_candidates(prefix):
@@ -2794,10 +2813,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
-            # Layers not in quantized_layers stay unquantized. So do MXFP8
-            # layers: no kernel serves E8M0-per-32 weights before SM80, so
-            # the model loader dequantizes them (see dequantize_mxfp8_pairs).
-            # An LM head keeps its own UnquantizedEmbeddingMethod.
+            if quant_algo == "MXFP8" and isinstance(layer, LinearBase):
+                # Built whenever quantized_layers names an MXFP8 layer.
+                assert self.mxfp8_config is not None
+                return ModelOptMxFp8LinearMethod(self.mxfp8_config)
+            # Layers not in quantized_layers stay unquantized, and so does an
+            # MXFP8 LM head: the model loader dequantizes both (see
+            # dequantize_mxfp8_weight_pairs). An LM head keeps its own
+            # UnquantizedEmbeddingMethod.
             return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
 
         if isinstance(layer, RoutedExperts):

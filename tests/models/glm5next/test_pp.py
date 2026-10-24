@@ -308,3 +308,30 @@ def test_glm53_merged_kda_state_contract(num_spec: int):
         (6144, conv_width) if is_conv_state_dim_first() else (conv_width, 6144)
     )
     assert model_shapes[0] == expected_conv
+
+
+def _kda_layer(split_qkv: bool) -> Glm5NextLinearAttention:
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    nn.Module.__init__(layer)
+    layer.split_qkv = split_qkv
+    return layer
+
+
+@pytest.mark.parametrize(
+    "splits,target",
+    [((True, True), ".in_proj_qkv"), ((False, False), ".in_proj_qkvbfg_a")],
+)
+def test_kda_projection_mapping_follows_the_built_layers(splits, target):
+    model = _bare_glm_model()
+    model.layers = nn.ModuleList(_kda_layer(split) for split in splits)
+    mapping = {shard: param for param, shard, _ in model._kda_projection_mapping()}
+    assert mapping[".q_proj"] == target
+
+
+def test_kda_projection_mapping_rejects_layers_that_disagree():
+    # One mapping serves the stage; mixed layers would map some names to a
+    # projection the layer does not have.
+    model = _bare_glm_model()
+    model.layers = nn.ModuleList([_kda_layer(True), _kda_layer(False)])
+    with pytest.raises(ValueError, match="in_proj_qkv in some KDA layers"):
+        model._kda_projection_mapping()
