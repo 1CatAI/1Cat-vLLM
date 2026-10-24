@@ -157,6 +157,10 @@ deployment warmed 102 profiles and added about six minutes to startup. This
 bounded coverage does not guarantee that arbitrary unseen shapes avoid JIT
 compilation; three or more simultaneous partial tails are outside its coverage.
 
+For an opt-in policy that separates a two-request decode tail at feedback
+depth two, see [PP decode staggering](../design/pp_decode_stagger.md). It
+requires a separate performance comparison; it is disabled by default.
+
 ## Optional decode transport and feedback packing
 
 Two independent boolean options allow a staged rollout of the communication

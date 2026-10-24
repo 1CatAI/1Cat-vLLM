@@ -661,6 +661,25 @@ class VllmConfig:
             return max(2, self.scheduler_config.sm70_queue_depth())
         return pp_size
 
+    def _validate_pp_decode_stagger(self) -> None:
+        if not self.scheduler_config.pp_decode_stagger or self.is_speculative_draft:
+            # Internal draft configs inherit target scheduling options but do
+            # not construct an independent target scheduler.
+            return
+        if (
+            self.parallel_config.pipeline_parallel_size <= 1
+            or not self.scheduler_config.async_scheduling
+            or not self.use_v2_model_runner
+            or self.parallel_config.distributed_executor_backend != "mp"
+            or self.scheduler_config.scheduler_cls is not None
+            or self.max_concurrent_batches != 2
+        ):
+            raise ValueError(
+                "pp_decode_stagger requires PP > 1, Model Runner V2, async "
+                "scheduling with the multiprocessing executor (mp), the "
+                "default scheduler, and a batch/feedback depth of 2."
+            )
+
     def _validate_pp_async_queue_depth(self) -> None:
         depth = self.scheduler_config.pp_async_queue_depth
         if depth is None:
@@ -1408,6 +1427,7 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = True
 
         self._validate_pp_async_queue_depth()
+        self._validate_pp_decode_stagger()
         logger.info_once(
             "Asynchronous scheduling is %s.",
             "enabled" if self.scheduler_config.async_scheduling else "disabled",

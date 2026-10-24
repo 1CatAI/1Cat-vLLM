@@ -739,6 +739,7 @@ class EngineArgs:
     async_scheduling: bool | None = SchedulerConfig.async_scheduling
 
     pp_async_queue_depth: int | None = SchedulerConfig.pp_async_queue_depth
+    pp_decode_stagger: bool = SchedulerConfig.pp_decode_stagger
 
     stream_interval: int = SchedulerConfig.stream_interval
 
@@ -1491,6 +1492,9 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--pp-async-queue-depth", **scheduler_kwargs["pp_async_queue_depth"]
+        )
+        scheduler_group.add_argument(
+            "--pp-decode-stagger", **scheduler_kwargs["pp_decode_stagger"]
         )
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
@@ -2333,6 +2337,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             pp_async_queue_depth=self.pp_async_queue_depth,
+            pp_decode_stagger=self.pp_decode_stagger,
             stream_interval=self.stream_interval,
         )
 

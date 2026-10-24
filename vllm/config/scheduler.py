@@ -203,6 +203,17 @@ class SchedulerConfig:
     per decode batch at the cost of pipeline overlap. Restart to change it.
     """
 
+    pp_decode_stagger: bool = False
+    """Separate two ready decode requests across consecutive PP batches.
+
+    Opt-in for V2 asynchronous scheduling with the multiprocessing executor
+    and a batch/feedback depth of two. Unsupported target configurations are
+    rejected. With exactly two resident decoders and no waiting requests,
+    defer the second request for one scheduling step after the first has
+    successfully acquired KV slots. Never advance feedback eligibility.
+    Other request counts and mixed prefill/decode retain the normal policy.
+    """
+
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.
     A smaller value (1) makes streaming smoother by sending each token immediately,

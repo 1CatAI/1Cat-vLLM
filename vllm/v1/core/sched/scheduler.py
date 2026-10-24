@@ -53,6 +53,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.pp_causal_trace import PPCausalTrace
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -85,6 +86,7 @@ def _ddtree_debug_log(message: str, *args: object) -> None:
 class Scheduler(SchedulerInterface):
     _mixed_prefill_trace: MixedPrefillTrace | None = None
     _early_prefill_quota: EarlyPrefillQuota | None = None
+    _pp_causal_trace: PPCausalTrace | None = None
 
     def __init__(
         self,
@@ -98,6 +100,12 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        causal_additional = vllm_config.additional_config
+        self._pp_causal_trace = PPCausalTrace.from_config(
+            causal_additional.get("pp_causal_trace")
+            if isinstance(causal_additional, dict)
+            else None
+        )
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -618,6 +626,8 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
+        if self._pp_causal_trace is not None:
+            self._pp_causal_trace.schedule_begin(self)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -756,6 +766,23 @@ class Scheduler(SchedulerInterface):
                 budget=self.max_num_scheduled_tokens,
             )
 
+        # Two ready decoders can otherwise remain in the same PP batch,
+        # followed by a feedback-only step, indefinitely. Split only this pure
+        # decode tail: one successful allocation now, the other on the next
+        # scheduling step. Eligibility and speculative state remain unchanged
+        # for the deferred request. Reevaluate after every 3 -> 2 transition;
+        # waiting work and mixed prefill use the existing admission policy.
+        stagger_ready_decoders = (
+            self.scheduler_config.pp_decode_stagger
+            and self.scheduler_config.async_scheduling
+            and self.use_v2_model_runner
+            and is_pp
+            and self.vllm_config.max_concurrent_batches == 2
+            and len(self.running) == len(resident_tokens) == 2
+            and not self.waiting
+            and not self.skipped_waiting
+        )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -778,6 +805,17 @@ class Scheduler(SchedulerInterface):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
+                req_index += 1
+                continue
+
+            if (
+                stagger_ready_decoders
+                and scheduled_running_reqs
+                and not preempted_reqs
+                and len(self.running) == 2
+            ):
+                # The earlier request is already allocated and scheduled.
+                # Do not consume this request's drafts or touch its KV state.
                 req_index += 1
                 continue
 
@@ -1506,6 +1544,8 @@ class Scheduler(SchedulerInterface):
             )
         if self._mixed_prefill_trace is not None:
             self._mixed_prefill_trace.end_schedule(self, scheduler_output)
+        if self._pp_causal_trace is not None:
+            self._pp_causal_trace.schedule_end(self, scheduler_output)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1876,6 +1916,10 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self._pp_causal_trace is not None:
+            self._pp_causal_trace.feedback_begin(
+                self, scheduler_output, model_runner_output
+            )
         if self._mixed_prefill_trace is not None:
             trace_budget_before = budget_snapshot(self.mixed_prefill_budget)
         self.mixed_prefill_budget.update(model_runner_output.mixed_prefill_timing)
@@ -2223,6 +2267,8 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        if self._pp_causal_trace is not None:
+            self._pp_causal_trace.feedback_end(self, scheduler_output)
         return engine_core_outputs
 
     @staticmethod
