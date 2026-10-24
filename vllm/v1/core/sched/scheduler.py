@@ -41,6 +41,11 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
+from vllm.v1.core.sched.mixed_prefill_trace import (
+    MixedPrefillTrace,
+    budget_snapshot,
+    create_mixed_prefill_trace,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -77,6 +82,8 @@ def _ddtree_debug_log(message: str, *args: object) -> None:
 
 
 class Scheduler(SchedulerInterface):
+    _mixed_prefill_trace: MixedPrefillTrace | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -394,6 +401,9 @@ class Scheduler(SchedulerInterface):
             self._re_block_ids: dict[str, list[int]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        self._mixed_prefill_trace = create_mixed_prefill_trace(
+            vllm_config.additional_config, self
+        )
 
     @staticmethod
     def _ddtree_payload_is_flat_chain(payload: object) -> bool:
@@ -663,6 +673,15 @@ class Scheduler(SchedulerInterface):
             and not self.scheduler_config.disable_chunked_mm_input
             and not self.is_encoder_decoder
         )
+
+        if self._mixed_prefill_trace is not None:
+            self._mixed_prefill_trace.begin_schedule(
+                self,
+                prefill_remaining,
+                resident_tokens,
+                has_inflight_decode,
+                control_mixed_prefill,
+            )
 
         def limit_prefill(req_id: str, tokens: int) -> int:
             if not control_mixed_prefill or prefill_remaining.get(req_id, 0) <= 0:
@@ -1432,6 +1451,8 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self._mixed_prefill_trace is not None:
+            self._mixed_prefill_trace.end_schedule(self, scheduler_output)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1802,7 +1823,16 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self._mixed_prefill_trace is not None:
+            trace_budget_before = budget_snapshot(self.mixed_prefill_budget)
         self.mixed_prefill_budget.update(model_runner_output.mixed_prefill_timing)
+        if self._mixed_prefill_trace is not None:
+            self._mixed_prefill_trace.feedback(
+                self,
+                scheduler_output,
+                model_runner_output.mixed_prefill_timing,
+                trace_budget_before,
+            )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
