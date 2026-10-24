@@ -40,14 +40,12 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
 from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
-from vllm.model_executor.layers.quantization.modelopt import (
-    ModelOptMixedPrecisionConfig,
-)
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
+from vllm.models.glm5next.nvidia.quant import declared_quant_config
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -400,16 +398,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         exact_fp16_projection = (
             self._use_sm70_exact_kda_gemv or self._use_sm70_glm53_tp8_cublaslt
         )
-        declared_quant_config = (
-            saved_quant_config
-            if isinstance(saved_quant_config, ModelOptMixedPrecisionConfig)
-            and not exact_fp16_projection
-            else None
+        declared_config = (
+            None if exact_fp16_projection else declared_quant_config(saved_quant_config)
         )
-        self.quant_config = declared_quant_config
+        self.quant_config = declared_config
         # q/k/v split from b/f_a/g_a: those three stay BF16 in the checkpoint.
-        self.split_qkv = declared_quant_config is not None and (
-            declared_quant_config.is_quantized(f"{prefix}.in_proj_qkv")
+        self.split_qkv = declared_config is not None and (
+            declared_config.is_quantized(f"{prefix}.in_proj_qkv")
         )
 
         if self.split_qkv:
