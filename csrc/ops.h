@@ -447,6 +447,12 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
 void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
                               torch::Tensor weight);
 
+void sm70_glm53_sparse_mla_fp8_out(torch::Tensor out, torch::Tensor o_part,
+                                   torch::Tensor ml, torch::Tensor q,
+                                   torch::Tensor kv_cache,
+                                   torch::Tensor indices, torch::Tensor lengths,
+                                   double scale);
+
 void sm70_glm53_moe_permute_q8_out(torch::Tensor input, torch::Tensor topk_ids,
                                    torch::Tensor permuted_input,
                                    torch::Tensor sorted_row_idx,
