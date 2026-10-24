@@ -103,6 +103,7 @@ from .multimodal import (
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
 )
+from .quant import declared_quant_config
 
 logger = init_logger(__name__)
 
@@ -414,7 +415,15 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                # fused_qkv_a_proj stays BF16: the NoPE padding of kv_a leaves its
+                # 2624 rows off the 128 x 128 block grid. q_b_proj and o_proj stay
+                # packed where the checkpoint names them (block FP8); a projection
+                # it does not name resolves to BF16. MTP layers load through
+                # their own path.
+                quant_config=None,
+                projection_quant_config=(
+                    None if is_mtp_layer else declared_quant_config(quant_config)
+                ),
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=getattr(config, "mla_nope", False),
