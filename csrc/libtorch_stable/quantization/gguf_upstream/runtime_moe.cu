@@ -392,10 +392,20 @@ MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
 Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
                                    const Tensor& topk_ids, int64_t type,
                                    int64_t row, int64_t top_k, int64_t tokens,
-                                   int64_t k, MoeKernel requested) {
+                                   int64_t k, MoeKernel requested,
+                                   bool pack_independent_rows = false) {
   const int32_t device_index = X.get_device_index();
   const DeviceGuard device_guard(device_index);
   const auto& device = ggml_cuda_info().devices[device_index];
+  if (pack_independent_rows) {
+    STD_TORCH_CHECK(
+        requested == MoeKernel::kMmvq && device.cc == GGML_CUDA_CC_VOLTA &&
+            X.scalar_type() == ScalarType::Half && type == GGML_TYPE_IQ4_XS &&
+            tokens == 40 && top_k == 1 && k == 2048 && row == 4096 &&
+            W.size(0) == 288 && W.size(2) == 1088,
+        kMoeNotEligibleMarker,
+        ": packed MMVQ requires the calibrated SM70 FP16 IQ4_XS down shape");
+  }
   // Grouped dense sorts expert IDs on the host and cannot run during CUDA
   // graph capture. Check the dense BLAS shape constraints before selecting it.
   const bool grouped_eligible = !is_upstream_float_type(type) &&
@@ -441,7 +451,23 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
       static_cast<const int32_t*>(topk_ids.data_ptr()), top_k, tokens);
   ggml_tensor dst = make_moe_output_tensor(buffers.result, row, top_k, tokens);
 
-  if (kernel == MoeKernel::kMmvq && tokens <= chunk_size) {
+  if (pack_independent_rows) {
+    // Forty independent rows, not five shared inputs: r = token * 5 + channel.
+    // Keep the existing eight-warp MoE kernel and flat output order.
+    constexpr int64_t channels = 5;
+    constexpr int64_t batch = 8;
+    STD_TORCH_CHECK(kernel == MoeKernel::kMmvq && chunk_size >= batch,
+                    kMoeNotEligibleMarker, ": packed MMVQ batch unavailable");
+    src1 = make_moe_input_tensor(buffers.input, k, batch);
+    src1.ne[1] = channels;
+    src1.nb[2] = src1.nb[1] * channels;
+    src1.nb[3] = src1.nb[2] * batch;
+    ids_tensor = make_moe_ids_tensor(
+        static_cast<const int32_t*>(topk_ids.data_ptr()), channels, batch);
+    dst = make_moe_output_tensor(buffers.result, row, channels, batch);
+    ggml_cuda_mul_mat_vec_q(call.context, &src0, &src1, &ids_tensor, &dst);
+    check_launch("upstream packed MoE MMVQ");
+  } else if (kernel == MoeKernel::kMmvq && tokens <= chunk_size) {
     ggml_cuda_mul_mat_vec_q(call.context, &src0, &src1, &ids_tensor, &dst);
     check_launch("upstream MoE MMVQ");
   } else if (kernel == MoeKernel::kMmq && tokens <= chunk_size) {
@@ -492,7 +518,8 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
 
 Tensor run_upstream_moe(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                         int64_t row, int64_t top_k, int64_t tokens,
-                        MoeKernel requested) {
+                        MoeKernel requested,
+                        bool pack_independent_rows = false) {
   check_moe_inputs(X, W, topk_ids, type, row, top_k, tokens);
   const bool float_weight = is_upstream_float_type(type);
   const int64_t k =
@@ -509,7 +536,7 @@ Tensor run_upstream_moe(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
   checked_moe_product(routes, k, "routed input element count");
   checked_moe_product(routes, row, "routed output element count");
   return run_upstream_moe_projection(W, X, topk_ids, type, row, top_k, tokens,
-                                     k, requested);
+                                     k, requested, pack_independent_rows);
 }
 
 Tensor run_aligned_mmq(Tensor X, Tensor W, Tensor sorted_ids, Tensor expert_ids,
@@ -601,6 +628,12 @@ Tensor ggml_moe_mmvq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                      int64_t row, int64_t top_k, int64_t tokens) {
   return run_upstream_moe(X, W, topk_ids, type, row, top_k, tokens,
                           MoeKernel::kMmvq);
+}
+
+Tensor ggml_moe_mmvq_packed(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                            int64_t row, int64_t top_k, int64_t tokens) {
+  return run_upstream_moe(X, W, topk_ids, type, row, top_k, tokens,
+                          MoeKernel::kMmvq, true);
 }
 
 Tensor ggml_moe_mmq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
