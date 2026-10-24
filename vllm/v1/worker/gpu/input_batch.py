@@ -99,6 +99,9 @@ class InputBatch:
     is_incomplete_prefilling_np: np.ndarray | None = None
     # Dummy profiling and graph-capture inputs must never write KV slots.
     is_dummy_batch: bool = False
+    # Context bound a context-bucket graph is captured at; the attention
+    # metadata is built for this length instead of the model's maximum.
+    capture_context_len: int | None = None
 
     @classmethod
     def make_dummy(
@@ -106,7 +109,13 @@ class InputBatch:
         num_reqs: int,
         num_tokens: int,
         input_buffers: InputBuffers,
+        context_len: int | None = None,
     ) -> "InputBatch":
+        """Dummy batch for profiling and graph capture.
+
+        ``context_len`` (a context-bucket graph's bound) gives every request
+        that sequence length; otherwise seq_len equals query_len.
+        """
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
 
@@ -146,6 +155,15 @@ class InputBatch:
         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
         # Dummy: seq_len == query_len (fresh-prefill shape).
         seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
+        num_computed_tokens_np = np.zeros(num_reqs, dtype=np.int32)
+        if context_len is not None:
+            assert context_len >= int(num_scheduled_tokens.max())
+            # query_start_loc above already holds the query offsets.
+            input_buffers.seq_lens[:num_reqs] = context_len
+            seq_lens_cpu_upper_bound = torch.full(
+                (num_reqs,), context_len, dtype=torch.int32
+            )
+            num_computed_tokens_np = context_len - num_scheduled_tokens
         return cls(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -164,7 +182,7 @@ class InputBatch:
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=None,
-            num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+            num_computed_tokens_np=num_computed_tokens_np,
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
@@ -176,6 +194,7 @@ class InputBatch:
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=False,
             is_dummy_batch=True,
+            capture_context_len=context_len,
         )
 
 

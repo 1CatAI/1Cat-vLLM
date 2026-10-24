@@ -66,7 +66,9 @@ def get_parallel_drafting_token_id(hf_config) -> int:
         return int(hf_config.pard_token)
     if hasattr(hf_config, "ptd_token_id"):
         return int(hf_config.ptd_token_id)
+    if hasattr(hf_config, "dspark_noise_token_id"):
+        return int(hf_config.dspark_noise_token_id)
     raise ValueError(
         "Model config must specify dflash_config.mask_token_id, pard_token, "
-        "or ptd_token_id for parallel drafting."
+        "ptd_token_id, or dspark_noise_token_id for parallel drafting."
     )
