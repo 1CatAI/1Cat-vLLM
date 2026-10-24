@@ -20,8 +20,11 @@ def _volta_gencode_flags():
             continue
         ptx = arch.endswith("+PTX")
         arch = arch.removesuffix("+PTX")
-        if arch not in {"7.0", "7.2"}:
-            raise ValueError("Flash-V100 supports only CUDA architectures 7.0 and 7.2")
+        # fused_mma.h knows the WMMA fragment layouts of these architectures.
+        if arch not in {"7.0", "7.2", "7.5"}:
+            raise ValueError(
+                "Flash-V100 supports only CUDA architectures 7.0, 7.2 and 7.5"
+            )
         digits = arch.replace(".", "")
         flags.extend(["-gencode", f"arch=compute_{digits},code=sm_{digits}"])
         if ptx:

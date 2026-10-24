@@ -1,9 +1,12 @@
 #ifndef FUSED_MMA_H
 #define FUSED_MMA_H
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ != 700 && __CUDA_ARCH__ != 720)
+// Fragment element positions are architecture-specific. Kernels that touch
+// elements by row use accumulator_16x16_rows(), which knows these layouts.
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ != 700 && __CUDA_ARCH__ != 720 && __CUDA_ARCH__ != 750)
   #error \
-      "Volta WMMA: This header is for sm_70/sm_72 ONLY! Compile with -arch=sm_70 or -arch=sm_72"
+      "Volta WMMA: This header supports sm_70/sm_72/sm_75 only. Compile with -arch=sm_70, sm_72 or sm_75"
 #endif
 
 #include <cuda_fp16.h>
@@ -107,6 +110,26 @@ __device__ __forceinline__ unsigned get_lane_id() {
   unsigned lane_id;
   asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
   return lane_id;
+}
+
+// Rows of a 16x16x16 FP32 accumulator fragment held by this lane: elements
+// x[0], x[1], x[4], x[5] lie in `first`, x[2], x[3], x[6], x[7] in `second`.
+struct accumulator_rows {
+  int first;
+  int second;
+};
+
+__device__ __forceinline__ accumulator_rows accumulator_16x16_rows() {
+  const int lane = static_cast<int>(get_lane_id());
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  // Turing executes the tile as m16n8k8 MMAs: rows lane / 4 and lane / 4 + 8.
+  const int row = lane >> 2;
+  return {row, row + 8};
+#else
+  // Volta quad-pair layout of HMMA.884.
+  const int row = (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
+  return {row, row + 2};
+#endif
 }
 
 template <int M, int N, int K>
