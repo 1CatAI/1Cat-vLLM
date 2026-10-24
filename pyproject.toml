@@ -156,6 +156,8 @@ inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
 iy = "iy"
+# EXL3 (exllamav3) input sign/scale vector
+suh = "suh"
 indx = "indx"
 # intel cpu features
 tme = "tme"
