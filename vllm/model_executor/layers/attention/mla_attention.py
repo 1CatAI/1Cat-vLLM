@@ -637,16 +637,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if attn_metadata is None:
             # During the profile run try to simulate to worse case output size
             # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            _ = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
+            # since this can be large. Sparse impls only run forward_mqa and
+            # never up-project the cached context, so they reserve nothing
+            # (GLM-5.3-Flash: 1 GiB at 16k, 4 GiB from 64k tokens on every stage).
+            if not isinstance(self.impl, SparseMLAAttentionImpl):
+                _ = torch.empty(
+                    (
+                        self.chunked_prefill_workspace_size,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
@@ -1399,8 +1402,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # Try for 8 full length requests, never more than the scheduler can
             # hold at once, or at least 4 pages per request. A single-sequence
             # engine keeps one request's context per chunk; the profile run
-            # sizes the kv_b_proj output by this (GLM-5.3-Flash: 64 heads x 512
-            # x 64k tokens = 4 GiB on every pipeline stage).
+            # sizes the kv_b_proj output by this (dense impls only; a sparse impl
+            # never up-projects the context, see `forward_impl`).
             max(
                 min(8, scheduler_config.max_num_seqs) * model_config.max_model_len,
                 4 * scheduler_config.max_num_seqs * cache_config.block_size,
