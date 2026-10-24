@@ -91,6 +91,16 @@ class SchedulerConfig:
     and running requests. Only applies when long_prefill_token_threshold is
     nonzero."""
 
+    pp_prefill_quota_compensation: bool = False
+    """Bound early partial-prefill service skew in V2 asynchronous PP.
+
+    A newly admitted, equally prioritized group may redistribute its usual
+    quota briefly, retaining at least half each request's fair share. Only
+    initially uncached partial prefills admitted within one feedback window
+    qualify. Existing
+    mixed-decode, allocation and recurrent-state limits remain in force.
+    """
+
     mixed_prefill_step_latency_ms: float = Field(default=250.0, ge=0)
     """Soft target: GPU step time (PP=1), engine-observed batch latency (PP>1).
     PP includes queueing and protects in-flight decode. Pure prefill keeps the

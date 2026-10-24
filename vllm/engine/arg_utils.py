@@ -560,6 +560,7 @@ class EngineArgs:
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
     mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+    pp_prefill_quota_compensation: bool = SchedulerConfig.pp_prefill_quota_compensation
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
@@ -1447,6 +1448,10 @@ class EngineArgs:
             "--long-prefill-token-threshold-adaptive",
             **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
         )
+        scheduler_group.add_argument(
+            "--pp-prefill-quota-compensation",
+            **scheduler_kwargs["pp_prefill_quota_compensation"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         scheduler_group.add_argument(
             "--mixed-prefill-step-latency-ms",
@@ -2320,6 +2325,7 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+            pp_prefill_quota_compensation=self.pp_prefill_quota_compensation,
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),

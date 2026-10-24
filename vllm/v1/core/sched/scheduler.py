@@ -39,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.sched.early_prefill import EarlyPrefillQuota
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.mixed_prefill_trace import (
@@ -83,6 +84,7 @@ def _ddtree_debug_log(message: str, *args: object) -> None:
 
 class Scheduler(SchedulerInterface):
     _mixed_prefill_trace: MixedPrefillTrace | None = None
+    _early_prefill_quota: EarlyPrefillQuota | None = None
 
     def __init__(
         self,
@@ -133,6 +135,11 @@ class Scheduler(SchedulerInterface):
         )
         self.adaptive_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold_adaptive
+        )
+        self._early_prefill_quota = (
+            EarlyPrefillQuota()
+            if self.scheduler_config.pp_prefill_quota_compensation
+            else None
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.mixed_prefill_budget = MixedPrefillBudget(
@@ -735,6 +742,20 @@ class Scheduler(SchedulerInterface):
                 self.max_num_scheduled_tokens // num_eligible_reqs,
             )
 
+        early_prefill_quotas: dict[str, int] = {}
+        if self._early_prefill_quota is not None:
+            early_prefill_quotas = self._early_prefill_quota.plan(
+                self.running,
+                waiting=bool(
+                    self.waiting
+                    or self.skipped_waiting
+                    or self._pause_state != PauseState.UNPAUSED
+                ),
+                step=self.current_step,
+                nominal=long_prefill_token_threshold,
+                budget=self.max_num_scheduled_tokens,
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -812,8 +833,11 @@ class Scheduler(SchedulerInterface):
                         request.request_id,
                         num_new_tokens,
                     )
-            if 0 < long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = long_prefill_token_threshold
+            request_prefill_threshold = early_prefill_quotas.get(
+                request.request_id, long_prefill_token_threshold
+            )
+            if 0 < request_prefill_threshold < num_new_tokens:
+                num_new_tokens = request_prefill_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
             num_new_tokens = self._balanced_prefill_chunk(
                 request, request.num_computed_tokens, num_new_tokens
@@ -933,6 +957,11 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
+                    if self._early_prefill_quota is not None:
+                        # Do not change this request's already aligned chunk.
+                        # Subsequent requests revert to the original quota.
+                        self._early_prefill_quota.cancel()
+                        early_prefill_quotas.clear()
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -1451,6 +1480,30 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self._early_prefill_quota is not None:
+            self._early_prefill_quota.observe(
+                self.running,
+                self.requests,
+                scheduler_output.num_scheduled_tokens,
+                admitted=frozenset(
+                    request.request_id for request in scheduled_new_reqs
+                ),
+                waiting=bool(
+                    self.waiting
+                    or self.skipped_waiting
+                    or self._pause_state != PauseState.UNPAUSED
+                ),
+                step=self.current_step,
+                budget=self.max_num_scheduled_tokens,
+                feedback_depth=getattr(self, "pp_feedback_depth", 1),
+                enabled=(
+                    self.scheduler_config.async_scheduling is True
+                    and self.use_v2_model_runner
+                    and self.parallel_config.pipeline_parallel_size > 1
+                    and self.adaptive_long_prefill_threshold
+                    and self.scheduler_config.long_prefill_token_threshold > 0
+                ),
+            )
         if self._mixed_prefill_trace is not None:
             self._mixed_prefill_trace.end_schedule(self, scheduler_output)
         return scheduler_output
@@ -2533,6 +2586,8 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
+        if self._early_prefill_quota is not None and pause_state != PauseState.UNPAUSED:
+            self._early_prefill_quota.cancel()
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
