@@ -255,8 +255,16 @@ class Gemma4Config(VerifyAndUpdateConfig):
         with different head dimensions for prefill-decode disaggregation.
         """
         hf_text_config = vllm_config.model_config.hf_text_config
-        head_dim = getattr(hf_text_config, "head_dim", None)
-        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+        # head_dim is per-layer; __dict__ bypasses the heterogeneity guard.
+        head_dim = hf_text_config.__dict__.get("head_dim")
+        # global_head_dim only lives in per_layer_config.
+        per_layer = getattr(hf_text_config, "per_layer_config", None)
+        global_head_dim = None
+        if per_layer is not None:
+            try:
+                global_head_dim = per_layer["full_attention"].head_dim
+            except (ValueError, IndexError, AttributeError):
+                pass
 
         # Only force Triton when head dimensions actually differ AND the
         # larger one exceeds FlashAttention's kernel limit (head_size <= 256).

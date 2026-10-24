@@ -520,6 +520,11 @@ class LongCatFlashMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
 
 
 class Gemma4MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def __init__(self, hf_config, hf_text_config):
+        super().__init__(hf_config, hf_text_config)
+        if not getattr(hf_text_config, "allow_global_per_layer_attribute_access", False):
+            hf_text_config.allow_global_per_layer_attribute_access = True
+
     def get_hidden_size(self) -> int:
         # The speculator buffer must match the backbone (target) model's
         # hidden dimension, not the draft model's smaller dimension.
@@ -532,6 +537,12 @@ class Gemma4MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
 
 
 class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def __init__(self, hf_config, hf_text_config):
+        super().__init__(hf_config, hf_text_config)
+        # Allow global access to per-layer attrs (head_dim, num_kv_heads).
+        if not getattr(hf_text_config, "allow_global_per_layer_attribute_access", False):
+            hf_text_config.allow_global_per_layer_attribute_access = True
+
     def is_mm_prefix_lm(self) -> bool:
         # use_bidirectional_attention="vision" describes the vision
         # encoder's self-attention pattern, not the text model's.
@@ -542,13 +553,6 @@ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         # Gemma4 uses dual head dimensions: head_dim (sliding attention)
         # and global_head_dim (full attention).  Return the largest so
         # that attention backends allocate buffers large enough for both.
-        # transformers >=5.18 treats head_dim as a per-layer attribute and
-        # raises AmbiguousGlobalPerLayerAttributeError on global access;
-        # suppress it by enabling the escape hatch.
-        try:
-            self.hf_text_config.allow_global_per_layer_attribute_access = True
-        except (AttributeError, TypeError):
-            pass
         head_dim = getattr(self.hf_text_config, "head_dim", 0)
         global_head_dim = getattr(self.hf_text_config, "global_head_dim", 0)
         return max(head_dim, global_head_dim) or super().get_head_size()

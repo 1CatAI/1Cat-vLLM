@@ -273,17 +273,16 @@ class Gemma4MTPDecoderLayer(nn.Module):
         layer_idx = extract_layer_index(prefix)
         layer_type = config.layer_types[layer_idx]
         is_full_attention = layer_type == "full_attention"
-        head_dim = (
-            getattr(config, "global_head_dim", config.head_dim)
-            if is_full_attention
-            else config.head_dim
-        )
+        if is_full_attention:
+            head_dim = config.per_layer_config[layer_idx].head_dim
+        else:
+            head_dim = config.__dict__["head_dim"]
 
         self.self_attn = Gemma4MTPAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=config.__dict__["num_key_value_heads"],
             head_dim=head_dim,
             max_position_embeddings=config.max_position_embeddings,
             cache_config=cache_config,
