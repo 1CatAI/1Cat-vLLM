@@ -86,6 +86,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.offloader import get_offloader
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
@@ -862,6 +863,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
             )
+            # A step reads only a few rows of this table, so `--cpu-offload-params
+            # embed_tokens` can keep it in pinned host memory (UVA) and leave the
+            # card's 1.18 GiB to the KV pool. Only when named: an unnamed UVA
+            # budget (--cpu-offload-gb alone) stays with the layers it served.
+            if "embed_tokens" in vllm_config.offload_config.uva.cpu_offload_params:
+                self.embed_tokens = get_offloader().wrap_module(
+                    self.embed_tokens, parameter_prefix=f"{prefix}.embed_tokens"
+                )
             if replicate_dflash_embedding:
                 # The final PP stage owns this extra copy solely so DFlash can
                 # borrow it. Mark it unready until load_weights observes the
