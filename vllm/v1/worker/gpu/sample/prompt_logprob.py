@@ -5,6 +5,7 @@ from collections.abc import Callable
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
@@ -66,14 +67,6 @@ class PromptLogprobsWorker:
         if not np.any(needs_prompt_logprobs):
             return {}
 
-        # get the maximum number in this batch
-        requested_num_prompt_logprobs = num_prompt_logprobs[needs_prompt_logprobs]
-        max_num_prompt_logprobs = (
-            -1
-            if np.any(requested_num_prompt_logprobs == -1)
-            else int(requested_num_prompt_logprobs.max())
-        )
-
         # Get the prompt logprobs token_ids.
         prompt_logprobs_token_ids = get_prompt_logprobs_token_ids(
             input_batch.num_tokens,
@@ -83,15 +76,6 @@ class PromptLogprobsWorker:
             all_token_ids,
             prompt_lens_gpu,
         )
-        prompt_token_ids, prompt_logprobs, prompt_ranks = (
-            compute_prompt_logprobs_with_chunking(
-                prompt_logprobs_token_ids,
-                hidden_states[: input_batch.num_tokens],
-                logits_fn,
-                max_num_prompt_logprobs,
-            )
-        )
-
         pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
         is_prompt_chunked = pos_after_step < prompt_lens
 
@@ -111,21 +95,19 @@ class PromptLogprobsWorker:
             if not req_is_prompt_chunked:
                 end_idx -= 1
 
-            width = (
-                prompt_logprobs.shape[1]
-                if req_num_prompt_logprobs == -1
-                else req_num_prompt_logprobs + 1
-            )
-            # no logprobs if start_idx >= end_idx
-            logprobs = (
-                None
-                if start_idx >= end_idx
-                else LogprobsTensors(
-                    logprob_token_ids=prompt_token_ids[start_idx:end_idx, :width],
-                    logprobs=prompt_logprobs[start_idx:end_idx, :width],
-                    selected_token_ranks=prompt_ranks[start_idx:end_idx],
+            # Score only this request's known prompt rows, at its own width.
+            # In particular, a short -1 request must not expand other requests
+            # (or decode rows) to dense full-vocabulary output.
+            logprobs = None
+            if start_idx < end_idx:
+                logprobs = LogprobsTensors(
+                    *compute_prompt_logprobs_with_chunking(
+                        prompt_logprobs_token_ids[start_idx:end_idx],
+                        hidden_states[start_idx:end_idx],
+                        logits_fn,
+                        req_num_prompt_logprobs,
+                    )
                 )
-            )
 
             prompt_logprobs_list = self.in_progress_prompt_logprobs[req_id]
             if logprobs is not None and (req_is_prompt_chunked or prompt_logprobs_list):
@@ -220,16 +202,21 @@ def compute_prompt_logprobs_with_chunking(
     prompt_hidden_states: torch.Tensor,
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
     num_prompt_logprobs: int,
+    *,
+    chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
-    CHUNK_SIZE = 1024
+    if chunk_size is None:
+        chunk_size = envs.VLLM_PROMPT_LOGPROBS_CHUNK_SIZE
+    if not 1 <= chunk_size <= 1024:
+        raise ValueError("prompt logprobs chunk_size must be between 1 and 1024")
     token_ids = []
     logprobs = []
     ranks = []
     prompt_token_ids = prompt_token_ids.to(torch.int64)
-    for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
-        end_idx = start_idx + CHUNK_SIZE
+    for start_idx in range(0, prompt_token_ids.shape[0], chunk_size):
+        end_idx = start_idx + chunk_size
         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
         requested_num_prompt_logprobs = (
@@ -242,9 +229,13 @@ def compute_prompt_logprobs_with_chunking(
             requested_num_prompt_logprobs,
             prompt_token_ids[start_idx:end_idx],
         )
-        token_ids.append(prompt_logprobs.logprob_token_ids)
-        logprobs.append(prompt_logprobs.logprobs)
-        ranks.append(prompt_logprobs.selected_token_ranks)
+        # Blocking D2H bounds GPU output storage independently of prompt length
+        # and prefill steps. AsyncOutput already accepts CPU LogprobsTensors.
+        # Do not retain the previous chunk's logits across the next all-gather.
+        token_ids.append(prompt_logprobs.logprob_token_ids.cpu())
+        logprobs.append(prompt_logprobs.logprobs.cpu())
+        ranks.append(prompt_logprobs.selected_token_ranks.cpu())
+        del prompt_logits, prompt_logprobs
 
     token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
     logprobs = torch.cat(logprobs, dim=0) if len(logprobs) > 1 else logprobs[0]
