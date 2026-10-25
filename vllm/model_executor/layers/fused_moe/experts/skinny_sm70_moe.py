@@ -46,8 +46,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.model_executor.layers.quantization.utils.s5_scales import (
+    S5_MAX_SPREAD,
     S5Scales,
     encode_s5,
+    scale_spread,
 )
 from vllm.platforms import current_platform
 
@@ -410,11 +412,14 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         self._scale_caches: _ScaleCaches | None = None
         # csf_32x2_v1 planes (w13, w2): the block scales above are then shared
         # rasters that each grouped call fills for its routed experts.
-        self._csf_planes: tuple[CsfExpertScales, CsfExpertScales] | None = None
+        self._csf_planes: (
+            tuple[CsfExpertScales | None, CsfExpertScales | None] | None
+        ) = None
         self._csf_scale_entries: torch.Tensor | None = None
         # The same scales as five-bit planes (s5_scales.py), which the kernels
-        # read in place; they replace the csf planes once the weights are loaded.
-        self._s5: tuple[S5Scales, S5Scales] | None = None
+        # read in place; a projection whose rows span more than five bits carry
+        # keeps its csf planes (above) and is expanded to the raster per call.
+        self._s5: tuple[S5Scales | None, S5Scales | None] | None = None
 
     def attach_csf_scales(self, w13: CsfExpertScales, w2: CsfExpertScales) -> None:
         """Serve compressed expert scales; call before process_weights_after_loading."""
@@ -548,18 +553,25 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             sg,
         )
 
-    def _csf_to_s5(self) -> tuple[S5Scales, S5Scales]:
-        """Re-encode the csf planes as five-bit planes and drop the csf planes.
+    def _csf_to_s5(
+        self,
+    ) -> tuple[S5Scales | None, S5Scales | None]:
+        """Re-encode the csf planes as five-bit planes where the rows fit.
 
         Each projection set is expanded for all experts into its shared raster
-        (the expansion kernel the csf planes always went through), then packed.
+        (the expansion kernel the csf planes always went through) and measured;
+        a set whose rows span at most `S5_MAX_SPREAD` is packed and its csf
+        planes are dropped, any other keeps them.
         """
         assert self._csf_planes is not None and self._csf_scale_entries is not None
         scales = self._get_scale_caches()
-        converted = []
+        converted: list[S5Scales | None] = []
+        kept: list[CsfExpertScales | None] = []
+        spreads: list[int] = []
         for planes, raster in zip(
             self._csf_planes, (scales.w1_scales_u8, scales.w2_scales_u8)
         ):
+            assert planes is not None
             experts = raster.shape[0]
             routed = torch.arange(experts, dtype=torch.int32, device=raster.device)
             expand_csf32_experts(
@@ -569,9 +581,24 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                 torch.arange(experts + 1, dtype=torch.int32, device=raster.device),
                 self._csf_scale_entries,
             )
-            converted.append(encode_s5(raster.view(experts, -1), planes.groups))
-        self._csf_planes = None
-        self._csf_scale_entries = None
+            spread = scale_spread(raster.view(experts, -1), planes.groups)
+            spreads.append(spread)
+            fits = spread <= S5_MAX_SPREAD
+            converted.append(
+                encode_s5(raster.view(experts, -1), planes.groups) if fits else None
+            )
+            kept.append(None if fits else planes)
+        self._csf_planes = (kept[0], kept[1])
+        if all(plane is None for plane in kept):
+            self._csf_scale_entries = None
+        if any(plane is not None for plane in kept):
+            logger.info(
+                "Skinny MoE: csf scales stay compressed where five bits do not "
+                "carry them (row spans %d / %d, limit %d)",
+                spreads[0],
+                spreads[1],
+                S5_MAX_SPREAD,
+            )
         return converted[0], converted[1]
 
     def _scale_rasters(
@@ -774,6 +801,21 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         num_slots = topk_ids.numel()
         perm, gids32, goff32 = group_routing(topk_ids)
         s5_w13, s5_w2 = self._s5 if self._s5 is not None else (None, None)
+        if self._csf_planes is not None:
+            # Projections without five-bit planes: csf expanded to the raster here.
+            assert self._csf_scale_entries is not None
+            for planes, raster, five_bit, projection in (
+                (self._csf_planes[0], scales.w1_scales_u8, s5_w13, w1),
+                (self._csf_planes[1], scales.w2_scales_u8, s5_w2, w2),
+            ):
+                if five_bit is None and planes is not None:
+                    expand_csf32_experts(
+                        raster.view(projection.size(0), -1),
+                        planes,
+                        gids32,
+                        goff32,
+                        self._csf_scale_entries,
+                    )
         y13 = torch.empty(
             (num_slots, w1.size(1)), dtype=hidden_states.dtype, device=device
         )

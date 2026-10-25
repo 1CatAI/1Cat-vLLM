@@ -9,6 +9,7 @@ from vllm.model_executor.layers.quantization.utils.s5_scales import (
     S5_MAX_SPREAD,
     decode_s5,
     encode_s5,
+    scale_spread,
 )
 
 
@@ -58,3 +59,11 @@ def test_s5_refuses_a_row_wider_than_five_bits():
     raster[1, 2, 3, 7] = raster[1, 2, 0, 7] + 32  # 32 above the position's smallest
     with pytest.raises(ValueError, match="five-bit"):
         encode_s5(raster.reshape(raster.shape[0], -1), raster.shape[2])
+
+
+@pytest.mark.parametrize("spread", [0, 7, 31, 32, 56])
+def test_scale_spread_reports_the_widest_row(spread):
+    raster = _raster(min(spread, 31)) if spread <= 31 else _raster(31)
+    if spread > 31:
+        raster[2, 4, 5, 9] = raster[2, 4, 0, 9] + spread  # one row spans `spread`
+    assert scale_spread(raster.reshape(raster.shape[0], -1), raster.shape[2]) == spread
