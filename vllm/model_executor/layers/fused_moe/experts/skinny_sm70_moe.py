@@ -15,6 +15,7 @@ codes, MXFP4 one E8M0 scale per 32; the codes, their packing and the fragment
 order are the same, so both formats share the kernels.
 """
 
+import dataclasses
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -601,7 +602,29 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                 spreads[1],
                 S5_MAX_SPREAD,
             )
+        self._release_rasters((converted[0], converted[1]))
         return converted[0], converted[1]
+
+    def _release_rasters(self, packed: tuple[S5Scales | None, S5Scales | None]) -> None:
+        """Let go of the shared raster of every projection now served from five-bit
+        planes (the kernels read the planes and ignore the raster argument); the
+        last layer of a card to do so frees the raster."""
+        caches = self._get_scale_caches()
+        placeholder = caches.w1_scales_u8.new_empty(0)
+        if packed[0] is not None:
+            self._w1_block_scales = placeholder
+            self.quant_config._w1.scale = placeholder
+            caches = dataclasses.replace(caches, w1_scales_u8=placeholder)
+        if packed[1] is not None:
+            self._w2_block_scales = placeholder
+            self.quant_config._w2.scale = placeholder
+            caches = dataclasses.replace(caches, w2_scales_u8=placeholder)
+        self._scale_caches = caches
+
+    def scale_rasters_released(self) -> tuple[bool, bool]:
+        """Which projections no longer need a raster (served from five-bit planes)."""
+        s5 = self._s5 if self._s5 is not None else (None, None)
+        return s5[0] is not None, s5[1] is not None
 
     def _scale_rasters(
         self, layer: torch.nn.Module
