@@ -125,7 +125,7 @@ class MambaHybridModelState(DefaultModelState):
             and speculative_config is not None
             and speculative_config.method == "mtp"
             and device.type == "cuda"
-            and current_platform.is_device_capability(70)
+            and current_platform.is_device_capability_family(70)
         )
         if self._use_mtp4_common_gdn_metadata:
             logger.info_once("SM70 MTP shared GDN batch metadata fast path enabled.")
@@ -139,7 +139,9 @@ class MambaHybridModelState(DefaultModelState):
             )
             and self.cache_config.mamba_cache_mode in ("none", "align")
             and device.type == "cuda"
-            and current_platform.is_device_capability(70)
+            # One Triton launch for all groups; Turing stages (the first stage of a
+            # mixed Volta/Turing pipeline starts every round) need it as much as Volta.
+            and current_platform.is_device_capability_family(70)
         )
         self._use_mtp4_fused_gdn_metadata = bool(
             self._use_mtp4_common_gdn_metadata
