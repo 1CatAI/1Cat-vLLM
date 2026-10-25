@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Explicit compact E4M3 scalar attention for SM70 target tail graphs."""
 
-from functools import lru_cache
+_builtin_scalar_cache: dict = {}
 
 import torch
 
@@ -42,18 +42,20 @@ BUILTIN_SCALAR_MANIFEST = {
 }
 
 
-@lru_cache(maxsize=1)
 def builtin_scalar_tail_attention():
-    try:
-        # The FA2 library loads on first use; resolve it before the lookup.
-        from vllm.vllm_flash_attn.flash_attn_interface import (
-            ensure_fa2_library_loaded,
-        )
+    if "op" not in _builtin_scalar_cache:
+        try:
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                ensure_fa2_library_loaded,
+            )
 
-        ensure_fa2_library_loaded()
-        return getattr(torch.ops._vllm_fa2_C, BUILTIN_SCALAR_OP)
-    except (AttributeError, ImportError):
-        return None
+            ensure_fa2_library_loaded()
+            _builtin_scalar_cache["op"] = getattr(
+                torch.ops._vllm_fa2_C, BUILTIN_SCALAR_OP
+            )
+        except (AttributeError, ImportError):
+            _builtin_scalar_cache["op"] = None
+    return _builtin_scalar_cache["op"]
 
 
 def scalar_tail_attention_available() -> bool:
@@ -69,10 +71,15 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
     )
 
 
-@lru_cache(maxsize=4)
+_scalar_tail_cache: dict = {}
+
+
 def _load_scalar_tail_attention(
     manifest_name: str, device: torch.device, capability: int
 ):
+    cache_key = (manifest_name, device, capability)
+    if cache_key in _scalar_tail_cache:
+        return _scalar_tail_cache[cache_key]
     if manifest_name:
         module, manifest = load_attention_library(manifest_name)
     else:
@@ -92,6 +99,7 @@ def _load_scalar_tail_attention(
     # can be captured at -- which never exceeds the long-context capability.
     if not manifest_name and manifest["max_context"] < capability:
         # A new grouped DSO must not widen an old scalar workspace ABI.
+        _scalar_tail_cache[cache_key] = None
         return None
     if not (
         manifest.get("share_kv_six_heads")
@@ -193,9 +201,14 @@ def _load_scalar_tail_attention(
         )
         return True
 
+    _scalar_tail_cache[cache_key] = run
     return run
 
 
+def _scalar_tail_cache_clear():
+    _scalar_tail_cache.clear()
+
+
 load_scalar_tail_attention.cache_clear = (  # type: ignore[attr-defined]
-    _load_scalar_tail_attention.cache_clear
+    _scalar_tail_cache_clear
 )
