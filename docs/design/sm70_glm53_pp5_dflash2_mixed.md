@@ -15,6 +15,8 @@ CSF records written by the expansion kernel), whose own measurements are in thei
 - Draft: `--speculative-config` with `method dflash`, the DFlash2 drafter, `num_speculative_tokens 7`,
   `draft_sample_method greedy`, `kv_cache_dtype auto`, `attention_backend FLASH_ATTN` (FA2). The draft runs on the last
   stage, an RTX 8000, where the V100-only `flash_attn_v100` kernels refuse to start (`Kernel supports only Volta GPUs`).
+- The LM head stays MXFP8 (QPN8), so the drafter's candidate top-k needs `"sm70_dflash2": {"quant_lm_head": true}` in
+  the speculative config; without it the profile run stops with `DFlash2 requires an unquantized target LM head`.
 - The token embedding (1.18 GiB, and its replica for the draft on the last stage) lives in pinned host memory:
   `--cpu-offload-gb 1.4 --cpu-offload-params embed_tokens`. A step reads a few rows; the table does not need to occupy a
   card. Measured cost: 8 tokens +20 us per step, a 512-token chunk +1.24 ms.

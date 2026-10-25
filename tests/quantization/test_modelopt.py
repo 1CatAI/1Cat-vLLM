@@ -557,12 +557,26 @@ def test_modelopt_mixed_precision_dispatches_mxfp8_linear():
     assert isinstance(gate_up, m.ModelOptMxFp8LinearMethod)
 
 
-def test_modelopt_mixed_precision_leaves_the_mxfp8_lm_head_to_the_loader():
-    # The head keeps its UnquantizedEmbeddingMethod; the model loader
-    # dequantizes its weight pair.
+def test_modelopt_mixed_precision_serves_the_mxfp8_lm_head_as_a_linear():
+    # The head is served like any MXFP8 linear; the model loader keeps its
+    # weight pair packed.
+    from vllm.model_executor.layers.quantization import modelopt as m
+
     config = _mixed_mxfp8_config()
 
-    assert config.get_quant_method(_mock_lm_head(), prefix="lm_head") is None
+    with patch.object(m, "init_mxfp8_linear_kernel"):
+        method = config.get_quant_method(_mock_lm_head(), prefix="lm_head")
+
+    assert isinstance(method, m.ModelOptMxFp8LinearMethod)
+
+
+def test_modelopt_mixed_precision_leaves_an_unlisted_lm_head_unquantized():
+    config = _mixed_mxfp8_config()
+
+    assert (
+        config.get_quant_method(_mock_lm_head(), prefix="language_model.other_head")
+        is None
+    )
 
 
 def test_modelopt_mixed_precision_builds_the_mxfp8_config_only_when_named():
