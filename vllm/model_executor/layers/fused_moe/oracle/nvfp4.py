@@ -275,6 +275,28 @@ def select_nvfp4_moe_backend(
             requested_backend, config, weight_key, activation_key, activation_format
         )
 
+    # Keep the NVFP4 dense and expert paths on the same explicitly requested
+    # software backend. In particular, this lets pre-Blackwell PP ranks avoid
+    # Marlin when a checkpoint fails the numeric correctness gate there.
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    linear_emulation = (
+        envs.VLLM_NVFP4_GEMM_BACKEND == "emulation"
+        or (
+            vllm_config is not None
+            and vllm_config.kernel_config.linear_backend == "emulation"
+        )
+    )
+    if linear_emulation:
+        return _return_or_raise(
+            NvFp4MoeBackend.EMULATION,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
+
     if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP4"):
         if not envs.VLLM_USE_FLASHINFER_MOE_FP4:
             # If the user rejects FlashInfer remove those backends.
