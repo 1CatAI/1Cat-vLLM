@@ -914,9 +914,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // csf_32x2_v1 expert scales -> skinny QPN scale raster.
   ops.def(
       "csf32_expand_sm70(Tensor(a!) out, Tensor bases, Tensor codes, "
-      "Tensor entries, Tensor gids, Tensor goff, int rows, int groups, "
-      "int projections, int group_rows, int pairs_per_program, "
-      "int runs) -> ()");
+      "Tensor page_bases, Tensor offsets, Tensor exceptions, "
+      "Tensor exception_start, Tensor entries, Tensor gids, Tensor goff, "
+      "int rows, int groups, int projections, int group_rows, "
+      "int pairs_per_program, int runs) -> ()");
   ops.impl("csf32_expand_sm70", torch::kCUDA, &csf32_expand_sm70);
 
   // Causal prefill attention, head dim 256, over a paged fp16 KV cache on
