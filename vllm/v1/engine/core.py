@@ -260,6 +260,12 @@ class EngineCore:
                 # much memory can be allocated for kv cache.
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+                # The pool is the smallest one over the workers; only rank 0 logs
+                # its own figure, so name all of them.
+                logger.info(
+                    "Available KV cache memory per worker: %s",
+                    ", ".join(f"{m / 2**30:.2f} GiB" for m in available_gpu_memory),
+                )
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
