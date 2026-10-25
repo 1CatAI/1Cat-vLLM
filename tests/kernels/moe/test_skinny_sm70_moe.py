@@ -648,7 +648,11 @@ def _reference_moe(x, w13, s13, w2, s2, g1, g2, topk_weights, topk_ids):
 
 def _skinny_experts(device, order, w13, s13, w2, s2, g1, g2):
     experts = Nvfp4SkinnySm70Experts.__new__(Nvfp4SkinnySm70Experts)
-    experts.quant_config = SimpleNamespace(gemm1_clamp_limit=None)
+    experts.quant_config = SimpleNamespace(
+        gemm1_clamp_limit=None,
+        _w1=SimpleNamespace(scale=s13),
+        _w2=SimpleNamespace(scale=s2),
+    )
     experts._scale_mode = 0
     experts._fragment_order = order
     experts._triton_tensor_cores = False
@@ -924,3 +928,9 @@ def test_csf_experts_give_the_same_output_as_five_bit_planes(
     fits = w2_spread <= 31
     assert (served._s5[0] is not None) and (served._s5[1] is not None) == fits
     assert (served._csf_planes is None) == fits
+    # Packed projections let go of their raster, the others keep it.
+    assert served.scale_rasters_released() == (True, fits)
+    caches = served._scale_caches
+    assert caches.w1_scales_u8.numel() == 0
+    assert (caches.w2_scales_u8.numel() == 0) == fits
+    assert served.quant_config._w1.scale.numel() == 0
