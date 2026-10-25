@@ -7,10 +7,10 @@ N/32][group K/16][position 32]``, the layout `qpn_prepack` gives the checkpoint
 scales. The csf_32x2_v1 checkpoint planes are smaller, but a few scales per
 thousand fall outside a row's four-bit window and are patched from a record list,
 which a kernel cannot afford to look up in its loop (one block in six has a
-record). The scale bytes of a row do span a short range, though: the group scales
-of GLM-5.3 differ from their row's smallest by at most 23, and the e4m3 bytes of
-positive scales order like integers. Five bits per scale therefore carry every
-scale without exceptions:
+record). The scale bytes of a row do span a short range, though: outside the layers
+named below, the group scales of GLM-5.3 differ from their row's smallest by at most
+31, and the e4m3 bytes of positive scales order like integers. Five bits per scale
+therefore carry those scales without exceptions:
 
     scale = base[expert][tile][position] + nibble + 16 * high
 
@@ -20,6 +20,10 @@ Positions are the raster positions of the card's fragment order, so a lane
 reads the bytes it would read from the raster and decodes them with three integer
 operations. The planes take 5/8 of the raster, and no raster has to exist for the
 experts of a layer.
+
+Not every layer fits: the last MoE layers of GLM-5.3 have rows that span up to 56
+(layers 43 and 44; a few rows in layers 36, 40 to 42). `scale_spread` tells, and a
+projection that does not fit keeps its csf planes.
 """
 
 from dataclasses import dataclass
@@ -47,6 +51,17 @@ class S5Scales:
     @property
     def tiles(self) -> int:
         return self.base.shape[1]
+
+
+def scale_spread(raster: torch.Tensor, groups: int) -> int:
+    """The widest span, over all rows, between a row's largest and smallest scale
+    in a u8 scale raster [E, tiles * groups * 32] (kernel positions)."""
+    experts = raster.shape[0]
+    widest = 0
+    for first in range(0, experts, _ENCODE_EXPERTS):
+        r = raster[first : first + _ENCODE_EXPERTS].reshape(-1, groups, 32)
+        widest = max(widest, int((r.amax(dim=1) - r.amin(dim=1)).max()))
+    return widest
 
 
 def encode_s5(raster: torch.Tensor, groups: int) -> S5Scales:
