@@ -1564,7 +1564,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.idx_mapping_np,
                     input_batch.num_scheduled_tokens,
                 )
-                self._set_active_loras(*lora_inputs)
+                # Logits have 1 + num_draft rows per request under spec decode;
+                # map each logits row (not each request) to its LoRA.
+                prompt_mapping, token_mapping, active_loras = lora_inputs
+                if input_batch.num_draft_tokens > 0:
+                    prompt_mapping = tuple(
+                        np.repeat(prompt_mapping, np.diff(input_batch.cu_num_logits_np))
+                    )
+                self._set_active_loras(prompt_mapping, token_mapping, active_loras)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             input_batch = InputBatch.make_dummy(
