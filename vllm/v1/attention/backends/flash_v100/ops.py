@@ -372,6 +372,10 @@ def get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
             _flash_attn_forward_lse = _flash_attn_forward
         except (ImportError, AttributeError):
             _flash_attn_forward_lse = None
+    if _flash_attn_forward_lse is not None:
+        # MLA can load the LSE entry without loading the ordinary attention
+        # ops first. Bind each engine's owner even when the native op is cached.
+        prepare_attention_runtime()
     return bind_attention_operation(_flash_attn_forward_lse)
 
 

@@ -74,6 +74,7 @@ def test_draft_phase_aware_predicate(has_prefill):
 
 def test_execute_rejects_prefill_before_dp_graph_dispatch(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = SimpleNamespace(type="cpu")
     runner.req_states = SimpleNamespace(
         req_id_to_index={"tail": 0},
         num_computed_prefill_tokens=np.array([800]),
@@ -90,6 +91,7 @@ def test_execute_rejects_prefill_before_dp_graph_dispatch(monkeypatch):
         num_scheduled_tokens={"tail": 4},
         total_num_scheduled_tokens=4,
         new_block_ids_to_zero=[],
+        prefix_cache_reset_req_ids=None,
     )
 
     class DispatchReached(Exception):

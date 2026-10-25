@@ -110,6 +110,24 @@ class GGUFModelLoader(BaseModelLoader):
 
         return [str(path) for path in gguf_shard_paths(model_path)]
 
+    @staticmethod
+    def _uses_multimodal_wrapper(model_config: ModelConfig) -> bool:
+        has_vision = getattr(model_config.hf_config, "vision_config", None) is not None
+        # A text-only draft can inherit a target's vision config. Resolve the
+        # actual model capability before applying wrapper prefixes or mmproj.
+        return has_vision and getattr(model_config, "is_multimodal_model", True)
+
+    @staticmethod
+    def _requires_vision_weights(model_config: ModelConfig) -> bool:
+        # A text-only run retains the multimodal HF wrapper and its language
+        # weight prefixes, but must not discover or open a vision checkpoint.
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        language_model_only = getattr(multimodal_config, "language_model_only", False)
+        return (
+            GGUFModelLoader._uses_multimodal_wrapper(model_config)
+            and not language_model_only
+        )
+
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
@@ -140,6 +158,7 @@ class GGUFModelLoader(BaseModelLoader):
         )
 
         from .gguf_adapters import get_gguf_adapter
+        from .gguf_adapters.vision import get_vision_adapter_spec
 
         if (
             adapter := get_gguf_adapter(
@@ -149,7 +168,44 @@ class GGUFModelLoader(BaseModelLoader):
             local = self._prepare_weights(model_config)
             self._native_adapter = adapter
             self._native_tensors = gguf_tensor_index(gguf_shard_paths(local))
-            return adapter.build_name_map(self._native_tensors)
+            names = adapter.build_name_map(self._native_tensors)
+            self._native_vision_adapter = None
+            vision_spec = get_vision_adapter_spec(text_config.model_type)
+            companion = getattr(self, "multimodal_weights", None)
+            if (
+                vision_spec is None
+                and companion is None
+                and self._requires_vision_weights(model_config)
+            ):
+                raise ValueError(
+                    "No native GGUF vision adapter registered for "
+                    f"{text_config.model_type!r}"
+                )
+            if (
+                vision_spec is not None
+                and companion is None
+                and self._uses_multimodal_wrapper(model_config)
+            ):
+                # A native mmproj stream loads both towers through the wrapper.
+                # Its names below are already qualified. The safetensors route
+                # keeps the upstream language-submodule scope instead.
+                adapter.language_model_prefix = ""
+                if self._requires_vision_weights(model_config):
+                    mmproj = detect_gguf_multimodal(local)
+                    if mmproj is None:
+                        raise ValueError(
+                            f"{text_config.model_type} multimodal GGUF requires mmproj"
+                        )
+                    self._native_vision_adapter = vision_spec.create(
+                        config.vision_config, gguf_tensor_index([mmproj])
+                    )
+                # The conditional model wraps the native language model. Keep
+                # these names consistent for quantization, PLE and PP loading.
+                names = {
+                    raw: vision_spec.language_prefix + name
+                    for raw, name in names.items()
+                }
+            return names
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
         # Gemma3Config, this returns config.text_config. For text-only
@@ -391,9 +447,8 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = {}
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
-        is_multimodal = hasattr(model_config.hf_config, "vision_config")
         if (
-            is_multimodal
+            self._requires_vision_weights(model_config)
             and getattr(self, "_native_adapter", None) is None
             and getattr(self, "multimodal_weights", None) is None
         ):
@@ -430,10 +485,10 @@ class GGUFModelLoader(BaseModelLoader):
                 self._native_tensors, gguf_to_hf_name_map, model_config.dtype
             )
             return
-        hf_config = model_config.hf_config
-        is_multimodal = hasattr(hf_config, "vision_config")
-
-        if is_multimodal:
+        if (
+            self._requires_vision_weights(model_config)
+            and getattr(self, "multimodal_weights", None) is None
+        ):
             # Load mm_proj (mm_encoder + projector) for multimodal weights
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
@@ -488,9 +543,31 @@ class GGUFModelLoader(BaseModelLoader):
             model_config, local_model_path, gguf_weights_map
         ):
             yield weight_prefix + name, tensor
+        native_vision = getattr(self, "_native_vision_adapter", None)
+        if native_vision is not None:
+            from vllm.model_executor.models.utils import (
+                PPMissingLayer,
+                StageMissingLayer,
+            )
+
+            tower = getattr(model, "visual", None)
+            if isinstance(tower, (PPMissingLayer, StageMissingLayer)):
+                return
+            vision_names = native_vision.name_map
+            if skip_weight is not None:
+                vision_names = {
+                    raw: name
+                    for raw, name in vision_names.items()
+                    if not skip_weight(name)
+                }
+            yield from native_vision.weights(model_config.dtype, vision_names)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        model.load_weights(self.get_all_weights(model_config, model))
+        loaded = model.load_weights(self.get_all_weights(model_config, model))
+        adapter = getattr(self, "_native_adapter", None)
+        validate = getattr(adapter, "validate_loaded_parameters", None)
+        if validate is not None:
+            validate(model, loaded)
 
     @staticmethod
     def _start_load_sampler():
@@ -623,6 +700,11 @@ class GGUFModelLoader(BaseModelLoader):
         if TYPE_CHECKING:
             vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(unquant_names)
+        native_vision = getattr(self, "_native_vision_adapter", None)
+        if native_vision is not None:
+            vllm_config.quant_config.unquantized_modules.extend(
+                native_vision.unquantized_modules
+            )
 
         if adapter is not None:
             language_prefix = getattr(adapter, "language_model_prefix", "")
@@ -652,6 +734,9 @@ class GGUFModelLoader(BaseModelLoader):
             model._gguf_model_path = local_model_path
             weight_model = native_gguf_language_model(model, adapter)
             weight_model._gguf_model_path = local_model_path
+            configure = getattr(adapter, "configure_model", None)
+            if configure is not None:
+                configure(weight_model)
             if (
                 adapter is not None
                 and quant_config.native_expert_storage

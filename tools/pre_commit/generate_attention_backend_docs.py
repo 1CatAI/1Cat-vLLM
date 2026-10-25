@@ -30,6 +30,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 RELEVANT_PATTERNS = [
     "vllm/v1/attention/backends/*.py",
     "vllm/v1/attention/backends/**/*.py",
+    "vllm/models/deepseek_v4/common/portable_sparse.py",
     "vllm/model_executor/layers/attention/mla_attention.py",
     "vllm/platforms/cuda.py",
     "tools/pre_commit/generate_attention_backend_docs.py",
@@ -591,11 +592,181 @@ def parse_head_sizes(node: ast.ClassDef) -> str:
     return ", ".join(sizes) if sizes else "Any"
 
 
-def parse_compute_capability(node: ast.ClassDef) -> str:
+def _literal_capabilities(
+    value: ast.expr, tree: ast.AST
+) -> set[tuple[int, int]] | None:
+    """Read a literal capability collection without importing or executing code."""
+    if isinstance(value, ast.Name):
+        assignments = [
+            stmt.value
+            for stmt in getattr(tree, "body", [])
+            if isinstance(stmt, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == value.id
+                for target in stmt.targets
+            )
+        ]
+        if len(assignments) != 1:
+            return None
+        value = assignments[0]
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in {"frozenset", "set"}
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        value = value.args[0]
+    try:
+        capabilities = ast.literal_eval(value)
+    except (ValueError, TypeError, SyntaxError):
+        return None
+    if not isinstance(capabilities, (set, tuple, list)) or not capabilities:
+        return None
+    if any(
+        not isinstance(cap, tuple)
+        or len(cap) != 2
+        or any(type(part) is not int or part < 0 for part in cap)
+        for cap in capabilities
+    ):
+        return None
+    return set(capabilities)
+
+
+def _exact_capabilities(
+    method: ast.FunctionDef,
+    tree: ast.AST,
+    source_file: Path | None,
+    visited: set[tuple[Path | None, str]],
+) -> set[tuple[int, int]] | None:
+    """Follow simple predicate delegation and explicit (major, minor) membership.
+
+    Only a single return with optional imports/docstring is supported. Other
+    branches or extra conditions are not interpreted as an exhaustive list.
+    """
+    identity = (source_file, method.name)
+    if identity in visited:
+        return None
+    visited = visited | {identity}
+    args = method.args.posonlyargs + method.args.args
+    if any(
+        isinstance(decorator, ast.Name) and decorator.id == "classmethod"
+        for decorator in method.decorator_list
+    ):
+        args = args[1:]
+    if len(args) != 1:
+        return None
+    parameter = args[0].arg
+    statements = [
+        stmt
+        for stmt in method.body
+        if not (
+            isinstance(stmt, (ast.Import, ast.ImportFrom))
+            or (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            )
+        )
+    ]
+    if len(statements) != 1 or not isinstance(statements[0], ast.Return):
+        return None
+    expression = statements[0].value
+    if isinstance(expression, ast.BoolOp) and isinstance(expression.op, ast.And):
+        # A nullable device probe does not change the supported GPU set.
+        expressions = [
+            value
+            for value in expression.values
+            if not (
+                isinstance(value, ast.Compare)
+                and isinstance(value.left, ast.Name)
+                and value.left.id == parameter
+                and len(value.ops) == 1
+                and isinstance(value.ops[0], ast.IsNot)
+                and len(value.comparators) == 1
+                and isinstance(value.comparators[0], ast.Constant)
+                and value.comparators[0].value is None
+            )
+        ]
+        if len(expressions) != 1:
+            return None
+        expression = expressions[0]
+    if (
+        isinstance(expression, ast.Compare)
+        and len(expression.ops) == 1
+        and isinstance(expression.ops[0], ast.In)
+        and isinstance(expression.left, ast.Tuple)
+        and len(expression.left.elts) == 2
+        and all(
+            isinstance(elt, ast.Attribute)
+            and elt.attr == field
+            and isinstance(elt.value, ast.Name)
+            and elt.value.id == parameter
+            for elt, field in zip(expression.left.elts, ("major", "minor"))
+        )
+    ):
+        return _literal_capabilities(expression.comparators[0], tree)
+    if not (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Name)
+        and len(expression.args) == 1
+        and not expression.keywords
+        and isinstance(expression.args[0], ast.Name)
+        and expression.args[0].id == parameter
+    ):
+        return None
+    name = expression.func.id
+    function = next(
+        (
+            stmt
+            for stmt in getattr(tree, "body", [])
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == name
+        ),
+        None,
+    )
+    if function is not None:
+        return _exact_capabilities(function, tree, source_file, visited)
+    imported_file = _resolve_import_to_file(tree, name, source_file)
+    if imported_file is None:
+        return None
+    imported_name = next(
+        (
+            alias.name
+            for stmt in ast.walk(tree)
+            if isinstance(stmt, ast.ImportFrom)
+            for alias in stmt.names
+            if (alias.asname or alias.name) == name
+        ),
+        name,
+    )
+    try:
+        imported_tree = ast.parse(imported_file.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return None
+    function = next(
+        (
+            stmt
+            for stmt in imported_tree.body
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == imported_name
+        ),
+        None,
+    )
+    if function is not None:
+        return _exact_capabilities(function, imported_tree, imported_file, visited)
+    return None
+
+
+def parse_compute_capability(
+    node: ast.ClassDef, tree: ast.AST | None = None, source_file: Path | None = None
+) -> str:
     """Parse supports_compute_capability method."""
     method = find_method(node, "supports_compute_capability")
     if method is None:
         return "Any"
+
+    capabilities = _exact_capabilities(method, tree or node, source_file, set())
+    if capabilities:
+        return ", ".join(f"{major}.{minor}" for major, minor in sorted(capabilities))
 
     min_cap: tuple[int, int] | None = None
     max_cap: tuple[int, int] | None = None
@@ -774,7 +945,9 @@ def analyze_backend(backend_name: str, class_path: str) -> dict[str, Any] | None
 
     # Determine compute capability - use N/A for non-CUDA backends
     is_non_cuda = backend_name.startswith(("CPU_", "ROCM_"))
-    compute_cap = "N/A" if is_non_cuda else parse_compute_capability(class_node)
+    compute_cap = (
+        "N/A" if is_non_cuda else parse_compute_capability(class_node, tree, file_path)
+    )
 
     # Parse impl class features (DCP support)
     impl_method = find_method(class_node, "get_impl_cls")

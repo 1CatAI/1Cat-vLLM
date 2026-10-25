@@ -1,0 +1,391 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Opt-in metadata-free V2 Qwen MTP decode transport.
+
+Every rank derives the wire length from the same SchedulerOutput. Startup
+negotiates the model-owned tensor schema once; prefill and nonuniform tails
+retain the dynamic protocol. Wire tensors contain only real token rows, so
+different local CUDA graph padding cannot change a peer's receive size.
+"""
+
+import json
+import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator, Handle
+
+logger = init_logger(__name__)
+
+
+def decode_fallback_reason(output: Any, query_len: int, capacity: int) -> str | None:
+    """Return the first disqualifying condition, using common scheduler data."""
+    counts = output.num_scheduled_tokens
+    if not counts:
+        return "empty"
+    if output.scheduled_new_reqs:
+        return "new_request"
+    if output.scheduled_encoder_inputs:
+        return "encoder"
+    if output.scheduled_cached_reqs.resumed_req_ids:
+        return "resumed_request"
+    if output.total_num_scheduled_tokens > capacity:
+        return "capacity"
+    if output.total_num_scheduled_tokens != query_len * len(counts) or any(
+        count != query_len for count in counts.values()
+    ):
+        return "nonuniform_query"
+    cached = output.scheduled_cached_reqs
+    output_counts = dict(zip(cached.req_ids, cached.num_output_tokens))
+    if any(output_counts.get(req_id, 0) <= 0 for req_id in counts):
+        return "prefill"
+    if any(
+        len(output.scheduled_spec_decode_tokens.get(req_id, ())) != query_len - 1
+        for req_id in counts
+    ):
+        return "incomplete_draft"
+    return None
+
+
+def is_complete_mtp_decode(output: Any, query_len: int, capacity: int) -> bool:
+    return decode_fallback_reason(output, query_len, capacity) is None
+
+
+class PPTransportMetrics:
+    """Opt-in host counters; never synchronize CUDA or read tensor values.
+
+    Payload bytes exclude protocol metadata and NCCL/network overhead. Host
+    wait time measures Work.wait() submission/blocking, not GPU transfer time.
+    Snapshots are cumulative and may also be read through worker collective RPC.
+    """
+
+    def __init__(self, rank: int, interval: int):
+        self.rank = rank
+        self.interval = interval
+        self.steps = 0
+        self.static_steps = 0
+        self.fallbacks: dict[str, int] = {}
+        self.payload_bytes: dict[str, int] = {}
+        self.tensor_messages: dict[str, int] = {}
+        self.send_wait_calls = 0
+        self.send_wait_host_seconds = 0.0
+
+    @classmethod
+    def create(cls, additional: Any, rank: int) -> "PPTransportMetrics | None":
+        interval = (
+            additional.get("pp_transport_metrics_interval", 0)
+            if isinstance(additional, dict)
+            else 0
+        )
+        if type(interval) is not int or interval < 0:
+            raise ValueError("pp_transport_metrics_interval must be a nonnegative int")
+        return cls(rank, interval) if interval else None
+
+    def record_step(self, *, static: bool, reason: str | None) -> None:
+        # Log the previous complete interval, before beginning the next step.
+        if self.steps and self.steps % self.interval == 0:
+            logger.info("PP_TRANSPORT_METRICS %s", json.dumps(self.snapshot()))
+        self.steps += 1
+        if static:
+            self.static_steps += 1
+        else:
+            reason = reason or "disabled"
+            self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1
+
+    def record_payload(
+        self,
+        direction: str,
+        protocol: str,
+        tensors: dict[str, torch.Tensor],
+        *,
+        num_tokens: int | None = None,
+        elements: dict[str, int] | None = None,
+    ) -> None:
+        key = f"{direction}_{protocol}"
+        size = 0
+        messages = 0
+        for name, tensor in tensors.items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            count = (
+                tensor.numel()
+                if num_tokens is None
+                else num_tokens * math.prod(tensor.shape[1:])
+            )
+            if elements is not None:
+                count = elements[name]
+            size += count * tensor.element_size()
+            messages += int(count > 0)
+        self.payload_bytes[key] = self.payload_bytes.get(key, 0) + size
+        self.tensor_messages[key] = self.tensor_messages.get(key, 0) + messages
+
+    def record_dynamic_send(
+        self,
+        pp: "GroupCoordinator",
+        tensors: dict[str, torch.Tensor],
+        all_gather_group: "GroupCoordinator | None",
+        all_gather_tensors: dict[str, bool] | None,
+    ) -> None:
+        # Reuse the sender's predicate. TP may transmit only a tensor slice;
+        # receiver-side TP reconstruction is a separate collective.
+        elements = {}
+        for name, tensor in tensors.items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            count = tensor.numel()
+            if count and pp._should_use_all_gather(
+                name, count, all_gather_group, all_gather_tensors
+            ):
+                assert all_gather_group is not None
+                count //= all_gather_group.world_size
+            elements[name] = count
+        self.record_payload("send", "dynamic", tensors, elements=elements)
+
+    def record_send_wait(self, seconds: float) -> None:
+        self.send_wait_calls += 1
+        self.send_wait_host_seconds += seconds
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "rank": self.rank,
+            "steps": self.steps,
+            "static_steps": self.static_steps,
+            "static_fraction": self.static_steps / self.steps if self.steps else 0.0,
+            "fallbacks": dict(self.fallbacks),
+            "payload_bytes": dict(self.payload_bytes),
+            "tensor_messages": dict(self.tensor_messages),
+            "send_wait_calls": self.send_wait_calls,
+            "send_wait_host_seconds": self.send_wait_host_seconds,
+        }
+
+
+@dataclass
+class _ReceiveSlot:
+    tensors: dict[str, torch.Tensor]
+    consumed: torch.cuda.Event | None = None
+
+
+class StaticPPDecodeTransfer:
+    """D receive slots protected until their model-input copy has completed."""
+
+    pp: "GroupCoordinator"
+    device: torch.device
+    shape: tuple[int, ...]
+    capacity: int
+    query_len: int
+    depth: int
+    slots: list[_ReceiveSlot]
+    slot_index: int
+    active_slot: _ReceiveSlot | None
+    static_steps: int
+    dynamic_steps: int
+    receive_stream: torch.cuda.Stream | None
+
+    @classmethod
+    def create(
+        cls, config: Any, runner: Any, pp: "GroupCoordinator", *, use_v2: bool
+    ) -> "StaticPPDecodeTransfer | None":
+        additional = getattr(config, "additional_config", None)
+        enabled = (
+            additional.get("pp_decode_static_transfer", False)
+            if isinstance(additional, dict)
+            else False
+        )
+        if enabled is False:
+            return None
+        if enabled is not True:
+            raise ValueError("pp_decode_static_transfer must be a boolean")
+        parallel = config.parallel_config
+        spec = config.speculative_config
+        text = config.model_config.hf_text_config
+        # Only common configuration participates in admission. Never use a
+        # local GPU architecture or rank-local model state to choose a protocol.
+        if (
+            not use_v2
+            or parallel.pipeline_parallel_size <= 1
+            or parallel.tensor_parallel_size != 1
+            or parallel.data_parallel_size != 1
+            or parallel.enable_dbo
+            or parallel.ubatch_size > 1
+            or config.compilation_config.pass_config.enable_sp
+            or config.model_config.dtype != torch.float16
+            or text.model_type not in ("qwen4_exp", "qwen4_exp_text")
+            or spec is None
+            or spec.method != "mtp"
+            or not 1 <= spec.num_speculative_tokens <= 4
+        ):
+            raise ValueError(
+                "pp_decode_static_transfer requires V2 Qwen4Exp FP16, PP>1, "
+                "TP=DP=1, MTP1..4, and no SP/DBO/microbatching"
+            )
+        query_len = spec.num_speculative_tokens + 1
+        capacity = min(
+            runner.max_num_tokens,
+            max(
+                config.scheduler_config.max_num_seqs * query_len,
+                max(config.compilation_config.cudagraph_capture_sizes or [0]),
+            ),
+        )
+        signature = None
+        error = None
+        try:
+            schema = runner.model.make_empty_intermediate_tensors(
+                batch_size=1, dtype=torch.float16, device=torch.device("meta")
+            ).tensors
+            if tuple(schema) != ("hidden_states",):
+                raise ValueError("expected one model-owned hidden_states tensor")
+            hidden = schema["hidden_states"]
+            shape = tuple(hidden.shape[1:])
+            allowed_shapes = (
+                (text.hidden_size * text.hc_count,),
+                (text.hc_count, text.hidden_size),
+            )
+            if (
+                hidden.shape[0] != 1
+                or shape not in allowed_shapes
+                or hidden.dtype != torch.float16
+                or not hidden.is_contiguous()
+                or runner.device.type != "cuda"
+                or capacity < query_len
+            ):
+                raise ValueError("unsupported model-owned decode tensor schema")
+            if not pp.is_first_rank:
+                buffers = runner.intermediate_tensors
+                if buffers is None or tuple(buffers.tensors) != tuple(schema):
+                    raise ValueError("missing persistent model input buffer")
+                local = buffers.tensors["hidden_states"]
+                if (
+                    local.shape[0] < capacity
+                    or tuple(local.shape[1:]) != shape
+                    or local.dtype != hidden.dtype
+                    or local.device != runner.device
+                    or not local.is_contiguous()
+                ):
+                    raise ValueError("persistent model input violates the schema")
+            signature = (
+                shape,
+                str(hidden.dtype),
+                capacity,
+                query_len,
+                config.max_concurrent_batches,
+            )
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        # Rank-local validation errors participate in the same collective, then
+        # every rank fails together. No peer can silently choose dynamic while
+        # another has already selected the metadata-free receive protocol.
+        reports: list[Any] = [None] * pp.world_size
+        torch.distributed.all_gather_object(
+            reports, (signature, error), group=pp.cpu_group
+        )
+        if any(report[1] is not None for report in reports) or any(
+            report[0] != signature for report in reports
+        ):
+            raise RuntimeError(
+                f"PP decode transport schema agreement failed: {reports}"
+            )
+        assert signature is not None
+        result = cls.__new__(cls)
+        result.pp = pp
+        result.device = runner.device
+        result.shape = signature[0]
+        result.capacity = capacity
+        result.query_len = query_len
+        result.depth = config.max_concurrent_batches
+        result.slots = []
+        result.slot_index = 0
+        result.active_slot = None
+        result.static_steps = 0
+        result.dynamic_steps = 0
+        result.receive_stream = None
+        if not pp.is_first_rank:
+            result.receive_stream = torch.cuda.Stream(runner.device)
+            result.slots = [
+                _ReceiveSlot(
+                    {
+                        "hidden_states": torch.empty(
+                            (capacity, *result.shape),
+                            dtype=torch.float16,
+                            device=runner.device,
+                        )
+                    }
+                )
+                for _ in range(result.depth)
+            ]
+            # CUDA's caching allocator may recycle storage whose previous use
+            # is still queued on its allocation stream. Establish ownership
+            # before the first receive, even though torch.empty has no payload.
+            result.receive_stream.wait_stream(torch.cuda.current_stream(runner.device))
+        logger.info(
+            "PP decode static transfer ready: shape=%s capacity=%d slots=%d "
+            "query_len=%d; prefill/nonuniform decode use dynamic transfer",
+            result.shape,
+            capacity,
+            result.depth,
+            query_len,
+        )
+        return result
+
+    def matches(self, output: Any) -> bool:
+        hit = is_complete_mtp_decode(output, self.query_len, self.capacity)
+        if hit:
+            self.static_steps += 1
+            if self.static_steps == 1:
+                logger.info(
+                    "PP decode static transfer first hit: requests=%d tokens=%d",
+                    len(output.num_scheduled_tokens),
+                    output.total_num_scheduled_tokens,
+                )
+        elif output.total_num_scheduled_tokens:
+            self.dynamic_steps += 1
+        return hit
+
+    def receive(
+        self, num_tokens: int
+    ) -> tuple[dict[str, torch.Tensor], list["Handle"]]:
+        if self.active_slot is not None:
+            raise RuntimeError("previous PP decode receive has not been consumed")
+        slot = self.slots[self.slot_index]
+        self.slot_index = (self.slot_index + 1) % self.depth
+        self.active_slot = slot
+        assert self.receive_stream is not None
+        with torch.cuda.stream(self.receive_stream):
+            if slot.consumed is not None:
+                self.receive_stream.wait_event(slot.consumed)
+            # Padding is local and deterministic. Do not send graph-padding
+            # rows: capture sizes can differ between heterogeneous PP stages.
+            slot.tensors["hidden_states"][num_tokens:].zero_()
+            wire = {key: tensor[:num_tokens] for key, tensor in slot.tensors.items()}
+            handles = self.pp.irecv_tensor_dict_static(wire)
+        return slot.tensors, handles
+
+    def mark_consumed(self) -> None:
+        if self.active_slot is None:
+            return
+        # AsyncIntermediateTensors.wait_for_comm establishes NCCL -> current
+        # stream ordering before the runner copies this slot to graph inputs.
+        # Reuse waits on this event in the receive stream (no CPU synchronize).
+        self.active_slot.consumed = torch.cuda.current_stream(
+            self.device
+        ).record_event()
+        self.active_slot = None
+
+    def send(self, tensors: dict[str, torch.Tensor], num_tokens: int) -> list["Handle"]:
+        if tuple(tensors) != ("hidden_states",):
+            raise RuntimeError("PP decode output keys violate negotiated schema")
+        hidden = tensors["hidden_states"]
+        if (
+            tuple(hidden.shape[1:]) != self.shape
+            or not num_tokens <= hidden.shape[0] <= self.capacity
+            or hidden.dtype != torch.float16
+            or hidden.device != self.device
+            or not hidden.is_contiguous()
+        ):
+            raise RuntimeError("PP decode output tensor violates negotiated schema")
+        # Worker waits for its previous send before reusing graph output memory.
+        return self.pp.isend_tensor_dict_static({"hidden_states": hidden[:num_tokens]})

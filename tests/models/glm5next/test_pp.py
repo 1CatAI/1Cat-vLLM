@@ -155,6 +155,9 @@ class _FakeMaterializedMHCStage1Layer(nn.Module):
 def test_glm53_materialized_mhc_state_crosses_pp_boundary(monkeypatch):
     group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
     monkeypatch.setattr("vllm.models.glm5next.nvidia.model.get_pp_group", lambda: group)
+    monkeypatch.setattr(
+        Glm5NextModel, "_debug_dump_pp_aux_hidden_states", lambda *a: None
+    )
 
     stage0 = Glm5NextModel.__new__(Glm5NextModel)
     nn.Module.__init__(stage0)
@@ -197,6 +200,9 @@ def test_glm53_materialized_mhc_state_crosses_pp_boundary(monkeypatch):
 def test_glm53_dflash_aux_hidden_states_cross_pp_boundary(monkeypatch):
     group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
     monkeypatch.setattr("vllm.models.glm5next.nvidia.model.get_pp_group", lambda: group)
+    monkeypatch.setattr(
+        Glm5NextModel, "_debug_dump_pp_aux_hidden_states", lambda *a: None
+    )
 
     stage0 = Glm5NextModel.__new__(Glm5NextModel)
     nn.Module.__init__(stage0)

@@ -12,6 +12,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CapturedAttentionState,
     CudaGraphManager,
+    mtp_manager_capture_sizes,
     prepare_inputs_to_capture,
 )
 from vllm.v1.worker.gpu.input_batch import InputBuffers
@@ -29,7 +30,24 @@ class EagleCudaGraphManagerBase(CudaGraphManager):
         cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
     ):
-        super().__init__(vllm_config, device, cudagraph_mode, decode_query_len)
+        spec = vllm_config.speculative_config
+        draft_config = getattr(spec, "draft_model_config", None)
+        draft_hf = getattr(draft_config, "hf_config", None)
+        stage_local_mtp = (
+            getattr(spec, "method", None) == "mtp"
+            and getattr(draft_hf, "mtp_draft_pipeline_parallel_size", None) == 1
+        )
+        # A stage-local native MTP head needs B-token decode graphs even when
+        # the shared target config contains only B*(K+1) verifier shapes. This
+        # contract also applies on an Ampere/Ada final rank of a mixed PP rig.
+        sizes = (
+            mtp_manager_capture_sizes(vllm_config, decode_query_len)
+            if stage_local_mtp
+            else None
+        )
+        super().__init__(
+            vllm_config, device, cudagraph_mode, decode_query_len, capture_sizes=sizes
+        )
 
         # Use a dedicated pool for Eagle to avoid memory overlap with the main
         # model's cudagraph. The base class uses a shared global pool, but Eagle's

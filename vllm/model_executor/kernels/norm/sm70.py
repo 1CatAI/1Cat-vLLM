@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM70 normalization providers; preserve each reduction and cast boundary."""
 
+from pathlib import Path
+
 import torch
 
 from vllm import ir
@@ -13,6 +15,18 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+# Additive, candidate-local library: never replace the shared native extension.
+_PP7_FUSION_LIBRARY = Path(__file__).resolve().parents[3] / "_pp7_fusion.so"
+_PP7_FUSION_LOAD_ERROR = None
+try:
+    if _PP7_FUSION_LIBRARY.is_file():
+        torch.ops.load_library(str(_PP7_FUSION_LIBRARY))
+    else:
+        _PP7_FUSION_LOAD_ERROR = "candidate extension is not built"
+except (OSError, RuntimeError) as error:
+    _PP7_FUSION_LOAD_ERROR = str(error)
+_PP7_EXACT_NORM_AVAILABLE = hasattr(torch.ops.vllm_pp7, "rmsnorm_gated_exact_out")
 
 
 @torch.compiler.assume_constant_result
@@ -28,7 +42,7 @@ def _sm70_gated_norm_shape_supported(
     return bool(
         z is not None
         and x.ndim == 2
-        and 1 <= x.shape[0] <= 768  # 64 tokens x 12 local heads
+        and 1 <= x.shape[0] <= 3072
         and x.shape[1] == 128
         and z.shape == x.shape
         and weight.shape == (128,)
@@ -40,6 +54,44 @@ def _sm70_gated_norm_shape_supported(
     )
 
 
+def maybe_gated_norm(
+    x: torch.Tensor,
+    z: torch.Tensor | None,
+    weight: torch.Tensor,
+    epsilon: float,
+    *,
+    enabled: bool,
+    batch_invariant: bool,
+    group_size: int | None,
+    norm_before_gate: bool,
+    activation: str,
+    bias: torch.Tensor | None = None,
+    require_extension: bool = False,
+) -> torch.Tensor | None:
+    """Opt in to the exact provider; None preserves the caller's usual tail.
+
+    The native path may use the FP32 reference without the additive extension.
+    CUDA dispatch requires an available native kernel and otherwise keeps its
+    existing Triton reduction/activation schedule.
+    """
+    if (
+        enabled
+        and not batch_invariant
+        and x.is_cuda
+        and _sm70_gated_norm_device_supported(x.device.index)
+        and group_size is None
+        and bias is None
+        and norm_before_gate
+        and activation in ("sigmoid", "silu", "swish")
+        and _sm70_gated_norm_shape_supported(x, z, weight)
+        and (not require_extension or x.shape[0] <= 192 or _PP7_EXACT_NORM_AVAILABLE)
+    ):
+        return torch.ops.vllm.sm70_rmsnorm_gated_exact(
+            x, z, weight, epsilon, activation != "sigmoid"
+        )
+    return None
+
+
 def _sm70_rmsnorm_gated_exact_impl(
     x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, silu: bool
 ) -> torch.Tensor:
@@ -47,6 +99,32 @@ def _sm70_rmsnorm_gated_exact_impl(
         "SM70 exact native gated RMSNorm fusion enabled "
         "(N128, sigmoid/SiLU, M1 and batch)."
     )
+    if x.shape[0] > 192:
+        if not _PP7_EXACT_NORM_AVAILABLE:
+            logger.warning_once(
+                "PP7 extended exact gated norm unavailable; using the native "
+                "FP32 reference: %s",
+                _PP7_FUSION_LOAD_ERROR,
+            )
+            from vllm.model_executor.layers.layernorm import RMSNormGated
+
+            return RMSNormGated.forward_static(
+                x,
+                z,
+                weight,
+                eps,
+                x.dtype,
+                norm_before_gate=True,
+                activation="silu" if silu else "sigmoid",
+            )
+        logger.info_once(
+            "PP7 extended exact gated RMSNorm hit vllm_pp7 native op "
+            "(rows=%d, N=128, bound=3072).",
+            x.shape[0],
+        )
+        out = torch.empty_like(x)
+        torch.ops.vllm_pp7.rmsnorm_gated_exact_out(out, x, z, weight, eps, silu)
+        return out
     out = torch.empty_like(x)
     torch.ops._C.sm70_rmsnorm_gated_exact_out(out, x, z, weight, eps, silu)
     return out

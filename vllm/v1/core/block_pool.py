@@ -26,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.prefill_boundary import prefill_boundary_hash
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -201,6 +202,7 @@ class BlockPool:
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
+        self.enable_verified_mtp_prefill = False
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
@@ -332,6 +334,11 @@ class BlockPool:
                 block_hash, kv_cache_group_id
             )
             blk.block_hash = block_hash_with_group_id
+            if self.enable_verified_mtp_prefill:
+                boundary = (num_cached_blocks + i + 1) * block_size
+                blk.prefill_boundary_hash = prefill_boundary_hash(
+                    request, boundary, block_hash
+                )
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if event_block_indices is not None:
                 event_block_indices.append(num_cached_blocks + i)

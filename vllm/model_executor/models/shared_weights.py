@@ -41,7 +41,14 @@ def should_share(draft_model, flag, draft, target, *, legacy=False):
             and isinstance(draft_weight, torch.Tensor)
             and torch.equal(target_weight.cpu(), draft_weight.cpu())
         )
-    weight = draft.weight
+    weight = getattr(draft, "weight", None)
+    target_weight = getattr(target, "weight", None)
+    if not isinstance(weight, torch.Tensor) or not isinstance(
+        target_weight, torch.Tensor
+    ):
+        # Packed/quantized modules have no common dense comparison contract.
+        # Keep explicitly owned draft heads instead of replacing trained weights.
+        return False
     if (
         weight.is_cuda
         and torch.cuda.mem_get_info(weight.device)[0] < weight.numel() * 2

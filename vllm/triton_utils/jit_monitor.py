@@ -22,6 +22,7 @@ from vllm.triton_utils.importing import HAS_TRITON
 logger = init_logger(__name__)
 
 _active: bool = False
+_jit_event_count: int = 0
 
 
 def is_active() -> bool:
@@ -93,6 +94,8 @@ def _setup_triton_jit_hook() -> None:
     existing_hook = knobs.runtime.jit_post_compile_hook
 
     def _on_jit_compile(**kwargs):
+        global _jit_event_count
+        _jit_event_count += 1
         # `jit_post_compile_hook` is Triton internal API and its
         # signature has changed across releases (kwargs added/renamed).
         # Accept **kwargs so an upstream change cannot crash this hook
@@ -100,11 +103,12 @@ def _setup_triton_jit_hook() -> None:
         # pre-existing hook unchanged.
         fn = kwargs.get("fn")
         fn_name = getattr(fn, "name", "<unknown>")
-        logger.warning_once(
-            "Triton kernel JIT compilation during inference: %s. "
+        logger.warning(
+            "Triton kernel JIT compilation during inference: %s (event=%d). "
             "This causes a latency spike; consider extending warmup "
             "to cover this shape/config.",
             fn_name,
+            _jit_event_count,
         )
         if existing_hook is not None:
             return existing_hook(**kwargs)

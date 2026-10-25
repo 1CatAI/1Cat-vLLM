@@ -28,6 +28,95 @@ requires_sm70 = pytest.mark.skipif(
 _HEAD_DIM = 128
 _BLOCK_SIZE = 64
 
+
+@requires_sm70
+@pytest.mark.parametrize("relu", [True, False])
+def test_paged_indexer_reuses_kernel_across_split_grids(relu):
+    """Changing mixed-batch occupancy must not add a JIT specialization.
+
+    Exercise odd splits, empty programs, partial cache blocks and different
+    sequence lengths against the independent FP32 reference.
+    """
+    torch.manual_seed(20261023)
+    generator = torch.Generator().manual_seed(20261023)
+    rows, heads, width = 3, 64, 1027
+    blocks_per_row = (width + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    num_blocks = rows * blocks_per_row
+    bits, values = _random_fp8_keys(num_blocks * _BLOCK_SIZE, generator)
+    scales = torch.rand((num_blocks, _BLOCK_SIZE), generator=generator).cuda() + 0.5
+    cache = _build_paged_index_cache(
+        bits.reshape(num_blocks, _BLOCK_SIZE, _HEAD_DIM), scales
+    )
+    table = torch.randperm(num_blocks, generator=generator).to(torch.int32).cuda()
+    table = table.reshape(rows, blocks_per_row)
+    lengths = [1, 513, width]
+    seq_lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    q, weights = _make_queries(rows, heads)
+    weighted_q = sm70_indexer._combine_index_queries(q, weights)
+    output = torch.empty((rows, width), device="cuda", dtype=torch.float32)
+    block_values = values.reshape(num_blocks, _BLOCK_SIZE, _HEAD_DIM)
+    expected = []
+    for row, length in enumerate(lengths):
+        positions = torch.arange(length, device="cuda")
+        physical = table[row][positions // _BLOCK_SIZE].long()
+        offset = positions % _BLOCK_SIZE
+        keys = block_values[physical, offset] * scales[physical, offset, None]
+        expected.append(
+            _reference_index_logits(q[row : row + 1], weights[row : row + 1], keys)
+            if relu
+            else weighted_q[row : row + 1].float() @ keys.float().T
+        )
+    compiled_hashes = set()
+    for splits in (1, 3, 7, 19, 51, 73, 512):
+        output.fill_(float("nan"))
+        if relu:
+            compiled = sm70_indexer._paged_index_logits_relu_kernel[(rows, splits)](
+                q,
+                weights,
+                cache,
+                table,
+                seq_lens,
+                output,
+                q.stride(0),
+                q.stride(1),
+                weights.stride(0),
+                cache.stride(0),
+                table.stride(0),
+                output.stride(0),
+                _BLOCK_SIZE,
+                head_dim=_HEAD_DIM,
+                NUM_HEADS=heads,
+                BLOCK_N=64,
+                num_warps=8,
+            )
+        else:
+            compiled = sm70_indexer._paged_index_logits_kernel[(rows, splits)](
+                weighted_q,
+                cache,
+                table,
+                seq_lens,
+                output,
+                weighted_q.stride(0),
+                cache.stride(0),
+                table.stride(0),
+                output.stride(0),
+                _BLOCK_SIZE,
+                head_dim=_HEAD_DIM,
+                BLOCK_N=32,
+                num_warps=4,
+            )
+        compiled_hashes.add(compiled.hash)
+        for row, length in enumerate(lengths):
+            torch.testing.assert_close(
+                output[row, :length].unsqueeze(0),
+                expected[row],
+                rtol=1e-2,
+                atol=1e-2,
+            )
+            assert torch.isnan(output[row, length:]).all()
+    assert len(compiled_hashes) == 1
+
+
 # E4M3FN bit patterns with exact values. Building keys from a palette keeps the
 # reference bit-exact and needs no native FP8 conversion, which SM70 lacks.
 _FP8_BITS = torch.tensor([0x00, 0x30, 0x38, 0x3C, 0x40, 0xB0, 0xB8, 0xC0])

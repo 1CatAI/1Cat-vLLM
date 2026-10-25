@@ -71,6 +71,23 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 
+def _prepared_expert_bank(
+    original: torch.Tensor, prepared_expert: torch.Tensor
+) -> torch.Tensor:
+    """Reuse owned packed weights when the prepared layout needs no padding."""
+    experts = original.shape[0]
+    shape = (experts, *prepared_expert.shape)
+    if (
+        original.is_contiguous()
+        and original.numel() * original.element_size()
+        == experts * prepared_expert.numel() * prepared_expert.element_size()
+    ):
+        return original.view(prepared_expert.dtype).view(shape)
+    return torch.empty(
+        shape, dtype=prepared_expert.dtype, device=prepared_expert.device
+    )
+
+
 def arm_dflash_nvfp4_trace() -> None:
     if capture_runtime_trace().dflash.value("target_layer_trace"):
         diagnostic_history("nvfp4_dflash")["armed"] = True
@@ -910,13 +927,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
         glm53_qpn_w13_q8 = bool(glm53_qpn_w13_requested and glm53_qpn_w13_available)
 
-        w13_tm_weights: list[torch.Tensor] = []
-        w13_tm_scales: list[torch.Tensor] = []
+        w13_tm_weights = None
+        w13_tm_scales = None
         w13_raw_scale_codes: list[torch.Tensor] = []
         w13_raw_global_scales: list[torch.Tensor] = []
         w13_meta: list[torch.Tensor] = []
-        w2_tm_weights: list[torch.Tensor] = []
-        w2_tm_scales: list[torch.Tensor] = []
+        w2_tm_weights = None
+        w2_tm_scales = None
         w2_raw_scale_codes: list[torch.Tensor] = []
         w2_raw_global_scales: list[torch.Tensor] = []
         w2_meta: list[torch.Tensor] = []
@@ -933,8 +950,18 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 NVFP4_GROUP_SIZE,
                 interleave_gated_silu=fused_swiglu_prefill,
             )
-            w13_tm_weights.append(prepared_w13[0])
-            w13_tm_scales.append(prepared_w13[1])
+            if w13_tm_weights is None:
+                w13_tm_weights = _prepared_expert_bank(
+                    layer.w13_weight, prepared_w13[0]
+                )
+                w13_tm_scales = torch.empty(
+                    (num_experts, *prepared_w13[1].shape),
+                    dtype=prepared_w13[1].dtype,
+                    device=prepared_w13[1].device,
+                )
+            w13_tm_weights[expert_id].copy_(prepared_w13[0])
+            assert w13_tm_scales is not None
+            w13_tm_scales[expert_id].copy_(prepared_w13[1])
             if raw_scale:
                 if fused_swiglu_prefill:
                     physical_global = w13_global.repeat(
@@ -960,8 +987,16 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 w2_scales.half().t().contiguous(),
                 NVFP4_GROUP_SIZE,
             )
-            w2_tm_weights.append(prepared_w2[0])
-            w2_tm_scales.append(prepared_w2[1])
+            if w2_tm_weights is None:
+                w2_tm_weights = _prepared_expert_bank(layer.w2_weight, prepared_w2[0])
+                w2_tm_scales = torch.empty(
+                    (num_experts, *prepared_w2[1].shape),
+                    dtype=prepared_w2[1].dtype,
+                    device=prepared_w2[1].device,
+                )
+            w2_tm_weights[expert_id].copy_(prepared_w2[0])
+            assert w2_tm_scales is not None
+            w2_tm_scales[expert_id].copy_(prepared_w2[1])
             if raw_scale:
                 w2_raw_scale_codes.append(
                     (prepared_w2[1].float() / w2_global)
@@ -972,12 +1007,10 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 w2_raw_global_scales.append(w2_global.reshape(1))
             w2_meta.append(prepared_w2[2])
 
-        layer.w13_tm_weight = Parameter(
-            torch.stack(w13_tm_weights), requires_grad=False
-        )
-        layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
-        prepared_w13_scales = torch.stack(w13_tm_scales)
-        prepared_w2_scales = torch.stack(w2_tm_scales)
+        layer.w13_tm_weight = Parameter(w13_tm_weights, requires_grad=False)
+        layer.w2_tm_weight = Parameter(w2_tm_weights, requires_grad=False)
+        prepared_w13_scales = w13_tm_scales
+        prepared_w2_scales = w2_tm_scales
         if raw_scale:
             raw_w13_codes = torch.stack(w13_raw_scale_codes)
             raw_w13_globals = torch.stack(w13_raw_global_scales).float()

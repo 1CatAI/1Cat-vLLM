@@ -14,18 +14,14 @@ from __future__ import annotations
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.cache_utils import needs_software_fp8
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp32_to_fp8_e4m3fn_bits,
 )
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
-
-
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
 
 
 # Hadamard-128 rotation
@@ -149,7 +145,7 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert q.dtype in (torch.bfloat16, torch.float16)
     assert q.is_contiguous()
     n_rows = q.shape[0]
-    software_fp8 = _is_exact_sm70_cuda()
+    software_fp8 = needs_software_fp8()
     q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
     q_scale = torch.empty((n_rows, 1), dtype=torch.float32, device=q.device)
     if n_rows == 0:
@@ -458,7 +454,7 @@ def kpool_compress_and_write_cache(
             )
         return None
 
-    software_fp8 = _is_exact_sm70_cuda()
+    software_fp8 = needs_software_fp8()
     buf_fp8 = buf if software_fp8 else buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     # bytes per page (last dim of kv_cache) viewed as uint8
@@ -528,37 +524,41 @@ def _kpool_tail_seed_kernel(
     tslot_ptr,
     tail_ptr,
     n_tokens,
+    TAIL_BLOCK_STRIDE: tl.constexpr,
+    TAIL_HALF_STRIDE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    KPOOL: tl.constexpr,
+    HISTORY_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Copy token ``i``'s raw K + gate into its request's tail block.
 
-    Token ``i`` is among its request's last KPOOL tokens iff the token KPOOL
-    ahead belongs to a different tail block (or is past the batch / padding,
-    slot < 0). ``tslot = block * KPOOL + pos % KPOOL``; the destination is
-    ``tail[block, {0:K, 1:score}, pos % KPOOL, :]``.
+    Token ``i`` is among its request's last HISTORY_SIZE tokens iff the token
+    HISTORY_SIZE positions ahead belongs to a different block (or is past the batch,
+    slot < 0). ``tslot = block * HISTORY_SIZE + pos % HISTORY_SIZE``; the
+    destination is ``tail[block, {0:K, 1:score}, pos % HISTORY_SIZE, :]``.
     """
     i = tl.program_id(0)
     t = tl.load(tslot_ptr + i).to(tl.int64)
     if t < 0:
         return
-    blk = t // KPOOL  # t >= 0 here, so trunc == floor
-    ahead = tl.load(tslot_ptr + i + KPOOL, mask=i + KPOOL < n_tokens, other=-1).to(
-        tl.int64
-    )
+    blk = t // HISTORY_SIZE  # t >= 0 here, so trunc == floor
+    ahead = tl.load(
+        tslot_ptr + i + HISTORY_SIZE,
+        mask=i + HISTORY_SIZE < n_tokens,
+        other=-1,
+    ).to(tl.int64)
     # Match the torch semantics exactly: a negative ahead slot floors to a
     # block id that differs from every real block -> token is in the tail.
     # Only divide non-negative slots (Triton int div truncates, torch floors).
-    if ahead >= 0 and ahead // KPOOL == blk:
+    if ahead >= 0 and ahead // HISTORY_SIZE == blk:
         return
     offs = tl.arange(0, BLOCK_D)
     m = offs < HEAD_DIM
-    base = (blk * 2 * KPOOL + t % KPOOL) * HEAD_DIM
+    base = blk * TAIL_BLOCK_STRIDE + (t % HISTORY_SIZE) * HEAD_DIM
     k = tl.load(key_ptr + i * HEAD_DIM + offs, mask=m)
     s = tl.load(score_ptr + i * HEAD_DIM + offs, mask=m)
     tl.store(tail_ptr + base + offs, k, mask=m)
-    tl.store(tail_ptr + base + KPOOL * HEAD_DIM + offs, s, mask=m)
+    tl.store(tail_ptr + base + TAIL_HALF_STRIDE + offs, s, mask=m)
 
 
 def kpool_seed_tail_cache(
@@ -573,6 +573,8 @@ def kpool_seed_tail_cache(
     assert tail_kv_cache.dtype in (torch.bfloat16, torch.float16)
     assert key.dtype == tail_kv_cache.dtype
     assert gate_score.dtype == key.dtype
+    history_size = tail_kv_cache.shape[2]
+    assert history_size >= kpool and history_size % kpool == 0
     n = tslot.shape[0]
     if n == 0:
         return
@@ -582,8 +584,10 @@ def kpool_seed_tail_cache(
         tslot,
         tail_kv_cache,
         n,
+        TAIL_BLOCK_STRIDE=tail_kv_cache.stride(0),
+        TAIL_HALF_STRIDE=tail_kv_cache.stride(1),
         HEAD_DIM=head_dim,
-        KPOOL=kpool,
+        HISTORY_SIZE=history_size,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
 
@@ -611,6 +615,7 @@ def _kpool_decode_update_batched_kernel(
     PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     POOL_SIZE: tl.constexpr,
+    HISTORY_SIZE: tl.constexpr,
     TAIL_BLOCK_ELEMS: tl.constexpr,
     KPOOL_HEAD: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -644,7 +649,7 @@ def _kpool_decode_update_batched_kernel(
         pos_valid = (cache_loc >= 0) & (pos >= 0)
 
         slot = safe_pos % POOL_SIZE
-        phys_slot = safe_pos % POOL_SIZE
+        phys_slot = safe_pos % HISTORY_SIZE
 
         # Derive the tail block from THIS token's tail_slot (the request's block
         # is constant across a pool, but a padded / invalid entry carries a
@@ -652,7 +657,7 @@ def _kpool_decode_update_batched_kernel(
         # token's base address). Clamp so an invalid entry can never form an
         # out-of-bounds base; the accesses below are gated on pos_valid anyway.
         tail_slot = tl.load(tail_slot_mapping_ptr + idx)
-        block = tl.maximum(tail_slot, 0).to(tl.int64) // POOL_SIZE
+        block = tl.maximum(tail_slot, 0).to(tl.int64) // HISTORY_SIZE
         block_base = block * TAIL_BLOCK_ELEMS
 
         # The tail-ring stash must run for EVERY real token, so it is gated on
@@ -680,7 +685,7 @@ def _kpool_decode_update_batched_kernel(
             max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
             for pool_slot in tl.static_range(0, POOL_SIZE):
                 is_current = pool_slot == slot
-                phys = (pool_logical_start + pool_slot) % POOL_SIZE
+                phys = (pool_logical_start + pool_slot) % HISTORY_SIZE
                 score_buf = tl.load(
                     tail_kv_ptr + block_base + KPOOL_HEAD + phys * HEAD_DIM + offs,
                     mask=dim_mask,
@@ -698,7 +703,7 @@ def _kpool_decode_update_batched_kernel(
             denom = tl.full((BLOCK_D,), 0.0, tl.float32)
             for pool_slot in tl.static_range(0, POOL_SIZE):
                 is_current = pool_slot == slot
-                phys = (pool_logical_start + pool_slot) % POOL_SIZE
+                phys = (pool_logical_start + pool_slot) % HISTORY_SIZE
                 score_buf = tl.load(
                     tail_kv_ptr + block_base + KPOOL_HEAD + phys * HEAD_DIM + offs,
                     mask=dim_mask,
@@ -800,7 +805,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 
     Args:
         kv_cache: indexer K cache ``[num_blocks, block_size, head_dim+4]`` uint8.
-        tail_kv_cache: paged tail cache ``[num_blocks, 2, pool_size, head_dim]``
+        tail_kv_cache: paged tail cache ``[num_blocks, 2, history_size, head_dim]``
             FP16/BF16 (K at half 0, gate score at half 1).
         tail_slot_mapping: ``[num_requests, next_n]`` int32.
         key / slot_score: ``[num_requests, next_n, head_dim]`` FP16/BF16.
@@ -812,7 +817,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         return
     assert tail_kv_cache.ndim == 4
     assert tail_kv_cache.shape[1] == 2
-    assert tail_kv_cache.shape[2] == pool_size
+    history_size = tail_kv_cache.shape[2]
+    assert history_size >= pool_size and history_size % pool_size == 0
     assert tail_kv_cache.shape[3] == head_dim
     assert tail_kv_cache.dtype in (torch.bfloat16, torch.float16)
     assert key.ndim == 3 and key.shape[2] == head_dim
@@ -829,7 +835,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 
     page_size = kv_cache.shape[1]
     buf = kv_cache
-    software_fp8 = _is_exact_sm70_cuda()
+    software_fp8 = needs_software_fp8()
     buf_fp8 = buf if software_fp8 else buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
 
@@ -860,6 +866,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         PAGE_SIZE=page_size,
         BUF_NUMEL_PER_PAGE=buf.stride(0),
         POOL_SIZE=pool_size,
+        HISTORY_SIZE=history_size,
         TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0),
         KPOOL_HEAD=tail_kv_cache.stride(1),
         HEAD_DIM=head_dim,

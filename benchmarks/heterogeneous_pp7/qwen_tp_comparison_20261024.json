@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-24",
+  "source_head": "219067a4dec2f9cf7f28d24015a8d9fe4020f4bc",
+  "workload": {
+    "lanes": 8,
+    "long_lanes": 2,
+    "long_input_tokens_per_lane": 214528,
+    "long_output_tokens_per_lane": 512,
+    "short_lanes": 6,
+    "short_input_tokens_per_lane": 2048,
+    "short_output_tokens_per_lane": 1024,
+    "generated_tokens_per_round": 7168,
+    "measurement": "mean of two warm rounds after one prime round and MTP shape warmup"
+  },
+  "results": [
+    {
+      "name": "historical_tp1_pp7",
+      "source": "ac9523a1c5102d9004c529f4489f99c66aed2fc9",
+      "status": "PASS",
+      "warm_mean_round_seconds": 42.26429168898903,
+      "warm_mean_shared_decode_tokens_per_second": 257.8004395560899
+    },
+    {
+      "name": "current_tp1_pp7_default",
+      "status": "PASS",
+      "warm_mean_round_seconds": 83.947,
+      "warm_mean_shared_decode_tokens_per_second": 226.682
+    },
+    {
+      "name": "current_tp1_pp7_qwen_override",
+      "status": "PASS",
+      "mixed_prefill_step_latency_ms": 0,
+      "warm_mean_round_seconds": 41.083,
+      "warm_mean_shared_decode_tokens_per_second": 286.397
+    },
+    {
+      "name": "current_tp2_pp3_qwen_override",
+      "status": "PASS",
+      "mixed_prefill_step_latency_ms": 0,
+      "warm_mean_round_seconds": 50.849,
+      "warm_mean_shared_decode_tokens_per_second": 227.996
+    },
+    {
+      "name": "current_tp4_pp1",
+      "status": "STARTUP_FAILED",
+      "throughput_available": false,
+      "collective": "_ALLGATHER_BASE",
+      "collective_sequence": 27,
+      "rank_0_input_elements": 496640,
+      "rank_1_to_3_input_elements_each": 10240
+    }
+  ]
+}

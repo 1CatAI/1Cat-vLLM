@@ -878,6 +878,32 @@ class EagleSpeculator(TargetSamplingHooks):
             )
         self._mtp_prefill_end(num_reqs)
 
+        # A non-final prompt chunk must still run the draft prefill above:
+        # its KV/recurrent state is needed when the prompt eventually finishes.
+        # No output is sampled for such chunks, so their additional draft
+        # decode steps can never be verified by the target. Avoid those steps
+        # without reading num_sampled back from the GPU. DP peers may have a
+        # different phase, so keep their collective schedule unchanged.
+        incomplete = input_batch.is_incomplete_prefilling_np
+        if (
+            not dummy_run
+            and not (
+                isinstance(self.vllm_config.additional_config, dict)
+                and self.vllm_config.additional_config.get(
+                    "disable_incomplete_prefill_draft_pruning", False
+                )
+            )
+            and not is_profile
+            and self.dp_size == 1
+            and num_reqs > 0
+            and incomplete is not None
+            and incomplete.size == num_reqs
+            and bool(np.all(incomplete))
+        ):
+            # Keep the fixed-width PP feedback contract, with deterministic
+            # unused proposals instead of stale rows from an earlier batch.
+            return self.draft_tokens[:num_reqs].zero_()
+
         if self.num_speculative_steps == 1:
             # Early exit.
             return self.draft_tokens[:num_reqs, :1]

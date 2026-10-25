@@ -87,11 +87,21 @@ def test_expert_projection_storage_keeps_types_and_tp_dimensions_independent():
         )
 
 
-def test_reject_unconverted_q2_down_before_allocating_expert_storage():
-    layer, method = layer_and_method(0)
+@pytest.mark.parametrize("rank", range(4))
+def test_unconverted_q2_down_retains_covering_blocks_and_activation_padding(rank):
+    layer, method = layer_and_method(rank)
+    raw = q2_weight(256)
     method.load_expert(layer, layer.w2_qweight_type, torch.tensor(42), "w2", 0)
-    with pytest.raises(ValueError, match="local K=160.*block 64"):
-        method.load_expert(
-            layer, layer.w2_qweight, torch.from_numpy(q2_weight(256)), "w2", 0
-        )
-    assert not hasattr(layer, "gguf_w2")
+    method.load_expert(layer, layer.w2_qweight, torch.from_numpy(raw), "w2", 0)
+    left, physical_k = method.input_padding["w2"]
+    assert physical_k == 192
+    assert left == (rank * 160) % 64
+    decoded = dequantize(layer.gguf_w2[0].numpy(), 42)
+    expected = dequantize(raw, 42)[:, rank * 160 : (rank + 1) * 160]
+    np.testing.assert_array_equal(decoded[:, left : left + 160], expected)
+    # Padded activations must select exactly the local logical columns.
+    active = np.zeros(physical_k, dtype=np.float32)
+    active[left : left + 160] = np.arange(160, dtype=np.float32) / 160
+    np.testing.assert_allclose(
+        decoded @ active, expected @ active[left : left + 160], rtol=1e-6, atol=1e-6
+    )

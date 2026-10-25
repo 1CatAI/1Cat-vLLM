@@ -358,6 +358,10 @@ class VocabParallelEmbedding(PluggableLayer):
         quant_method: QuantizeMethodBase | None = None,
     ):
         super().__init__()
+        # ModelOpt may use UnquantizedLinearMethod for an excluded LM head.
+        # It has the same policy/trace ownership contract as LinearBase.
+        self._layer_execution_policy = layer_policy()
+        self._layer_trace = capture_runtime_trace()
         self._sm70_dflash2_policy = capture_sm70_dflash2_config()
         self.prefix = prefix
 

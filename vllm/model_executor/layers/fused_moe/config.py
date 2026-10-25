@@ -853,9 +853,10 @@ def nvfp4_w4a16_moe_quant_config(
     g2_alphas: torch.Tensor,
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
-    Construct a quant config for 16-but activations and nvp4 weights.
+    Construct a quant config for 16-bit activations and NVFP4 weights.
     """
     return FusedMoEQuantConfig.make(
         quant_dtype=None,
@@ -864,6 +865,7 @@ def nvfp4_w4a16_moe_quant_config(
         g1_alphas=g1_alphas,
         g2_alphas=g2_alphas,
         weight_dtype="nvfp4",
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 

@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.model_executor.models.glm4_1v import (
+    _MAX_FRAMES_PER_VIDEO,
     Glm4vMultiModalProcessor,
     Glm4vProcessingInfo,
 )
@@ -626,6 +627,11 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
     """
 
     def get_hf_processor(self, **kwargs: object):
+        from vllm.transformers_utils.processors.glm5next import (
+            _reject_pixel_budget_kwargs,
+        )
+
+        _reject_pixel_budget_kwargs(self.ctx.get_merged_mm_kwargs(kwargs))
         proc = getattr(self, "_glm5_hf_processor", None)
         if proc is None:
             from vllm.transformers_utils.processors.glm5next import Glm5NextProcessor
@@ -634,28 +640,72 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             self._glm5_hf_processor = proc
         return proc
 
-    def _processor_pixel_budget(self, proc) -> tuple[int, int]:
-        from vllm.transformers_utils.processors.glm5next import _pixel_budget
+    def _processor_pixel_budget(self, proc, *, modality: str) -> tuple[int, int]:
+        from vllm.transformers_utils.processors.glm5next import (
+            _pixel_budget,
+            _reject_pixel_budget_kwargs,
+        )
+
+        kwargs = self.ctx.get_merged_mm_kwargs({})
+        _reject_pixel_budget_kwargs(kwargs)
+        # ProcessorMixin applies modality-specific options after common kwargs.
+        # Profiling must use the same limits as the real image/video processor.
+        nested_key = f"{modality}s_kwargs"
+        nested_kwargs = kwargs.get(nested_key, {})
+        if not isinstance(nested_kwargs, Mapping):
+            raise TypeError(f"{nested_key} must be a mapping")
+        kwargs = {**kwargs, **nested_kwargs}
 
         return _pixel_budget(
-            proc.min_image_tokens,
-            proc.max_image_tokens,
+            kwargs.get("min_image_tokens", proc.min_image_tokens),
+            kwargs.get("max_image_tokens", proc.max_image_tokens),
             proc.patch_size,
             proc.merge_size,
             proc.temporal_patch_size,
         )
 
     def _get_image_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
-        if (override := mm_kwargs.get("max_pixels")) is not None:
-            return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
+        return self._processor_pixel_budget(
+            self.get_hf_processor().image_processor, modality="image"
+        )[1]
 
     def _get_video_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
-        if (override := mm_kwargs.get("max_pixels")) is not None:
-            return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().video_processor)[1]
+        return self._processor_pixel_budget(
+            self.get_hf_processor().video_processor, modality="video"
+        )[1]
+
+    def get_num_video_tokens(
+        self, *, image_width: int, image_height: int, num_frames: int
+    ) -> int:
+        min_pixels, max_pixels = self._processor_pixel_budget(
+            self.get_hf_processor().video_processor, modality="video"
+        )
+        _, tokens = self._get_vision_info(
+            image_width=image_width,
+            image_height=image_height,
+            num_frames=num_frames,
+            min_image_pixels=min_pixels,
+            max_image_pixels=max_pixels,
+        )
+        return tokens
+
+    def _get_max_video_frames(self, max_tokens: int) -> int:
+        # A capped total video budget can plateau below max_tokens. Bound the
+        # inherited search before one aligned patch per frame exceeds that cap.
+        proc = self.get_hf_processor().video_processor
+        factor = proc.patch_size * proc.merge_size * proc.patch_expand_factor
+        limit = min(_MAX_FRAMES_PER_VIDEO, self._get_video_max_pixels() // factor**2)
+        limit -= limit % proc.temporal_patch_size
+        width, height = self.get_image_size_with_most_features()
+        frames = 0
+        for candidate in range(1, limit + 1):
+            tokens = self.get_num_video_tokens(
+                image_width=width, image_height=height, num_frames=candidate
+            )
+            if tokens > max_tokens or tokens == 0:
+                break
+            frames = candidate
+        return frames
 
     def _get_vision_info(
         self,
@@ -664,6 +714,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         image_height: int,
         num_frames: int = 16,
         do_resize: bool = True,
+        min_image_pixels: int | None = None,
         max_image_pixels: int = 28 * 28 * 2 * 30000,
     ) -> tuple[ImageSize, int]:
         """GLM-5.3-Flash canvas geometry for token budgeting and dummy inputs.
@@ -683,6 +734,10 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         temporal_patch_size = vision_config.temporal_patch_size
 
         image_processor = self.get_hf_processor().image_processor
+        if min_image_pixels is None:
+            min_image_pixels = self._processor_pixel_budget(
+                image_processor, modality="image"
+            )[0]
         factor = patch_size * merge_size * image_processor.patch_expand_factor
         # Keep the profiling search viable when the caller's budget is below
         # one aligned canvas of the requested duration.
@@ -697,7 +752,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
                 t_factor=temporal_patch_size,
                 h_factor=factor,
                 w_factor=factor,
-                min_pixels=1,
+                min_pixels=min(min_image_pixels, max_image_pixels),
                 max_pixels=max_image_pixels,
             )
             preprocessed_size = ImageSize(width=resized_width, height=resized_height)

@@ -15,6 +15,7 @@ from vllm.diagnostics import diagnostic_history
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fla.ops.gdn_chunk_kernels import bind_kda_kernels
 from vllm.model_executor.layers.fla.ops.kda import (
     FusedRMSNormGated,
     chunk_kda_with_fused_gate,
@@ -316,6 +317,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config.quant_config = None
         super().__init__(config, vllm_config, prefix)
         vllm_config.quant_config = saved_quant_config
+        # Bind worker-local tuners before either runner enters prefill/warmup.
+        # The shared binder reuses them across layers of this engine only.
+        self.chunk_kernels = bind_kda_kernels(vllm_config)
 
         # Linear-attention head config: read the flattened top-level fields when
         # present (new schema); fall back to the legacy linear_attn_config dict

@@ -32,9 +32,10 @@ def _is_sm70_flash_v100_platform() -> bool:
     return capability is not None and tuple(capability) == (7, 0)
 
 
-@functools.cache
 def _flash_v100_dense_prefill_lse_usable() -> bool:
     """Return whether the SM70 dense prefill entry can emit softmax LSE."""
+    # The native entry is already cached by its loader. Repeat the loader's
+    # engine-local binding so a prior engine's successful probe is not reused.
     if not _is_sm70_flash_v100_platform():
         return False
     try:

@@ -51,6 +51,41 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _restore_nvfp4_projection_scales(
+    output,
+    scales,
+    sorted_ids,
+    expert_ids,
+    padded_count,
+    ROWS: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    block = tl.program_id(0)
+    if block * BLOCK_M < tl.load(padded_count):
+        expert = tl.load(expert_ids + block)
+        if expert >= 0:
+            gate = tl.load(scales + expert * 2)
+            up = tl.load(scales + expert * 2 + 1)
+            base = tl.maximum(gate, up)
+            denominator = tl.where(base > 0, base, 1.0)
+            offsets = tl.arange(0, triton.next_power_of_2(BLOCK_M))
+            rows = tl.load(
+                sorted_ids + block * BLOCK_M + offsets,
+                mask=offsets < BLOCK_M,
+                other=ROWS,
+            )
+            cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+            mask = (rows[:, None] < ROWS) & (cols[None, :] < 2 * N)
+            ptrs = output + rows[:, None] * (2 * N) + cols[None, :]
+            values = tl.load(ptrs, mask=mask, other=0).to(tl.float32)
+            ratio = tl.where(cols < N, gate, up) / denominator
+            tl.store(ptrs, values * ratio[None, :], mask=mask)
 
 
 def _fused_marlin_moe(
@@ -130,6 +165,21 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
+    separate_global_scales = (
+        global_scale1 is not None
+        and global_scale1.ndim == 2
+        and global_scale1.shape[1] == 2
+    )
+    if separate_global_scales:
+        assert global_scale1 is not None
+        if bias1 is not None or not activation.is_gated:
+            raise NotImplementedError(
+                "Independent NVFP4 projection scales require bias-free gated MoE."
+            )
+        gemm_global_scale1 = global_scale1.amax(dim=-1).contiguous()
+    else:
+        gemm_global_scale1 = global_scale1
+
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
         intermediate_cache1,
@@ -137,7 +187,7 @@ def _fused_marlin_moe(
         bias1,
         w1_scale,
         a_scales1,
-        global_scale1,
+        gemm_global_scale1,
         w1_zeros,
         g_idx1,
         sort_indices1,
@@ -158,6 +208,23 @@ def _fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
+    if separate_global_scales:
+        _restore_nvfp4_projection_scales[
+            (
+                triton.cdiv(sorted_token_ids.numel(), block_size_m),
+                triton.cdiv(2 * N, 128),
+            )
+        ](
+            intermediate_cache1,
+            global_scale1,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            M * num_topk,
+            N,
+            block_size_m,
+            128,
+        )
     if clamp_limit is not None and activation == MoEActivation.SILU:
         swiglu_limit_func(
             intermediate_cache2,

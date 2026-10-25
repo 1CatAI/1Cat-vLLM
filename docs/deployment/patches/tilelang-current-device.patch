@@ -1,0 +1,43 @@
+--- tilelang/utils/target.py
++++ tilelang/utils/target.py
+@@ -97,7 +97,7 @@
+     """Return the CUDA SM architecture detected from PyTorch, if available."""
+     if not torch.cuda.is_available():
+         return None
+-    cap = torch.cuda.get_device_capability(0)
++    cap = torch.cuda.get_device_capability(torch.cuda.current_device())
+     return f"sm_{nvcc.get_target_arch(cap)}" if cap else None
+ 
+ 
+--- tilelang/contrib/nvcc.py
++++ tilelang/contrib/nvcc.py
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import os
++import torch
+ import subprocess
+ import warnings
+ import contextlib
+@@ -417,8 +418,8 @@
+             raise ValueError(f"Unsupported arch: {arch}")
+ 
+     # 3. GPU compute version
+-    if tvm.cuda(0).exist:
+-        return tvm.cuda(0).compute_version
++    if tvm.cuda(torch.cuda.current_device()).exist:
++        return tvm.cuda(torch.cuda.current_device()).compute_version
+ 
+     raise ValueError(
+         "No CUDA architecture was specified or GPU detected. Specify it with a target config such as {'kind': 'cuda', 'arch': 'sm_90'}."
+@@ -503,8 +504,8 @@
+         isn't specified.
+     """
+     if compute_version is None:
+-        if tvm.cuda(0).exist:
+-            compute_version = tvm.cuda(0).compute_version
++        if tvm.cuda(torch.cuda.current_device()).exist:
++            compute_version = tvm.cuda(torch.cuda.current_device()).compute_version
+         else:
+             if target is None or "arch" not in target.attrs:
+                 warnings.warn(

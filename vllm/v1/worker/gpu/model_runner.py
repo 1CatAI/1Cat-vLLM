@@ -74,6 +74,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.spec_decode.profiling import create_step_profiler
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -270,10 +271,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
         )
         if self.use_pp:
+            additional_config = vllm_config.additional_config
+            packed_feedback = (
+                additional_config.get("pp_packed_feedback", False)
+                if isinstance(additional_config, dict)
+                else False
+            )
+            if not isinstance(packed_feedback, bool):
+                raise ValueError("pp_packed_feedback must be a boolean")
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                feedback_depth=vllm_config.max_concurrent_batches,
+                packed_feedback=packed_feedback,
             )
         # Prefix-anchored SWA: persistent GPU buffer for per-request prompt
         # lengths (stable device address across steps).
@@ -1013,6 +1024,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert sampled_tokens is not None
         assert num_sampled is not None
         assert num_rejected is not None
+        # PP_DELAYED_MAMBA_REQUEST_ROWS
+        # Align-state migration indexes the persistent input block tables by
+        # batch row. Deferred PP feedback refers to an older microbatch, while
+        # those tables currently contain the most recently executed microbatch.
+        # Rebuild its rows from the stable request-owned block tables before
+        # committing recurrent state. The next prepare_attn rebuilds current
+        # forward rows as usual.
+        if self.cache_config.mamba_cache_mode == "align":
+            # Freed/excluded requests use -1 and are skipped by postprocess.
+            # The gather kernel does not accept -1, so gather an unused safe row
+            # for those entries while retaining the original commit mask.
+            self.block_tables.gather_block_tables(
+                idx_mapping.clamp_min(0), num_reqs_padded=idx_mapping.shape[0]
+            )
         self.postprocess_sampled(
             idx_mapping,
             sampled_tokens,
@@ -1487,185 +1512,194 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if not dummy_run:
-            if self.device.type == "cuda":
-                self.mixed_prefill_timer.begin(scheduler_output)
-            # Update the request states.
-            self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
-            self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
-            if scheduler_output.new_block_ids_to_zero:
-                self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
-            if scheduler_output.total_num_scheduled_tokens == 0:
-                # No need to run the model.
+        with record_function_or_nullcontext("gpu_model_runner: preprocess"):
+            if not dummy_run:
+                if self.device.type == "cuda":
+                    self.mixed_prefill_timer.begin(scheduler_output)
+                # Update the request states.
+                # A force-reset releases every affected request's blocks, including
+                # requests that cannot resume in this batch. Invalidate their old
+                # PP generations before a delayed Mamba commit can touch those
+                # blocks after they have been assigned to another request.
+                for req_id in scheduler_output.prefix_cache_reset_req_ids or ():
+                    self._remove_request(req_id)
+                self.update_pp_decode_requests()
+                self.finish_requests(scheduler_output)
+                self.free_states(scheduler_output)
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+                self.block_tables.apply_staged_writes()
+                if scheduler_output.new_block_ids_to_zero:
+                    self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+                if scheduler_output.total_num_scheduled_tokens == 0:
+                    # No need to run the model.
+                    empty_output = self.kv_connector.no_forward(scheduler_output)
+                    return empty_output
+
+            # Get batch descriptor and sync across DP ranks.
+            num_reqs = len(scheduler_output.num_scheduled_tokens)
+            num_toks = scheduler_output.total_num_scheduled_tokens
+            uniform_tok_count = self._get_uniform_decode_token_count(
+                scheduler_output, dummy_run
+            )
+
+            skip_compiled = False
+            if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
+                # Encoder-decoder models such as Whisper should run eager/non-compiled
+                # when encoder inputs are scheduled, because this step updates
+                # cross-attention cache with dynamic encoder outputs.
+                skip_compiled = True
+
+            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                self.cudagraph_manager,
+                num_reqs,
+                num_toks,
+                uniform_tok_count,
+                self.dp_size,
+                self.dp_rank,
+                need_eager=is_profile or skip_compiled,
+            )
+
+            if batch_desc.num_tokens == 0:
+                # All DP ranks have zero tokens to run.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
-        # Get batch descriptor and sync across DP ranks.
-        num_reqs = len(scheduler_output.num_scheduled_tokens)
-        num_toks = scheduler_output.total_num_scheduled_tokens
-        uniform_tok_count = self._get_uniform_decode_token_count(
-            scheduler_output, dummy_run
-        )
-
-        skip_compiled = False
-        if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
-            # Encoder-decoder models such as Whisper should run eager/non-compiled
-            # when encoder inputs are scheduled, because this step updates
-            # cross-attention cache with dynamic encoder outputs.
-            skip_compiled = True
-
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.cudagraph_manager,
-            num_reqs,
-            num_toks,
-            uniform_tok_count,
-            self.dp_size,
-            self.dp_rank,
-            need_eager=is_profile or skip_compiled,
-        )
-
-        if batch_desc.num_tokens == 0:
-            # All DP ranks have zero tokens to run.
-            empty_output = self.kv_connector.no_forward(scheduler_output)
-            return empty_output
-
-        early_model_inputs: dict[str, Any] | None = None
-        ple_prepared = False
-        if not dummy_run:
-            # Common case.
-            # Prepare all the inputs and copy to the input buffers.
-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-            early_model_inputs, ple_prepared = self.prepare_model_inputs_early(
-                input_batch, batch_desc.cg_mode
-            )
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
-            # Hybrid Mamba align-mode prefix caching migrates recurrent state
-            # across block boundaries before attention metadata consumes it.
-            self.model_state.preprocess_state(
-                input_batch,
-                block_tables,
-                self.kv_cache_config,
-                self.req_states.num_computed_tokens.gpu,
-            )
-
-            if self.lora_config:
-                # Activate LoRA adapters.
-                lora_inputs = self.lora_state.make_lora_inputs(
-                    input_batch.req_ids,
-                    input_batch.idx_mapping_np,
-                    input_batch.num_scheduled_tokens,
+            early_model_inputs: dict[str, Any] | None = None
+            ple_prepared = False
+            if not dummy_run:
+                # Common case.
+                # Prepare all the inputs and copy to the input buffers.
+                input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+                early_model_inputs, ple_prepared = self.prepare_model_inputs_early(
+                    input_batch, batch_desc.cg_mode
                 )
-                self._set_active_loras(*lora_inputs)
-        else:
-            # No actual tokens to run. A dummy run for DP or memory profiling.
-            input_batch = InputBatch.make_dummy(
-                batch_desc.num_reqs or num_reqs,
-                batch_desc.num_tokens,
-                self.input_buffers,
-            )
-            if not skip_attn_for_dummy_run:
-                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
-            else:
-                assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
-                    "Attention metadata must be prepared for dummy runs when using "
-                    "FULL cudagraph mode."
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
+                # Hybrid Mamba align-mode prefix caching migrates recurrent state
+                # across block boundaries before attention metadata consumes it.
+                self.model_state.preprocess_state(
+                    input_batch,
+                    block_tables,
+                    self.kv_cache_config,
+                    self.req_states.num_computed_tokens.gpu,
                 )
-                block_tables = None
-                slot_mappings = None
-            if self.lora_config:
-                # program a no-LoRA mapping here so kernels early-exit instead of
-                # reading uninitialized metadata during dummy runs.
-                # FIXME: Replace this with LoRA warmup:
-                # https://github.com/vllm-project/vllm/pull/35536
-                assert hasattr(self, "lora_manager")
-                adapter_manager = self.lora_manager._adapter_manager
-                adapter_manager.set_adapter_mapping(
-                    LoRAMapping(
-                        index_mapping=(0,) * input_batch.num_tokens_after_padding,
-                        prompt_mapping=(0,) * input_batch.num_reqs,
-                        is_prefill=True,
+
+                if self.lora_config:
+                    # Activate LoRA adapters.
+                    lora_inputs = self.lora_state.make_lora_inputs(
+                        input_batch.req_ids,
+                        input_batch.idx_mapping_np,
+                        input_batch.num_scheduled_tokens,
                     )
+                    self._set_active_loras(*lora_inputs)
+            else:
+                # No actual tokens to run. A dummy run for DP or memory profiling.
+                input_batch = InputBatch.make_dummy(
+                    batch_desc.num_reqs or num_reqs,
+                    batch_desc.num_tokens,
+                    self.input_buffers,
                 )
-                seen_wrappers: set[int] = set()
-                for punica_wrapper in adapter_manager.punica_wrapper_mapping.values():
-                    if id(punica_wrapper) in seen_wrappers:
-                        continue
-                    seen_wrappers.add(id(punica_wrapper))
-                    for kernel_meta in (
-                        punica_wrapper.token_mapping_meta,  # type: ignore[attr-defined]
-                        punica_wrapper.prompt_mapping_meta,  # type: ignore[attr-defined]
-                    ):
-                        kernel_meta.no_lora_flag_cpu[0] = False
-                        kernel_meta.num_active_loras_cpu[0] = 1
+                if not skip_attn_for_dummy_run:
+                    block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                else:
+                    assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
+                        "Attention metadata must be prepared for dummy runs when using "
+                        "FULL cudagraph mode."
+                    )
+                    block_tables = None
+                    slot_mappings = None
+                if self.lora_config:
+                    # program a no-LoRA mapping here so kernels early-exit instead of
+                    # reading uninitialized metadata during dummy runs.
+                    # FIXME: Replace this with LoRA warmup:
+                    # https://github.com/vllm-project/vllm/pull/35536
+                    assert hasattr(self, "lora_manager")
+                    adapter_manager = self.lora_manager._adapter_manager
+                    adapter_manager.set_adapter_mapping(
+                        LoRAMapping(
+                            index_mapping=(0,) * input_batch.num_tokens_after_padding,
+                            prompt_mapping=(0,) * input_batch.num_reqs,
+                            is_prefill=True,
+                        )
+                    )
+                    seen_wrappers: set[int] = set()
+                    for (
+                        punica_wrapper
+                    ) in adapter_manager.punica_wrapper_mapping.values():
+                        if id(punica_wrapper) in seen_wrappers:
+                            continue
+                        seen_wrappers.add(id(punica_wrapper))
+                        for kernel_meta in (
+                            punica_wrapper.token_mapping_meta,  # type: ignore[attr-defined]
+                            punica_wrapper.prompt_mapping_meta,  # type: ignore[attr-defined]
+                        ):
+                            kernel_meta.no_lora_flag_cpu[0] = False
+                            kernel_meta.num_active_loras_cpu[0] = 1
 
-        attn_metadata = None
-        slot_mappings_by_layer = None
-        if not (dummy_run and skip_attn_for_dummy_run):
-            assert slot_mappings is not None
-            slot_mappings_by_layer = build_slot_mappings_by_layer(
-                slot_mappings, self.kv_cache_config
-            )
-            assert block_tables is not None
-            attn_metadata = self.model_state.prepare_attn(
-                input_batch,
-                batch_desc.cg_mode,
-                block_tables,
-                slot_mappings,
-                self.attn_groups,
-                self.kv_cache_config,
-            )
+            attn_metadata = None
+            slot_mappings_by_layer = None
+            if not (dummy_run and skip_attn_for_dummy_run):
+                assert slot_mappings is not None
+                slot_mappings_by_layer = build_slot_mappings_by_layer(
+                    slot_mappings, self.kv_cache_config
+                )
+                assert block_tables is not None
+                attn_metadata = self.model_state.prepare_attn(
+                    input_batch,
+                    batch_desc.cg_mode,
+                    block_tables,
+                    slot_mappings,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                )
 
-        inputs_embeds = None
-        if self.supports_mm_inputs and self.is_first_pp_rank:
-            # Run MM encoder (if needed) and get multimodal embeddings.
-            # Only first PP rank prepares multimodal embeddings.
-            # NOTE(woosuk): We must call get_mm_embeddings even during dummy runs
-            # to obtain inputs_embeds, because the compiled model expects this input.
-            inputs_embeds = self.model_state.get_mm_embeddings(
-                scheduler_output.scheduled_encoder_inputs,
-                input_batch,
-                self.req_states,
-            )
+            inputs_embeds = None
+            if self.supports_mm_inputs and self.is_first_pp_rank:
+                # Run MM encoder (if needed) and get multimodal embeddings.
+                # Only first PP rank prepares multimodal embeddings.
+                # NOTE(woosuk): We must call get_mm_embeddings even during dummy runs
+                # to obtain inputs_embeds: the compiled model expects this input.
+                inputs_embeds = self.model_state.get_mm_embeddings(
+                    scheduler_output.scheduled_encoder_inputs,
+                    input_batch,
+                    self.req_states,
+                )
 
-        model_inputs = {
-            "input_ids": input_batch.input_ids,
-            "positions": input_batch.positions,
-            "inputs_embeds": inputs_embeds,
-            # NOTE: Values returned by `prepare_inputs` will override the default
-            # values above.
-            **(
-                early_model_inputs
-                if early_model_inputs is not None
-                else self.model_state.prepare_inputs(input_batch, self.req_states)
-            ),
-        }
-        if self._ple_offload_connector is not None and not ple_prepared:
-            self._ple_offload_connector.prepare_forward(
-                input_batch.num_reqs,
-                input_batch.num_tokens_after_padding,
-                dummy_run,
-                use_local_model=batch_desc.cg_mode == CUDAGraphMode.FULL,
-            )
-        if not self.is_first_pp_rank:
-            # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
-            model_inputs["inputs_embeds"] = None
+            model_inputs = {
+                "input_ids": input_batch.input_ids,
+                "positions": input_batch.positions,
+                "inputs_embeds": inputs_embeds,
+                # NOTE: Values returned by `prepare_inputs` will override the default
+                # values above.
+                **(
+                    early_model_inputs
+                    if early_model_inputs is not None
+                    else self.model_state.prepare_inputs(input_batch, self.req_states)
+                ),
+            }
+            if self._ple_offload_connector is not None and not ple_prepared:
+                self._ple_offload_connector.prepare_forward(
+                    input_batch.num_reqs,
+                    input_batch.num_tokens_after_padding,
+                    dummy_run,
+                    use_local_model=batch_desc.cg_mode == CUDAGraphMode.FULL,
+                )
+            if not self.is_first_pp_rank:
+                # Update for non-first PP ranks.
+                model_inputs["input_ids"] = None
+                model_inputs["inputs_embeds"] = None
 
-            # Prepare the intermediate tensors.
-            assert intermediate_tensors is not None
-            assert self.intermediate_tensors is not None
-            n = input_batch.num_tokens_after_padding
-            model_inputs["intermediate_tensors"] = IntermediateTensors(
-                {
-                    k: v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                    for k, v in self.intermediate_tensors.tensors.items()
-                }
-            )
-            del intermediate_tensors
+                # Prepare the intermediate tensors.
+                assert intermediate_tensors is not None
+                assert self.intermediate_tensors is not None
+                n = input_batch.num_tokens_after_padding
+                model_inputs["intermediate_tensors"] = IntermediateTensors(
+                    {
+                        k: v[:n].copy_(intermediate_tensors.tensors[k][:n])
+                        for k, v in self.intermediate_tensors.tensors.items()
+                    }
+                )
+                del intermediate_tensors
 
         # Profile only real MTP verification steps. Prefill, non-spec decode,
         # warmup, and ordinary production runs keep the event path disabled.
@@ -1688,72 +1722,74 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         mtp_target_start = self._step_profiler.start_context(mtp_profile_ctx)
 
         # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            assert self.cudagraph_manager is not None
-            batch_desc = self.cudagraph_manager.select_attention_graph(
-                batch_desc, input_batch.seq_lens_cpu_upper_bound
-            )
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-        else:
-            # For piecewise and eager mode, just call model().
-            batch_descriptor = BatchDescriptor(
-                num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
-            )
-
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
-                batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-            ):
+        with record_function_or_nullcontext("gpu_model_runner: forward"):
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Use explicit cudagraph replay for FULL mode.
+                # NOTE(woosuk): Here, we don't need to pass the input tensors,
+                # because they are already copied to the CUDA graph input buffers.
+                assert self.cudagraph_manager is not None
+                batch_desc = self.cudagraph_manager.select_attention_graph(
+                    batch_desc, input_batch.seq_lens_cpu_upper_bound
+                )
                 self.kv_connector.pre_forward(scheduler_output)
-                model_output = self.model(**model_inputs)
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            else:
+                # For piecewise and eager mode, just call model().
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                )
 
-        if self._ple_offload_connector is not None:
-            self._ple_offload_connector.release_outputs()
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                ):
+                    self.kv_connector.pre_forward(scheduler_output)
+                    model_output = self.model(**model_inputs)
+
+            if self._ple_offload_connector is not None:
+                self._ple_offload_connector.release_outputs()
         self._step_profiler.finish_context(
             mtp_profile_ctx, "target_forward", mtp_target_start
         )
 
-        if self.is_last_pp_rank:
-            if self.use_aux_hidden_state_outputs:
-                assert isinstance(model_output, tuple)
-                hidden_states, aux_hidden_states = model_output
+        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            if self.is_last_pp_rank:
+                if self.use_aux_hidden_state_outputs:
+                    assert isinstance(model_output, tuple)
+                    hidden_states, aux_hidden_states = model_output
+                else:
+                    assert isinstance(model_output, torch.Tensor)
+                    hidden_states = model_output
+                    aux_hidden_states = None
+                output_intermediate_tensors = None
             else:
-                assert isinstance(model_output, torch.Tensor)
-                hidden_states = model_output
+                assert isinstance(model_output, IntermediateTensors)
+                hidden_states = None
                 aux_hidden_states = None
-            output_intermediate_tensors = None
-        else:
-            assert isinstance(model_output, IntermediateTensors)
-            hidden_states = None
-            aux_hidden_states = None
-            output_intermediate_tensors = model_output
+                output_intermediate_tensors = model_output
 
-        finished_req_ids = scheduler_output.finished_req_ids
-        self.execute_model_state = ExecuteModelState(
-            input_batch=input_batch,
-            attn_metadata=attn_metadata,
-            slot_mappings_by_layer=slot_mappings_by_layer,
-            hidden_states=hidden_states,
-            aux_hidden_states=aux_hidden_states,
-            finished_req_ids=finished_req_ids,
-        )
-        self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
+            finished_req_ids = scheduler_output.finished_req_ids
+            self.execute_model_state = ExecuteModelState(
+                input_batch=input_batch,
+                attn_metadata=attn_metadata,
+                slot_mappings_by_layer=slot_mappings_by_layer,
+                hidden_states=hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                finished_req_ids=finished_req_ids,
+            )
+            self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
-        if not self.is_last_pp_rank:
-            # Non-last PP rank: return IntermediateTensors for sending.
-            return output_intermediate_tensors
-        return None
+            if not self.is_last_pp_rank:
+                # Non-last PP rank: return IntermediateTensors for sending.
+                return output_intermediate_tensors
+            return None
 
     @torch.inference_mode()
     @step_eplb_after()
@@ -1775,100 +1811,108 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._sm70_v2_mtp_profile_pending = None
 
         if not self.is_last_pp_rank:
-            assert self.pp_handler is not None
-            all_decode_next = self.pp_handler.receive(input_batch)
-            # Advance query positions immediately; sampled/rejected tokens and
-            # next-step drafts are applied from the PP-depth slot ring.
-            self.postprocess_num_computed_tokens(input_batch)
-            if not all_decode_next:
-                self.model_state.postprocess_state(
-                    input_batch.idx_mapping,
-                    0,
-                    self.req_states.num_computed_tokens.gpu,
-                )
+            with record_function_or_nullcontext("gpu_model_runner: pp_feedback"):
+                assert self.pp_handler is not None
+                all_decode_next = self.pp_handler.receive(input_batch)
+                # Advance query positions immediately; sampled/rejected tokens and
+                # next-step drafts are applied from the PP-depth slot ring.
+                self.postprocess_num_computed_tokens(input_batch)
+                if not all_decode_next:
+                    self.model_state.postprocess_state(
+                        input_batch.idx_mapping,
+                        0,
+                        self.req_states.num_computed_tokens.gpu,
+                    )
 
-            # Post-step KV connector related operations.
-            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+                # Post-step KV connector related operations.
+                kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+                return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        if self.speculator is not None:
-            self.speculator.prepare_target_context(
-                input_batch, hidden_states, aux_hidden_states
+        with record_function_or_nullcontext("gpu_model_runner: sample"):
+            if self.speculator is not None:
+                self.speculator.prepare_target_context(
+                    input_batch, hidden_states, aux_hidden_states
+                )
+            mtp_sample_start = self._step_profiler.start_context(mtp_profile_ctx)
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
             )
-        mtp_sample_start = self._step_profiler.start_context(mtp_profile_ctx)
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
-        self._step_profiler.finish_context(
-            mtp_profile_ctx, "target_sample", mtp_sample_start
-        )
-
-        assert self.prompt_logprobs_worker is not None
-        prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
-            self.model.compute_logits,
-            hidden_states,
-            input_batch,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.num_computed_tokens.gpu,
-            self.req_states.prompt_len.np,
-            self.req_states.prefill_len.np,
-            self.req_states.num_computed_prefill_tokens,
-            self.req_states.prompt_len.gpu,
-        )
-
-        # Prepare the model runner output.
-        model_runner_output = ModelRunnerOutput(
-            req_ids=input_batch.req_ids,
-            # NOTE(woosuk): req_id_to_index is unused in this model runner.
-            # Only for compatibility with the existing model runner and scheduler.
-            req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
-            sampled_token_ids=None,  # type: ignore
-            prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
-        )
-        # Start async output copy here so that it can overlap with speculator proposal.
-        async_output = AsyncOutput(
-            model_runner_output=model_runner_output,
-            sampler_output=sampler_output,
-            num_sampled_tokens=num_sampled,
-            main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
-        )
-
-        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
-            # Get cached multimodal embeddings for draft forward.
-            # NOTE: This is done here because postprocess updates
-            # num_computed_prefill_tokens.
-            prefill_lens = self.req_states.prefill_len.np[input_batch.idx_mapping_np]
-            computed_prefill_lens = self.req_states.num_computed_prefill_tokens[
-                input_batch.idx_mapping_np
-            ]
-            mm_inputs = self.model_state.encoder_runner.gather_mm_embeddings(
-                input_batch.req_ids,
-                input_batch.num_tokens,
-                input_batch.num_scheduled_tokens,
-                input_batch.query_start_loc_np,
-                prefill_lens,
-                computed_prefill_lens + 1,  # +1 to consider the skew in eagle
+            self._step_profiler.finish_context(
+                mtp_profile_ctx, "target_sample", mtp_sample_start
             )
+
+        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            assert self.prompt_logprobs_worker is not None
+            prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
+                self.model.compute_logits,
+                hidden_states,
+                input_batch,
+                self.req_states.all_token_ids.gpu,
+                self.req_states.num_computed_tokens.gpu,
+                self.req_states.prompt_len.np,
+                self.req_states.prefill_len.np,
+                self.req_states.num_computed_prefill_tokens,
+                self.req_states.prompt_len.gpu,
+            )
+
+            # Prepare the model runner output.
+            model_runner_output = ModelRunnerOutput(
+                req_ids=input_batch.req_ids,
+                # NOTE(woosuk): req_id_to_index is unused in this model runner.
+                # Only for compatibility with the existing model runner and scheduler.
+                req_id_to_index={
+                    req_id: i for i, req_id in enumerate(input_batch.req_ids)
+                },
+                sampled_token_ids=None,  # type: ignore
+                prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            )
+            # Start async output copy here to overlap with speculator proposal.
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+            )
+
+            mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+            if self.speculator is not None and self.speculator.supports_mm_inputs:
+                # Get cached multimodal embeddings for draft forward.
+                # NOTE: This is done here because postprocess updates
+                # num_computed_prefill_tokens.
+                prefill_lens = self.req_states.prefill_len.np[
+                    input_batch.idx_mapping_np
+                ]
+                computed_prefill_lens = self.req_states.num_computed_prefill_tokens[
+                    input_batch.idx_mapping_np
+                ]
+                mm_inputs = self.model_state.encoder_runner.gather_mm_embeddings(
+                    input_batch.req_ids,
+                    input_batch.num_tokens,
+                    input_batch.num_scheduled_tokens,
+                    input_batch.query_start_loc_np,
+                    prefill_lens,
+                    computed_prefill_lens + 1,  # +1 to consider the skew in eagle
+                )
 
         # Postprocess results and update request states.
         # NOTE: This is intentionally done after creating the AsyncOutput,
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        mtp_state_update_start = self._step_profiler.start_context(mtp_profile_ctx)
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
-        self._step_profiler.finish_context(
-            mtp_profile_ctx, "target_state_update", mtp_state_update_start
-        )
+        with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            mtp_state_update_start = self._step_profiler.start_context(mtp_profile_ctx)
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
+            self._step_profiler.finish_context(
+                mtp_profile_ctx, "target_state_update", mtp_state_update_start
+            )
         if mtp_profile_ctx is not None:
             # Profiling is explicit and diagnostic-only. This fence turns the
             # target phase into a directly comparable wall measurement while
@@ -1879,104 +1923,107 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ) * 1000.0
 
         if self.speculator is not None:
-            assert self.sampler is not None
-            requires_host_token_state = bool(
-                getattr(self.speculator, "requires_host_token_state", False)
-            )
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            mtp_draft_start = self._step_profiler.start_context(mtp_profile_ctx)
-            if self._ple_draft_ring is not None:
-                # The committed state now ends at each request's bonus token.
-                self._ple_draft_ring.publish_round(
-                    input_batch.idx_mapping,
-                    input_batch.num_reqs,
-                    self.req_states.all_token_ids.gpu,
-                    self.req_states.num_computed_tokens.gpu,
-                    self.model_state.ngram_eos_token_id,
+            with record_function_or_nullcontext("gpu_model_runner: draft"):
+                assert self.sampler is not None
+                requires_host_token_state = bool(
+                    getattr(self.speculator, "requires_host_token_state", False)
                 )
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                mm_inputs=mm_inputs,
-                output_copy_event=(
-                    async_output.copy_event if requires_host_token_state else None
-                ),
-                sampled_token_ids_cpu=(
-                    async_output.sampled_token_ids
-                    if requires_host_token_state
-                    else None
-                ),
-                num_sampled_tokens_cpu=(
-                    async_output.num_sampled_tokens_np
-                    if requires_host_token_state
-                    else None
-                ),
-                all_token_ids_cpu=(
-                    self.req_states.all_token_ids.get_cpu_view().numpy()
-                    if requires_host_token_state
-                    else None
-                ),
-            )
-            self._step_profiler.finish_context(
-                mtp_profile_ctx, "draft_total", mtp_draft_start
-            )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            num_draft_tokens = None
-            if hasattr(self.speculator, "next_num_draft_tokens"):
-                num_draft_tokens = self.speculator.next_num_draft_tokens()
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                draft_tokens,
-                num_draft_tokens=num_draft_tokens,
-            )
+                # Let the target override the hidden state fed to the drafter
+                # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+                # target returns a persistent buffer sized at max_num_batched_tokens;
+                # slice to the active token count that propose() expects.
+                spec_hidden_states = hidden_states
+                if hasattr(self.model, "get_mtp_target_hidden_states"):
+                    pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                mtp_draft_start = self._step_profiler.start_context(mtp_profile_ctx)
+                if self._ple_draft_ring is not None:
+                    # The committed state now ends at each request's bonus token.
+                    self._ple_draft_ring.publish_round(
+                        input_batch.idx_mapping,
+                        input_batch.num_reqs,
+                        self.req_states.all_token_ids.gpu,
+                        self.req_states.num_computed_tokens.gpu,
+                        self.model_state.ngram_eos_token_id,
+                    )
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    mm_inputs=mm_inputs,
+                    output_copy_event=(
+                        async_output.copy_event if requires_host_token_state else None
+                    ),
+                    sampled_token_ids_cpu=(
+                        async_output.sampled_token_ids
+                        if requires_host_token_state
+                        else None
+                    ),
+                    num_sampled_tokens_cpu=(
+                        async_output.num_sampled_tokens_np
+                        if requires_host_token_state
+                        else None
+                    ),
+                    all_token_ids_cpu=(
+                        self.req_states.all_token_ids.get_cpu_view().numpy()
+                        if requires_host_token_state
+                        else None
+                    ),
+                )
+                self._step_profiler.finish_context(
+                    mtp_profile_ctx, "draft_total", mtp_draft_start
+                )
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                num_draft_tokens = None
+                if hasattr(self.speculator, "next_num_draft_tokens"):
+                    num_draft_tokens = self.speculator.next_num_draft_tokens()
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    draft_tokens,
+                    num_draft_tokens=num_draft_tokens,
+                )
 
         if self.pp_handler is not None:
             # The drafter only runs on the last PP rank. Send its device-side
             # proposals with the sampled outputs so the first rank embeds the
             # actual drafts during the next target verification pass.
-            self.pp_handler.broadcast(
-                sampler_output.sampled_token_ids,
-                num_sampled,
-                num_rejected,
-                input_batch,
-                draft_token_ids=(
-                    self.req_states.draft_tokens[input_batch.idx_mapping]
-                    if self.num_speculative_steps
-                    else None
-                ),
-            )
+            with record_function_or_nullcontext("gpu_model_runner: pp_feedback"):
+                self.pp_handler.broadcast(
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                    input_batch,
+                    draft_token_ids=(
+                        self.req_states.draft_tokens[input_batch.idx_mapping]
+                        if self.num_speculative_steps
+                        else None
+                    ),
+                )
 
         # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-        model_runner_output.kv_connector_output = kv_connector_output
-        model_runner_output.mixed_prefill_timing = self.mixed_prefill_timer.finish()
+        with record_function_or_nullcontext("gpu_model_runner: output"):
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            model_runner_output.kv_connector_output = kv_connector_output
+            model_runner_output.mixed_prefill_timing = self.mixed_prefill_timer.finish()
 
-        self._step_profiler.finish_context(
-            mtp_profile_ctx,
-            "total_gpu",
-            None if mtp_profile_ctx is None else mtp_profile_ctx["total_gpu_start"],
-        )
-        self._step_profiler.report(mtp_profile_ctx)
+            self._step_profiler.finish_context(
+                mtp_profile_ctx,
+                "total_gpu",
+                None if mtp_profile_ctx is None else mtp_profile_ctx["total_gpu_start"],
+            )
+            self._step_profiler.report(mtp_profile_ctx)
 
-        if self.use_async_scheduling:
-            return async_output
-        return async_output.get_output()
+            if self.use_async_scheduling:
+                return async_output
+            return async_output.get_output()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()

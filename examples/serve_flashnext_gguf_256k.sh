@@ -208,4 +208,3 @@ exec "${PIN[@]}" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" 
   --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20}' \
   --compilation-config '{"mode":3,"cudagraph_mode":"FULL","cudagraph_capture_sizes":['"$CAPTURE_SIZES"'],"inductor_compile_config":{"benchmark_combo_kernel":false}}' \
   --kernel-config "$KC" --speculative-config "$SPEC"
-

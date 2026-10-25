@@ -560,6 +560,7 @@ class EngineArgs:
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
     mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+    pp_prefill_quota_compensation: bool = SchedulerConfig.pp_prefill_quota_compensation
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
@@ -736,6 +737,9 @@ class EngineArgs:
     """Custom logitproc types"""
 
     async_scheduling: bool | None = SchedulerConfig.async_scheduling
+
+    pp_async_queue_depth: int | None = SchedulerConfig.pp_async_queue_depth
+    pp_decode_stagger: bool = SchedulerConfig.pp_decode_stagger
 
     stream_interval: int = SchedulerConfig.stream_interval
 
@@ -1445,6 +1449,10 @@ class EngineArgs:
             "--long-prefill-token-threshold-adaptive",
             **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
         )
+        scheduler_group.add_argument(
+            "--pp-prefill-quota-compensation",
+            **scheduler_kwargs["pp_prefill_quota_compensation"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         scheduler_group.add_argument(
             "--mixed-prefill-step-latency-ms",
@@ -1481,6 +1489,12 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--async-scheduling", **scheduler_kwargs["async_scheduling"]
+        )
+        scheduler_group.add_argument(
+            "--pp-async-queue-depth", **scheduler_kwargs["pp_async_queue_depth"]
+        )
+        scheduler_group.add_argument(
+            "--pp-decode-stagger", **scheduler_kwargs["pp_decode_stagger"]
         )
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
@@ -2315,12 +2329,15 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+            pp_prefill_quota_compensation=self.pp_prefill_quota_compensation,
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            pp_async_queue_depth=self.pp_async_queue_depth,
+            pp_decode_stagger=self.pp_decode_stagger,
             stream_interval=self.stream_interval,
         )
 

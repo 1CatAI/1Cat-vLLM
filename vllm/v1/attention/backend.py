@@ -1010,6 +1010,14 @@ class SparseMLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     They do not support prefill (MHA-style) attention.
     """
 
+    def reserve_profile_workspace(self, device: torch.device) -> None:
+        """Allocate lazy backend workspace before KV-cache memory sizing.
+
+        Implementations that reserve their workspace during construction need
+        no additional action. Others must retain the same buffer used by
+        forward_mqa so profiling accounts for its actual storage.
+        """
+
     def fused_output_quant_supported(self, quant_key: "QuantKey"):
         """
         Does this attention implementation support fused output quantization.

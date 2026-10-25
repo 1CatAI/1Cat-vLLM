@@ -51,9 +51,8 @@ _RELU_BLOCK_M = 32
 # Route prefill scoring through cuBLAS instead of the Triton MMA. Set 0 for an
 # A/B against the Triton kernel above (which stays as the reference shape and
 # is what the decode path still uses, since decode gathers from a paged cache).
-# Cap (MiB) on the [tokens*heads, key_tile] fp16 score tile. At the default
-# 2048-token prefill chunk and 64 heads this is 128 KiB per key, so the tile
-# is what keeps a long-context chunk from asking for gigabytes in one go.
+# Cap (MiB) on the [tokens*heads, key_tile] FP32 score intermediate.
+# The final logits and gathered keys are separate allocations from this budget.
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
 
@@ -286,25 +285,27 @@ def _paged_index_logits_kernel(
     cache_block_size,
     head_dim: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
 ):
     """Index logits straight out of the paged FP8 cache, no gather buffer.
 
     `_dequant_paged_index_k_kernel` + bmm has a grid and a GEMM shape derived
     from `max_seq_len`, and under a captured decode CUDA Graph that is frozen
-    at `max_model_len` forever. Here the grid is static -- (rows, NUM_SPLITS),
+    at `max_model_len` forever. Here the grid is static -- (rows, splits),
     sized from `max_seq_len` on the host -- and only each program's trip count
     follows the live `seq_len`, so one captured graph serves any context while
     a short context costs almost nothing.
     """
     row_idx = tl.program_id(0)
     split_id = tl.program_id(1)
+    # The launch grid already carries the split count. Keeping it
+    # dynamic avoids compiling a new kernel for each mixed-batch shape.
+    num_splits = tl.num_programs(1)
     dim_offsets = tl.arange(0, head_dim)
     q = tl.load(q_ptr + row_idx * q_stride0 + dim_offsets).to(tl.float32)
 
     seq_len = tl.load(seq_lens_ptr + row_idx)
     chunks = (seq_len + BLOCK_N - 1) // BLOCK_N
-    chunks_per_split = (chunks + NUM_SPLITS - 1) // NUM_SPLITS
+    chunks_per_split = (chunks + num_splits - 1) // num_splits
     lo = split_id * chunks_per_split * BLOCK_N
     hi = tl.minimum(lo + chunks_per_split * BLOCK_N, seq_len)
 
@@ -427,16 +428,18 @@ def _paged_index_logits_relu_kernel(
     head_dim: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
 ):
     """Decode counterpart of `_contiguous_index_logits_relu_kernel`.
 
     Same static-grid property as `_paged_index_logits_kernel`: the grid is
-    (rows, NUM_SPLITS) and only the trip count follows the live `seq_len`, so
+    (rows, splits) and only the trip count follows the live `seq_len`, so
     one captured CUDA graph serves any context length.
     """
     row_idx = tl.program_id(0)
     split_id = tl.program_id(1)
+    # The launch grid already carries the split count. Keeping it
+    # dynamic avoids compiling a new kernel for each mixed-batch shape.
+    num_splits = tl.num_programs(1)
     head_offsets = tl.arange(0, NUM_HEADS)
     dim_offsets = tl.arange(0, head_dim)
     q = tl.load(
@@ -449,7 +452,7 @@ def _paged_index_logits_relu_kernel(
 
     seq_len = tl.load(seq_lens_ptr + row_idx)
     chunks = (seq_len + BLOCK_N - 1) // BLOCK_N
-    chunks_per_split = (chunks + NUM_SPLITS - 1) // NUM_SPLITS
+    chunks_per_split = (chunks + num_splits - 1) // num_splits
     lo = split_id * chunks_per_split * BLOCK_N
     hi = tl.minimum(lo + chunks_per_split * BLOCK_N, seq_len)
 
@@ -538,15 +541,21 @@ def _relu_weight_headsum_kernel(
     acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
     for head in range(0, num_heads, BLOCK_H):
         h_offsets = head + tl.arange(0, BLOCK_H)
+        if num_heads % BLOCK_H == 0:
+            h_valid = tl.full((BLOCK_H,), True, tl.int1)
+        else:
+            h_valid = h_offsets < num_heads
         s = tl.load(
             s_ptr
             + token * s_stride0
             + h_offsets[:, None] * s_stride1
             + k_offsets[None, :],
-            mask=k_valid[None, :],
+            mask=h_valid[:, None] & k_valid[None, :],
             other=0.0,
         ).to(tl.float32)
-        w = tl.load(w_ptr + token * w_stride0 + h_offsets).to(tl.float32)
+        w = tl.load(w_ptr + token * w_stride0 + h_offsets, mask=h_valid, other=0.0).to(
+            tl.float32
+        )
         acc += tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
 
     scale = tl.load(scale_ptr + k_offsets, mask=k_valid, other=0.0).to(tl.float32)
@@ -592,6 +601,21 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
     policy = sparse_policy()
     num_q, num_heads, head_dim = q.shape
     num_k = k_quant.shape[0]
+    if num_heads < 1:
+        raise ValueError("indexer queries must have at least one head")
+    if num_q == 0 or num_k == 0:
+        return torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
+
+    rows = num_q * num_heads
+    # FP32 C must remain finite before ReLU and the signed head reduction.
+    # Prefer a 64-key tile, but do not exceed a small configured budget just
+    # to align its width. The epilogue already masks partial key tiles.
+    budget_bytes = policy.value("indexer_prefill_tile_mb") * 2**20
+    max_keys = budget_bytes // (rows * 4)
+    if max_keys < 1:
+        raise ValueError("indexer_prefill_tile_mb cannot hold one FP32 score column")
+    aligned_keys = max_keys // _RELU_BLOCK_N * _RELU_BLOCK_N
+    k_tile = min(num_k, aligned_keys or max_keys)
     out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
 
     k_fp16 = torch.empty((num_k, head_dim), dtype=torch.float16, device=q.device)
@@ -608,17 +632,12 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
     if not q2.is_contiguous():
         q2 = q2.contiguous()
 
-    rows = num_q * num_heads
-    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 2))
-    k_tile = max(_RELU_BLOCK_N, min(num_k, budget // _RELU_BLOCK_N * _RELU_BLOCK_N))
-
     for start in range(0, num_k, k_tile):
         stop = min(start + k_tile, num_k)
         width = stop - start
-        # fp16 out with fp32 accumulate: the epilogue reduces in fp32 and only
-        # the top-k *set* is consumed downstream, so the 5e-4 rounding here is
-        # far below the gap between neighbouring index scores.
-        scores = torch.mm(q2, k_fp16[start:stop].t())
+        # An FP16 C can overflow even with finite inputs and FP32 accumulation.
+        # Keep C in FP32 through ReLU, head weighting and key scaling.
+        scores = torch.mm(q2, k_fp16[start:stop].t(), out_dtype=torch.float32)
         _relu_weight_headsum_kernel[(num_q, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
             scores,
             weights,
@@ -634,6 +653,9 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
             BLOCK_H=_EPILOGUE_BLOCK_H,
             num_warps=4,
         )
+        # Do not retain the previous tile during the next torch.mm allocation.
+        # All uses were submitted on the current stream before releasing it.
+        del scores
     return out
 
 
@@ -828,8 +850,10 @@ def _decode_cublas_blocker(
     requirements = (
         (
             "a CUDA pre-Ampere device",
-            lambda: current_platform.is_cuda()
-            and current_platform.is_device_capability_family(70),
+            lambda: (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability_family(70)
+            ),
         ),
         (
             f"a key bound of at least {policy.value('indexer_decode_min_keys')}",
@@ -837,68 +861,88 @@ def _decode_cublas_blocker(
         ),
         (
             "whole requests in the block table",
-            lambda: table_rows_per_request > 0
-            and block_table.ndim == 2
-            and block_table.shape[0] > 0
-            and block_table.shape[0] % table_rows_per_request == 0
-            and total_rows % (block_table.shape[0] // table_rows_per_request) == 0,
+            lambda: (
+                table_rows_per_request > 0
+                and block_table.ndim == 2
+                and block_table.shape[0] > 0
+                and block_table.shape[0] % table_rows_per_request == 0
+                and total_rows % (block_table.shape[0] // table_rows_per_request) == 0
+            ),
         ),
         (
             "query rows that share one gather per request",
-            lambda: (native_rows or total_rows == 1 or table_rows_per_request > 1)
-            and rows_per_request() > 0,
+            lambda: (
+                (native_rows or total_rows == 1 or table_rows_per_request > 1)
+                and rows_per_request() > 0
+            ),
         ),
         (
             f"float16 q [rows, heads % {_EPILOGUE_BLOCK_H} == 0, {_INDEX_HEAD_DIM}]",
-            lambda: q.ndim == 3
-            and q.dtype == torch.float16
-            and q.shape[2] == _INDEX_HEAD_DIM
-            and q.shape[1] > 0
-            and q.shape[1] % _EPILOGUE_BLOCK_H == 0,
+            lambda: (
+                q.ndim == 3
+                and q.dtype == torch.float16
+                and q.shape[2] == _INDEX_HEAD_DIM
+                and q.shape[1] > 0
+                and q.shape[1] % _EPILOGUE_BLOCK_H == 0
+            ),
         ),
         (
             "float32 weights [rows, heads]",
-            lambda: weights.ndim == 2
-            and weights.shape == q.shape[:2]
-            and weights.dtype == torch.float32,
+            lambda: (
+                weights.ndim == 2
+                and weights.shape == q.shape[:2]
+                and weights.dtype == torch.float32
+            ),
         ),
         (
             "shared gather and FP32 scores within the indexer workspace budget",
-            lambda: max_seq_len
-            * (_INDEX_HEAD_DIM * 2 + rows_per_request() * q.shape[1] * 4)
-            <= policy.value("indexer_prefill_tile_mb") * 2**20,
+            lambda: (
+                max_seq_len
+                * (_INDEX_HEAD_DIM * 2 + rows_per_request() * q.shape[1] * 4)
+                <= policy.value("indexer_prefill_tile_mb") * 2**20
+            ),
         ),
         (
-            f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
-            "contiguous blocks",
-            lambda: cache.ndim == 3
-            and cache.dtype == torch.uint8
-            and cache.shape[1] > 0
-            and cache.shape[2] == _INDEX_CACHE_BYTES
-            and cache.stride(1) == _INDEX_CACHE_BYTES
-            and cache.stride(2) == 1,
+            (
+                f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
+                "contiguous blocks"
+            ),
+            lambda: (
+                cache.ndim == 3
+                and cache.dtype == torch.uint8
+                and cache.shape[1] > 0
+                and cache.shape[2] == _INDEX_CACHE_BYTES
+                and cache.stride(1) == _INDEX_CACHE_BYTES
+                and cache.stride(2) == 1
+            ),
         ),
         (
             "an int32 block table that covers the key bound",
-            lambda: block_table.ndim == 2
-            and block_table.dtype == torch.int32
-            and triton.cdiv(max_seq_len, cache.shape[1]) <= block_table.shape[1],
+            lambda: (
+                block_table.ndim == 2
+                and block_table.dtype == torch.int32
+                and triton.cdiv(max_seq_len, cache.shape[1]) <= block_table.shape[1]
+            ),
         ),
         ("int32 row lengths", lambda: flat_lens.dtype == torch.int32),
         (
             "all tensors on one device",
-            lambda: q.device
-            == cache.device
-            == weights.device
-            == flat_lens.device
-            == block_table.device,
+            lambda: (
+                q.device
+                == cache.device
+                == weights.device
+                == flat_lens.device
+                == block_table.device
+            ),
         ),
         (
             "contiguous q, weights, row lengths and block table",
-            lambda: q.is_contiguous()
-            and weights.is_contiguous()
-            and flat_lens.is_contiguous()
-            and block_table.is_contiguous(),
+            lambda: (
+                q.is_contiguous()
+                and weights.is_contiguous()
+                and flat_lens.is_contiguous()
+                and block_table.is_contiguous()
+            ),
         ),
     )
     for name, met in requirements:
@@ -1005,7 +1049,6 @@ def sm70_indexer_decode_logits(
             head_dim=_INDEX_HEAD_DIM,
             NUM_HEADS=q.shape[1],
             BLOCK_N=_RELU_BLOCK_N,
-            NUM_SPLITS=splits,
             num_warps=8,
         )
         # Positions >= seq_len are left uninitialised; every consumer masks by
@@ -1031,7 +1074,6 @@ def sm70_indexer_decode_logits(
             cache.shape[1],
             head_dim=_INDEX_HEAD_DIM,
             BLOCK_N=_LOGITS_BLOCK_N,
-            NUM_SPLITS=splits,
             num_warps=4,
         )
         # Positions >= seq_len are left uninitialised, exactly as the

@@ -1803,15 +1803,30 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 layer.base_quant_method = fallback
                 return
 
-        # Use a single gscale for w13.
-        if self.moe.is_act_and_mul and not torch.allclose(
-            layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
+        # Marlin preserves independent gate/up factors and restores their
+        # ratio after GEMM, before the model's activation/clamp.
+        separate_marlin_scales = (
+            self.nvfp4_backend == NvFp4MoeBackend.MARLIN
+            and self.moe.is_act_and_mul
+            and not torch.equal(
+                layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
+            )
+        )
+        if separate_marlin_scales:
+            w13_weight_scale_2 = layer.w13_weight_scale_2.contiguous()
+        else:
+            w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
+        if (
+            not separate_marlin_scales
+            and self.moe.is_act_and_mul
+            and not torch.allclose(
+                layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
+            )
         ):
             logger.warning_once(
                 "w1_weight_scale_2 must match w3_weight_scale_2. "
                 "Accuracy may be affected."
             )
-        w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
 
         (
             w13,

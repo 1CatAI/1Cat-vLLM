@@ -243,6 +243,28 @@ def _validate_mtp_expert_weights_loaded(
         )
 
 
+def _validate_mtp_embedding_weights_loaded(
+    model: nn.Module,
+    loaded_weights: set[str],
+) -> None:
+    """Require the standalone PP draft to load its own token embedding.
+
+    PP1 binds the target embedding after loading. Under PP, that embedding
+    lives on another stage, so the draft checkpoint must supply this weight.
+    Check the loader's actual result before generic postprocessing exemptions
+    can mark an uninitialized embedding as loaded.
+    """
+    if getattr(model, "share_target_io_weights", False):
+        return
+    if "model.embed_tokens.weight" not in loaded_weights:
+        raise ValueError(
+            "Qwen4Exp MTP token embedding was not loaded: "
+            "model.embed_tokens.weight. Pipeline-parallel drafts cannot "
+            "share the first stage's target embedding; include the target "
+            "embedding in the standalone draft checkpoint."
+        )
+
+
 def _mtp_fp8_experts_supported(
     draft_vllm_config: VllmConfig,
     draft_quant_config: QuantizationConfig,
@@ -1028,6 +1050,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             )
         )
         _validate_mtp_expert_weights_loaded(self, loaded_weights)
+        _validate_mtp_embedding_weights_loaded(self, loaded_weights)
         # Phase 2: an E4M3 main KV cache makes the drafter's QSA layer E4M3 too.
         # Finalize its calibrated k/v scales strictly from the checkpoint (no
         # runtime fallback; missing names are listed). No-op for FP16/BF16 caches

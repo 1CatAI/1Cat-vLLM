@@ -49,7 +49,13 @@ from .utils import maybe_prefix
 logger = init_logger(__name__)
 
 
-def _use_sm70_bf16_emulation(config) -> bool:
+def _use_sm70_bf16_emulation(config, runtime_dtype: torch.dtype | None = None) -> bool:
+    """Preserve a BF16 checkpoint's range when its runtime uses FP16.
+
+    The historical name and one-argument device fallback remain compatible;
+    model construction must supply its resolved runtime dtype. A draft may
+    inherit FP16 from its target even on a GPU with native BF16 support.
+    """
     declared_dtype = getattr(config, "dtype", None)
     if declared_dtype is None:
         declared_dtype = getattr(config, "torch_dtype", None)
@@ -64,11 +70,10 @@ def _use_sm70_bf16_emulation(config) -> bool:
     enabled = dflash2_bf16_emulation(policy)
     if not (enabled and is_bf16 and current_platform.is_cuda()):
         return False
-    # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the
-    # draft in FP16, so both need the range-preserving path: the criterion is
-    # the missing capability, not one architecture number. Ask the device this
-    # worker builds on; device 0 of the visibility list may be another card on
-    # a node that mixes architectures.
+    if runtime_dtype is not None:
+        return runtime_dtype == torch.float16
+    # Legacy callers without a resolved dtype infer FP16 below SM80. Ask the
+    # worker's own device on nodes that mix architectures.
     return not current_platform.has_device_capability(
         80, device_id=torch.accelerator.current_device_index()
     )
@@ -83,9 +88,8 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
     """
     if not current_platform.is_cuda():
         return None
-    # Same rule as _use_sm70_bf16_emulation: ask the worker's own device, not
-    # device 0 of the visibility list; the cache is per process, i.e. per
-    # worker.
+    # Ask the worker's own device, not device 0 of the visibility list; the
+    # cache is per process, i.e. per worker.
     if not current_platform.has_device_capability(
         80, device_id=torch.accelerator.current_device_index()
     ):
@@ -210,14 +214,9 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             quant_config=quant_config,
             prefix=prefix,
         )
-        self.use_sm70_bf16_emulation = _use_sm70_bf16_emulation(config)
+        runtime_dtype = vllm_config.model_config.dtype
+        self.use_sm70_bf16_emulation = _use_sm70_bf16_emulation(config, runtime_dtype)
         if self.use_sm70_bf16_emulation:
-            runtime_dtype = vllm_config.model_config.dtype
-            if runtime_dtype != torch.float16:
-                raise ValueError(
-                    "BF16 DFlash2 on SM70 requires FP16 runtime transport; "
-                    f"got runtime dtype {runtime_dtype}."
-                )
             self.self_attn.output_input_scale = DFLASH_SM70_WIDE_OUTPUT_SCALE
             self.mlp = DFlashSM70MLP(self.mlp)
             self.input_layernorm = DFlashSM70RMSNorm(
@@ -462,9 +461,11 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             prefix=prefix,
         )
         draft_config = self.config.dflash_config
-        self.use_sm70_bf16_emulation = _use_sm70_bf16_emulation(self.config)
+        runtime_dtype = vllm_config.model_config.dtype
+        self.use_sm70_bf16_emulation = _use_sm70_bf16_emulation(
+            self.config, runtime_dtype
+        )
         if self.use_sm70_bf16_emulation:
-            runtime_dtype = vllm_config.model_config.dtype
             self.hidden_norm = DFlashSM70RMSNorm(
                 self.config.hidden_size,
                 self.config.rms_norm_eps,
@@ -477,7 +478,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 runtime_dtype,
             )
             logger.info_once(
-                "Using range-preserving BF16 DFlash2 arithmetic on SM70 "
+                "Using range-preserving BF16 DFlash2 arithmetic with FP16 transport "
                 "(FP32 residual, BF16 RNE, scaled FP16 projections)."
             )
         self.input_embedding_scale = float(

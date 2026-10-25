@@ -1231,6 +1231,8 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
         video_array: np.ndarray,
         metadata: dict[str, Any],
         grid_thw: torch.Tensor,
+        *,
+        timestamps: torch.Tensor | None = None,
     ) -> list[int]:
         hf_processor = self.get_hf_processor()
         tokenizer = self.get_tokenizer()
@@ -1245,19 +1247,32 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
 
         assert isinstance(grid_thw, torch.Tensor)
 
-        if isinstance(hf_processor, Glm4vProcessor):
-            timestamps = self._get_video_second_idx_glm4v(metadata, len(video_array))
+        if timestamps is not None:
+            if timestamps.ndim != 1 or len(timestamps) != int(grid_thw[0]):
+                raise ValueError(
+                    "Processed video timestamps must contain one value per "
+                    f"temporal group; got {timestamps.shape} for grid {grid_thw}."
+                )
+            timestamp_values = timestamps.tolist()
+        elif isinstance(hf_processor, Glm4vProcessor):
+            timestamp_values = self._get_video_second_idx_glm4v(
+                metadata, len(video_array)
+            )
         elif self._is_glmga_model(hf_processor):
-            timestamps = self._get_video_second_idx_glmga(metadata, len(video_array))
+            timestamp_values = self._get_video_second_idx_glmga(
+                metadata, len(video_array)
+            )
         else:
-            timestamps = self._get_video_second_idx_glm46v(metadata, len(video_array))
+            timestamp_values = self._get_video_second_idx_glm46v(
+                metadata, len(video_array)
+            )
 
         timestamp_format = (
             "{}" if isinstance(hf_processor, Glm4vProcessor) else "{:.1f} seconds"
         )
         frames_idx_token = [
             tokenizer.encode(timestamp_format.format(i), add_special_tokens=False)
-            for i in timestamps
+            for i in timestamp_values
         ]
         T, H, W = grid_thw
         num_tokens_per_frame = int(H * W) // merge_length
@@ -1539,8 +1554,15 @@ class Glm4vMultiModalProcessor(BaseMultiModalProcessor[Glm4vProcessingInfo]):
             assert isinstance(grid_thw, torch.Tensor)
 
             video, metadata = mm_items["video"][item_idx]
+            timestamps = (
+                out_item["timestamps"].data if "timestamps" in out_item else None
+            )
+            assert timestamps is None or isinstance(timestamps, torch.Tensor)
             placeholder = self.info._construct_video_placeholder(
-                video, metadata, grid_thw
+                video,
+                metadata,
+                grid_thw,
+                timestamps=timestamps,
             )
             return PromptUpdateDetails.select_token_id(
                 placeholder,
@@ -1553,8 +1575,15 @@ class Glm4vMultiModalProcessor(BaseMultiModalProcessor[Glm4vProcessingInfo]):
             assert isinstance(grid_thw, torch.Tensor)
 
             video, metadata = mm_items["video"][item_idx]
+            timestamps = (
+                out_item["timestamps"].data if "timestamps" in out_item else None
+            )
+            assert timestamps is None or isinstance(timestamps, torch.Tensor)
             placeholder = self.info._construct_video_placeholder(
-                video, metadata, grid_thw
+                video,
+                metadata,
+                grid_thw,
+                timestamps=timestamps,
             )
             return PromptUpdateDetails.select_token_id(
                 placeholder,

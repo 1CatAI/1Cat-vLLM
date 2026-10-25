@@ -525,6 +525,44 @@ def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapabilit
     )
 
 
+# Measured original-bank MMQ ranges: (SM, quant type, K, N, experts, top-k)
+# maps to inclusive projection input-row bounds. Down projections see routed
+# rows, not source tokens. Keep unmeasured layouts and small decode batches on
+# their existing route; another model can add a calibrated layout here without
+# adding a model-name branch to the generic executor.
+_ORIGINAL_MOE_PREFILL_RANGES = {
+    (sm, kind, k, n, 288, 8): (minimum * routes, 768 * routes)
+    for sm, minimum in ((70, 384), (86, 384), (89, 256))
+    for kind, k, n, routes in ((21, 4096, 2048, 1), (23, 2048, 4096, 8))
+}
+
+
+def original_moe_prefill_block_size(
+    source_types: tuple[int, int, int],
+    hidden_size: int,
+    intermediate_size: int,
+    experts: int,
+    top_k: int,
+    dtype: torch.dtype,
+    compute_capability: int | None,
+) -> int:
+    """Shared route alignment for measured original-bank prefill layouts.
+
+    Types are gate/up/down. Admission does not change the existing MMQ row
+    bounds: the executor must require all three prepared MMQ capabilities to
+    admit the batch. In particular, decode and MMVQ-sized tails keep their
+    original activation quantization and accumulation order.
+    """
+    if (
+        compute_capability in (70, 86, 89)
+        and dtype == torch.float16
+        and source_types == (21, 21, 23)
+        and (hidden_size, intermediate_size, experts, top_k) == (4096, 2048, 288, 8)
+    ):
+        return 16
+    return 0
+
+
 def original_moe_prefill_capability(
     source_type: int,
     k: int,
@@ -536,8 +574,9 @@ def original_moe_prefill_capability(
     enabled: bool = True,
     mmq_supported: bool | None = None,
     top_k: int = 10,
+    compute_capability: int | None = None,
 ) -> GGUFOperatorCapability:
-    """Batched MMQ for prefill-sized original TP4 expert banks.
+    """Batched MMQ for calibrated prefill-sized original expert banks.
 
     M is the projection input count: down sees ``tokens * top_k`` routed rows.
     Every chunk from 64 tokens up uses the batched kernel; the per-token MMVQ
@@ -549,19 +588,36 @@ def original_moe_prefill_capability(
     down = n == 2560 and k in (160, 192)
     min_tokens = 64
     m = min_tokens * top_k if down else min_tokens
+    sm = (
+        compute_capability
+        if compute_capability is not None
+        else (70 if is_sm70 else None)
+    )
+    measured = (
+        _ORIGINAL_MOE_PREFILL_RANGES.get((sm, source_type, k, n, experts, top_k))
+        if sm is not None
+        else None
+    )
+    maximum_m = 1 << 30
+    if measured is not None:
+        m, maximum_m = measured
     reason = None
     if not enabled:
         reason = "disabled_by_kernel_config"
-    elif not is_sm70:
+    elif not is_sm70 and measured is None:
         reason = "requires_sm70"
     elif dtype != torch.float16:
         reason = "requires_fp16_activations"
-    elif experts != 512 or not (gate or down):
+    elif measured is None and (experts != 512 or not (gate or down)):
         reason = "original_prefill_shape_or_source_unmeasured"
     elif mmq_supported is False:
         reason = "mmq_not_supported_for_source_type"
-    elif mmq_supported is None and not (
-        source_type in (18, 21, 22, 23) and gate or source_type in (20, 42) and down
+    elif (
+        measured is None
+        and mmq_supported is None
+        and not (
+            source_type in (18, 21, 22, 23) and gate or source_type in (20, 42) and down
+        )
     ):
         reason = "original_prefill_shape_or_source_unmeasured"
     elif not hasattr(torch.ops._C_gguf, operator):
@@ -572,7 +628,7 @@ def original_moe_prefill_capability(
         operator,
         True,
         min_m=m,
-        max_m=1 << 30,
+        max_m=maximum_m,
         reason=reason,
     )
 

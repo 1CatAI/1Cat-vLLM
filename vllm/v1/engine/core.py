@@ -67,6 +67,10 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.mixed_prefill import (
+    finish_pp_mixed_prefill_timing,
+    start_pp_mixed_prefill_timing,
+)
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -482,6 +486,7 @@ class EngineCore:
         if profile_ddtree_engine:
             profile_schedule_ms = (time.perf_counter() - profile_part_t0) * 1000.0
             profile_part_t0 = time.perf_counter()
+        start_pp_mixed_prefill_timing(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         if profile_ddtree_engine:
             profile_execute_submit_ms = (time.perf_counter() - profile_part_t0) * 1000.0
@@ -503,6 +508,7 @@ class EngineCore:
                 if profile_ddtree_engine:
                     profile_sample_ms = (time.perf_counter() - profile_part_t0) * 1000.0
 
+        finish_pp_mixed_prefill_timing(scheduler_output, model_output)
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -617,6 +623,7 @@ class EngineCore:
                 trace_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
             with self.log_error_detail(scheduler_output):
                 trace_execute_t0 = time.perf_counter() if trace_log else 0.0
+                start_pp_mixed_prefill_timing(scheduler_output)
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
@@ -702,6 +709,7 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+        finish_pp_mixed_prefill_timing(scheduler_output, model_output)
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()

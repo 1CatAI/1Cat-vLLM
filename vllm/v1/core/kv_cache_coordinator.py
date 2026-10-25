@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     KVCacheBlock,
 )
+from vllm.v1.core.prefill_boundary import prefill_boundary_hash
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     MambaManager,
@@ -51,6 +52,7 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
         self.retention_interval: int | None = None
+        self.verified_mtp_prefill_cache = False
         self.shared_prefix_boundary = 0
 
         self.block_pool = BlockPool(
@@ -84,6 +86,12 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+    def find_verified_prefill_cache_hit(
+        self, request: Request, max_length: int, current_hit: int
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+        """Optional fast path; unsupported layouts use ordinary conservative replay."""
+        return None
 
     def configure_prefix_cache_retention(self, interval: int | None) -> None:
         """Validate after 1Cat has resolved the heterogeneous cache geometry."""
@@ -130,9 +138,10 @@ class KVCacheCoordinator(ABC):
             return (request.num_tokens - 1, request.num_tokens)
         resend = (request.num_tokens - 1) // alignment * alignment
         extension = request.num_tokens // alignment * alignment
-        return tuple(
-            sorted({max(resend - alignment, 0), max(extension - alignment, 0)})
-        )
+        boundaries = {max(resend - alignment, 0), max(extension - alignment, 0)}
+        if getattr(self, "verified_mtp_prefill_cache", False):
+            boundaries.add(resend)
+        return tuple(sorted(boundaries))
 
     def _cache_manager_blocks(
         self,
@@ -547,6 +556,59 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for g in kv_cache_config.kv_cache_groups
             ), "Hybrid DCP requires full-attention shards or replicated cache owners."
         self.verify_and_split_kv_cache_groups()
+
+    def find_verified_prefill_cache_hit(
+        self, request: Request, max_length: int, current_hit: int
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+        boundary = max_length // self.lcm_block_size * self.lcm_block_size
+        if boundary <= current_hit or not self.eagle_group_ids:
+            return None
+        # Limit the initial implementation to full attention plus immutable
+        # align-mode recurrent checkpoints. Windowed/ring owners keep their
+        # normal lookup; non-cacheable scratch groups remain request-private.
+        if any(
+            not isinstance(group.spec, FullAttentionSpec | MambaSpec)
+            or (
+                isinstance(group.spec, MambaSpec)
+                and group.spec.mamba_cache_mode != "align"
+            )
+            for group in self.attention_groups
+        ):
+            return None
+        result: list[list[KVCacheBlock]] = [
+            [] for _ in self.kv_cache_config.kv_cache_groups
+        ]
+        for spec, group_ids, manager_cls, _ in self.attention_groups:
+            hashes: BlockHashList = request.block_hashes
+            if spec.block_size != self.hash_block_size:
+                hashes = BlockHashListWithBlockSize(
+                    request.block_hashes, self.hash_block_size, spec.block_size
+                )
+            hits = manager_cls.find_longest_cache_hit(
+                hashes,
+                boundary,
+                group_ids,
+                self.block_pool,
+                spec,
+                drop_eagle_block=False,
+                alignment_tokens=self.lcm_block_size,
+            )
+            if not hits or len(hits[0]) * spec.block_size != boundary:
+                return None
+            for group_id, blocks in zip(group_ids, hits):
+                # Check every resident block, not just the last: a pool may
+                # contain duplicates from siblings with different next tokens.
+                for index, block in enumerate(blocks):
+                    if block.is_null:
+                        continue
+                    proof = prefill_boundary_hash(
+                        request, (index + 1) * spec.block_size, hashes[index]
+                    )
+                    if proof is None or block.prefill_boundary_hash != proof:
+                        return None
+                result[group_id] = blocks
+        self.shared_prefix_boundary = max(self.shared_prefix_boundary, boundary)
+        return tuple(result), boundary
 
     def verify_and_split_kv_cache_groups(self) -> None:
         """

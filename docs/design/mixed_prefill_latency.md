@@ -5,7 +5,7 @@ for a large prefill chunk. Its decode/verification rows may use fast kernels
 and still wait seconds for the rest of the step to finish.
 
 The scheduler now reserves tokens for eligible resident decoders and limits
-the aggregate prefill work sharing their step. The default GPU step latency
+the aggregate prefill work sharing their step. The default step latency
 target is 250 ms. A conservative initial budget is adjusted using completed
 GPU measurements, so the policy follows the actual model, device, parallelism,
 and context instead of an exact model-shape contract. This is a soft target,
@@ -15,8 +15,40 @@ budget is retained. Pure decode retains its existing FULL CUDA graph route.
 `--mixed-prefill-step-latency-ms` changes the target; zero disables the policy
 for comparison. There is no extra environment variable. GPU timing creates
 events only for controlled mixed steps, checks their readiness without waiting,
-and returns plain completed timing data to the scheduler. Pipeline parallel
-and indivisible multimodal chunks retain their existing scheduling behavior.
+and returns plain completed timing data to the scheduler for PP=1.
+Indivisible multimodal chunks retain their existing scheduling behavior.
+
+## Pipeline parallel feedback
+
+For PP>1 the engine measures submission-to-result-consumption latency on its
+monotonic host clock. Each `SchedulerOutput` owns its start timestamp, including
+when structured-output sampling is deferred. This is an observed end-to-end
+latency including queued work, communication, sampling and engine consumption
+delay, not GPU compute time. No new device synchronization or result wait is
+introduced. Workers skip local CUDA timing for these batches: the last stage's
+events are not a complete pipeline measurement.
+
+PP also limits prefill queued behind resident decoders that are temporarily
+ineligible because their feedback is still in flight. These controlled batches
+can have zero local decode rows. Execution eligibility, MTP placeholders and
+recurrent-state feedback ordering are unchanged. Cancellation removes the
+resident from protection through the normal scheduler request lifecycle.
+
+PP starts with 32 aggregate prefill tokens per controlled batch, subject to the
+configured minimum and maximum. This avoids an initially large chunk before
+pipeline measurements are available. A stalled PP batch can reduce the budget
+even when another scheduling limit makes the chunk smaller than the budget;
+short fast boundary chunks still cannot increase it. Small budgets can grow by
+at least one 16-token quantum when measured cost permits, so a temporary stall
+cannot permanently trap the controller at its minimum.
+
+The target remains soft: queued batches may already have been submitted, and
+long-context decode alone can exceed it. Smaller prefill chunks favor resident
+decode continuity at the cost of incoming prompt TTFT. Pure prefill without
+resident decoders retains its normal budget, and pure decode retains the same
+CUDA graph route. CPU regressions cover PP7/MTP cadence, queued and deferred
+feedback, cancellation and budget adaptation. The GPU performance measurements
+below predate PP support and do not establish its throughput or latency gains.
 
 ## Small chunks and recurrent state
 
@@ -111,3 +143,26 @@ and computation overlap is not implemented in this change. Broad scheduler
 tests that import Llava were unavailable in the test environment because of
 an unrelated Transformers Pixtral import mismatch; focused cache, state,
 scheduling, kernel and packaging tests provide the change's validation.
+
+## Context-only draft work and PP observations
+
+An incomplete prompt chunk still populates the Eagle/MTP draft model's KV and
+recurrent state. With a single data-parallel replica, it now stops after that
+prefill pass instead of performing the remaining speculative decode steps:
+these proposals cannot be consumed until the prompt finishes. The feedback
+keeps its normal fixed-width shape and contains zero-filled unused proposals.
+Final prompt chunks, mixed batches, DP collectives, profiling and warmup keep
+their existing draft path. No device-to-host check or synchronization is added.
+
+PP timing also observes standalone prefill batches. A zero control budget marks
+these observations so they cannot train the mixed-prefill latency controller.
+The engine emits one batch-latency sample per ten seconds, including token
+counts and the mixed budget, without logging prompts or request identifiers.
+The measured latency includes queued work and PP communication; it is not a
+per-stage GPU kernel measurement. Pure decode does not create timing events.
+
+Larger standalone prefill capacity can be configured through
+`max_num_batched_tokens` while the separate mixed-prefill budget continues to
+reserve resident decode capacity. The capacity must still be checked against
+the deployment's peak memory. CPU tests cover these execution and scheduling
+contracts; they do not establish a GPU throughput improvement.

@@ -863,7 +863,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = seq_lens.unsqueeze(-1)
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
+            # Resolve the provider at execution time: importing its model
+            # package during metadata-module initialization cycles through
+            # the quantization registry and partially initialized native ops.
+            from vllm.models.deepseek_v4.common.portable_sparse import (
+                use_portable_sparse,
+            )
+
+            # The portable KPool scorer does not consume DeepGEMM schedules.
+            # Merely having DeepGEMM installed does not make its GPU kernels
+            # usable on the older devices served by that route.
+            if (
+                current_platform.is_cuda()
+                and not (self.compress_ratio > 1 and use_portable_sparse())
+                and has_deep_gemm()
+            ):
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,

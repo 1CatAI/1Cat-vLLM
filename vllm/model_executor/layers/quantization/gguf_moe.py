@@ -11,11 +11,13 @@ from torch.nn import Parameter
 
 from vllm._sm70.policy import register_policy_op
 from vllm.config import get_current_vllm_config_or_none
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
     admit_moe_fallback,
     decoder_family,
     moe_mmq_supported,
+    original_moe_prefill_block_size,
     original_moe_prefill_capability,
 )
 from vllm.model_executor.layers.fused_moe import (
@@ -33,6 +35,8 @@ from vllm.model_executor.layers.quantization.gguf_native import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
@@ -129,6 +133,39 @@ register_policy_op(
 )
 
 
+def _original_expert_activation(gate, up, limit):
+    if (
+        limit is not None
+        and 0 <= limit <= 65504
+        and gate.is_cuda
+        and gate.dtype == up.dtype == torch.float16
+        and gate.device == up.device
+        and gate.shape == up.shape
+        and gate.is_contiguous()
+        and up.is_contiguous()
+        and hasattr(torch.ops._C, "gguf_silu_mul_clamp_out")
+    ):
+        out = torch.empty_like(gate)
+        torch.ops._C.gguf_silu_mul_clamp_out(out, gate, up, limit)
+        return out
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    return torch.nn.functional.silu(gate) * up
+
+
+def _original_expert_activation_fake(gate, up, limit):
+    return torch.empty_like(gate)
+
+
+register_policy_op(
+    "gguf_original_expert_activation",
+    "(Tensor gate, Tensor up, float? limit) -> Tensor",
+    _original_expert_activation,
+    _original_expert_activation_fake,
+)
+
+
 def _original_expert_reduce(down, probabilities):
     return moe_fused_mul_sum(down, probabilities)
 
@@ -146,10 +183,17 @@ register_policy_op(
 
 
 class GGUFNativeMoEMethod(FusedMoEMethodBase):
+    packed_down_enabled = False
+    packed_down_admitted = False
+    packed_down_device: torch.device | None = None
+
     def __init__(self, quant_config: "GGUFConfig", moe):
         super().__init__(moe)
         self.quant_config = quant_config
         config = get_current_vllm_config_or_none()
+        self.packed_down_enabled = bool(
+            config and config.kernel_config.gguf_moe_packed_down
+        )
         self.native_enabled = (
             config.kernel_config.sm70_gguf.enabled if config is not None else True
         )
@@ -290,6 +334,8 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         self.loaded_experts[shard_id].add(expert_id)
 
     def process_weights_after_loading(self, layer):
+        self.packed_down_admitted = False
+        self.packed_down_device = None
         if not self.native_enabled or not native_available():
             raise ValueError(
                 "Native GGUF experts require enabled packaged _C_gguf operators"
@@ -303,6 +349,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         self.projection_capabilities = {}
         self.prefill_capabilities = {}
         self.native_admission["prefill_projections"] = {}
+        device_capability = current_platform.get_device_capability()
         for shard in ("w1", "w3", "w2"):
             if self.loaded_experts[shard] != set(range(self.num_experts)):
                 raise ValueError(f"Incomplete GGUF {shard} expert payloads")
@@ -332,6 +379,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 enabled=self.native_enabled,
                 mmq_supported=moe_mmq_supported(prepared, value, self.params_dtype),
                 top_k=getattr(layer, "top_k", 10),
+                compute_capability=(
+                    device_capability.to_int()
+                    if device_capability is not None
+                    else None
+                ),
             )
             self.prefill_capabilities[shard] = prefill
             self.native_admission["prefill_projections"][shard] = asdict(prefill)
@@ -340,6 +392,16 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 "shape": list(weight.shape),
                 "activation_padding": list(self.input_padding.get(shard, (0, 0))),
             }
+        self.prefill_block_size = original_moe_prefill_block_size(
+            (self.weight_types["w1"], self.weight_types["w3"], self.weight_types["w2"]),
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_experts,
+            getattr(layer, "top_k", 10),
+            self.params_dtype,
+            device_capability.to_int() if device_capability is not None else None,
+        )
+        self.native_admission["prefill_block_size"] = self.prefill_block_size
         self.dp4a_admitted = bool(
             self.small_m_dp4a
             and self.params_dtype == torch.float16
@@ -361,6 +423,38 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             "storage": "original",
             "accumulation": "FP32",
         }
+        if self.packed_down_enabled:
+            self._prepare_packed_down(layer)
+
+    def _prepare_packed_down(self, layer):
+        weight = layer.gguf_w2
+        self.packed_down_admitted = bool(
+            self.packed_down_enabled
+            and self.native_enabled
+            and self.params_dtype == torch.float16
+            and self.weight_types["w2"] == 23
+            and (self.num_experts, self.hidden_size, self.intermediate_size)
+            == (288, 4096, 2048)
+            and self.input_padding.get("w2", (0, self.intermediate_size)) == (0, 2048)
+            and self.expert_cache is None
+            and layer.expert_map is None
+            and getattr(layer, "top_k", None) == 8
+            and weight.is_cuda
+            and weight.dtype == torch.uint8
+            and tuple(weight.shape) == (288, 4096, 1088)
+            and weight.is_contiguous()
+            and torch.cuda.get_device_capability(weight.device) == (7, 0)
+            and hasattr(torch.ops._C_gguf, "ggml_moe_mmvq_packed")
+        )
+        self.packed_down_device = weight.device if self.packed_down_admitted else None
+        logger.info_once(
+            "GGUF packed down admission: eligible=%s shape=%s dtype=%s type=%s",
+            self.packed_down_admitted,
+            tuple(weight.shape),
+            str(weight.dtype),
+            self.weight_types["w2"],
+            scope="process",
+        )
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -393,9 +487,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             ids = ids.clamp_min(0).contiguous()
         tokens, top_k = ids.shape
         cache = self.expert_cache
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
         w1, w3, w2 = layer.gguf_w1, layer.gguf_w3, layer.gguf_w2
         if (
-            self.dp4a_admitted
+            swiglu_limit is None
+            and self.dp4a_admitted
             and 1 <= tokens <= 64
             and layer.expert_map is None
             and topk_weights.dtype == torch.float32
@@ -426,51 +522,136 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 )
             return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
         if cache is not None and cache.tm is not None:
+            if swiglu_limit is not None:
+                # TurboMind cache banks do not allocate the raw-MMQ prefill
+                # storage, so falling through to cache.prefill is unsafe.
+                raise ValueError(
+                    "GGUF TurboMind expert cache does not support swiglu_limit; "
+                    "use expert_cache_prefill='mmq' or disable the expert cache"
+                )
             return cache.prefill_moe(
                 self.cache_layer, x.contiguous(), ids, topk_weights
             )
         if cache is not None:
             w1, w3, w2, ids = cache.prefill(self.cache_layer, ids)
         native = torch.ops._C_gguf
+        alignment = None
+        block_size = getattr(self, "prefill_block_size", 0)
+        if block_size and cache is None and layer.expert_map is None:
+            # Reuse one GPU route plan across all projections. Requiring the
+            # original per-projection bounds preserves MMVQ tails and decode.
+            caps = self.prefill_capabilities
+            if all(
+                caps[shard].reason is None
+                and caps[shard].operator == "ggml_moe_mmq"
+                and caps[shard].supports_m(tokens * top_k if shard == "w2" else tokens)
+                for shard in ("w1", "w3", "w2")
+            ):
+                from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+                    moe_align_block_size,
+                )
 
-        def projection(shard):
+                alignment = moe_align_block_size(
+                    ids, block_size, self.num_experts, pad_sorted_ids=True
+                )
+
+        def projection(shard, inputs, weight, rows, routes, count):
+            if alignment is not None:
+                sorted_ids, expert_ids, padded_count = alignment
+                return native.ggml_moe_mmq(
+                    inputs,
+                    weight,
+                    sorted_ids,
+                    self.weight_types[shard],
+                    rows,
+                    routes,
+                    count,
+                    expert_ids,
+                    padded_count,
+                )
             capability = self.projection_capabilities[shard]
             prefill = getattr(self, "prefill_capabilities", {}).get(shard)
             m = tokens * top_k if shard == "w2" else tokens
             if prefill is not None and prefill.reason is None and prefill.supports_m(m):
                 capability = prefill
-            return getattr(native, capability.operator)
+            if (
+                self.packed_down_admitted
+                and shard == "w2"
+                and capability.operator == "ggml_moe_mmvq"
+                and cache is None
+                and layer.expert_map is None
+                and (tokens, top_k) == (5, 8)
+                and (rows, routes, count) == (4096, 1, 40)
+                and self.weight_types[shard] == 23
+                and inputs.is_cuda
+                and inputs.dtype == torch.float16
+                and tuple(inputs.shape) == (40, 2048)
+                and inputs.is_contiguous()
+                and ids.is_cuda
+                and ids.dtype == torch.int32
+                and tuple(ids.shape) == (5, 8)
+                and ids.is_contiguous()
+                and ids.device == inputs.device
+                and weight.device == inputs.device
+                and weight.device == self.packed_down_device
+                and weight.dtype == torch.uint8
+                and tuple(weight.shape) == (288, 4096, 1088)
+                and weight.is_contiguous()
+            ):
+                result = native.ggml_moe_mmvq_packed(
+                    inputs, weight, ids.reshape(-1, 1), 23, rows, routes, count
+                )
+                logger.info_once(
+                    "GGUF MoE down dispatch: ggml_moe_mmvq_packed "
+                    "X=(40,2048) W=(288,4096,1088) FP16 IQ4_XS SM70",
+                    scope="process",
+                )
+                return result
+            return getattr(native, capability.operator)(
+                inputs,
+                weight,
+                ids.reshape(-1, 1) if shard == "w2" else ids,
+                self.weight_types[shard],
+                rows,
+                routes,
+                count,
+            )
 
-        gate = projection("w1")(
+        gate = projection(
+            "w1",
             x.contiguous(),
             w1,
-            ids,
-            self.weight_types["w1"],
             self.intermediate_size,
             top_k,
             tokens,
         )
-        up = projection("w3")(
+        up = projection(
+            "w3",
             x.contiguous(),
             w3,
-            ids,
-            self.weight_types["w3"],
             self.intermediate_size,
             top_k,
             tokens,
         )
-        hidden = torch.nn.functional.silu(gate) * up
+        if swiglu_limit is not None:
+            # Preserve the trained clamp and eager FP16 rounding in one launch.
+            activation = (
+                torch.ops.vllm.gguf_original_expert_activation
+                if gate.is_cuda
+                else _original_expert_activation
+            )
+            hidden = activation(gate, up, swiglu_limit)
+        else:
+            hidden = torch.nn.functional.silu(gate) * up
         left, physical_k = self.input_padding.get("w2", (0, self.intermediate_size))
         if left or physical_k != self.intermediate_size:
             hidden = torch.nn.functional.pad(
                 hidden, (left, physical_k - left - self.intermediate_size)
             )
-        routed_ids = ids.reshape(-1, 1)
-        down = projection("w2")(
+        down = projection(
+            "w2",
             hidden.contiguous(),
             w2,
-            routed_ids,
-            self.weight_types["w2"],
             self.hidden_size,
             1,
             tokens * top_k,

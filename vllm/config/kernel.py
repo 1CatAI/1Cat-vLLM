@@ -759,6 +759,20 @@ class KernelConfig:
     )
     """Observed per-group collective capabilities and rejection reasons."""
 
+    gguf_moe_packed_down: bool = False
+    """Use the calibrated SM70 FP16 IQ4_XS forty-row expert down route.
+
+    Other shapes and devices retain the existing operator selection.
+    """
+
+    canonical_prefill_topk_order: bool = False
+    """Order selected logical IDs in participating sparse-indexer prefill paths.
+
+    Preserve each negative slot and the selected multiset. This does not change
+    TopK selection, guarantee membership for tied scores, or affect decode.
+    Applies independently of device-specific sparse-kernel qualification.
+    """
+
     sm70_sparse: Sm70SparseConfig = Field(default_factory=Sm70SparseConfig)
     """SM70 sparse attention policy; admission uses actual tensor capabilities."""
 
@@ -857,6 +871,15 @@ class KernelConfig:
     sm70_round_cost_diagnostics: bool = False
     """Record bounded decode routing histories for a byte/instruction cost
     ledger. Extra diagnostic kernels invalidate latency measurements."""
+
+    @property
+    def moe_route_recorder(self) -> Callable[..., Any] | None:
+        """Provide the opt-in route recorder without coupling generic MoE to SM70."""
+        if not self.sm70_round_cost_diagnostics:
+            return None
+        from vllm.sm70_round_cost import attach_route_recorder
+
+        return attach_route_recorder
 
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,

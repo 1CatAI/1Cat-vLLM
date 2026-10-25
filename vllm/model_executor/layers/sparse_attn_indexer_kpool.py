@@ -15,13 +15,6 @@ from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.models.glm5next.nvidia.ops.kpool_compress import (
-    expand_pools_and_append_tail,
-    expand_pools_to_tokens,
-    kpool_compress_and_write_cache,
-    kpool_decode_update_and_maybe_write_cache_batched,
-    kpool_seed_tail_cache,
-)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -37,6 +30,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
+from vllm.v1.attention.ops.canonical_topk import canonicalize_selected_indices
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -53,8 +47,12 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 MXFP4_BLOCK_SIZE = 32
 
 
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+def _get_kpool_ops():
+    # The provider package registers model classes that import this layer.
+    # Resolve it only after this module has finished defining those classes.
+    from vllm.models.glm5next.nvidia.ops import kpool_compress
+
+    return kpool_compress
 
 
 # kpool write helper: form pools from the current token batch and compress them
@@ -92,7 +90,7 @@ def _kpool_compress_insert(
     write_mask = valid & (pos >= kpool - 1)
     offs = torch.arange(kpool, device=k.device)
     idx = (pos - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
-    kpool_compress_and_write_cache(
+    _get_kpool_ops().kpool_compress_and_write_cache(
         kv_cache,
         k[idx],  # [n, kpool, head_dim]
         gate_score[idx],
@@ -274,6 +272,7 @@ def sparse_attn_indexer_kpool(
     # path and when the tail cache is disabled.
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    canonical_prefill_order: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -333,6 +332,7 @@ def sparse_attn_indexer_kpool(
             topk_indices_buffer,
             skip_k_cache_insert,
             use_fp4_cache,
+            canonical_prefill_order=canonical_prefill_order,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -340,14 +340,19 @@ def sparse_attn_indexer_kpool(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
-    sm70_fp16_indexer = _is_exact_sm70_cuda()
+    # Provider packages own model registration, so import after native ops
+    # and metadata module initialization have completed.
+    from vllm.models.deepseek_v4.common.portable_sparse import use_portable_sparse
+
+    portable_fp16_indexer = use_portable_sparse()
+    kpool_ops = _get_kpool_ops()
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
-    if sm70_fp16_indexer:
+    if portable_fp16_indexer:
         assert q_quant.dtype == torch.float16
         assert q_scale is None
-        assert not use_fp4_cache, "SM70 requires the FP8 indexer cache"
+        assert not use_fp4_cache, "portable FP16 indexer requires the FP8 cache"
     elif use_fp4_cache:
         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
     else:
@@ -396,7 +401,7 @@ def sparse_attn_indexer_kpool(
                     tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
                     if tail_meta is not None:
                         assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
-                        kpool_seed_tail_cache(
+                        kpool_ops.kpool_seed_tail_cache(
                             tail_kv_cache,
                             k[prefill_slice],
                             gate_score[prefill_slice],
@@ -497,7 +502,7 @@ def sparse_attn_indexer_kpool(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            if sm70_fp16_indexer:
+            if portable_fp16_indexer:
                 from vllm.models.deepseek_v4.sm70.indexer import (
                     sm70_indexer_prefill_logits,
                 )
@@ -556,6 +561,11 @@ def sparse_attn_indexer_kpool(
                     select_k,
                 )
 
+            if canonical_prefill_order:
+                # Order selected logical IDs before any pool expansion. The
+                # same call covers native/XPU selection and pool size one.
+                topk_dst.copy_(canonicalize_selected_indices(topk_dst))
+
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
                 if positions is not None:
@@ -566,12 +576,12 @@ def sparse_attn_indexer_kpool(
                         positions[chunk.token_start : chunk.token_end].to(torch.int32)
                         + 1
                     )
-                    expanded = expand_pools_and_append_tail(
+                    expanded = kpool_ops.expand_pools_and_append_tail(
                         pool_ids, q_seq, index_kpool
                     )
                 else:
                     valid = pool_ids >= 0
-                    expanded = expand_pools_to_tokens(
+                    expanded = kpool_ops.expand_pools_to_tokens(
                         pool_ids, valid, topk_tokens, index_kpool
                     )
                 topk_indices_buffer[
@@ -582,7 +592,7 @@ def sparse_attn_indexer_kpool(
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
         kv_cache_raw = kv_cache  # raw [num_blocks, block_size, head_dim+4] for writes
-        if not sm70_fp16_indexer:
+        if not portable_fp16_indexer:
             kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
 
         # Update the tail before reading logits; completed pools are compressed
@@ -667,7 +677,8 @@ def sparse_attn_indexer_kpool(
             # Paged tail cache replaces the transient _DECODE_TAIL ring. Group
             # the tail group's token-granular slot_mapping per-request, mirroring
             # dec_slot / dec_pos, so the kernel gets each request's current-token
-            # tail slot (block * kpool + pos % kpool).
+            # tail slot (block * history_size + pos % history_size). The
+            # history can span several pools to preserve rejected-token state.
             if tail_meta is not None:
                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
             if tail_meta is None or tail_kv_cache is None:
@@ -692,7 +703,7 @@ def sparse_attn_indexer_kpool(
                 # provided. Inputs are already grouped per request (uniform:
                 # view; non-uniform: _scatter_decode_tokens_by_request padded to
                 # [B, lmax]) — no per-token .contiguous() copies needed.
-                kpool_decode_update_and_maybe_write_cache_batched(
+                kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
                     kv_cache_raw,
                     tail_kv_cache,
                     dec_tail_slot,
@@ -748,7 +759,7 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if sm70_fp16_indexer:
+        if portable_fp16_indexer:
             from vllm.models.deepseek_v4.sm70.indexer import (
                 sm70_indexer_decode_logits,
             )
@@ -848,7 +859,7 @@ def sparse_attn_indexer_kpool(
                 if dec_seq.ndim == 2:
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
-            out = expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+            out = kpool_ops.expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
             if (
                 capture_runtime_trace().dflash.coord_exact_one
                 and not diagnostic_history("kpool_coord_trace").get("seen", False)
@@ -902,6 +913,7 @@ def sparse_attn_indexer_kpool_fake(
     positions: torch.Tensor | None = None,
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    canonical_prefill_order: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -959,9 +971,17 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        # Initialization owns the engine config; execution may have only a
+        # ForwardContext. Keep this graph-affecting option local to the layer.
+        config = get_current_vllm_config_or_none()
+        self.canonical_prefill_topk_order = bool(
+            config is not None and config.kernel_config.canonical_prefill_topk_order
+        )
+        from vllm.models.deepseek_v4.common.portable_sparse import use_portable_sparse
+
         if (
             current_platform.is_cuda()
-            and not _is_exact_sm70_cuda()
+            and not use_portable_sparse()
             and not has_deep_gemm()
         ):
             raise RuntimeError(
@@ -1040,6 +1060,7 @@ class SparseAttnIndexerKpool(CustomOp):
             positions,
             self.tail_cache.kv_cache if self.tail_cache is not None else None,
             self.tail_cache.prefix if self.tail_cache is not None else None,
+            self.canonical_prefill_topk_order,
         )
 
     def forward_hip(

@@ -12,12 +12,16 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.vllm_flash_attn.sm70_library import (
+    has_qualified_fa2_library,
+    qualified_fa2_library_path,
+)
 
 logger = init_logger(__name__)
 
 # isort: off
 # FA2 ships one library per architecture: the CMake build for the target list
-# and, on mixed Volta/Turing rigs, a separate Turing build next to it. Both
+# and, on mixed-architecture rigs, qualified builds next to it. All
 # export the same module and op namespace, so a process can hold only one of
 # them, and the choice has to follow the GPU the ops run on. Importing here
 # would decide before a worker has selected its device, so the library loads
@@ -28,7 +32,11 @@ _FA2_TURING_PATH = os.path.join(os.path.dirname(__file__), "_vllm_fa2_C_sm75.abi
 _FA2_DEFAULT_SPEC = importlib.util.find_spec(_FA2_MODULE)
 _fa2_loaded_capability: tuple[int, int] | None = None
 
-if _FA2_DEFAULT_SPEC is not None or os.path.exists(_FA2_TURING_PATH):
+if (
+    _FA2_DEFAULT_SPEC is not None
+    or os.path.exists(_FA2_TURING_PATH)
+    or has_qualified_fa2_library(os.path.dirname(__file__))
+):
     FA2_UNAVAILABLE_REASON = None
     FA2_AVAILABLE = True
 else:
@@ -38,6 +46,9 @@ else:
 
 def _fa2_library_path(capability: tuple[int, int]) -> str | None:
     """Return the FA2 library installed for ``capability``, or None."""
+    path = qualified_fa2_library_path(capability, os.path.dirname(__file__))
+    if path is not None:
+        return path
     if capability == _FA2_TURING_CAPABILITY:
         return _FA2_TURING_PATH if os.path.exists(_FA2_TURING_PATH) else None
     return _FA2_DEFAULT_SPEC.origin if _FA2_DEFAULT_SPEC is not None else None

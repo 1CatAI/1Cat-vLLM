@@ -45,10 +45,11 @@ def test_unregistered_packed_operand_and_workspace_are_inventoried():
 def test_cpu_offload_gate_does_not_create_cuda_recorder(monkeypatch):
     import vllm.config
     import vllm.sm70_round_cost
+    from vllm.config.kernel import KernelConfig
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
     config = SimpleNamespace(
-        kernel_config=SimpleNamespace(sm70_round_cost_diagnostics=True)
+        kernel_config=KernelConfig(sm70_round_cost_diagnostics=True)
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
 

@@ -336,6 +336,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     # scheduled token that would normally be recorded by _update_after_schedule.
     request.num_in_flight_tokens = 1
 
+    scheduler.mixed_prefill_budget = Mock()
     scheduler.perf_metrics = None
     scheduler.connector = None
     scheduler.structured_output_manager = Mock()

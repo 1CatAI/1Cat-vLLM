@@ -24,6 +24,8 @@ Tensor ggml_moe_upstream(Tensor X, Tensor W, Tensor ids, int64_t type,
                          int64_t row, int64_t top_k, int64_t tokens);
 Tensor ggml_moe_mmvq(Tensor X, Tensor W, Tensor ids, int64_t type, int64_t row,
                      int64_t top_k, int64_t tokens);
+Tensor ggml_moe_mmvq_packed(Tensor X, Tensor W, Tensor ids, int64_t type,
+                            int64_t row, int64_t top_k, int64_t tokens);
 Tensor ggml_moe_mmq(Tensor X, Tensor W, Tensor ids, int64_t type, int64_t row,
                     int64_t top_k, int64_t tokens,
                     std::optional<Tensor> expert_ids,
@@ -54,6 +56,10 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
       "ggml_moe_mmvq(Tensor X, Tensor W, Tensor ids, int type, SymInt row, "
       "SymInt top_k, SymInt tokens) -> Tensor");
   ops.def(
+      "ggml_moe_mmvq_packed(Tensor X, Tensor W, Tensor ids, int type, SymInt "
+      "row, "
+      "SymInt top_k, SymInt tokens) -> Tensor");
+  ops.def(
       "ggml_moe_mmq(Tensor X, Tensor W, Tensor ids, int type, SymInt row, "
       "SymInt top_k, SymInt tokens, Tensor? expert_ids=None, Tensor? "
       "padded_count=None) -> Tensor");
@@ -70,6 +76,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_dequantize_upstream", TORCH_BOX(&ggml_dequantize_upstream));
   ops.impl("ggml_moe_upstream", TORCH_BOX(&ggml_moe_upstream));
   ops.impl("ggml_moe_mmvq", TORCH_BOX(&ggml_moe_mmvq));
+  ops.impl("ggml_moe_mmvq_packed", TORCH_BOX(&ggml_moe_mmvq_packed));
   ops.impl("ggml_moe_mmq", TORCH_BOX(&ggml_moe_mmq));
   ops.impl("ggml_moe_grouped_dense", TORCH_BOX(&ggml_moe_grouped_dense));
 }

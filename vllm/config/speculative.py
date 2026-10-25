@@ -967,6 +967,23 @@ class SpeculativeConfig:
                     or self.use_dspark()
                 ):
                     pass
+                elif self.draft_model_config.hf_config.model_type in get_args(
+                    MTPModelTypes
+                ) or getattr(self.draft_model_config.hf_config, "is_mtp_draft", False):
+                    # Native draft metadata takes precedence over repository
+                    # names, which may mention bundled DFlash/EAGLE assets.
+                    self.method = "mtp"
+                    self._inherit_target_rope_for_extended_native_mtp()
+                    if (
+                        self.num_speculative_tokens > 1
+                        and self.draft_model_config.hf_config.model_type
+                        != "step3p5_mtp"
+                    ):
+                        logger.warning(
+                            "Enabling num_speculative_tokens > 1 will run "
+                            "multiple times of forward on same MTP layer"
+                            ",which may result in lower acceptance rate"
+                        )
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
                 # yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
@@ -981,21 +998,6 @@ class SpeculativeConfig:
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
                     self.method = "mlp_speculator"
-                elif self.draft_model_config.hf_config.model_type in get_args(
-                    MTPModelTypes
-                ) or getattr(self.draft_model_config.hf_config, "is_mtp_draft", False):
-                    self.method = "mtp"
-                    self._inherit_target_rope_for_extended_native_mtp()
-                    if (
-                        self.num_speculative_tokens > 1
-                        and self.draft_model_config.hf_config.model_type
-                        != "step3p5_mtp"
-                    ):
-                        logger.warning(
-                            "Enabling num_speculative_tokens > 1 will run "
-                            "multiple times of forward on same MTP layer"
-                            ",which may result in lower acceptance rate"
-                        )
                 elif self.method == "draft_model":
                     pass
                 else:
@@ -1152,11 +1154,17 @@ class SpeculativeConfig:
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config,
                         self.draft_tensor_parallel_size,
-                        # MRV2 constructs complete DFlash/DSpark drafters on the
-                        # target model's final PP rank. They are local to that
-                        # stage rather than partitioned across target PP ranks.
+                        # Final-stage drafters are not partitioned across the
+                        # target PP ranks. Native MTP configs can declare this
+                        # contract without claiming SupportsPP on their model.
                         speculative_draft_pipeline_parallel_size=(
-                            1 if self.use_dspark() or self.use_dflash() else None
+                            1
+                            if self.use_dspark() or self.use_dflash()
+                            else getattr(
+                                self.draft_model_config.hf_config,
+                                "mtp_draft_pipeline_parallel_size",
+                                None,
+                            )
                         ),
                     )
                 )
