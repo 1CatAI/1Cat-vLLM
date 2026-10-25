@@ -129,6 +129,33 @@ def test_v2_pp_spec_decode_respects_pipeline_cadence(monkeypatch):
     assert len(decode_output.scheduled_spec_decode_tokens[request.request_id]) == 7
 
 
+@pytest.mark.parametrize(
+    ("use_v2_model_runner", "history_is_sent"), [(True, False), (False, True)]
+)
+def test_cached_request_history_is_only_sent_to_the_runner_that_reads_it(
+    use_v2_model_runner: bool, history_is_sent: bool
+):
+    scheduler = create_scheduler(async_scheduling=True)
+    scheduler.use_v2_model_runner = use_v2_model_runner
+    (request,) = create_requests(num_requests=1, num_tokens=1000)
+    scheduler.add_request(request)
+    scheduler.schedule()  # prefill: the request is now running
+
+    # A step that does not schedule the request (the PP cadence leaves such steps in
+    # between): the next decode step finds it missing from the previous step.
+    scheduler.prev_step_scheduled_req_ids.clear()
+    cached = scheduler._make_cached_request_data(
+        [request],
+        [],
+        {request.request_id: 1},
+        {},
+        {request.request_id: scheduler.kv_cache_manager.empty_kv_cache_blocks},
+    )
+
+    assert cached.req_ids == [request.request_id]
+    assert (request.request_id in cached.all_token_ids) is history_is_sent
+
+
 def test_abort():
     scheduler = create_scheduler(async_scheduling=True)
     requests = create_requests(num_requests=10, max_tokens=20)

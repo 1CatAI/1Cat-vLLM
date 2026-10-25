@@ -1543,7 +1543,13 @@ class Scheduler(SchedulerInterface):
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            # Only the V1 runner reads this history: it drops a request that skipped a
+            # step from its persistent batch and rebuilds the outputs from it. The V2
+            # runner keeps every request's tokens on the GPU and gets a resumed
+            # request as a new one, so under PP (a request is scheduled every
+            # pp_size-th step) the copy and its serialization would cost the whole
+            # context length per decode step: about 4 ms at 287k tokens.
+            if not scheduled_in_prev_step and not self.use_v2_model_runner:
                 all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
