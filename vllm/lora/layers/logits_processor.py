@@ -189,6 +189,11 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         logits = logits[:, : self.base_layer.vocab_size]
         return logits
 
+    def _apply_logits_transforms(
+        self, logits: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        return self.base_layer._apply_logits_transforms(logits)
+
     def forward(self, *args, **kwargs):
         return type(self.base_layer).forward(self, *args, **kwargs)
 
