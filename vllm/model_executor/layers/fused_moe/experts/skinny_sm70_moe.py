@@ -588,9 +588,11 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                 encode_s5(raster.view(experts, -1), planes.groups) if fits else None
             )
             kept.append(None if fits else planes)
-        self._csf_planes = (kept[0], kept[1])
         if all(plane is None for plane in kept):
+            self._csf_planes = None
             self._csf_scale_entries = None
+        else:
+            self._csf_planes = (kept[0], kept[1])
         if any(plane is not None for plane in kept):
             logger.info(
                 "Skinny MoE: csf scales stay compressed where five bits do not "

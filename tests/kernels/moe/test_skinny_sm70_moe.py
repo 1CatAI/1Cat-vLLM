@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -18,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
     grouped_splitk,
     nvfp4_skinny_scale_reason,
     qpn_prepack,
+    qpn_scale_entries,
     rebase_e8m0_for_fp16,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
@@ -29,6 +31,10 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     NvFp4MoeBackend,
     map_nvfp4_backend,
 )
+from vllm.model_executor.layers.quantization.utils.csf32_expand import (
+    CsfExpertScales,
+)
+from vllm.model_executor.layers.quantization.utils.csf32_scales import encode_csf32
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     break_fp4_bytes,
 )
@@ -805,3 +811,116 @@ def test_large_mxfp4_dispatch_matches_reference(device, order, skewed):
         rtol=0,
         atol=3e-3 * reference.abs().max().item(),
     )
+
+
+def _csf_planes(scales: list[np.ndarray], rows, groups, projections, device):
+    parts = [encode_csf32(m) for m in scales]
+
+    def stack(name, dtype):
+        return torch.stack(
+            [torch.from_numpy(part[name].astype(dtype)) for part in parts]
+        ).to(device)
+
+    counts = [part["exceptions"].size for part in parts]
+    return CsfExpertScales(
+        rows=rows,
+        groups=groups,
+        projections=projections,
+        bases=stack("bases", np.uint8),
+        codes=stack("codes", np.uint8),
+        page_bases=stack("page_bases", np.int32),
+        offsets=stack("offsets", np.int32),
+        exceptions=torch.from_numpy(
+            np.concatenate([part["exceptions"] for part in parts]).astype(np.int32)
+        ).to(device),
+        exception_start=torch.tensor(
+            np.concatenate(([0], np.cumsum(counts)[:-1])),
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+
+
+def _spread_scales(rng, rows, groups, spread):
+    """fp8-e4m3 scale bytes whose rows span `spread` (and leave csf's 4-bit window)."""
+    low = 100 + rng.integers(0, 6, (rows, 1))
+    scale = low + rng.integers(0, spread + 1, (rows, groups))
+    scale[:, 0] = low[:, 0]
+    scale[:, 1] = low[:, 0] + spread
+    return scale.astype(np.uint8)
+
+
+@pytest.mark.parametrize("w2_spread", [26, 40], ids=["both_fit", "w2_too_wide"])
+@pytest.mark.parametrize("num_tokens", [1, 6, 40])
+def test_csf_experts_give_the_same_output_as_five_bit_planes(
+    device, order, w2_spread, num_tokens
+):
+    # A layer whose scale rows fit five bits is served from planes, the same layer
+    # kept on csf planes expands per call; a projection that does not fit stays on
+    # csf next to a packed one. All three must produce the same bytes.
+    rng = np.random.default_rng(5)
+    generator = torch.Generator().manual_seed(6)
+    experts, hidden, inter, top_k = 8, 256, 128, 3
+    w13 = torch.randint(0, 256, (experts, 2 * inter, hidden // 2), generator=generator)
+    w2 = torch.randint(0, 256, (experts, hidden, inter // 2), generator=generator)
+    w13, w2 = w13.to(torch.uint8).to(device), w2.to(torch.uint8).to(device)
+    for e in range(experts):
+        w13[e].view(-1).copy_(qpn_prepack(w13[e], None, 16, order)[0])
+        w2[e].view(-1).copy_(qpn_prepack(w2[e], None, 16, order)[0])
+    g1 = torch.rand(experts, generator=generator) * 1e-4 + 5e-5
+    g2 = torch.rand(experts, generator=generator) * 1e-4 + 5e-5
+    planes13 = _csf_planes(
+        [_spread_scales(rng, inter, hidden // 16, 26) for _ in range(experts * 2)],
+        inter,
+        hidden // 16,
+        2,
+        device,
+    )
+    planes2 = _csf_planes(
+        [_spread_scales(rng, hidden, inter // 16, w2_spread) for _ in range(experts)],
+        hidden,
+        inter // 16,
+        1,
+        device,
+    )
+    x = (torch.randn(num_tokens, hidden, generator=generator) * 0.1).half()
+    topk_ids = torch.stack(
+        [torch.randperm(experts, generator=generator)[:top_k] for _ in x]
+    )
+    topk_weights = torch.rand(num_tokens, top_k, generator=generator)
+
+    def serve(convert: bool):
+        rasters = (
+            torch.zeros(
+                experts, 2 * inter * (hidden // 16), dtype=torch.uint8, device=device
+            ),
+            torch.zeros(
+                experts, hidden * (inter // 16), dtype=torch.uint8, device=device
+            ),
+        )
+        served = _skinny_experts(device, order, w13, rasters[0], w2, rasters[1], g1, g2)
+        served._csf_planes = (planes13, planes2)
+        served._csf_scale_entries = qpn_scale_entries(order, device)
+        if convert:
+            served._s5 = served._csf_to_s5()
+        output = torch.empty(num_tokens, hidden, dtype=torch.float16, device=device)
+        served._apply_grouped(
+            output=output,
+            hidden_states=x.to(device),
+            w1=w13,
+            w2=w2,
+            topk_weights=topk_weights.to(device),
+            topk_ids=topk_ids.to(device),
+            activation=MoEActivation.SILU,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+        return output, served
+
+    expected, _ = serve(convert=False)
+    assert torch.isfinite(expected).all()
+    got, served = serve(convert=True)
+    assert torch.equal(got, expected)
+    fits = w2_spread <= 31
+    assert (served._s5[0] is not None) and (served._s5[1] is not None) == fits
+    assert (served._csf_planes is None) == fits
