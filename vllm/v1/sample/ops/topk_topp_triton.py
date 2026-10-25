@@ -1141,16 +1141,24 @@ def _apply_top_k_top_p_compact(
     vocabulary order. Restore that order before sorting the shortlist so that
     top-p also splits ties at the same token. Numerically close cumulative
     probabilities still use the full reference reduction.
+
+    Rows are classified on the device, so admitting a batch needs no
+    device-to-host sync: rows with nothing to filter (top-k disabled and
+    top_p >= 1, e.g. greedy rows in a mixed batch) are left unchanged,
+    top-k-only rows skip the top-p boundary check, and rows whose k does not
+    fit the shortlist take the dense reference route with the other
+    ambiguous rows.
     """
     capacity = 128
-    if not ((k > 0) & (k < capacity)).all():
-        return None
+    vocab_size = logits.shape[1]
+    no_top_p = p >= 1.0
+    passthrough = ((k <= 0) | (k >= vocab_size)) & no_top_p
+    admitted = (k > 0) & (k < capacity)
+    shortlist_k = torch.where(admitted, k, torch.ones_like(k))
 
     values, indices = logits.topk(capacity, dim=-1, sorted=False)
-    values, indices = sort_topk_with_vocab_ties(
-        values, indices, vocab_size=logits.shape[1]
-    )
-    cutoff = values.gather(1, (capacity - k.long()).unsqueeze(1))
+    values, indices = sort_topk_with_vocab_ties(values, indices, vocab_size=vocab_size)
+    cutoff = values.gather(1, (capacity - shortlist_k.long()).unsqueeze(1))
     reference_rows = (values[:, 0] >= cutoff[:, 0]) | ~torch.isfinite(values[:, -1])
     reference_rows |= torch.isnan(values[:, 0])
     values.masked_fill_(values < cutoff, -float("inf"))
@@ -1160,8 +1168,13 @@ def _apply_top_k_top_p_compact(
     # Conservative margin for the different FP32 softmax/cumsum reduction.
     # There are fewer than capacity nonzero probabilities in admitted rows.
     margin = 8 * capacity * torch.finfo(torch.float32).eps
-    reference_rows |= ((cumulative - boundary).abs() <= margin).any(dim=-1)
-    remove = cumulative <= boundary
+    # With top_p >= 1 nothing is removed, so the boundary check would only
+    # send top-k-only rows to the dense route (cumulative and boundary are 0).
+    reference_rows |= ~no_top_p & ((cumulative - boundary).abs() <= margin).any(dim=-1)
+    reference_rows |= ~admitted
+    reference_rows &= ~passthrough
+    keep_rows = reference_rows | passthrough
+    remove = (cumulative <= boundary) & ~no_top_p.unsqueeze(1)
     remove[:, -1] = False
     values.masked_fill_(remove, -float("inf"))
     # Direct callers permit in-place filtering. Keep the original logits in
@@ -1170,14 +1183,14 @@ def _apply_top_k_top_p_compact(
     result = logits
     _clear_compact_rows_kernel[(logits.shape[0], triton.cdiv(logits.shape[1], 4096))](
         result,
-        reference_rows,
+        keep_rows,
         result.stride(0),
         result.shape[1],
         BLOCK=4096,
     )
     _scatter_compact_rows_kernel[(logits.shape[0],)](
         result,
-        reference_rows,
+        keep_rows,
         values,
         indices,
         result.stride(0),
