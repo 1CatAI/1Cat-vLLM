@@ -13,20 +13,18 @@ Only full CSF tiles are supported (rows % 128 == 0, groups % 4 == 0), which
 covers every routed-expert shape of the GLM-5.3 checkpoints.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 import torch
 
-from vllm.triton_utils import tl, triton
-
 CSF32_SCALE_ENCODING = "csf_32x2_v1"
 
-_RECORDS_PER_STEP = 256
-# Programs a launch should offer the GPU: a decode launch has one group row per
-# routed expert (8 for one token) and its programs walk 24-64 dependent steps,
-# so it must split that walk until enough programs hide the load latency.
-_TARGET_PROGRAMS = 4096
+# Blocks a launch should offer the GPU: about one wave (80 SMs x 8 resident blocks of
+# 256 threads). A decode launch has one group row per routed expert (8 for one token);
+# more, smaller blocks only repeat each block's set-up (one token: 0.085 ms against
+# 0.050 ms).
+_TARGET_PROGRAMS = 512
 
 
 @dataclass
@@ -46,11 +44,6 @@ class CsfExpertScales:
     offsets: torch.Tensor  # i32 [M, blocks + pages] (u16 widened)
     exceptions: torch.Tensor  # i32 [total records] (u16 widened)
     exception_start: torch.Tensor  # i64 [M]
-    exception_count: torch.Tensor  # i32 [M]
-    max_exceptions: int = field(init=False)  # most records of one matrix
-
-    def __post_init__(self) -> None:
-        self.max_exceptions = int(self.exception_count.max())
 
     @property
     def num_blocks(self) -> int:
@@ -153,7 +146,6 @@ class CsfExpertScaleLoader:
             projections=self.projections,
             exceptions=exceptions,
             exception_start=starts.to(device),
-            exception_count=counts.to(torch.int32).to(device),
             **self.parts,
         )
 
@@ -182,74 +174,6 @@ def shared_scale_raster(
         )
         _SHARED_RASTERS[key] = raster
     return raster
-
-
-@triton.jit
-def _csf32_exceptions_kernel(
-    out_ptr,
-    out_expert_stride,
-    gids_ptr,
-    goff_ptr,
-    num_slots,
-    page_bases_ptr,
-    offsets_ptr,
-    exceptions_ptr,
-    exception_start_ptr,
-    exception_count_ptr,
-    entries_ptr,
-    ROWS: tl.constexpr,
-    GROUPS: tl.constexpr,
-    PROJECTIONS: tl.constexpr,
-    NUM_PAGES: tl.constexpr,
-    SEARCH_STEPS: tl.constexpr,
-    STEP: tl.constexpr,
-):
-    # One program per group, projection and run of STEP records.
-    slot = tl.program_id(0)
-    if tl.load(goff_ptr + slot) >= num_slots:
-        return
-    expert = tl.load(gids_ptr + slot).to(tl.int64)
-    projection = tl.program_id(1)
-    matrix = expert * PROJECTIONS + projection
-    num_blocks: tl.constexpr = (ROWS // 32) * (GROUPS // 2)
-    tile_pairs: tl.constexpr = GROUPS // 4
-    start = tl.load(exception_start_ptr + matrix)
-    count = tl.load(exception_count_ptr + matrix)
-    offsets_row = offsets_ptr + matrix * (num_blocks + NUM_PAGES)
-    pages_row = page_bases_ptr + matrix * NUM_PAGES
-
-    first = tl.program_id(2) * STEP
-    if first < count:
-        k = first + tl.arange(0, STEP)
-        valid = k < count
-        record = tl.load(exceptions_ptr + start + k, mask=valid, other=0)
-        # The block owning record k: the last block whose first record is <= k.
-        low = tl.zeros([STEP], dtype=tl.int32)
-        high = tl.full([STEP], num_blocks, dtype=tl.int32)
-        for _ in range(SEARCH_STEPS):
-            mid = (low + high) // 2
-            page = mid // (8 * 32)
-            first_record = tl.load(pages_row + page) // 2 + tl.load(
-                offsets_row + mid + page
-            )
-            go_right = first_record <= k
-            low = tl.where(go_right, mid, low)
-            high = tl.where(go_right, high, mid)
-        block = low
-        tile = block // 8
-        at = block % 8
-        block_row = (tile // tile_pairs) * 4 + at % 4
-        pair = (tile % tile_pairs) * 2 + at // 4
-        position = record & 0xFF
-        r = position // 2
-        c = position % 2
-        out_tile = projection * (ROWS // 32) + block_row
-        index = (out_tile * GROUPS + pair * 2 + c) * 32 + tl.load(entries_ptr + r)
-        tl.store(
-            out_ptr + expert * out_expert_stride + index,
-            (record >> 8).to(tl.uint8),
-            mask=valid,
-        )
 
 
 def _runs_per_row(tile_pairs: int, programs: int) -> int:
@@ -296,6 +220,10 @@ def expand_csf32_experts(
         out,
         planes.bases,
         planes.codes,
+        planes.page_bases,
+        planes.offsets,
+        planes.exceptions,
+        planes.exception_start,
         scale_entries,
         gids,
         goff,
@@ -305,24 +233,4 @@ def expand_csf32_experts(
         group_rows,
         tile_pairs // runs,
         runs,
-    )
-    record_runs = max(1, -(-planes.max_exceptions // _RECORDS_PER_STEP))
-    _csf32_exceptions_kernel[(group_rows, planes.projections, record_runs)](
-        out,
-        out.stride(0),
-        gids,
-        goff,
-        num_slots,
-        planes.page_bases,
-        planes.offsets,
-        planes.exceptions,
-        planes.exception_start,
-        planes.exception_count,
-        scale_entries,
-        ROWS=planes.rows,
-        GROUPS=planes.groups,
-        PROJECTIONS=planes.projections,
-        NUM_PAGES=planes.num_pages,
-        SEARCH_STEPS=max(1, (planes.num_blocks - 1).bit_length()),
-        STEP=_RECORDS_PER_STEP,
     )

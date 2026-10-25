@@ -332,7 +332,9 @@ void indexer_prefill_scores_sm75(torch::Tensor out, torch::Tensor q,
                                  torch::Tensor key_scales);
 
 void csf32_expand_sm70(torch::Tensor out, torch::Tensor bases,
-                       torch::Tensor codes, torch::Tensor entries,
+                       torch::Tensor codes, torch::Tensor page_bases,
+                       torch::Tensor offsets, torch::Tensor exceptions,
+                       torch::Tensor exception_start, torch::Tensor entries,
                        torch::Tensor gids, torch::Tensor goff, int64_t rows,
                        int64_t groups, int64_t projections, int64_t group_rows,
                        int64_t pairs_per_program, int64_t runs);

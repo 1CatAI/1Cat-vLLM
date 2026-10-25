@@ -149,7 +149,6 @@ def _planes(matrices: list[dict[str, np.ndarray]], rows, groups, projections, de
             np.concatenate([m["exceptions"] for m in matrices]).astype(np.int32)
         ).to(device),
         exception_start=torch.tensor(starts, dtype=torch.int64, device=device),
-        exception_count=torch.tensor(counts, dtype=torch.int32, device=device),
     )
 
 
