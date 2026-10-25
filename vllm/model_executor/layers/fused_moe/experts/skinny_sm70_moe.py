@@ -45,6 +45,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.model_executor.layers.quantization.utils.s5_scales import (
+    S5Scales,
+    encode_s5,
+)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -130,6 +134,18 @@ def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
         if not torch.isfinite((scales.float() * 2**14).half()).all():
             return "global NVFP4 scale rebias exceeds FP16 range"
     return None
+
+
+def qpn_scale_entries(order: QpnFragmentOrder, device: torch.device) -> torch.Tensor:
+    """Raster position of each tile row's scale byte, int32 [32].
+
+    The inverse of the scale column table of ``_fragment_tables``; the CSF
+    expansion writes compressed expert scales through it.
+    """
+    _, _, scale_col = _fragment_tables(order, device)
+    entries = torch.empty(32, dtype=torch.int32, device=device)
+    entries[scale_col] = torch.arange(32, dtype=torch.int32, device=device)
+    return entries
 
 
 def qpn_prepack(
@@ -395,10 +411,17 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         # csf_32x2_v1 planes (w13, w2): the block scales above are then shared
         # rasters that each grouped call fills for its routed experts.
         self._csf_planes: tuple[CsfExpertScales, CsfExpertScales] | None = None
+        self._csf_scale_entries: torch.Tensor | None = None
+        # The same scales as five-bit planes (s5_scales.py), which the kernels
+        # read in place; they replace the csf planes once the weights are loaded.
+        self._s5: tuple[S5Scales, S5Scales] | None = None
 
     def attach_csf_scales(self, w13: CsfExpertScales, w2: CsfExpertScales) -> None:
         """Serve compressed expert scales; call before process_weights_after_loading."""
         self._csf_planes = (w13, w2)
+        self._csf_scale_entries = qpn_scale_entries(
+            self._fragment_order, w13.bases.device
+        )
 
     @property
     def quant_dtype(self) -> torch.dtype | str | None:
@@ -489,13 +512,18 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                     f"K={w.size(2) * 2}"
                 )
         if self._csf_planes is not None:
-            # The shared rasters already take expanded scales in QPN order.
+            # The shared rasters take the expanded scales in this card's order.
             for e in range(w13.size(0)):
-                w13[e].view(-1).copy_(qpn_prepack(w13[e], None)[0])
-                w2[e].view(-1).copy_(qpn_prepack(w2[e], None)[0])
+                w13[e].view(-1).copy_(
+                    qpn_prepack(w13[e], None, 16, self._fragment_order)[0]
+                )
+                w2[e].view(-1).copy_(
+                    qpn_prepack(w2[e], None, 16, self._fragment_order)[0]
+                )
+            self._s5 = self._csf_to_s5()
             logger.info_once(
                 "Skinny MoE: expert codes re-permuted to QPN fragment order; "
-                "csf_32x2_v1 scales stay compressed (%d experts)",
+                "csf_32x2_v1 scales re-encoded as five-bit planes (%d experts)",
                 w13.size(0),
             )
             return
@@ -519,6 +547,32 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             w13.size(0),
             sg,
         )
+
+    def _csf_to_s5(self) -> tuple[S5Scales, S5Scales]:
+        """Re-encode the csf planes as five-bit planes and drop the csf planes.
+
+        Each projection set is expanded for all experts into its shared raster
+        (the expansion kernel the csf planes always went through), then packed.
+        """
+        assert self._csf_planes is not None and self._csf_scale_entries is not None
+        scales = self._get_scale_caches()
+        converted = []
+        for planes, raster in zip(
+            self._csf_planes, (scales.w1_scales_u8, scales.w2_scales_u8)
+        ):
+            experts = raster.shape[0]
+            routed = torch.arange(experts, dtype=torch.int32, device=raster.device)
+            expand_csf32_experts(
+                raster.view(experts, -1),
+                planes,
+                routed,
+                torch.arange(experts + 1, dtype=torch.int32, device=raster.device),
+                self._csf_scale_entries,
+            )
+            converted.append(encode_s5(raster.view(experts, -1), planes.groups))
+        self._csf_planes = None
+        self._csf_scale_entries = None
+        return converted[0], converted[1]
 
     def _scale_rasters(
         self, layer: torch.nn.Module
@@ -719,14 +773,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         # kernel launches min(S, experts) group rows and skips the empty ones.
         num_slots = topk_ids.numel()
         perm, gids32, goff32 = group_routing(topk_ids)
-        if self._csf_planes is not None:
-            w13_planes, w2_planes = self._csf_planes
-            expand_csf32_experts(
-                scales.w1_scales_u8.view(w1.size(0), -1), w13_planes, gids32, goff32
-            )
-            expand_csf32_experts(
-                scales.w2_scales_u8.view(w2.size(0), -1), w2_planes, gids32, goff32
-            )
+        s5_w13, s5_w2 = self._s5 if self._s5 is not None else (None, None)
         y13 = torch.empty(
             (num_slots, w1.size(1)), dtype=hidden_states.dtype, device=device
         )
@@ -742,6 +789,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y13,
             False,
             num_tokens,
+            s5_w13,
         )
         inter = torch.empty((num_slots, inter_dim), dtype=y13.dtype, device=device)
         self.activation(activation, inter, y13)
@@ -758,6 +806,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y2,
             True,
             num_tokens,
+            s5_w2,
         )
         # One pass over the slot rows straight into the output (the reduction
         # moe_unpermute computes) instead of writing and re-reading two FP32
@@ -777,8 +826,13 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         y: torch.Tensor,
         x_slot_major: bool,
         num_tokens: int,
+        s5: S5Scales | None = None,
     ) -> None:
-        """y[slot] = x[row] @ W[expert].T over the expert groups of the slots."""
+        """y[slot] = x[row] @ W[expert].T over the expert groups of the slots.
+
+        With five-bit scale planes ``scales_u8`` is only the raster the op fills
+        for launches that do not decode the planes in place.
+        """
         # Volta's hand kernel decodes every weight tile again for each 8-row
         # block; past 13 rows per expert on average the Triton kernel, which
         # decodes a tile once per row block, is faster.
@@ -807,6 +861,9 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             grouped_splitk(x.size(1), self._fragment_order),
             self._scale_mode,
             self._fragment_order,
+            None if s5 is None else s5.base,
+            None if s5 is None else s5.nib,
+            None if s5 is None else s5.hi,
         )
 
 
