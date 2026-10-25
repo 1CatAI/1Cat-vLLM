@@ -1,0 +1,208 @@
+{
+  "runtime_base_commit": "2d9737c0f7ad331cff272ede78a75a0c1649a3b5",
+  "publication_parent_commit": "56019049f9d0d4ac8642bae12d90fc8063775302",
+  "model_revision": "6db2f05b776babd37e4fb96a749193b3cd61993f",
+  "test_results": {
+    "mtp-config-tests.log": "9 passed, 1 warning in 10.24s",
+    "marlin-clamp-3090.log": "17 passed, 15 warnings in 9.59s",
+    "marlin-clamp-4090.log": "17 passed, 15 warnings in 9.49s",
+    "sm70-load-tests.log": "4 passed, 15 warnings in 10.21s",
+    "sm70-compact-tp1-tests.log": "6 passed, 15 warnings in 10.30s",
+    "lm-head-tests.log": "1 passed, 15 warnings in 7.80s"
+  },
+  "validation": {
+    "long-32768-cold": {
+      "ttft_seconds": 60.53984510002192,
+      "elapsed_seconds": 60.748454000102356,
+      "usage": {
+        "prompt_tokens": 32768,
+        "total_tokens": 32780,
+        "completion_tokens": 12
+      },
+      "passphrase_correct": true,
+      "metric_deltas": {
+        "prefix_cache_hits_total": 0.0,
+        "request_prefill_kv_computed_tokens_sum": 32768.0,
+        "spec_decode_num_drafts_total": 3.0,
+        "spec_decode_num_draft_tokens_total": 12.0,
+        "spec_decode_num_accepted_tokens_total": 9.0,
+        "num_preemptions_total": 0.0
+      }
+    },
+    "long-160000-cold": {
+      "ttft_seconds": 186.83457679999992,
+      "elapsed_seconds": 186.99955520010553,
+      "usage": {
+        "prompt_tokens": 160000,
+        "total_tokens": 160012,
+        "completion_tokens": 12
+      },
+      "passphrase_correct": true,
+      "metric_deltas": {
+        "prefix_cache_hits_total": 26880.0,
+        "request_prefill_kv_computed_tokens_sum": 133120.0,
+        "spec_decode_num_drafts_total": 3.0,
+        "spec_decode_num_draft_tokens_total": 12.0,
+        "spec_decode_num_accepted_tokens_total": 9.0,
+        "num_preemptions_total": 0.0
+      }
+    },
+    "long-160000-replay": {
+      "ttft_seconds": 14.50491349992808,
+      "elapsed_seconds": 14.667755599948578,
+      "usage": {
+        "prompt_tokens": 160000,
+        "total_tokens": 160012,
+        "completion_tokens": 12
+      },
+      "passphrase_correct": true,
+      "metric_deltas": {
+        "prefix_cache_hits_total": 152320.0,
+        "request_prefill_kv_computed_tokens_sum": 7680.0,
+        "spec_decode_num_drafts_total": 3.0,
+        "spec_decode_num_draft_tokens_total": 12.0,
+        "spec_decode_num_accepted_tokens_total": 9.0,
+        "num_preemptions_total": 0.0
+      }
+    },
+    "text-smoke": {
+      "http_status": 200,
+      "elapsed_seconds": 2.9711424000561237,
+      "message": {
+        "role": "assistant",
+        "content": "703",
+        "refusal": null,
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "tool_calls": [],
+        "reasoning": null
+      }
+    },
+    "vision-two-images": {
+      "http_status": 200,
+      "elapsed_seconds": 2.857024500030093,
+      "message": {
+        "role": "assistant",
+        "content": "第一张图：红色。\n第二张图：蓝色。",
+        "refusal": null,
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "tool_calls": [],
+        "reasoning": null
+      }
+    },
+    "tool-smoke": {
+      "http_status": 200,
+      "elapsed_seconds": 2.755853299982846,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "refusal": null,
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "tool_calls": [
+          {
+            "id": "chatcmpl-tool-a948d5191bf3e098",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\": \"北京\"}"
+            }
+          }
+        ],
+        "reasoning": null
+      }
+    }
+  },
+  "limitations": [
+    "Targeted tests, not the full repository test suite",
+    "First 160000-token request reused 26880 tokens",
+    "Native MTP4 only; independent DFlash2 not GPU-validated",
+    "No native extension rebuild for this patch"
+  ],
+  "gpu_tested_source_sha256": {
+    "vllm/config/speculative.py": "1e88c61d777aa0e8446ae3f2db353c0361cc1e64ceb5e9c54b2564e8ba653489",
+    "vllm/_sm70/moe.py": "f03e92e8c8bf53da2de21d4bd540591433d3ac3e63107726b8861628b26f4bf7",
+    "vllm/model_executor/layers/fused_moe/config.py": "735e83ef1cdf5957194a512e3b89b7afe145a78a6ed5d9097e179dcade69f0c1",
+    "vllm/model_executor/layers/fused_moe/oracle/nvfp4.py": "c180ffe9dfec6aa5cbb29fa3dd616e8eaa3555366ba54d606e7cc379c6df6044",
+    "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py": "b45824e2a690a18c0f6ad2aca1d9756f23acfc00881bae1835ffc952e3d46b1c",
+    "vllm/model_executor/layers/quantization/modelopt.py": "9fa3af9e8a580fbbeebcedad6e11ffed8ef1debb63ebac9ffc9ad2c97c842755",
+    "vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py": "4181dc7f06b2b0842446a1bc0d6444b33f8e037cdd1aa4b186cf004f0f2cd7bb",
+    "vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py": "ce86a543e0bd49085d5631c5c8bfeb0f0ce1b4c2f2564126de3c8f2b29fe7360",
+    "vllm/model_executor/layers/vocab_parallel_embedding.py": "bb579871d4768d474f1d7189463f999f32faee94ee2a32c609f74fb034c502d7",
+    "tests/quantization/test_nvfp4_marlin_clamp.py": "10a3ddc4148234d6544206279ce300bf5ed7e287ab93184eddf3d4cb7dc5f89f",
+    "tests/quantization/test_nvfp4_sm70_load_memory.py": "7e8ae88a7a3e2ab3fba48e78623d9b4a8623004b4b18a87655bd1f9299d976b2",
+    "tests/quantization/test_nvfp4_sm70_compact_tp1.py": "3e944b688f4dac049f798587f85b4a05d51dad96ae056a7459419838dd402a2d",
+    "tests/model_executor/layers/test_lm_head_execution_policy.py": "7fc35a8441f0969f629c96c65b72a3d2323973c66d24b1a99111087739b637d5",
+    "tests/models/glm5next/test_mtp_config.py": "25db9e8f8ee606b0b6d95430c2aee87e9bc15995260df16b32a70f81dec694fb"
+  },
+  "publication_source_sha256": {
+    "vllm/config/speculative.py": "1e88c61d777aa0e8446ae3f2db353c0361cc1e64ceb5e9c54b2564e8ba653489",
+    "vllm/_sm70/moe.py": "3746aa478e50dd63e69f530f72a7b22b4597c61ef672aab4b3a895e9dc35e88b",
+    "vllm/model_executor/layers/fused_moe/config.py": "735e83ef1cdf5957194a512e3b89b7afe145a78a6ed5d9097e179dcade69f0c1",
+    "vllm/model_executor/layers/fused_moe/oracle/nvfp4.py": "c180ffe9dfec6aa5cbb29fa3dd616e8eaa3555366ba54d606e7cc379c6df6044",
+    "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py": "d556dbd5ec88c17f385aff0886c2aedece6c5162f1ba4f6bac10cfe2b237e016",
+    "vllm/model_executor/layers/quantization/modelopt.py": "9fa3af9e8a580fbbeebcedad6e11ffed8ef1debb63ebac9ffc9ad2c97c842755",
+    "vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py": "4181dc7f06b2b0842446a1bc0d6444b33f8e037cdd1aa4b186cf004f0f2cd7bb",
+    "vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py": "aaca08339669ba230c5fb792b279b1e1921aaddc419c19685285115d1400fe34",
+    "vllm/model_executor/layers/vocab_parallel_embedding.py": "bb579871d4768d474f1d7189463f999f32faee94ee2a32c609f74fb034c502d7",
+    "tests/quantization/test_nvfp4_marlin_clamp.py": "d01c69e3e9c6fd751c8dd20c568cdb24f05cb3726fccfd00ac896b9cf00e918b",
+    "tests/quantization/test_nvfp4_sm70_load_memory.py": "7f9bc42cd02308bc9f09d409dbf6f870879f07850056fe6837b3f72c4a9359ac",
+    "tests/quantization/test_nvfp4_sm70_compact_tp1.py": "e2d932a2a029e829ca6c9496c1c019098cc04988dd816bdb17775d10affc7de0",
+    "tests/model_executor/layers/test_lm_head_execution_policy.py": "7fc35a8441f0969f629c96c65b72a3d2323973c66d24b1a99111087739b637d5",
+    "tests/models/glm5next/test_mtp_config.py": "25db9e8f8ee606b0b6d95430c2aee87e9bc15995260df16b32a70f81dec694fb"
+  },
+  "publication_checks": {
+    "mtp-config-cpu": {
+      "returncode": 0,
+      "summary": "9 passed, 1 warning in 11.10s",
+      "command": [
+        "/media/zhangwei/Sata02/llm-deploy/glm-nvfp4-publication-20261025/checkout/.venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/models/glm5next/test_mtp_config.py",
+        "--confcutdir=tests/models/glm5next"
+      ]
+    },
+    "lm-head-cpu": {
+      "returncode": 0,
+      "summary": "1 passed, 15 warnings in 8.31s",
+      "command": [
+        "/media/zhangwei/Sata02/llm-deploy/glm-nvfp4-publication-20261025/checkout/.venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/model_executor/layers/test_lm_head_execution_policy.py",
+        "--confcutdir=tests/model_executor/layers"
+      ]
+    },
+    "quantization-cpu": {
+      "returncode": 0,
+      "summary": "5 passed, 22 skipped, 15 warnings in 7.41s",
+      "command": [
+        "/media/zhangwei/Sata02/llm-deploy/glm-nvfp4-publication-20261025/checkout/.venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/quantization/test_nvfp4_marlin_clamp.py",
+        "tests/quantization/test_nvfp4_sm70_load_memory.py",
+        "tests/quantization/test_nvfp4_sm70_compact_tp1.py",
+        "--confcutdir=tests/quantization"
+      ]
+    },
+    "accelerator-api": {
+      "returncode": 0,
+      "summary": "2.10.0+cu128 accelerator APIs present"
+    }
+  },
+  "publication_cleanup": [
+    "Explicit non-null assertions for mypy",
+    "Pinned repository formatter",
+    "Equivalent torch.accelerator synchronization and memory-stat APIs in tests",
+    "GPU tests not rerun alongside the production service"
+  ]
+}

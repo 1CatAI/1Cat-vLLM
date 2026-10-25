@@ -322,6 +322,36 @@ def prepare_fp4_layer_for_marlin(
     return
 
 
+def _repack_nvfp4_experts_in_place(weight: torch.Tensor) -> torch.Tensor:
+    """Repack owned expert weights with only one expert's temporary storage.
+
+    NVFP4 and Marlin contain the same packed bits per expert. Reuse each
+    contiguous expert slice after its repack completes, avoiding two whole
+    expert banks of temporary storage from the list-and-cat implementation.
+    The input layout is consumed; callers must replace it with the result.
+    """
+    assert weight.dtype == torch.uint8 and weight.ndim == 3
+    weight = weight.contiguous()
+    experts, size_n, packed_k = weight.shape
+    size_k = packed_k * 2
+    perm = torch.empty(0, dtype=torch.int, device=weight.device)
+    result = None
+    for i in range(experts):
+        packed = ops.gptq_marlin_repack(
+            b_q_weight=weight[i].view(torch.int32).T.contiguous(),
+            perm=perm,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=4,
+            is_a_8bit=False,
+        )
+        if result is None:
+            result = weight.view(torch.int32).view(experts, *packed.shape)
+        result[i].copy_(packed)
+    assert result is not None
+    return result
+
+
 def prepare_nvfp4_moe_layer_for_marlin(
     layer: torch.nn.Module,
     w13: torch.Tensor,
@@ -356,37 +386,11 @@ def prepare_nvfp4_moe_layer_for_marlin(
 
     # WORKSPACE
     layer.workspace = marlin_make_workspace_new(device, 4)
-    perm = torch.empty(0, dtype=torch.int, device=device)
-
-    # WEIGHT
-    # Repack weights to marlin format
-    def repack_weight(weight: torch.Tensor, name: str) -> torch.Tensor:
-        tensor_list = []
-        num_shards = 2 if is_act_and_mul else 1
-        if "w13" in name:
-            size_n, size_k = N * num_shards, K
-        else:
-            size_n, size_k = K, N
-
-        assert weight.shape == (E, size_n, size_k // 2)
-
-        for i in range(E):
-            qweight = weight[i].view(torch.int32).T.contiguous()
-
-            marlin_qweight = ops.gptq_marlin_repack(
-                b_q_weight=qweight,
-                perm=perm,
-                size_k=size_k,
-                size_n=size_n,
-                num_bits=4,
-                is_a_8bit=is_a_8bit,
-            )
-            tensor_list.append(marlin_qweight)
-
-        return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
-
-    w13 = repack_weight(w13, "w13")
-    w2 = repack_weight(w2, "w2")
+    # Reuse the packed weight storage instead of duplicating each expert bank.
+    assert w13.shape == (E, N * (2 if is_act_and_mul else 1), K // 2)
+    assert w2.shape == (E, K, N // 2)
+    w13 = _repack_nvfp4_experts_in_place(w13)
+    w2 = _repack_nvfp4_experts_in_place(w2)
 
     # WEIGHT SCALES
     # Permute scales

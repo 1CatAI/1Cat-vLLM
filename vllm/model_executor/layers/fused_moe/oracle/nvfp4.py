@@ -196,6 +196,8 @@ def select_nvfp4_moe_backend(
 
     NVFP4_BACKENDS_WITH_CLAMP = {
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        # Applies swiglu_limit_func between the two Marlin GEMMs.
+        NvFp4MoeBackend.MARLIN,
         # Applies the clamp through the inherited TritonExperts.activation().
         NvFp4MoeBackend.SM70_SKINNY,
     }
@@ -281,12 +283,9 @@ def select_nvfp4_moe_backend(
     from vllm.config import get_current_vllm_config_or_none
 
     vllm_config = get_current_vllm_config_or_none()
-    linear_emulation = (
-        envs.VLLM_NVFP4_GEMM_BACKEND == "emulation"
-        or (
-            vllm_config is not None
-            and vllm_config.kernel_config.linear_backend == "emulation"
-        )
+    linear_emulation = envs.VLLM_NVFP4_GEMM_BACKEND == "emulation" or (
+        vllm_config is not None
+        and vllm_config.kernel_config.linear_backend == "emulation"
     )
     if linear_emulation:
         return _return_or_raise(
@@ -526,11 +525,10 @@ def make_nvfp4_moe_quant_config(
             g2_alphas=w2_scale_2,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
+            gemm1_clamp_limit=swiglu_limit,
         )
     elif backend == NvFp4MoeBackend.SM70_SKINNY:
-        # w4a16 like MARLIN's nvfp4_w4a16_moe_quant_config, but with the
-        # SwiGLU clamp carried through (the w4a16 helper has no such
-        # parameter and MARLIN never serves clamp models).
+        # Carry the model's activation clamp through to TritonExperts.
         return FusedMoEQuantConfig.make(
             quant_dtype=None,
             w1_scale=w13_scale,

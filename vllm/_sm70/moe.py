@@ -531,7 +531,9 @@ for _raw_namespace, _raw_prefix in (
             scale_codes,
             global_scales,
             interleaved_w13,
-            fast_decode_rounding: (None)
+            fast_decode_rounding: (  # noqa: E501
+                None
+            )
         )
     if hasattr(_raw_namespace, "nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out"):
         register_fake(f"{_raw_prefix}::nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out")(
@@ -541,7 +543,9 @@ for _raw_namespace, _raw_prefix in (
             scale_codes,
             global_scales,
             expert_ids,
-            interleaved: (None)
+            interleaved: (  # noqa: E501
+                None
+            )
         )
     if hasattr(_raw_namespace, "nvfp4_moe_qpn_raw_w2_reduce_sm70_out"):
         register_fake(f"{_raw_prefix}::nvfp4_moe_qpn_raw_w2_reduce_sm70_out")(
@@ -551,7 +555,9 @@ for _raw_namespace, _raw_prefix in (
             scale_codes,
             global_scales,
             expert_ids,
-            topk_weights: (None)
+            topk_weights: (  # noqa: E501
+                None
+            )
         )
 
 
@@ -709,6 +715,38 @@ def nvfp4_moe_dense_stage_sm70_out(
     group_size: int,
     native_policy: tuple[str, ...] = (),
 ) -> None:
+    # These TP1 projections exceed the current native compact dispatch's
+    # scratch bound above 32 one-row groups. Keep the already validated
+    # per-group calculation, using bounded calls instead of changing weights
+    # or falling back to a launch for every one of the 288 experts.
+    # The native compact contract guarantees one row per group for these
+    # shapes (the TP4/TP8 dynamic grouped-row shapes are excluded).
+    if (
+        (k, n) in ((4096, 4096), (2048, 4096))
+        and group_size == 16
+        and input.shape[0] == num_experts
+        and 32 < num_experts <= 80
+    ):
+        for start in range(0, num_experts, 32):
+            count = min(32, num_experts - start)
+            offsets = torch.arange(
+                count + 1, dtype=torch.int32, device=expert_offsets.device
+            )
+            call_native(
+                _op("nvfp4_moe_dense_stage_sm70_out"),
+                native_policy,
+                out.narrow(0, start, count),
+                input.narrow(0, start, count),
+                offsets,
+                dense_expert_ids.narrow(0, start, count),
+                ptrs_w,
+                ptrs_s,
+                count,
+                k,
+                n,
+                group_size,
+            )
+        return
     call_native(
         _op("nvfp4_moe_dense_stage_sm70_out"),
         native_policy,
