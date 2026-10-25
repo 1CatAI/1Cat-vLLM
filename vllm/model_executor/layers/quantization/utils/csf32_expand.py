@@ -13,6 +13,7 @@ Only full CSF tiles are supported (rows % 128 == 0, groups % 4 == 0), which
 covers every routed-expert shape of the GLM-5.3 checkpoints.
 """
 
+import weakref
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -60,6 +61,9 @@ class CsfScaleConsumer(Protocol):
 
     def attach_csf_scales(self, w13: CsfExpertScales, w2: CsfExpertScales) -> None:
         """Take the layer's planes; called before process_weights_after_loading."""
+
+    def scale_rasters_released(self) -> tuple[bool, bool]:
+        """Which projections no longer read their shared raster (w13, w2)."""
 
 
 # csf32 part name -> CsfExpertScales field; exceptions are concatenated per layer.
@@ -154,7 +158,11 @@ def _widen_u16(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(torch.int16).reshape(-1).to(torch.int32) & 0xFFFF
 
 
-_SHARED_RASTERS: dict[tuple, torch.Tensor] = {}
+# Weak: a card whose layers all serve their scales from five-bit planes lets go of the
+# last reference and the raster is freed.
+_SHARED_RASTERS: weakref.WeakValueDictionary[tuple, torch.Tensor] = (
+    weakref.WeakValueDictionary()
+)
 
 
 def shared_scale_raster(
