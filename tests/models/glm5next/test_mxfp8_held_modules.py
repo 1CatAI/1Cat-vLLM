@@ -57,6 +57,19 @@ def test_modules_with_an_mxfp8_method_are_held_under_their_checkpoint_names():
     assert not held("model.visual.blocks.0.qkv")
 
 
+def test_an_lm_head_with_an_mxfp8_method_is_held_under_its_checkpoint_name():
+    quant_config = SimpleNamespace(packed_modules_mapping={})
+    model = _language_model()
+    model.language_model.lm_head = _Linear(_mxfp8_method())
+
+    held = glm_model._mxfp8_held_modules(model, quant_config)
+    text_held = glm_model._mxfp8_held_modules(model.language_model, quant_config)
+
+    assert held("lm_head")
+    assert text_held("lm_head")
+    assert not held("model.language_model.layers.0.self_attn.fused_qkv_a_proj")
+
+
 def test_the_language_model_alone_gives_the_same_answer():
     quant_config = SimpleNamespace(
         packed_modules_mapping={"gate_up_proj": ["gate_proj", "up_proj"]}

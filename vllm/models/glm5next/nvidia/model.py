@@ -1515,9 +1515,9 @@ class Glm5NextForCausalLM(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        # ModelOpt MXFP8 modules the model builds as MXFP8 linears stay
-        # packed (QPN8 serves E8M0-per-32 weights); the others (lm_head) are
-        # dequantized.
+        # ModelOpt MXFP8 modules the model builds as MXFP8 linears (lm_head
+        # included) stay packed (QPN8 serves E8M0-per-32 weights); the others
+        # are dequantized.
         return loader.load_weights(
             dequantize_mxfp8_weight_pairs(
                 weights,
@@ -1665,9 +1665,10 @@ def get_spec_layer_idx_from_weight_name(
 
 
 # Checkpoint and model prefix the same module differently
-# (``model.language_model.layers.4.`` against ``language_model.model.layers.4.``);
-# the name from the layer or block index on is common to both.
-_FROM_LAYER_INDEX = re.compile(r"(?:layers|blocks)\.\d+\..*$")
+# (``model.language_model.layers.4.`` against ``language_model.model.layers.4.``,
+# ``lm_head`` against ``language_model.lm_head``); the name from the layer or
+# block index on, or the LM head's own name, is common to both.
+_FROM_LAYER_INDEX = re.compile(r"(?:(?:layers|blocks)\.\d+\..*|lm_head)$")
 
 
 def _from_layer_index(name: str) -> str:
@@ -1690,7 +1691,10 @@ def _mxfp8_held_modules(
         ):
             continue
         parent, _, leaf = _from_layer_index(name).rpartition(".")
-        held.update(f"{parent}.{shard}" for shard in packed_modules.get(leaf, [leaf]))
+        held.update(
+            f"{parent}.{shard}" if parent else shard
+            for shard in packed_modules.get(leaf, [leaf])
+        )
     return lambda module: _from_layer_index(module) in held
 
 

@@ -2826,14 +2826,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
-            if quant_algo == "MXFP8" and isinstance(layer, LinearBase):
-                # Built whenever quantized_layers names an MXFP8 layer.
+            if quant_algo == "MXFP8":
+                # Built whenever quantized_layers names an MXFP8 layer. An
+                # MXFP8 LM head is served like any MXFP8 linear: the model
+                # loader keeps its weight pair packed (see
+                # dequantize_mxfp8_weight_pairs).
                 assert self.mxfp8_config is not None
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)
-            # Layers not in quantized_layers stay unquantized, and so does an
-            # MXFP8 LM head: the model loader dequantizes both (see
-            # dequantize_mxfp8_weight_pairs). An LM head keeps its own
-            # UnquantizedEmbeddingMethod.
+            # Layers not in quantized_layers stay unquantized; an LM head
+            # keeps its own UnquantizedEmbeddingMethod.
             return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
 
         if isinstance(layer, RoutedExperts):
