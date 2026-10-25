@@ -342,6 +342,19 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> FusedMoE layer lookup in custom ops.
         self.layer_name = layer_name
 
+        from vllm.config import get_current_vllm_config_or_none
+
+        cost_config = get_current_vllm_config_or_none()
+        route_recorder = (
+            cost_config.kernel_config.moe_route_recorder
+            if cost_config is not None
+            else None
+        )
+        if route_recorder is not None:
+            parameter = next(gate.parameters(), None) if gate is not None else None
+            if parameter is not None and parameter.device.type == "cuda":
+                route_recorder(self.router, layer_name, parameter.device)
+
         self._forward_entry = self._select_forward()
 
     def _select_forward(self) -> Callable:

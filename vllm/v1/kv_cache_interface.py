@@ -145,8 +145,18 @@ class KVCacheSpec:
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
         Create a new KVCacheSpec from self but replacing the block size.
+
+        A padded physical page is a byte count, not a token count, so growing
+        the logical block grows the payload underneath it. Keep the padding at
+        or above the new payload; otherwise the returned spec fails its own
+        ``page_size_padded >= real_page_size`` invariant the first time
+        ``page_size_bytes`` is read.
         """
-        return replace(self, block_size=block_size)
+        new_spec = replace(self, block_size=block_size)
+        padded = self.page_size_padded
+        if padded is not None and new_spec.real_page_size_bytes > padded:
+            new_spec = replace(new_spec, page_size_padded=new_spec.real_page_size_bytes)
+        return new_spec
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -167,6 +177,25 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+
+    def layout_cache_dtype(self, configured_dtype: str) -> str:
+        """Bind carrier shape to this spec's declared quantization layout.
+
+        Target and draft share an allocator but may use different codecs. This
+        compatibility spelling is only for backend shape/block-dim APIs; each
+        attention implementation retains its independently bound reader codec.
+        """
+        if get_kv_quant_mode(configured_dtype) == self.kv_quant_mode:
+            return configured_dtype
+        # Keep one entry per KVQuantMode: a missing spelling raises KeyError
+        # during KV allocation, far from the mode that was actually requested.
+        return {
+            KVQuantMode.NONE: "auto",
+            KVQuantMode.FP8_PER_TENSOR: "fp8",
+            KVQuantMode.INT8_PER_TOKEN_HEAD: "int8_per_token_head",
+            KVQuantMode.FP8_PER_TOKEN_HEAD: "fp8_per_token_head",
+            KVQuantMode.NVFP4: "nvfp4",
+        }[self.kv_quant_mode]
 
     @property
     def page_size_bytes(self) -> int:

@@ -1113,8 +1113,41 @@ def _compact_sm70_hybrid_sliding_window_pages(
             type(spec) is not SlidingWindowSpec
             or spec.page_size_padded is not None
             or spec.page_size_bytes <= target_page
-            or spec.page_size_bytes % target_page
         ):
+            continue
+        if spec.page_size_bytes % target_page:
+            # Scale bytes can make the physical ratio non-integral. Preserve
+            # the existing prefix/checkpoint grid by using a divisor of the
+            # logical block and padding its physical page to the common size.
+            grid = math.gcd(
+                *(
+                    other.block_size
+                    for other in specs.values()
+                    if isinstance(other, (AttentionSpec, MambaSpec))
+                )
+            )
+            divisors: set[int] = set()
+            for factor in range(1, math.isqrt(grid) + 1):
+                if grid % factor == 0:
+                    divisors.update((factor, grid // factor))
+            for block_size in sorted(divisors, reverse=True):
+                if block_size >= spec.block_size or block_size % 16:
+                    continue
+                compact = replace(spec, block_size=block_size)
+                page = compact.page_size_bytes
+                if page > target_page:
+                    continue
+                # A divisor that merely fits pads away most of the block, and
+                # the padded page is charged per block: 1648 tokens/1664-page
+                # has grid 16, so block=16 fits at 1.9% utilization and costs
+                # 212992 B/token instead of 4096. Fall through to the round-up
+                # path below unless this divisor also fills the page.
+                if page * 2 >= target_page:
+                    result[name] = replace(compact, page_size_padded=target_page)
+                # Divisors descend, so this is the largest that fits; a poorer
+                # one cannot fill the page either. Leave the spec untouched so
+                # the round-up path below can size it from the byte budget.
+                break
             continue
         ratio = spec.page_size_bytes // target_page
         if spec.block_size % (16 * ratio):
@@ -1158,8 +1191,10 @@ def unify_kv_cache_spec_page_size(
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
     are the same, return the original KVCacheSpec. If not same, unify the page
-    size by increasing the block size of layers with smaller page size. Raise
-    NotImplementedError if failed to unify the page size.
+    size by increasing the block size of layers with smaller page size. When
+    page sizes are not integer multiples, use the spec's physical padding
+    contract without changing its logical block size. Raise NotImplementedError
+    for specs that cannot represent the common physical page.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1183,9 +1218,18 @@ def unify_kv_cache_spec_page_size(
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
+                # Payload, scale and state regions need not have an integral
+                # size ratio. Their logical token/checkpoint grids still agree
+                # with the scheduler; padding belongs to the physical page.
+                if isinstance(layer_spec, (AttentionSpec, MambaSpec)):
+                    padded_spec = replace(layer_spec, page_size_padded=max_page_size)
+                    if padded_spec.page_size_bytes == max_page_size:
+                        new_kv_cache_spec[layer_name] = padded_spec
+                        continue
                 raise NotImplementedError(
                     "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+                    "maximum page size and its spec cannot represent padding. "
+                    "Cannot unify the physical pages."
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
