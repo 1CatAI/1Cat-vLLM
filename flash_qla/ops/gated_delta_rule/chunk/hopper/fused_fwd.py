@@ -925,6 +925,7 @@ def tilelang_fused_chunk_gdr_fwd_sm75(
     state_layout_vlk,
     indexed_state=False,
     block_DV=128,
+    threads=128,
 ):
     """The SM70 kernel within Turing's 64 KiB of opt-in shared memory.
 
@@ -983,7 +984,9 @@ def tilelang_fused_chunk_gdr_fwd_sm75(
         h: T.Tensor(h_shape, dtype=h_dtype),
         ht: T.Tensor(ht_shape, dtype=ht_dtype),
     ):
-        with T.Kernel(T.ceildiv(DV, block_DV) * batch_size * H, threads=128) as (bbhv,):
+        with T.Kernel(
+            T.ceildiv(DV, block_DV) * batch_size * H, threads=threads
+        ) as (bbhv,):
             bbh, bv = bbhv // T.ceildiv(DV, block_DV), bbhv % T.ceildiv(DV, block_DV)
             bb, bh = bbh // H, bbh % H
             bhg = bh // (H // Hg)
