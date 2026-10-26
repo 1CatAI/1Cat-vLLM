@@ -61,15 +61,7 @@ using namespace nvcuda::wmma;
 #define BLOCK_N_512 32
 #define WARPS_512 16
 
-inline bool env_flag_enabled(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw != nullptr && std::strcmp(raw, "0") != 0;
-}
 
-inline bool env_flag_enabled_default_on(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw == nullptr || std::strcmp(raw, "0") != 0;
-}
 template <int D, bool LOW_SMEM = false>
 struct KernelConfig {
   static constexpr int BLOCK_M =
