@@ -122,6 +122,78 @@ def test_two_engine_policies_remain_isolated_after_environment_change(monkeypatc
     assert first.compute_hash() != second.compute_hash()
 
 
+@pytest.mark.parametrize("enforce_eager", [False, True])
+@pytest.mark.parametrize("kv_bytes", [None, 0, 1024**3])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_qpn4_workspace_policy_engine_lifecycle(
+    tmp_path, enforce_eager, kv_bytes, override
+):
+    from transformers import Qwen3Config
+
+    from vllm.config import CacheConfig, DeviceConfig, ModelConfig, VllmConfig
+
+    Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        num_hidden_layers=2,
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+        vocab_size=64,
+    ).save_pretrained(tmp_path)
+    model = ModelConfig(
+        model=str(tmp_path),
+        tokenizer=str(tmp_path),
+        dtype="half",
+        skip_tokenizer_init=True,
+        enforce_eager=enforce_eager,
+        max_model_len=64,
+    )
+    engine = VllmConfig(
+        model_config=model,
+        device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(kv_cache_memory_bytes=kv_bytes),
+        kernel_config=KernelConfig(
+            sm70_nvfp4=Sm70NvFp4Config(qpn4_lazy_dense_workspace=override)
+        ),
+    )
+    policy = engine.kernel_config.sm70_nvfp4
+    expected = override if override is not None else enforce_eager and kv_bytes is None
+    assert policy.qpn4_lazy_dense_workspace is expected
+    assert policy.sources["qpn4_lazy_dense_workspace"] == (
+        "configuration"
+        if override is not None
+        else "auto:eager-profile"
+        if expected
+        else "auto:resident"
+    )
+    # Loader activation must not resolve again using its default arguments.
+    policy.resolve(qualified=False)
+    assert policy.qpn4_lazy_dense_workspace is expected
+
+
+def test_qpn4_workspace_effective_graph_identity_and_provenance():
+    auto_resident, resident, auto_lazy, lazy = [
+        KernelConfig(sm70_nvfp4=Sm70NvFp4Config(qpn4_lazy_dense_workspace=value))
+        for value in (None, False, None, True)
+    ]
+    for kernel, eager in zip(
+        (auto_resident, resident, auto_lazy, lazy), (False, True, True, False)
+    ):
+        kernel.sm70_nvfp4.resolve(qualified=False, active=False, enforce_eager=eager)
+    hashes = {
+        kernel.compute_hash()
+        for kernel in (auto_resident, resident, auto_lazy, lazy)
+    }
+    assert len(hashes) == 1
+    for kernel in (auto_resident, resident, auto_lazy, lazy):
+        kernel.sm70_nvfp4.active = True
+    assert auto_resident.compute_hash() == resident.compute_hash()
+    assert auto_lazy.compute_hash() == lazy.compute_hash()
+    assert resident.compute_hash() != lazy.compute_hash()
+
+
 def test_model_policy_retains_state_contract_but_not_tp_kv_concurrency():
     for tp, kv, concurrency in [(2, "fp8_e5m2", 8), (4, "float16", 1)]:
         cfg = make_config("dflash", tp, concurrency, kv, 4096)

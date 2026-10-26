@@ -469,19 +469,36 @@ class Qpn4NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
 
     def try_process_weights(self, layer):
         # Capability and qualification were checked by the common selector.
-        workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(layer.weight)
+        lazy_workspace = self.config.policy.qpn4_lazy_dense_workspace
+        if lazy_workspace:
+            workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(
+                layer.weight, temporary=True
+            )
+        else:
+            workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(layer.weight)
         if workspace is None:
             logger.warning_once(
                 "Insufficient memory for the bounded SM70 NVFP4 QPN4 "
                 "prefill workspace; retaining TurboMind."
             )
             return False
+        if lazy_workspace:
+            # Admission must precede conversion/fallback, but the probe must
+            # not become a resident tensor or a registered graph address.
+            del workspace
+            workspace = None
         sm70_tm.prepare_nvfp4_qpn4_linear(
             layer, workspace, gated_silu=self.config.dense_gated_silu
         )
         self._release_checkpoint_parameters(layer)
-        logger.info_once(
-            "Memory-neutral SM70 NVFP4 QPN4 M=1 decode "
-            "path enabled with bounded FP16 prefill workspace."
-        )
+        if workspace is None:
+            logger.info_once(
+                "SM70 NVFP4 QPN4 enabled with native temporary FP16 prefill "
+                "workspace; M=1 decode needs no dense workspace."
+            )
+        else:
+            logger.info_once(
+                "Memory-neutral SM70 NVFP4 QPN4 M=1 decode "
+                "path enabled with bounded FP16 prefill workspace."
+            )
         return True

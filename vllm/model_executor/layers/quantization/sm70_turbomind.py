@@ -47,6 +47,7 @@ class SM70TurboMindLinearState:
     # QPN2 launch configuration (split-K, independent accumulator chains).
     split_k: int = 0
     accumulator_chains: int = 0
+    qpn4_lazy_dense_workspace: bool = False
     native_ops: "NativeBindings" = field(init=False, repr=False, compare=False)
     provider: "PreparedLinearProvider" = field(init=False, repr=False, compare=False)
 
@@ -354,6 +355,7 @@ def _store_state(
     prescaled_scales: bool = False,
     split_k: int = 0,
     accumulator_chains: int = 0,
+    qpn4_lazy_dense_workspace: bool = False,
 ) -> None:
     state = SM70TurboMindLinearState(
         weight=weight,
@@ -370,6 +372,7 @@ def _store_state(
         prescaled_scales=prescaled_scales,
         split_k=split_k,
         accumulator_chains=accumulator_chains,
+        qpn4_lazy_dense_workspace=qpn4_lazy_dense_workspace,
     )
     setattr(layer, STATE_ATTR, state)
 
@@ -760,17 +763,26 @@ def apply_prepared_fp8_qpn8_linear(
     return out.reshape(x.shape[:-1] + (state.output_size,))
 
 
-def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
-    device_index = weight.device.index
-    if device_index is None:
-        device_index = torch.accelerator.current_device_index()
+def get_nvfp4_qpn4_dense_workspace(
+    weight: torch.Tensor, *, temporary: bool = False
+) -> torch.Tensor | None:
+    """Admit the bounded workspace, optionally without retaining an allocation.
+
+    Temporary admission uses the same bound as resident admission. The caller
+    must drop the probe before preparing weights; neither pool nor layer owns it.
+    """
     elements = max(NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 2)
-    cache_key = (device_index, torch.float16, elements)
-    workspace = workspace_pool(
-        "_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces
-    ).get(cache_key)
-    if workspace is not None:
-        return workspace
+    if not temporary:
+        device_index = weight.device.index
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        cache_key = (device_index, torch.float16, elements)
+        pool = workspace_pool(
+            "_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces
+        )
+        workspace = pool.get(cache_key)
+        if workspace is not None:
+            return workspace
     try:
         workspace = torch.empty(
             (elements,),
@@ -779,15 +791,14 @@ def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
         )
     except torch.OutOfMemoryError:
         return None
-    workspace_pool("_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces)[
-        cache_key
-    ] = workspace
+    if not temporary:
+        pool[cache_key] = workspace
     return workspace
 
 
 def prepare_nvfp4_qpn4_linear(
     layer: torch.nn.Module,
-    workspace: torch.Tensor,
+    workspace: torch.Tensor | None,
     gated_silu: bool,
 ) -> None:
     """Replace one accepted NVFP4 dense weight with memory-neutral QPN4."""
@@ -814,7 +825,8 @@ def prepare_nvfp4_qpn4_linear(
         packed_weight, packed_scales = sm70_ops.nvfp4_qpn4_prepare_sm70(
             qweight, fp16_scales
         )
-    register_layer_workspace(layer, workspace, family="nvfp4")
+    if workspace is not None:
+        register_layer_workspace(layer, workspace, family="nvfp4")
     _store_state(
         layer,
         packed_weight,
@@ -826,6 +838,7 @@ def prepare_nvfp4_qpn4_linear(
         gated_silu=gated_silu,
         global_scale=global_scale,
         use_scale_code=use_scale_code,
+        qpn4_lazy_dense_workspace=workspace is None,
     )
 
 

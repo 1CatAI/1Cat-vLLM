@@ -254,6 +254,12 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     """Captured native selectors/tuning; unused formats do not affect graph keys."""
     qpn4: bool | None = None
     """Retain the shape/model-qualified QPN4 provider."""
+    qpn4_lazy_dense_workspace: bool | None = None
+    """Auto uses native temporary scratch for eager, automatically profiled KV.
+
+    True forces temporary scratch; False forces the resident workspace.
+    Both paths retain load-time workspace admission and QPN4 qualification.
+    """
     dense_qpn2: bool = True
     """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
     qpn2: bool | None = None
@@ -274,13 +280,34 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     loader_aliases: ClassVar[dict[str, str]] = SM70_LOADER_ALIASES["nvfp4"]
     input_aliases: ClassVar[tuple[str, ...]] = (*SM70_NVFP4_LINEAR_ALIASES.values(),)
 
-    def resolve(self, *, qualified: bool, active: bool = True) -> None:
+    def resolve(
+        self,
+        *,
+        qualified: bool,
+        active: bool = True,
+        enforce_eager: bool = False,
+        kv_cache_memory_bytes: int | None = None,
+    ) -> None:
         self.capture_inputs()
 
         self.active = self.active or active
         if self.resolved:
             return
         self.qualified = qualified
+        workspace_field = "qpn4_lazy_dense_workspace"
+        self.sources[workspace_field] = (
+            "configuration"
+            if self.qpn4_lazy_dense_workspace is not None
+            else "auto:eager-profile"
+            if enforce_eager and kv_cache_memory_bytes is None
+            else "auto:resident"
+        )
+        if self.qpn4_lazy_dense_workspace is None:
+            # Fixed KV budgets skip peak-memory deduction. Graph pools can
+            # retain temporary scratch, so auto keeps their resident contract.
+            self.qpn4_lazy_dense_workspace = (
+                enforce_eager and kv_cache_memory_bytes is None
+            )
         defaults = {
             "qpn2": qualified,
             "prefill": qualified,

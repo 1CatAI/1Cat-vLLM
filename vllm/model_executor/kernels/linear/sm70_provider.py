@@ -59,6 +59,22 @@ def _qpn4(state, x, out, prefix, *, gated=False):
     return out
 
 
+def _qpn4_native_workspace(state, x, out, prefix, *, gated=False):
+    # Native dispatch ignores the pointer for M=1 and owns temporary dense
+    # scratch for M>1. No Python allocation or process-local address is traced.
+    state.native_ops.nvfp4_qpn4_dispatch_sm70_out(
+        out,
+        0,
+        x,
+        state.weight,
+        state.scales,
+        state.global_scale,
+        state.use_scale_code,
+        gated,
+    )
+    return out
+
+
 def _qpn2_dense(state, x, out, prefix, *, gated=False):
     from vllm.model_executor.kernels.linear.qpn import nvfp4_dequant
 
@@ -92,10 +108,11 @@ def bind_prepared_provider(state: Any) -> PreparedLinearProvider:
     """Resolve once after the existing preparation selected the layout."""
     kind = state.op_kind
     if kind == "nvfp4_qpn4":
+        run = _qpn4_native_workspace if state.qpn4_lazy_dense_workspace else _qpn4
         return PreparedLinearProvider(
             "nvfp4_qpn4",
-            _qpn4,
-            _qpn4,
+            run,
+            run,
             True,
             "SM70 NVFP4 QPN4 requires float16 activations, got {dtype}.",
         )
