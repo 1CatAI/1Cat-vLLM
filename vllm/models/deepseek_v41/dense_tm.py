@@ -11,6 +11,8 @@ with same-input projections merged into one launch.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 import vllm.envs as envs
@@ -110,7 +112,7 @@ def _planes(projection, tile0, tile1):
 
 _TARGET_CTAS = int(envs.VLLM_V41_DMV_CTAS)
 # (k, widths) -> (warps, tp, split) overrides from the dmv13 sweep.
-_SMALL_M_CONFIG = {}
+_SMALL_M_CONFIG: Any = {}
 _GROUP_VIEWS = envs.VLLM_V41_WOA_VIEWS == "1"
 
 
@@ -233,9 +235,9 @@ def prepare(model, extra_groups=()) -> dict:
         if not all(
             _convert(m) or getattr(m, "gguf_tm_projections", None) for m in group
         ):
-            report["skipped"].append(getattr(group[0], "prefix", "?"))
+            report["skipped"].append(getattr(group[0], "prefix", "?"))  # type: ignore[attr-defined]
             continue
-        report["converted"] += len(group)
+        report["converted"] += len(group)  # type: ignore[operator]
         projections = [m.gguf_tm_projections[0] for m in group]
         k = projections[0].kernel.config.partition_weight_shape[0]
         if k % 128 or any(
@@ -244,7 +246,7 @@ def prepare(model, extra_groups=()) -> dict:
             or p.output_padding
             for p in projections
         ):
-            report["skipped"].append(getattr(group[0], "prefix", "?") + ":shape")
+            report["skipped"].append(getattr(group[0], "prefix", "?") + ":shape")  # type: ignore[attr-defined]
             continue
         segments = [
             (
@@ -256,7 +258,7 @@ def prepare(model, extra_groups=()) -> dict:
         ]
         group[0].v41_small_m = SmallM(segments, k)
         if len(group) > 1:
-            report["fused_groups"] += 1
+            report["fused_groups"] += 1  # type: ignore[operator]
             for m in group[1:]:
                 m.v41_small_m_peer = group[0]
     # Block-diagonal wo_a: one runner per O group over its own 1024 rows.

@@ -39,10 +39,17 @@ class SharedExpertDmaLane {
       : control_(reinterpret_cast<uint64_t*>(control)),
         arena_(reinterpret_cast<uint8_t*>(arena)),
         scratch_(reinterpret_cast<uint8_t*>(scratch)),
-        device_(device), rank_(rank), ranks_(ranks),
-        layouts_(std::move(layouts)), per_op_(scratch_per_op),
-        rank_start_(rank_start), rank_words_(rank_words), op_start_(op_start),
-        op_words_(op_words), flag_word_(flag_word), timeout_ns_(timeout_ns) {
+        device_(device),
+        rank_(rank),
+        ranks_(ranks),
+        layouts_(std::move(layouts)),
+        per_op_(scratch_per_op),
+        rank_start_(rank_start),
+        rank_words_(rank_words),
+        op_start_(op_start),
+        op_words_(op_words),
+        flag_word_(flag_word),
+        timeout_ns_(timeout_ns) {
     if (!control_ || !arena_ || !scratch_ || rank >= ranks || ranks > 8)
       throw std::invalid_argument("invalid shared expert DMA lane");
     for (const auto& l : layouts_)
@@ -81,7 +88,9 @@ class SharedExpertDmaLane {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
   }
-  uint64_t* rank_words(unsigned r) { return control_ + rank_start_ + r * rank_words_; }
+  uint64_t* rank_words(unsigned r) {
+    return control_ + rank_start_ + r * rank_words_;
+  }
   uint64_t* flag(unsigned r) { return rank_words(r) + flag_word_; }
 
   void check(cudaError_t e, const char* what) {
@@ -98,21 +107,28 @@ class SharedExpertDmaLane {
       cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
       check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
       cudaStream_t stream;
-      check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+      check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+            "stream");
       uint64_t active_until = 0;
       while (!stopped_.load(std::memory_order_acquire)) {
         const uint64_t seq = load(flag(rank_));
         if (seq == last_) {
-          if (now() < active_until) relax();
-          else std::this_thread::sleep_for(std::chrono::microseconds(10));
+          if (now() < active_until)
+            relax();
+          else
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
           continue;
         }
         const uint64_t begin = now();
         if (debug_)
-          std::fprintf(stderr, "[dma r%u] seq %llu seen (last %llu) flags %llu %llu %llu %llu\n", rank_,
-                       (unsigned long long)seq, (unsigned long long)last_,
-                       (unsigned long long)load(flag(0)), (unsigned long long)load(flag(1)),
-                       (unsigned long long)load(flag(2)), (unsigned long long)load(flag(3)));
+          std::fprintf(
+              stderr,
+              "[dma r%u] seq %llu seen (last %llu) flags %llu %llu %llu %llu\n",
+              rank_, (unsigned long long)seq, (unsigned long long)last_,
+              (unsigned long long)load(flag(0)),
+              (unsigned long long)load(flag(1)),
+              (unsigned long long)load(flag(2)),
+              (unsigned long long)load(flag(3)));
         // Boundary down blocks are read by two ranks: no rank may overwrite
         // the incoming allocation before every rank has read it.
         for (;;) {
@@ -130,7 +146,10 @@ class SharedExpertDmaLane {
           throw std::runtime_error("DMA lane: invalid plan");
         const auto& L = layouts_[layer];
         uint64_t prefix[3], off = 0;
-        for (int i = 0; i < 3; ++i) { prefix[i] = off; off += uint64_t(L[7 * i + 5] * L[7 * i + 4]); }
+        for (int i = 0; i < 3; ++i) {
+          prefix[i] = off;
+          off += uint64_t(L[7 * i + 5] * L[7 * i + 4]);
+        }
         const uint64_t layer_per_op = (off + 255) / 256 * 256;  // as swap_stage
         for (uint64_t op = 0; op < copies; ++op) {
           const uint64_t dst0 = load(control_ + op_start_ + op * op_words_ + 3);
@@ -139,19 +158,23 @@ class SharedExpertDmaLane {
                           W = L[7 * i + 4], N = L[7 * i + 5], P = L[7 * i + 6];
             if (!W || !N) continue;
             check(cudaMemcpy2DAsync(arena_ + dst0 + R * S + F + P, S,
-                                    scratch_ + op * layer_per_op + prefix[i], W, W, N,
-                                    cudaMemcpyDeviceToHost, stream),
+                                    scratch_ + op * layer_per_op + prefix[i], W,
+                                    W, N, cudaMemcpyDeviceToHost, stream),
                   "writeback");
           }
         }
         if (debug_)
-          std::fprintf(stderr, "[dma r%u] seq %llu flags ok after %llu us, layer %llu copies %llu\n", rank_,
-                       (unsigned long long)seq, (unsigned long long)((now() - begin) / 1000),
+          std::fprintf(stderr,
+                       "[dma r%u] seq %llu flags ok after %llu us, layer %llu "
+                       "copies %llu\n",
+                       rank_, (unsigned long long)seq,
+                       (unsigned long long)((now() - begin) / 1000),
                        (unsigned long long)layer, (unsigned long long)copies);
         check(cudaStreamSynchronize(stream), "writeback sync");
         if (debug_)
-          std::fprintf(stderr, "[dma r%u] seq %llu acked after %llu us\n", rank_,
-                       (unsigned long long)seq, (unsigned long long)((now() - begin) / 1000));
+          std::fprintf(stderr, "[dma r%u] seq %llu acked after %llu us\n",
+                       rank_, (unsigned long long)seq,
+                       (unsigned long long)((now() - begin) / 1000));
         __atomic_store_n(rank_words(rank_) + 1, seq, __ATOMIC_RELEASE);
         last_ = seq;
         done_.fetch_add(1, std::memory_order_release);
@@ -159,7 +182,8 @@ class SharedExpertDmaLane {
       }
       cudaStreamDestroy(stream);
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "[SharedExpertDmaLane rank %u] %s\n", rank_, e.what());
+      std::fprintf(stderr, "[SharedExpertDmaLane rank %u] %s\n", rank_,
+                   e.what());
       std::lock_guard<std::mutex> guard(mutex_);
       error_ = e.what();
     }

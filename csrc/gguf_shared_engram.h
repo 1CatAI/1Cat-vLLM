@@ -81,7 +81,8 @@ class SharedEngramReader {
       // Cold rows are random 144-byte NVMe reads: queue depth (threads)
       // bounds IOPS. VLLM_V41_ENGRAM_READERS overrides the default.
       size_t readers = 64;
-      if (const char* v = std::getenv("VLLM_V41_ENGRAM_READERS")) readers = std::max(1, std::atoi(v));
+      if (const char* v = std::getenv("VLLM_V41_ENGRAM_READERS"))
+        readers = std::max(1, std::atoi(v));
       for (size_t i = 0; i < readers; ++i)
         readers_.emplace_back([this] { read_worker(); });
       thread_ = std::thread([this] { run(); });

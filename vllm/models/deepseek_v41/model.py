@@ -8,6 +8,7 @@ one request and at most 16K total tokens, with prefix caching disabled.
 """
 
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch import nn
@@ -287,9 +288,9 @@ class V41Indexer(nn.Module):
             )
             return
         key = attention_qdq(key, fp4=True, group=32)
-        metadata = self.k_cache.metadata()
+        metadata = self.k_cache.metadata()  # type: ignore[union-attr]
         insert_latents(
-            self.k_cache.kv_cache,
+            self.k_cache.kv_cache,  # type: ignore[union-attr]
             key,
             positions,
             valid_tokens,
@@ -448,7 +449,7 @@ def _treport(tokens):
     if not marks or get_tensor_model_parallel_rank() != 0:
         return
     torch.accelerator.synchronize()
-    total = {}
+    total: Any = {}
     for (a, ea), (_, eb) in zip(marks, marks[1:]):
         total[a] = total.get(a, 0.0) + ea.elapsed_time(eb)
     text = " ".join(
@@ -601,9 +602,9 @@ class V41Attention(nn.Module):
                     compact = attention_qdq(
                         compact, fp4=True, group=16, e4m3_scale=True
                     )
-                    compressed_metadata = self.compressor.cache.metadata()
+                    compressed_metadata = self.compressor.cache.metadata()  # type: ignore[union-attr]
                     insert_latents(
-                        self.compressor.cache.kv_cache,
+                        self.compressor.cache.kv_cache,  # type: ignore[union-attr]
                         compact,
                         positions,
                         valid,
@@ -833,7 +834,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         hidden = hidden.float()[:, None].expand(-1, 4, -1).contiguous()
         pre = torch.zeros(hidden.shape[0], 4, device=hidden.device, dtype=torch.float32)
         pre[:, 0] = 1
-        auxiliary = []
+        auxiliary: Any = []
         if _HC_FUSED:
             result = self._forward_fused(
                 hidden, positions, pre, metadata, valid, auxiliary

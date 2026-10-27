@@ -12,6 +12,7 @@ import os
 import socket
 import struct
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -173,8 +174,8 @@ class SharedExpertOwner:
         self.close()
 
 
-_INPLACE_RANKS = []
-_ALL_RANKS = []
+_INPLACE_RANKS: Any = []
+_ALL_RANKS: Any = []
 
 
 def set_trunc_cutoff(cutoff: int):
@@ -408,7 +409,7 @@ class SharedExpertRank:
                 if envs.VLLM_V41_MISS_HIST == "1"
                 else None
             )
-            self.hint_weights = {}
+            self.hint_weights: Any = {}
             _ALL_RANKS.append(self)
             self.free_swap = (envs.VLLM_V41_SWAP_FREE or "0") == "1"
             self.inplace = self.free_swap or (envs.VLLM_V41_SWAP_INPLACE or "0") == "1"
@@ -465,8 +466,8 @@ class SharedExpertRank:
                     + [t.stride(0) * t.element_size() for t in tensors]
                 )
             self.job_lane = self.native.SharedExpertJobLane(
-                self.control_host.data_ptr(),
-                self.host.data_ptr(),
+                self.control_host.data_ptr(),  # type: ignore[union-attr]
+                self.host.data_ptr(),  # type: ignore[union-attr]
                 self.device.index,
                 self.rank,
                 banks,
@@ -491,8 +492,8 @@ class SharedExpertRank:
             _thread_local_graph_capture()
             start, words = self.meta["RANK_START"], self.meta["RANK_WORDS"]
             self.swap_dma = self.native.SharedExpertDmaLane(
-                self.control_host.data_ptr(),
-                self.host.data_ptr(),
+                self.control_host.data_ptr(),  # type: ignore[union-attr]
+                self.host.data_ptr(),  # type: ignore[union-attr]
                 self.swap_scratch.data_ptr(),
                 self.device.index,
                 self.rank,
@@ -567,15 +568,15 @@ class SharedExpertRank:
         control = self.control_host
         begin = time.monotonic()
         while True:
-            if int(control[1]) >= int(control[request]):
-                head = int(control[start])
+            if int(control[1]) >= int(control[request]):  # type: ignore[index]
+                head = int(control[start])  # type: ignore[index]
                 # per rank: saves done (word 1 + r) + loads done (word 5 + r)
                 if all(
-                    int(control[start + 1 + r]) + int(control[start + 5 + r]) >= head
+                    int(control[start + 1 + r]) + int(control[start + 5 + r]) >= head  # type: ignore[index]
                     for r in range(4)
                 ):
                     return
-            if int(control[2]) != 0:
+            if int(control[2]) != 0:  # type: ignore[index]
                 raise RuntimeError("Shared expert coordinator failed")
             if time.monotonic() - begin > timeout:
                 raise RuntimeError("Shared expert job lanes did not drain")
@@ -881,8 +882,8 @@ class SharedExpertRank:
                     self.router_bias,
                     self.trunc,
                     ids.numel(),
-                    EXPERTS=self.router_logits.shape[1],
-                    BLOCK_E=triton_next_pow2(self.router_logits.shape[1]),
+                    EXPERTS=self.router_logits.shape[1],  # type: ignore[union-attr]
+                    BLOCK_E=triton_next_pow2(self.router_logits.shape[1]),  # type: ignore[union-attr]
                     SCALE=self.router_scale,
                     SUBST=self.skip_subst,
                     TRUNC=self.trunc_enabled,

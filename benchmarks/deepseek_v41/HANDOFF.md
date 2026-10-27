@@ -3,6 +3,7 @@
 **Hardware:** 54633, 4× V100-SXM2 32G with NVLink. All four GPUs sit behind one x16 Gen3 uplink (12.2 GB/s aggregate). Host RAM is 62 GB; the compute container's memcg is 54 GiB.
 
 **Model:**
+
 - ISTA-DASLab `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS` (138 GB)
 - Engram IQ4_NL (110.6 GB)
 - DSpark5 draft from the base repository
@@ -22,6 +23,7 @@ python3 benchmarks/deepseek_v41/tools/tcp_forward.py 8000 <container-ip> 18000
 ### Configs
 
 `serve-ds41-phase3.yaml`:
+
 - chunk 8192, max-model-len 524288
 - KV 256 MiB (window layers only)
 - offload 0.33, prefill group 4096
@@ -34,6 +36,7 @@ Requests can pass `chat_template_kwargs: {"thinking": false}` or `reasoning_effo
 `serve-ds41-phase2.yaml` is the 16K, non-packed variant (`run_serve2.sh`).
 
 `run_serve3.sh` sets these env vars:
+
 - `VLLM_V41_DOWN_ROWS=1`
 - `VLLM_V41_SESSION_PREFIX=1`
 - `VLLM_V41_PACKED_KV=1`
@@ -53,6 +56,7 @@ Requests can pass `chat_template_kwargs: {"thinking": false}` or `reasoning_effo
 | KV per token | 54 KB | 12.4 KB paged (packed: about 1 KB GPU + host) |
 
 Other results:
+
 - Quality: e2e 5/5 including the 16K context check.
 - At ≤16K, packed KV gives tokens identical to the paged FP16 cache.
 - Needle retrieval passes at 4K, 32K, 128K and 500K.
@@ -61,6 +65,7 @@ Other results:
 ## Changes (switch, default)
 
 ### G1: prefill activation memory
+
 - MoE down output goes to a per-tile scratch plus an FP32 token accumulator.
 - `expand_hc` runs in place.
 - `hc_transition` is windowed (`VLLM_V41_HC_WINDOW`).
@@ -71,51 +76,57 @@ Other results:
 - Chunks up to 16384.
 
 ### G2: cold-expert staging ring
+
 - `VLLM_V41_STAGE_RING=1`, `VLLM_V41_STAGE_SLOTS=128`.
 - Stages cold experts only, issued ahead across layers.
 - The host never blocks on a pinned row.
 
 ### G3: down projection split by rows (`VLLM_V41_DOWN_ROWS`)
+
 - Each rank owns 1280 output rows with full K, so there are no duplicated TP boundary blocks.
 - Saves 2.25 GiB per GPU and about 10% of PCIe bytes.
 - Decode: `gate_up7` → IPC `peer_gather` (about 8 µs) → `down_rows`.
 - Prefill: P2P h-row banks plus a per-tile NCCL fence.
 
 ### G4: KV
+
 - **Window rings** (`VLLM_V41_WINDOW_RING`): a 256-row private ring per target layer ≥ 1.
 - **Packed KV** (`VLLM_V41_PACKED_KV`; `kv_pack.py`, `kv_store.py`), lossless:
-  - Compressed latents are FP4 + E4M3 scales (288 B/row). They live once in a shared host memfd (rank 0 writes) plus a 32K-position GPU hot ring.
-  - Index keys are FP4 + power-of-two scales (68 B/row), stored on the GPU.
-  - Decode: selected-row buffer, CUDA `index_scores_decode`, and segment-parallel exact top-k.
-  - Prefill: staging plus an unpack → cuBLAS indexer.
+    - Compressed latents are FP4 + E4M3 scales (288 B/row). They live once in a shared host memfd (rank 0 writes) plus a 32K-position GPU hot ring.
+    - Index keys are FP4 + power-of-two scales (68 B/row), stored on the GPU.
+    - Decode: selected-row buffer, CUDA `index_scores_decode`, and segment-parallel exact top-k.
+    - Prefill: staging plus an unpack → cuBLAS indexer.
 - **RoPE:** positions past the table rotate on the fly.
 - **Limits:** C2, Engram and the guard are lifted to 512K. The DSpark draft length cap is lifted (`speculative.py`).
 
 ### G5: prefill compute
+
 - Engram reader threads: `VLLM_V41_ENGRAM_READERS` = 64.
 - Adaptive indexer tile: `VLLM_V41_INDEX_TILE_MB`.
 - Persistent-grid activation: `VLLM_V41_ACT_PROGRAMS`.
 
 ### G6: short prompts (`VLLM_V41_ROUTED_PREFILL_MAX` = 1536)
+
 - Only routed experts are transcoded or staged, with one sync per layer.
 
 ### G7: same-session prefix cache (`VLLM_V41_SESSION_PREFIX`)
+
 - The scheduler accepts a hit only when the new request continues the last executed sequence, the hit position is even, and processed − 128 ≤ hit ≤ processed.
 - The worker's `restore_prefix` rewinds the Engram history and the C2 positions.
 
 ## Tests and tools
 
 - **`benchmarks/deepseek_v41/tests/`**: GPU micro-tests for each change (bit-exact or equivalent).
-  - `test_kv_pack.py`, `test_packed_attn.py`, `test_index_packed.py`, `test_topk_par.py`
-  - `test_window_ring.py`, `test_g3_down.py`, `test_peer_gather.py`, `test_g1mem.py`, `test_rope_tail.py`
-  - Run: `PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 .venv/bin/python <test>`.
+    - `test_kv_pack.py`, `test_packed_attn.py`, `test_index_packed.py`, `test_topk_par.py`
+    - `test_window_ring.py`, `test_g3_down.py`, `test_peer_gather.py`, `test_g1mem.py`, `test_rope_tail.py`
+    - Run: `PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 .venv/bin/python <test>`.
 - **`benchmarks/deepseek_v41/tools/`**:
-  - `v41_e2e.py` / `run_e2e2.sh`: full e2e.
-  - `real_decode.py` / `run_real.sh`: fresh-text decode.
-  - `prefill_profile.py` / `run_prefill_profile.sh`: prefill segment timers, enabled with `VLLM_V41_PREFILL_TIMING=1 VLLM_V41_ATTN_TIMING=1`.
-  - `session_test.py`, `longctx_test.py` (needle, TTFT, follow-up decode).
-  - `api_multiturn.py`, `api_think.py`, `api_soak.py`.
-  - `run_decode_spy.sh`: py-spy.
+    - `v41_e2e.py` / `run_e2e2.sh`: full e2e.
+    - `real_decode.py` / `run_real.sh`: fresh-text decode.
+    - `prefill_profile.py` / `run_prefill_profile.sh`: prefill segment timers, enabled with `VLLM_V41_PREFILL_TIMING=1 VLLM_V41_ATTN_TIMING=1`.
+    - `session_test.py`, `longctx_test.py` (needle, TTFT, follow-up decode).
+    - `api_multiturn.py`, `api_think.py`, `api_soak.py`.
+    - `run_decode_spy.sh`: py-spy.
 
 ## Dead ends (kept, default off)
 

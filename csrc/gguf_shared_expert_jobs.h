@@ -33,13 +33,17 @@ class SharedExpertJobLane {
  public:
   // banks[layer] = 3 bank base pointers then 3 slot strides (bytes);
   // layouts[layer] = 3 x (S, R, F, D, W, N, P), as the device swap kernels.
-  SharedExpertJobLane(uint64_t control, uint64_t arena, int device, unsigned rank,
-                      std::vector<std::vector<int64_t>> banks,
-                      std::vector<std::vector<int64_t>> layouts, uint64_t timeout_ns)
+  SharedExpertJobLane(uint64_t control, uint64_t arena, int device,
+                      unsigned rank, std::vector<std::vector<int64_t>> banks,
+                      std::vector<std::vector<int64_t>> layouts,
+                      uint64_t timeout_ns)
       : control_(reinterpret_cast<uint64_t*>(control)),
         arena_(reinterpret_cast<uint8_t*>(arena)),
-        device_(device), rank_(rank), banks_(std::move(banks)),
-        layouts_(std::move(layouts)), timeout_ns_(timeout_ns) {
+        device_(device),
+        rank_(rank),
+        banks_(std::move(banks)),
+        layouts_(std::move(layouts)),
+        timeout_ns_(timeout_ns) {
     if (!control_ || !arena_ || rank >= kSharedMaxRanks ||
         banks_.size() != layouts_.size())
       throw std::invalid_argument("invalid shared expert job lane");
@@ -66,7 +70,9 @@ class SharedExpertJobLane {
   uint64_t completed() { return load(done_word(0)) + load(done_word(1)); }
 
  private:
-  static uint64_t load(const uint64_t* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+  static uint64_t load(const uint64_t* p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+  }
   static uint64_t now() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -76,15 +82,17 @@ class SharedExpertJobLane {
   uint64_t* done_word(int kind) { return jobs() + 1 + 4 * kind + rank_; }
   uint64_t* issued_word() { return jobs() + 9 + rank_; }
 
-  using WriteValue64 = CUresult (*)(CUstream, CUdeviceptr, cuuint64_t, unsigned int);
+  using WriteValue64 = CUresult (*)(CUstream, CUdeviceptr, cuuint64_t,
+                                    unsigned int);
   WriteValue64 stream_write_ = nullptr;
   CUdeviceptr done_device_[2] = {0, 0};
   void init_stream_write() {
     if (std::getenv("VLLM_V41_JOB_EVENTS")) return;
     void* fn = nullptr;
     cudaDriverEntryPointQueryResult status;
-    if (cudaGetDriverEntryPoint("cuStreamWriteValue64", &fn, cudaEnableDefault, &status) !=
-            cudaSuccess || status != cudaDriverEntryPointSuccess || !fn)
+    if (cudaGetDriverEntryPoint("cuStreamWriteValue64", &fn, cudaEnableDefault,
+                                &status) != cudaSuccess ||
+        status != cudaDriverEntryPointSuccess || !fn)
       return;
     for (int k = 0; k < 2; ++k) {
       void* device = nullptr;
@@ -104,20 +112,25 @@ class SharedExpertJobLane {
   }
 
   void issue(const uint64_t* entry, cudaStream_t stream) {
-    const uint64_t kind = entry[1], layer = entry[2], slot = entry[3], at = entry[4];
+    const uint64_t kind = entry[1], layer = entry[2], slot = entry[3],
+                   at = entry[4];
     const auto& L = layouts_[layer];
     const auto& B = banks_[layer];
     for (int i = 0; i < 3; ++i) {
-      const int64_t S = L[7 * i], R = L[7 * i + 1], F = L[7 * i + 2], D = L[7 * i + 3],
-                    W = L[7 * i + 4], N = L[7 * i + 5], P = L[7 * i + 6];
+      const int64_t S = L[7 * i], R = L[7 * i + 1], F = L[7 * i + 2],
+                    D = L[7 * i + 3], W = L[7 * i + 4], N = L[7 * i + 5],
+                    P = L[7 * i + 6];
       if (!N) continue;
       auto* dev = reinterpret_cast<uint8_t*>(B[i]) + int64_t(slot) * B[3 + i];
       auto* host = arena_ + at + P + R * S + F;
       if (kind == 0) {
-        if (W) check(cudaMemcpy2DAsync(host, S, dev, D, W, N, cudaMemcpyDeviceToHost, stream),
-                     "save");
+        if (W)
+          check(cudaMemcpy2DAsync(host, S, dev, D, W, N, cudaMemcpyDeviceToHost,
+                                  stream),
+                "save");
       } else {
-        check(cudaMemcpy2DAsync(dev, D, host, S, D, N, cudaMemcpyHostToDevice, stream),
+        check(cudaMemcpy2DAsync(dev, D, host, S, D, N, cudaMemcpyHostToDevice,
+                                stream),
               "load");
       }
     }
@@ -146,11 +159,13 @@ class SharedExpertJobLane {
           bool used[2] = {false, false};
           for (; issued_ < head; ++issued_) {
             const uint64_t* entry =
-                jobs() + kSharedJobHeader + (issued_ % kSharedJobEntries) * kSharedJobWords;
+                jobs() + kSharedJobHeader +
+                (issued_ % kSharedJobEntries) * kSharedJobWords;
             if (load(entry) != issued_ + 1)
               throw std::runtime_error("job lane: torn or lapped job entry");
             const uint64_t kind = entry[1];
-            if (entry[2] >= layouts_.size() || kind > 1 || entry[6] != ordinal_[kind])
+            if (entry[2] >= layouts_.size() || kind > 1 ||
+                entry[6] != ordinal_[kind])
               throw std::runtime_error("job lane: invalid job");
             issue(entry, streams[kind]);
             ++ordinal_[kind];
@@ -159,14 +174,16 @@ class SharedExpertJobLane {
           for (int k = 0; k < 2; ++k) {
             if (!used[k]) continue;
             if (stream_write_) {
-              if (stream_write_(reinterpret_cast<CUstream>(streams[k]), done_device_[k],
-                                ordinal_[k], 0) != CUDA_SUCCESS)
+              if (stream_write_(reinterpret_cast<CUstream>(streams[k]),
+                                done_device_[k], ordinal_[k],
+                                0) != CUDA_SUCCESS)
                 throw std::runtime_error("job lane: stream write");
               continue;
             }
             cudaEvent_t event;
             if (spare.empty()) {
-              check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event");
+              check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                    "event");
             } else {
               event = spare.back();
               spare.pop_back();
@@ -176,8 +193,9 @@ class SharedExpertJobLane {
           }
           __atomic_store_n(issued_word(), issued_, __ATOMIC_RELEASE);
           if (debug_)
-            std::fprintf(stderr, "[job lane r%u] issued %llu ord %llu/%llu\n", rank_,
-                         (unsigned long long)issued_, (unsigned long long)ordinal_[0],
+            std::fprintf(stderr, "[job lane r%u] issued %llu ord %llu/%llu\n",
+                         rank_, (unsigned long long)issued_,
+                         (unsigned long long)ordinal_[0],
                          (unsigned long long)ordinal_[1]);
           busy = true;
         }
@@ -186,7 +204,8 @@ class SharedExpertJobLane {
             const auto status = cudaEventQuery(inflight[k].front().first);
             if (status == cudaErrorNotReady) break;
             check(status, "query");
-            __atomic_store_n(done_word(k), inflight[k].front().second, __ATOMIC_RELEASE);
+            __atomic_store_n(done_word(k), inflight[k].front().second,
+                             __ATOMIC_RELEASE);
             spare.push_back(inflight[k].front().first);
             inflight[k].pop_front();
             busy = true;
@@ -196,7 +215,8 @@ class SharedExpertJobLane {
           active_until = now() + 4'000'000;
           continue;
         }
-        if (!inflight[0].empty() || !inflight[1].empty() || now() < active_until) {
+        if (!inflight[0].empty() || !inflight[1].empty() ||
+            now() < active_until) {
 #if defined(__x86_64__) || defined(__i386__)
           _mm_pause();
 #else
@@ -211,7 +231,8 @@ class SharedExpertJobLane {
       for (auto e : spare) cudaEventDestroy(e);
       for (auto s : streams) cudaStreamDestroy(s);
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "[SharedExpertJobLane rank %u] %s\n", rank_, e.what());
+      std::fprintf(stderr, "[SharedExpertJobLane rank %u] %s\n", rank_,
+                   e.what());
       std::lock_guard<std::mutex> guard(mutex_);
       error_ = e.what();
     }

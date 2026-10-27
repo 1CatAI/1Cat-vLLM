@@ -776,7 +776,8 @@ void copy_h2d(int64_t dst, int64_t src, int64_t bytes, int64_t stream_ptr) {
 }
 
 // Batched strided host->device copies (one Python call per prefill tile).
-void copy_h2d_2d(const std::vector<int64_t>& dst, const std::vector<int64_t>& src,
+void copy_h2d_2d(const std::vector<int64_t>& dst,
+                 const std::vector<int64_t>& src,
                  const std::vector<int64_t>& dpitch,
                  const std::vector<int64_t>& spitch,
                  const std::vector<int64_t>& width,
@@ -787,10 +788,11 @@ void copy_h2d_2d(const std::vector<int64_t>& dst, const std::vector<int64_t>& sr
     throw std::invalid_argument("copy_h2d_2d: mismatched descriptor lists");
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   for (size_t i = 0; i < n; ++i)
-    check(cudaMemcpy2DAsync(reinterpret_cast<void*>(dst[i]), dpitch[i],
-                            reinterpret_cast<const void*>(src[i]), spitch[i],
-                            width[i], height[i], cudaMemcpyHostToDevice, stream),
-          "copy host to device 2d");
+    check(
+        cudaMemcpy2DAsync(reinterpret_cast<void*>(dst[i]), dpitch[i],
+                          reinterpret_cast<const void*>(src[i]), spitch[i],
+                          width[i], height[i], cudaMemcpyHostToDevice, stream),
+        "copy host to device 2d");
 }
 
 }  // namespace
@@ -836,9 +838,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("error", &SharedExpertJobLane::error)
       .def("completed", &SharedExpertJobLane::completed);
   m.def("shared_expert_hint_layout", [] {
-    return std::vector<uint64_t>{kSharedHintStart, kSharedHintHeader,
+    return std::vector<uint64_t>{kSharedHintStart,   kSharedHintHeader,
                                  kSharedHintEntries, kSharedHintWords,
-                                 kSharedHintTokens, kSharedHintCands};
+                                 kSharedHintTokens,  kSharedHintCands};
   });
   m.def("shared_expert_job_layout", [] {
     return std::vector<uint64_t>{kSharedJobStart, kSharedJobHeader,

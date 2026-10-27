@@ -183,7 +183,7 @@ def _v41_prefill_activation_rows_p(
         up = tl.minimum(tl.maximum(up, -10.0), 10.0)
         probability = tl.load(probabilities + tl.load(order + route))
         value = ((gate / (1.0 + tl.exp(-gate))) * up * probability).to(tl.float16)
-        at = route.to(tl.int64) * FULL + COLUMN + col
+        at = route.to(tl.int64) * FULL + COLUMN + col  # type: ignore[attr-defined]
         tl.store(out0.to(tl.pointer_type(tl.float16)) + at, value, inside)
         tl.store(out1.to(tl.pointer_type(tl.float16)) + at, value, inside)
         tl.store(out2.to(tl.pointer_type(tl.float16)) + at, value, inside)
@@ -438,9 +438,9 @@ class SharedOriginalPrefill:
             self.ring_rows, 3, self.tile_experts, dtype=torch.int64, pin_memory=True
         )
         self.ring_row_ready = [None] * self.ring_rows
-        self.ring_fifo = deque()
+        self.ring_fifo: Any = deque()
         self.ring_entries = {}
-        self.ring_pending = deque()
+        self.ring_pending: Any = deque()
         self.ring_head = 0
         self.ring_free = slots
         self.ring_short = False
@@ -479,7 +479,7 @@ class SharedOriginalPrefill:
         base = runtime.host.data_ptr()
         while self.ring_pending:
             layer, first, count = self.ring_pending[0]
-            table, cold = self.host_table[layer], self.host_cold[layer]
+            table, cold = self.host_table[layer], self.host_cold[layer]  # type: ignore[index]
             used = self.ring_routed.get(layer)
             local = [
                 i
@@ -585,7 +585,7 @@ class SharedOriginalPrefill:
         stream = self.copy_stream
         stream.wait_event(self.free[buffer])
         base = runtime.host.data_ptr()
-        table, cold = self.host_table[layer], self.host_cold[layer]
+        table, cold = self.host_table[layer], self.host_cold[layer]  # type: ignore[index]
         dst, src, dpitch, spitch, width, height = [], [], [], [], [], []
         geometries = spec.layouts(cache.rank)
         for i in range(count):
@@ -639,7 +639,7 @@ class SharedOriginalPrefill:
         torch.accelerator.synchronize(self.cache.device)
         marks = self._t
         self._t = []
-        first = {}
+        first: Any = {}
         for layer, kind, e in marks:
             first.setdefault((layer, kind), []).append(e)
         layers = sorted({l for l, _, _ in marks})  # noqa: E741
@@ -670,7 +670,7 @@ class SharedOriginalPrefill:
         span = first[(layers[0], "start")][0].elapsed_time(
             first[(layers[-1], "end")][0]
         )
-        sub, subs = {}, self._s
+        sub, subs = {}, self._s  # type: ignore[var-annotated]
         self._s = []
         for (a, ea), (b, eb) in zip(subs, subs[1:]):
             if a != "tile_end":
@@ -984,7 +984,7 @@ class SharedOriginalPrefill:
                         BLOCK=256,
                         enable_fp_fusion=False,
                     )
-                    h = hidden[:count]
+                    h = hidden[:count]  # type: ignore[index]
                 fmt = info["dn"]
                 self._sub("dn")
                 torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(

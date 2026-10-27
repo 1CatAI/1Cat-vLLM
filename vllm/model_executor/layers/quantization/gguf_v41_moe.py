@@ -3,6 +3,7 @@
 """V4.1 SwiGLU and routing boundaries around the original Q8_1 integer dots."""
 
 import os
+from typing import Any
 
 import torch
 
@@ -124,19 +125,19 @@ def default_v41k_library():
     )
 
 
-_EM = {"loaded": None, "books": {}}
+_EM: Any = {"loaded": None, "books": {}}
 _EM5 = envs.VLLM_V41_EM5 == "1"
 
 
 def _expert_major_ready():
     """Expert-major V4.1 kernels (one decode of each distinct expert per layer)."""
     if _EM["loaded"] is None:
-        _EM["loaded"] = False
+        _EM["loaded"] = False  # type: ignore[assignment]
         if envs.VLLM_V41_EM == "1":
             path = default_v41k_library()
             if os.path.exists(path):
                 torch.ops.load_library(path)
-                _EM["loaded"] = True
+                _EM["loaded"] = True  # type: ignore[assignment]
     return _EM["loaded"]
 
 
@@ -146,16 +147,16 @@ os.environ.setdefault("VLLM_V41_EM8", "0")  # single-barrier down: no gain measu
 
 def _plan(device):
     key = ("plan", device)
-    if key not in _EM["books"]:
-        _EM["books"][key] = torch.zeros(512, dtype=torch.int32, device=device)
-    return _EM["books"][key]
+    if key not in _EM["books"]:  # type: ignore[operator]
+        _EM["books"][key] = torch.zeros(512, dtype=torch.int32, device=device)  # type: ignore[index]
+    return _EM["books"][key]  # type: ignore[index]
 
 
 def _book(kind, device):
     key = (kind, device)
-    if key not in _EM["books"]:
-        _EM["books"][key] = torch.ops.v41k.table(kind, device)
-    return _EM["books"][key]
+    if key not in _EM["books"]:  # type: ignore[operator]
+        _EM["books"][key] = torch.ops.v41k.table(kind, device)  # type: ignore[index]
+    return _EM["books"][key]  # type: ignore[index]
 
 
 _ROWS = {}
@@ -183,7 +184,7 @@ def _rows_context(device):
         from vllm.distributed import get_tp_group
 
         group = get_tp_group()
-        _ROWS[device] = (group.rank_in_group, group.device_communicator.pynccl_comm)
+        _ROWS[device] = (group.rank_in_group, group.device_communicator.pynccl_comm)  # type: ignore[union-attr]
     return _ROWS[device]
 
 
@@ -291,7 +292,7 @@ def _v41_experts(
         raise ValueError("V4.1 integer experts require FP16 M1..6, top-6 and clamp 10")
     if _expert_major_ready() and down.shape[1] == 1280:
         # Row tile sweep (V100, 36 routes): 4 rows x 8 lanes of K, 8 warps.
-        rows, warps = (int(v) for v in envs.VLLM_V41_ROWS_TILE.split(","))
+        rows, warps = (int(v) for v in envs.VLLM_V41_ROWS_TILE.split(","))  # type: ignore[union-attr]
         return _v41_experts_rows(
             x,
             ids.to(torch.int32).contiguous(),

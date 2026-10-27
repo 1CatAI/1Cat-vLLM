@@ -71,7 +71,8 @@ class SharedExpertPlanner {
           layer.slot[expert] = expert;
         else
           layer.cold[expert] =
-              int64_t(offset + uint64_t(expert - config.resident) * config.expert_bytes);
+              int64_t(offset +
+                      uint64_t(expert - config.resident) * config.expert_bytes);
       }
       layers_.push_back(std::move(layer));
       offset += cold * config.expert_bytes;
@@ -98,10 +99,12 @@ class SharedExpertPlanner {
         const uint64_t bytes = layer.config.expert_bytes;
         if (free_.count(bytes)) continue;
         auto& list = free_[bytes];
-        const uint64_t count = per_class + uint64_t(async_free_) * layers_of[bytes];
+        const uint64_t count =
+            per_class + uint64_t(async_free_) * layers_of[bytes];
         for (uint64_t i = 0; i < count; ++i) {
           if (at + bytes > exchange_offset_ + exchange_bytes)
-            throw std::invalid_argument("free-slot exchange exceeds the reserve");
+            throw std::invalid_argument(
+                "free-slot exchange exceeds the reserve");
           list.push_back(at);
           at += bytes;
         }
@@ -141,7 +144,8 @@ class SharedExpertPlanner {
       } else {
         r = kSkipRoute;
         if (!layer.prefetching.count(e) &&
-            std::find(background_.begin(), background_.end(), e) == background_.end())
+            std::find(background_.begin(), background_.end(), e) ==
+                background_.end())
           background_.push_back(e);
       }
     }
@@ -160,7 +164,10 @@ class SharedExpertPlanner {
       throw std::runtime_error("shared expert LRU sequence exhausted");
     }
     // The GPU numbers its forwards; truncation never carries across them.
-    if (round != round_) { trunc_ = kNoTrunc; round_ = round; }
+    if (round != round_) {
+      trunc_ = kNoTrunc;
+      round_ = round;
+    }
     std::unordered_set<int32_t> skipped;
     std::vector<uint64_t> saves_by_order;
     auto* pool = free_mode_ ? &free_.at(layer.config.expert_bytes) : nullptr;
@@ -180,9 +187,12 @@ class SharedExpertPlanner {
       }
       std::stable_sort(need.begin(), need.end());
       for (const auto& [pos, e] : need) {
-        if (pos >= trunc_) skipped.insert(e);
-        else if (cutoff > 0 && pos >= cutoff) { trunc_ = pos; skipped.insert(e); }
-        else if (layer.evicting.count(e) || layer.ghost.count(e)) {
+        if (pos >= trunc_)
+          skipped.insert(e);
+        else if (cutoff > 0 && pos >= cutoff) {
+          trunc_ = pos;
+          skipped.insert(e);
+        } else if (layer.evicting.count(e) || layer.ghost.count(e)) {
           // still intact in its old slot: reinstated without a copy
         } else if (free_slots > 0) {
           --free_slots;
@@ -190,7 +200,8 @@ class SharedExpertPlanner {
           // No free allocation of this class: exact truncation at the
           // earliest position that still needs this expert.
           if (pos == 0)
-            throw std::runtime_error("free-slot exchange cannot hold verify position 0");
+            throw std::runtime_error(
+                "free-slot exchange cannot hold verify position 0");
           trunc_ = pos;
           skipped.insert(e);
         } else if (pool) {
@@ -203,14 +214,15 @@ class SharedExpertPlanner {
     std::unordered_set<int32_t> evicting;
     // Route order is stable; unordered_set is used only for membership.
     for (auto incoming : routes) {
-      if (incoming == kSkipRoute || layer.slot[incoming] >= 0 || skipped.count(incoming) ||
+      if (incoming == kSkipRoute || layer.slot[incoming] >= 0 ||
+          skipped.count(incoming) ||
           std::any_of(copies.begin(), copies.end(),
                       [&](const auto& op) { return op.incoming == incoming; }))
         continue;
       if (auto it = layer.evicting.find(incoming); it != layer.evicting.end()) {
         // Rescue: the GPU table dropped it but the save only reads the slot.
-        copies.push_back({it->second.slot, incoming, -1, kSharedNoOffset,
-                          kSharedNoOffset});
+        copies.push_back(
+            {it->second.slot, incoming, -1, kSharedNoOffset, kSharedNoOffset});
         ++stat_rescue_;
         continue;
       }
@@ -219,11 +231,13 @@ class SharedExpertPlanner {
         const int32_t slot = it->second;
         layer.free_slots.erase(
             std::find(layer.free_slots.begin(), layer.free_slots.end(), slot));
-        copies.push_back({slot, incoming, -1, kSharedNoOffset, kSharedNoOffset});
+        copies.push_back(
+            {slot, incoming, -1, kSharedNoOffset, kSharedNoOffset});
         ghost_rescues_.push_back({incoming, layer.cold[incoming]});
         layer.ghost.erase(it);
         ++stat_ghost_;
-        if (prefetched_.erase({int32_t(layer_index), incoming})) ++stat_prefetch_hit_;
+        if (prefetched_.erase({int32_t(layer_index), incoming}))
+          ++stat_prefetch_hit_;
         continue;
       }
       const uint64_t bytes = layer.config.expert_bytes;
@@ -231,10 +245,14 @@ class SharedExpertPlanner {
       // Load-only into the least recently freed empty slot whose previous
       // expert (saved asynchronously) is not routed here; its ghost is dropped.
       auto pick = layer.free_slots.end();
-      for (auto f = layer.free_slots.begin(); f != layer.free_slots.end(); ++f) {
+      for (auto f = layer.free_slots.begin(); f != layer.free_slots.end();
+           ++f) {
         auto g = std::find_if(layer.ghost.begin(), layer.ghost.end(),
                               [&](const auto& v) { return v.second == *f; });
-        if (g == layer.ghost.end() || !wanted.count(g->first)) { pick = f; break; }
+        if (g == layer.ghost.end() || !wanted.count(g->first)) {
+          pick = f;
+          break;
+        }
       }
       if (pick != layer.free_slots.end()) {
         const int32_t slot = *pick;
@@ -286,18 +304,20 @@ class SharedExpertPlanner {
     if (async_free_ > 0 && pool) {
       size_t have = layer.free_slots.size() + layer.evicting.size();
       while (have < size_t(async_free_) && pool->size() > kEvictReserve &&
-             jobs_[0].size() + jobs_[1].size() + evicts_.size() < kMaxPendingJobs &&
+             jobs_[0].size() + jobs_[1].size() + evicts_.size() <
+                 kMaxPendingJobs &&
              copies.size() + evicts_.size() < kMaxPlanOps) {
         int32_t victim = -1;
         for (int32_t expert = 0; expert < layer.config.experts; ++expert) {
           if (layer.slot[expert] < 0 || wanted.count(expert) ||
               evicting.count(expert))
             continue;
-          if (victim < 0 || layer.use[expert] < layer.use[victim]) victim = expert;
+          if (victim < 0 || layer.use[expert] < layer.use[victim])
+            victim = expert;
         }
         if (victim < 0) break;
-        evicts_.push_back({layer.slot[victim], -1, victim, kSharedNoOffset,
-                           pool->back()});
+        evicts_.push_back(
+            {layer.slot[victim], -1, victim, kSharedNoOffset, pool->back()});
         ++stat_evict_;
         pool->pop_back();
         evicting.insert(victim);
@@ -340,7 +360,8 @@ class SharedExpertPlanner {
       const auto job = queue.front();
       queue.pop_front();
       auto& layer = layers_.at(job.layer);
-      if (kind == 1 && demand_.erase(job.ordinal)) continue;  // committed by its plan
+      if (kind == 1 && demand_.erase(job.ordinal))
+        continue;  // committed by its plan
       if (kind == 1) {
         // Prefetch landed on every rank: the slot is free, holding a ghost
         // of the expert while its host copy is still canonical.
@@ -348,8 +369,10 @@ class SharedExpertPlanner {
         if (it != layer.prefetching.end() && it->second == job.ordinal)
           layer.prefetching.erase(it);
         layer.free_slots.push_back(job.slot);
-        if (layer.slot[job.expert] < 0 && layer.cold[job.expert] == int64_t(job.offset) &&
-            !layer.ghost.count(job.expert) && !layer.prefetching.count(job.expert)) {
+        if (layer.slot[job.expert] < 0 &&
+            layer.cold[job.expert] == int64_t(job.offset) &&
+            !layer.ghost.count(job.expert) &&
+            !layer.prefetching.count(job.expert)) {
           layer.ghost[job.expert] = job.slot;
           prefetched_.insert({job.layer, job.expert});
         }
@@ -369,13 +392,18 @@ class SharedExpertPlanner {
     }
     for (size_t i = 0; i < deferred_.size();) {
       const auto d = deferred_[i];
-      const bool pending = std::any_of(jobs_[1].begin(), jobs_[1].end(), [&](const auto& j) {
-        return j.layer == d.layer && j.slot == d.slot;
-      });
-      if (pending) { ++i; continue; }
+      const bool pending =
+          std::any_of(jobs_[1].begin(), jobs_[1].end(), [&](const auto& j) {
+            return j.layer == d.layer && j.slot == d.slot;
+          });
+      if (pending) {
+        ++i;
+        continue;
+      }
       auto& layer = layers_.at(d.layer);
       layer.free_slots.push_back(d.slot);
-      if (layer.slot[d.expert] < 0 && layer.cold[d.expert] == int64_t(d.offset) &&
+      if (layer.slot[d.expert] < 0 &&
+          layer.cold[d.expert] == int64_t(d.offset) &&
           !layer.ghost.count(d.expert) && !layer.prefetching.count(d.expert))
         layer.ghost[d.expert] = d.slot;
       deferred_[i] = deferred_.back();
@@ -388,14 +416,21 @@ class SharedExpertPlanner {
   // (ring id, ordinal), or (~0, ~0) for copies the GPU performs itself.
   std::vector<std::pair<uint64_t, uint64_t>> demand_jobs() {
     std::lock_guard<std::mutex> guard(mutex_);
-    std::vector<std::pair<uint64_t, uint64_t>> out(copies_.size(), {~uint64_t{0}, ~uint64_t{0}});
-    if (!pending_ || jobs_[0].size() + jobs_[1].size() + copies_.size() >= kMaxPendingJobs)
+    std::vector<std::pair<uint64_t, uint64_t>> out(
+        copies_.size(), {~uint64_t{0}, ~uint64_t{0}});
+    if (!pending_ ||
+        jobs_[0].size() + jobs_[1].size() + copies_.size() >= kMaxPendingJobs)
       return out;
     for (size_t i = 0; i < copies_.size(); ++i) {
       const auto& c = copies_[i];
       if (c.victim >= 0 || c.load_offset == kSharedNoOffset) continue;
-      const SharedExpertJob job{next_job_++, 1, int32_t(pending_layer_), c.slot, c.incoming,
-                                c.load_offset, next_ordinal_[1]++};
+      const SharedExpertJob job{next_job_++,
+                                1,
+                                int32_t(pending_layer_),
+                                c.slot,
+                                c.incoming,
+                                c.load_offset,
+                                next_ordinal_[1]++};
       demand_.insert(job.ordinal);
       jobs_[1].push_back(job);
       new_jobs_.push_back(job);
@@ -424,15 +459,17 @@ class SharedExpertPlanner {
           jobs_[0].size() + jobs_[1].size() >= kMaxPendingJobs)
         break;
       if (e < 0 || e >= layer.config.experts || layer.slot[e] >= 0 ||
-          layer.cold[e] < 0 || layer.evicting.count(e) || layer.ghost.count(e) ||
-          layer.prefetching.count(e))
+          layer.cold[e] < 0 || layer.evicting.count(e) ||
+          layer.ghost.count(e) || layer.prefetching.count(e))
         continue;
       // Oldest free slot; a prefetched ghost is only displaced by a newer one.
       auto pick = layer.free_slots.end();
-      for (auto f = layer.free_slots.begin(); f != layer.free_slots.end(); ++f) {
+      for (auto f = layer.free_slots.begin(); f != layer.free_slots.end();
+           ++f) {
         auto g = std::find_if(layer.ghost.begin(), layer.ghost.end(),
                               [&](const auto& v) { return v.second == *f; });
-        if (g == layer.ghost.end() || !prefetched_.count({int32_t(layer_index), g->first})) {
+        if (g == layer.ghost.end() ||
+            !prefetched_.count({int32_t(layer_index), g->first})) {
           pick = f;
           break;
         }
@@ -446,8 +483,13 @@ class SharedExpertPlanner {
           layer.ghost.erase(g);
           break;
         }
-      const SharedExpertJob job{next_job_++, 1, int32_t(layer_index), slot, e,
-                                uint64_t(layer.cold[e]), next_ordinal_[1]++};
+      const SharedExpertJob job{next_job_++,
+                                1,
+                                int32_t(layer_index),
+                                slot,
+                                e,
+                                uint64_t(layer.cold[e]),
+                                next_ordinal_[1]++};
       layer.prefetching[e] = job.ordinal;
       jobs_[1].push_back(job);
       new_jobs_.push_back(job);
@@ -459,8 +501,8 @@ class SharedExpertPlanner {
 
   // In-flight prefetches (ring id, ordinal) of experts routed here, which
   // the coordinator may wait for before planning.
-  std::vector<std::pair<uint64_t, uint64_t>> inflight_for(size_t layer_index,
-                                                          const std::vector<int32_t>& routes) {
+  std::vector<std::pair<uint64_t, uint64_t>> inflight_for(
+      size_t layer_index, const std::vector<int32_t>& routes) {
     std::lock_guard<std::mutex> guard(mutex_);
     std::vector<std::pair<uint64_t, uint64_t>> out;
     auto& layer = layers_.at(layer_index);
@@ -468,7 +510,10 @@ class SharedExpertPlanner {
       auto it = layer.prefetching.find(e);
       if (it == layer.prefetching.end()) continue;
       for (const auto& job : jobs_[1])
-        if (job.ordinal == it->second) { out.push_back({job.id, job.ordinal}); break; }
+        if (job.ordinal == it->second) {
+          out.push_back({job.id, job.ordinal});
+          break;
+        }
     }
     return out;
   }
@@ -515,7 +560,8 @@ class SharedExpertPlanner {
         continue;
       }
       if (copy.save_offset != copy.load_offset)
-        std::memcpy(arena_ + copy.load_offset, arena_ + copy.save_offset, bytes);
+        std::memcpy(arena_ + copy.load_offset, arena_ + copy.save_offset,
+                    bytes);
       layer.cold[copy.victim] = layer.cold[copy.incoming];
       layer.cold[copy.incoming] = -1;
       layer.slot[copy.incoming] = copy.slot;
@@ -526,8 +572,10 @@ class SharedExpertPlanner {
       if (at >= 0) free_.at(bytes).push_back(uint64_t(at));
     ghost_rescues_.clear();
     for (const auto& ev : evicts_) {
-      const SharedExpertJob job{next_job_++, 0, int32_t(pending_layer_), ev.slot,
-                                ev.victim, ev.save_offset, next_ordinal_[0]++};
+      const SharedExpertJob job{
+          next_job_++,       0,         int32_t(pending_layer_),
+          ev.slot,           ev.victim, ev.save_offset,
+          next_ordinal_[0]++};
       layer.slot[ev.victim] = -1;
       layer.evicting[ev.victim] = {ev.slot, job.id};
       jobs_[0].push_back(job);
@@ -588,11 +636,15 @@ class SharedExpertPlanner {
     std::vector<int32_t> slot;
     std::vector<int64_t> cold;
     std::vector<uint64_t> use;
-    struct Evicting { int32_t slot; uint64_t job; };
-    std::vector<int32_t> free_slots;                 // empty, saved on all ranks
+    struct Evicting {
+      int32_t slot;
+      uint64_t job;
+    };
+    std::vector<int32_t> free_slots;  // empty, saved on all ranks
     std::unordered_map<int32_t, Evicting> evicting;  // dropped, save in flight
-    std::unordered_map<int32_t, int32_t> ghost;      // saved, still in a free slot
-    std::unordered_map<int32_t, uint64_t> prefetching;  // load ordinal in flight
+    std::unordered_map<int32_t, int32_t> ghost;  // saved, still in a free slot
+    std::unordered_map<int32_t, uint64_t>
+        prefetching;  // load ordinal in flight
   };
   uint8_t* const arena_;
   const bool inplace_ = [] {
@@ -609,17 +661,22 @@ class SharedExpertPlanner {
     const char* f = std::getenv("VLLM_V41_SWAP_FREE");
     return v && f && f[0] == '1' ? std::atoi(v) : 0;
   }();
-  static constexpr size_t kEvictReserve = 4;     // host allocations kept for exchange
+  static constexpr size_t kEvictReserve =
+      4;  // host allocations kept for exchange
   static constexpr size_t kMaxPendingJobs = 160;  // < job ring entries
   static constexpr size_t kMaxPlanOps = 44;       // control page op capacity
   std::deque<SharedExpertJob> jobs_[2];
   std::unordered_set<uint64_t> demand_;
-  struct Deferred { int32_t layer, slot, expert; uint64_t offset; };
+  struct Deferred {
+    int32_t layer, slot, expert;
+    uint64_t offset;
+  };
   std::vector<Deferred> deferred_;
   uint64_t next_ordinal_[2] = {0, 0};
   struct PairHash {
     size_t operator()(const std::pair<int32_t, int32_t>& v) const {
-      return std::hash<int64_t>()((int64_t(v.first) << 32) | uint32_t(v.second));
+      return std::hash<int64_t>()((int64_t(v.first) << 32) |
+                                  uint32_t(v.second));
     }
   };
   std::unordered_set<std::pair<int32_t, int32_t>, PairHash> prefetched_;
@@ -628,16 +685,21 @@ class SharedExpertPlanner {
   std::vector<int32_t> background_;
   uint64_t next_job_ = 0;
   std::vector<std::pair<int32_t, int64_t>> ghost_rescues_;
+
  public:
-  uint64_t stat_free_ = 0, stat_exchange_ = 0, stat_rescue_ = 0, stat_ghost_ = 0,
-           stat_evict_ = 0, stat_prefetch_ = 0, stat_prefetch_hit_ = 0, stat_adopt_ = 0;
+  uint64_t stat_free_ = 0, stat_exchange_ = 0, stat_rescue_ = 0,
+           stat_ghost_ = 0, stat_evict_ = 0, stat_prefetch_ = 0,
+           stat_prefetch_hit_ = 0, stat_adopt_ = 0;
+
  private:
   std::unordered_map<uint64_t, std::vector<uint64_t>> free_;
   const unsigned max_routes_;
   static constexpr int32_t kNoTrunc = 1 << 20;
+
  public:
   static constexpr int32_t kSkipRoute = 0x7FFFFFFF;
   static constexpr int32_t kDeferFlag = 1 << 30;
+
  private:
   int32_t trunc_ = kNoTrunc;
   uint64_t round_ = 0;

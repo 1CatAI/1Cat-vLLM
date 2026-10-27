@@ -218,6 +218,6 @@ class V41PackedKV:
         newest = (int(positions[-1].item()) + 1) // ratio - 1
         old = newest - self.hot_rows[source] + 1
         if old > 0:
-            self.staging[:old].copy_(self.host[source][:old], non_blocking=True)
+            self.staging[:old].copy_(self.host[source][:old], non_blocking=True)  # type: ignore[index]
         self.staged = source
         return old

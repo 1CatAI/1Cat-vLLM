@@ -61,10 +61,12 @@ constexpr size_t kSharedHintHeader = 8;
 constexpr size_t kSharedHintEntries = 32;
 constexpr size_t kSharedHintTokens = 8;
 constexpr size_t kSharedHintCands = 8;
-constexpr size_t kSharedHintWords = 4 + 2 * kSharedHintTokens * kSharedHintCands + 4;
+constexpr size_t kSharedHintWords =
+    4 + 2 * kSharedHintTokens * kSharedHintCands + 4;
 constexpr size_t kSharedHintRankWords =
     kSharedHintHeader + kSharedHintEntries * kSharedHintWords;
-constexpr size_t kSharedTotalWords = kSharedHintStart + kSharedMaxRanks * kSharedHintRankWords;
+constexpr size_t kSharedTotalWords =
+    kSharedHintStart + kSharedMaxRanks * kSharedHintRankWords;
 
 class SharedExpertCoordinator {
  public:
@@ -152,16 +154,17 @@ class SharedExpertCoordinator {
           "shared expert coordinator stopped during a plan");
     if (now() - started >= timeout_ns_) {
       char text[512];
-      std::snprintf(text, sizeof(text),
-                    "shared expert group %s timed out: req %llu %llu %llu %llu "
-                    "done %llu %llu %llu %llu layer %llu %llu %llu %llu copies %llu",
-                    where, (unsigned long long)rank(0)[0], (unsigned long long)rank(1)[0],
-                    (unsigned long long)rank(2)[0], (unsigned long long)rank(3)[0],
-                    (unsigned long long)rank(0)[1], (unsigned long long)rank(1)[1],
-                    (unsigned long long)rank(2)[1], (unsigned long long)rank(3)[1],
-                    (unsigned long long)rank(0)[2], (unsigned long long)rank(1)[2],
-                    (unsigned long long)rank(2)[2], (unsigned long long)rank(3)[2],
-                    (unsigned long long)control_[3]);
+      std::snprintf(
+          text, sizeof(text),
+          "shared expert group %s timed out: req %llu %llu %llu %llu "
+          "done %llu %llu %llu %llu layer %llu %llu %llu %llu copies %llu",
+          where, (unsigned long long)rank(0)[0], (unsigned long long)rank(1)[0],
+          (unsigned long long)rank(2)[0], (unsigned long long)rank(3)[0],
+          (unsigned long long)rank(0)[1], (unsigned long long)rank(1)[1],
+          (unsigned long long)rank(2)[1], (unsigned long long)rank(3)[1],
+          (unsigned long long)rank(0)[2], (unsigned long long)rank(1)[2],
+          (unsigned long long)rank(2)[2], (unsigned long long)rank(3)[2],
+          (unsigned long long)control_[3]);
       throw std::runtime_error(text);
     }
   }
@@ -216,8 +219,9 @@ class SharedExpertCoordinator {
       hits_read_ = head - kSharedHitEntries;
     int32_t routes[kSharedMaxRoutes];
     while (hits_read_ < head) {
-      const uint64_t* entry = control_ + kSharedHitStart + kSharedHitHeader +
-                              (hits_read_ % kSharedHitEntries) * kSharedHitWords;
+      const uint64_t* entry =
+          control_ + kSharedHitStart + kSharedHitHeader +
+          (hits_read_ % kSharedHitEntries) * kSharedHitWords;
       const uint64_t tag = load(entry);
       const uint64_t layer = entry[1], count = entry[2];
       if (tag == hits_read_ + 1 && count && count <= kSharedMaxRoutes) {
@@ -252,7 +256,8 @@ class SharedExpertCoordinator {
       }
     }
     uint64_t issued = load(jobs() + 9);
-    for (unsigned r = 1; r < ranks_; ++r) issued = std::min(issued, load(jobs() + 9 + r));
+    for (unsigned r = 1; r < ranks_; ++r)
+      issued = std::min(issued, load(jobs() + 9 + r));
     jobs_completed_ = issued;  // lanes copy an entry when they issue it
   }
 
@@ -264,11 +269,13 @@ class SharedExpertCoordinator {
     const auto waits = planner_.inflight_for(layer, routes);
     if (waits.empty()) return;
     uint64_t issued = load(jobs() + 9);
-    for (unsigned r = 1; r < ranks_; ++r) issued = std::min(issued, load(jobs() + 9 + r));
+    for (unsigned r = 1; r < ranks_; ++r)
+      issued = std::min(issued, load(jobs() + 9 + r));
     const uint64_t begin = now();
     for (const auto& [id, ordinal] : waits) {
       if (issued <= id) continue;
-      while (kind_done(1) <= ordinal && now() - begin < prefetch_wait_ns_) relax();
+      while (kind_done(1) <= ordinal && now() - begin < prefetch_wait_ns_)
+        relax();
     }
     stat_wait_ns_ += now() - begin;
     ++stat_waits_;
@@ -289,7 +296,8 @@ class SharedExpertCoordinator {
     for (int d = 0; d < 2; ++d) {
       auto& keep = last_hint_[d][layer];
       for (const auto& c : keep) {
-        const bool used = std::find(routes, routes + count, c.e) != routes + count;
+        const bool used =
+            std::find(routes, routes + count, c.e) != routes + count;
         ++eval_[d][bucket(c.w)][used];
       }
       keep.clear();
@@ -317,12 +325,15 @@ class SharedExpertCoordinator {
     if (!prefetch_) return;
     uint64_t head = load(hints(0));
     for (unsigned r = 1; r < ranks_; ++r) head = std::min(head, load(hints(r)));
-    if (head - hints_read_ > kSharedHintEntries) hints_read_ = head - kSharedHintEntries;
+    if (head - hints_read_ > kSharedHintEntries)
+      hints_read_ = head - kSharedHintEntries;
     const size_t layers = layer_count_;
     while (hints_read_ < head) {
-      const size_t at = kSharedHintHeader + (hints_read_ % kSharedHintEntries) * kSharedHintWords;
+      const size_t at = kSharedHintHeader +
+                        (hints_read_ % kSharedHintEntries) * kSharedHintWords;
       bool ok = true;
-      for (unsigned r = 0; r < ranks_; ++r) ok &= load(hints(r) + at) == hints_read_ + 1;
+      for (unsigned r = 0; r < ranks_; ++r)
+        ok &= load(hints(r) + at) == hints_read_ + 1;
       const uint64_t layer = hints(0)[at + 1], tokens = hints(0)[at + 2];
       const uint64_t trunc = hints(0)[at + 3];
       ++hints_read_;
@@ -338,23 +349,26 @@ class SharedExpertCoordinator {
           for (unsigned r = 0; r < ranks_; ++r)
             for (size_t c = 0; c < kSharedHintCands; ++c) {
               const uint64_t w =
-                  hints(r)[at + 4 + (d * kSharedHintTokens + t) * kSharedHintCands + c];
+                  hints(r)[at + 4 +
+                           (d * kSharedHintTokens + t) * kSharedHintCands + c];
               float key;
               const uint32_t bits = uint32_t(w);
               std::memcpy(&key, &bits, 4);
               cand[m++] = {key, int32_t(w >> 32)};
             }
           const size_t k = std::min<size_t>(prefetch_topk_, m);
-          std::partial_sort(cand, cand + k, cand + m,
-                            [](const auto& a, const auto& b) { return a.first > b.first; });
+          std::partial_sort(
+              cand, cand + k, cand + m,
+              [](const auto& a, const auto& b) { return a.first > b.first; });
           const float pos = 1.0f / float(1 + t);
           for (size_t c = 0; c < k; ++c)
             weight[cand[c].second] += pos * (1.0f + float(k - c) / float(k));
         }
         std::vector<std::pair<float, int32_t>> order;
         for (const auto& [e, w] : weight) order.push_back({w, e});
-        std::sort(order.begin(), order.end(),
-                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
+          return a.first > b.first;
+        });
         std::vector<int32_t> ids;
         for (const auto& [w, e] : order)
           if (w >= prefetch_min_weight_) ids.push_back(e);
@@ -374,9 +388,11 @@ class SharedExpertCoordinator {
     auto list = planner_.take_jobs();
     if (list.empty()) return;
     for (const auto& job : list) {
-      if (job.id != jobs_published_ || job.id - jobs_completed_ >= kSharedJobEntries)
+      if (job.id != jobs_published_ ||
+          job.id - jobs_completed_ >= kSharedJobEntries)
         throw std::runtime_error("shared expert job ring overflow");
-      auto* entry = jobs() + kSharedJobHeader + (job.id % kSharedJobEntries) * kSharedJobWords;
+      auto* entry = jobs() + kSharedJobHeader +
+                    (job.id % kSharedJobEntries) * kSharedJobWords;
       entry[1] = uint64_t(job.kind);
       entry[2] = uint64_t(job.layer);
       entry[3] = uint64_t(job.slot);
@@ -450,9 +466,12 @@ class SharedExpertCoordinator {
                                     rank(0)[41]);
         control_[6] = uint64_t(planner_.trunc());
         if (coord_debug_)
-          std::fprintf(stderr, "[coord] seq %llu layer %llu routes %zu copies %zu trunc %d cutoff %d round %llu\n",
-                       (unsigned long long)sequence, (unsigned long long)layer, routes.size(),
-                       copies.size(), planner_.trunc(), cutoff, (unsigned long long)rank(0)[41]);
+          std::fprintf(stderr,
+                       "[coord] seq %llu layer %llu routes %zu copies %zu "
+                       "trunc %d cutoff %d round %llu\n",
+                       (unsigned long long)sequence, (unsigned long long)layer,
+                       routes.size(), copies.size(), planner_.trunc(), cutoff,
+                       (unsigned long long)rank(0)[41]);
         if (trace_) {
           std::vector<int32_t> incoming;
           for (const auto& c : copies) incoming.push_back(c.incoming);
@@ -468,13 +487,18 @@ class SharedExpertCoordinator {
           uint64_t last_id = 0, last_ord = 0;
           bool any = false;
           for (const auto& [id, ord] : dj)
-            if (id != ~uint64_t{0}) { any = true; last_id = std::max(last_id, id); last_ord = std::max(last_ord, ord); }
+            if (id != ~uint64_t{0}) {
+              any = true;
+              last_id = std::max(last_id, id);
+              last_ord = std::max(last_ord, ord);
+            }
           if (any) {
             publish_jobs();
             const uint64_t t0 = now();
             auto issued = [&] {
               uint64_t v = load(jobs() + 9);
-              for (unsigned r = 1; r < ranks_; ++r) v = std::min(v, load(jobs() + 9 + r));
+              for (unsigned r = 1; r < ranks_; ++r)
+                v = std::min(v, load(jobs() + 9 + r));
               return v;
             };
             while (issued() <= last_id && now() - t0 < dma_issue_ns_) relax();
@@ -484,11 +508,13 @@ class SharedExpertCoordinator {
             // bytes; the late DMA is benign and its slot reuse is deferred).
             bool done = false;
             if (issued() > last_id) {
-              while (kind_done(1) <= last_ord && now() - t0 < dma_done_ns_) relax();
+              while (kind_done(1) <= last_ord && now() - t0 < dma_done_ns_)
+                relax();
               done = kind_done(1) > last_ord;
             }
             if (done) {
-              for (size_t i = 0; i < dj.size(); ++i) by_dma[i] = dj[i].first != ~uint64_t{0};
+              for (size_t i = 0; i < dj.size(); ++i)
+                by_dma[i] = dj[i].first != ~uint64_t{0};
               ++stat_dma_;
             } else {
               ++stat_dma_fallback_;
@@ -501,11 +527,13 @@ class SharedExpertCoordinator {
           throw std::runtime_error("shared expert plan exceeds op capacity");
         for (size_t i = 0; i < copies.size() + evicts.size(); ++i) {
           auto* op = control_ + kSharedOpStart + i * kSharedOpWords;
-          const auto& copy = i < copies.size() ? copies[i] : evicts[i - copies.size()];
+          const auto& copy =
+              i < copies.size() ? copies[i] : evicts[i - copies.size()];
           op[0] = uint64_t(int64_t(copy.slot));
           op[1] = uint64_t(int64_t(copy.incoming));
           op[2] = uint64_t(int64_t(copy.victim));
-          op[3] = i < copies.size() && by_dma[i] ? uint64_t(-2) : copy.load_offset;
+          op[3] =
+              i < copies.size() && by_dma[i] ? uint64_t(-2) : copy.load_offset;
           op[4] = copy.save_offset;
         }
         // Low 16 bits: copies (swap kernel ops); high: evictions after them.
@@ -516,7 +544,8 @@ class SharedExpertCoordinator {
         // A plan without copies (every miss truncated) has no writeback, so
         // no rank publishes a completion for it.
         if (copies.empty() && evicts.empty()) {
-          for (unsigned r = 0; r < ranks_; ++r) planner_.acknowledge(r, sequence, now());
+          for (unsigned r = 0; r < ranks_; ++r)
+            planner_.acknowledge(r, sequence, now());
           completed = all_ranks;
         }
         while (completed != all_ranks) {
@@ -541,26 +570,36 @@ class SharedExpertCoordinator {
         {
           const auto background = planner_.take_background();
           if (!background.empty())
-            stat_background_ += planner_.prefetch(layer, background, background.size(), bg_inflight_);
+            stat_background_ += planner_.prefetch(
+                layer, background, background.size(), bg_inflight_);
         }
         publish_jobs();
         if (plan_stats_ && sequence % 2000 == 0)
-          std::fprintf(stderr, "[coord] plans %llu free %llu exchange %llu rescue %llu ghost %llu evict %llu pending %llu prefetch %llu hit %llu waits %llu wait_ms %.1f\n",
-                       (unsigned long long)sequence, (unsigned long long)planner_.stat_free_,
-                       (unsigned long long)planner_.stat_exchange_, (unsigned long long)planner_.stat_rescue_,
-                       (unsigned long long)planner_.stat_ghost_, (unsigned long long)planner_.stat_evict_,
+          std::fprintf(stderr,
+                       "[coord] plans %llu free %llu exchange %llu rescue %llu "
+                       "ghost %llu evict %llu pending %llu prefetch %llu hit "
+                       "%llu waits %llu wait_ms %.1f\n",
+                       (unsigned long long)sequence,
+                       (unsigned long long)planner_.stat_free_,
+                       (unsigned long long)planner_.stat_exchange_,
+                       (unsigned long long)planner_.stat_rescue_,
+                       (unsigned long long)planner_.stat_ghost_,
+                       (unsigned long long)planner_.stat_evict_,
                        (unsigned long long)planner_.pending_jobs(),
                        (unsigned long long)planner_.stat_prefetch_,
                        (unsigned long long)planner_.stat_prefetch_hit_,
                        (unsigned long long)stat_waits_, stat_wait_ns_ / 1e6);
         if (plan_stats_ && sequence % 2000 == 0 && dma_demand_)
-          std::fprintf(stderr, "[coord] dma plans %llu fallback %llu dma_ms %.1f\n",
-                       (unsigned long long)stat_dma_, (unsigned long long)stat_dma_fallback_,
-                       stat_dma_ns_ / 1e6);
+          std::fprintf(
+              stderr, "[coord] dma plans %llu fallback %llu dma_ms %.1f\n",
+              (unsigned long long)stat_dma_,
+              (unsigned long long)stat_dma_fallback_, stat_dma_ns_ / 1e6);
         if (plan_stats_ && sequence % 2000 == 0) print_eval();
         if (plan_stats_ && sequence % 2000 == 0)
-          std::fprintf(stderr, "[coord] skip adopt %llu background loads %llu\n",
-                       (unsigned long long)planner_.stat_adopt_, (unsigned long long)stat_background_);
+          std::fprintf(stderr,
+                       "[coord] skip adopt %llu background loads %llu\n",
+                       (unsigned long long)planner_.stat_adopt_,
+                       (unsigned long long)stat_background_);
         store(control_ + 1, sequence);
         if (sequence == std::numeric_limits<uint64_t>::max())
           throw std::runtime_error("shared expert request sequence exhausted");
@@ -584,7 +623,10 @@ class SharedExpertCoordinator {
   uint64_t kind_completed_[2] = {0, 0};
   uint64_t hints_read_ = 0, stat_waits_ = 0, stat_wait_ns_ = 0;
   size_t layer_count_ = 0;
-  struct HintCand { int32_t e; float w; };
+  struct HintCand {
+    int32_t e;
+    float w;
+  };
   std::vector<std::vector<HintCand>> last_hint_[2];
   uint64_t eval_[2][8][2] = {};
   const bool prefetch_eval_ = std::getenv("VLLM_V41_PREFETCH_EVAL") != nullptr;
@@ -594,14 +636,20 @@ class SharedExpertCoordinator {
   }
   const bool prefetch_ = env_number("VLLM_V41_PREFETCH", 0) > 0;
   const bool dma_demand_ = env_number("VLLM_V41_DMA_DEMAND", 0) > 0;
-  const uint64_t dma_issue_ns_ = uint64_t(env_number("VLLM_V41_DMA_ISSUE_US", 300) * 1000);
-  const uint64_t dma_done_ns_ = uint64_t(env_number("VLLM_V41_DMA_DONE_US", 4000) * 1000);
-  uint64_t stat_dma_ = 0, stat_dma_fallback_ = 0, stat_dma_ns_ = 0, stat_background_ = 0;
+  const uint64_t dma_issue_ns_ =
+      uint64_t(env_number("VLLM_V41_DMA_ISSUE_US", 300) * 1000);
+  const uint64_t dma_done_ns_ =
+      uint64_t(env_number("VLLM_V41_DMA_DONE_US", 4000) * 1000);
+  uint64_t stat_dma_ = 0, stat_dma_fallback_ = 0, stat_dma_ns_ = 0,
+           stat_background_ = 0;
   const size_t bg_inflight_ = size_t(env_number("VLLM_V41_BG_INFLIGHT", 8));
   const size_t prefetch_topk_ = size_t(env_number("VLLM_V41_PREFETCH_TOPK", 8));
-  const size_t prefetch_budget_ = size_t(env_number("VLLM_V41_PREFETCH_BUDGET", 3));
-  const size_t prefetch_inflight_ = size_t(env_number("VLLM_V41_PREFETCH_INFLIGHT", 6));
-  const float prefetch_min_weight_ = float(env_number("VLLM_V41_PREFETCH_MIN_WEIGHT", 1.5));
+  const size_t prefetch_budget_ =
+      size_t(env_number("VLLM_V41_PREFETCH_BUDGET", 3));
+  const size_t prefetch_inflight_ =
+      size_t(env_number("VLLM_V41_PREFETCH_INFLIGHT", 6));
+  const float prefetch_min_weight_ =
+      float(env_number("VLLM_V41_PREFETCH_MIN_WEIGHT", 1.5));
   const uint64_t prefetch_wait_ns_ =
       uint64_t(env_number("VLLM_V41_PREFETCH_WAIT_US", 3000) * 1000);
   const unsigned ranks_;
