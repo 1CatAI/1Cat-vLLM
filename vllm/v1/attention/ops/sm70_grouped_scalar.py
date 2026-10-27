@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Explicit compact E4M3 scalar attention for SM70 target tail graphs."""
 
-_builtin_scalar_cache: dict = {}
-
 import torch
 
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -17,6 +15,7 @@ from vllm.v1.attention.ops.sm70_grouped_long import (
     run_six_head_groups,
 )
 
+_builtin_scalar_cache: dict = {}
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_scalar")
 
 

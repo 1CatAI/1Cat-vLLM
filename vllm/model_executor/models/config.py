@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -261,10 +262,8 @@ class Gemma4Config(VerifyAndUpdateConfig):
         per_layer = getattr(hf_text_config, "per_layer_config", None)
         global_head_dim = None
         if per_layer is not None:
-            try:
+            with contextlib.suppress(ValueError, IndexError, AttributeError):
                 global_head_dim = per_layer["full_attention"].head_dim
-            except (ValueError, IndexError, AttributeError):
-                pass
 
         # Only force Triton when head dimensions actually differ AND the
         # larger one exceeds FlashAttention's kernel limit (head_size <= 256).

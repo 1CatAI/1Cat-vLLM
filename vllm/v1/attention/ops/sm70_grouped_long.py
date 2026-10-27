@@ -5,7 +5,6 @@
 import hashlib
 import importlib.util
 import json
-_builtin_long_attention_cache: dict = {}
 from pathlib import Path
 
 import torch
@@ -14,6 +13,7 @@ from vllm.config.execution_policy import flash_v100_options
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
+_builtin_long_attention_cache: dict = {}
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
 
 # Capacity the shipped operator was qualified for. This is a claim about the
