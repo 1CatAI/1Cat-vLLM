@@ -95,3 +95,26 @@ def test_qpn8_mxfp8_prepare_rejects_exponents_outside_the_exact_range():
     scale[0, 0] = low - 1
     with pytest.raises(RuntimeError, match="exact QPN8 range"):
         tm.prepare_mxfp8_qpn8_linear(nn.Module(), weight, scale)
+
+
+@pytest.mark.parametrize(
+    "n,k,reason",
+    [
+        (4096, 8192, None),
+        (48, 128, "N % 32 == 0"),
+        # K = 160 is a valid MXFP8 width, but no split-K divides its 10 groups.
+        (64, 160, "no QPN8 launch configuration"),
+    ],
+)
+def test_qpn8_mxfp8_kernel_declines_shapes_it_cannot_pack(monkeypatch, n, k, reason):
+    """A shape QPN8 cannot pack goes to the next MXFP8 kernel at selection
+    instead of failing when the weights load."""
+    from vllm.model_executor.kernels.linear.mxfp8 import Mxfp8LinearLayerConfig
+
+    monkeypatch.setattr(pre_ampere, "_qpn8_fp8_available", lambda: (True, None))
+    ok, why = pre_ampere.Qpn8Mxfp8LinearKernel.can_implement(
+        Mxfp8LinearLayerConfig((n, k))
+    )
+    assert ok == (reason is None)
+    if reason is not None:
+        assert reason in why

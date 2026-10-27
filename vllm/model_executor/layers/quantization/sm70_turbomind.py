@@ -677,6 +677,10 @@ class FP8QPN8LinearState:
         self.sm75_mma = sm75_mma
 
 
+# Split-K values of the QPN8 launch table, largest first.
+_QPN8_SPLIT_K = (16, 12, 8)
+
+
 def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
     """Split-K, accumulator chains and code prefetch for a QPN8 GEMM.
 
@@ -685,10 +689,21 @@ def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
     accumulator chains.
     """
     groups = k // QPN2_GROUP_SIZE
-    for split_k in (16, 12, 8):
+    for split_k in _QPN8_SPLIT_K:
         if groups % split_k == 0:
             return split_k, 2, False
     raise RuntimeError(f"no QPN8 launch configuration for K={k}")
+
+
+def fp8_qpn8_shape_reason(n: int, k: int) -> str | None:
+    """Why QPN8 cannot pack an ``[N, K]`` weight, or None when it can: the
+    packing needs N % 32 and K % 16 to be zero, the launch table a split-K
+    that divides K's 16-element code groups."""
+    if n % 32 != 0 or k % 16 != 0:
+        return f"QPN8 needs N % 32 == 0 and K % 16 == 0, got N={n}, K={k}"
+    if all((k // QPN2_GROUP_SIZE) % split_k for split_k in _QPN8_SPLIT_K):
+        return f"no QPN8 launch configuration for K={k}"
+    return None
 
 
 # One CTA of the M <= 8 QPN8 GEMM covers this many output columns.
@@ -810,8 +825,9 @@ def _prepare_fp8_qpn8_linear(
     from vllm import _sm70_ops as sm70_ops
 
     n, k = (int(dim) for dim in weight.shape)
-    if n % 32 != 0 or k % 16 != 0:
-        raise RuntimeError(f"QPN8 needs N % 32 == 0 and K % 16 == 0, got N={n}, K={k}.")
+    reason = fp8_qpn8_shape_reason(n, k)
+    if reason is not None:
+        raise RuntimeError(f"{reason}.")
     codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(weight.contiguous(), scales)
     layer.register_buffer("_sm70_turing_fp8_packed_codes", codes, persistent=False)
     layer.register_buffer(

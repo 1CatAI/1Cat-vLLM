@@ -13,6 +13,7 @@ from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MarlinNvFp4LinearKernel,
+    Mxfp8LinearLayerConfig,
     NvFp4LinearLayerConfig,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
@@ -2123,8 +2124,6 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 "Dynamic quantization is not supported."
             )
 
-        self.kernel = init_mxfp8_linear_kernel()
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2144,6 +2143,11 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             )
 
         output_size_per_partition = sum(output_partition_sizes)
+        self.kernel = init_mxfp8_linear_kernel(
+            Mxfp8LinearLayerConfig(
+                (output_size_per_partition, input_size_per_partition)
+            )
+        )
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
