@@ -2348,6 +2348,46 @@ def wvSplitKQ(
 
 
 # moe
+def csf32_expand(
+    out: torch.Tensor,
+    bases: torch.Tensor,
+    codes: torch.Tensor,
+    page_bases: torch.Tensor,
+    offsets: torch.Tensor,
+    exceptions: torch.Tensor,
+    exception_start: torch.Tensor,
+    entries: torch.Tensor,
+    gids: torch.Tensor,
+    goff: torch.Tensor,
+    rows: int,
+    groups: int,
+    projections: int,
+    group_rows: int,
+    pairs_per_program: int,
+    runs: int,
+) -> None:
+    # Plain CUDA without tensor-core instructions; it is built with the SM70
+    # kernel family, which gives the native op its name.
+    torch.ops._C.csf32_expand_sm70(
+        out,
+        bases,
+        codes,
+        page_bases,
+        offsets,
+        exceptions,
+        exception_start,
+        entries,
+        gids,
+        goff,
+        rows,
+        groups,
+        projections,
+        group_rows,
+        pairs_per_program,
+        runs,
+    )
+
+
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
     torch.ops._moe_C.moe_sum(input, output)
 
