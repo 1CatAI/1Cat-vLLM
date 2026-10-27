@@ -105,9 +105,8 @@ __global__ void fp8_qpn8_row_group_scale_sm70_kernel(
   }
   const int k_group = static_cast<int>(index / n);
   const int col = static_cast<int>(index % n);
-  group_scales[index] =
-      __float2half(scales[static_cast<size_t>(col) * k_groups + k_group] *
-                   256.0f);
+  group_scales[index] = __float2half(
+      scales[static_cast<size_t>(col) * k_groups + k_group] * 256.0f);
 }
 
 __global__ void fp8_qpn8_channel_scale_sm70_kernel(
@@ -330,8 +329,9 @@ __global__ void fp8_qpn8_sm70_kernel(
       // One scale per column and 32 K, i.e. per two 16-wide code groups.
       const int scale_group = group >> 1;
       if (scale_group != loaded_scale_group) {
-        loaded_scale = __ldg(group_scales + static_cast<size_t>(scale_group) * n +
-                             tile * 32 + qpn8_col_from_lane(lane));
+        loaded_scale =
+            __ldg(group_scales + static_cast<size_t>(scale_group) * n +
+                  tile * 32 + qpn8_col_from_lane(lane));
         loaded_scale_group = scale_group;
       }
     } else {
@@ -1461,19 +1461,19 @@ void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
 // MXFP8 row-group scales, M <= 8: the instantiations the launch configuration
 // of a dense linear can pick. M=1 gets the single-row-tile kernel.
 static void launch_fp8_qpn8_row_group_sm70(const uint8_t* codes,
-                                    const half* group_scales,
-                                    const half* input, half* output, int n,
-                                    int k, int m, int split_k,
-                                    cudaStream_t stream) {
-#define VLLM_LAUNCH_QPN8_ROW_GROUP(SPLIT)                                   \
-  do {                                                                      \
-    if (m == 1) {                                                           \
-      launch_fp8_qpn8_sm70<SPLIT, 2, true, false, true, 1, true>(           \
-          codes, group_scales, input, output, n, k, 1, false, stream);      \
-    } else {                                                                \
-      launch_fp8_qpn8_sm70<SPLIT, 2, true, false, false, 1, true>(          \
-          codes, group_scales, input, output, n, k, m, false, stream);      \
-    }                                                                       \
+                                           const half* group_scales,
+                                           const half* input, half* output,
+                                           int n, int k, int m, int split_k,
+                                           cudaStream_t stream) {
+#define VLLM_LAUNCH_QPN8_ROW_GROUP(SPLIT)                              \
+  do {                                                                 \
+    if (m == 1) {                                                      \
+      launch_fp8_qpn8_sm70<SPLIT, 2, true, false, true, 1, true>(      \
+          codes, group_scales, input, output, n, k, 1, false, stream); \
+    } else {                                                           \
+      launch_fp8_qpn8_sm70<SPLIT, 2, true, false, false, 1, true>(     \
+          codes, group_scales, input, output, n, k, m, false, stream); \
+    }                                                                  \
   } while (0)
   if (split_k == 8) {
     VLLM_LAUNCH_QPN8_ROW_GROUP(8);
