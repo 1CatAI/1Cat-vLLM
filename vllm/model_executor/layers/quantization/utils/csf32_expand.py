@@ -19,6 +19,8 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
+from vllm import _custom_ops as ops
+
 CSF32_SCALE_ENCODING = "csf_32x2_v1"
 
 # Blocks a launch should offer the GPU: about one wave (80 SMs x 8 resident blocks of
@@ -224,7 +226,7 @@ def expand_csf32_experts(
     row_tiles = planes.projections * (planes.rows // 128)
     tile_pairs = planes.groups // 4
     runs = _runs_per_row(tile_pairs, group_rows * row_tiles)
-    torch.ops._C.csf32_expand_sm70(
+    ops.csf32_expand(
         out,
         planes.bases,
         planes.codes,
