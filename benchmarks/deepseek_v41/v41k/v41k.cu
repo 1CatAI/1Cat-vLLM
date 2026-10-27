@@ -2781,10 +2781,16 @@ void v41k_gate_up4(torch::Tensor down_in, torch::Tensor x, torch::Tensor ids32,
         reinterpret_cast<const uint32_t*>(book.data_ptr()), routes, 6,     \
         tokens);                                                           \
   }
-  if (type == 16)
+  // clang-format off
+  if (type == 16) {
     V41K_GU4(16)
-    else if (type == 17) V41K_GU4(17) else V41K_GU4(29)
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else if (type == 17) {
+    V41K_GU4(17)
+  } else {
+    V41K_GU4(29)
+  }
+  // clang-format on
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void v41k_down4(torch::Tensor out, torch::Tensor h, torch::Tensor ids32,
@@ -3334,12 +3340,18 @@ void v41k_down_rows(torch::Tensor out, torch::Tensor gathered,
   TORCH_CHECK(gathered.numel() >= 4 * rank_stride && out.size(1) == 5120);
   auto stream = at::cuda::getCurrentCUDAStream();
   const int sub = rows % 4 ? 16 : (rows % 8 ? 8 : 4);
-#define V41K_DNR(T, W)                                              \
-  do {                                                              \
-    if (sub == 16)                                                  \
-      V41K_DNR2(T, W, 16)                                           \
-      else if (sub == 8) V41K_DNR2(T, W, 8) else V41K_DNR2(T, W, 4) \
+// clang-format off
+#define V41K_DNR(T, W)     \
+  do {                     \
+    if (sub == 16) {       \
+      V41K_DNR2(T, W, 16)  \
+    } else if (sub == 8) { \
+      V41K_DNR2(T, W, 8)   \
+    } else {               \
+      V41K_DNR2(T, W, 4)   \
+    }                      \
   } while (0)
+// clang-format on
 #define V41K_DNR2(T, W, S)                                                   \
   v41k::down_rows<T, W, S><<<rows_local / rows, 32 * W, 0, stream>>>(        \
       reinterpret_cast<half*>(out.data_ptr()), gathered.data_ptr<uint8_t>(), \
