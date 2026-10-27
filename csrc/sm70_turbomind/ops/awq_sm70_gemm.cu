@@ -964,8 +964,10 @@ void validate_fp8_inputs(const torch::Tensor& qweight,
               "fp8_sm70_prepare: scales must be float32.");
   TORCH_CHECK(qweight.dim() == 2, "fp8_sm70_prepare: qweight must be 2D.");
   TORCH_CHECK(scales.dim() == 2, "fp8_sm70_prepare: scales must be 2D.");
-  TORCH_CHECK(group_size == 128,
-              "fp8_sm70_prepare: only group_size=128 is supported.");
+  // 128: 128 x 128 blocks (DeepSeek-V3/V4 style); 32: 32 x 32 blocks
+  // (e.g. DeepSeek-V4.1). sm70_884_8.cu registers both tile families.
+  TORCH_CHECK(group_size == 128 || group_size == 32,
+              "fp8_sm70_prepare: only group_size 128 or 32 is supported.");
 }
 
 void validate_f16_weight(const torch::Tensor& weight, const char* op_name) {
@@ -2385,8 +2387,10 @@ void fp8_sm70_dequantize_out(torch::Tensor output, torch::Tensor packed_weight,
   TORCH_CHECK(output.is_contiguous() && packed_weight.is_contiguous() &&
                   packed_scales.is_contiguous(),
               "SM70 FP8 prefill dequant expects contiguous tensors.");
-  TORCH_CHECK(group_size == 128,
-              "SM70 FP8 prefill dequant requires group_size=128.");
+  // The kernel indexes groups as k / group_size, so 128 x 128 and 32 x 32
+  // block scales share it.
+  TORCH_CHECK(group_size == 128 || group_size == 32,
+              "SM70 FP8 prefill dequant requires group_size 128 or 32.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   const int64_t k = output.size(0);
@@ -3681,6 +3685,9 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
                                             int64_t group_size,
                                             bool interleave_gated_silu) {
   validate_fp8_inputs(qweight, scales, group_size);
+  TORCH_CHECK(group_size == 128 || !interleave_gated_silu,
+              "fp8_sm70_prepare: the gated-SiLU interleave is only qualified "
+              "for group_size=128.");
 
   qweight = qweight.contiguous();
   scales = scales.contiguous();
@@ -3698,7 +3705,7 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
       scales.size(1) == (k + group_size - 1) / group_size;
   TORCH_CHECK(channelwise_scales || blockwise_scales,
               "fp8_sm70_prepare: expected [N, 1] channel scales or "
-              "[ceil(N/128), ceil(K/128)] block scales.");
+              "[ceil(N/group), ceil(K/group)] block scales.");
 
   const auto converters = turbomind::gemm::GetConverters(
       turbomind::kHalf, turbomind::kFloat8_e4m3, turbomind::kHalf, true, 70);
@@ -4268,8 +4275,10 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
               "fp8_gemm_sm70: scales must be float16.");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16,
               "fp8_gemm_sm70: output must be float16.");
-  TORCH_CHECK(group_size == 128,
-              "fp8_gemm_sm70: only group_size=128 is supported.");
+  TORCH_CHECK(group_size == 128 ||
+                  (group_size == 32 && !exact_8k_prefill_prescaled && !gated_silu),
+              "fp8_gemm_sm70: group_size 128, or 32 without the pre-scaled "
+              "and fused gated-SiLU variants, is supported.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_feats));
   const int device = in_feats.get_device();
