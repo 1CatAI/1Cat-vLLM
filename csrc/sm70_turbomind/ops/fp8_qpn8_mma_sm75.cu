@@ -2,13 +2,13 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
 // Block-FP8 (or MXFP8 row-group) GEMM on the QPN8 packed codes with Turing's
-// m16n8k8 tensor-core MMA. Turing executes the Volta m8n8k4 MMA of the packed GEMMs at half its
-// tensor rate, and above M=8 the block-FP8 route otherwise reconstructs the
-// whole FP16 weight on every call. Here each CTA decodes and block-scales its
-// codes once while staging them into shared memory, exactly as the dense
-// reconstruction rounds them, and feeds both operands through ldmatrix.
-// No second weight layout is held. Split-K across CTAs writes FP32 partials
-// that a second kernel sums in fixed split order.
+// m16n8k8 tensor-core MMA. Turing executes the Volta m8n8k4 MMA of the packed
+// GEMMs at half its tensor rate, and above M=8 the block-FP8 route otherwise
+// reconstructs the whole FP16 weight on every call. Here each CTA decodes and
+// block-scales its codes once while staging them into shared memory, exactly as
+// the dense reconstruction rounds them, and feeds both operands through
+// ldmatrix. No second weight layout is held. Split-K across CTAs writes FP32
+// partials that a second kernel sums in fixed split order.
 
 #include <torch/all.h>
 
@@ -96,8 +96,8 @@ __global__ __launch_bounds__(kThreads, MinBlocks) void fp8_qpn8_mma_sm75_kernel(
                            k_begin / 16 + b_group) *
                               32 +
                           lane;
-  const half* scale_source =
-      RowGroupScales ? group_scales + n0 + b_row : group_scales + n0 / 32 + b_tile;
+  const half* scale_source = RowGroupScales ? group_scales + n0 + b_row
+                                            : group_scales + n0 / 32 + b_tile;
   const int tiles_n32 = n >> 5;
 
   // One K step held in registers on its way into shared memory. The scale is
@@ -399,15 +399,15 @@ void fp8_qpn8_mma_sm75_out(torch::Tensor out, torch::Tensor input,
   const TileChoice tile = choose_tile(m, n, k, properties->multiProcessorCount);
   const int splits = tile.splits;
 
-#define VLLM_LAUNCH_QPN8_MMA(BLOCK_M, WARPS_M, MIN_BLOCKS)                    \
-  do {                                                                         \
-    if (row_group_scales) {                                                    \
-      launch_fp8_qpn8_mma_sm75<BLOCK_M, WARPS_M, MIN_BLOCKS, true>(            \
-          out, input, codes, group_scales, splits, stream);                    \
-    } else {                                                                   \
-      launch_fp8_qpn8_mma_sm75<BLOCK_M, WARPS_M, MIN_BLOCKS, false>(           \
-          out, input, codes, group_scales, splits, stream);                    \
-    }                                                                          \
+#define VLLM_LAUNCH_QPN8_MMA(BLOCK_M, WARPS_M, MIN_BLOCKS)           \
+  do {                                                               \
+    if (row_group_scales) {                                          \
+      launch_fp8_qpn8_mma_sm75<BLOCK_M, WARPS_M, MIN_BLOCKS, true>(  \
+          out, input, codes, group_scales, splits, stream);          \
+    } else {                                                         \
+      launch_fp8_qpn8_mma_sm75<BLOCK_M, WARPS_M, MIN_BLOCKS, false>( \
+          out, input, codes, group_scales, splits, stream);          \
+    }                                                                \
   } while (0)
 
   switch (tile.block_m) {

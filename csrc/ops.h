@@ -339,16 +339,13 @@ void csf32_expand_sm70(torch::Tensor out, torch::Tensor bases,
                        int64_t groups, int64_t projections, int64_t group_rows,
                        int64_t pairs_per_program, int64_t runs);
 
-void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
-                         torch::Tensor qscales, torch::Tensor gscales,
-                         torch::Tensor perm, torch::Tensor gids,
-                         torch::Tensor goff, int64_t topk,
-                         torch::Tensor y_slots, bool x_slot_major,
-                         int64_t num_tokens, int64_t splitk, int64_t scale_mode,
-                         int64_t fragment_order,
-                         std::optional<torch::Tensor> s5_base,
-                         std::optional<torch::Tensor> s5_nib,
-                         std::optional<torch::Tensor> s5_hi);
+void skinny_moe_qpn_sm70(
+    torch::Tensor x, torch::Tensor qcodes, torch::Tensor qscales,
+    torch::Tensor gscales, torch::Tensor perm, torch::Tensor gids,
+    torch::Tensor goff, int64_t topk, torch::Tensor y_slots, bool x_slot_major,
+    int64_t num_tokens, int64_t splitk, int64_t scale_mode,
+    int64_t fragment_order, std::optional<torch::Tensor> s5_base,
+    std::optional<torch::Tensor> s5_nib, std::optional<torch::Tensor> s5_hi);
 
 void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,
