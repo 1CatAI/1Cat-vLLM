@@ -876,11 +876,9 @@ def choose_mp_linear_kernel(
     )
 
 
-def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
+def init_mxfp8_linear_kernel(config: Mxfp8LinearLayerConfig) -> Mxfp8LinearKernel:
     """Select and instantiate the best MXFP8 linear kernel for the
-    current platform."""
-    config = Mxfp8LinearLayerConfig()
-
+    current platform and the layer's shape."""
     platform = current_platform._enum
     possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
 

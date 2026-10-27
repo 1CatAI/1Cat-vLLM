@@ -179,7 +179,12 @@ class Qpn8Mxfp8LinearKernel(Mxfp8LinearKernel):
 
     @classmethod
     def can_implement(cls, c):
-        return _qpn8_fp8_available()
+        available = _qpn8_fp8_available()
+        if not available[0]:
+            return available
+        # The E8M0 exponent range is checked when the weights load.
+        reason = tm.fp8_qpn8_shape_reason(*c.partition_weight_shape)
+        return (False, reason) if reason is not None else (True, None)
 
     def process_weights_after_loading(self, layer):
         tm.prepare_mxfp8_qpn8_linear(layer, layer.weight, layer.weight_scale)
