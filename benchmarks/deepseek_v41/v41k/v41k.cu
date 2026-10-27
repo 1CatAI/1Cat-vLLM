@@ -3340,7 +3340,7 @@ void v41k_down_rows(torch::Tensor out, torch::Tensor gathered,
   TORCH_CHECK(gathered.numel() >= 4 * rank_stride && out.size(1) == 5120);
   auto stream = at::cuda::getCurrentCUDAStream();
   const int sub = rows % 4 ? 16 : (rows % 8 ? 8 : 4);
-// clang-format off
+  // clang-format off
 #define V41K_DNR(T, W)     \
   do {                     \
     if (sub == 16) {       \
