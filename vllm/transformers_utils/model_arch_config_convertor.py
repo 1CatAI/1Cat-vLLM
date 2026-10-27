@@ -522,7 +522,10 @@ class LongCatFlashMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
 class Gemma4MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
     def __init__(self, hf_config, hf_text_config):
         super().__init__(hf_config, hf_text_config)
-        if not getattr(hf_text_config, "allow_global_per_layer_attribute_access", False):
+        _allow = getattr(
+            hf_text_config, "allow_global_per_layer_attribute_access", False
+        )
+        if not _allow:
             hf_text_config.allow_global_per_layer_attribute_access = True
 
     def get_hidden_size(self) -> int:
@@ -540,7 +543,10 @@ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
     def __init__(self, hf_config, hf_text_config):
         super().__init__(hf_config, hf_text_config)
         # Allow global access to per-layer attrs (head_dim, num_kv_heads).
-        if not getattr(hf_text_config, "allow_global_per_layer_attribute_access", False):
+        _allow = getattr(
+            hf_text_config, "allow_global_per_layer_attribute_access", False
+        )
+        if not _allow:
             hf_text_config.allow_global_per_layer_attribute_access = True
 
     def is_mm_prefix_lm(self) -> bool:

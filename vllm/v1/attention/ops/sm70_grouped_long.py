@@ -5,7 +5,6 @@
 import hashlib
 import importlib.util
 import json
-_builtin_long_attention_cache: dict = {}
 from pathlib import Path
 
 import torch
@@ -15,6 +14,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.v1.attention.ops.sm70_grouped import model_context_limit
 
+_builtin_long_attention_cache: dict = {}
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
 
 # Compatibility capacity of binaries predating the dynamic-context ABI.

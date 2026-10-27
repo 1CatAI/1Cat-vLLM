@@ -61,7 +61,6 @@ using namespace nvcuda::wmma;
 #define BLOCK_N_512 32
 #define WARPS_512 16
 
-
 template <int D, bool LOW_SMEM = false>
 struct KernelConfig {
   static constexpr int BLOCK_M =
@@ -1006,7 +1005,7 @@ at::Tensor flash_attention_qk_scores(const at::Tensor& q, const at::Tensor& k,
   TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
   auto scores = torch::full({B, H, M, N}, -1e30f,
-                             torch::dtype(torch::kFloat32).device(q.device()));
+                            torch::dtype(torch::kFloat32).device(q.device()));
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   switch (D) {
