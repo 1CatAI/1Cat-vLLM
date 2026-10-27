@@ -17,7 +17,7 @@ import torch
 
 from vllm.transformers_utils.gguf_tensor_reader import quant_size
 
-DEVICE_LATTICE_TYPES = frozenset((18, 21, 22))
+DEVICE_LATTICE_TYPES = frozenset((16, 17, 18, 21, 22, 29))
 DEVICE_LUT4_TYPES = frozenset((20, 23))
 DEVICE_AFFINE_TYPES = frozenset((42,))
 DEVICE_TYPES = DEVICE_LATTICE_TYPES | DEVICE_LUT4_TYPES | DEVICE_AFFINE_TYPES
@@ -68,7 +68,7 @@ def _blocks(data: torch.Tensor, weight_type: int):
 
 
 def lattice_storage(data: torch.Tensor, weight_type: int):
-    """IQ2_S/IQ3_XXS/IQ3_S rows -> (U2 codes [N,K], packed metadata [N,K/g]).
+    """IQ1/2/3 rows -> (U2 codes [N,K], packed metadata [N,K/g]).
 
     Equivalent to ``transcode_lattice(...).mma884_storage()`` with the
     metadata already reinterpreted as the signed type the native prepare
@@ -78,19 +78,50 @@ def lattice_storage(data: torch.Tensor, weight_type: int):
         raise ValueError(f"GGUF type {weight_type} has no device lattice codec")
     blocks, n, k = _blocks(data, weight_type)
     count = blocks.shape[0]
-    d = _f16(blocks, 0)
-    if weight_type == 18:
-        group, grid_width = 32, 4
-        indices = blocks[:, 2:66].long()
-        meta = _u32(blocks, 66, 8)
+    deltas = None
+    if weight_type == 29:
+        group, grid_width = 16, 8
+        words = blocks[:, 48:].long().reshape(count, 4, 2)
+        words = words[..., 0] | (words[..., 1] << 8)
+        shifts = torch.tensor([12, 8, 4, 0], device=data.device)
+        bits = ((words & 0xF000) >> shifts).sum(-1).to(torch.int16)
+        d = bits.view(torch.float16).float().unsqueeze(-1)
+        shifts = torch.tensor([0, 3, 6, 9], device=data.device)
+        local = ((words[..., None] >> shifts) & 7).reshape(count, 16)
+        scales = d * (2 * local + 1).float()
+        high = _nibbles(blocks[:, 32:48]).long()
+        indices = blocks[:, :32].long() | ((high & 7) << 8)
+        deltas = (high >> 3) & 1
+        signs = torch.zeros((count, 32), dtype=torch.uint8, device=data.device)
+    elif weight_type in (16, 18):
+        group, grid_width = 32, 8 if weight_type == 16 else 4
+        d = _f16(blocks, 0)
+        if weight_type == 16:
+            words = _u32(blocks, 2, 16).reshape(count, 8, 2)
+            shifts = torch.tensor([0, 8, 16, 24], device=data.device)
+            indices = ((words[..., :1] >> shifts) & 255).reshape(count, 32)
+            meta = words[..., 1]
+        else:
+            indices = blocks[:, 2:66].long()
+            meta = _u32(blocks, 66, 8)
         scales = d * (0.5 + (meta >> 28).float())
-        scales = scales * 0.5
+        scales = scales * (0.25 if weight_type == 16 else 0.5)
         sign_indices = (
             meta[..., None] >> torch.tensor([0, 7, 14, 21], device=data.device)
         ) & 127
         signs = _ksigns(data.device)[sign_indices.reshape(count, 32)]
+    elif weight_type == 17:
+        group, grid_width = 16, 8
+        d = _f16(blocks, 0)
+        words = blocks[:, 2:66].long().reshape(count, 32, 2)
+        words = words[..., 0] | (words[..., 1] << 8)
+        indices = words & 511
+        signs = _ksigns(data.device)[words >> 9]
+        scales = d * (0.5 + _nibbles(blocks[:, 66:]).float())
+        scales = scales * 0.25
     elif weight_type == 22:
         group, grid_width = 16, 8
+        d = _f16(blocks, 0)
         qh = blocks[:, 66:74].long()
         high = (
             (qh[..., None] >> torch.tensor([0, 2, 4, 6], device=data.device)) & 3
@@ -101,6 +132,7 @@ def lattice_storage(data: torch.Tensor, weight_type: int):
         scales = scales * 0.25
     else:
         group, grid_width = 32, 4
+        d = _f16(blocks, 0)
         qh = blocks[:, 66:74].long()
         high = ((qh[..., None] >> torch.arange(8, device=data.device)) & 1).reshape(
             count, 64
@@ -112,7 +144,11 @@ def lattice_storage(data: torch.Tensor, weight_type: int):
     indices = indices.reshape(n, k // grid_width)
     signs = signs.reshape(n, k // 8).long()
     scale_bits = scales.view(torch.int16).long() & 0xFFFF
-    if grid_width == 8:
+    if weight_type == 29:
+        assert deltas is not None
+        packets = indices | (deltas.reshape(n, k // 8) << 15)
+        metadata = scales.view(torch.int16)
+    elif grid_width == 8:
         packets = (indices & 255) | (signs << 8)
         high = (indices >> 8).reshape(n, k // group, -1)
         shifts = 16 + 2 * torch.arange(high.shape[-1], device=data.device)

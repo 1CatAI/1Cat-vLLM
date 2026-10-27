@@ -131,6 +131,7 @@ def native_dense(
     weight_type: int,
     prefill_min_m: int = 8,
     max_dequant_bytes: int = 0,
+    v41_q5_hmma: bool = False,
 ) -> torch.Tensor | None:
     if weight_type not in NATIVE_TYPES or not native_available():
         return None
@@ -147,6 +148,26 @@ def native_dense(
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     volta = current_platform.is_device_capability((7, 0), device_id=device_index)
+    if (
+        v41_q5_hmma
+        and volta
+        and weight_type == 13
+        and x.ndim == 2
+        and x.dtype == torch.float16
+        and 1 <= x.shape[0] <= 6
+        and 0 < weight.shape[0] <= 65536
+        and weight.shape[0] % 64 == 0
+        and (not max_dequant_bytes or max_dequant_bytes >= 16 * weight.shape[0] * 4)
+    ):
+        if not hasattr(native, "ggml_dense_q5_k_hmma"):
+            raise RuntimeError("V4.1 Q5_K HMMA requires rebuilding vllm._C_gguf")
+        return native.ggml_dense_q5_k_hmma(
+            weight,
+            x,
+            0,
+            min(max_dequant_bytes or 32 * 1024**2, 32 * 1024**2),
+            vector_decode=True,
+        )
 
     def blas():
         if max_dequant_bytes:

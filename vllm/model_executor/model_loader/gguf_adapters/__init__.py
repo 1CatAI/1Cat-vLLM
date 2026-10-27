@@ -5,6 +5,10 @@
 
 def get_gguf_adapter(config, tp_size=1):
     text = config.get_text_config()
+    if text.model_type == "deepseek_v41_text":
+        from .deepseek_v41 import DeepseekV41Adapter
+
+        return DeepseekV41Adapter(text, tp_size=tp_size)
     if getattr(text, "gguf_architecture", None) == "dflash" or "DFlash2DraftModel" in (
         getattr(text, "architectures", None) or []
     ):

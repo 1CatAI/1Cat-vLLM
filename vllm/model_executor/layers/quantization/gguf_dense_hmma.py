@@ -17,6 +17,10 @@ from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _FORMATS = {12: 0, 13: 1, 14: 2, 20: 3, 23: 3, 8: 4}
+# Models may register further measured (k, n) shapes (e.g. DeepSeek-V4.1).
+EXTRA_SEGMENT_SHAPES: set[tuple[int, int]] = set()
+# Larger registered shapes may need a larger restore workspace.
+MIN_WORKSPACE_BYTES = {"weight": 0, "stats": 0}
 # The two streams may overlap shared and routed work. Keep shared scratch
 # separate from ordinary dense projections; layers within each stream are ordered.
 _workspaces = {}
@@ -31,12 +35,17 @@ def workspace(device, shared=False):
         # K2560, or K160/N2560. Keep independent banks for overlapping streams.
         weight_bytes = (1 if shared else 10) * 1024**2
         stats_bytes = (1 if shared else 5) * 1024**2
+        if not shared:
+            weight_bytes = max(weight_bytes, MIN_WORKSPACE_BYTES["weight"])
+            stats_bytes = max(stats_bytes, MIN_WORKSPACE_BYTES["stats"])
         partial_elements = 128 * 1024 if shared else 1024 * 1024
         _workspaces[key] = dict(
             weight=torch.empty(weight_bytes, device=device, dtype=torch.uint8),
             stats=torch.empty(stats_bytes, device=device, dtype=torch.uint8),
             partial=torch.empty(partial_elements, device=device, dtype=torch.float32),
-            counters=torch.zeros(1024, device=device, dtype=torch.int32),
+            # tiles(N/32) x ceil(M/8) for M <= 40 and every admitted N (1024 overflowed
+            # for short 33-40 token prefills of wide projections)
+            counters=torch.zeros(8192, device=device, dtype=torch.int32),
             h=torch.empty((32, 160), device=device, dtype=torch.float16),
             gate=torch.empty(32, device=device, dtype=torch.float16),
         )
@@ -58,6 +67,7 @@ def prepare_segment_bank(projection, canonical, device):
             for width in (128, 160, 256, 320, 512, 1536, 2560, 3072, 3328, 3584, 4096)
         }
         | {(160, 2560), (1536, 2560)}
+        | EXTRA_SEGMENT_SHAPES
     ):
         reason = "segment_shape_has_no_calibration"
     elif projection.output_padding:

@@ -606,7 +606,13 @@ def copy_and_expand_dflash_inputs_kernel(
         valid_ctx_end = ctx_end - num_rejected
     else:
         valid_ctx_end = ctx_end
-    last_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+    # Async padded batches can pair a stale rejected count with a new
+    # request; keep the anchor index inside this request context.
+    last_idx = tl.minimum(
+        tl.maximum(valid_ctx_end - 1, ctx_start), total_input_tokens - 1
+    )
+    last_idx = tl.maximum(last_idx, 0)
+    last_pos = tl.load(target_positions_ptr + last_idx)
     query_pos = last_pos + 1 + query_off
     query_out = req_idx * num_query_per_req + query_off
 

@@ -115,6 +115,30 @@ class DSparkProposer(DFlashProposer):
                 "DSpark sample rows must be divisible by "
                 f"num_speculative_tokens={self.num_speculative_tokens}, got {num_rows}."
             )
+        greedy_graph = getattr(self.model, "greedy_draft_tokens", None)
+        if (
+            greedy_graph is not None
+            and batch_size == 1
+            and logits is None
+            and sampling_metadata is not None
+            and sampling_metadata.all_greedy
+            and not self.collect_confidence_logits
+            and self._static_draft_vocab is None
+        ):
+            tokens = greedy_graph(hidden_states, self.input_ids[:1])
+            if tokens is not None:
+                self._last_confidence_logits = None
+                self._last_verification_lengths = (
+                    torch.full(
+                        (1,),
+                        self._max_verification_tokens,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                    if self.confidence_scheduling_enabled
+                    else None
+                )
+                return tokens, None
         if logits is None:
             logits = self.model.compute_logits(hidden_states)
         base_logits = logits.view(batch_size, self.num_speculative_tokens, -1)

@@ -456,7 +456,10 @@ COMPATIBILITY_CONSUMERS = {
     "vllm/sm70_decode_trace.py": {"sm70_decode_event_trace_enabled", "_should_log"},
     "csrc/attention/sm70_79t/register.cpp": {"policy_value"},
     "flash-attention-v100/include/flash_v100_policy.h": {"value"},
-    "csrc/sm70_turbomind/ops/awq_sm70_gemm.cu": {"glm_mhc_pre_threads"},
+    "csrc/sm70_turbomind/ops/awq_sm70_gemm.cu": {
+        "glm_mhc_pre_threads",
+        "mxfp4_moe_dense_stage_sm70_out",
+    },
 }
 
 CONFIG_INITIALIZERS = {
@@ -582,4 +585,25 @@ COMPATIBILITY_CONSUMERS["csrc/quantization/marlin/sm70_marlin_common.cuh"] = {
 }
 COMPATIBILITY_CONSUMERS["csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh"] = {
     "sm70_marlin_moe_auto_env_is_set",
+}
+
+# DS-V4.1 shared expert lane: prefetch/DMA constants read once when the lane
+# thread is constructed (csrc/gguf_shared_expert_lane.h, VLLM_V41_* registry).
+DYNAMIC_DOMAINS[("csrc/gguf_shared_expert_lane.h", "env_number")] = (
+    "initialization",
+    "VLLM_V41_PREFETCH*, VLLM_V41_DMA_* and VLLM_V41_BG_INFLIGHT lane constants",
+)
+# DS-V4.1 DSpark draft (M5 x top-3): the MXFP4 module sets the process default
+# before the native op reads it once on first use. Typed Sm70MxFp4MoEConfig
+# ownership is a follow-up.
+PARAMETER_BOUNDARIES["VLLM_SM70_MXFP4_GROUPED_ANY"] = (
+    "standalone_compatibility",
+    (
+        "Process default set by mxfp4_sm70_moe; static native read in "
+        "mxfp4_moe_dense_stage_sm70_out. One grouped launch for small "
+        "one-row-per-route batches; no algorithm or numerics change."
+    ),
+)
+COMPATIBILITY_CONSUMERS["vllm/model_executor/layers/quantization/mxfp4_sm70_moe.py"] = {
+    ""
 }

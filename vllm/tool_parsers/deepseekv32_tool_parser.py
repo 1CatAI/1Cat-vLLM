@@ -53,6 +53,8 @@ class DeepSeekV32ToolParser(ToolParser):
 
     tool_call_start_token: str = "<｜DSML｜function_calls>"
     tool_call_end_token: str = "</｜DSML｜function_calls>"
+    invoke_tag_name: str = "invoke"
+    parameter_tag_name: str = "parameter"
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
@@ -79,16 +81,19 @@ class DeepSeekV32ToolParser(ToolParser):
             + re.escape(self.tool_call_end_token),
             re.DOTALL,
         )
+        invoke = re.escape(self.invoke_tag_name)
+        parameter = re.escape(self.parameter_tag_name)
         self.invoke_complete_regex = re.compile(
-            r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>', re.DOTALL
-        )
-        self.parameter_complete_regex = re.compile(
-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜parameter>',
+            rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>(.*?)</｜DSML｜{invoke}>',
             re.DOTALL,
         )
-        self.invoke_start_regex = re.compile(r'<｜DSML｜invoke\s+name="([^"]+)"\s*>')
+        self.parameter_complete_regex = re.compile(
+            rf'<｜DSML｜{parameter}\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜{parameter}>',
+            re.DOTALL,
+        )
+        self.invoke_start_regex = re.compile(rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>')
         self.parameter_start_regex = re.compile(
-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>'
+            rf'<｜DSML｜{parameter}\s+name="([^"]+)"\s+string="(true|false)"\s*>'
         )
 
         if not self.model_tokenizer:
@@ -396,8 +401,8 @@ class DeepSeekV32ToolParser(ToolParser):
         content_parts: list[str],
         tool_call_deltas: dict[int, DeltaToolCall],
     ) -> None:
-        parameter_end_token = "</｜DSML｜parameter>"
-        invoke_end_token = "</｜DSML｜invoke>"
+        parameter_end_token = f"</｜DSML｜{self.parameter_tag_name}>"
+        invoke_end_token = f"</｜DSML｜{self.invoke_tag_name}>"
 
         while True:
             if not self._in_tool_calls:

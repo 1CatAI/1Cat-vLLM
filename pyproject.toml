@@ -59,6 +59,8 @@ include = ["vllm*", "flash_qla*", "flash_attn_v100*"]
 "vllm/third_party/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
+# DS-V4.1 bring-up scripts (run by hand on the 4x V100 host).
+"benchmarks/deepseek_v41/**" = ["E501", "E402", "E741", "B023", "UP031", "SIM115"]
 
 [tool.ruff.lint]
 select = [

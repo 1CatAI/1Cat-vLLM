@@ -82,6 +82,9 @@ void gguf_prefill_transcode_sm70(torch::Tensor dst_w, torch::Tensor dst_s,
                  ctas, n_out, k, k_offset, src_stride, error);                 \
     break;
   switch (source_type) {
+    CASE(16, 256, 66)
+    CASE(17, 256, 74)
+    CASE(29, 256, 56)
     CASE(18, 256, 98)
     CASE(21, 256, 110)
     CASE(22, 256, 82)

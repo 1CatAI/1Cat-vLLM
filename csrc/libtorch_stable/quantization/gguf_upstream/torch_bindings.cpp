@@ -18,8 +18,12 @@ Tensor ggml_dense_mmvq(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor ggml_dense_mmq(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor ggml_dense_mmf(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor ggml_dense_blas(Tensor W, Tensor X, int64_t type, int64_t row);
+Tensor ggml_dense_q5_k_hmma(Tensor W, Tensor X, int64_t split_k,
+                            int64_t workspace_bytes, bool grouped,
+                            bool vector_decode);
 Tensor ggml_dequantize_upstream(Tensor W, int64_t type, int64_t m, int64_t n,
-                                std::optional<ScalarType> dtype);
+                                std::optional<ScalarType> dtype,
+                                bool batched_blocks);
 Tensor ggml_moe_upstream(Tensor X, Tensor W, Tensor ids, int64_t type,
                          int64_t row, int64_t top_k, int64_t tokens);
 Tensor ggml_moe_mmvq(Tensor X, Tensor W, Tensor ids, int64_t type, int64_t row,
@@ -45,8 +49,12 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def(
       "ggml_dense_blas(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
   ops.def(
+      "ggml_dense_q5_k_hmma(Tensor W, Tensor X, int split_k=0, "
+      "int workspace_bytes=33554432, bool grouped=False, "
+      "bool vector_decode=False) -> Tensor");
+  ops.def(
       "ggml_dequantize_upstream(Tensor W, int type, SymInt m, SymInt n, "
-      "ScalarType? dtype) -> Tensor");
+      "ScalarType? dtype, bool batched_blocks=False) -> Tensor");
   ops.def(
       "ggml_moe_upstream(Tensor X, Tensor W, Tensor ids, int type, SymInt row, "
       "SymInt top_k, SymInt tokens) -> Tensor");
@@ -67,6 +75,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_dense_mmq", TORCH_BOX(&ggml_dense_mmq));
   ops.impl("ggml_dense_mmf", TORCH_BOX(&ggml_dense_mmf));
   ops.impl("ggml_dense_blas", TORCH_BOX(&ggml_dense_blas));
+  ops.impl("ggml_dense_q5_k_hmma", TORCH_BOX(&ggml_dense_q5_k_hmma));
   ops.impl("ggml_dequantize_upstream", TORCH_BOX(&ggml_dequantize_upstream));
   ops.impl("ggml_moe_upstream", TORCH_BOX(&ggml_moe_upstream));
   ops.impl("ggml_moe_mmvq", TORCH_BOX(&ggml_moe_mmvq));
