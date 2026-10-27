@@ -145,18 +145,8 @@ class KVCacheSpec:
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
         Create a new KVCacheSpec from self but replacing the block size.
-
-        A padded physical page is a byte count, not a token count, so growing
-        the logical block grows the payload underneath it. Keep the padding at
-        or above the new payload; otherwise the returned spec fails its own
-        ``page_size_padded >= real_page_size`` invariant the first time
-        ``page_size_bytes`` is read.
         """
-        new_spec = replace(self, block_size=block_size)
-        padded = self.page_size_padded
-        if padded is not None and new_spec.real_page_size_bytes > padded:
-            new_spec = replace(new_spec, page_size_padded=new_spec.real_page_size_bytes)
-        return new_spec
+        return replace(self, block_size=block_size)
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -177,6 +167,23 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+
+    def copy_with_new_block_size(self, block_size: int) -> Self:
+        """
+        Create a new KVCacheSpec from self but replacing the block size.
+
+        A padded physical page is a byte count, not a token count, so growing
+        the logical block grows the payload underneath it. Keep the padding at
+        or above the new payload; otherwise the returned spec fails its own
+        ``page_size_padded >= real_page_size`` invariant the first time
+        ``page_size_bytes`` is read. (A MambaSpec page does not depend on the
+        block size, so only attention pages need this.)
+        """
+        new_spec = replace(self, block_size=block_size)
+        padded = self.page_size_padded
+        if padded is not None and new_spec.real_page_size_bytes > padded:
+            new_spec = replace(new_spec, page_size_padded=new_spec.real_page_size_bytes)
+        return new_spec
 
     def layout_cache_dtype(self, configured_dtype: str) -> str:
         """Bind carrier shape to this spec's declared quantization layout.
@@ -352,6 +359,22 @@ class FullAttentionSpec(AttentionSpec):
         )
 
 
+def _bind_cache_dtype_codec(spec: MLAAttentionSpec | SlidingWindowMLASpec):
+    # An MLA spec that names its cache dtype stores that codec. The KV
+    # allocator shapes every carrier by the codec a spec declares
+    # (AttentionSpec.layout_cache_dtype), so a packed fp8 page left at NONE
+    # would be reshaped as a 16-bit one of the wrong width.
+    if spec.cache_dtype_str is None:
+        return
+    codec = get_kv_quant_mode(spec.cache_dtype_str)
+    if spec.kv_quant_mode not in (KVQuantMode.NONE, codec):
+        raise ValueError(
+            f"kv_quant_mode {spec.kv_quant_mode.name} contradicts "
+            f"cache_dtype_str {spec.cache_dtype_str!r}"
+        )
+    object.__setattr__(spec, "kv_quant_mode", codec)
+
+
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
     if spec.alignment is None:
         return
@@ -398,6 +421,7 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        _bind_cache_dtype_codec(self)
         _apply_alignment_padding(self)
 
     @property
@@ -636,6 +660,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     model_version: str | None = None
 
     def __post_init__(self):
+        _bind_cache_dtype_codec(self)
         _apply_alignment_padding(self)
 
     @property
