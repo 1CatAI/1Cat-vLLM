@@ -218,10 +218,11 @@ __global__ void skinny_nvfp4_qpn(const uint8_t* __restrict__ qcodes,
 // order, so the result depends on neither RB nor NT.
 
 template <int SPLITK, int SCALE_MODE, int RB, int NT, bool S5>
-__global__ void __launch_bounds__(32 * SPLITK, (S5 && RB > 1 && SPLITK <= 8) ? 2 : 0)
+__global__ void __launch_bounds__(32 * SPLITK,
+                                  (S5 && RB > 1 && SPLITK <= 8) ? 2 : 0)
     skinny_nvfp4_moe_qpn(const uint8_t* __restrict__ qcodes,
-                         const uint8_t* __restrict__ qscales,
-                         const S5Planes s5, const float* __restrict__ gscales,
+                         const uint8_t* __restrict__ qscales, const S5Planes s5,
+                         const float* __restrict__ gscales,
                          const half* __restrict__ x, half* __restrict__ y_slots,
                          const int* __restrict__ perm,
                          const int* __restrict__ gids,
@@ -326,8 +327,8 @@ __global__ void __launch_bounds__(32 * SPLITK, (S5 && RB > 1 && SPLITK <= 8) ? 2
                     static_cast<uint32_t>(__ldg(s5_hi[nt] + g)), g, lane)),
                 gm2);
           else
-            sc2 = __hmul2(
-                group_scale<SCALE_MODE>(sb + (size_t)nt * SG * 32, g), gm2);
+            sc2 = __hmul2(group_scale<SCALE_MODE>(sb + (size_t)nt * SG * 32, g),
+                          gm2);
           dequant8_tm(q2.x, sc2, bq[nt] + 0);
           dequant8_tm(q2.y, sc2, bq[nt] + 4);
         }
@@ -359,8 +360,8 @@ __global__ void __launch_bounds__(32 * SPLITK, (S5 && RB > 1 && SPLITK <= 8) ? 2
       // so every read of a chunk's second group is bounded by gend. The guards
       // are uniform across the warp and fall away when Gq is even.
       uint2 qv[XCH][NT];
-      uint8_t sv[XCH][NT];     // raster scale bytes, or the nibble bytes of S5
-      uint32_t hv[XCH][NT];    // S5 only: high-bit words
+      uint8_t sv[XCH][NT];   // raster scale bytes, or the nibble bytes of S5
+      uint32_t hv[XCH][NT];  // S5 only: high-bit words
       auto load_weights = [&](int gc) {
 #pragma unroll
         for (int gi = 0; gi < XCH; gi++) {
@@ -499,14 +500,15 @@ __device__ __forceinline__ uint32_t s5_scale_word(uint32_t base4,
 }
 
 template <int SPLITK, int SCALE_MODE, int RB, int NT, bool S5>
-__global__ void __launch_bounds__(32 * SPLITK, (S5 && RB > 1 && SPLITK <= 8) ? 2 : 0)
+__global__ void __launch_bounds__(32 * SPLITK,
+                                  (S5 && RB > 1 && SPLITK <= 8) ? 2 : 0)
     skinny_nvfp4_moe_m16n8k8(
-    const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
-    const S5Planes s5, const float* __restrict__ gscales,
-    const half* __restrict__ x,
-    half* __restrict__ y_slots, const int* __restrict__ perm,
-    const int* __restrict__ gids, const int* __restrict__ goff, int N, int K,
-    int topk, int x_slot_major) {
+        const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
+        const S5Planes s5, const float* __restrict__ gscales,
+        const half* __restrict__ x, half* __restrict__ y_slots,
+        const int* __restrict__ perm, const int* __restrict__ gids,
+        const int* __restrict__ goff, int N, int K, int topk,
+        int x_slot_major) {
   static_assert(!S5 || SCALE_MODE == SCALE_NVFP4_FP8_16,
                 "five-bit scales carry fp8-e4m3 bytes");
   constexpr int ROWS = RB * 8;
@@ -536,8 +538,8 @@ __global__ void __launch_bounds__(32 * SPLITK, (S5 && RB > 1 && SPLITK <= 8) ? 2
   const uint32_t* sb = reinterpret_cast<const uint32_t*>(qscales) +
                        tile_index * SG * 8 + row_group;
   const half2 gm2 = __float2half2_rn(gscales[e] * 16384.f);
-  // Five-bit scales: the lane's four rows keep one base word for the kernel; the
-  // nibble and high words of a group come with its codes.
+  // Five-bit scales: the lane's four rows keep one base word for the kernel;
+  // the nibble and high words of a group come with its codes.
   uint32_t base4[NT];
   const uint32_t* nib_ptr[NT];
   const int32_t* hi_ptr[NT];
@@ -548,9 +550,9 @@ __global__ void __launch_bounds__(32 * SPLITK, (S5 && RB > 1 && SPLITK <= 8) ? 2
       base4[nt] =
           __ldg(reinterpret_cast<const uint32_t*>(s5.base + tile_s5 * 32) +
                 row_group);
-      nib_ptr[nt] = reinterpret_cast<const uint32_t*>(
-                        s5.nib + tile_s5 * (G >> 1) * 32) +
-                    row_group;
+      nib_ptr[nt] =
+          reinterpret_cast<const uint32_t*>(s5.nib + tile_s5 * (G >> 1) * 32) +
+          row_group;
       hi_ptr[nt] = s5.hi + tile_s5 * G;
     }
   }
@@ -718,16 +720,13 @@ torch::Tensor skinny_qpn_gemm_sm70(torch::Tensor x, torch::Tensor qcodes,
   return y;
 }
 
-void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
-                         torch::Tensor qscales, torch::Tensor gscales,
-                         torch::Tensor perm, torch::Tensor gids,
-                         torch::Tensor goff, int64_t topk,
-                         torch::Tensor y_slots, bool x_slot_major,
-                         int64_t num_tokens, int64_t splitk, int64_t scale_mode,
-                         int64_t fragment_order,
-                         std::optional<torch::Tensor> s5_base,
-                         std::optional<torch::Tensor> s5_nib,
-                         std::optional<torch::Tensor> s5_hi) {
+void skinny_moe_qpn_sm70(
+    torch::Tensor x, torch::Tensor qcodes, torch::Tensor qscales,
+    torch::Tensor gscales, torch::Tensor perm, torch::Tensor gids,
+    torch::Tensor goff, int64_t topk, torch::Tensor y_slots, bool x_slot_major,
+    int64_t num_tokens, int64_t splitk, int64_t scale_mode,
+    int64_t fragment_order, std::optional<torch::Tensor> s5_base,
+    std::optional<torch::Tensor> s5_nib, std::optional<torch::Tensor> s5_hi) {
   TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
   const c10::cuda::CUDAGuard device_guard(x.device());
   TORCH_CHECK(fragment_order == ORDER_M8N8K4 || fragment_order == ORDER_M16N8K8,
@@ -814,7 +813,8 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
                     s5_nib->numel() == E * tiles * (groups >> 1) * 32,
                 "S5 nibble plane");
     TORCH_CHECK(s5_hi->is_cuda() && s5_hi->dtype() == torch::kInt &&
-                    s5_hi->is_contiguous() && s5_hi->numel() == E * tiles * groups,
+                    s5_hi->is_contiguous() &&
+                    s5_hi->numel() == E * tiles * groups,
                 "S5 high plane");
     s5 = S5Planes{s5_base->data_ptr<uint8_t>(), s5_nib->data_ptr<uint8_t>(),
                   s5_hi->data_ptr<int32_t>()};
@@ -824,33 +824,33 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
     // RTX 8000: four 8-row tiles per weight decode in prefill cut the GEMMs
     // to 0.59-0.68 of the m8n8k4 kernel on the same card; decode (one row
     // tile) stays at parity. Deeper load rings measured slower.
-#define LAUNCH_MOE_M16N8K8_R(SPv, SMv, RBv)                                 \
-  skinny_nvfp4_moe_m16n8k8<SPv, SMv, RBv, kColumnTiles, false>              \
-      <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
-          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),          \
-          S5Planes{}, gscales.data_ptr<float>(),                            \
-          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
-          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
-          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
+#define LAUNCH_MOE_M16N8K8_R(SPv, SMv, RBv)                                    \
+  skinny_nvfp4_moe_m16n8k8<SPv, SMv, RBv, kColumnTiles, false>                 \
+      <<<grid, dim3(32 * SPv), 0, stream>>>(                                   \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), S5Planes{}, \
+          gscales.data_ptr<float>(),                                           \
+          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),               \
+          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),               \
+          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(),    \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
 
     // Five-bit scales: the kernel decodes them from the planes.
-#define LAUNCH_MOE_M16N8K8_S5(SPv, RBv)                                     \
-  skinny_nvfp4_moe_m16n8k8<SPv, SCALE_NVFP4_FP8_16, RBv, kColumnTiles, true>\
-      <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
-          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), s5,      \
-          gscales.data_ptr<float>(),                                        \
-          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
-          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
-          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
+#define LAUNCH_MOE_M16N8K8_S5(SPv, RBv)                                      \
+  skinny_nvfp4_moe_m16n8k8<SPv, SCALE_NVFP4_FP8_16, RBv, kColumnTiles, true> \
+      <<<grid, dim3(32 * SPv), 0, stream>>>(                                 \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), s5,       \
+          gscales.data_ptr<float>(),                                         \
+          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),             \
+          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),             \
+          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(),  \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
 
-#define LAUNCH_MOE_M16N8K8_S(SPv, SMv)                                   \
-  do {                                                                   \
-    if (prefill)                                                         \
-      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 4);                                 \
-    else                                                                 \
-      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 1);                                 \
+#define LAUNCH_MOE_M16N8K8_S(SPv, SMv)   \
+  do {                                   \
+    if (prefill)                         \
+      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 4); \
+    else                                 \
+      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 1); \
   } while (0)
 
 #define LAUNCH_MOE_M16N8K8(SPv)                       \
@@ -866,14 +866,20 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
       // fewer than 16 groups (grouped_splitk in skinny_sm70_moe.py).
       case 4:
         if (s5_in_place) {
-          if (prefill) LAUNCH_MOE_M16N8K8_S5(4, 4); else LAUNCH_MOE_M16N8K8_S5(4, 1);
+          if (prefill)
+            LAUNCH_MOE_M16N8K8_S5(4, 4);
+          else
+            LAUNCH_MOE_M16N8K8_S5(4, 1);
         } else {
           LAUNCH_MOE_M16N8K8(4);
         }
         break;
       case 8:
         if (s5_in_place) {
-          if (prefill) LAUNCH_MOE_M16N8K8_S5(8, 4); else LAUNCH_MOE_M16N8K8_S5(8, 1);
+          if (prefill)
+            LAUNCH_MOE_M16N8K8_S5(8, 4);
+          else
+            LAUNCH_MOE_M16N8K8_S5(8, 1);
         } else {
           LAUNCH_MOE_M16N8K8(8);
         }
@@ -892,14 +898,14 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   // V100: two 8-row blocks per weight load in prefill (four helped DSv4 by 1 %
   // and slowed GLM-5.3 by 6 %), with two column tiles 0.87-0.98 of the
   // one-tile kernel in prefill and 0.80-0.97 in decode.
-#define LAUNCH_MOE_QPN_R(SPv, SMv, RBv)                                     \
-  skinny_nvfp4_moe_qpn<SPv, SMv, RBv, kColumnTiles, false>                  \
-      <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
-          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),          \
-          S5Planes{}, gscales.data_ptr<float>(),                            \
-          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
-          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
-          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
+#define LAUNCH_MOE_QPN_R(SPv, SMv, RBv)                                        \
+  skinny_nvfp4_moe_qpn<SPv, SMv, RBv, kColumnTiles, false>                     \
+      <<<grid, dim3(32 * SPv), 0, stream>>>(                                   \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), S5Planes{}, \
+          gscales.data_ptr<float>(),                                           \
+          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),               \
+          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),               \
+          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(),    \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
 
 #define LAUNCH_MOE_QPN_S5(SPv, RBv)                                         \
@@ -931,7 +937,10 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   switch (splitk) {
     case 8:
       if (s5_in_place) {
-        if (prefill) LAUNCH_MOE_QPN_S5(8, 2); else LAUNCH_MOE_QPN_S5(8, 1);
+        if (prefill)
+          LAUNCH_MOE_QPN_S5(8, 2);
+        else
+          LAUNCH_MOE_QPN_S5(8, 1);
       } else {
         LAUNCH_MOE_QPN(8);
       }
@@ -941,14 +950,20 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
     // cannot divide.
     case 10:
       if (s5_in_place) {
-        if (prefill) LAUNCH_MOE_QPN_S5(10, 2); else LAUNCH_MOE_QPN_S5(10, 1);
+        if (prefill)
+          LAUNCH_MOE_QPN_S5(10, 2);
+        else
+          LAUNCH_MOE_QPN_S5(10, 1);
       } else {
         LAUNCH_MOE_QPN(10);
       }
       break;
     case 16:
       if (s5_in_place) {
-        if (prefill) LAUNCH_MOE_QPN_S5(16, 2); else LAUNCH_MOE_QPN_S5(16, 1);
+        if (prefill)
+          LAUNCH_MOE_QPN_S5(16, 2);
+        else
+          LAUNCH_MOE_QPN_S5(16, 1);
       } else {
         LAUNCH_MOE_QPN(16);
       }
