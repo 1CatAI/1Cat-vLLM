@@ -319,6 +319,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         super().__init__(config, vllm_config, prefix)
         vllm_config.quant_config = saved_quant_config
         self.chunk_kernels = bind_kda_kernels(vllm_config)
+        self._prefill_kernels_warmed_up = False
 
         # Linear-attention head config: read the flattened top-level fields when
         # present (new schema); fall back to the legacy linear_attn_config dict
@@ -698,6 +699,49 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         return projected_output
 
+    def _warmup_prefill_kernels(self, qkv_proj_states: torch.Tensor) -> None:
+        """Tune the chunked prefill kernels at the profile run's token count.
+
+        Their autotuners key on chunk constants and dtypes, not on the
+        sequence length, so the first prefill fixes the choice for all of
+        them. Left to the first request, a short prompt picks among configs
+        that tie at a few tokens; at a 512-token chunk the KKT sub-chunk
+        kernel then runs up to six times slower on Volta and Turing. The
+        inputs are bounded and carry the dtypes of a real prefill, which are
+        part of the autotune keys.
+        """
+        if self._prefill_kernels_warmed_up:
+            return
+        self._prefill_kernels_warmed_up = True
+        num_tokens = qkv_proj_states.size(0)
+        device, dtype = qkv_proj_states.device, qkv_proj_states.dtype
+        shape = (1, num_tokens, self.local_num_heads, self.head_dim)
+        q = torch.full(shape, 1.0e-3, device=device, dtype=dtype)
+        k = torch.full(shape, 1.0e-3, device=device, dtype=dtype)
+        v = torch.full(shape, 1.0e-3, device=device, dtype=dtype)
+        raw_g = torch.zeros(shape, device=device, dtype=dtype)
+        beta = torch.full(shape[:3], 0.5, device=device, dtype=torch.float32)
+        _, state_dtype = self.get_state_dtype()
+        _, state_shape = self.get_state_shape()
+        initial_state = torch.zeros((1, *state_shape), device=device, dtype=state_dtype)
+        cu_seqlens = torch.tensor([0, num_tokens], device=device, dtype=torch.int32)
+        chunk_kda_with_fused_gate(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            beta=beta,
+            A_log=self.A_log,
+            g_bias=self.dt_bias,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+            safe_gate=self.kda_safe_gate,
+            lower_bound=self.kda_lower_bound,
+            kernels=self.chunk_kernels,
+        )
+
     @eager_break_during_capture
     def _forward(
         self,
@@ -711,6 +755,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         if attn_metadata_raw is None:
             #     # V1 profile run
+            self._warmup_prefill_kernels(qkv_proj_states)
             return
 
         assert isinstance(attn_metadata_raw, dict)
