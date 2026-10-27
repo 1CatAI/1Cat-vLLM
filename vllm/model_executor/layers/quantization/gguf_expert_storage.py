@@ -3,6 +3,7 @@
 """Contiguous allocation of original expert banks, preserving TP block guards."""
 
 import math
+from typing import Any
 
 import torch
 
@@ -95,6 +96,9 @@ def prepare_original_expert_arena(model, name_map, tensors, device):
                 targets[raw] = (layer, layer.quant_method, shards[projection])
     cache_config = _expert_cache_config()
     if cache_config is not None:
+        if cache_config.expert_cache_host_storage == "shared_original":
+            _prepare_shared_cache(banks, cache_config, device)
+            return targets
         _prepare_expert_cache(banks, cache_config, device)
         return targets
     arena = torch.empty(total, dtype=torch.uint8, device=device)
@@ -265,6 +269,8 @@ def start_prefetch(targets, tensors) -> None:
     global _PREFETCH
     jobs = []
     for raw, (layer, method, shard) in targets.items():
+        if getattr(method.expert_cache, "shared_original", False):
+            continue
         tensor = tensors[raw]
         rows, span = _slice_spec(layer, method, shard, tensor)
         jobs.append((raw, tensor, shard, rows, span))
@@ -290,6 +296,21 @@ def load_expert_bank(layer, method, shard, tensor, raw=None) -> None:
     import time
 
     started = time.perf_counter()
+    cache = getattr(method, "expert_cache", None)
+    if cache is not None and getattr(cache, "shared_original", False):
+        cache.store_original_bank(method.cache_layer, shard, tensor)
+        if shard == "w2":
+            from .gguf_shared_layout import DOWN_ROWS
+
+            if DOWN_ROWS:  # full K per rank: no activation margins
+                method.input_padding[shard] = (0, int(tensor.shape[0]))
+            else:
+                _, _, left, physical_k = packed_tp_span(
+                    int(tensor.shape[0]), value, layer.tp_size, layer.tp_rank
+                )
+                method.input_padding[shard] = (left, physical_k)
+        method.loaded_experts[shard] = set(range(method.num_experts))
+        return
     tp_size, tp_rank = layer.tp_size, layer.tp_rank
     rows, span = _slice_spec(layer, method, shard, tensor)
     if shard == "w2":
@@ -339,9 +360,40 @@ def _expert_cache_config():
 
     config = get_current_vllm_config_or_none()
     gguf = config.kernel_config.sm70_gguf if config is not None else None
-    if gguf is None or not 0 < gguf.expert_cache_fraction < 1:
+    if gguf is None:
+        return None
+    if gguf.expert_cache_host_storage == "shared_original":
+        gguf.check_shared_expert_storage()
+        return gguf
+    if not 0 < gguf.expert_cache_fraction < 1:
         return None
     return gguf
+
+
+def _prepare_shared_cache(banks, config, device):
+    from .gguf_expert_cache import layer_index
+    from .gguf_shared_storage import SharedOriginalExpertCache
+
+    layers: dict[int, tuple[int, Any, Any, dict[str, int]]] = {}
+    for layer, method, shard, _, _, _, _, source in banks:
+        name = str(getattr(layer, "layer_name", None) or getattr(layer, "prefix", ""))
+        index = layer_index(name)
+        if index < 0:
+            raise ValueError(f"Shared expert cache cannot index layer {name}")
+        if index not in layers:
+            layers[index] = (index, layer, method, {})
+        layers[index][3][shard] = source[0]
+    cache = SharedOriginalExpertCache(
+        [layers[i] for i in sorted(layers)], config, device
+    )
+    for index, layer, method, kinds in layers.values():
+        for shard in kinds:
+            layer.register_buffer(
+                "gguf_" + shard, cache.bank(index, shard), persistent=False
+            )
+            method.guarded_shards.add(shard)
+        method.expert_cache = cache
+        method.cache_layer = index
 
 
 def _prepare_expert_cache(banks, config, device):

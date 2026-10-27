@@ -1029,8 +1029,11 @@ class SpeculativeConfig:
 
                 if self.use_dspark():
                     draft_hf_config = self.draft_model_config.hf_config
-                    draft_hf_config.model_type = "deepseek_v4"
-                    draft_hf_config.architectures = ["DSparkDraftModel"]
+                    if draft_hf_config.model_type == "deepseek_v41_text":
+                        draft_hf_config.architectures = ["DSparkDeepseekV41ForCausalLM"]
+                    else:
+                        draft_hf_config.model_type = "deepseek_v4"
+                        draft_hf_config.architectures = ["DSparkDraftModel"]
                     self.update_arch_()
 
                 if self.use_dflash_family() or self.use_dspark():
@@ -1136,6 +1139,16 @@ class SpeculativeConfig:
                     self.target_model_config, self.draft_model_config
                 ):
                     # The draft now covers the target's extended positions.
+                    self.draft_model_config.max_model_len = max(
+                        self.draft_model_config.max_model_len,
+                        self.target_model_config.max_model_len,
+                    )
+                if (
+                    self.method == "dspark"
+                    and __import__("os").environ.get("VLLM_V41_PACKED_KV", "0") == "1"
+                ):
+                    # V4.1 DSpark attends only its sliding window and rotates
+                    # RoPE on the fly past its table: it covers the target length.
                     self.draft_model_config.max_model_len = max(
                         self.draft_model_config.max_model_len,
                         self.target_model_config.max_model_len,

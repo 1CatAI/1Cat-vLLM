@@ -100,6 +100,10 @@ _TEXT_GENERATION_MODELS = {
     "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
     "DeepseekV32ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
     "DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", "DeepseekV4ForCausalLM"),
+    "DeepseekV41ForCausalLM": (
+        "vllm.models.deepseek_v41.model",
+        "DeepseekV41ForCausalLM",
+    ),
     "Dots1ForCausalLM": ("dots1", "Dots1ForCausalLM"),
     "Ernie4_5ForCausalLM": ("ernie45", "Ernie4_5ForCausalLM"),
     "Ernie4_5_MoeForCausalLM": ("ernie45_moe", "Ernie4_5_MoeForCausalLM"),
@@ -618,6 +622,10 @@ _SPECULATIVE_DECODING_MODELS = {
     "DSparkDraftModel": (
         "vllm.models.deepseek_v4",
         "DSparkDeepseekV4ForCausalLM",
+    ),
+    "DSparkDeepseekV41ForCausalLM": (
+        "vllm.models.deepseek_v41.dspark",
+        "DSparkDeepseekV41ForCausalLM",
     ),
     "PEagleDraftModel": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "PeagleLlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),

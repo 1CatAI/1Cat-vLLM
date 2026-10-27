@@ -7,7 +7,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+import vllm.envs as envs
 from vllm.utils import is_moe_layer
+
+_PYNCCL_ALLGATHER = envs.VLLM_PYNCCL_ALLGATHER == "1"
 
 
 class Cache:
@@ -199,8 +202,18 @@ class DeviceCommunicatorBase:
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
-        # All-gather.
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        # All-gather. Prefer the existing pynccl communicator: a torch NCCL
+        # communicator costs another ~146 MiB per GPU and is created lazily.
+        pynccl = getattr(self, "pynccl_comm", None)
+        if (
+            _PYNCCL_ALLGATHER
+            and pynccl is not None
+            and not pynccl.disabled
+            and input_.is_contiguous()
+        ):
+            pynccl.all_gather(output_tensor, input_)
+        else:
+            dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)

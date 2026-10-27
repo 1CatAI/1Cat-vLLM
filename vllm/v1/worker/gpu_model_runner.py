@@ -347,6 +347,44 @@ def _dflash_ddtree_trace_event(
         logger.exception("Failed to write DDTree trace event to %s", trace_path)
 
 
+def _clip_stateful_sample_limits(
+    output_token_ids, req_ids, requests, output_budget=None
+):
+    """Keep stop/length clipping on device before a private-state commit.
+
+    The normal CPU output processor also applies these limits. Models with
+    prefix snapshots need the same boundary before an asynchronous next step
+    consumes the sampled-count selector. Other models retain their old path.
+    """
+    for row, req_id in enumerate(req_ids[: output_token_ids.shape[0]]):
+        request = requests.get(req_id)
+        params = None if request is None else request.sampling_params
+        if params is None:
+            continue
+        if params.max_tokens is not None:
+            if output_budget is not None:
+                positions = torch.arange(
+                    output_token_ids.shape[1], device=output_token_ids.device
+                )
+                output_token_ids[row].masked_fill_(positions >= output_budget[row], -1)
+            else:
+                remaining = max(0, params.max_tokens - len(request.output_token_ids))
+                output_token_ids[row, remaining:].fill_(-1)
+        if output_token_ids.shape[1] <= 1:
+            continue
+        stops = set(params.stop_token_ids or ())
+        if not params.ignore_eos and params.eos_token_id is not None:
+            stops.add(params.eos_token_id)
+        if stops:
+            values = output_token_ids[row]
+            stop = torch.zeros_like(values, dtype=torch.bool)
+            for token_id in stops:
+                stop |= values == token_id
+            # Include the first stop itself, excluding every later candidate.
+            after = stop.to(torch.int32).cumsum(0) - stop.to(torch.int32) > 0
+            values.masked_fill_(after, -1)
+
+
 def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
     valid_token_mask = output_token_ids != -1
     token_offsets = torch.arange(
@@ -1040,6 +1078,10 @@ def _non_greedy_rows_carry_drafts(
     # small device-to-host copy here does not sit on the steady-state step.
     is_greedy = (temperature[: len(num_draft_tokens)] == GREEDY_TEMPERATURE).tolist()
     return any(n > 0 and not greedy for n, greedy in zip(num_draft_tokens, is_greedy))
+
+
+_V41_TRUNC_CUTOFF = int(envs.VLLM_V41_TRUNC_CUTOFF)
+_V41_TRUNC = envs.VLLM_V41_TRUNC == "1"
 
 
 class GPUModelRunner(
@@ -2234,6 +2276,12 @@ class GPUModelRunner(
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
+            if new_req_data.num_computed_tokens > 0:
+                restore = getattr(self.get_model(), "restore_prefix", None)
+                if restore is not None:
+                    restore(
+                        new_req_data.num_computed_tokens, new_req_data.prompt_token_ids
+                    )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -2520,6 +2568,31 @@ class GPUModelRunner(
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
         """
+        commit_state = getattr(
+            getattr(self, "model", None), "commit_speculative_state", None
+        )
+        if commit_state is not None:
+            # V4.1 keeps bounded Engram/C2 candidates rather than Mamba blocks.
+            # Reuse the same contiguous accepted-count convention. The model
+            # selects its full input length for a prefill chunk, including
+            # chunks whose sampler output is intentionally discarded.
+            batch = getattr(self, "input_batch", None)
+            if batch is not None:
+                budget = None
+                get_budget = getattr(self.model, "stateful_output_budget", None)
+                if get_budget is not None:
+                    if output_token_ids.shape[0] != 1:
+                        raise ValueError("Private V4.1 state requires one request")
+                    request = self.requests[batch.req_ids[0]]
+                    params = request.sampling_params
+                    if params is not None and params.max_tokens is not None:
+                        budget = get_budget(
+                            params.max_tokens, request.num_prompt_tokens
+                        )
+                _clip_stateful_sample_limits(
+                    output_token_ids, batch.req_ids, self.requests, budget
+                )
+            commit_state(_count_contiguous_spec_tokens(output_token_ids))
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
@@ -7485,6 +7558,18 @@ class GPUModelRunner(
                 "silently fall back to an invalid no-draft-probability "
                 "acceptance path and can corrupt output quality."
             )
+        if _V41_TRUNC and len(spec_decode_metadata.num_draft_tokens) == 1:
+            from vllm.model_executor.layers.quantization import gguf_shared_runtime
+
+            trunc = gguf_shared_runtime.current_trunc(self.device)
+            if trunc is not None:
+                # Draft i is verify position i + 1; positions >= trunc were not
+                # fully computed, so they can never be accepted.
+                drafts = spec_decode_metadata.draft_token_ids
+                index = torch.arange(drafts.numel(), device=drafts.device)
+                spec_decode_metadata.draft_token_ids = torch.where(
+                    index + 1 >= trunc, torch.full_like(drafts, -1), drafts
+                )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
@@ -8263,6 +8348,15 @@ class GPUModelRunner(
 
         if self.device.type == "cuda":
             self.mixed_prefill_timer.begin(scheduler_output)
+        if _V41_TRUNC_CUTOFF:
+            from vllm.model_executor.layers.quantization import gguf_shared_runtime
+
+            # Exact only for greedy rows of a single request (positions = rows).
+            single = self.input_batch.num_reqs == 1
+            greedy = bool(getattr(self.input_batch, "all_greedy", False))
+            gguf_shared_runtime.set_trunc_cutoff(
+                _V41_TRUNC_CUTOFF if single and greedy else 0
+            )
 
         trace_enabled = (
             bool(self._runtime_trace.async_cpu and self.use_async_scheduling)
@@ -12191,10 +12285,21 @@ class GPUModelRunner(
                 if cg_support.value < min_cg_support.value:
                     min_cg_support = cg_support
                     min_cg_attn_backend = attn_backend.__name__
+        graph_query_len = self.uniform_decode_query_len
+        if (
+            self.model_config.hf_text_config.model_type == "deepseek_v41_text"
+            and self.max_num_reqs == 1
+            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+            and not self.compilation_config.pass_config.enable_sp
+        ):
+            # Exact single-request M1..6 graphs need no uniform-batch padding.
+            # Rounding their capture sizes to six would also pad the native
+            # M5 draft query, whose own graph reads five noncausal positions.
+            graph_query_len = 1
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             min_cg_support,
             min_cg_attn_backend,
-            self.uniform_decode_query_len,
+            graph_query_len,
             self.parallel_config.tensor_parallel_size,
             self.kv_cache_config,
             self.max_num_reqs,
@@ -12203,7 +12308,7 @@ class GPUModelRunner(
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, graph_query_len
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.

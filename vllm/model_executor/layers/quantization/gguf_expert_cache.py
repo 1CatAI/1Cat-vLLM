@@ -795,7 +795,7 @@ def _sub_fill(
         tl.store(inverse + (flat - base_route), q.to(tl.int32), mask=mask)
 
 
-_LATTICE = (18, 21, 22)
+_LATTICE = (16, 17, 18, 21, 22, 29)
 _LUT4 = (20, 23)
 _AFFINE = (42,)
 
@@ -803,8 +803,8 @@ _AFFINE = (42,)
 def _canonical(gguf_type: int, n: int, k: int):
     """(family, decoder, group, weight bytes, stats bytes) of one expert."""
     if gguf_type in _LATTICE:
-        group = 16 if gguf_type == 22 else 32
-        stat = 8 if gguf_type in (18, 21) else 4
+        group = 16 if gguf_type in (17, 22, 29) else 32
+        stat = 8 if gguf_type in (18, 21) else 2 if gguf_type == 29 else 4
         return 0, gguf_type, group, n * k // 4, k // group * n * stat
     if gguf_type in _LUT4:
         return 1, 0, 32, n * k // 2, k // 32 * n * 2

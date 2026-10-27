@@ -29,6 +29,9 @@ logger = init_logger(__name__)
 _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
 
 
+_INPLACE_AR_MIN = int(__import__("os").environ.get("VLLM_INPLACE_AR_MIN", str(1 << 22)))
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     def __init__(
         self,
@@ -391,7 +394,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self._collective_trace.record("torch_distributed", input_)
             return out
         assert pynccl_comm is not None
-        out = pynccl_comm.all_reduce(input_)
+        # Long prefill chunks: reduce large temporaries in place instead of
+        # allocating another chunk-sized output (callers use only the result).
+        inplace = (
+            _INPLACE_AR_MIN > 0
+            and input_.numel() >= _INPLACE_AR_MIN
+            and input_.is_contiguous()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        out = pynccl_comm.all_reduce(input_, input_ if inplace else None)
         if out is None:
             # fall back to the default all-reduce using PyTorch.
             # this usually happens during testing.

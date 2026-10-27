@@ -45,10 +45,14 @@ from vllm.model_executor.layers.quantization.gguf_native import pad_weight_tail
 from vllm.model_executor.layers.quantization.gguf_raw import RawGGUFProjection
 from vllm.model_executor.layers.quantization.gguf_transcode import (
     AffineGGUFProjection,
+    tp_slice_packed,
     transcode_affine,
 )
 from vllm.platforms import current_platform
-from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
+from vllm.transformers_utils.gguf_tensor_reader import (
+    quant_size,
+    quant_type_name,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)

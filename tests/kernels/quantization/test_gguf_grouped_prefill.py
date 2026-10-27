@@ -27,8 +27,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
         (513, 576, 256, False, False),  # wide projection: existing fallback
     ],
 )
-def test_narrow_grouped_prefill(weight_type, m, n, k, gated, indexed):
+def test_narrow_grouped_prefill(
+    weight_type, m, n, k, gated, indexed, source_k=None, left=0
+):
     experts = 5
+    source_k = k if source_k is None else source_k
     rows = n // 2 if gated else n
     parts = []
     dense = []
@@ -40,7 +43,7 @@ def test_narrow_grouped_prefill(weight_type, m, n, k, gated, indexed):
                     weight_type,
                     scale=0.0009765625,
                     n=rows,
-                    k=k,
+                    k=source_k,
                     seed=9683 + part * experts + expert,
                 )
                 for expert in range(experts)
@@ -49,7 +52,9 @@ def test_narrow_grouped_prefill(weight_type, m, n, k, gated, indexed):
         parts.append(torch.from_numpy(data).cuda())
         dense.append(
             torch.from_numpy(
-                gguf.quants.dequantize(data, gguf.GGMLQuantizationType(weight_type))
+                gguf.quants.dequantize(data, gguf.GGMLQuantizationType(weight_type))[
+                    ..., left : left + k
+                ].copy()
             ).cuda()
         )
     family, decoder, group, weight_bytes, stats_bytes = _canonical(weight_type, n, k)
@@ -71,7 +76,7 @@ def test_narrow_grouped_prefill(weight_type, m, n, k, gated, indexed):
         weight_type,
         n,
         k,
-        0,
+        left,
         parts[0].shape[-1],
         error,
     )
@@ -150,3 +155,18 @@ def test_narrow_grouped_prefill(weight_type, m, n, k, gated, indexed):
             indices.copy_(torch.flip(indices, (0,)))
         graph.replay()
         check()
+
+
+@pytest.mark.parametrize("weight_type", [16, 17, 29])
+@pytest.mark.parametrize("projection", ["gate_up", "down"])
+def test_v41_full_shape_ungated_prefill(weight_type, projection):
+    if projection == "gate_up":
+        # V4.1 rounds the linear gate/up output to FP16 before its FP32
+        # clamp/SiLU/probability operation, so the native epilogue is ungated.
+        test_narrow_grouped_prefill(weight_type, 513, 1152, 5120, False, True)
+    else:
+        # Last TP rank's 576 columns start at offset 192 in a 768-column
+        # carrier. No extra padded activation columns may enter the GEMM.
+        test_narrow_grouped_prefill(
+            weight_type, 513, 5120, 576, False, False, source_k=768, left=192
+        )

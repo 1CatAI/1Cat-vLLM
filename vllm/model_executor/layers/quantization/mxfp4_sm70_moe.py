@@ -9,6 +9,7 @@ UE8M0 scales. It never materializes an FP16/BF16 expert-weight copy.
 
 from __future__ import annotations
 
+import os
 from typing import Final
 
 import torch
@@ -58,6 +59,11 @@ _DEEPSEEK_V4_FLASH_TOP_K: Final = 6
 _GRAPH_SAFE_MAX_TOKENS: Final = 8
 _MXFP4_QPN_M1_ENV: Final = "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE"
 _MXFP4_QPN_M1_OP: Final = "mxfp4_moe_qpn_m1_sm70_out"
+
+
+# One grouped launch for small one-row-per-route batches (V4.1 DSpark draft:
+# M5 x top-3); the native op reads this once on first use.
+os.environ.setdefault("VLLM_SM70_MXFP4_GROUPED_ANY", "1")
 
 
 def _mxfp4_policy(layer) -> Sm70MxFp4MoEConfig:
@@ -211,6 +217,7 @@ def _select_mxfp4_stage_dispatch(
     num_experts: int,
     fully_replicated_experts: bool,
     policy: Sm70MxFp4MoEConfig | None = None,
+    top_k: int = 6,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     if (
         0 < num_tokens <= _mxfp4_active_expert_max_tokens(policy)
@@ -219,7 +226,7 @@ def _select_mxfp4_stage_dispatch(
         # Keep the graph launch count fixed. The compactor represents unused
         # tail entries as zero-row experts, avoiding a host readback of the
         # dynamic unique-expert count.
-        graph_expert_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
+        graph_expert_slots = num_tokens * top_k
         if _mxfp4_grouped_verifier_for_tokens(num_tokens, policy):
             if _mxfp4_grouped_m8_expert_rows_enabled(policy):
                 return (
@@ -285,7 +292,15 @@ def validate_mxfp4_sm70_moe_contract(
     intermediate_size_per_partition: int,
     tp_size: int,
 ) -> None:
-    """Reject shapes outside the exact V4-Flash SM70 implementation contract."""
+    """Admit V4 Flash and the separately qualified V4.1 DSpark TP4 shape."""
+    if (
+        global_num_experts,
+        top_k,
+        hidden_size,
+        intermediate_size_per_partition,
+        tp_size,
+    ) == (128, 3, 5120, 576, 4):
+        return
     if global_num_experts != _DEEPSEEK_V4_FLASH_NUM_EXPERTS:
         raise NotImplementedError(
             "SM70 TurboMind MXFP4 MoE currently supports DeepSeek-V4-Flash "
@@ -405,7 +420,7 @@ def _prepare_mxfp4_sm70_experts(
 
 
 class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
-    """Exact-SM70 V4-Flash MXFP4 MoE using TurboMind packed GEMMs.
+    """Native V4 Flash and V4.1 DSpark MXFP4 using TurboMind packed GEMMs.
 
     ``Mxfp4MoEMethod`` owns the checkpoint parameter layout. Its generic
     Oracle backends are intentionally bypassed here because they are not an
@@ -585,10 +600,14 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         self._allocate_graph_safe_decode_buffers(layer)
 
         logger.info_once(
-            "SM70 TurboMind MXFP4 MoE enabled for DeepSeek-V4-Flash "
-            "(local_experts=%d, graph_safe_decode=B1-B%d, "
+            "SM70 TurboMind MXFP4 MoE enabled "
+            "(local_experts=%d, hidden=%d, local_intermediate=%d, top_k=%d, "
+            "graph_safe_decode=B1-B%d, "
             "active_expert_max_tokens=%d).",
             num_experts,
+            hidden_size,
+            intermediate_size,
+            layer.top_k,
             _GRAPH_SAFE_MAX_TOKENS,
             _mxfp4_active_expert_max_tokens(self.sm70_moe_policy),
         )
@@ -602,6 +621,41 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
     @staticmethod
     def _apply_swiglu(layer, out, gate_up, *, interleaved=False) -> None:
         apply_swiglu(out, gate_up, layer.swiglu_limit, interleaved=interleaved)
+
+    def _apply_v41_draft(self, layer, x, probabilities, ids):
+        """At most fifteen native TC rows, with probability before down FP16."""
+        if not 1 <= x.shape[0] <= 5 or layer.swiglu_limit != 10.0:
+            raise ValueError("V4.1 draft experts require M1..5 and clamp 10")
+        buffers = self._get_buffers(layer, x.shape[0])
+        order = ids.flatten().argsort(stable=True)
+        experts = ids.flatten()[order].int().contiguous()
+        buffers["permuted_input"].copy_(x[order // 3])
+        plan = select_fp4_stage_plan(Stage.DENSE, Stage.DENSE)
+        offsets = buffers["slot_expert_offsets"]
+        codec = layer.sm70_fp4_codec
+        codec.gemm_w13(
+            plan,
+            buffers,
+            buffers["permuted_input"],
+            None,
+            offsets,
+            experts,
+            ids.numel(),
+            ids,
+        )
+        gate, up = buffers["gate_up"].float().chunk(2, dim=-1)
+        intermediate = (
+            torch.nn.functional.silu(gate.clamp(max=10))
+            * up.clamp(-10, 10)
+            * probabilities.flatten()[order, None]
+        ).half()
+        buffers["intermediate"].copy_(intermediate)
+        codec.gemm_w2(plan, buffers, None, offsets, experts, ids.numel(), probabilities)
+        restored = buffers["sorted_output"][order.argsort()].view(x.shape[0], 3, -1)
+        # Each native matrix product keeps its FP16 boundary. The routed sum
+        # and following TP reduction feed the FP32 HC residual: valid draft
+        # queries can exceed FP16 range when four finite partials are added.
+        return restored.float().sum(1)
 
     def apply(
         self,
@@ -617,16 +671,16 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             raise TypeError("SM70 MXFP4 MoE requires CUDA FP16 activations [M, H].")
         if not is_exact_sm70_cuda(x, enabled=True):
             raise RuntimeError("SM70 MXFP4 MoE dispatch is restricted to CUDA SM70.")
-        if x.shape[1] != _DEEPSEEK_V4_FLASH_HIDDEN_SIZE:
+        if x.shape[1] != layer.sm70_mxfp4_hidden_size:
             raise ValueError(
                 "SM70 MXFP4 MoE activation hidden size mismatch: expected "
-                f"{_DEEPSEEK_V4_FLASH_HIDDEN_SIZE}, got {x.shape[1]}."
+                f"{layer.sm70_mxfp4_hidden_size}, got {x.shape[1]}."
             )
         if tuple(topk_ids.shape) != (
             x.shape[0],
-            _DEEPSEEK_V4_FLASH_TOP_K,
+            layer.top_k,
         ):
-            raise ValueError("SM70 MXFP4 MoE requires top-k IDs with shape [M, 6].")
+            raise ValueError("SM70 MXFP4 MoE top-k IDs do not match the layer.")
         if tuple(topk_weights.shape) != tuple(topk_ids.shape):
             raise ValueError("SM70 MXFP4 MoE top-k weights and IDs must share shape.")
         if topk_weights.dtype != torch.float32:
@@ -638,12 +692,15 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
 
         num_tokens = x.shape[0]
         if num_tokens == 0:
-            return x.new_empty((0, _DEEPSEEK_V4_FLASH_HIDDEN_SIZE))
+            return x.new_empty((0, layer.sm70_mxfp4_hidden_size))
+        if (layer.global_num_experts, layer.top_k, x.shape[1]) == (128, 3, 5120):
+            return self._apply_v41_draft(layer, x, topk_weights, topk_ids)
         buffers = self._get_buffers(layer, num_tokens)
         output = buffers["output"]
 
         direct_top6 = (
             num_tokens == 1
+            and layer.top_k == 6
             and self.sm70_moe_policy.direct_top6
             and layer.expert_map is None
             and layer.local_num_experts == layer.global_num_experts
@@ -696,7 +753,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
 
         output.zero_()
 
-        total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
+        total_slots = num_tokens * layer.top_k
         topk_ids_i32 = buffers["topk_ids"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
         buffers["permuted_idx"].fill_(total_slots)
@@ -707,7 +764,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             layer.expert_map,
             layer.global_num_experts,
             layer.local_num_experts,
-            _DEEPSEEK_V4_FLASH_TOP_K,
+            layer.top_k,
             buffers["permuted_input"],
             buffers["expert_offsets64"],
             buffers["inv_permuted_idx"],
@@ -745,6 +802,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                     layer.expert_map is None
                     and layer.local_num_experts == layer.global_num_experts
                 ),
+                top_k=layer.top_k,
             )
         )
 

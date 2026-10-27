@@ -1,0 +1,64 @@
+# DS-V4.1 Phase 3 API (2026-10-27): 512K context (packed FP4 KV, host latents), prefix cache, tools, DSpark 5.
+# Needs run_serve3.sh envs (packed KV, G3 rows, session prefix).
+# Development launch profile. Run only after the acceptance report passes.
+# The container must expose only V100 GPUs 0-3 and preserve 8 GiB host reserve.
+model: /home/ymzx/ds41-models/gguf/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf
+hf-config-path: /home/ymzx/ds41-models/base
+tokenizer: /home/ymzx/ds41-models/base
+tokenizer-mode: deepseek_v41
+served-model-name: deepseek-v4.1-flash
+host: 0.0.0.0
+port: 18000
+dtype: half
+quantization: gguf
+load-format: gguf
+tensor-parallel-size: 4
+max-model-len: 524288
+max-num-seqs: 1
+max-num-batched-tokens: 8192
+kv-cache-memory-bytes: 268435456
+gpu-memory-utilization: 0.96
+no-enforce-eager: true
+compilation-config:
+  mode: 0
+  cudagraph_mode: FULL
+  cudagraph_capture_sizes: [1, 2, 3, 4, 5, 6]
+  max_cudagraph_capture_size: 6
+# This baseline's YAML loader omits false scalar flags; use explicit negations.
+async-scheduling: true
+enable-prefix-caching: true
+enable-chunked-prefill: true
+no-disable-custom-all-reduce: true
+enable-auto-tool-choice: true
+tool-call-parser: deepseek_v41
+# Thinking on by default (R1-style <think>...</think>); a request can pass
+# chat_template_kwargs {"thinking": false} or reasoning_effort.
+reasoning-parser: deepseek_v4
+default-chat-template-kwargs: '{"thinking": true}'
+model-loader-extra-config:
+  engram_path: /home/ymzx/ds41-models/gguf/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf
+speculative-config:
+  method: dspark
+  model: /home/ymzx/ds41-dev/dspark-v41
+  quantization: fp8
+  num_speculative_tokens: 5
+  draft_load_config:
+    load_format: safetensors
+  enforce_eager: false
+kernel-config:
+  sm70_ring:
+    enabled: false
+  sm70_gguf:
+    expert_storage: original
+    expert_arena: true
+    expert_cache_host_storage: shared_original
+    expert_cache_offload_fraction: 0.33
+    expert_cache_fraction: 0
+    expert_cache_host_slack: 0
+    expert_load_prefetch_banks: 1
+    expert_cache_prefill_tokens: 4096
+    dense_storage: original
+    embedding_storage: original
+    prefill_min_m: 1
+    dequant_workspace_bytes: 33554432
+api-key: sk-ds41-dNCMTcG1OUSl

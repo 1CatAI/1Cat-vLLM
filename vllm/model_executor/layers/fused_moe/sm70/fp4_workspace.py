@@ -201,7 +201,7 @@ class MxFp4MoEWorkspace:
     @classmethod
     def allocate(cls, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
-        top_k = 6
+        top_k = int(layer.top_k)
         max_slots = 8 * top_k
         num_experts = int(layer.sm70_mxfp4_num_experts)
         hidden_size = int(layer.sm70_mxfp4_hidden_size)
@@ -281,7 +281,7 @@ class MxFp4MoEWorkspace:
     def _persistent_decode_buffers(
         layer: RoutedExperts, num_tokens: int
     ) -> dict[str, torch.Tensor]:
-        total_slots = num_tokens * 6
+        total_slots = num_tokens * int(layer.top_k)
         return {
             "output": layer._mxfp4_sm70_buf_output[:num_tokens],
             "permuted_input": layer._mxfp4_sm70_buf_permuted_input[:total_slots],
@@ -324,7 +324,7 @@ class MxFp4MoEWorkspace:
         layer: RoutedExperts, num_tokens: int
     ) -> dict[str, torch.Tensor]:
         device = layer.w13_tm_weight.device
-        top_k = 6
+        top_k = int(layer.top_k)
         total_slots = num_tokens * top_k
         num_experts = int(layer.sm70_mxfp4_num_experts)
         hidden_size = int(layer.sm70_mxfp4_hidden_size)

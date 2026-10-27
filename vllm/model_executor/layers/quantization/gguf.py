@@ -240,6 +240,7 @@ def _fused_mul_mat_gguf(
     prefill_min_m: int = 8,
     prefer_native: bool = False,
     max_dequant_bytes: int = 0,
+    v41_q5_hmma: bool = False,
 ) -> torch.Tensor:
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
@@ -257,7 +258,7 @@ def _fused_mul_mat_gguf(
     # candidates; TurboMind supplies the primary accelerated GGUF routes.
     if native_enabled and (prefer_native or qweight_type not in DEQUANT_TYPES):
         native_result = native_dense(
-            x, qweight, qweight_type, prefill_min_m, max_dequant_bytes
+            x, qweight, qweight_type, prefill_min_m, max_dequant_bytes, v41_q5_hmma
         )
         if native_result is not None:
             return native_result
@@ -300,6 +301,7 @@ def _fused_mul_mat_gguf_fake(
     prefill_min_m: int = 8,
     prefer_native: bool = False,
     max_dequant_bytes: int = 0,
+    v41_q5_hmma: bool = False,
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
 
@@ -314,6 +316,27 @@ try:
 
 except AttributeError as error:
     raise error
+
+
+def _fused_grouped_q5_gguf(
+    x: torch.Tensor, qweight: torch.Tensor, workspace_bytes: int
+) -> torch.Tensor:
+    return torch.ops._C_gguf.ggml_dense_q5_k_hmma(
+        qweight, x, 0, workspace_bytes, grouped=True, vector_decode=True
+    )
+
+
+def _fused_grouped_q5_gguf_fake(
+    x: torch.Tensor, qweight: torch.Tensor, workspace_bytes: int
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], qweight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="_fused_grouped_q5_gguf",
+    op_func=_fused_grouped_q5_gguf,
+    fake_impl=_fused_grouped_q5_gguf_fake,
+)
 
 
 def _fused_moe_gguf(
@@ -558,6 +581,12 @@ class GGUFLinearMethod(LinearMethodBase):
             getattr(policy, "dequant_workspace_bytes", 32 * 1024**2)
             if self.dense_storage == "original"
             else 0
+        )
+        self.v41_q5_hmma = bool(
+            config is not None
+            and config.model_config is not None
+            and config.model_config.hf_text_config.model_type == "deepseek_v41_text"
+            and self.dense_storage == "original"
         )
         self.native_prepared = False
         self.canonical_projections = ()
@@ -999,6 +1028,28 @@ class GGUFLinearMethod(LinearMethodBase):
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
             layer.register_parameter("qweight", padded_param)
 
+    def apply_grouped(self, layer, x):
+        """V4.1's block-diagonal output projection from the same raw rows."""
+        if (
+            not self.v41_q5_hmma
+            or x.ndim != 3
+            or not 1 <= x.shape[0] <= 6
+            or self.layout is not None
+            or self.canonical_projections
+            or hasattr(layer, "gguf_native_shard_weights")
+            or hasattr(layer, "gguf_shard_weights")
+            or layer.qweight.shard_id
+            or layer.qweight_type.weight_type != WeightType.Q5_K
+        ):
+            return None
+        if x.shape[2] != 4096 or layer.qweight.shape[0] != x.shape[1] * 1024:
+            raise ValueError("V4.1 grouped Q5 projection requires 1024 rows/group")
+        return torch.ops.vllm._fused_grouped_q5_gguf(
+            x.contiguous(),
+            layer.qweight,
+            min(self.max_dequant_bytes or 32 * 1024**2, 32 * 1024**2),
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1007,6 +1058,22 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if self.layout is not None:
             x = self.layout.input_to_gguf(x)
+        dense_options = {"v41_q5_hmma": True} if self.v41_q5_hmma else {}
+        small = getattr(layer, "v41_small_m", None)
+        if small is not None and len(small.widths) == 1 and 1 <= x.shape[0] <= 8:
+            # V4.1 TurboMind route: dmv13 on the resident segment planes.
+            out = small(x.reshape(-1, x.shape[-1]))[0]
+            return out if bias is None else out + bias
+        if (
+            small is not None
+            and getattr(layer, "v41_small_m_chunked", False)
+            and x.shape[0] > 8
+        ):
+            rows = x.reshape(-1, x.shape[-1])
+            out = torch.cat(
+                [small(rows[i : i + 8])[0] for i in range(0, rows.shape[0], 8)]
+            )
+            return out if bias is None else out + bias
         if self.canonical_projections:
             from vllm.model_executor.layers.quantization.gguf_turbomind import (
                 apply_prepared_gguf_projections,
@@ -1070,6 +1137,7 @@ class GGUFLinearMethod(LinearMethodBase):
                         self.prefill_min_m,
                         self.dense_storage == "original",
                         self.max_dequant_bytes,
+                        **dense_options,
                     )
                     for weight, weight_type in zip(weights, types)
                 ],
@@ -1097,6 +1165,7 @@ class GGUFLinearMethod(LinearMethodBase):
                         self.prefill_min_m,
                         self.dense_storage == "original",
                         self.max_dequant_bytes,
+                        **dense_options,
                     )
                 )
             out = torch.cat(result, axis=1)
@@ -1111,6 +1180,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 self.prefill_min_m,
                 self.dense_storage == "original",
                 self.max_dequant_bytes,
+                **dense_options,
             )
         if bias is not None:
             out.add_(bias)

@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -24,6 +25,11 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+_V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
+# A hit at P needs window rows [P - 128, P) still in the 256-row rings.
+_V41_RING_REACH = 128
 
 
 @dataclass
@@ -199,6 +205,18 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    # V4.1 window rings hold only the last executed sequence's recent rows.
+    _v41_last: tuple[list[int], int] | None = None
+
+    def _v41_session_hit(self, request: Request, hit: int) -> bool:
+        last = self._v41_last
+        if last is None or hit % 2:
+            return False
+        tokens, processed = last
+        if not processed - _V41_RING_REACH <= hit <= processed:
+            return False
+        return list(request.all_token_ids)[:hit] == tokens[:hit]
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -235,6 +253,13 @@ class KVCacheManager:
         # Keep the existing two-value lookup API used by 1Cat connectors. The
         # synchronous coordinator exposes the junction from this lookup only.
         request.shared_prefix_boundary = self.coordinator.shared_prefix_boundary
+        if (
+            _V41_SESSION_PREFIX
+            and num_new_computed_tokens
+            and not self._v41_session_hit(request, num_new_computed_tokens)
+        ):
+            request.shared_prefix_boundary = 0
+            return self.empty_kv_cache_blocks, 0
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -452,6 +477,8 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        if _V41_SESSION_PREFIX:
+            self._v41_last = (list(request.all_token_ids), request.num_computed_tokens)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

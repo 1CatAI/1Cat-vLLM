@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import asdict, fields
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from vllm.config.execution_policy import LayerExecutionPolicy
 from vllm.config.gdn import GdnConfig
@@ -528,6 +528,14 @@ class Sm70GgufConfig:
     are copied in by a native host thread while the step waits in-graph; LRU
     keeps the slots hot. Prefill assembles each layer's full bank. Off at 0."""
 
+    expert_cache_host_storage: Literal["rank_local", "shared_original"] = "rank_local"
+    """Host expert representation. ``shared_original`` uses one unsliced GGUF
+    cold pool per local TP4 group, with a single native swap coordinator."""
+
+    expert_cache_offload_fraction: float = Field(default=0.30, gt=0.0, lt=1.0)
+    """Actual fraction of cold experts in ``shared_original`` mode. GPU spare
+    slots are additional capacity and do not reduce this fraction."""
+
     expert_cache_spare_slots: int = Field(default=8, ge=1, le=64)
     """Free GPU slots kept per layer so decode misses never wait on eviction."""
 
@@ -615,6 +623,28 @@ class Sm70GgufConfig:
         if value <= 0:
             raise ValueError("GGUF prefill_min_m must be positive")
         return value
+
+    @model_validator(mode="after")
+    def validate_shared_expert_storage(self) -> "Sm70GgufConfig":
+        self.check_shared_expert_storage()
+        return self
+
+    def check_shared_expert_storage(self) -> None:
+        if self.expert_cache_host_storage == "shared_original":
+            if self.expert_storage != "original" or not self.expert_arena:
+                raise ValueError("shared_original requires original experts and arena")
+            if self.expert_cache_fraction or self.expert_cache_host_slack:
+                raise ValueError(
+                    "shared_original requires expert_cache_fraction=0 and "
+                    "expert_cache_host_slack=0; use expert_cache_offload_fraction"
+                )
+            if self.expert_cache_profile is not None:
+                raise ValueError("shared_original currently uses deterministic hot ids")
+            if (
+                self.expert_cache_prefill != "turbomind"
+                or self.expert_cache_prefill_prepare != "all"
+            ):
+                raise ValueError("shared_original requires complete TurboMind prefill")
 
 
 @config
