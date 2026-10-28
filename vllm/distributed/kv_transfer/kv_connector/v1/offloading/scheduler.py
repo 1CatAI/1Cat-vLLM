@@ -362,6 +362,15 @@ class OffloadingConnectorScheduler:
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
         self._mamba_align_size: int | None = resolve_mamba_align_size(spec)
+        # With EAGLE/MTP (same condition as Scheduler.use_eagle), restored Mamba
+        # states must sit one page before the full-attention reach; see _lookup.
+        speculative_config = spec.vllm_config.speculative_config
+        self._eagle_state_shift: int | None = (
+            self._mamba_align_size
+            if speculative_config is not None
+            and speculative_config.use_eagle_kv_cache()
+            else None
+        )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
@@ -488,6 +497,7 @@ class OffloadingConnectorScheduler:
                 )
         num_hit_tokens: int = 0
         defer_lookup = False
+        eagle_state_shift = self._eagle_state_shift
         lookup_groups = self._lookup_groups
         while lookup_groups:
             looked_up_sliding_window: bool = False
@@ -495,6 +505,25 @@ class OffloadingConnectorScheduler:
             lookup_groups = ()
             for group_idx in groups_iter:
                 group_config: GroupOffloadConfig = self._group_config_by_idx[group_idx]
+                if (
+                    eagle_state_shift is not None
+                    and group_config.sliding_window_size_in_blocks is not None
+                ):
+                    # With EAGLE/MTP a GPU prefix hit ends one Mamba page before
+                    # the full-attention reach (MambaManager.find_longest_cache_hit),
+                    # and sparse retention keeps states only on such pages. Look
+                    # the sparse groups up one page before the reach as well (the
+                    # full-attention groups come first): a state on the last
+                    # matched page would be restored where the GPU cannot use it,
+                    # so the GPU would keep the attention blocks but no usable
+                    # state, and every later request with this prefix would
+                    # reload the whole prefix from this tier.
+                    max_hit_size_tokens = max(
+                        round_down(max_hit_size_tokens, eagle_state_shift)
+                        - eagle_state_shift,
+                        0,
+                    )
+                    eagle_state_shift = None
                 group_state: RequestGroupState = req_status.group_states[group_idx]
                 offloaded_block_size = group_config.offloaded_block_size
                 offload_keys = group_state.offload_keys
@@ -660,14 +689,20 @@ class OffloadingConnectorScheduler:
         # Record it on the request (like the GPU prefix cache does) so the
         # scheduler ends a chunk there, the retention mask keeps the state and
         # the boundary hand-off offloads it; the next sibling then hits.
+        junction = req_status.external_full_attention_hit_tokens
+        if self._eagle_state_shift is not None:
+            # A usable state sits one page before the reach (see _lookup).
+            junction = max(
+                round_down(junction, self._eagle_state_shift) - self._eagle_state_shift,
+                0,
+            )
         if (
             num_hit_tokens is not None
             and self._sliding_window_groups
-            and req_status.external_full_attention_hit_tokens > served_tokens
+            and junction > served_tokens
         ):
             request.shared_prefix_boundary = max(
-                request.shared_prefix_boundary,
-                req_status.external_full_attention_hit_tokens,
+                request.shared_prefix_boundary, junction
             )
 
         self._touch(req_status)
