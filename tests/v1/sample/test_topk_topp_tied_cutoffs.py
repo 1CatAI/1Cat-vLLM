@@ -357,3 +357,37 @@ def test_shortlist_order_preserves_radix_ties_and_value_bits(width, descending):
         assert torch.equal(
             output[0].view(torch.int32), ordered_values.view(torch.int32)
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compact_classifies_rows_without_rejecting_the_batch(monkeypatch):
+    from vllm.v1.sample.ops import topk_topp_sampler
+    from vllm.v1.sample.ops.topk_topp_triton import _apply_top_k_top_p_compact
+
+    # One batch mixing greedy-style rows (top-k disabled, top_p=1), top-k-only
+    # rows, sampled rows and rows whose k exceeds the shortlist. Admission is
+    # decided on the device (no per-step sync), and only the out-of-shortlist
+    # rows that still need top-p take the dense reference route.
+    vocab = 248320
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    logits = torch.randn((8, vocab), device="cuda", generator=generator) * 3
+    logits[:, :4] += 12.0
+    k = torch.tensor(
+        [vocab, vocab, 20, 50, 20, 200, vocab, 127], dtype=torch.int32, device="cuda"
+    )
+    p = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.95, 0.9, 0.8, 0.95], device="cuda")
+    expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    dense_rows = []
+
+    def counting_reference(x, k, p, **kwargs):
+        dense_rows.append(x.shape[0])
+        return apply_top_k_top_p_pytorch(x, k, p, **kwargs)
+
+    monkeypatch.setattr(
+        topk_topp_sampler, "apply_top_k_top_p_pytorch", counting_reference
+    )
+    actual = _apply_top_k_top_p_compact(logits.clone(), k, p, -float("inf"))
+    assert actual is not None
+    assert torch.equal(actual, expected)
+    # rows 5 (k=200, top_p=0.9) and 6 (top-k disabled, top_p=0.8) only
+    assert sum(dense_rows) == 2
