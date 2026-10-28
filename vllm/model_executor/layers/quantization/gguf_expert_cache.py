@@ -574,8 +574,18 @@ class ExpertCache:
         return dict(zip(names, self.lane.stats())) if self.lane else {}
 
     # -- decode ----------------------------------------------------------
-    def resolve(self, layer: int, ids: torch.Tensor) -> torch.Tensor:
-        """Slot ids for ``ids`` once every routed expert is resident."""
+    def resolve(
+        self,
+        layer: int,
+        ids: torch.Tensor,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Slot ids for ``ids`` once every routed expert is resident.
+
+        ``weights`` is accepted for signature parity with
+        :meth:`SharedOriginalExpertCache.resolve`, which ``gguf_moe`` calls
+        with the same arguments; slot resolution does not need it.
+        """
         self.start()
         if self.tm is not None and self.tm.preparation is not None:
             self.tm.preparation.wait_decode()
