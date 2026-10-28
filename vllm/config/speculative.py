@@ -227,6 +227,11 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
+    disable_eagle_block_drop: bool = False
+    """Keep the trailing hashed prefix-cache page on an EAGLE/MTP hit.
+    Backport of vllm-project/vllm#53388. Default ``False`` matches current
+    1Cat behavior. Hybrid Qwen3.8 MTP pages are thousands of tokens, so the
+    stock drop recomputes a full page on every prefix hit."""
     use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -1668,7 +1673,13 @@ class SpeculativeConfig:
         # so dropping an additional target block is both unnecessary and can
         # eliminate all prefix hits when hybrid page unification makes blocks
         # large. Keep DDTree and DSpark on their established V1 semantics.
-        return self.use_eagle() and not self.use_dflash()
+        # disable_eagle_block_drop is the #53388 opt-in: keep the trailing
+        # hashed page (Qwen3.8 hybrid MTP pages are 2048+ tokens).
+        return (
+            self.use_eagle()
+            and not self.use_dflash()
+            and not self.disable_eagle_block_drop
+        )
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
