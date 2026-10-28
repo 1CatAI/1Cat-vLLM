@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
+import os
 from typing import cast
 
 import torch
@@ -29,7 +29,24 @@ logger = init_logger(__name__)
 _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
 
 
-_INPLACE_AR_MIN = int(__import__("os").environ.get("VLLM_INPLACE_AR_MIN", str(1 << 22)))
+def inplace_all_reduce_min() -> int:
+    """Smallest all-reduce, in elements, that pynccl reduces in place; 0: never.
+
+    The ``vllm.all_reduce`` op is registered as out-of-place, so compiled
+    graphs may read its input again after the call. Reducing in place then
+    hands those readers the reduced sum instead of the rank's own partial:
+    with Qwen3.8-27B NVFP4 + DFlash2 the target output stayed the same, but
+    the draft context changed and speed-fixture acceptance fell from 2.88 to
+    2.66 tokens per round at 1K. Only the DeepSeek-V4.1 packed-KV prefill,
+    which was qualified with it, reduces in place unless asked explicitly.
+    """
+    configured = os.environ.get("VLLM_INPLACE_AR_MIN")
+    if configured is not None:
+        return int(configured)
+    return 1 << 22 if os.environ.get("VLLM_V41_PACKED_KV", "0") == "1" else 0
+
+
+_INPLACE_AR_MIN = inplace_all_reduce_min()
 
 
 class CudaCommunicator(DeviceCommunicatorBase):

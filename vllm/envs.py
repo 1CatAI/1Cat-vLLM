@@ -447,7 +447,7 @@ if TYPE_CHECKING:
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_EXPERT_CACHE_MEMLOG: bool = False
-    VLLM_INPLACE_AR_MIN: str = "4194304"
+    VLLM_INPLACE_AR_MIN: str | None = None
     VLLM_PYNCCL_ALLGATHER: str = "1"
     VLLM_V41_ATTN_TIMING: str = "0"
     VLLM_V41_MARKOV_FUSED: str | None = None
@@ -8048,14 +8048,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_INPLACE_AR_MIN": env_var(
-        lambda: os.getenv("VLLM_INPLACE_AR_MIN", "4194304"),
+        lambda: os.getenv("VLLM_INPLACE_AR_MIN"),
         description=(
             "All-reduce large (prefill) temporaries in place at or above this many "
-            "elements; 0 disables."
+            "elements; 0 disables. Unset: 4194304 with VLLM_V41_PACKED_KV=1, "
+            "otherwise 0, because the all_reduce op is declared out-of-place."
         ),
         category="tuning",
-        declared_default="'4194304'",
-        effective_default="'4194304'",
+        declared_default="None",
+        effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
