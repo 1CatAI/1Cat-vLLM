@@ -361,7 +361,7 @@ _flash_attn_forward_lse: Callable[..., tuple[torch.Tensor, ...]] | None = None
 _flash_attn_forward_lse_checked = False
 
 
-def get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
+def _load_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
     """Lazy-load the private LSE-capable forward entry of the FA-V100 wheel."""
     global _flash_attn_forward_lse, _flash_attn_forward_lse_checked
     if not _flash_attn_forward_lse_checked:
@@ -372,7 +372,19 @@ def get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
             _flash_attn_forward_lse = _flash_attn_forward
         except (ImportError, AttributeError):
             _flash_attn_forward_lse = None
-    return bind_attention_operation(_flash_attn_forward_lse)
+    return _flash_attn_forward_lse
+
+
+def get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
+    """The LSE-capable forward entry, bound to this engine's runtime."""
+    return bind_attention_operation(_load_flash_dense_forward())
+
+
+def flash_dense_forward_available() -> bool:
+    """Whether the wheel ships the entry. Backend selection asks this while the
+    model is built, before the engine binds its Flash-V100 runtime, so it must
+    not bind."""
+    return _load_flash_dense_forward() is not None
 
 
 def _get_flash_turboquant_decode_op():

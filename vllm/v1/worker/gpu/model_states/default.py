@@ -169,6 +169,7 @@ class DefaultModelState(ModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_id: int = 0,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
@@ -203,5 +204,6 @@ class DefaultModelState(ModelState):
             positions=input_batch.positions,
             for_cudagraph_capture=for_capture,
             prefix_anchor_lens=input_batch.prefix_anchor_lens,
+            ubatch_id=ubatch_id,
         )
         return attn_metadata

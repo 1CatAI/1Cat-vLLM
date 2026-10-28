@@ -11,7 +11,7 @@ identify initialization/hash code; they do not evaluate its semantics.
 
 | Type | Owner paths | Lifecycle / hash methods | Source |
 | --- | --- | --- | --- |
-| `vllm.config.attention.AttentionConfig` | attention_config | compute_hash: [vllm/config/attention.py](../../../vllm/config/attention.py#L101) | [vllm/config/attention.py](../../../vllm/config/attention.py#L16) |
+| `vllm.config.attention.AttentionConfig` | attention_config | compute_hash: [vllm/config/attention.py](../../../vllm/config/attention.py#L111) | [vllm/config/attention.py](../../../vllm/config/attention.py#L16) |
 | `vllm.config.cache.CacheConfig` | cache_config | compute_hash: [vllm/config/cache.py](../../../vllm/config/cache.py#L202) | [vllm/config/cache.py](../../../vllm/config/cache.py#L43) |
 | `vllm.config.compilation.CUDAGraphMode` | compilation_config.cudagraph_mode |  | [vllm/config/compilation.py](../../../vllm/config/compilation.py#L54) |
 | `vllm.config.compilation.CompilationConfig` | compilation_config | compute_hash: [vllm/config/compilation.py](../../../vllm/config/compilation.py#L790); __post_init__: [vllm/config/compilation.py](../../../vllm/config/compilation.py#L916) | [vllm/config/compilation.py](../../../vllm/config/compilation.py#L391) |
@@ -37,8 +37,9 @@ identify initialization/hash code; they do not evaluate its semantics.
 | `vllm.config.gdn_schedule.GdnScheduleConfig` | kernel_config.gdn.schedule | resolve: [vllm/config/gdn_schedule.py](../../../vllm/config/gdn_schedule.py#L129); graph_options: [vllm/config/gdn_schedule.py](../../../vllm/config/gdn_schedule.py#L160) | [vllm/config/gdn_schedule.py](../../../vllm/config/gdn_schedule.py#L49) |
 | `vllm.config.gdn_state.GdnStateConfig` | kernel_config.gdn.state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L39); graph_options: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L52) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L23) |
 | `vllm.config.gdn_state.GdnStateTraceConfig` | observability_config.gdn_state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L99); compile_ignored_aliases: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L142) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L59) |
+| `vllm.config.kernel.HostReduceConfig` | kernel_config.host_reduce | __post_init__: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L681) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L662) |
 | `vllm.config.kernel.IrOpPriorityConfig` | kernel_config.ir_op_priority | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L84) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L67) |
-| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1129) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L662) |
+| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1169) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L692) |
 | `vllm.config.kernel.Sm70AwqConfig` | kernel_config.sm70_awq | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L338); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L317) |
 | `vllm.config.kernel.Sm70Fp8Config` | kernel_config.sm70_fp8 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L433); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L369) |
 | `vllm.config.kernel.Sm70GgufConfig` | kernel_config.sm70_gguf |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L498) |

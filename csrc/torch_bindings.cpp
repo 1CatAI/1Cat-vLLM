@@ -758,6 +758,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            vllm::sm70::with_policy(&fp8_qpn8_gemm_sm70_out));
 
   ops.def(
+      "fp8_qpn8_mma_sm75_out(Tensor(a!) out, Tensor input, Tensor codes, "
+      "Tensor group_scales, str? native_policy=None ) -> ()");
+  ops.impl("fp8_qpn8_mma_sm75_out", torch::kCUDA,
+           vllm::sm70::with_policy(&fp8_qpn8_mma_sm75_out));
+
+  ops.def(
       "fp8_qpn8_gemm_ba_split_sm70_out(Tensor(a!) qkv_out, Tensor(b!) "
       "z_out, Tensor(c!) b_out, Tensor(d!) a_out, Tensor input, Tensor codes, "
       "Tensor group_scales, Tensor ba_weight, str? native_policy=None ) -> "
@@ -891,7 +897,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            vllm::sm70::with_policy(&nvfp4_qpn2_gemm_sm70_out));
 
   // Skinny QPN GEMM and grouped NVFP4/MXFP4 MoE (SM70/SM75), weights
-  // prepacked in mma.m8n8k4 fragment order.
+  // prepacked in mma.m8n8k4 fragment order; the grouped MoE also runs on
+  // mma.m16n8k8 order (SM75 and later).
   ops.def(
       "skinny_qpn_gemm_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
       "float gscale, int n) -> Tensor");
@@ -901,8 +908,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "skinny_moe_qpn_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
       "Tensor gscales, Tensor perm, Tensor gids, Tensor goff, int topk, "
       "Tensor(a!) y_slots, bool x_slot_major, int num_tokens, int splitk, "
-      "int nacc, int scale_mode) -> ()");
+      "int scale_mode, int fragment_order) -> ()");
   ops.impl("skinny_moe_qpn_sm70", torch::kCUDA, &skinny_moe_qpn_sm70);
+
+  // Causal prefill attention, head dim 256, over a paged fp16 KV cache on
+  // Turing's m16n8k8 tensor cores (SM75 and later).
+  ops.def(
+      "paged_prefill_attention_sm75(Tensor(a!) out, Tensor q, Tensor k_cache, "
+      "Tensor v_cache, Tensor cu_seqlens_q, Tensor seqused_k, "
+      "Tensor block_table, int max_seqlen_q, float softmax_scale, "
+      "int num_kv_splits) -> ()");
+  ops.impl("paged_prefill_attention_sm75", torch::kCUDA,
+           &paged_prefill_attention_sm75);
 
   ops.def(
       "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
