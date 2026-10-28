@@ -230,7 +230,7 @@ class SpeculativeConfig:
     disable_eagle_block_drop: bool = False
     """Keep the trailing hashed prefix-cache page on an EAGLE/MTP hit.
     Backport of vllm-project/vllm#53388. Default ``False`` matches current
-    1Cat behavior. Hybrid Qwen3.8 MTP pages are thousands of tokens, so the
+    1Cat behavior. Hybrid-model MTP pages can be thousands of tokens, so the
     stock drop recomputes a full page on every prefix hit."""
     use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
@@ -1674,7 +1674,7 @@ class SpeculativeConfig:
         # eliminate all prefix hits when hybrid page unification makes blocks
         # large. Keep DDTree and DSpark on their established V1 semantics.
         # disable_eagle_block_drop is the #53388 opt-in: keep the trailing
-        # hashed page (Qwen3.8 hybrid MTP pages are 2048+ tokens).
+        # hashed page (hybrid-model MTP pages can be 2048+ tokens).
         return (
             self.use_eagle()
             and not self.use_dflash()
