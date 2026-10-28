@@ -40,6 +40,29 @@ def test_floor_holds_on_slow_steps_and_growth_starts_from_it():
     assert budget.tokens > 1632
 
 
+def _converge(budget, fixed_ms, ms_per_token, steps=40):
+    for _ in range(steps):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 32, n, fixed_ms + ms_per_token * n))
+    return budget.tokens
+
+
+def test_fixed_step_cost_below_target_is_not_charged_to_prefill():
+    # 60 ms of decode/launch cost plus 0.25 ms per prefill token: 250 ms
+    # leaves room for (250 - 60) / 0.25 = 760 prefill tokens.
+    budget = MixedPrefillBudget(4064, 250)
+    assert 736 <= _converge(budget, 60, 0.25) <= 768
+
+
+def test_fixed_step_cost_above_target_does_not_collapse_the_budget():
+    # Eager mixed steps can cost more than the target before any prefill.
+    # Splitting the prompt finer only multiplies those steps, so the budget
+    # must settle near fixed / per_token instead of the 16-token quantum.
+    budget = MixedPrefillBudget(4064, 250, min_tokens=0)
+    budget.tokens = 32
+    assert 1100 <= _converge(budget, 300, 0.25, steps=60) <= 1216
+
+
 @pytest.mark.parametrize("elapsed", [0, -1, float("nan"), float("inf")])
 def test_invalid_timing_does_not_change_budget(elapsed):
     budget = MixedPrefillBudget(8192, 250)
