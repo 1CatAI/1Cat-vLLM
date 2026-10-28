@@ -381,6 +381,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         self._initialize_decode_policy()
 
+        # Long-prefix prefill workspaces are sized by the engine contract, not
+        # by the profiling batch; keep it for profile_sm70_long_prefix_workspaces.
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+        self._prefix_max_model_len = (
+            cfg.model_config.max_model_len
+            if cfg is not None and cfg.model_config is not None
+            else None
+        )
+        self._prefix_kv_block_size = (
+            cfg.cache_config.block_size if cfg is not None else None
+        )
+
         if self.prefix_anchored_decode_window is not None:
             if (
                 self.prefix_anchored_decode_window <= 0
@@ -776,6 +790,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 and abs(self.scale - 0.0625) <= 1.0e-8
             ):
                 _dense_prefill.profile_sm70_prefill_workspace(query, self.num_kv_heads)
+                _dense_prefill.profile_sm70_long_prefix_workspaces(
+                    query,
+                    num_kv_heads=self.num_kv_heads,
+                    max_model_len=self._prefix_max_model_len,
+                    kv_block_size=self._prefix_kv_block_size,
+                    fp8_bridge=self.use_fp8_prefill_bridge,
+                )
             _routing.record_route(
                 _routing.ROUTE_SPECS["metadata_none_zero_output"].name
             )

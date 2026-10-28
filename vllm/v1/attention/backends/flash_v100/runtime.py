@@ -56,6 +56,8 @@ class PrefillRuntime:
         )
         # Resolve bound methods once. No native strings or env parsing in forward.
         self.operations = {8000: self.owner.q8000, 8192: self.owner.q8192}
+        if hasattr(self.owner, "q4096"):
+            self.operations[4096] = self.owner.q4096
 
     def close(self):
         self.owner.close()
@@ -66,6 +68,7 @@ class PrefillRuntime:
             "evidence": "host dispatches: capture included; replay excluded",
             "q8000": counts[0],
             "q8192": counts[1],
+            "q4096": counts[2] if len(counts) > 2 else 0,
         }
 
 

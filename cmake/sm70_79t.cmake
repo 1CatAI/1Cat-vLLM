@@ -51,6 +51,10 @@ set_source_files_properties("${SM70_79T_DIR}/prefill_q8192.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
   COMPILE_DEFINITIONS "${_79t_defs}"
   COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda")
+set_source_files_properties("${SM70_79T_DIR}/prefill_q4096.cu"
+  TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
+  COMPILE_DEFINITIONS "${_79t_defs}"
+  COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda")
 set_source_files_properties("${SM70_79T_DIR}/legacy_tail_adapter.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
   COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70")
@@ -62,6 +66,7 @@ set_property(SOURCE
 target_sources(_vllm_fa2_C PRIVATE
   "${SM70_79T_DIR}/prefill.cu"
   "${SM70_79T_DIR}/prefill_q8192.cu"
+  "${SM70_79T_DIR}/prefill_q4096.cu"
   "${SM70_79T_DIR}/legacy_tail_adapter.cu"
   "${SM70_79T_DIR}/register.cpp")
 target_link_libraries(_vllm_fa2_C PRIVATE CUDA::cublas)

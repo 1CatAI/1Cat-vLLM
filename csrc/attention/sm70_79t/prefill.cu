@@ -5862,6 +5862,8 @@ namespace FLASH_NAMESPACE {
 
   #if PREFIX_TORCH_QUERY_TOKENS == 8192
 extern "C" int64_t onecat_sm70_q8192_accumulation_bits() {
+  #elif PREFIX_TORCH_QUERY_TOKENS == 4096
+extern "C" int64_t onecat_sm70_q4096_accumulation_bits() {
   #else
 extern "C" int64_t onecat_sm70_q8000_accumulation_bits() {
   #endif
@@ -5905,9 +5907,12 @@ std::map<int, Sm70GqaScoreWorkspacePtr>& sm70_gqa_score_cache() {
 Sm70GqaScoreWorkspacePtr get_sm70_gqa_score_workspace(const at::Tensor& q,
                                                       int rows, int block_n) {
   if (auto* owner = onecat_sm70_prefill::current_owner()) {
-    constexpr auto slot = PREFIX_TORCH_QUERY_TOKENS == 8000
-                              ? onecat_sm70_prefill::CacheSlot::Q8000Score
-                              : onecat_sm70_prefill::CacheSlot::Q8192Score;
+    constexpr auto slot =
+        PREFIX_TORCH_QUERY_TOKENS == 8000
+            ? onecat_sm70_prefill::CacheSlot::Q8000Score
+            : (PREFIX_TORCH_QUERY_TOKENS == 4096
+                   ? onecat_sm70_prefill::CacheSlot::Q4096Score
+                   : onecat_sm70_prefill::CacheSlot::Q8192Score);
     return owner->workspace<Sm70GqaScoreWorkspace>(slot, q.get_device(), [&] {
       return std::make_shared<Sm70GqaScoreWorkspace>(q, rows, block_n);
     });
@@ -5924,9 +5929,12 @@ Sm70GqaScoreWorkspacePtr get_sm70_gqa_score_workspace(const at::Tensor& q,
 
 Sm70GqaScoreWorkspacePtr find_sm70_gqa_score_workspace(int device) {
   if (auto* owner = onecat_sm70_prefill::current_owner()) {
-    constexpr auto slot = PREFIX_TORCH_QUERY_TOKENS == 8000
-                              ? onecat_sm70_prefill::CacheSlot::Q8000Score
-                              : onecat_sm70_prefill::CacheSlot::Q8192Score;
+    constexpr auto slot =
+        PREFIX_TORCH_QUERY_TOKENS == 8000
+            ? onecat_sm70_prefill::CacheSlot::Q8000Score
+            : (PREFIX_TORCH_QUERY_TOKENS == 4096
+                   ? onecat_sm70_prefill::CacheSlot::Q4096Score
+                   : onecat_sm70_prefill::CacheSlot::Q8192Score);
     return owner->find<Sm70GqaScoreWorkspace>(slot, device);
   }
   std::lock_guard<std::mutex> lock(sm70_gqa_score_cache_mutex());
@@ -6112,7 +6120,8 @@ struct Sm70GqaHalf2Workspace {
   std::mutex& launch_mutex;
 
   explicit Sm70GqaHalf2Workspace(const at::Tensor& q)
-      : shared_scores(onecat_sm70_prefill::get_score_workspace(q, kBlockN)),
+      : shared_scores(
+            onecat_sm70_prefill::get_score_workspace(q, kBlockN, kRows)),
         prefix_cublas(runtime.prefix_cublas),
         tail_cublas(runtime.tail_cublas),
         prefix_stream(runtime.prefix_stream),
@@ -6156,9 +6165,11 @@ struct Sm70GqaHalf2Workspace {
     static_assert(kQuery % kTailTileTokens == 0);
     static_assert(
         (kQuery == 8000 && kTailTileTokens == 320 && kTailTiles == 25) ||
-        (kQuery == 8192 && kTailTileTokens == 256 && kTailTiles == 32));
+        (kQuery == 8192 && kTailTileTokens == 256 && kTailTiles == 32) ||
+        (kQuery == 4096 && kTailTileTokens == 256 && kTailTiles == 16));
     static_assert(kFinePVGroupTiles == 4);
-    static_assert(kFinePVTasks == (kQuery == 8000 ? 91 : 144));
+    static_assert(kFinePVTasks ==
+                  (kQuery == 8000 ? 91 : (kQuery == 4096 ? 40 : 144)));
     static_assert(kBlockN >= 8192 && kBlockN <= 16 * 8192 &&
                   kBlockN % 8192 == 0);
     static_assert(kTailScoreElements <= size_t(kBlockN) * kRows);
@@ -6238,9 +6249,12 @@ std::map<int, Sm70GqaHalf2WorkspacePtr>& sm70_gqa_half2_cache() {
 
 Sm70GqaHalf2WorkspacePtr get_sm70_gqa_half2_workspace(const at::Tensor& q) {
   if (auto* owner = onecat_sm70_prefill::current_owner()) {
-    constexpr auto slot = PREFIX_TORCH_QUERY_TOKENS == 8000
-                              ? onecat_sm70_prefill::CacheSlot::Q8000Half2
-                              : onecat_sm70_prefill::CacheSlot::Q8192Half2;
+    constexpr auto slot =
+        PREFIX_TORCH_QUERY_TOKENS == 8000
+            ? onecat_sm70_prefill::CacheSlot::Q8000Half2
+            : (PREFIX_TORCH_QUERY_TOKENS == 4096
+                   ? onecat_sm70_prefill::CacheSlot::Q4096Half2
+                   : onecat_sm70_prefill::CacheSlot::Q8192Half2);
     return owner->workspace<Sm70GqaHalf2Workspace>(slot, q.get_device(), [&] {
       return std::make_shared<Sm70GqaHalf2Workspace>(q);
     });
