@@ -374,9 +374,16 @@ class KVBlockZeroer:
                         spec.head_size,
                         cache_dtype_str=cache_dtype,
                     )
-                    dp = kv.data_ptr()
-
                     el = kv.element_size()
+                    # Packed DCP pages (attn_utils) expose each member as a
+                    # view offset by whole kernel blocks inside one physical
+                    # page, with a block stride that spans every member. Zero
+                    # from the page base: starting at member j's own offset
+                    # runs j kernel blocks past the page into the next block.
+                    # The members then share one segment that covers the page.
+                    page_offset_el = kv.storage_offset() % kv.stride(block_dim)
+                    dp = kv.data_ptr() - page_offset_el * el
+
                     cur_bytes = kv.stride(block_dim) * el
                     assert cur_bytes % 4 == 0
                     kernel_block_el = cur_bytes // 4

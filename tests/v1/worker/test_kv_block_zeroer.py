@@ -448,3 +448,99 @@ def test_host_backed_layers_are_not_zeroed() -> None:
     zeroed = caches["attn.device"].flatten(1).eq(0).all(1).tolist()
     assert zeroed == [False, True, False, False]
     assert bool(caches["attn.host"].eq(1).all())
+
+
+# Small fp16 layout, and the deployed Qwen3.8 DCP2 main KV: 816 local slots,
+# one 256-wide E4M3 head, FlashAttention kernel blocks of 16 (ratio 51).
+_SMALL = (
+    FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=4, dtype=torch.float16),
+    2,
+)
+_DEPLOYED = (
+    FullAttentionSpec(
+        block_size=816, num_kv_heads=1, head_size=256, dtype=torch.float8_e4m3fn
+    ),
+    16,
+)
+
+
+def _packed_members(device: torch.device, num_blocks: int = 4, layout=_SMALL):
+    """Two attention layers packed into one physical page, as attn_utils builds
+    them for DCP-sharded pages: member j is a view offset by j kernel blocks
+    with a block stride that spans both members."""
+    spec, kernel_bs = layout
+    member_count = 2
+    ratio = spec.block_size // kernel_bs
+    block_bytes = spec.page_size_bytes * member_count
+    raw = torch.ones(num_blocks * block_bytes, dtype=torch.int8, device=device)
+    shape = (num_blocks * ratio, 2, kernel_bs, spec.num_kv_heads, spec.head_size)
+    strides = list(torch.empty(shape, device="meta").stride())
+    kernel_block_numel = strides[0]
+    strides[0] = kernel_block_numel * member_count
+    views = {
+        f"layer{j}": torch.as_strided(
+            raw.view(spec.dtype),
+            size=shape,
+            stride=tuple(strides),
+            storage_offset=kernel_block_numel * j,
+        )
+        for j in range(member_count)
+    }
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=list(views),
+        backend=_BlockFirstAttentionBackend,
+    )
+    context = {name: SimpleNamespace(kv_cache=kv) for name, kv in views.items()}
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[kernel_bs],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context=context,
+    )
+    return raw, block_bytes, zeroer
+
+
+@pytest.mark.parametrize("layout", (_SMALL, _DEPLOYED), ids=("small", "deployed"))
+@pytest.mark.skip_global_cleanup
+def test_packed_member_segments_stay_inside_their_page(layout) -> None:
+    """Every (block, segment) zero range must lie inside that block's physical
+    page and the segments must cover it. Zeroing member 1 from its own start
+    used to run one kernel block into the next page (DCP2 packed main KV)."""
+    num_blocks = 3
+    raw, block_bytes, zeroer = _packed_members(torch.device("cpu"), num_blocks, layout)
+    assert zeroer._meta is not None
+    seg_addrs, seg_strides, seg_pages = (t.tolist() for t in zeroer._meta[:3])
+    base = raw.data_ptr()
+    for block in range(num_blocks):
+        page = (base + block * block_bytes, base + (block + 1) * block_bytes)
+        spans = []
+        for addr, stride, size in zip(seg_addrs, seg_strides, seg_pages):
+            start = addr + block * stride * 4
+            end = start + size * 4
+            assert page[0] <= start and end <= page[1], (block, start, end, page)
+            spans.append((start, end))
+        # The segments cover the page exactly (byte intervals, merged).
+        spans.sort()
+        merged = [list(spans[0])]
+        for start, end in spans[1:]:
+            if start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        assert merged == [list(page)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zero_block_ids_packed_members_leave_next_block_alone() -> None:
+    num_blocks = 4
+    raw, block_bytes, zeroer = _packed_members(torch.device("cuda"), num_blocks)
+    zeroer.zero_block_ids([1])
+    torch.accelerator.synchronize()
+    pages = raw.view(num_blocks, block_bytes)
+    assert bool((pages[1] == 0).all())
+    for block in (0, 2, 3):
+        assert bool((pages[block] == 1).all()), block
