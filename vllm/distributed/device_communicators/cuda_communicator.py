@@ -165,6 +165,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else 8192 * 1024
                 ),
                 long_prefill_fusion_enabled=use_sm70_tp4_long_prefill_fused_norm,
+                # Provisioned for the compact collectives although the user
+                # disabled custom all-reduce: do not trust the driver's P2P
+                # report alone. Some hosts report peer access whose direct
+                # peer stores never land, which would wedge these kernels.
+                verify_p2p=not use_custom_allreduce,
             )
 
             if current_platform.is_rocm():
