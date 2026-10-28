@@ -36,6 +36,120 @@ def _dummy_item(size_by_key: dict[str, int]):
     )
 
 
+class TestShmObjectStorageReferenceCounting(unittest.TestCase):
+    """One writer and four readers, as with tensor-parallel workers."""
+
+    def setUp(self):
+        ring_buffer = SingleWriterShmRingBuffer(
+            data_buffer_size=1024 * 100, create=True
+        )
+        self.writer = SingleWriterShmObjectStorage(
+            max_object_size=1024 * 10,
+            n_readers=4,
+            ring_buffer=ring_buffer,
+            serde_class=MsgpackSerde,
+        )
+        handle = self.writer.handle()
+        handle.reader_lock = Lock()
+        self.readers = [
+            SingleWriterShmObjectStorage.create_from_handle(handle) for _ in range(4)
+        ]
+
+    def tearDown(self):
+        for reader in self.readers:
+            reader.close()
+        self.writer.close()
+
+    def _is_evictable(self, key: str) -> bool:
+        self.writer.free_unused()
+        return not self.writer.is_cached(key)
+
+    def test_second_request_before_all_readers_fetched_the_first(self):
+        """Two requests carry the same new item in one scheduler step.
+
+        Every reader starts on the first request at the same time, and the
+        readers that finish it early go on to the second request while the
+        others are still fetching. With the conditional reader count this
+        ordering left the item at 10 of the 12 counts it needed.
+        """
+        first = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.writer.touch("image")
+        second = self.writer.get_cached("image")
+        self.writer.release_touches()
+        self.assertEqual(first, second)
+
+        for reader in self.readers:
+            reader.touch("image", address=first[0], monotonic_id=first[1])
+        for reader in self.readers:
+            reader.get(*first)
+            reader.touch("image", address=second[0], monotonic_id=second[1])
+            reader.get(*second)
+
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_item_stays_until_every_reference_is_fetched(self):
+        first = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.writer.touch("image")
+        second = self.writer.get_cached("image")
+        self.writer.release_touches()
+
+        for reader in self.readers:
+            reader.get(*first)
+        self.assertFalse(self._is_evictable("image"))
+        for reader in self.readers[:-1]:
+            reader.get(*second)
+        self.assertFalse(self._is_evictable("image"))
+        self.readers[-1].get(*second)
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_touch_protects_a_fetched_item_until_it_is_looked_up(self):
+        address, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        for reader in self.readers:
+            reader.get(address, monotonic_id)
+
+        self.writer.touch("image")
+        self.assertFalse(self._is_evictable("image"))
+        self.assertEqual(self.writer.get_cached("image"), (address, monotonic_id))
+        self.writer.release_touches()
+        self.assertFalse(self._is_evictable("image"))
+        for reader in self.readers:
+            reader.get(address, monotonic_id)
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_touch_without_lookup_is_released(self):
+        address, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        for reader in self.readers:
+            reader.get(address, monotonic_id)
+
+        self.writer.touch("image")
+        self.writer.touch("missing")
+        self.writer.release_touches()
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_item_twice_in_one_request(self):
+        first = self.writer.put("image", _dummy_item({"pixels": 64}))
+        second = self.writer.get_cached("image")
+        self.writer.release_touches()
+
+        for reader in self.readers[:-1]:
+            reader.get(*first)
+            reader.get(*second)
+        self.readers[-1].get(*first)
+        self.assertFalse(self._is_evictable("image"))
+        self.readers[-1].get(*second)
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_reader_touch_does_not_write_to_shared_memory(self):
+        address, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        for reader in self.readers:
+            reader.get(address, monotonic_id)
+        before = bytes(self.writer.ring_buffer.shared_memory.buf)
+
+        self.readers[0].touch("image", address=address, monotonic_id=monotonic_id)
+
+        self.assertEqual(bytes(self.writer.ring_buffer.shared_memory.buf), before)
+
+
 class TestSingleWriterShmObjectStorage(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures before each test method."""
