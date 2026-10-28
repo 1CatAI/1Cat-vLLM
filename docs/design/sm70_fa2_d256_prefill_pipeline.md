@@ -218,6 +218,34 @@ dispatch remains evidence-bounded to batch 1, `Q=4096`, `Hq=6`, `Hkv=1`,
 D256, FP16 dense K/V, and `KV>=32768`; other shapes continue to use exact
 dense. Set the variable to `0` to disable it.
 
+### Split-KV for short prefix chunks
+
+A prefix-cache hit leaves a short uncached chunk over a long prefix: the rest
+of a conversation turn, or the few tokens after a snapshot boundary. Such a
+chunk has few 64-row query tiles (Q=1088 gives 17 x 6 heads = 102 CTAs on 80
+SMs; Q=64 gives 6), so the unsplit kernel left most of the GPU idle, and
+chunks below Q=1024 fell back to the paged BM32 kernel. The split-KV3 kernel
+now takes a runtime split count
+(`sm70_d256_splitd_n32_dense_splitkv_fwd`, patch
+`sm70_flash_attn_d256_splitkv_n.patch`); the three-split entry and its merge
+are unchanged and bit-identical. Prefix chunks below the 79T Q4096 range pick
+the split count that minimizes CTA waves per split plus a small per-split
+merge cost, bounded by a shared 24 MiB FP32 partial workspace (4096 query rows)
+reserved during memory profiling and by at least 1024 prefix keys per split.
+
+The E4M3 bridge also pads chunks it previously could not admit. Unaligned
+sequence lengths get zero keys and zero queries appended past the end of the
+sequence, which causal masking hides from every real query; leading zero
+queries still align the chunk to 64 rows. Chunks shorter than 32 tokens enter
+the bridge once the sequence reaches 8192 keys.
+
+Measured on V100 at 110K keys (attention per layer): Q=64 13.5 -> 1.1 ms,
+Q=128 12.2 -> 1.9 ms, Q=512 11.7 -> 7.3 ms, Q=1088 24.0 -> 15.5 ms. For
+Qwen3.8-27B NVFP4 TP4 with a 109K cached prefix, TTFT for a 1.1K-token turn
+fell 1.39 -> 1.09 s, and turns whose last step had fewer than 32 tokens fell
+1.9 -> 0.63 s. `VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3=0` disables both
+split routes.
+
 The subsequent exhaustive SM70 ownership and instruction-scheduling study is
 recorded in [SM70 HMMA Pipeline Search](sm70_hmma_pipeline_search.md). It
 admits a register-double-buffered PV schedule and closes the minimum-shuffle,

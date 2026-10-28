@@ -70,6 +70,9 @@ elseif(VLLM_FLASH_ATTN_SM70)
           COMMAND
             ${PATCH_EXECUTABLE} --batch --forward -p1 -l
             -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_gqa_arch.patch
+          COMMAND
+            ${PATCH_EXECUTABLE} --batch --forward -p1 -l
+            -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_splitkv_n.patch
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()

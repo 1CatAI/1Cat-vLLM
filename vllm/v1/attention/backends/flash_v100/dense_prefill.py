@@ -53,6 +53,18 @@ _prefill_dense_splitkv3_workspaces: dict[
     tuple[int, int, torch.dtype],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
+# Split-KV for prefix chunks below the 79T query range. A short chunk over a
+# long prefix has too few 64-row query tiles to fill the GPU, so the prefix is
+# split across CTAs. The FP32 partials of all splits share one workspace of
+# this many query rows, which bounds the split count of longer chunks.
+_SM70_SPLITKV_WORKSPACE_ROWS = 4096
+_SM70_SPLITKV_MAX_SPLITS = 64
+_SM70_SPLITKV_MIN_SPLIT_KV = 1024
+_prefill_dense_splitkv_workspaces: dict[
+    tuple[int, int, torch.dtype, int],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+_sm70_num_sms: dict[int, int] = {}
 _sm70_79t_q8192_padding_workspaces: dict[
     tuple[int, int, torch.dtype, int, int, int],
     tuple[torch.Tensor, torch.Tensor],
@@ -73,6 +85,7 @@ def clear_flash_attn_v100_workspaces(config=None) -> None:
     _fp8_prefill_bridge_tail_workspaces.clear()
     _kv_layout._prefill_gather_dense_workspaces.clear()
     _prefill_dense_splitkv3_workspaces.clear()
+    _prefill_dense_splitkv_workspaces.clear()
     _sm70_79t_q8192_padding_workspaces.clear()
 
 
@@ -162,6 +175,97 @@ def _get_prefill_dense_splitkv3_workspace(
     workspace = (partial_out, partial_max, partial_sum)
     cache[cache_key] = workspace
     return workspace
+
+
+def _get_prefill_dense_splitkv_workspace(
+    query: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    cache = workspace_cache(
+        "prefill_dense_splitkv_workspaces", _prefill_dense_splitkv_workspaces
+    )
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    stream_id = int(torch.cuda.current_stream(query.device).cuda_stream)
+    heads = int(query.shape[2])
+    cache_key = (device_index, stream_id, query.dtype, heads)
+    workspace = cache.get(cache_key)
+    if workspace is not None:
+        return workspace
+    if _routing.is_cuda_graph_capturing(query):
+        return None
+    rows = _SM70_SPLITKV_WORKSPACE_ROWS * heads
+    try:
+        workspace = (
+            torch.empty(rows * 256, dtype=torch.float32, device=query.device),
+            torch.empty(rows, dtype=torch.float32, device=query.device),
+            torch.empty(rows, dtype=torch.float32, device=query.device),
+        )
+    except torch.OutOfMemoryError:
+        logger.warning_once(
+            "Insufficient memory for the prefix-prefill split-KV workspace; "
+            "short chunks keep the exact dense kernel.",
+            scope="process",
+        )
+        return None
+    cache[cache_key] = workspace
+    return workspace
+
+
+def _prefill_dense_splitkv_splits(
+    query: torch.Tensor, max_seqlen_q: int, max_seqlen_k: int
+) -> int:
+    """Split count for a prefix chunk; 1 keeps the unsplit kernel."""
+    if (
+        not _config.options().value("prefill_dense_splitkv3")
+        or max_seqlen_q >= _SM70_79T_Q4096_MIN_QUERY_LEN
+        or max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT
+        or max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT
+        or query.shape[0] != 1
+        or _ops.get_sm70_splitd_d256_splitkv_op() is None
+    ):
+        return 1
+    max_splits = min(
+        _SM70_SPLITKV_MAX_SPLITS,
+        _SM70_SPLITKV_WORKSPACE_ROWS // max_seqlen_q,
+        (max_seqlen_k - max_seqlen_q) // _SM70_SPLITKV_MIN_SPLIT_KV,
+    )
+    if max_splits < 2:
+        return 1
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    num_sms = _sm70_num_sms.get(device_index)
+    if num_sms is None:
+        num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+        _sm70_num_sms[device_index] = num_sms
+    tiles = max_seqlen_q // _SM70_79T_EXACT_QUERY_ALIGNMENT * int(query.shape[2])
+    # Waves of CTAs that each cover 1/n of the prefix, plus the per-split
+    # partial write and merge (fitted on V100 at 8K-110K keys).
+    best, best_cost = 1, float("inf")
+    for splits in range(1, max_splits + 1):
+        cost = _masks.cdiv_int(tiles * splits, num_sms) / splits + 2e-4 * splits
+        if cost < best_cost:
+            best, best_cost = splits, cost
+    return best
+
+
+def _try_prefill_dense_splitkv(
+    query, key, value, out, max_seqlen_q, max_seqlen_k, softmax_scale
+):
+    splits = _prefill_dense_splitkv_splits(query, max_seqlen_q, max_seqlen_k)
+    if splits < 2 or key.shape[2] != 1:
+        return None
+    workspace = _get_prefill_dense_splitkv_workspace(query)
+    if workspace is None:
+        return None
+    result = _ops.get_sm70_splitd_d256_splitkv_op()(
+        query, key, value, *workspace, out, softmax_scale, True, splits
+    )
+    _routing.record_route(
+        _routing.ROUTE_SPECS["prefill_dense_splitd_d256_splitkv_kernel"].name
+    )
+    return result
 
 
 def _should_use_prefill_dense_splitkv3(
@@ -580,9 +684,14 @@ def try_sm70_fa2_d256_prefill(
         return None
     paged_kv = block_table is not None
     if max_seqlen_q < 1024:
-        if paged_kv or not _config.options().value("prefill_d256_gqa_v37"):
+        if paged_kv:
             return None
-        if not _should_use_prefill_d256_gqa_architecture(
+        if not _config.options().value("prefill_d256_gqa_v37"):
+            # Short chunks over a long prefix take split-KV, or keep the
+            # existing fallback.
+            if _prefill_dense_splitkv_splits(query, max_seqlen_q, max_seqlen_k) < 2:
+                return None
+        elif not _should_use_prefill_d256_gqa_architecture(
             query,
             key,
             value,
@@ -672,6 +781,16 @@ def try_sm70_fa2_d256_prefill(
                     dense_op,
                 )
 
+                if splitd_result is None:
+                    splitd_result = _try_prefill_dense_splitkv(
+                        query,
+                        key,
+                        value,
+                        splitd_out,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        softmax_scale,
+                    )
                 if splitd_result is None and _should_use_prefill_dense_splitkv3(
                     query,
                     key,
@@ -783,6 +902,17 @@ def profile_sm70_long_prefix_workspaces(
         if cache_key not in profiled:
             shaped = query.new_empty((1, chunk, query.shape[1], 256))
             if get_fp8_prefill_bridge_tail_workspace(shaped, padded) is not None:
+                profiled.add(cache_key)
+    if (
+        fp8_bridge
+        and num_kv_heads == 1
+        and _config.options().value("prefill_dense_splitkv3")
+        and _ops.get_sm70_splitd_d256_splitkv_op() is not None
+    ):
+        cache_key = (query.device, "splitkv", 0)
+        if cache_key not in profiled:
+            shaped = query.new_empty((1, 64, query.shape[1], 256))
+            if _get_prefill_dense_splitkv_workspace(shaped) is not None:
                 profiled.add(cache_key)
     if (
         padded == 4096

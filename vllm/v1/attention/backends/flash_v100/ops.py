@@ -361,6 +361,15 @@ def get_sm70_d256_gqa_architecture_q4096_op():
     return bind_prefill_operation(_sm70_d256_gqa_architecture_q4096_op, 4096)
 
 
+def get_sm70_splitd_d256_splitkv_op():
+    """Runtime split-count variant of split-KV3; absent from older FA2 builds."""
+    if get_sm70_splitd_d256_ops() is None:
+        return None
+    return getattr(
+        torch.ops._vllm_fa2_C, "sm70_d256_splitd_n32_dense_splitkv_fwd", None
+    )
+
+
 def get_sm70_v37_e4m3_bridge_op():
     """Resolve the format-specific bridge from the same FA2 runtime."""
     # E4M3 storage conversion is independent of the dense compute kernel.
