@@ -28,7 +28,7 @@
     "max_num_seqs": 4,
     "mixed_prefill_step_latency_ms": 0,
     "block_size": 2048,
-    "mamba_block_size": 8192,
+    "mamba_block_size": 2048,
     "enable_prefix_caching": true,
     "mamba_cache_mode": "align",
     "served_model_name": "qwen3.8-27b-dflash2",

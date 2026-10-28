@@ -62,7 +62,7 @@ def test_profile_schema():
     assert profile["args"]["kv_cache_dtype"] == "fp8_e4m3"
     assert profile["args"]["max_num_batched_tokens"] == 4096
     assert profile["args"]["block_size"] == 2048
-    assert profile["args"]["mamba_block_size"] == 8192
+    assert profile["args"]["mamba_block_size"] == 2048
     # Prefill beside resident decoders takes the full token budget.
     assert profile["args"]["mixed_prefill_step_latency_ms"] == 0
     spec = profile["args"]["speculative_config"]
