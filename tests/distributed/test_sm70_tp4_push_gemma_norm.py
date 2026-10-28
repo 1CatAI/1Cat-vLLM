@@ -31,8 +31,14 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
     )
     assert not ca.disabled and ca.fully_connected and ca.sm70_tp4_push_buffer_ptrs
     try:
-        for dtype in (torch.float16, torch.float32):
-            x = torch.zeros(8, 5120, device="cuda", dtype=torch.float16)
+        # One to four eight-row verifier blocks; the batched rows use their
+        # own packets and must not disturb the interleaved eight-row route.
+        for rows, dtype in [
+            (rows, dtype)
+            for rows in (8, 16, 24, 32)
+            for dtype in (torch.float16, torch.float32)
+        ]:
+            x = torch.zeros(rows, 5120, device="cuda", dtype=torch.float16)
             residual = torch.zeros_like(x, dtype=torch.float32)
             weight = torch.zeros(5120, device="cuda", dtype=dtype)
             ca.custom_all_reduce(x)
@@ -50,6 +56,10 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
                             )
                             # Separate packets must survive interleaved ordinary AR.
                             ca.custom_all_reduce(x)
+                            if rows != 8:
+                                ca.sm70_tp4_all_reduce_gemma_rms_norm(
+                                    x[:8], residual[:8], weight, 1e-6
+                                )
                         else:
                             output = _sm70_dflash2_gemma_fused_add_rms_norm(
                                 ca.custom_all_reduce(x), residual, weight, 1e-6
