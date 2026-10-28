@@ -26,6 +26,7 @@
     "gpu_memory_utilization": 0.86,
     "max_num_batched_tokens": 4096,
     "max_num_seqs": 4,
+    "mixed_prefill_step_latency_ms": 0,
     "block_size": 2048,
     "mamba_block_size": 8192,
     "enable_prefix_caching": true,

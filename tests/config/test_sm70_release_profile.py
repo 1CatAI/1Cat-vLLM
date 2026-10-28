@@ -63,6 +63,8 @@ def test_profile_schema():
     assert profile["args"]["max_num_batched_tokens"] == 4096
     assert profile["args"]["block_size"] == 2048
     assert profile["args"]["mamba_block_size"] == 8192
+    # Prefill beside resident decoders takes the full token budget.
+    assert profile["args"]["mixed_prefill_step_latency_ms"] == 0
     spec = profile["args"]["speculative_config"]
     assert spec["revision"] == profile["draft"]["revision"]
     assert len(spec["revision"]) == 40

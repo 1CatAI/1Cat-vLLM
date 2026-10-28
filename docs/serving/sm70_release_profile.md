@@ -89,6 +89,18 @@ E4M3 prefix bridge for the full context during memory profiling. Measured on
 for 8192-token chunks at 0.92 memory utilization; time to first token is within
 1% up to 32K, +1.6% at 128K and +3.9% at 250K tokens, and decode rounds are
 unchanged.
+The profile disables the mixed-prefill latency target
+(`--mixed-prefill-step-latency-ms 0`), so a prompt that arrives while other
+requests decode is prefilled in full 4096-token chunks. On SM70 every mixed
+step pays a fixed cost of about 130 ms, mostly launch-bound recurrent layers.
+With the 250 ms target, chunks shrank to about 100 tokens: a 4K prompt then
+took about 35 mixed steps at under 1000 prefill tokens/s, and the resident
+requests advanced one round per step throughout. Full chunks finish the same
+prompt in about one second at full prefill speed and return the batch to pure
+decode. With prefix caching, most new prefills are the uncached tail of a
+conversation, so the decode pause stays short. Pass a positive value to bound
+mixed steps for latency-sensitive services.
+
 The 0.86 default keeps about 690 MiB of device headroom on 16GB cards: one
 250K request followed by four concurrent 64K requests completed with a 15.1 GiB
 peak and 4.07 GiB of KV per GPU. At 0.92 that mix ran out of memory, and at
