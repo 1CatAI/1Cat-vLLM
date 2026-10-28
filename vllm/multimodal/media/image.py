@@ -11,7 +11,7 @@ from PIL import Image
 
 from vllm.utils.serial_utils import tensor2base64
 
-from ..image import convert_image_mode, rgba_to_rgb
+from ..image import convert_image_mode
 from .base import MediaIO, MediaWithBytes
 
 MAGIC_NUMPY_PREFIX = b"\x93NUMPY"  # https://numpy.org/devdocs/reference/generated/numpy.lib.format.html#format-version-1-0
@@ -60,12 +60,7 @@ class ImageMediaIO(MediaIO[Image.Image]):
         """Convert image mode with custom background color."""
         if isinstance(image, MediaWithBytes):
             image = image.media
-        if image.mode == self.image_mode:
-            return image
-        elif image.mode == "RGBA" and self.image_mode == "RGB":
-            return rgba_to_rgb(image, self.rgba_background_color)
-        else:
-            return convert_image_mode(image, self.image_mode)
+        return convert_image_mode(image, self.image_mode, self.rgba_background_color)
 
     def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
         try:
