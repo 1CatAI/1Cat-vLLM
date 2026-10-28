@@ -301,15 +301,34 @@ def test_source_wheel_reuse_keeps_sm70_native_operators(
         compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"),
         scope,
     )
-    wheel = tmp_path / "native.whl"
-    names = [
-        f"_h3_{kind}_C.cpython-312-x86_64-linux-gnu.so"
-        for kind in ("w8a16", "flashinfer", "flashattn")
-    ] + [
+    # The Docker build stage reinstalls from the native-stage wheel, so every
+    # SM70/H3 extension declared in setup.py must survive the extraction.
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "CMakeExtension"
+        ):
+            continue
+        keywords = {k.arg: k.value for k in node.keywords}
+        declared = keywords.get("name")
+        module = declared.value if isinstance(declared, ast.Constant) else None
+        if not (
+            isinstance(module, str)
+            and re.fullmatch(r"vllm\._(?:sm70|h3)_\w+_C", module)
+        ):
+            continue
+        limited = keywords.get("py_limited_api")
+        abi3 = not (isinstance(limited, ast.Constant) and limited.value is False)
+        suffix = ".abi3.so" if abi3 else ".cpython-312-x86_64-linux-gnu.so"
+        names.append(module.removeprefix("vllm.") + suffix)
+    assert {
         "_sm70_sampler_C.abi3.so",
-        "_sm70_exact_reduce_C.cpython-312-x86_64-linux-gnu.so",
-        "_sm70_sparse_attention_C.cpython-312-x86_64-linux-gnu.so",
-    ]
+        "_sm70_qsa_indexer_C.cpython-312-x86_64-linux-gnu.so",
+        "_sm70_router_C.cpython-312-x86_64-linux-gnu.so",
+        "_h3_w8a16_C.cpython-312-x86_64-linux-gnu.so",
+    } <= set(names)
+    wheel = tmp_path / "native.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         for name in names:
             archive.writestr("vllm/" + name, b"native-test-bytes")
