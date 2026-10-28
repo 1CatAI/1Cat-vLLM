@@ -32,6 +32,7 @@
     "enable_prefix_caching": true,
     "mamba_cache_mode": "align",
     "partial_prefix_cache": true,
+    "enable_prompt_tokens_details": true,
     "served_model_name": "qwen3.8-27b-dflash2",
     "limit_mm_per_prompt": {
       "image": 0,

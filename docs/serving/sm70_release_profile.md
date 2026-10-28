@@ -117,6 +117,8 @@ beyond the new ones (previously about 1,000); with four concurrent
 conversations the median time to first token fell from 1.07 s to 0.71 s.
 Entries are bounded to a quarter of the KV blocks and released first when
 running requests need blocks.
+Responses report the reused tokens in `usage.prompt_tokens_details.cached_tokens`
+(`--enable-prompt-tokens-details`), so clients can see their cache hits.
 
 The profile disables the mixed-prefill latency target
 (`--mixed-prefill-step-latency-ms 0`), so a prompt that arrives while other
