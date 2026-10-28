@@ -100,6 +100,24 @@ prompt, ~1.3K new tokens per turn) raise the prefix-cache hit rate from 28% to
 68%. Four such conversations at once finished in 36.4 s instead of 57.7 s, with
 the median time to first token falling from 2.34 s to 1.34 s.
 
+The profile also enables partial prefix-cache hits
+(`--partial-prefix-cache`). The chat API passes two prompt positions to the
+engine: the end of the last message (before the generation prompt) and the end
+of the system prompt, each rounded down to the 64-token GDN chunk. When a
+prefill step reaches one of them, the partially filled KV pages, the sliding
+window blocks of the draft and the recurrent states at that position are copied
+into cache-owned blocks. A later request that matches the full blocks before it
+and the tail inside the block resumes there from private copies. Reasoning
+templates render a finished assistant turn differently from the prompt that
+started it, so the end of the last message is also the hit point in thinking
+mode; thinking requests no longer cache their output blocks, which the next
+turn cannot reuse. In an eight-turn agent conversation this raises the hit to
+99-100% of the reusable prefix and leaves 30-60 recomputed tokens per turn
+beyond the new ones (previously about 1,000); with four concurrent
+conversations the median time to first token fell from 1.07 s to 0.71 s.
+Entries are bounded to a quarter of the KV blocks and released first when
+running requests need blocks.
+
 The profile disables the mixed-prefill latency target
 (`--mixed-prefill-step-latency-ms 0`), so a prompt that arrives while other
 requests decode is prefilled in full 4096-token chunks. On SM70 every mixed

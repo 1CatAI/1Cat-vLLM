@@ -56,6 +56,10 @@ class StreamingUpdate:
         )
 
 
+# Chunk size of the chunked recurrent (GDN/Mamba) prefill kernels.
+PREFIX_CACHE_BOUNDARY_ALIGNMENT = 64
+
+
 class Request:
     def __init__(
         self,
@@ -153,6 +157,27 @@ class Request:
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
+        # Prompt positions inside a block where a partial prefix-cache entry
+        # should be kept (e.g. the end of the last chat message).
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        # Boundaries are rounded down to whole recurrent-kernel chunks, so a
+        # request resumed there chunks its prefill exactly like a cold one.
+        align = PREFIX_CACHE_BOUNDARY_ALIGNMENT
+        self.prefix_cache_boundaries: tuple[int, ...] = tuple(
+            sorted(
+                {
+                    int(b) // align * align
+                    for b in extra_args.get("prefix_cache_boundaries", ())
+                    if align <= int(b) < len(prompt_token_ids or ())
+                }
+            )
+        )
+        # Partial prefix-cache entry selected by the last cache lookup.
+        self.partial_prefix_entry: Any = None
+        # A request that starts in reasoning (thinking) mode: chat templates
+        # drop the reasoning from later turns, so its output blocks can never
+        # be a prefix of another request and are not cached.
+        self.cache_output_tokens = reasoning_ended is not False
 
         # Multi-modal related
         self.mm_features = mm_features or []

@@ -281,6 +281,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
+            partial_prefix_cache=self.cache_config.partial_prefix_cache,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -561,6 +562,11 @@ class Scheduler(SchedulerInterface):
                     getattr(request, "shared_prefix_boundary", 0)
                     // block_size
                     * block_size,
+                    *(
+                        self.kv_cache_manager.partial_prefix_stops(request, start, end)
+                        if getattr(self.kv_cache_manager, "partial_cache", None)
+                        else ()
+                    ),
                 )
                 if start < stop < end
             ),
@@ -1363,6 +1369,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            kv_block_copies=self.kv_cache_manager.take_block_copies() or None,
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),
