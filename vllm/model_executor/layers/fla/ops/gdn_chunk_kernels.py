@@ -45,7 +45,10 @@ def _retune(kernel, configs, key, *, use_cuda_graph=False):
 def create_chunk_kernels(schedule: GdnScheduleConfig) -> GdnChunkKernels | None:
     if not torch.cuda.is_available():
         return None
-    from .chunk_delta_h import chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+    from .chunk_delta_h import (
+        _delta_h_configs,
+        chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
+    )
     from .chunk_o import BKV_LIST, NUM_WARPS, chunk_fwd_kernel_o
     from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
     from .utils import use_cuda_graph
@@ -61,12 +64,7 @@ def create_chunk_kernels(schedule: GdnScheduleConfig) -> GdnChunkKernels | None:
             {"BV": schedule.delta_h_bv}, schedule.delta_h_warps, schedule.delta_h_stages
         )
         if sm70 and schedule.delta_h_enabled
-        else [
-            triton.Config({"BV": bv}, num_warps=w, num_stages=s)
-            for w in [2, 4]
-            for s in [2, 3, 4]
-            for bv in [32, 64]
-        ]
+        else _delta_h_configs
     )
     output = (
         _configs(

@@ -20,11 +20,18 @@ from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 NUM_WARPS = [2, 4, 8, 16]
 
 
+# ptxas caps some builds of this kernel at 64 registers per thread and
+# spills the state tiles (sm_75: 2.9-8.7 KB of stack per thread, every config
+# listed here). maxnreg=255 lifts that cap; autotune keeps the faster variant
+# on each device, so devices without the cap are unaffected.
 _delta_h_configs = [
-    triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+    triton.Config(
+        {"BV": BV}, num_warps=num_warps, num_stages=num_stages, maxnreg=maxnreg
+    )
     for num_warps in [2, 4]
     for num_stages in [2, 3, 4]
     for BV in [32, 64]
+    for maxnreg in [None, 255]
 ]
 
 
