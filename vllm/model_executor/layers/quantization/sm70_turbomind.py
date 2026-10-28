@@ -660,28 +660,90 @@ class FP8QPN8LinearState:
         group_scales: torch.Tensor,
         output_size: int,
         split_k: int,
+        decode_split_k: int,
         accumulator_chains: int,
         prefetch_codes: bool,
+        sm75_mma: bool = False,
     ) -> None:
         self.codes = codes
         self.group_scales = group_scales
         self.output_size = output_size
         self.split_k = split_k
+        self.decode_split_k = decode_split_k
         self.accumulator_chains = accumulator_chains
         self.prefetch_codes = prefetch_codes
+        # Turing's tensor-core GEMM serves M above 8 without rebuilding the
+        # FP16 weight; it takes row-group scales on N, K multiples of 128.
+        self.sm75_mma = sm75_mma
+
+
+# Split-K values of the QPN8 launch table, largest first.
+_QPN8_SPLIT_K = (16, 12, 8)
 
 
 def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
     """Split-K, accumulator chains and code prefetch for a QPN8 GEMM.
 
-    The dispatcher admits split-K up to 16; the measured Qwen3.8 shapes use
-    16 (K = 5120) and 12 (K = 1536) with two accumulator chains.
+    The dispatcher admits split-K up to 16; the table takes the largest of
+    16, 12 and 8 that divides K's 16-element code groups, with two
+    accumulator chains.
     """
     groups = k // QPN2_GROUP_SIZE
-    for split_k in (16, 12, 8):
+    for split_k in _QPN8_SPLIT_K:
         if groups % split_k == 0:
             return split_k, 2, False
     raise RuntimeError(f"no QPN8 launch configuration for K={k}")
+
+
+def fp8_qpn8_shape_reason(n: int, k: int) -> str | None:
+    """Why QPN8 cannot pack an ``[N, K]`` weight, or None when it can: the
+    packing needs N % 32 and K % 16 to be zero, the launch table a split-K
+    that divides K's 16-element code groups."""
+    if n % 32 != 0 or k % 16 != 0:
+        return f"QPN8 needs N % 32 == 0 and K % 16 == 0, got N={n}, K={k}"
+    if all((k // QPN2_GROUP_SIZE) % split_k for split_k in _QPN8_SPLIT_K):
+        return f"no QPN8 launch configuration for K={k}"
+    return None
+
+
+# One CTA of the M <= 8 QPN8 GEMM covers this many output columns.
+_QPN8_COLUMNS_PER_CTA = 32
+# fp8_qpn8_occupancy_split_k was measured for the M <= 8 QPN8 GEMM only.
+QPN8_OCCUPANCY_MAX_M = 8
+
+
+def fp8_qpn8_occupancy_split_k(
+    k: int, n: int, split_k: int, device: torch.device
+) -> int:
+    """Fit the split-K of the M <= 8 QPN8 GEMM to the device's occupancy.
+
+    A CTA runs ``split_k`` warps along K (32 * split_k threads). Where a
+    split-16 CTA fills half an SM (Turing, 1024 threads per SM) and the grid
+    spills into a second wave that keeps fewer than half the SMs busy,
+    split-K 8 fits it into one wave (3-27 % faster in CUDA graphs on RTX 8000
+    at M = 1..8); with 2048 threads per SM (Volta) split-K 8 is slower there.
+    Split-K 32 for grids with no more CTAs than SMs was faster in isolation as
+    well, but on DeepSeek-V4 it gave no measurable step gain and lowered the
+    sampled draft acceptance in all eight comparisons, so it is not used.
+    """
+    properties = torch.cuda.get_device_properties(device)
+    sms = properties.multi_processor_count
+    ctas_per_sm_at = {
+        split: properties.max_threads_per_multi_processor // (32 * split)
+        for split in (8, 16)
+    }
+    ctas = n // _QPN8_COLUMNS_PER_CTA
+    groups = k // QPN2_GROUP_SIZE
+    spill = ctas - sms * ctas_per_sm_at[16]
+    if (
+        split_k == 16
+        and ctas_per_sm_at[16] <= 2
+        and 0 < spill < sms // 2
+        and ctas <= sms * ctas_per_sm_at[8]
+        and groups % 8 == 0
+    ):
+        return 8
+    return split_k
 
 
 def prepare_fp8_qpn8_dense_linear(
@@ -694,22 +756,79 @@ def prepare_fp8_qpn8_dense_linear(
     so the scale is broadcast over the rows; the dequantization is then the
     same product the reference path computes.
     """
+    n = int(weight.shape[0])
+    prepare_fp8_qpn8_channel_linear(
+        layer,
+        weight,
+        weight_scale.to(torch.float32).reshape(1, 1).expand(n, 1).contiguous(),
+    )
+
+
+def prepare_fp8_qpn8_channel_linear(
+    layer: torch.nn.Module, weight: torch.Tensor, channel_scales: torch.Tensor
+) -> None:
+    """Prepare an fp8-e4m3fn ``[N, K]`` linear with FP32 ``[N, 1]`` row scales."""
+    n = int(weight.shape[0])
+    if channel_scales.shape != (n, 1) or channel_scales.dtype != torch.float32:
+        raise RuntimeError(
+            f"QPN8 needs FP32 channel scales of shape ({n}, 1), got "
+            f"{tuple(channel_scales.shape)} {channel_scales.dtype}."
+        )
+    _prepare_fp8_qpn8_linear(layer, weight, channel_scales)
+
+
+# QPN8 stores each scale times 256 in FP16. A power of two is exact there from
+# the smallest FP16 subnormal (2^-24) to 2^15; the weight is then the exact
+# product rounded once to FP16, as the load-time dequantization produces it.
+MXFP8_QPN8_EXPONENT_RANGE = (127 - 24 - 8, 127 + 15 - 8)
+
+
+def prepare_mxfp8_qpn8_linear(
+    layer: torch.nn.Module, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> None:
+    """Prepare an MXFP8 linear: fp8-e4m3fn ``[N, K]`` codes with uint8 E8M0
+    ``[N, K/32]`` scales, one per row and 32-wide K group. The codes stay 8-bit;
+    the scales become QPN8 row-group scales, exact for powers of two."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        _upcast_e8m0_to_fp32,
+    )
+
+    n, k = (int(dim) for dim in weight.shape)
+    if weight_scale.shape != (n, k // 32) or weight_scale.dtype != torch.uint8:
+        raise RuntimeError(
+            f"MXFP8 QPN8 needs uint8 E8M0 scales of shape ({n}, {k // 32}), got "
+            f"{tuple(weight_scale.shape)} {weight_scale.dtype}."
+        )
+    low, high = MXFP8_QPN8_EXPONENT_RANGE
+    exponents = weight_scale.view(torch.uint8)
+    smallest, largest = int(exponents.min()), int(exponents.max())
+    if smallest < low or largest > high:
+        raise RuntimeError(
+            f"MXFP8 exponents {smallest}..{largest} leave the exact QPN8 range "
+            f"{low}..{high}."
+        )
+    _prepare_fp8_qpn8_linear(
+        layer, weight, _upcast_e8m0_to_fp32(exponents).contiguous()
+    )
+
+
+def _prepare_fp8_qpn8_linear(
+    layer: torch.nn.Module, weight: torch.Tensor, scales: torch.Tensor
+) -> None:
+    """Pack ``[N, K]`` fp8-e4m3fn codes with FP32 row ``[N, 1]`` or row-group
+    ``[N, K/32]`` scales and attach the QPN8 state to ``layer``."""
     if not hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
         raise RuntimeError(
-            "The Turing FP8 QPN8 path requires a build with CUDA arch 7.0 and "
+            "The FP8 QPN8 path requires a build with CUDA arch 7.0 and "
             "the SM70 TurboMind FP8 extension."
         )
     from vllm import _sm70_ops as sm70_ops
 
     n, k = (int(dim) for dim in weight.shape)
-    if n % 32 != 0 or k % 16 != 0:
-        raise RuntimeError(f"QPN8 needs N % 32 == 0 and K % 16 == 0, got N={n}, K={k}.")
-    channel_scales = (
-        weight_scale.to(torch.float32).reshape(1, 1).expand(n, 1).contiguous()
-    )
-    codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(
-        weight.contiguous(), channel_scales
-    )
+    reason = fp8_qpn8_shape_reason(n, k)
+    if reason is not None:
+        raise RuntimeError(f"{reason}.")
+    codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(weight.contiguous(), scales)
     layer.register_buffer("_sm70_turing_fp8_packed_codes", codes, persistent=False)
     layer.register_buffer(
         "_sm70_turing_fp8_packed_scales", group_scales, persistent=False
@@ -723,8 +842,15 @@ def prepare_fp8_qpn8_dense_linear(
             group_scales,
             n,
             split_k,
+            fp8_qpn8_occupancy_split_k(k, n, split_k, codes.device),
             accumulator_chains,
             prefetch_codes,
+            sm75_mma=(
+                scales.shape == (n, k // 32)
+                and n % 128 == 0
+                and k % 128 == 0
+                and torch.cuda.get_device_capability(weight.device) == (7, 5)
+            ),
         ),
     )
 
@@ -752,8 +878,10 @@ def apply_prepared_fp8_qpn8_linear(
         state.group_scales,
         state.output_size,
         state.split_k,
+        state.decode_split_k,
         state.accumulator_chains,
         state.prefetch_codes,
+        state.sm75_mma,
     )
     if bias is not None:
         out.add_(bias)

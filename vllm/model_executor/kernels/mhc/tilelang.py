@@ -10,18 +10,27 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+# Compute capabilities 7.0 and 7.5 share the FP16 mHC kernels; 7.5 runs the
+# code built for 7.0.
+FP16_MHC_CAPABILITIES = (70, 75)
+
 
 def _is_exact_sm70_glm_mhc(
     residual: torch.Tensor, norm_weight: torch.Tensor | None = None
 ) -> bool:
     if residual.dtype != torch.float16 or not current_platform.is_cuda():
         return False
-    capability = current_platform.get_device_capability()
-    if capability is None or capability.to_int() != 70:
+    capability = current_platform.get_device_capability(residual.get_device())
+    if capability is None or capability.to_int() not in FP16_MHC_CAPABILITIES:
         return False
     if residual.shape[-2:] != (4, 4096):
         return False
     return norm_weight is None or norm_weight.dtype == torch.float16
+
+
+# Up to this many tokens the fused path takes the small-M FMA kernels; above it
+# a prefill-shaped projection can run on tensor cores.
+_SMALL_FMA_MAX_TOKENS = 16
 
 
 def _sm70_mhc_n_splits(num_tokens: int) -> int:
@@ -174,6 +183,7 @@ def mhc_pre_tilelang(
     n_splits: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    tensor_cores: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
@@ -195,6 +205,8 @@ def mhc_pre_tilelang(
             When provided, RMSNorm is fused into the layer_input write path.
         norm_eps: epsilon for the fused RMSNorm; only consulted when
             norm_weight is given.
+        tensor_cores: the layer's ``triton_sm7x_tensor_cores`` route; FP16
+            inputs above the small-M size take the tensor-core projection.
 
     Returns:
         post_mix: shape (..., hc_mult), dtype torch.float32
@@ -241,7 +253,10 @@ def mhc_pre_tilelang(
     use_sm70_triton = norm_weight is not None and _is_exact_sm70_glm_mhc(
         residual_flat, norm_weight
     )
-    if use_sm70_triton:
+    use_tensor_cores = tensor_cores and use_fp16 and num_tokens > _SMALL_FMA_MAX_TOKENS
+    if use_tensor_cores:
+        n_splits = 1
+    elif use_sm70_triton:
         n_splits = _sm70_mhc_n_splits(num_tokens)
     elif use_deep_gemm:
         # these numbers are from deepgemm kernel impl
@@ -269,7 +284,11 @@ def mhc_pre_tilelang(
     )
 
     residual_2d = residual_flat.view(num_tokens, hc_mult * hidden_size)
-    if use_sm70_triton:
+    if use_tensor_cores:
+        from vllm.model_executor.kernels.mhc.triton import mhc_prenorm_tensor_cores
+
+        mhc_prenorm_tensor_cores(residual_2d, fn, gemm_out_mul, gemm_out_sqrsum)
+    elif use_sm70_triton:
         from vllm.model_executor.kernels.mhc.triton import (
             sm70_mhc_prenorm_staging,
         )
@@ -385,6 +404,7 @@ def _mhc_pre_tilelang_fake(
     n_splits: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    tensor_cores: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -466,12 +486,14 @@ def mhc_pre_broadcast_tilelang(
 
     num_tokens = residual.shape[0]
     capability = (
-        current_platform.get_device_capability() if current_platform.is_cuda() else None
+        current_platform.get_device_capability(residual.get_device())
+        if current_platform.is_cuda()
+        else None
     )
     use_sm70_triton = (
         use_fp16
         and capability is not None
-        and capability.to_int() == 70
+        and capability.to_int() in FP16_MHC_CAPABILITIES
         and hidden_size == 4096
         and hc_mult == 4
     )
@@ -685,13 +707,16 @@ def mhc_fused_post_pre_tilelang(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    tensor_cores: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Run one MHC post block followed by the next MHC pre block.
 
     When ``norm_weight`` is provided, the layer_input_cur output is the
     RMSNorm'd activation (fused into the kernel); otherwise it is the
-    raw pre-norm activation as before.
+    raw pre-norm activation as before. ``tensor_cores`` is the layer's
+    ``triton_sm7x_tensor_cores`` route: FP16 inputs above the small-M size
+    take the tensor-core projection.
 
     Returns:
         residual_cur: post-mapped residual, shape (..., hc_mult, hidden_size)
@@ -752,7 +777,7 @@ def mhc_fused_post_pre_tilelang(
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
     use_deep_gemm = is_deep_gemm_supported()
-    use_small_fma = num_tokens <= 16
+    use_small_fma = num_tokens <= _SMALL_FMA_MAX_TOKENS
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
         # GLM-5.3 verifies eight rows at once. On SM70, grouping twelve of the
@@ -778,14 +803,16 @@ def mhc_fused_post_pre_tilelang(
             n_splits = 1
 
     capability = (
-        current_platform.get_device_capability() if current_platform.is_cuda() else None
+        current_platform.get_device_capability(residual.get_device())
+        if current_platform.is_cuda()
+        else None
     )
     use_sm70_fp32_stage = (
         layer_policy().value("mhc_fp32_stage")
         and use_small_fma
         and use_fp16
         and capability is not None
-        and capability.to_int() == 70
+        and capability.to_int() in FP16_MHC_CAPABILITIES
         and 1 <= num_tokens <= 8
         and hidden_size == 4096
         and hc_mult == 4
@@ -809,6 +836,9 @@ def mhc_fused_post_pre_tilelang(
     )
     if use_sm70_triton_large:
         n_splits = _sm70_mhc_n_splits(num_tokens)
+    use_tensor_cores = tensor_cores and use_fp16 and not use_small_fma
+    if use_tensor_cores:
+        n_splits = 1
 
     gemm_out_mul = torch.empty(
         n_splits,
@@ -940,7 +970,13 @@ def mhc_fused_post_pre_tilelang(
             )
 
         residual_cur_2d = residual_cur.view(num_tokens, hc_mult * hidden_size)
-        if use_sm70_triton_large:
+        if use_tensor_cores:
+            from vllm.model_executor.kernels.mhc.triton import (
+                mhc_prenorm_tensor_cores,
+            )
+
+            mhc_prenorm_tensor_cores(residual_cur_2d, fn, gemm_out_mul, gemm_out_sqrsum)
+        elif use_sm70_triton_large:
             from vllm.model_executor.kernels.mhc.triton import (
                 sm70_mhc_prenorm_staging,
             )
@@ -974,7 +1010,7 @@ def mhc_fused_post_pre_tilelang(
     use_sm70_pre_norm = (
         use_fp16
         and capability is not None
-        and capability.to_int() == 70
+        and capability.to_int() in FP16_MHC_CAPABILITIES
         and norm_weight is not None
         and hidden_size == 4096
         and hc_mult == 4
@@ -1069,6 +1105,7 @@ def _mhc_fused_post_pre_tilelang_fake(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    tensor_cores: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]

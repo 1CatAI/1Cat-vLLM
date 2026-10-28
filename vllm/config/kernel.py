@@ -659,6 +659,36 @@ class Sm70RingConfig:
 
 
 @config
+class HostReduceConfig:
+    """Two-rank FP16 all-reduce through pinned host memory for GPU pairs without
+    peer access; exact, the same bits as NCCL's two-rank sum."""
+
+    enabled: bool = True
+    """Admit the operator for two-rank groups whose GPUs NCCL cannot connect
+    peer to peer."""
+
+    max_bytes: int = Field(default=262144, gt=0, le=4194304, multiple_of=16)
+    """Largest payload of the kernel mode (decode)."""
+
+    copy_engine_max_bytes: int = Field(default=0, ge=0, multiple_of=16)
+    """Largest payload of the copy-engine mode for prefill-sized all-reduces:
+    the copy engines move both tensors through the host buffer, ordered by
+    stream memory operations, so no SM polls host memory and computation on
+    other streams keeps its speed. Eager calls only; it pins four slots of
+    this size in shared host memory. 0 leaves payloads above max_bytes on
+    NCCL."""
+
+    def __post_init__(self) -> None:
+        # The copy-engine mode serves payloads above max_bytes; a smaller limit
+        # would never be reached.
+        if 0 < self.copy_engine_max_bytes <= self.max_bytes:
+            raise ValueError(
+                "host_reduce.copy_engine_max_bytes must be 0 or exceed "
+                f"max_bytes ({self.max_bytes}), got {self.copy_engine_max_bytes}"
+            )
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -728,6 +758,42 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    triton_sm7x_tensor_cores: bool = False
+    """The installed Triton lowers ``tl.dot`` to tensor cores on Volta
+    (mma.m8n8k4) and Turing (mma.m16n8k8), so SM70-family routes run their
+    Triton kernels instead of cuBLAS or hand-written ones (Turing keeps its
+    fused indexer prefill scorer, which is faster there). Stock Triton lowers
+    ``tl.dot`` to FMA before SM80; each architecture is verified against the
+    installed compiler on first use and a mismatch stops the engine."""
+
+    def use_triton_sm7x_tensor_cores(self, device_index: int | None = None) -> bool:
+        """Whether the SM70-family routes on a device take their Triton kernels.
+
+        ``device_index`` defaults to the current device; layers decide this once
+        when they are built. With the setting on, a Triton that lowers ``tl.dot``
+        to FMA on this architecture stops the engine instead of running slowly.
+        """
+        if not self.triton_sm7x_tensor_cores:
+            return False
+        import torch
+
+        from vllm.platforms import current_platform
+        from vllm.triton_utils import mma_probe, triton
+
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        capability = current_platform.get_device_capability(device_index)
+        if capability is None or capability.major != 7:
+            return False
+        if not mma_probe.lowers_dot_to_mma(capability.to_int()):
+            raise RuntimeError(
+                "kernel_config.triton_sm7x_tensor_cores is set, but Triton "
+                f"{triton.__version__} ({triton.__file__}) lowers tl.dot to FMA on "
+                f"sm_{capability.to_int()}. Install the sm7x Triton or leave the "
+                "setting off."
+            )
+        return True
+
     sm70_packed_topk_gather: bool = True
     """Gather SM70 TP2/TP4 compact candidates in one lossless message."""
 
@@ -784,6 +850,16 @@ class KernelConfig:
     """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
     sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
     """Read the FP16 checkpoint router directly or retain its packed duplicate."""
+
+    host_reduce: HostReduceConfig = Field(default_factory=HostReduceConfig)
+    """Two-rank host-memory all-reduce policy, resolved from peer access."""
+
+    tp_prefill_overlap_min_tokens: int = Field(default=0, ge=0)
+    """Prefill batches of at least this many tokens run as two interleaved
+    halves on a tensor-parallel engine without pipeline stages: while one half
+    all-reduces on a side stream, the other half computes. 0 keeps batches
+    whole. Every collective in the model's forward must be an all-reduce."""
+
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -1160,6 +1236,10 @@ class KernelConfig:
             "qsa_host_kv_reason",
             "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
             "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
+            # Collective transport chosen outside the compiled graph.
+            "host_reduce",
+            # Micro-batch interleaving around the same compiled graph.
+            "tp_prefill_overlap_min_tokens",
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active

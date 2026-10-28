@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import ClassVar, Literal
 
+import regex as re
 import torch
 from torch import nn
 
@@ -45,8 +46,12 @@ from vllm.model_executor.layers.mhc import (
     hc_contract,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8LinearMethod
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     arm_dflash_nvfp4_trace,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    dequantize_mxfp8_weight_pairs,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -81,6 +86,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.offloader import get_offloader
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
@@ -98,6 +104,7 @@ from .multimodal import (
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
 )
+from .quant import declared_quant_config
 
 logger = init_logger(__name__)
 
@@ -409,7 +416,15 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                # fused_qkv_a_proj stays BF16: the NoPE padding of kv_a leaves its
+                # 2624 rows off the 128 x 128 block grid. q_b_proj and o_proj stay
+                # packed where the checkpoint names them (block FP8); a projection
+                # it does not name resolves to BF16. MTP layers load through
+                # their own path.
+                quant_config=None,
+                projection_quant_config=(
+                    None if is_mtp_layer else declared_quant_config(quant_config)
+                ),
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=getattr(config, "mla_nope", False),
@@ -848,6 +863,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
             )
+            # A step reads only a few rows of this table, so `--cpu-offload-params
+            # embed_tokens` can keep it in pinned host memory (UVA) and leave the
+            # card's 1.18 GiB to the KV pool. Only when named: an unnamed UVA
+            # budget (--cpu-offload-gb alone) stays with the layers it served.
+            if "embed_tokens" in vllm_config.offload_config.uva.cpu_offload_params:
+                self.embed_tokens = get_offloader().wrap_module(
+                    self.embed_tokens, parameter_prefix=f"{prefix}.embed_tokens"
+                )
             if replicate_dflash_embedding:
                 # The final PP stage owns this extra copy solely so DFlash can
                 # borrow it. Mark it unready until load_weights observes the
@@ -1136,6 +1159,39 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             ]
         return hidden_states
 
+    def _kda_projection_mapping(self) -> list[tuple[str, str, int]]:
+        """KDA input projections as the layers were built: q, k, v packed
+        MXFP8 and b, f_a, g_a BF16, or all six merged into one GEMM. One
+        mapping serves every KDA layer of this stage, so the layers must agree."""
+        splits = {
+            module.split_qkv
+            for module in self.modules()
+            if isinstance(module, Glm5NextLinearAttention)
+        }
+        if len(splits) > 1:
+            raise ValueError(
+                "The checkpoint quantizes in_proj_qkv in some KDA layers of this "
+                "pipeline stage only; their input projections cannot share one "
+                "weight mapping."
+            )
+        if splits == {True}:
+            return [
+                (".in_proj_qkv", ".q_proj", 0),
+                (".in_proj_qkv", ".k_proj", 1),
+                (".in_proj_qkv", ".v_proj", 2),
+                (".in_proj_bfg_a", ".b_proj", 0),
+                (".in_proj_bfg_a", ".f_a_proj", 1),
+                (".in_proj_bfg_a", ".g_a_proj", 2),
+            ]
+        return [
+            (".in_proj_qkvbfg_a", ".q_proj", 0),
+            (".in_proj_qkvbfg_a", ".k_proj", 1),
+            (".in_proj_qkvbfg_a", ".v_proj", 2),
+            (".in_proj_qkvbfg_a", ".b_proj", 3),
+            (".in_proj_qkvbfg_a", ".f_a_proj", 4),
+            (".in_proj_qkvbfg_a", ".g_a_proj", 5),
+        ]
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1147,13 +1203,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Indexer: fuse wk and weights_proj
             (".wk_weights_proj", ".wk", 0),
             (".wk_weights_proj", ".weights_proj", 1),
-            # KDA: merge q, k, v, b, f_a, g_a projections into one GEMM
-            (".in_proj_qkvbfg_a", ".q_proj", 0),
-            (".in_proj_qkvbfg_a", ".k_proj", 1),
-            (".in_proj_qkvbfg_a", ".v_proj", 2),
-            (".in_proj_qkvbfg_a", ".b_proj", 3),
-            (".in_proj_qkvbfg_a", ".f_a_proj", 4),
-            (".in_proj_qkvbfg_a", ".g_a_proj", 5),
+            *self._kda_projection_mapping(),
         ]
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1195,6 +1245,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with
             # weights_proj into wk_weights_proj.
             if _try_load_fp8_indexer_wk(
+                self,
                 name,
                 loaded_weight,
                 _pending_wk_fp8,
@@ -1206,6 +1257,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # FP8 checkpoint: dequantize BF16-kept MLA projections
             # (q_a_proj / kv_a_proj_with_mqa / o_proj) to BF16.
             if _try_load_fp8_attn_proj(
+                self,
                 name,
                 loaded_weight,
                 _pending_wk_fp8,
@@ -1259,7 +1311,26 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 ) in enumerate(expert_params_mapping):
                     if weight_name not in name:
                         continue
+                    # The mapping swallows the dot before `weight_scale`, so
+                    # the csf32 suffix is read off the checkpoint name.
+                    checkpoint_name = name
                     name = name.replace(weight_name, param_name)
+                    if _CSF_SCALE_PART in checkpoint_name:
+                        experts_prefix = name.rsplit(param_name, 1)[0] + param_name
+                        experts_prefix = experts_prefix.removesuffix(".w13_")
+                        experts_prefix = experts_prefix.removesuffix(".w2_")
+                        w13_name = experts_prefix + ".w13_weight"
+                        if is_pp_missing_parameter(w13_name, self):
+                            break
+                        experts = self.get_submodule(experts_prefix)
+                        experts.quant_method.load_csf_scale_part(
+                            experts,
+                            expert_id,
+                            expert_shard_id,
+                            checkpoint_name.rsplit(_CSF_SCALE_PART, 1)[1],
+                            loaded_weight,
+                        )
+                        break
                     if is_pp_missing_parameter(name, self):
                         continue
                     param = params_dict[name]
@@ -1294,6 +1365,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        # Weights and scales arrive next to each other (see
+        # dequantize_mxfp8_weight_pairs); a half left over here would leave its
+        # projection unloaded.
+        unpaired = sorted(prefix for prefix, entry in _pending_wk_fp8.items() if entry)
+        if unpaired:
+            raise ValueError(
+                f"Block-FP8 weights or scales without their partner: {unpaired[:4]}"
+            )
         if self._replicate_dflash_embedding and "embed_tokens.weight" in loaded_params:
             # AutoWeightsLoader groups consecutive tensors by top-level prefix,
             # so a checkpoint whose shard order interleaves language-model
@@ -1436,7 +1515,15 @@ class Glm5NextForCausalLM(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        # ModelOpt MXFP8 modules the model builds as MXFP8 linears stay
+        # packed (QPN8 serves E8M0-per-32 weights); the others (lm_head) are
+        # dequantized.
+        return loader.load_weights(
+            dequantize_mxfp8_weight_pairs(
+                weights,
+                keep_quantized=_mxfp8_held_modules(self, self.quant_config),
+            )
+        )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1447,6 +1534,16 @@ class Glm5NextForCausalLM(
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid, SupportsEagle3
 ):
+    # Fused language-model modules and their checkpoint shards (the vision
+    # tower stores gate_up_proj fused and matches it directly).
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "in_proj_qkv": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wk_weights_proj": ["wk", "weights_proj"],
+    }
+
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
@@ -1487,6 +1584,7 @@ class Glm5NextForConditionalGeneration(
 
         self.config = config
         self.model_config = vllm_config.model_config
+        self.quant_config = vllm_config.quant_config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.is_multimodal_pruning_enabled = (
@@ -1539,6 +1637,17 @@ class Glm5NextForConditionalGeneration(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.language_model.get_topk_tokens_and_logits(hidden_states, top_k)
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Pair weights with their scales over the whole stream: the loader
+        # below calls the language model once per run of its prefix, and the
+        # shards interleave those runs with visual tensors.
+        return super().load_weights(
+            dequantize_mxfp8_weight_pairs(
+                weights,
+                keep_quantized=_mxfp8_held_modules(self, self.quant_config),
+            )
+        )
+
 
 def get_spec_layer_idx_from_weight_name(
     config: Glm5NextConfig, weight_name: str
@@ -1555,14 +1664,67 @@ def get_spec_layer_idx_from_weight_name(
     return None
 
 
-def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+# Checkpoint and model prefix the same module differently
+# (``model.language_model.layers.4.`` against ``language_model.model.layers.4.``);
+# the name from the layer or block index on is common to both.
+_FROM_LAYER_INDEX = re.compile(r"(?:layers|blocks)\.\d+\..*$")
+
+
+def _from_layer_index(name: str) -> str:
+    match = _FROM_LAYER_INDEX.search(name)
+    return match.group(0) if match else name
+
+
+def _mxfp8_held_modules(
+    model: nn.Module, quant_config: QuantizationConfig | None
+) -> Callable[[str], bool]:
+    """Tells which checkpoint modules the built model holds as MXFP8 linears.
+    A fused module counts for each of its checkpoint shards, as the quant
+    config resolved it: the language model, whether it loads on its own or
+    inside the multimodal model, gets the same answer."""
+    packed_modules = quant_config.packed_modules_mapping if quant_config else {}
+    held: set[str] = set()
+    for name, module in model.named_modules():
+        if not isinstance(
+            getattr(module, "quant_method", None), ModelOptMxFp8LinearMethod
+        ):
+            continue
+        parent, _, leaf = _from_layer_index(name).rpartition(".")
+        held.update(f"{parent}.{shard}" for shard in packed_modules.get(leaf, [leaf]))
+    return lambda module: _from_layer_index(module) in held
+
+
+# ModelOpt csf_32x2_v1 routed-expert scales: `<expert proj>.weight_scale.csf32_<part>`.
+_CSF_SCALE_PART = ".weight_scale.csf32_"
+
+
+def _is_block_fp8_scale(name: str, tensor: torch.Tensor) -> bool:
+    """A block-FP8 dequant scale: DeepSeek ``weight_scale_inv`` or ModelOpt
+    FP8_PB_WO ``weight_scale`` (float32 [N/128, 1, K/128, 1])."""
+    return name.endswith(".weight_scale_inv") or (
+        name.endswith(".weight_scale")
+        and tensor.dtype == torch.float32
+        and tensor.dim() == 4
+    )
+
+
+def _block_fp8_scale_2d(scale: torch.Tensor) -> torch.Tensor:
+    return scale.squeeze(3).squeeze(1) if scale.dim() == 4 else scale
+
+
+def _try_load_fp8_indexer_wk(model, name, tensor, buf, params_dict, loaded_params):
     if "indexer.wk." not in name or "wk_weights" in name:
         return False
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
+    is_scale = _is_block_fp8_scale(name, tensor)
     if not is_weight and not is_scale:
         return False
     layer_prefix = name.rsplit(".wk.", 1)[0]
+    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+    if is_pp_missing_parameter(fused_name, model):
+        return True
+    if is_scale:
+        tensor = _block_fp8_scale_2d(tensor)
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1578,7 +1740,6 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
         out_dtype=torch.bfloat16,
     )
 
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
     param = params_dict[fused_name]
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
@@ -1623,6 +1784,7 @@ _FP8_ATTN_PROJS = {
 
 
 def _try_load_fp8_attn_proj(
+    model,
     name,
     tensor,
     buf,
@@ -1648,17 +1810,23 @@ def _try_load_fp8_attn_proj(
         return False
     suffix, (key, target_base, shard_id, is_kva) = matched
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
+    is_scale = _is_block_fp8_scale(name, tensor)
     if not is_weight and not is_scale:
         return False
 
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
-    target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
+    if is_pp_missing_parameter(target_w, model):
+        return True
     # If the model actually kept this projection in FP8, let the normal path
-    # handle it (it has a weight_scale_inv param).
-    if target_s in params_dict:
+    # handle it (it has a scale param).
+    if any(
+        f"{layer_prefix}.{target_base}.{scale}" in params_dict
+        for scale in ("weight_scale_inv", "weight_scale")
+    ):
         return False
+    if is_scale:
+        tensor = _block_fp8_scale_2d(tensor)
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
     entry["weight" if is_weight else "scale"] = tensor

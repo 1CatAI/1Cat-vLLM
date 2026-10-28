@@ -9,12 +9,15 @@ import torch
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
 from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.quantization.sm70_turbomind import (
+    is_pre_ampere_cuda_platform,
+)
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     expand_pools_and_append_tail,
     expand_pools_to_tokens,
@@ -51,10 +54,6 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
-
-
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
 
 
 # kpool write helper: form pools from the current token batch and compress them
@@ -261,6 +260,7 @@ def sparse_attn_indexer_kpool(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
+    triton_tensor_cores: bool,
     use_fp4_cache: bool = False,
     # kpool params (Plan-A: gate is consumed at write time and read back at
     # topk time to softmax-weight the pool).
@@ -340,7 +340,7 @@ def sparse_attn_indexer_kpool(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
-    sm70_fp16_indexer = _is_exact_sm70_cuda()
+    sm70_fp16_indexer = is_pre_ampere_cuda_platform()
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -507,6 +507,7 @@ def sparse_attn_indexer_kpool(
                     k_quant,
                     k_scale,
                     weights[chunk.token_start : chunk.token_end],
+                    triton_tensor_cores=triton_tensor_cores,
                 )
             else:
                 logits = fp8_fp4_mqa_logits(
@@ -555,6 +556,10 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+            # Free this chunk's logits before the next chunk allocates its own:
+            # the rebinding alone frees them only after the new ones exist, so
+            # sub-chunks under the logits budget would still peak at two.
+            del logits
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
@@ -895,6 +900,7 @@ def sparse_attn_indexer_kpool_fake(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
+    triton_tensor_cores: bool,
     use_fp4_cache: bool = False,
     gate_score: torch.Tensor | None = None,
     compress_ape: torch.Tensor | None = None,
@@ -958,10 +964,13 @@ class SparseAttnIndexerKpool(CustomOp):
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
+        self.triton_tensor_cores = (
+            get_current_vllm_config().kernel_config.use_triton_sm7x_tensor_cores()
+        )
         self.use_fp4_cache = use_fp4_cache
         if (
             current_platform.is_cuda()
-            and not _is_exact_sm70_cuda()
+            and not is_pre_ampere_cuda_platform()
             and not has_deep_gemm()
         ):
             raise RuntimeError(
@@ -1033,6 +1042,7 @@ class SparseAttnIndexerKpool(CustomOp):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
+            self.triton_tensor_cores,
             self.use_fp4_cache,
             gate_score,
             compress_ape,

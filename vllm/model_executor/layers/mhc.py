@@ -6,6 +6,7 @@ import torch
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.kernels.mhc.tilelang import FP16_MHC_CAPABILITIES
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
@@ -16,8 +17,8 @@ def _use_sm70_fp16_mhc_fallback(residual: torch.Tensor, *, prefill_only: bool) -
     del prefill_only
     if residual.dtype != torch.float16 or not current_platform.is_cuda():
         return False
-    capability = current_platform.get_device_capability()
-    if capability is None or capability.to_int() != 70:
+    capability = current_platform.get_device_capability(residual.get_device())
+    if capability is None or capability.to_int() not in FP16_MHC_CAPABILITIES:
         return False
     # GLM-5.3's exact mHC4/H4096 contract has dedicated SM70 kernels for
     # standalone pre/post, small-M fused decode, and large-M fused prefill.
