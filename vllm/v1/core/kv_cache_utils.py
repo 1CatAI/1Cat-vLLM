@@ -3102,6 +3102,22 @@ def _max_memory_usage_bytes_from_groups(
     return group_size * page_size * blocks_needed
 
 
+def _kv_cache_memory_needed(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    """Include the shared pool's permanent null block in startup admission.
+
+    BlockPool removes one physical block before any request can allocate.
+    Request memory alone can therefore fit while scheduling can never finish.
+    Use the allocator's byte stride, including hybrid padding and DCP packing.
+    """
+    if not kv_cache_groups:
+        return 0
+    return _max_memory_usage_bytes_from_groups(
+        vllm_config, kv_cache_groups
+    ) + _pool_bytes_per_block(kv_cache_groups)
+
+
 def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -3115,10 +3131,7 @@ def _estimate_max_model_len_from_groups(
 
     def fits(model_len: int) -> bool:
         vllm_config.model_config.max_model_len = model_len
-        return (
-            _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
-            <= available_memory
-        )
+        return _kv_cache_memory_needed(vllm_config, kv_cache_groups) <= available_memory
 
     try:
         left, right = 1, original_max
@@ -3356,13 +3369,13 @@ def get_kv_cache_configs(
                 "pool_block_bytes=%d groups=[%s]",
                 worker_index,
                 format_gib(avail_mem),
-                format_gib(_max_memory_usage_bytes_from_groups(vllm_config, groups)),
+                format_gib(_kv_cache_memory_needed(vllm_config, groups)),
                 _pool_bytes_per_block(groups),
                 ", ".join(group_ledger),
             )
         _check_enough_kv_cache_memory(
             avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+            partial(_kv_cache_memory_needed, vllm_config, groups),
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
