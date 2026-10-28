@@ -555,6 +555,10 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+            # Free this chunk's logits before the next chunk allocates its own:
+            # the rebinding alone frees them only after the new ones exist, so
+            # sub-chunks under the logits budget would still peak at two.
+            del logits
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)

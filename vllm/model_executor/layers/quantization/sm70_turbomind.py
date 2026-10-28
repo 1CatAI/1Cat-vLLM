@@ -660,6 +660,7 @@ class FP8QPN8LinearState:
         group_scales: torch.Tensor,
         output_size: int,
         split_k: int,
+        decode_split_k: int,
         accumulator_chains: int,
         prefetch_codes: bool,
     ) -> None:
@@ -667,6 +668,7 @@ class FP8QPN8LinearState:
         self.group_scales = group_scales
         self.output_size = output_size
         self.split_k = split_k
+        self.decode_split_k = decode_split_k
         self.accumulator_chains = accumulator_chains
         self.prefetch_codes = prefetch_codes
 
@@ -674,14 +676,55 @@ class FP8QPN8LinearState:
 def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
     """Split-K, accumulator chains and code prefetch for a QPN8 GEMM.
 
-    The dispatcher admits split-K up to 16; the measured Qwen3.8 shapes use
-    16 (K = 5120) and 12 (K = 1536) with two accumulator chains.
+    The dispatcher admits split-K up to 16; the table takes the largest of
+    16, 12 and 8 that divides K's 16-element code groups, with two
+    accumulator chains.
     """
     groups = k // QPN2_GROUP_SIZE
     for split_k in (16, 12, 8):
         if groups % split_k == 0:
             return split_k, 2, False
     raise RuntimeError(f"no QPN8 launch configuration for K={k}")
+
+
+# One CTA of the M <= 8 QPN8 GEMM covers this many output columns.
+_QPN8_COLUMNS_PER_CTA = 32
+# fp8_qpn8_occupancy_split_k was measured for the M <= 8 QPN8 GEMM only.
+QPN8_OCCUPANCY_MAX_M = 8
+
+
+def fp8_qpn8_occupancy_split_k(
+    k: int, n: int, split_k: int, device: torch.device
+) -> int:
+    """Fit the split-K of the M <= 8 QPN8 GEMM to the device's occupancy.
+
+    A CTA runs ``split_k`` warps along K (32 * split_k threads). Where a
+    split-16 CTA fills half an SM (Turing, 1024 threads per SM) and the grid
+    spills into a second wave that keeps fewer than half the SMs busy,
+    split-K 8 fits it into one wave (3-27 % faster in CUDA graphs on RTX 8000
+    at M = 1..8); with 2048 threads per SM (Volta) split-K 8 is slower there.
+    Split-K 32 for grids with no more CTAs than SMs was faster in isolation as
+    well, but on DeepSeek-V4 it gave no measurable step gain and lowered the
+    sampled draft acceptance in all eight comparisons, so it is not used.
+    """
+    properties = torch.cuda.get_device_properties(device)
+    sms = properties.multi_processor_count
+    ctas_per_sm_at = {
+        split: properties.max_threads_per_multi_processor // (32 * split)
+        for split in (8, 16)
+    }
+    ctas = n // _QPN8_COLUMNS_PER_CTA
+    groups = k // QPN2_GROUP_SIZE
+    spill = ctas - sms * ctas_per_sm_at[16]
+    if (
+        split_k == 16
+        and ctas_per_sm_at[16] <= 2
+        and 0 < spill < sms // 2
+        and ctas <= sms * ctas_per_sm_at[8]
+        and groups % 8 == 0
+    ):
+        return 8
+    return split_k
 
 
 def prepare_fp8_qpn8_dense_linear(
@@ -723,6 +766,7 @@ def prepare_fp8_qpn8_dense_linear(
             group_scales,
             n,
             split_k,
+            fp8_qpn8_occupancy_split_k(k, n, split_k, codes.device),
             accumulator_chains,
             prefetch_codes,
         ),
@@ -752,6 +796,7 @@ def apply_prepared_fp8_qpn8_linear(
         state.group_scales,
         state.output_size,
         state.split_k,
+        state.decode_split_k,
         state.accumulator_chains,
         state.prefetch_codes,
     )
