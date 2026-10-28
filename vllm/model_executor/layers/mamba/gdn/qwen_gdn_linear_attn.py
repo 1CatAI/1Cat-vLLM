@@ -2797,7 +2797,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.norm_before_gate
             and self.norm.activation in ("silu", "swish")
         )
-        if self.enable_sm70_dflash2_fused_gdn_norm or num_tokens > 64:
+        # The direct prefill call is only valid behind an opaque op boundary:
+        # when Dynamo traces this projection, the Triton norm's device guard
+        # (torch.accelerator.device_index) is on Dynamo's skip list.
+        direct_prefill_norm = not torch.compiler.is_compiling() and num_tokens > 64
+        if self.enable_sm70_dflash2_fused_gdn_norm or direct_prefill_norm:
             # Prefill (and the fused-norm draft path): RMSNormGated is
             # decomposed into a nine-kernel native chain when
             # it is reached from the opaque Qwen GDN op under the default
