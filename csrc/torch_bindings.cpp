@@ -1156,6 +1156,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            vllm::sm70::with_policy(&sm70_gemm_export_cache));
 
   ops.def(
+      "sm70_gemm_freeze_tuning(Tensor device_hint, str? "
+      "native_policy=None ) -> int");
+  ops.impl("sm70_gemm_freeze_tuning", torch::kCUDA,
+           vllm::sm70::with_policy(&sm70_gemm_freeze_tuning));
+
+  ops.def(
       "awq_moe_build_strided_ptrs(Tensor tm_weights, Tensor tm_scales, "
       "int k_ld, int q_ld, int num_experts, str? native_policy=None ) -> "
       "Tensor[]");
