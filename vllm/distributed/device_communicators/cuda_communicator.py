@@ -29,7 +29,10 @@ logger = init_logger(__name__)
 _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
 
 
-_INPLACE_AR_MIN = int(__import__("os").environ.get("VLLM_INPLACE_AR_MIN", str(1 << 22)))
+# The all_reduce custom op is registered as out-of-place, so compiled graphs
+# may read its input again after the call; an in-place reduction hands those
+# readers the summed tensor. Only callers that opt in (see envs.py) use it.
+_INPLACE_AR_MIN = int(envs.VLLM_INPLACE_AR_MIN)
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
