@@ -3,7 +3,10 @@
 """Grouped NVFP4 and MXFP4 MoE over the skinny QPN kernels (SM70/SM75).
 
 The backend oracle admits compatible configurations by default. Expert weights
-are permuted in place into mma.m8n8k4 fragment order at load time. Device-side
+are permuted in place at load time into the fragment order of the card's
+tensor-core MMA: mma.m8n8k4 on SM70, mma.m16n8k8 from SM75 on, which Turing
+runs at twice its m8n8k4 rate. Each layer's weights live on one card, so one
+order per card covers every serving path. Device-side
 routing handles both scale formats; chunking bounds native CUDA grid dimensions
 and temporary bytes without a fixed token or concurrency admission limit.
 
@@ -13,6 +16,7 @@ order are the same, so both formats share the kernels.
 """
 
 from dataclasses import dataclass
+from enum import IntEnum
 
 import torch
 
@@ -40,12 +44,70 @@ _CUDA_GRID_Y_LIMIT = 65535
 _QPN_MAX_M = 16
 
 
-def grouped_splitk(k: int, preferred: int) -> int:
-    """Choose only launch specializations that divide the actual K groups."""
-    for split in dict.fromkeys((preferred, 16, 8, 10)):
+class QpnFragmentOrder(IntEnum):
+    """Register order of the packed expert weights, one per MMA shape.
+
+    The values are the native operator's ``fragment_order`` argument.
+    """
+
+    M8N8K4 = 0
+    M16N8K8 = 1
+
+
+def qpn_fragment_order(device_id: int) -> QpnFragmentOrder:
+    """The order the given card's kernels read: m16n8k8 where the card has it."""
+    if current_platform.has_device_capability(75, device_id=device_id):
+        return QpnFragmentOrder.M16N8K8
+    return QpnFragmentOrder.M8N8K4
+
+
+def grouped_splitk(k: int, order: QpnFragmentOrder) -> int:
+    """Split-K warps per CTA for a GEMM that reduces over ``k``.
+
+    Picks the most preferred specialization the native kernel instantiates
+    that divides the actual K groups. Both kernels prefer 8 warps (tuning
+    sweeps 2026-10-21); Turing's m16n8k8 kernel takes 4 where 8 would leave a
+    warp fewer than 16 groups, Volta's m8n8k4 kernel 16 or 10 where 8 does
+    not divide K.
+    """
+    if order == QpnFragmentOrder.M8N8K4:
+        preference: tuple[int, ...] = (8, 16, 10)
+    else:
+        preference = (8, 4) if k >= 2048 else (4, 8)
+    for split in preference:
         if k > 0 and k % 64 == 0 and (k // 16) % split == 0:
             return split
     raise ValueError(f"skinny grouped MoE has no split-K specialization for K={k}")
+
+
+def _fragment_tables(
+    order: QpnFragmentOrder, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Where each packed code and scale byte of a tile comes from.
+
+    Returns the output column [32 lanes, 16 codes] and the K offset inside the
+    16-code group [32, 16] of every code a lane holds (codes in nibble order,
+    low nibble first), and the column [32] of each of a scale group's 32
+    scale bytes. The m16n8k8 tables mirror m16n8k8_fp4_column and
+    m16n8k8_fp4_k in csrc/sm70_turbomind/ops/mma_fragments_sm70.cuh.
+    """
+    lane = torch.arange(32, device=device).view(32, 1)
+    if order == QpnFragmentOrder.M8N8K4:
+        # Lane holds one column; its 16 K values interleaved so the decoder's
+        # (i, i + 4) output is the adjacent-k B register pair.
+        col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
+        korder = torch.tensor(
+            [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15], device=device
+        )
+        return col.expand(32, 16), korder.view(1, 16).expand(32, 16), col.view(32)
+    # Code word w covers A tile w; nibble n sits at column 16w + l/4 + 8(n&1)
+    # and K 4(l%4) + 2((n>>1)&1) + (n>>2). Scale byte r is column r/4 + 8(r%4).
+    position = torch.arange(16, device=device).view(1, 16)
+    word, nibble = position >> 3, position & 7
+    col = 16 * word + (lane >> 2) + 8 * (nibble & 1)
+    k = 4 * (lane & 3) + 2 * ((nibble >> 1) & 1) + (nibble >> 2)
+    entry = torch.arange(32, device=device)
+    return col, k, (entry >> 2) + 8 * (entry & 3)
 
 
 def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
@@ -61,14 +123,17 @@ def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
 
 
 def qpn_prepack(
-    codes: torch.Tensor, scales: torch.Tensor, scale_group: int = 16
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    scale_group: int,
+    order: QpnFragmentOrder,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Permute one weight matrix into the fragment order the QPN kernels read.
 
     Codes become [tile N/32][group K/16][lane 32] x 8 bytes, with the nibbles
-    interleaved so that the decoder's (i, i + 4) output pair is exactly the
-    adjacent-k B fragment register pair; scales become
-    [tile N/32][group K/scale_group][lane 32]. A pure permutation of the
+    placed so that the decoder's (i, i + 4) output pairs are exactly the MMA
+    operand registers of the given order; scales become
+    [tile N/32][group K/scale_group][32 bytes]. A pure permutation of the
     checkpoint bytes.
 
     Args:
@@ -77,6 +142,7 @@ def qpn_prepack(
         scale_group: codes per scale, 16 for NVFP4 (fp8-e4m3) and 32 for
             MXFP4 (E8M0). The code layout is the same for both: a 32-code
             MXFP4 block is two adjacent 16-code groups sharing one scale.
+        order: the MMA fragment order of the card the weights serve on.
 
     Returns:
         The permuted codes and scales, both flat and contiguous.
@@ -89,16 +155,12 @@ def qpn_prepack(
         )
     dev = codes.device
     tiles, groups = n // 32, k // scale_group
-    lane = torch.arange(32, device=dev)
-    col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
-    korder = torch.tensor(
-        [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15], device=dev
-    )
+    code_col, code_k, scale_col = _fragment_tables(order, dev)
     nib = torch.stack([codes & 0xF, codes >> 4], dim=-1).view(n, k)
     cgroups = k // 16  # code groups: always 16 codes per fragment pair
     g = torch.arange(groups, device=dev)
     cg = torch.arange(cgroups, device=dev)
-    kidx = cg.view(cgroups, 1) * 16 + korder.view(1, 16)
+    kidx = cg.view(cgroups, 1, 1) * 16 + code_k.view(1, 32, 16)
     qc = torch.empty(tiles, cgroups, 32, 8, dtype=torch.uint8, device=dev)
     qs = torch.empty(tiles, groups, 32, dtype=torch.uint8, device=dev)
     # Chunk the gather: the int64 index intermediates are 16x the payload,
@@ -107,14 +169,16 @@ def qpn_prepack(
     for t0 in range(0, tiles, chunk):
         t1 = min(t0 + chunk, tiles)
         tt = t1 - t0
-        ncol = torch.arange(t0, t1, device=dev).view(tt, 1) * 32 + col.view(1, 32)
+        tile_col = torch.arange(t0, t1, device=dev).view(tt, 1, 1) * 32
+        ncol = tile_col + code_col.view(1, 32, 16)
         nb = nib[
-            ncol.view(tt, 1, 32, 1).expand(tt, cgroups, 32, 16),
-            kidx.view(1, cgroups, 1, 16).expand(tt, cgroups, 32, 16),
+            ncol.view(tt, 1, 32, 16).expand(tt, cgroups, 32, 16),
+            kidx.view(1, cgroups, 32, 16).expand(tt, cgroups, 32, 16),
         ]
         qc[t0:t1] = nb[..., 0::2] | (nb[..., 1::2] << 4)
+        scol = tile_col.view(tt, 1) + scale_col.view(1, 32)
         qs[t0:t1] = scales[
-            ncol.view(tt, 1, 32).expand(tt, groups, 32),
+            scol.view(tt, 1, 32).expand(tt, groups, 32),
             g.view(1, groups, 1).expand(tt, groups, 32),
         ]
     del nib
@@ -298,6 +362,10 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         self._w2_block_scales: torch.Tensor = w2_scale
         # 0 = NVFP4 (fp8-e4m3 per 16 codes), 1 = MXFP4 (E8M0 per 32)
         self._scale_mode: int = 0
+        # From this worker's own card: a node may mix card generations.
+        self._fragment_order = qpn_fragment_order(
+            torch.accelerator.current_device_index()
+        )
         self.quant_config._w1.scale = None
         self.quant_config._w2.scale = None
         self.quantization_emulation = False
@@ -393,11 +461,12 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                     f"K={w.size(2) * 2}"
                 )
         s13, s2, sg = self._scale_rasters(layer)
+        order = self._fragment_order
         for e in range(w13.size(0)):
-            qc, qs = qpn_prepack(w13[e], s13[e], sg)
+            qc, qs = qpn_prepack(w13[e], s13[e], sg, order)
             w13[e].view(-1).copy_(qc)
             s13[e].view(-1).copy_(qs)
-            qc, qs = qpn_prepack(w2[e], s2[e], sg)
+            qc, qs = qpn_prepack(w2[e], s2[e], sg, order)
             w2[e].view(-1).copy_(qc)
             s2[e].view(-1).copy_(qs)
         if sg == 32:
@@ -405,8 +474,9 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             self._w2_block_scales = s2
             self._scale_mode = 1
         logger.info_once(
-            "Skinny MoE: expert weights re-permuted to QPN fragment order in "
+            "Skinny MoE: expert weights re-permuted to %s fragment order in "
             "place (%d experts, one scale per %d codes)",
+            order.name.lower(),
             w13.size(0),
             sg,
         )
@@ -442,8 +512,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        # The kernels are written for SM70 (mma.m8n8k4) and tested on SM70 and
-        # SM75. The capability comes from this worker's own device: on a node
+        # The kernels run mma.m8n8k4 on SM70 and m16n8k8 on SM75, tested on
+        # both. The capability comes from this worker's own device: on a node
         # that mixes card generations, device 0 answers for another card.
         if not current_platform.is_cuda() or not torch.accelerator.is_available():
             return False
@@ -471,12 +541,13 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         kernel_config.sm70_skinny_moe_applicable = True
         if not kernel_config.sm70_skinny_moe:
             return False, "disabled by kernel_config.sm70_skinny_moe"
+        order = qpn_fragment_order(torch.accelerator.current_device_index())
         for name, k in (
             ("hidden", moe_config.hidden_dim),
             ("intermediate", moe_config.intermediate_size_per_partition),
         ):
             try:
-                grouped_splitk(k, 16)
+                grouped_splitk(k, order)
             except ValueError as exc:
                 return False, f"{name} dimension: {exc}"
         if moe_config.in_dtype != torch.float16:
@@ -608,8 +679,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         # Compact device-side routing (all fixed shapes, CUDA-graph safe):
         # slots sorted by expert; consecutive equal experts form a group.
         # gids[g] = group's expert, goff[g]..goff[g+1] = its slot range;
-        # unused group slots stay empty (goff = S) and the kernel skips
-        # them -- the launch never scales with the expert count.
+        # unused group slots stay empty (goff = S); the kernel launches
+        # min(S, experts) group rows and skips the empty ones.
         flat = topk_ids.reshape(-1).to(torch.int64)
         num_slots = flat.numel()
         perm = torch.argsort(flat, stable=True).to(torch.int32)
@@ -642,9 +713,9 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y13,
             False,
             num_tokens,
-            grouped_splitk(hidden_states.size(1), 16),
-            1,
+            grouped_splitk(hidden_states.size(1), self._fragment_order),
             self._scale_mode,
+            self._fragment_order,
         )
         inter = torch.empty((num_slots, inter_dim), dtype=y13.dtype, device=device)
         self.activation(activation, inter, y13)
@@ -661,9 +732,9 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y2,
             True,
             num_tokens,
-            grouped_splitk(inter_dim, 8),
-            1,
+            grouped_splitk(inter_dim, self._fragment_order),
             self._scale_mode,
+            self._fragment_order,
         )
         output.copy_(
             weighted_reduce_rows(
