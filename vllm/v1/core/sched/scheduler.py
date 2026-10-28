@@ -1034,6 +1034,8 @@ class Scheduler(SchedulerInterface):
                                 request, num_new_local_computed_tokens
                             )
                         )
+                        if request.skip_reading_prefix_cache:
+                            ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
