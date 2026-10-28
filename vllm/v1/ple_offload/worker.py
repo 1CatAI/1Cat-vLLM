@@ -41,7 +41,7 @@ import zmq
 from cuda.bindings import driver as cuda_driver
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -384,10 +384,13 @@ def _init_offload_distributed() -> None:
     # initialize_model_parallel reads the active VllmConfig in the current
     # vLLM version. Explicitly configure DP1/TP1/PP1 to match the isolated
     # world, regardless of any DP environment variables inherited from the GPU
-    # worker. The real DP/TP configuration is used later for model construction,
-    # registration, and request routing.
-    offload_config = VllmConfig()
-    offload_parallel_config = offload_config.parallel_config
+    # worker. ParallelConfig takes those variables at construction and
+    # VllmConfig.__post_init__ derives the participating devices from them, so
+    # the parallel config is reduced to DP1 before the VllmConfig is built: a DP
+    # rank that sees only its own GPU would otherwise look up the device at its
+    # inherited local DP rank. The real DP/TP configuration is used later for
+    # model construction, registration, and request routing.
+    offload_parallel_config = ParallelConfig()
     offload_parallel_config.data_parallel_size = 1
     offload_parallel_config.data_parallel_size_local = 1
     offload_parallel_config.data_parallel_rank = 0
@@ -400,6 +403,7 @@ def _init_offload_distributed() -> None:
     offload_parallel_config.world_size = 1
     offload_parallel_config.nnodes = 1
     offload_parallel_config.node_rank = 0
+    offload_config = VllmConfig(parallel_config=offload_parallel_config)
     with set_current_vllm_config(offload_config):
         ensure_model_parallel_initialized(
             tensor_model_parallel_size=1,
