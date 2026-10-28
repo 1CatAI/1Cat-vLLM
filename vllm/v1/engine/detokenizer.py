@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 
 import tokenizers
 import tokenizers.decoders
@@ -113,21 +115,27 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             skipped_stop_token_id = None
 
         # 1) Detokenize the new token ids incrementally.
-        stop_check_offset = len(self.output_text)
+        num_prev_tokens = self.num_output_tokens()
+        first_new_token_index = len(self.token_ids)
+        # Output text offsets at the boundaries of the new tokens.
+        token_offsets = [len(self.output_text)] if self.stop else None
         for new_token_id in new_token_ids:
             self.token_ids.append(new_token_id)
             self.output_text += self.decode_next(new_token_id)
-            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
-            if self.min_tokens and self.num_output_tokens() <= self.min_tokens:
-                stop_check_offset = len(self.output_text)
+            if token_offsets is not None:
+                token_offsets.append(len(self.output_text))
 
         if skipped_stop_token_id is not None:
             # Cleanup after skipping detokenization.
             self.token_ids.append(skipped_stop_token_id)
+            if token_offsets is not None:
+                token_offsets.append(len(self.output_text))
 
         # 2) Evaluate stop strings.
         stop_string = None
-        if self.stop and self.num_output_tokens() > self.min_tokens:
+        if token_offsets is not None and self.num_output_tokens() > self.min_tokens:
+            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
+            stop_check_offset = token_offsets[max(self.min_tokens - num_prev_tokens, 0)]
             stop = check_stop_strings(
                 output_text=self.output_text,
                 new_char_count=len(self.output_text) - stop_check_offset,
@@ -136,6 +144,13 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             )
             if stop is not None:
                 stop_string, truncate_to = stop
+                stop_end = len(self.output_text) if truncate_to == -1 else truncate_to
+                if not self.include_stop_str_in_output:
+                    stop_end += len(stop_string)
+                # Keep the token completing the stop, including any characters
+                # after the stop inside that token, but drop later tokens.
+                num_kept = bisect_left(token_offsets, stop_end, lo=1)
+                del self.token_ids[first_new_token_index + num_kept :]
                 if truncate_to != -1:
                     self.output_text = self.output_text[:truncate_to]
 
@@ -320,10 +335,19 @@ def check_stop_strings(
     Where stop_string is the matched stop string and offset is the
     length to which output_text should be truncated, or -1 for no
     truncation.
+
+    When several stop strings match within the newly generated text (for
+    example when speculative decoding appends multiple tokens in a single
+    step), the stop string that completes earliest in the text is selected,
+    so the result matches appending one token at a time. Ties are broken by
+    stop-list order.
     """
     if not new_char_count or not stop:
         return None
 
+    best_stop_str: str | None = None
+    best_stop_index = 0
+    best_end = sys.maxsize
     for stop_str in stop:
         stop_string_len = len(stop_str)
         # Avoid searching already-searched text.
@@ -331,14 +355,22 @@ def check_stop_strings(
         if stop_index == -1:
             continue
 
-        if include_in_output:
-            # Truncate to end of stop string.
-            stop_index += stop_string_len
-            if stop_index >= len(output_text):
-                # No truncation required.
-                return stop_str, -1
+        # Prefer the stop string that completes earliest in the text.
+        end = stop_index + stop_string_len
+        if end < best_end:
+            best_stop_str = stop_str
+            best_stop_index = stop_index
+            best_end = end
 
-        # Truncate the output text to either the beginning
-        # or end of the stop string.
-        return stop_str, stop_index
-    return None
+    if best_stop_str is None:
+        return None
+
+    if include_in_output:
+        # Truncate to end of stop string.
+        if best_end >= len(output_text):
+            # No truncation required.
+            return best_stop_str, -1
+        return best_stop_str, best_end
+
+    # Truncate the output text to the beginning of the stop string.
+    return best_stop_str, best_stop_index

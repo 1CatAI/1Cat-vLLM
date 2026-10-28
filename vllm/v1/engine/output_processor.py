@@ -636,12 +636,16 @@ class OutputProcessor:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
                 # 2) Detokenize the token ids into text and perform stop checks.
+                num_prev_tokens = req_state.detokenizer.num_output_tokens()
                 stop_string = req_state.detokenizer.update(
                     new_token_ids, finish_reason == FinishReason.STOP
                 )
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
+                    self._trim_surplus_tokens(
+                        req_state, engine_core_output, num_prev_tokens
+                    )
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
@@ -691,6 +695,21 @@ class OutputProcessor:
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
         )
+
+    @staticmethod
+    def _trim_surplus_tokens(
+        req_state: RequestState, output: EngineCoreOutput, num_prev_tokens: int
+    ) -> None:
+        """Drop new tokens generated past a stop string in a multi-token step."""
+        assert req_state.detokenizer is not None
+        num_kept = req_state.detokenizer.num_output_tokens() - num_prev_tokens
+        if num_kept >= len(output.new_token_ids):
+            return
+        del output.new_token_ids[num_kept:]
+        if output.new_logprobs is not None:
+            output.new_logprobs = output.new_logprobs.slice_request(0, num_kept)
+        if output.routed_experts is not None:
+            req_state.routed_experts_chunks[-1] = output.routed_experts[:num_kept]
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
