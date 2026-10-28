@@ -418,7 +418,7 @@ def test_shared_capture_context_reaches_target_and_draft(
     monkeypatch.setattr(cg, "graph_capture", lambda **kwargs: nullcontext())
     monkeypatch.setattr(cg, "is_global_first_rank", lambda: False)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", object)
-    monkeypatch.setattr(torch.cuda, "graph", lambda *args: nullcontext())
+    monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
         cg,
         "get_offloader",
@@ -429,6 +429,7 @@ def test_shared_capture_context_reaches_target_and_draft(
     manager = object.__new__(cg.CudaGraphManager)
     manager.device = torch.device("cpu")
     manager.pool = None
+    manager.capture_context = SimpleNamespace(stream=None)
     manager.graphs = {}
     manager._capture_descs = {
         mode: [

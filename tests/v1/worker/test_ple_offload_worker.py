@@ -399,6 +399,7 @@ def test_ple_offload_uses_event_per_inflight_mrv2_batch() -> None:
     connector = PleOffloadConnector.__new__(PleOffloadConnector)
     connector.tp_rank = 0
     connector.dp_rank = 0
+    connector.fast_lane = None
     connector._uses_cuda_inputs = True
     connector._request_queue = queue.Queue(maxsize=2)
     connector._d2h_event_pool = queue.Queue(maxsize=2)
@@ -606,7 +607,7 @@ def test_ple_offload_requires_ple_layers(
     worker.model_config = SimpleNamespace(  # type: ignore[assignment]
         hf_text_config=SimpleNamespace(ple_layer_ids=ple_layer_ids)
     )
-    monkeypatch.setattr(envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
 
     assert worker._has_ple_layers() is expected
 
@@ -863,6 +864,7 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
             dtype=torch.float32,
             hf_text_config=SimpleNamespace(ple_embed_dim=2),
         ),
+        kernel_config=SimpleNamespace(ple_fast_lane=False),
     )
     runner._layers = {
         "ple": SimpleNamespace(
