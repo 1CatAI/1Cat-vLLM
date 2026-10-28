@@ -14,7 +14,7 @@ python -m vllm.sm70_profiles show qwen38_27b_nvfp4_dflash2 --json
 This recipe targets four peer-connected V100-SXM2 16GB or 32GB GPUs, TP4, CUDA
 12.8, Torch 2.10.0+cu128, FP16 target/draft compute, FLASH_ATTN_V100, a
 262144-token context, a 4096-token prefill budget, four sequences, 0.86 memory utilization,
-2048-token KV blocks and 8192-token mamba blocks. Model weights are downloaded
+2048-token KV blocks and 2048-token mamba blocks. Model weights are downloaded
 separately; pip installs the declared Python and CUDA runtime dependencies.
 No source overlay or private native extension is required.
 
@@ -89,6 +89,17 @@ E4M3 prefix bridge for the full context during memory profiling. Measured on
 for 8192-token chunks at 0.92 memory utilization; time to first token is within
 1% up to 32K, +1.6% at 128K and +3.9% at 250K tokens, and decode rounds are
 unchanged.
+Prefix caching runs in mamba `align` mode, which can resume a cached prefix
+only where a GDN state was saved: at multiples of `mamba_block_size`. With
+8192-token blocks a conversation shorter than 8K never hit the cache and longer
+ones recomputed up to 8K tokens every turn. 2048-token blocks (the KV page size,
+and the smallest valid value) keep the KV capacity unchanged (425,473 tokens on
+4x16GB) and decode rounds identical, cost about 1.5% of uncached 32K-128K
+prefill time, and in an eight-turn agent conversation (shared 2.6K system
+prompt, ~1.3K new tokens per turn) raise the prefix-cache hit rate from 28% to
+68%. Four such conversations at once finished in 36.4 s instead of 57.7 s, with
+the median time to first token falling from 2.34 s to 1.34 s.
+
 The profile disables the mixed-prefill latency target
 (`--mixed-prefill-step-latency-ms 0`), so a prompt that arrives while other
 requests decode is prefilled in full 4096-token chunks. On SM70 every mixed
