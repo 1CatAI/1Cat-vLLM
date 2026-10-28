@@ -689,6 +689,48 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+def _index_shards(hf_folder: str, index_file: str) -> set[str] | None:
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return None
+    with open(index_file_name) as f:
+        return set(json.load(f)["weight_map"].values())
+
+
+def indexed_shards_in_subfolders(
+    hf_folder: str, index_file: str, pattern: str
+) -> list[str]:
+    """Shards the checkpoint index keeps in subfolders whose file name matches
+    a top-level ``pattern``: the folder glob does not reach them.
+
+    (GLM-5.3-Flash-FP4-Local stores its BF16 attention tensors in
+    ``tensors/native-QB.safetensors``.)
+    """
+    shards = _index_shards(hf_folder, index_file)
+    if shards is None or "/" in pattern:
+        return []
+    return sorted(
+        os.path.join(hf_folder, shard)
+        for shard in shards
+        if os.path.dirname(shard) and fnmatch.fnmatch(os.path.basename(shard), pattern)
+    )
+
+
+def indexed_shards_not_selected(
+    hf_folder: str, index_file: str, hf_weights_files: list[str]
+) -> list[str]:
+    """Shards the checkpoint index names that are not among the files to load."""
+    shards = _index_shards(hf_folder, index_file)
+    if shards is None:
+        return []
+    selected = {os.path.normpath(path) for path in hf_weights_files}
+    return sorted(
+        shard
+        for shard in shards
+        if os.path.normpath(os.path.join(hf_folder, shard)) not in selected
+    )
+
+
 def get_safetensors_index_weights_by_file(
     hf_folder: str, index_file: str, hf_weights_files: list[str]
 ) -> dict[str, set[str]] | None:
