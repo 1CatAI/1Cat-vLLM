@@ -938,6 +938,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     # native Q4096 specialization; budgets of 8000+ the Q8000/Q8192 ones.
     chunk = getattr(cfg.scheduler_config, "max_num_scheduled_tokens", None) or budget
     q4096_chunk = 4000 <= min(chunk, budget) <= 4096
+    q8000_reason: str | None
     if budget < 8000 and not q4096_chunk:
         q8000_reason = "budget<8000"
     elif cfg.attention_config.flash_v100.options.value("prefill_d256_gqa_v37"):

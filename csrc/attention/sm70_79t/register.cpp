@@ -143,9 +143,8 @@ std::vector<int64_t> PrefillOwner::observations() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   return {observations_[0], observations_[1], observations_[2]};
 }
-at::Tensor PrefillOwner::run(int kind, at::Tensor q, at::Tensor k,
-                             at::Tensor v, at::Tensor out, double scale,
-                             bool causal) {
+at::Tensor PrefillOwner::run(int kind, at::Tensor q, at::Tensor k, at::Tensor v,
+                             at::Tensor out, double scale, bool causal) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   TORCH_CHECK(!closed_, "SM70 prefill runtime has been closed");
   OwnerScope scope(this);
@@ -153,11 +152,10 @@ at::Tensor PrefillOwner::run(int kind, at::Tensor q, at::Tensor k,
       kind == 2
           ? onecat_79t_q4096::sm70_d256_gqa_architecture_q4096_fwd(
                 q, k, v, out, scale, causal)
-          : (kind == 1
-                 ? onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd(
-                       q, k, v, out, scale, causal)
-                 : flash::sm70_d256_gqa_architecture_fwd(q, k, v, out, scale,
-                                                         causal));
+          : (kind == 1 ? onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd(
+                             q, k, v, out, scale, causal)
+                       : flash::sm70_d256_gqa_architecture_fwd(q, k, v, out,
+                                                               scale, causal));
   ++observations_[kind];
   return result;
 }
