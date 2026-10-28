@@ -11,9 +11,9 @@ serve_qwen38_27b_nvfp4_v100.sh /path/to/target --draft /path/to/downloaded-draft
 python -m vllm.sm70_profiles show qwen38_27b_nvfp4_dflash2 --json
 ```
 
-This recipe targets four peer-connected V100-SXM2 32GB GPUs, TP4, CUDA 12.8,
-Torch 2.10.0+cu128, FP16 target/draft compute, FLASH_ATTN_V100, a 262144-token
-context, an 8192-token prefill budget, four sequences, 0.80 memory utilization,
+This recipe targets four peer-connected V100-SXM2 16GB or 32GB GPUs, TP4, CUDA
+12.8, Torch 2.10.0+cu128, FP16 target/draft compute, FLASH_ATTN_V100, a
+262144-token context, a 4096-token prefill budget, four sequences, 0.86 memory utilization,
 2048-token KV blocks and 8192-token mamba blocks. Model weights are downloaded
 separately; pip installs the declared Python and CUDA runtime dependencies.
 No source overlay or private native extension is required.
@@ -74,11 +74,25 @@ selects that state. It does not satisfy the release's default-cache requirement.
 | Override | Expected capability affected |
 | --- | --- |
 | `--kv-cache-dtype fp8_e5m2` | E4M3 grouped FP32, long-context and scalar tail: `kv_dtype` |
-| `--max-num-batched-tokens 4096` | Q8000 prefill: `budget<8000` |
+| `--max-num-batched-tokens 6000` | Q8000 prefill: `budget<8000` |
 | `--block-size 16` | Compact scalar tail: `page_size` |
 | DFlash2 with five speculative tokens | Qualified verifier defaults: `num_speculative_tokens=5≠7` |
 | No speculative config | DFlash2 verifier: `method=None≠dflash` |
 | `--enforce-eager` | Compile/graph capability: `user_override` |
+
+The 4096-token budget keeps the long-prefill attention on the FP32-accumulated
+79T architecture through its native Q4096 specialization once a prompt's KV
+reaches 8192 tokens; the first chunks keep the exact Split-D kernel. Budgets of
+8192 select the Q8000/Q8192 specializations as before. Both budgets reserve the
+E4M3 prefix bridge for the full context during memory profiling. Measured on
+4x V100-SXM2-16GB, the profile leaves 4.07 GiB of KV per GPU against 3.33 GiB
+for 8192-token chunks at 0.92 memory utilization; time to first token is within
+1% up to 32K, +1.6% at 128K and +3.9% at 250K tokens, and decode rounds are
+unchanged.
+The 0.86 default keeps about 690 MiB of device headroom on 16GB cards: one
+250K request followed by four concurrent 64K requests completed with a 15.1 GiB
+peak and 4.07 GiB of KV per GPU. At 0.92 that mix ran out of memory, and at
+0.88 the peak came within 160 MiB of the allocator limit.
 
 Some operators select their default inside the quantization layer rather than
 in the global environment table. In particular, NVFP4 QPN2 decode and bounded

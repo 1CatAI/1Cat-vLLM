@@ -471,6 +471,7 @@ def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
 
     # isort: split
     from vllm.v1.attention.backends.flash_v100.ops import (
+        _get_sm70_d256_gqa_architecture_q4096_op,
         _get_sm70_d256_gqa_architecture_q8192_op,
     )
     from vllm.v1.attention.ops.sm70_grouped_long import (
@@ -494,6 +495,7 @@ def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
         "page_supported": long_attention_page_supported(page_size, BUILTIN_MANIFEST),
         "scalar": scalar_tail_attention_available(),
         "q8000": _get_sm70_d256_gqa_architecture_q8192_op() is not None,
+        "q4096": _get_sm70_d256_gqa_architecture_q4096_op() is not None,
         "bm32_aligned_pages": (
             getattr(flash_attn_v100_cuda, "paged_prefill_bm32_page_alignment", 0) == 16
         ),
@@ -932,18 +934,29 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         },
     )
     budget = cfg.scheduler_config.max_num_batched_tokens
+    # 4096-token chunks (4000..4096 after the speculative slots) take the
+    # native Q4096 specialization; budgets of 8000+ the Q8000/Q8192 ones.
+    chunk = getattr(cfg.scheduler_config, "max_num_scheduled_tokens", None) or budget
+    q4096_chunk = 4000 <= min(chunk, budget) <= 4096
+    q8000_reason: str | None
+    if budget < 8000 and not q4096_chunk:
+        q8000_reason = "budget<8000"
+    elif cfg.attention_config.flash_v100.options.value("prefill_d256_gqa_v37"):
+        q8000_reason = "user_override"
+    elif budget < 8000:
+        q8000_reason = (
+            None
+            if native.get("q4096", False)
+            else "operator_missing:sm70_d256_gqa_architecture_q4096_fwd"
+        )
+    else:
+        q8000_reason = (
+            None
+            if native["q8000"]
+            else "operator_missing:sm70_d256_gqa_architecture_q8192_fwd"
+        )
     paths["q8000_prefill"] = _row(
-        "budget<8000"
-        if budget < 8000
-        else (
-            "user_override"
-            if cfg.attention_config.flash_v100.options.value("prefill_d256_gqa_v37")
-            else (
-                None
-                if native["q8000"]
-                else "operator_missing:sm70_d256_gqa_architecture_q8192_fwd"
-            )
-        ),
+        q8000_reason,
         max_num_batched_tokens=budget,
         switches={
             "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": (

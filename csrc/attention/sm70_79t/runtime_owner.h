@@ -22,7 +22,16 @@ enum class PolicyField {
   DirectTail,
   Count
 };
-enum class CacheSlot { Scores, Q8000Half2, Q8192Half2, Q8000Score, Q8192Score };
+enum class CacheSlot {
+  Scores,
+  Q8000Half2,
+  Q8192Half2,
+  Q8000Score,
+  Q8192Score,
+  Q4096Half2,
+  Q4096Score,
+  Q4096Scores
+};
 
 class PrefillOwner : public torch::CustomClassHolder {
  public:
@@ -37,6 +46,8 @@ class PrefillOwner : public torch::CustomClassHolder {
   at::Tensor q8000(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
                    double scale, bool causal);
   at::Tensor q8192(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
+                   double scale, bool causal);
+  at::Tensor q4096(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
                    double scale, bool causal);
 
   template <typename T, typename Factory>
@@ -60,12 +71,13 @@ class PrefillOwner : public torch::CustomClassHolder {
   }
 
  private:
-  at::Tensor run(bool aligned, at::Tensor q, at::Tensor k, at::Tensor v,
+  // kind: 0 = Q8000, 1 = Q8192, 2 = Q4096.
+  at::Tensor run(int kind, at::Tensor q, at::Tensor k, at::Tensor v,
                  at::Tensor out, double scale, bool causal);
   const std::vector<int64_t> values_;
   std::recursive_mutex mutex_;
   bool closed_ = false;
-  std::array<int64_t, 2> observations_{};
+  std::array<int64_t, 3> observations_{};
   std::map<int, std::map<CacheSlot, std::shared_ptr<void>>> caches_;
 };
 
