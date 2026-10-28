@@ -985,6 +985,8 @@ class Qwen3_5ForCausalLMBase(
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
+    # Maps PEFT lm_head LoRA targets onto vLLM embedding wrappers.
+    embedding_modules = {"lm_head": "output_embeddings"}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
