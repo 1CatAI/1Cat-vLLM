@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -367,22 +368,82 @@ def test_ple_host_allocation_failure_keeps_materialization_retryable(monkeypatch
     _patch_tp(monkeypatch, rank=0, world_size=1)
     monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: 4 * 8)
     layer = _pinned_layer(num_embeddings=8)
-    empty = torch.empty
+    pin = ple_module._pin_host_tensor_exact
 
-    def failing_empty(*args, **kwargs):
-        if kwargs.get("pin_memory"):
-            raise RuntimeError("injected pinned allocation failure")
-        return empty(*args, **kwargs)
+    def failing_pin(tensor):
+        raise RuntimeError("injected pinned allocation failure")
 
-    monkeypatch.setattr(ple_module.torch, "empty", failing_empty)
+    monkeypatch.setattr(ple_module, "_pin_host_tensor_exact", failing_pin)
     with pytest.raises(RuntimeError, match="injected pinned allocation failure"):
         layer.materialize_tables()
     assert layer.ple_device_table is None
     assert layer.ple_host_storage is None
     assert layer._device_table_ptr == 0
-    monkeypatch.setattr(ple_module.torch, "empty", empty)
+    monkeypatch.setattr(ple_module, "_pin_host_tensor_exact", pin)
     layer.materialize_tables()
     assert (layer._device_rows, layer._host_rows) == (4, 4)
+    assert layer.ple_host_storage is not None
+    assert layer.ple_host_storage.is_pinned()
+
+
+class _FakeCudart:
+    """Records cudaHostRegister/Unregister calls instead of making them."""
+
+    def __init__(self, register_error: int = 0) -> None:
+        self.calls: list[tuple] = []
+        self.register_error = register_error
+
+    def cudaHostRegister(self, ptr, size, flags):
+        self.calls.append(("register", ptr, size, flags))
+        return SimpleNamespace(value=self.register_error)
+
+    def cudaHostUnregister(self, ptr):
+        self.calls.append(("unregister", ptr))
+        return SimpleNamespace(value=0)
+
+
+def _patch_cudart(
+    monkeypatch: pytest.MonkeyPatch, *, register_error: int = 0, pinned: bool
+) -> _FakeCudart:
+    cudart = _FakeCudart(register_error)
+    monkeypatch.setattr(ple_module.torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: pinned)
+    return cudart
+
+
+def test_exact_pin_registers_exactly_the_tensor_bytes(monkeypatch) -> None:
+    # 3 rows x 8 bytes: pin_memory=True would round this up to 32 bytes.
+    cudart = _patch_cudart(monkeypatch, pinned=True)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+    ptr = host.data_ptr()
+
+    ple_module._pin_host_tensor_exact(host)
+
+    assert cudart.calls == [("register", ptr, 24, 0x01 | 0x02)]
+    # The registration lives exactly as long as the table.
+    del host
+    gc.collect()
+    assert cudart.calls[-1] == ("unregister", ptr)
+
+
+def test_exact_pin_raises_when_registration_fails(monkeypatch) -> None:
+    cudart = _patch_cudart(monkeypatch, register_error=2, pinned=False)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(RuntimeError, match="cudaHostRegister"):
+        ple_module._pin_host_tensor_exact(host)
+    assert [call[0] for call in cudart.calls] == ["register"]
+
+
+def test_exact_pin_refuses_a_table_torch_does_not_see_as_pinned(monkeypatch) -> None:
+    # get_cuda_view_from_cpu_tensor would otherwise copy the whole table.
+    cudart = _patch_cudart(monkeypatch, pinned=False)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+    ptr = host.data_ptr()
+
+    with pytest.raises(RuntimeError, match="not pinned"):
+        ple_module._pin_host_tensor_exact(host)
+    assert cudart.calls == [("register", ptr, 24, 0x01 | 0x02), ("unregister", ptr)]
 
 
 @pytest.mark.parametrize(
