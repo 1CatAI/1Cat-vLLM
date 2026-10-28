@@ -1303,7 +1303,7 @@ def _use_sm70_qsa_indexer_cublas(
 ) -> bool:
     return (
         sparse_policy().value("qsa_indexer_cublas")
-        and current_platform.is_device_capability(70)
+        and current_platform.is_device_capability_family(70)
         and q.shape[0] >= sparse_policy().value("qsa_cublas_min_rows")
         and _qsa_indexer_cublas_shape_supported(q, k_cache, page_table)
     )
@@ -1314,9 +1314,9 @@ def _qsa_indexer_cublas_work_supported(rows: int, columns: int) -> bool:
 
 
 def _use_sm70_qsa_lexicographic_topk(topk: int) -> bool:
-    """Use the exact, deterministic selector for Volta QSA."""
+    """Use the exact, deterministic selector for Volta and Turing QSA."""
 
-    return topk == 512 and current_platform.is_device_capability(70)
+    return topk == 512 and current_platform.is_device_capability_family(70)
 
 
 def _sm70_qsa_lexicographic_topk_op():
@@ -1545,7 +1545,7 @@ def _qsa_select_by_request(
     if (
         page_table.shape[0] < 2
         or not sparse_policy().value("qsa_indexer_cublas")
-        or not current_platform.is_device_capability(70)
+        or not current_platform.is_device_capability_family(70)
         or not _qsa_indexer_cublas_shape_supported(q, k_cache, page_table[:1])
     ):
         return False
