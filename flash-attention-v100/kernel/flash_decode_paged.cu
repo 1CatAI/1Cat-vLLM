@@ -1981,10 +1981,9 @@ __device__ __forceinline__ void grouped_verify_qk(
 __device__ __forceinline__ void grouped_verify_scale_output_fragment(
     volta::fragment<volta::accumulator, 16, 16, 16, float>& fragment,
     const float* __restrict__ row_scale, const int tile_row_start) {
-  const int lane = threadIdx.x & 31;
-  const int row = (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
-  const float first_scale = row_scale[tile_row_start + row];
-  const float second_scale = row_scale[tile_row_start + row + 2];
+  const volta::accumulator_rows rows = volta::accumulator_16x16_rows();
+  const float first_scale = row_scale[tile_row_start + rows.first];
+  const float second_scale = row_scale[tile_row_start + rows.second];
   fragment.x[0] *= first_scale;
   fragment.x[1] *= first_scale;
   fragment.x[2] *= second_scale;
@@ -1999,10 +1998,9 @@ __device__ __forceinline__ void grouped_verify_add_output_tile(
     volta::fragment<volta::accumulator, 16, 16, 16, float>& output,
     const volta::fragment<volta::accumulator, 16, 16, 16, float>& tile,
     const float* row_scale, const int tile_row_start) {
-  const int lane = threadIdx.x & 31;
-  const int row = (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
-  const float first_scale = row_scale[tile_row_start + row];
-  const float second_scale = row_scale[tile_row_start + row + 2];
+  const volta::accumulator_rows rows = volta::accumulator_16x16_rows();
+  const float first_scale = row_scale[tile_row_start + rows.first];
+  const float second_scale = row_scale[tile_row_start + rows.second];
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
     const float scale = (i & 2) ? second_scale : first_scale;
@@ -4019,35 +4017,65 @@ void launch_flash_attention_decode_qk_scores(
 
 constexpr int kGroupedSparseQueries = 8;
 constexpr int kGroupedSparsePlannerThreads = 512;
-constexpr int kGroupedSparseHashCapacity = 8192;
 constexpr unsigned long long kGroupedSparseEmptyEntry = 0x00000000ffffffffULL;
-constexpr int kGroupedSparseItemsPerThread =
-    kGroupedSparseHashCapacity / kGroupedSparsePlannerThreads;
-using GroupedSparseSort =
-    cub::BlockRadixSort<unsigned long long, kGroupedSparsePlannerThreads,
-                        kGroupedSparseItemsPerThread, unsigned long long>;
-// Hash entries plus logical owners exactly fit Volta's 96 KiB opt-in limit.
-// After loading both into registers, reuse this storage for sorting and scans.
-constexpr size_t kGroupedSparsePlannerSharedMemory =
-    kGroupedSparseHashCapacity *
-    (sizeof(unsigned long long) + sizeof(uint32_t));
-static_assert(sizeof(GroupedSparseSort::TempStorage) <=
-              kGroupedSparsePlannerSharedMemory);
+// QSA selects aligned 4-token groups: a row contributes at most 512 complete
+// page4 microblocks plus the microblock of its open tail.
+constexpr int kGroupedSparseMaxEntries = kGroupedSparseQueries * (512 + 1);
+// 8192 hash entries fill Volta's 96 KiB opt-in shared memory; 5120 entries
+// (60 KiB) fit 64 KiB devices such as Turing and still hold the worst case.
+constexpr int kGroupedSparseLargeHashCapacity = 8192;
+constexpr int kGroupedSparseSmallHashCapacity = 5120;
 
+template <int HASH_CAPACITY>
+struct GroupedSparsePlanner {
+  static_assert(HASH_CAPACITY % kGroupedSparsePlannerThreads == 0);
+  static_assert(HASH_CAPACITY >= kGroupedSparseMaxEntries);
+  static constexpr int kItemsPerThread =
+      HASH_CAPACITY / kGroupedSparsePlannerThreads;
+  using Sort =
+      cub::BlockRadixSort<unsigned long long, kGroupedSparsePlannerThreads,
+                          kItemsPerThread, unsigned long long>;
+  // Hash entries plus logical owners. After loading both into registers,
+  // reuse this storage for sorting and scans.
+  static constexpr size_t kSharedMemory =
+      HASH_CAPACITY * (sizeof(unsigned long long) + sizeof(uint32_t));
+  static_assert(sizeof(typename Sort::TempStorage) <= kSharedMemory);
+  static constexpr bool kPowerOfTwo =
+      (HASH_CAPACITY & (HASH_CAPACITY - 1)) == 0;
+
+  __device__ __forceinline__ static int slot(const uint32_t hash) {
+    if constexpr (kPowerOfTwo) {
+      return static_cast<int>(hash & (HASH_CAPACITY - 1));
+    } else {
+      return static_cast<int>(hash % HASH_CAPACITY);
+    }
+  }
+
+  __device__ __forceinline__ static int next_slot(const int slot) {
+    if constexpr (kPowerOfTwo) {
+      return (slot + 1) & (HASH_CAPACITY - 1);
+    } else {
+      return slot + 1 == HASH_CAPACITY ? 0 : slot + 1;
+    }
+  }
+};
+
+template <int HASH_CAPACITY>
 __device__ __forceinline__ void grouped_sparse_hash_insert(
     unsigned long long* __restrict__ hash_table,
     uint32_t* __restrict__ logical_owners, const int physical_microblock,
     const uint32_t token_mask, const int query, const int logical_token) {
+  using Planner = GroupedSparsePlanner<HASH_CAPACITY>;
   if (physical_microblock < 0 || token_mask == 0) {
     return;
   }
-  int slot = (static_cast<uint32_t>(physical_microblock) * 2654435761u) &
-             (kGroupedSparseHashCapacity - 1);
+  int slot =
+      Planner::slot(static_cast<uint32_t>(physical_microblock) * 2654435761u);
   const unsigned long long desired =
       (static_cast<unsigned long long>(token_mask) << 32) |
       static_cast<uint32_t>(physical_microblock);
 #pragma unroll 1
-  for (int probe = 0; probe < kGroupedSparseHashCapacity; ++probe) {
+  for (int probe = 0; probe < HASH_CAPACITY; ++probe) {
     const unsigned long long old =
         atomicCAS(hash_table + slot, kGroupedSparseEmptyEntry, desired);
     if (old == kGroupedSparseEmptyEntry ||
@@ -4063,7 +4091,7 @@ __device__ __forceinline__ void grouped_sparse_hash_insert(
       atomicMin(logical_owners + slot, owner);
       return;
     }
-    slot = (slot + 1) & (kGroupedSparseHashCapacity - 1);
+    slot = Planner::next_slot(slot);
   }
 }
 
@@ -4106,6 +4134,7 @@ __device__ __forceinline__ int grouped_sparse_active_m_tiles(
   return active_m_tiles;
 }
 
+template <int HASH_CAPACITY>
 __global__
 __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_plan_kernel(
     const int* __restrict__ logical_indices,
@@ -4118,12 +4147,13 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
     const int64_t request_block_table_stride, const int num_requests,
     const int block_table_width, const int output_width, const int page_size,
     const int physical_page_stride, const int num_cache_blocks) {
+  using Planner = GroupedSparsePlanner<HASH_CAPACITY>;
   const int group_idx = blockIdx.x;
   const int tid = threadIdx.x;
   extern __shared__ unsigned long long hash_table[];
   auto* logical_owners =
-      reinterpret_cast<uint32_t*>(hash_table + kGroupedSparseHashCapacity);
-  for (int slot = tid; slot < kGroupedSparseHashCapacity;
+      reinterpret_cast<uint32_t*>(hash_table + HASH_CAPACITY);
+  for (int slot = tid; slot < HASH_CAPACITY;
        slot += kGroupedSparsePlannerThreads) {
     hash_table[slot] = kGroupedSparseEmptyEntry;
     logical_owners[slot] = UINT_MAX;
@@ -4170,9 +4200,9 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
             first_token, request_idx, request_block_table,
             request_block_table_stride, block_table_width, page_size,
             physical_page_stride, num_cache_blocks);
-        grouped_sparse_hash_insert(hash_table, logical_owners,
-                                   physical_microblock, 0xFu << (query * 4),
-                                   query, first_token);
+        grouped_sparse_hash_insert<HASH_CAPACITY>(
+            hash_table, logical_owners, physical_microblock,
+            0xFu << (query * 4), query, first_token);
       } else {
 #pragma unroll
         for (int token_offset = 0; token_offset < 4; ++token_offset) {
@@ -4182,7 +4212,7 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
                 token, request_idx, request_block_table,
                 request_block_table_stride, block_table_width, page_size,
                 physical_page_stride, num_cache_blocks);
-            grouped_sparse_hash_insert(
+            grouped_sparse_hash_insert<HASH_CAPACITY>(
                 hash_table, logical_owners, physical_microblock,
                 1u << (query * 4 + (token & 3)), query, token);
           }
@@ -4221,9 +4251,9 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
             request_block_table_stride, block_table_width, page_size,
             physical_page_stride, num_cache_blocks);
         const uint32_t tail_mask = ((1u << tail_count) - 1) << (query * 4);
-        grouped_sparse_hash_insert(hash_table, logical_owners,
-                                   physical_microblock, tail_mask, query,
-                                   selected_tail_token);
+        grouped_sparse_hash_insert<HASH_CAPACITY>(
+            hash_table, logical_owners, physical_microblock, tail_mask, query,
+            selected_tail_token);
       }
     }
   }
@@ -4232,11 +4262,11 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
   // Keep the existing physical-page union and masks, but never let physical
   // hash slots determine the attention reduction order. Category is primary
   // to preserve active-tile packing; the logical owner orders each category.
-  unsigned long long entries[kGroupedSparseItemsPerThread];
-  unsigned long long sort_keys[kGroupedSparseItemsPerThread];
+  unsigned long long entries[Planner::kItemsPerThread];
+  unsigned long long sort_keys[Planner::kItemsPerThread];
 #pragma unroll
-  for (int item = 0; item < kGroupedSparseItemsPerThread; ++item) {
-    const int slot = tid * kGroupedSparseItemsPerThread + item;
+  for (int item = 0; item < Planner::kItemsPerThread; ++item) {
+    const int slot = tid * Planner::kItemsPerThread + item;
     const unsigned long long entry = hash_table[slot];
     entries[item] = entry;
     const int category =
@@ -4248,13 +4278,13 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
   }
   __syncthreads();
   auto& sort_storage =
-      *reinterpret_cast<GroupedSparseSort::TempStorage*>(hash_table);
+      *reinterpret_cast<typename Planner::Sort::TempStorage*>(hash_table);
   // Three category bits, 32 owner bits, and one bit separating empty slots.
-  GroupedSparseSort(sort_storage).Sort(sort_keys, entries, 0, 36);
+  typename Planner::Sort(sort_storage).Sort(sort_keys, entries, 0, 36);
   __syncthreads();
 #pragma unroll
-  for (int item = 0; item < kGroupedSparseItemsPerThread; ++item) {
-    hash_table[tid * kGroupedSparseItemsPerThread + item] = entries[item];
+  for (int item = 0; item < Planner::kItemsPerThread; ++item) {
+    hash_table[tid * Planner::kItemsPerThread + item] = entries[item];
   }
   auto* category_counts = reinterpret_cast<int*>(logical_owners);
   int* category_offsets = category_counts + 8;
@@ -4268,7 +4298,7 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
     category_cursors[tid] = 0;
   }
   __syncthreads();
-  for (int slot = tid; slot < kGroupedSparseHashCapacity;
+  for (int slot = tid; slot < HASH_CAPACITY;
        slot += kGroupedSparsePlannerThreads) {
     const unsigned long long entry = hash_table[slot];
     if (static_cast<uint32_t>(entry) != 0xffffffffu) {
@@ -4291,7 +4321,7 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
   constexpr int kPlannerWarps = kGroupedSparsePlannerThreads / kWarpSize;
   const int lane = tid & (kWarpSize - 1);
   const int warp = tid / kWarpSize;
-  for (int chunk_start = 0; chunk_start < kGroupedSparseHashCapacity;
+  for (int chunk_start = 0; chunk_start < HASH_CAPACITY;
        chunk_start += kGroupedSparsePlannerThreads) {
     const unsigned long long entry = hash_table[chunk_start + tid];
     const uint32_t physical_microblock = static_cast<uint32_t>(entry);
@@ -4357,6 +4387,36 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
   }
 }
 
+template <int HASH_CAPACITY>
+void launch_grouped_sparse_page4_plan(
+    const at::Tensor& logical_indices, const at::Tensor& block_table,
+    const at::Tensor& token_to_req, const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths, at::Tensor& output_blocks,
+    at::Tensor& output_masks, at::Tensor& output_seq_lens, const int page_size,
+    const int physical_page_stride, const int num_cache_blocks,
+    cudaStream_t stream) {
+  constexpr size_t shared_memory =
+      GroupedSparsePlanner<HASH_CAPACITY>::kSharedMemory;
+  const cudaError_t smem_status = cudaFuncSetAttribute(
+      grouped_sparse_page4_plan_kernel<HASH_CAPACITY>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory);
+  TORCH_CHECK(smem_status == cudaSuccess,
+              "Failed to set grouped sparse page4 planner shared memory: ",
+              cudaGetErrorString(smem_status));
+  grouped_sparse_page4_plan_kernel<HASH_CAPACITY>
+      <<<static_cast<unsigned>(logical_indices.size(0) / kGroupedSparseQueries),
+         kGroupedSparsePlannerThreads, shared_memory, stream>>>(
+          logical_indices.data_ptr<int>(), block_table.data_ptr<int>(),
+          token_to_req.data_ptr<int>(), query_positions.data_ptr<int64_t>(),
+          sequence_lengths.data_ptr<int>(), output_blocks.data_ptr<int>(),
+          output_masks.data_ptr<uint32_t>(), output_seq_lens.data_ptr<int>(),
+          static_cast<int>(logical_indices.size(1)), logical_indices.stride(0),
+          block_table.stride(0), static_cast<int>(block_table.size(0)),
+          static_cast<int>(block_table.size(1)),
+          static_cast<int>(output_blocks.size(1)), page_size,
+          physical_page_stride, num_cache_blocks);
+}
+
 }  // namespace
 
 at::Tensor flash_attention_grouped_sparse_page4_plan(
@@ -4417,28 +4477,28 @@ at::Tensor flash_attention_grouped_sparse_page4_plan(
 
   c10::cuda::CUDAGuard device_guard(logical_indices.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
-  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
-              "grouped sparse page4 planner supports SM70 only");
+  const size_t opt_in_shared_memory = properties->sharedMemPerBlockOptin;
+  constexpr size_t small_table_bytes =
+      GroupedSparsePlanner<kGroupedSparseSmallHashCapacity>::kSharedMemory;
+  TORCH_CHECK(opt_in_shared_memory >= small_table_bytes,
+              "grouped sparse page4 planner needs ", small_table_bytes,
+              " bytes of opt-in shared memory per block; the device has ",
+              opt_in_shared_memory);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  const cudaError_t smem_status =
-      cudaFuncSetAttribute(grouped_sparse_page4_plan_kernel,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           kGroupedSparsePlannerSharedMemory);
-  TORCH_CHECK(smem_status == cudaSuccess,
-              "Failed to set grouped sparse page4 planner shared memory: ",
-              cudaGetErrorString(smem_status));
-  grouped_sparse_page4_plan_kernel<<<
-      static_cast<unsigned>(num_groups), kGroupedSparsePlannerThreads,
-      kGroupedSparsePlannerSharedMemory, stream>>>(
-      logical_indices.data_ptr<int>(), block_table.data_ptr<int>(),
-      token_to_req.data_ptr<int>(), query_positions.data_ptr<int64_t>(),
-      sequence_lengths.data_ptr<int>(), output_blocks.data_ptr<int>(),
-      output_masks.data_ptr<uint32_t>(), output_seq_lens.data_ptr<int>(),
-      static_cast<int>(logical_indices.size(1)), logical_indices.stride(0),
-      block_table.stride(0), static_cast<int>(block_table.size(0)),
-      static_cast<int>(block_table.size(1)),
-      static_cast<int>(output_blocks.size(1)), page_size, physical_page_stride,
-      num_cache_blocks);
+  // Both tables return the same plan: the output order depends only on the
+  // category and logical owner of each microblock, not on its hash slot.
+  if (opt_in_shared_memory >=
+      GroupedSparsePlanner<kGroupedSparseLargeHashCapacity>::kSharedMemory) {
+    launch_grouped_sparse_page4_plan<kGroupedSparseLargeHashCapacity>(
+        logical_indices, block_table, token_to_req, query_positions,
+        sequence_lengths, output_blocks, output_masks, output_seq_lens,
+        page_size, physical_page_stride, num_cache_blocks, stream);
+  } else {
+    launch_grouped_sparse_page4_plan<kGroupedSparseSmallHashCapacity>(
+        logical_indices, block_table, token_to_req, query_positions,
+        sequence_lengths, output_blocks, output_masks, output_seq_lens,
+        page_size, physical_page_stride, num_cache_blocks, stream);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output_blocks;
 }
@@ -4902,11 +4962,13 @@ at::Tensor flash_attention_grouped_sparse_page4(
 
   c10::cuda::CUDAGuard device_guard(q.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
-  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
-              "grouped sparse page4 supports SM70 only");
+  const size_t shared_mem = sizeof(GroupedVerifySmem);
+  TORCH_CHECK(properties->sharedMemPerBlockOptin >= shared_mem,
+              "grouped sparse page4 needs ", shared_mem,
+              " bytes of opt-in shared memory per block; the device has ",
+              properties->sharedMemPerBlockOptin);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   const dim3 grid(1, 1, static_cast<unsigned>(num_groups));
-  const size_t shared_mem = sizeof(GroupedVerifySmem);
 #define LAUNCH_GROUPED_SPARSE_PAGE4(KV_DTYPE_CODE)                             \
   do {                                                                         \
     auto kernel = (void*)flash_attention_grouped_verify_e5m2_partial_kernel<   \
@@ -4938,6 +5000,29 @@ at::Tensor flash_attention_grouped_sparse_page4(
 #undef LAUNCH_GROUPED_SPARSE_PAGE4
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+bool flash_attention_grouped_sparse_page4_device_supported(
+    const int64_t device_index) {
+  c10::cuda::CUDAGuard device_guard(
+      static_cast<c10::DeviceIndex>(device_index));
+  cudaFuncAttributes attributes;
+  const cudaError_t image_status = cudaFuncGetAttributes(
+      &attributes, flash_attention_grouped_verify_e5m2_partial_kernel<
+                       kGroupedVerifyQ8MaxQ, false, 4, false, false, false,
+                       flash_v100::KV_CACHE_DTYPE_FP16, true>);
+  if (image_status != cudaSuccess) {
+    // No kernel image: the build does not include this device's
+    // architecture. Clear the error so a later launch check does not
+    // report it.
+    cudaGetLastError();
+    return false;
+  }
+  const auto* properties = at::cuda::getDeviceProperties(device_index);
+  return properties->sharedMemPerBlockOptin >=
+         std::max(sizeof(GroupedVerifySmem),
+                  GroupedSparsePlanner<
+                      kGroupedSparseSmallHashCapacity>::kSharedMemory);
 }
 
 at::Tensor flash_attention_decode_paged(
