@@ -101,7 +101,9 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
     """Retain per-head ReLU scoring; the factored experiment remains explicit."""
 
     indexer_prefill_cublas: bool | None = None
-    """Use cuBLAS for eligible prefill index scores."""
+    """Use cuBLAS for eligible prefill index scores. On Turing, chunks with 32
+    or 64 indexer heads take the fused SM75 scorer before this choice; with
+    kernel_config.triton_sm7x_tensor_cores the Triton scorer replaces cuBLAS."""
 
     indexer_prefill_tile_mb: int | None = None
     """Bound the prefill score tile and decode gather workspace in MiB."""

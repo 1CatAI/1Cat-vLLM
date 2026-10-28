@@ -798,6 +798,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # Forward passes run outside the config context, so the engine's
         # sparse attention policy is kept with the layer.
         self.sm70_sparse = vllm_config.kernel_config.sm70_sparse
+        self.sparse_tensor_cores = (
+            vllm_config.kernel_config.use_triton_sm7x_tensor_cores()
+        )
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 

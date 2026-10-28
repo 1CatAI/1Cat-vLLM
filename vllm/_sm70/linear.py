@@ -893,6 +893,41 @@ if hasattr(torch.ops._C, "fp8_qpn8_gemm_sm70_out"):
         return None
 
 
+def fp8_qpn8_mma_sm75_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    native_policy: tuple[str, ...] = (),
+) -> None:
+    """Run the SM75 tensor-core GEMM on QPN8 block-FP8 codes into ``out``.
+
+    Turing only; the operator picks its tile and split-K from M, N, K and
+    the device's SM count.
+    """
+    call_native(
+        _op("fp8_qpn8_mma_sm75_out"),
+        native_policy,
+        out,
+        input,
+        codes,
+        group_scales,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_mma_sm75_out"):
+
+    @register_fake("_C::fp8_qpn8_mma_sm75_out")
+    def _fp8_qpn8_mma_sm75_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        native_policy: tuple[str, ...] = (),
+    ) -> None:
+        return None
+
+
 def fp8_qpn8_gemm_ba_split_sm70_out(
     qkv_out: torch.Tensor,
     z_out: torch.Tensor,
