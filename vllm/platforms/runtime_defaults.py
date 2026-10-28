@@ -30,7 +30,7 @@ _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
 # Mixed steps that join a short prompt to the resident verifier rows. Without
 # a piecewise graph each such step pays the eager launch cost of every layer.
-_SM70_SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES = (64, 96, 128, 160, 192, 256)
+_SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES = (64, 96, 128, 160, 192, 256)
 
 
 _SM70_BATCH_GEMM_DEFAULTS = {
@@ -247,7 +247,7 @@ def _sm70_speculative_cudagraph_capture_sizes(
     return sorted(
         set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES)
         | set(verifier_sizes)
-        | set(_SM70_SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES)
+        | set(_SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES)
     )
 
 
