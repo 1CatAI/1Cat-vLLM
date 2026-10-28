@@ -315,6 +315,12 @@ class AWQMarlinConfig(QuantizationConfig):
                 "marlin",
                 "awq_marlin",
             ):
+                # The returned name replaces the checkpoint's quant_method, so
+                # the caller's mismatch check never sees it. Only claim real
+                # AWQ checkpoints; anything else must keep failing loudly.
+                ckpt_method = str((hf_quant_cfg or {}).get("quant_method", ""))
+                if ckpt_method.lower() != "awq":
+                    return None
                 logger.info(
                     "VLLM_SM70_QUANT_BACKEND=turbomind overrides "
                     "quantization=%s for AWQ; using the AWQ TurboMind route.",
