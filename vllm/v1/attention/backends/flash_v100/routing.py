@@ -222,6 +222,15 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
             {"codecs": frozenset((FP16,)), "head_dims": (256,)},
         ),
         (
+            "prefill_dense_splitd_d256_splitkv_kernel",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+            },
+        ),
+        (
             "prefill_dense_splitd_d256_splitkv3_kernel",
             "prefill",
             {

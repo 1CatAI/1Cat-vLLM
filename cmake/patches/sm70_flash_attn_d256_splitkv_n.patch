@@ -1,0 +1,354 @@
+--- a/csrc/flash_attn/flash_api_torch_lib.cpp
++++ b/csrc/flash_attn/flash_api_torch_lib.cpp
+@@ -33,6 +33,18 @@
+     double softmax_scale,
+     bool causal);
+ 
++at::Tensor sm70_d256_splitd_dense_splitkv_fwd(
++    const at::Tensor &q,
++    const at::Tensor &k,
++    const at::Tensor &v,
++    at::Tensor &partial_out,
++    at::Tensor &partial_max,
++    at::Tensor &partial_sum,
++    at::Tensor &out,
++    double softmax_scale,
++    bool causal,
++    int64_t num_splits);
++
+ at::Tensor sm70_d256_splitd_dense_state_fwd(
+     const at::Tensor &q,
+     const at::Tensor &k,
+@@ -134,6 +146,13 @@
+     ops.impl("sm70_d256_splitd_n32_dense_splitkv3_fwd", torch::kCUDA,
+              make_pytorch_shim(&sm70_d256_splitd_dense_splitkv3_fwd));
+ 
++    ops.def("sm70_d256_splitd_n32_dense_splitkv_fwd(Tensor q, Tensor k, "
++            "Tensor v, Tensor(a!) partial_out, Tensor(b!) partial_max, "
++            "Tensor(c!) partial_sum, Tensor(d!) out, float softmax_scale, "
++            "bool causal, int num_splits) -> Tensor(d!)");
++    ops.impl("sm70_d256_splitd_n32_dense_splitkv_fwd", torch::kCUDA,
++             make_pytorch_shim(&sm70_d256_splitd_dense_splitkv_fwd));
++
+     ops.def("sm70_d256_splitd_n32_paged_fwd(Tensor q, Tensor k, Tensor v, "
+             "Tensor block_table, Tensor(a!) out, int kv_len, float softmax_scale, "
+             "bool causal) -> Tensor(a!)");
+--- a/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
++++ b/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
+@@ -24,6 +24,7 @@
+ using namespace cute;
+ 
+ struct Sm70D256SplitDTraits {
++    static constexpr int kMaxKVSplits = 64;
+     using Element = cutlass::half_t;
+     using MmaAtom = MMA_Atom<SM70_8x8x4_F32F16F16F32_TN>;
+     using PvMmaAtom = MMA_Atom<SM70_8x8x4_F32F16F16F32_TT>;
+@@ -428,7 +429,8 @@
+     int block_table_batch_stride,
+     float *__restrict__ partial_out,
+     float *__restrict__ partial_max,
+-    float *__restrict__ partial_sum) {
++    float *__restrict__ partial_sum,
++    int num_splits) {
+     using Traits = Sm70D256SplitDTraits;
+     constexpr int kBlockM = Traits::kBlockM;
+     constexpr int kBlockN = Traits::kBlockN;
+@@ -439,8 +441,8 @@
+     const int mma_group = warp / Traits::kWarpsPerGroup;
+     const int lane = tid % Traits::kMmaThreads;
+     const int m_block = blockIdx.x;
+-    const int split = SplitKV3 ? blockIdx.y % 3 : 0;
+-    const int batch = SplitKV3 ? blockIdx.y / 3 : blockIdx.y;
++    const int split = SplitKV3 ? blockIdx.y % num_splits : 0;
++    const int batch = SplitKV3 ? blockIdx.y / num_splits : blockIdx.y;
+     const int head_q = blockIdx.z;
+     const int head_kv = head_q / (heads_q / heads_kv);
+     const int query_row_base = m_block * kBlockM;
+@@ -521,8 +523,8 @@
+     int n_block_min = 0;
+     int n_block_max = visible_n_blocks - 1;
+     if constexpr (SplitKV3) {
+-        n_block_min = visible_n_blocks * split / 3;
+-        n_block_max = visible_n_blocks * (split + 1) / 3 - 1;
++        n_block_min = visible_n_blocks * split / num_splits;
++        n_block_max = visible_n_blocks * (split + 1) / num_splits - 1;
+     }
+ 
+     const int64_t k_batch_offset = PagedKV
+@@ -820,7 +822,7 @@
+     }
+     if constexpr (SplitKV3) {
+         const int64_t split_row_stride =
+-            static_cast<int64_t>(gridDim.y / 3) * query_len * heads_q;
++            static_cast<int64_t>(gridDim.y / num_splits) * query_len * heads_q;
+         if ((lane & 0x0e) == 0) {
+ #pragma unroll
+             for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
+@@ -979,6 +981,48 @@
+     out[element] = Element(numerator * merge[3]);
+ }
+ 
++// Merges any number of KV splits. The split-KV3 route keeps its own merge
++// so its rounding order is unchanged.
++template <typename Element>
++__global__ __launch_bounds__(Sm70D256SplitDTraits::kHeadDim, 1)
++void sm70_d256_splitkv_merge_kernel(
++    const float *__restrict__ partial_out,
++    const float *__restrict__ partial_max,
++    const float *__restrict__ partial_sum,
++    Element *__restrict__ out,
++    int64_t rows,
++    int num_splits,
++    float softmax_scale_log2) {
++    const int64_t row = blockIdx.x;
++    const int d = threadIdx.x;
++    __shared__ float scales[Sm70D256SplitDTraits::kMaxKVSplits];
++    __shared__ float inv_denominator;
++    if (d == 0) {
++        float global_max = -INFINITY;
++        for (int split = 0; split < num_splits; ++split) {
++            global_max = fmaxf(global_max, partial_max[split * rows + row]);
++        }
++        float denominator = 0.0f;
++        for (int split = 0; split < num_splits; ++split) {
++            const float scale = exp2f(
++                (partial_max[split * rows + row] - global_max)
++                * softmax_scale_log2);
++            scales[split] = scale;
++            denominator += partial_sum[split * rows + row] * scale;
++        }
++        inv_denominator = 1.0f / denominator;
++    }
++    __syncthreads();
++
++    const int64_t element = row * Sm70D256SplitDTraits::kHeadDim + d;
++    const int64_t split_stride = rows * Sm70D256SplitDTraits::kHeadDim;
++    float numerator = 0.0f;
++    for (int split = 0; split < num_splits; ++split) {
++        numerator += partial_out[split * split_stride + element] * scales[split];
++    }
++    out[element] = Element(numerator * inv_denominator);
++}
++
+ at::Tensor sm70_d256_splitd_dense_fwd(
+     const at::Tensor &q,
+     const at::Tensor &k,
+@@ -1064,7 +1108,8 @@
+         0,
+         nullptr,
+         nullptr,
+-        nullptr);
++        nullptr,
++        3);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return out;
+ }
+@@ -1146,7 +1191,8 @@
+         0,
+         nullptr,
+         state_max.data_ptr<float>(),
+-        state_sum.data_ptr<float>());
++        state_sum.data_ptr<float>(),
++        3);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return out;
+ }
+@@ -1213,11 +1259,12 @@
+         0,
+         nullptr,
+         state_max,
+-        state_sum);
++        state_sum,
++        3);
+     return cudaPeekAtLastError();
+ }
+ 
+-at::Tensor sm70_d256_splitd_dense_splitkv3_fwd(
++at::Tensor sm70_d256_splitd_dense_splitkv_fwd(
+     const at::Tensor &q,
+     const at::Tensor &k,
+     const at::Tensor &v,
+@@ -1226,38 +1273,42 @@
+     at::Tensor &partial_sum,
+     at::Tensor &out,
+     double softmax_scale,
+-    bool causal) {
++    bool causal,
++    int64_t num_splits) {
++    TORCH_CHECK(num_splits >= 1
++                    && num_splits <= Sm70D256SplitDTraits::kMaxKVSplits,
++                "split-KV count is out of range");
+     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda()
+                     && partial_out.is_cuda() && partial_max.is_cuda()
+                     && partial_sum.is_cuda() && out.is_cuda(),
+-                "split-KV3 inputs and workspaces must be CUDA tensors");
++                "split-KV inputs and workspaces must be CUDA tensors");
+     TORCH_CHECK(q.scalar_type() == at::ScalarType::Half
+                     && k.scalar_type() == q.scalar_type()
+                     && v.scalar_type() == q.scalar_type()
+                     && out.scalar_type() == q.scalar_type(),
+-                "split-KV3 requires FP16 q, k, v, and out");
++                "split-KV requires FP16 q, k, v, and out");
+     TORCH_CHECK(partial_out.scalar_type() == at::ScalarType::Float
+                     && partial_max.scalar_type() == at::ScalarType::Float
+                     && partial_sum.scalar_type() == at::ScalarType::Float,
+-                "split-KV3 workspaces must use FP32");
++                "split-KV workspaces must use FP32");
+     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+-                "split-KV3 q, k, and v must be rank four");
++                "split-KV q, k, and v must be rank four");
+     TORCH_CHECK(q.size(0) == k.size(0) && k.sizes() == v.sizes(),
+-                "split-KV3 batch and K/V shapes must match");
++                "split-KV batch and K/V shapes must match");
+     TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous(),
+-                "split-KV3 out must be contiguous and match q");
++                "split-KV out must be contiguous and match q");
+     TORCH_CHECK(q.size(3) == Sm70D256SplitDTraits::kHeadDim
+                     && k.size(3) == Sm70D256SplitDTraits::kHeadDim,
+-                "split-KV3 requires D256");
++                "split-KV requires D256");
+     TORCH_CHECK(q.size(2) % k.size(2) == 0,
+-                "split-KV3 query heads must be divisible by KV heads");
++                "split-KV query heads must be divisible by KV heads");
+     TORCH_CHECK(k.size(1) > q.size(1),
+-                "split-KV3 requires prefix prefill");
++                "split-KV requires prefix prefill");
+     TORCH_CHECK(q.size(1) % Sm70D256SplitDTraits::kBlockM == 0
+                     && k.size(1) % Sm70D256SplitDTraits::kBlockN == 0,
+-                "split-KV3 lengths must match the exact N32 tiles");
++                "split-KV lengths must match the exact N32 tiles");
+     TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
+-                "split-KV3 requires unit inner strides");
++                "split-KV requires unit inner strides");
+     TORCH_CHECK(q.stride(0) <= std::numeric_limits<int>::max()
+                     && q.stride(1) <= std::numeric_limits<int>::max()
+                     && q.stride(2) <= std::numeric_limits<int>::max()
+@@ -1267,32 +1318,36 @@
+                     && v.stride(0) <= std::numeric_limits<int>::max()
+                     && v.stride(1) <= std::numeric_limits<int>::max()
+                     && v.stride(2) <= std::numeric_limits<int>::max(),
+-                "split-KV3 strides exceed int32 addressing");
+-    TORCH_CHECK(causal, "split-KV3 exact path requires causal attention");
++                "split-KV strides exceed int32 addressing");
++    TORCH_CHECK(causal, "split-KV exact path requires causal attention");
+ 
+     const int64_t rows = q.size(0) * q.size(1) * q.size(2);
++    // Workspaces may be larger than this call needs; splits are packed.
+     TORCH_CHECK(partial_out.is_contiguous()
+                     && partial_out.numel()
+-                        == 3 * rows * Sm70D256SplitDTraits::kHeadDim,
+-                "split-KV3 partial_out shape is invalid");
++                        >= num_splits * rows * Sm70D256SplitDTraits::kHeadDim,
++                "split-KV partial_out is too small");
+     TORCH_CHECK(partial_max.is_contiguous() && partial_sum.is_contiguous()
+-                    && partial_max.numel() == 3 * rows
+-                    && partial_sum.numel() == 3 * rows,
+-                "split-KV3 partial stats shapes are invalid");
++                    && partial_max.numel() >= num_splits * rows
++                    && partial_sum.numel() >= num_splits * rows,
++                "split-KV partial stats are too small");
++    TORCH_CHECK(k.size(1) - q.size(1)
++                    >= num_splits * Sm70D256SplitDTraits::kBlockN,
++                "split-KV needs a prefix block per split");
+     TORCH_CHECK(q.get_device() == k.get_device()
+                     && q.get_device() == v.get_device()
+                     && q.get_device() == out.get_device()
+                     && q.get_device() == partial_out.get_device()
+                     && q.get_device() == partial_max.get_device()
+                     && q.get_device() == partial_sum.get_device(),
+-                "split-KV3 tensors must be on one CUDA device");
++                "split-KV tensors must be on one CUDA device");
+ 
+     const at::cuda::OptionalCUDAGuard device_guard(q.device());
+     auto stream = at::cuda::getCurrentCUDAStream();
+     const dim3 block(Sm70D256SplitDTraits::kNThreads);
+     const dim3 grid(
+         q.size(1) / Sm70D256SplitDTraits::kBlockM,
+-        q.size(0) * 3,
++        q.size(0) * num_splits,
+         q.size(2));
+     auto partial_kernel =
+         sm70_d256_splitd_dense_kernel<cutlass::half_t, false, true>;
+@@ -1326,24 +1381,60 @@
+         0,
+         partial_out.data_ptr<float>(),
+         partial_max.data_ptr<float>(),
+-        partial_sum.data_ptr<float>());
++        partial_sum.data_ptr<float>(),
++        static_cast<int>(num_splits));
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+-    sm70_d256_splitkv3_merge_kernel<cutlass::half_t>
+-        <<<static_cast<unsigned>(rows),
+-           Sm70D256SplitDTraits::kHeadDim,
+-           0,
+-           stream>>>(
+-            partial_out.data_ptr<float>(),
+-            partial_max.data_ptr<float>(),
+-            partial_sum.data_ptr<float>(),
+-            reinterpret_cast<cutlass::half_t *>(out.data_ptr()),
+-            rows,
+-            softmax_scale_log2);
++    if (num_splits == 3) {
++        sm70_d256_splitkv3_merge_kernel<cutlass::half_t>
++            <<<static_cast<unsigned>(rows),
++               Sm70D256SplitDTraits::kHeadDim,
++               0,
++               stream>>>(
++                partial_out.data_ptr<float>(),
++                partial_max.data_ptr<float>(),
++                partial_sum.data_ptr<float>(),
++                reinterpret_cast<cutlass::half_t *>(out.data_ptr()),
++                rows,
++                softmax_scale_log2);
++    } else {
++        sm70_d256_splitkv_merge_kernel<cutlass::half_t>
++            <<<static_cast<unsigned>(rows),
++               Sm70D256SplitDTraits::kHeadDim,
++               0,
++               stream>>>(
++                partial_out.data_ptr<float>(),
++                partial_max.data_ptr<float>(),
++                partial_sum.data_ptr<float>(),
++                reinterpret_cast<cutlass::half_t *>(out.data_ptr()),
++                rows,
++                static_cast<int>(num_splits),
++                softmax_scale_log2);
++    }
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return out;
+ }
+ 
++at::Tensor sm70_d256_splitd_dense_splitkv3_fwd(
++    const at::Tensor &q,
++    const at::Tensor &k,
++    const at::Tensor &v,
++    at::Tensor &partial_out,
++    at::Tensor &partial_max,
++    at::Tensor &partial_sum,
++    at::Tensor &out,
++    double softmax_scale,
++    bool causal) {
++    const int64_t rows = q.size(0) * q.size(1) * q.size(2);
++    TORCH_CHECK(partial_out.numel() == 3 * rows * Sm70D256SplitDTraits::kHeadDim
++                    && partial_max.numel() == 3 * rows
++                    && partial_sum.numel() == 3 * rows,
++                "split-KV3 workspace shapes are invalid");
++    return sm70_d256_splitd_dense_splitkv_fwd(
++        q, k, v, partial_out, partial_max, partial_sum, out, softmax_scale,
++        causal, 3);
++}
++
+ at::Tensor sm70_d256_splitd_paged_fwd(
+     const at::Tensor &q,
+     const at::Tensor &k,
+@@ -1441,7 +1532,8 @@
+         block_table.stride(0),
+         nullptr,
+         nullptr,
+-        nullptr);
++        nullptr,
++        3);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return out;
+ }
