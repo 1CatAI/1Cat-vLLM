@@ -41,9 +41,11 @@ class MixedPrefillBudget:
         all of it to prefill tokens shrinks the budget whenever the fixed
         part alone reaches the target, and the smaller chunks then make each
         token look even more expensive. Fitting both terms removes that
-        feedback. When the fixed cost already exceeds the target, smaller
-        chunks cannot meet it and only multiply the number of mixed steps, so
-        each mixed step instead takes about as much prefill as its fixed cost.
+        feedback. A chunk smaller than the prefill that costs as much as the
+        fixed part spends most of its step on overhead and only multiplies the
+        number of mixed steps, so the budget never drops below that amount.
+        Without this floor a fixed cost just under the target would leave a
+        budget of a few tokens.
         """
         w, sx, sy, sxx, sxy = self._fit
         spread = w * sxx - sx * sx
@@ -54,9 +56,7 @@ class MixedPrefillBudget:
         fixed = max(0.0, (sy - per_token * sx) / w)
         if per_token <= 0:
             return float(self.max_tokens)
-        if fixed >= self.target_ms:
-            return fixed / per_token
-        return (self.target_ms - fixed) / per_token
+        return max(self.target_ms - fixed, fixed) / per_token
 
     def update(self, sample: MixedPrefillTiming | None) -> None:
         if (
@@ -72,14 +72,24 @@ class MixedPrefillBudget:
         # It must not teach the controller that a full chunk is equally costly.
         if sample.prefill_tokens < sample.budget_tokens * 0.75:
             return
-        x, y = float(sample.prefill_tokens), float(sample.elapsed_ms)
-        w, sx, sy, sxx, sxy = (v * self.DECAY for v in self._fit)
-        self._fit = [w + 1, sx + x, sy + y, sxx + x * x, sxy + x * y]
-        cost = sample.elapsed_ms / sample.prefill_tokens
-        self.ms_per_token = (
-            cost if self.ms_per_token is None else 0.5 * self.ms_per_token + 0.5 * cost
-        )
+        # A short prefill that fits a captured graph skips most of the eager
+        # fixed cost. Fitting it with eager steps would make prefill tokens
+        # look expensive and split longer prompts into more eager steps. It
+        # still lets the budget move toward the eager fit, so a budget that
+        # fell into the graph range can recover.
+        if not sample.cuda_graph:
+            x, y = float(sample.prefill_tokens), float(sample.elapsed_ms)
+            w, sx, sy, sxx, sxy = (v * self.DECAY for v in self._fit)
+            self._fit = [w + 1, sx + x, sy + y, sxx + x * x, sxy + x * y]
+            cost = sample.elapsed_ms / sample.prefill_tokens
+            self.ms_per_token = (
+                cost
+                if self.ms_per_token is None
+                else 0.5 * self.ms_per_token + 0.5 * cost
+            )
         affine = self._affine_budget()
+        if sample.cuda_graph and affine is None:
+            return
         desired = self.target_ms / self.ms_per_token if affine is None else affine
         quantum = min(16, self.max_tokens)
         # Grow gradually, by at least one quantum so that a budget at the

@@ -37,6 +37,10 @@ class MixedPrefillTimer:
             ),
         )
 
+    def mark_cuda_graph(self) -> None:
+        if self.active is not None:
+            self.active[1].cuda_graph = True
+
     def finish(self) -> MixedPrefillTiming | None:
         if self.active is not None:
             start, sample = self.active
