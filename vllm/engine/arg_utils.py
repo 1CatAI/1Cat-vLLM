@@ -1940,8 +1940,11 @@ class EngineArgs:
                 self.compilation_config.cudagraph_capture_sizes = (
                     cudagraph_capture_sizes
                 )
+                max_tokens = self.max_num_batched_tokens
                 self.compilation_config.max_cudagraph_capture_size = max(
-                    cudagraph_capture_sizes
+                    size
+                    for size in cudagraph_capture_sizes
+                    if max_tokens is None or size <= max_tokens
                 )
                 profile_updates.append(
                     "cudagraph_capture_sizes="

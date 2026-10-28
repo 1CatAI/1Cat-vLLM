@@ -28,6 +28,11 @@ _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
 
+# Mixed steps that join a short prompt to the resident verifier rows. Without
+# a piecewise graph each such step pays the eager launch cost of every layer.
+_SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES = (64, 96, 128, 160, 192, 256)
+
+
 _SM70_BATCH_GEMM_DEFAULTS = {
     # Common dense-operator policy, independent of model name, checkpoint
     # quantization, speculative method/width and service concurrency. Local
@@ -240,7 +245,9 @@ def _sm70_speculative_cudagraph_capture_sizes(
     request_sizes.add(max_graph_reqs)
     verifier_sizes = [decode_query_len * size for size in request_sizes]
     return sorted(
-        set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
+        set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES)
+        | set(verifier_sizes)
+        | set(_SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES)
     )
 
 
