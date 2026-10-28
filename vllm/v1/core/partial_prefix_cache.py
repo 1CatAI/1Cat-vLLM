@@ -30,6 +30,7 @@ order, or when the block pool runs short.
 """
 
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from vllm.v1.core.block_pool import BlockPool
@@ -100,7 +101,7 @@ class PartialPrefixCache:
     def lookup(
         self,
         parent: BlockHash | None,
-        tokens: list[int] | tuple[int, ...],
+        tokens: Sequence[int],
         block_start: int,
         max_length: int,
         cache_salt: str | None,
