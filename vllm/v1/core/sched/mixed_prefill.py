@@ -88,9 +88,12 @@ class MixedPrefillBudget:
                 else 0.5 * self.ms_per_token + 0.5 * cost
             )
         affine = self._affine_budget()
-        if sample.cuda_graph and affine is None:
+        if affine is not None:
+            desired = affine
+        elif sample.cuda_graph or self.ms_per_token is None:
             return
-        desired = self.target_ms / self.ms_per_token if affine is None else affine
+        else:
+            desired = self.target_ms / self.ms_per_token
         quantum = min(16, self.max_tokens)
         # Grow gradually, by at least one quantum so that a budget at the
         # quantum can recover; a fitted cost model may double per step. React
