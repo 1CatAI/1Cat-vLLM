@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from PIL import Image
+import contextlib
+
+from PIL import Image, ImageOps
+
+
+def normalize_image(image: Image.Image) -> Image.Image:
+    """Apply EXIF orientation, tolerating malformed optional metadata."""
+    with contextlib.suppress(Exception):
+        image = ImageOps.exif_transpose(image)
+    return image
 
 
 def rescale_image_size(

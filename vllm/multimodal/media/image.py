@@ -11,7 +11,7 @@ from PIL import Image
 
 from vllm.utils.serial_utils import tensor2base64
 
-from ..image import convert_image_mode, rgba_to_rgb
+from ..image import convert_image_mode, normalize_image, rgba_to_rgb
 from .base import MediaIO, MediaWithBytes
 
 MAGIC_NUMPY_PREFIX = b"\x93NUMPY"  # https://numpy.org/devdocs/reference/generated/numpy.lib.format.html#format-version-1-0
@@ -70,6 +70,7 @@ class ImageMediaIO(MediaIO[Image.Image]):
     def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
         try:
             image = Image.open(BytesIO(data))
+            image = normalize_image(image)
             image.load()
             image = self._convert_image_mode(image)
         except (OSError, Image.UnidentifiedImageError) as e:
