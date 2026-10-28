@@ -2197,6 +2197,8 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.kv_block_copies:
+            self._kv_block_zeroer.copy_block_ids(scheduler_output.kv_block_copies)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
