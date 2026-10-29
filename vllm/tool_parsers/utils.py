@@ -169,13 +169,17 @@ def find_tool_properties(
     return {}
 
 
+def _params_or_empty_object(params: dict[str, Any] | None) -> dict[str, Any]:
+    # Missing or empty parameters still constrain the arguments to an object.
+    return params if params else {"type": "object", "properties": {}}
+
+
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
-    params = params if params else {"type": "object", "properties": {}}
     return {
         "properties": {
             "name": {"type": "string", "enum": [name]},
-            "parameters": params,
+            "parameters": _params_or_empty_object(params),
         },
         "required": ["name", "parameters"],
     }
@@ -232,7 +236,7 @@ def get_json_schema_from_tools(
         tool_map = {tool.name: tool for tool in tools if isinstance(tool, FunctionTool)}
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return tool_map[tool_name].parameters
+        return _params_or_empty_object(tool_map[tool_name].parameters)
     # tool_choice: Forced Function (ChatCompletion)
     if (not isinstance(tool_choice, str)) and isinstance(
         tool_choice, ChatCompletionNamedToolChoiceParam
@@ -245,7 +249,7 @@ def get_json_schema_from_tools(
         }
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return tool_map[tool_name].function.parameters
+        return _params_or_empty_object(tool_map[tool_name].function.parameters)
     # tool_choice: "required"
     if tool_choice == "required":
         return _get_json_schema_from_tools(tools)
