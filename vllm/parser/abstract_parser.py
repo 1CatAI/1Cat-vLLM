@@ -731,9 +731,11 @@ class DelegatingParser(Parser):
             if (
                 delta_message
                 and delta_message.tool_calls
-                and delta_message.tool_calls[0].id is not None
+                and any(tc.id is not None for tc in delta_message.tool_calls)
             ):
-                state.history_tool_call_cnt += 1
+                state.history_tool_call_cnt += sum(
+                    tc.id is not None for tc in delta_message.tool_calls
+                )
 
         # No phase active: pass through as content
         if (
