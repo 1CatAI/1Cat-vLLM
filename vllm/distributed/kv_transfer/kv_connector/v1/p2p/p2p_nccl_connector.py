@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
     P2pNcclEngine,
+    _kv_key,
 )
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
@@ -195,7 +196,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 layer = kv_cache
 
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
-                    request.request_id + "#" + layer_name, remote_address
+                    _kv_key(request.request_id) + "#" + layer_name, remote_address
                 )
 
                 if kv_cache is None:
@@ -250,7 +251,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
             kv_cache = kv_layer[request.block_ids, ...]
             self.p2p_nccl_engine.send_tensor(
-                request_id + "#" + layer_name, kv_cache, remote_address
+                _kv_key(request_id) + "#" + layer_name, kv_cache, remote_address
             )
 
     def wait_for_save(self):
@@ -377,7 +378,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if self.is_producer:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens = num_scheduled_tokens + num_computed_tokens
-                assert req_id in self.chunked_prefill
+                if req_id not in self.chunked_prefill:
+                    # Producer request whose prompt was fully prefilled in
+                    # a single step (no chunking): its KV was already
+                    # registered when that prefill step was scheduled. It
+                    # has no chunked-prefill bookkeeping, and any decode
+                    # step scheduled for it on the producer (callers are
+                    # expected to stop producer requests after prefill,
+                    # e.g. max_tokens=1) must be skipped. Previously this
+                    # path crashed the engine with an AssertionError.
+                    continue
                 assert new_block_ids is not None
                 block_ids = new_block_ids[0]
                 if not resumed_from_preemption:
