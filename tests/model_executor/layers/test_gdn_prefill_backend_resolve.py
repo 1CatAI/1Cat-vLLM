@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GDN prefill backend resolution across pre-Ampere capabilities.
 
-Turing (sm75) must not resolve to ``flashqla_sm70``: the path's default
-TileLang kernel does not compile there with the pinned tilelang, and its
-VLK CUDA alternative is slower than Triton/FLA at prefill chunk sizes.
+Volta (sm70) and Turing (sm75) resolve to ``flashqla_sm70``; Turing runs the
+TileLang kernel variant that fits its 64 KiB of opt-in shared memory.
 """
 
 from types import SimpleNamespace
@@ -50,16 +49,20 @@ def pre_ampere(monkeypatch):
     return _apply
 
 
-def test_turing_resolves_to_triton(pre_ampere):
+@pytest.mark.parametrize("requested", ["auto", "flashqla_sm70"])
+def test_turing_resolves_to_flashqla(pre_ampere, requested):
+    pytest.importorskip(
+        "flash_qla.ops.gated_delta_rule.chunk.sm70",
+        reason="FlashQLA-SM70 kernels are not installed.",
+    )
     pre_ampere(7, 5)
-    _, backend = _resolve_gdn_prefill_backend(_config())
-    assert backend == "triton"
+    _, backend = _resolve_gdn_prefill_backend(_config(requested=requested))
+    assert backend == "flashqla_sm70"
 
 
-def test_turing_resolves_to_triton_when_flashqla_requested(pre_ampere):
-    # An explicit request must not route Turing into a path that cannot run.
+def test_turing_non_fp16_falls_back(pre_ampere):
     pre_ampere(7, 5)
-    _, backend = _resolve_gdn_prefill_backend(_config(requested="flashqla_sm70"))
+    _, backend = _resolve_gdn_prefill_backend(_config(dtype=torch.bfloat16))
     assert backend == "triton"
 
 
