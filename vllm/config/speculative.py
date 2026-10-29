@@ -239,6 +239,11 @@ class SpeculativeConfig:
     non-tree speculation. ``None`` automatically enables the SM70
     FP16 Qwen4Exp TP4 MTP route with greedy drafts. Explicit booleans override
     automatic selection; other routes retain full-logits selection."""
+    disable_lookahead_block_hashes: bool = False
+    """Disable lookahead block hashes for EAGLE-like speculative methods and
+    fall back to dropping the trailing prefix-cache block. Lookahead hashes
+    also cover the token after each block, so engines sharing a KV store and
+    external consumers of KV cache events must use the same setting."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -1680,6 +1685,14 @@ class SpeculativeConfig:
             and not self.use_dflash()
             and not self.disable_eagle_block_drop
         )
+
+    def use_multi_module_mtp(self) -> bool:
+        if self.method != "mtp" or self.draft_model_config is None:
+            return False
+        num_mtp_layers = getattr(
+            self.draft_model_config.hf_config, "num_nextn_predict_layers", 1
+        )
+        return min(num_mtp_layers, self.num_speculative_tokens) > 1
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

@@ -132,6 +132,7 @@ class KVCacheManager:
         max_in_flight_tokens: int | None = None,
         enable_caching: bool = True,
         use_eagle: bool = False,
+        use_lookahead_block_hashes: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
@@ -167,6 +168,7 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            use_lookahead_block_hashes=use_lookahead_block_hashes,
         )
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval

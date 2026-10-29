@@ -26,7 +26,7 @@ MAMBA_BLOCK_SIZE = 816
 def _split(
     request, num_new_tokens: int, *, interval=None, eagle=False, tail=True
 ) -> int:
-    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
+    coordinator = SimpleNamespace(drop_eagle_group_ids={0} if eagle else set())
     coordinator.get_replay_boundaries = lambda request, block: (
         KVCacheCoordinator.get_replay_boundaries(coordinator, request, block)
     )
@@ -35,7 +35,7 @@ def _split(
         mamba_state_block_size=MAMBA_BLOCK_SIZE,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        use_eagle=eagle,
+        use_eagle_block_drop=eagle,
         mamba_state_retention_interval=interval,
         kv_cache_manager=SimpleNamespace(coordinator=coordinator),
     )
@@ -103,7 +103,7 @@ def test_contention_switch_keeps_single_request_sparse(running, waiting):
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
         mamba_state_block_size=8192,
-        use_eagle=True,
+        use_eagle_block_drop=True,
         mamba_state_retention_interval=0,
         mamba_dense_boundaries_on_contention=True,
         running=[request] * running,
@@ -235,7 +235,7 @@ def test_sparse_mtp_preserves_fine_resend_boundary_with_bulk_prefill():
 @pytest.mark.parametrize("length", [8160, 8161, 32768, 131040])
 def test_sparse_keeps_both_replay_boundaries(eagle, length):
     ends = _chunk_ends(length, eagle=eagle)
-    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
+    coordinator = SimpleNamespace(drop_eagle_group_ids={0} if eagle else set())
     boundaries = KVCacheCoordinator.get_replay_boundaries(
         coordinator, SimpleNamespace(num_tokens=length), MAMBA_BLOCK_SIZE
     )

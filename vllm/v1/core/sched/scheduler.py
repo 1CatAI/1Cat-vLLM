@@ -39,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import is_lookahead_block_hashing_enabled
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import (
@@ -264,16 +265,25 @@ class Scheduler(SchedulerInterface):
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
+        self.use_lookahead_block_hashes = is_lookahead_block_hashing_enabled(
+            vllm_config
+        )
+        # Lookahead hashes prove the boundary token, so EAGLE needs no drop.
+        self.use_eagle_block_drop = (
+            self.use_eagle and not self.use_lookahead_block_hashes
+        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
+        self.hash_block_size = hash_block_size
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.use_eagle_block_drop,
+            use_lookahead_block_hashes=self.use_lookahead_block_hashes,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -503,7 +513,7 @@ class Scheduler(SchedulerInterface):
         # unreachable state whenever the request length is block aligned.
         last_token = request.num_tokens - 1
         last_cache_position = last_token - last_token % block_size
-        if self.use_eagle:
+        if self.use_eagle_block_drop:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -1483,6 +1493,10 @@ class Scheduler(SchedulerInterface):
             session.num_prompt_tokens : num_computed_tokens
         ]
         del session._all_token_ids[num_computed_tokens:]
+        # A block hash covering a discarded token is stale; a lookahead hash
+        # also covers the token after its block.
+        num_hashed_tokens = num_computed_tokens - int(self.use_lookahead_block_hashes)
+        del session.block_hashes[max(num_hashed_tokens, 0) // self.hash_block_size :]
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
@@ -1898,6 +1912,18 @@ class Scheduler(SchedulerInterface):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            if (
+                self.use_lookahead_block_hashes
+                and stopped
+                and status_before_stop == RequestStatus.RUNNING
+            ):
+                # The last sampled token is the lookahead token of the block
+                # before it, which no later allocation will publish.
+                self.kv_cache_manager.cache_blocks(
+                    request,
+                    request.num_computed_tokens - request.num_in_flight_tokens,
+                )
 
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids

@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import ModelRunnerOutput
@@ -381,6 +382,10 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.recompute_kv_load_failures = False
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
+    # No latency target: update() ignores the step timing.
+    scheduler.mixed_prefill_budget = MixedPrefillBudget(1, 0.0)
+    # No speculative decoding, as __init__ derives without a speculative config.
+    scheduler.use_lookahead_block_hashes = False
 
     def free_request(req, delay_free_blocks=False):
         scheduler.finished_req_ids.add(req.request_id)

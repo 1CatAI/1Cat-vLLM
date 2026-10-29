@@ -48,6 +48,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
+    is_lookahead_block_hashing_enabled,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -216,7 +217,9 @@ class EngineCore:
             init_none_hash(caching_hash_fn)
 
             self.request_block_hasher = get_request_block_hasher(
-                hash_block_size, caching_hash_fn
+                hash_block_size,
+                caching_hash_fn,
+                is_lookahead_block_hashing_enabled(vllm_config),
             )
 
         self.step_fn = (
