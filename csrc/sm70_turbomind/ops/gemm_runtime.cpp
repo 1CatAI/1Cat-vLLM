@@ -198,7 +198,7 @@ bool awq_tune_small_shapes_enabled() {
 
 bool fp8_tune_small_shapes_enabled() {
   return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_tune_small_shapes,
-                                 1) != 0;
+                                 0) != 0;
 }
 
 bool mxfp4_tune_small_shapes_enabled() {

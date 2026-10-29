@@ -713,6 +713,39 @@ def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
     )
 
 
+def test_fp8_small_shape_tuning_defaults_to_fixed_dispatch(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
+    envs.disable_envs_cache()
+    calls = []
+
+    def warmup_layers(layers, m_values):
+        calls.append((layers, m_values))
+        return 5
+
+    monkeypatch.setattr(warmup, "_warmup_fp8_dense_layers", warmup_layers)
+    monkeypatch.setattr(
+        warmup,
+        "_export_lut_bytes",
+        lambda device: (_ for _ in ()).throw(AssertionError()),
+    )
+
+    assert not envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
+    assert not warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
+        has_awq_dense=False,
+        has_fp8_dense=True,
+        fp4_kinds=set(),
+    )
+    layers = [(nn.Module(), False)]
+    count = warmup._warmup_fp8_dense_layers_coordinated(
+        layers,
+        [1, 4],
+        torch.device("cuda:0"),
+    )
+    assert count == 5
+    assert calls == [(layers, [1, 4])]
+
+
 def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.delenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", raising=False)
