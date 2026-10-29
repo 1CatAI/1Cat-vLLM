@@ -310,17 +310,45 @@ endif()
 # _C extension
 #
 
-set(VLLM_EXT_SRC
-  "csrc/cuda_view.cu"
-  "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
-  "csrc/quantization/activation_kernels.cu"
-  "csrc/cuda_utils_kernels.cu"
-  "csrc/custom_all_reduce.cu"
-  "csrc/torch_bindings.cpp"
-  "csrc/ple_disk_rows.cpp"
-  "csrc/ple_fast_lane.cpp"
-  "csrc/gguf_dmv13_pack.cpp"
-  "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+# activation_kernels.cu uses bf16 packed intrinsics that CUDA only exposes
+# for __CUDA_ARCH__ >= 800, and its DeepGEMM fp8 MoE paths are runtime-dead
+# on pre-SM80 architectures. On SM70-only builds exclude the file from _C and
+# compile out its op registrations in torch_bindings (see
+# VLLM_REGISTER_DEEPGEMM_MOE_OPS below) so the extension still links.
+set(_VLLM_HAS_SM80 OFF)
+if(CMAKE_CUDA_ARCHITECTURES)
+  foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    string(REGEX REPLACE "[^0-9].*$" "" _arch_num "${_arch}")
+    if(_arch_num GREATER_EQUAL 80)
+      set(_VLLM_HAS_SM80 ON)
+    endif()
+  endforeach()
+endif()
+
+if(_VLLM_HAS_SM80)
+  set(VLLM_EXT_SRC
+    "csrc/cuda_view.cu"
+    "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
+    "csrc/quantization/activation_kernels.cu"
+    "csrc/cuda_utils_kernels.cu"
+    "csrc/custom_all_reduce.cu"
+    "csrc/torch_bindings.cpp"
+    "csrc/ple_disk_rows.cpp"
+    "csrc/ple_fast_lane.cpp"
+    "csrc/gguf_dmv13_pack.cpp"
+    "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+else()
+  set(VLLM_EXT_SRC
+    "csrc/cuda_view.cu"
+    "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
+    "csrc/cuda_utils_kernels.cu"
+    "csrc/custom_all_reduce.cu"
+    "csrc/torch_bindings.cpp"
+    "csrc/ple_disk_rows.cpp"
+    "csrc/ple_fast_lane.cpp"
+    "csrc/gguf_dmv13_pack.cpp"
+    "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_EXT_SRC
@@ -753,6 +781,9 @@ define_extension_target(
 # driver API. This causes problems when linking with earlier versions of CUDA.
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+if(_VLLM_HAS_SM80)
+  target_compile_definitions(_C PRIVATE VLLM_REGISTER_DEEPGEMM_MOE_OPS=1)
+endif()
 if(VLLM_REGISTER_BASIC_ACTIVATION_IN_C)
   target_compile_definitions(_C PRIVATE VLLM_REGISTER_BASIC_ACTIVATION_IN_C=1)
 endif()

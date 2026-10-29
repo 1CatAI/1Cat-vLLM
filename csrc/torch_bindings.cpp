@@ -200,12 +200,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor up) -> ()");
   ops.impl("gguf_iq3_gated_sm70_out", torch::kCUDA, &gguf_iq3_gated_sm70_out);
 #endif
+#ifdef VLLM_REGISTER_DEEPGEMM_MOE_OPS
   ops.def(
       "persistent_masked_m_silu_mul_quant(Tensor input, Tensor counts, Tensor! "
       "y_q, Tensor! y_s,"
       "bool use_ue8m0) -> ()");
   ops.impl("persistent_masked_m_silu_mul_quant", torch::kCUDA,
            &persistent_masked_m_silu_mul_quant);
+#endif
 
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
@@ -252,9 +254,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 #endif
 
+#ifdef VLLM_REGISTER_DEEPGEMM_MOE_OPS
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
   ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);
+#endif
 
   // Fused SiLU+Mul + per-block quantization
   ops.def(
