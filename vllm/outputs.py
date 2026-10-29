@@ -148,6 +148,11 @@ class RequestOutput:
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
 
+        # Parallel children can start in different steps. Keep the first
+        # prompt logprobs when merging a child's first DELTA into a later one.
+        if not self.prompt_logprobs and next_output.prompt_logprobs:
+            self.prompt_logprobs = next_output.prompt_logprobs
+
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
                 if completion.index == next_completion.index:
