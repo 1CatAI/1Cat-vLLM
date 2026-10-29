@@ -300,6 +300,8 @@ def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     connector = SimpleNamespace(
         _ple_policy=ple_policy(),
         _launch=lambda num_reqs, num_tokens: launches.append((num_reqs, num_tokens)),
+        early_prefill=False,
+        _host_result_regions={},
     )
 
     PleOffloadConnector.prepare_forward(
@@ -375,7 +377,10 @@ def test_hybrid_ple_admits_target_decode_widths(monkeypatch, tokens):
     monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
     launches = []
     connector = SimpleNamespace(
-        _ple_policy=ple_policy(), _launch=lambda *args: launches.append(args)
+        _ple_policy=ple_policy(),
+        _launch=lambda *args: launches.append(args),
+        early_prefill=False,
+        _host_result_regions={},
     )
     PleOffloadConnector.prepare_forward(connector, 1, tokens, False, True)
     assert launches == []
