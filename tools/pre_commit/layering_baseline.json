@@ -514,7 +514,7 @@
  },
  "vllm/v1/worker/gpu/cudagraph_utils.py": {
   "model": 11,
-  "platform": 33
+  "platform": 34
  },
  "vllm/v1/worker/gpu/mamba_align.py": {
   "model": 2
@@ -538,6 +538,9 @@
  },
  "vllm/v1/worker/gpu/spec_decode/__init__.py": {
   "model": 16
+ },
+ "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py": {
+  "model": 6
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py": {
   "model": 6
