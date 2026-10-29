@@ -106,6 +106,44 @@ The rest of SM70 still has legacy environment policies. This first migration
 isolates QPN2 policy; it does not claim complete multi-engine isolation for
 unmigrated attention, GEMM tuning or collective routes.
 
+## Automatic QPN4 temporary dense workspace
+
+The default `qpn4_lazy_dense_workspace: null` (auto) uses temporary native
+scratch only for already-qualified QPN4 linears in an `enforce_eager` engine
+with automatic KV memory profiling (`kv_cache_memory_bytes is None`).
+Graph-enabled engines and explicit fixed KV budgets retain resident scratch
+in auto mode. This reduces persistent storage, not guaranteed peak prefill
+storage or latency; it does not broaden QPN4's model/shape/state qualification.
+
+Explicit `false` forces resident scratch. Explicit `true` forces temporary
+scratch, including with graphs or fixed KV budgets:
+
+```bash
+vllm serve MODEL \
+  --kernel-config '{"sm70_nvfp4":{"qpn4_lazy_dense_workspace":true}}'
+```
+
+Both paths retain load-time admission using the existing bounded FP16
+workspace size (at least `5120 * 8704` elements, growing with the local weight).
+Temporary mode drops its uncached allocation probe before preparing weights:
+no tensor is retained by the layer or workspace pool. Admission OOM leaves
+checkpoint parameters intact and takes the existing TurboMind fallback.
+This is an admission check, not a reservation against subsequent memory use.
+
+M=1 native dispatch ignores scratch; M>1 allocates an operator-local `K * N`
+FP16 tensor. Normal automatic KV sizing measures the real profiling forward's
+torch allocation peak, including that temporary, before assigning KV memory.
+An explicit KV byte budget bypasses that measured-peak deduction; forcing
+temporary mode there requires the user to budget its runtime demand. The
+initial probe cannot guarantee later allocations against fragmentation or
+other processes. No per-request retry or duplicate weight fallback is added.
+
+Forced temporary mode with M>1 CUDA graphs can retain scratch in their private
+pool, so auto deliberately keeps the resident graph contract. The resolved
+workspace choice participates in active graph identity; auto/explicit source
+provenance does not. Native ABI, arithmetic and other workspace policies are
+unchanged. Policy resolution happens once per engine, not per invocation.
+
 ## Route regression command
 
 Run from a checkout with the normal Python dependencies installed:
