@@ -10,6 +10,8 @@ from typing import Any, Generic, TypeVar, cast, overload
 
 import vllm.envs as envs
 
+FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
+
 
 def options():
     from vllm.config.execution_policy import flash_v100_policy
@@ -90,6 +92,85 @@ def env_is_set(name: str) -> bool:
 
 
 @dataclass(frozen=True)
+class Fp8BridgeWorkspacePlan:
+    """Construction-time bound for one stream's optional bridge workspace."""
+
+    head_groups: int
+    budget_bytes: int
+    projected_bytes: int
+    max_kv_tokens: int
+    max_query_tokens: int
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        budget_bytes: int,
+        max_model_len: int,
+        max_query_tokens: int,
+        block_size: int,
+        num_kv_heads: int,
+        num_heads: int,
+        head_size: int,
+    ) -> Fp8BridgeWorkspacePlan:
+        if budget_bytes < 0:
+            raise ValueError("fp8_bridge_workspace_bytes must be nonnegative")
+        if min(
+            max_model_len, max_query_tokens, block_size,
+            num_kv_heads, num_heads, head_size,
+        ) <= 0 or num_heads % num_kv_heads:
+            raise ValueError("invalid FP8 bridge planning dimensions")
+        # Input block-table capacity may exceed max_model_len by a partial page.
+        # Conversion then rounds again to its native output pages.
+        input_tokens = (
+            (max_model_len + block_size - 1) // block_size * block_size
+        )
+        page_size = FP8_PREFILL_BRIDGE_PAGE_SIZE
+        kv_tokens = (input_tokens + page_size - 1) // page_size * page_size
+        query_tokens = min(max_model_len, max_query_tokens)
+        padded_query_tokens = (query_tokens + 63) // 64 * 64
+        table_bytes = kv_tokens // page_size * 4
+        for groups in range(1, num_kv_heads + 1):
+            if num_kv_heads % groups:
+                continue
+            # FP16 K/V, optional tail Q/output, and grouped Q/output copies.
+            # Count retained tail buffers even for an aligned maximum chunk:
+            # a shorter, unaligned chunk can have allocated them previously.
+            projected = (
+                4 * kv_tokens * (num_kv_heads // groups) * head_size
+                + table_bytes
+                + 4 * padded_query_tokens * (num_heads // groups) * head_size
+                + (
+                    4 * query_tokens * (num_heads // groups) * head_size
+                    if groups > 1 else 0
+                )
+            )
+            if projected <= budget_bytes:
+                return cls(groups, budget_bytes, projected, kv_tokens, query_tokens)
+        return cls(0, budget_bytes, 0, kv_tokens, query_tokens)
+
+
+def configure_fp8_bridge_workspace_plans(engine, kv_cache_groups, layers) -> None:
+    """Refine each layer from its final physical KV-group page, before use."""
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    for group in kv_cache_groups:
+        for name in group.layer_names:
+            layer = layers.get(name)
+            configure = getattr(
+                getattr(layer, "impl", None), "configure_fp8_bridge_workspace", None
+            )
+            if configure is None:
+                continue
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[name]
+            # Kernel pages divide physical group pages, so this covers their
+            # maximum block-table padding without assuming a default page size.
+            configure(engine, spec.block_size)
+
+
+@dataclass(frozen=True)
 class V100AttnConfig:
     """Resolved construction-time policy, separate from native ops and buffers."""
 
@@ -101,6 +182,8 @@ class V100AttnConfig:
     compare_triton_tensor_dump_dir: str | None
     compare_triton_tensor_dump_max_tokens: int
     decode_strategy: str
+    fp8_bridge_head_groups: int
+    fp8_bridge_workspace_plan: Fp8BridgeWorkspacePlan | None
     prefill_bfla_mask_block_n: int
     prefill_bfla_min_kv: int
     prefill_bfla_min_q: int

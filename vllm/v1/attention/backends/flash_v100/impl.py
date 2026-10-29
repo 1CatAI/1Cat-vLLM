@@ -115,6 +115,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         "use_flash_v100_prefill_splitkv"
     )
     use_fp8_prefill_bridge = _config.ConfigField[bool]("use_fp8_prefill_bridge")
+    fp8_bridge_head_groups = _config.ConfigField[int]("fp8_bridge_head_groups")
+    fp8_bridge_workspace_plan = _config.ConfigField[
+        _config.Fp8BridgeWorkspacePlan | None
+    ]("fp8_bridge_workspace_plan")
     use_prefill_paged_cache = _config.ConfigField[bool]("use_prefill_paged_cache")
     use_smallq_decode_xqa = _config.ConfigField[bool]("use_smallq_decode_xqa")
     use_triton_prefill = _config.ConfigField[bool]("use_triton_prefill")
@@ -241,6 +245,41 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged
         )
 
+    def configure_fp8_bridge_workspace(self, engine, block_size):
+        """Bind the resolved KV-group page envelope before profiling/capture."""
+        options = engine.attention_config.flash_v100.options
+        if (
+            options.value("fp8_bridge_head_groups") is not None
+            or self.kv_codec not in (FP8_E4M3, FP8_E5M2)
+            or self.head_size != 256
+            or not self.use_fp8_prefill_bridge
+            or not self.use_flash_v100_prefill_paged
+            or block_size is None
+        ):
+            return
+        budget = options.value("fp8_bridge_workspace_bytes")
+        if budget is None:
+            from vllm.runtime_resources import runtime_resources_for
+
+            requested = runtime_resources_for(engine).get("gpu_memory_budget_bytes")
+            if requested is None:
+                raise RuntimeError(
+                    "automatic FP8 bridge budgeting requires the GPU "
+                    "worker memory snapshot; initialize the worker or set "
+                    "fp8_bridge_workspace_bytes/fp8_bridge_head_groups"
+                )
+            budget = requested // 32
+        self.fp8_bridge_workspace_plan = _config.Fp8BridgeWorkspacePlan.build(
+            budget_bytes=budget,
+            max_model_len=engine.model_config.max_model_len,
+            max_query_tokens=engine.scheduler_config.max_num_batched_tokens,
+            block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            head_size=self.head_size,
+        )
+        self.fp8_bridge_head_groups = self.fp8_bridge_workspace_plan.head_groups
+
     def _initialize_prefill_policy(self):
         paged_prefill_enable = _config.options().value("enable_paged_prefill")
         paged_prefill_disable = _config.options().value("disable_paged_prefill")
@@ -254,6 +293,25 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if self.kv_codec is FP8_E4M3
             else self.fp8_e5m2_paged_kv_to_fp16 is not None
         ) and _config.options().value("fp8_prefill_bridge")
+        self.fp8_bridge_workspace_plan = None
+        groups = _config.options().value("fp8_bridge_head_groups")
+        if groups is None:
+            from vllm.config import get_current_vllm_config_or_none
+
+            engine = get_current_vllm_config_or_none()
+            # A cache-group hook refines this provisional page envelope before
+            # profiling and final KV initialization. A genuinely deferred page
+            # remains unsplit until that hook receives its resolved spec.
+            self.fp8_bridge_head_groups = 1
+            if engine is not None:
+                self.configure_fp8_bridge_workspace(
+                    engine, engine.cache_config.block_size
+                )
+            groups = self.fp8_bridge_head_groups
+        else:
+            # Preserve forced unsplit behavior for old zero/negative inputs.
+            groups = max(1, groups)
+        self.fp8_bridge_head_groups = groups
         self.use_flash_v100_prefill_splitkv = (
             self.flash_attn_prefill_paged_splitkv is not None
             and _config.options().value("prefill_split_kv")
@@ -796,6 +854,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     max_model_len=self._prefix_max_model_len,
                     kv_block_size=self._prefix_kv_block_size,
                     fp8_bridge=self.use_fp8_prefill_bridge,
+                    fp8_bridge_plan=self.fp8_bridge_workspace_plan,
                 )
             _routing.record_route(
                 _routing.ROUTE_SPECS["metadata_none_zero_output"].name

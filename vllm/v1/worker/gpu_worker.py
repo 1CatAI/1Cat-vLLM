@@ -51,6 +51,7 @@ from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
+from vllm.runtime_resources import runtime_resources_for
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
@@ -450,6 +451,11 @@ class Worker(WorkerBase):
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            # Reuse the worker's one-time capacity/admission snapshot. Optional
+            # attention workspace policies must not probe free memory per call.
+            runtime_resources_for(self.vllm_config)["gpu_memory_budget_bytes"] = int(
+                self.requested_memory
+            )
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
