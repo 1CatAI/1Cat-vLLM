@@ -720,3 +720,35 @@ if hasattr(torch.ops._C, "sm70_f16_gate_mul_out"):
         gate_weight: torch.Tensor,
     ) -> None:
         return None
+
+
+def sm70_glm53_sparse_mla_fp8_out(
+    out: torch.Tensor,
+    o_part: torch.Tensor,
+    ml: torch.Tensor,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    scale: float,
+) -> None:
+    _op("sm70_glm53_sparse_mla_fp8_out")(
+        out, o_part, ml, q, kv_cache, indices, lengths, scale
+    )
+
+
+if hasattr(torch.ops._C, "sm70_glm53_sparse_mla_fp8_out"):
+
+    @register_fake("_C::sm70_glm53_sparse_mla_fp8_out")
+    def _sm70_glm53_sparse_mla_fp8_out_fake(
+        out: torch.Tensor,
+        o_part: torch.Tensor,
+        ml: torch.Tensor,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        lengths: torch.Tensor,
+        scale: float,
+    ) -> None:
+        del out, o_part, ml, q, kv_cache, indices, lengths, scale
+        return None
