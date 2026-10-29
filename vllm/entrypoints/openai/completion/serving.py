@@ -323,6 +323,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 out_logprobs: GenericSequence[dict[int, Logprob] | None] | None
 
                 for output in res.outputs:
+                    self._raise_if_error(output.finish_reason, request_id)
                     i = output.index + prompt_idx * num_choices
 
                     # Useful when request.return_token_ids is True
