@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.envs import VLLM_ENFORCE_STRICT_TOOL_CALLING
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
@@ -25,6 +26,7 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
+from vllm.tool_parsers.qwen_xml_tool_grammar import adjust_qwen_xml_tool_request
 from vllm.tool_parsers.structural_tag_registry import (
     get_enable_structured_outputs_in_reasoning,
     get_model_structural_tag,
@@ -918,6 +920,14 @@ class Qwen3CoderToolParser(ToolParser):
                 return result
 
         return None
+
+    def adjust_request(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        if adjust_qwen_xml_tool_request(request, logger):
+            return request
+        return super().adjust_request(request)
 
     def get_structural_tag(self, request: ChatCompletionRequest):
         return get_model_structural_tag(
