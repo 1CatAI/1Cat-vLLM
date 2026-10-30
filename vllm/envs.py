@@ -1068,6 +1068,7 @@ if TYPE_CHECKING:
     VLLM_USE_SPINLOOP_EXT: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
+    VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
 
     # Native-only compatibility controls are raw optional strings.
     VLLM_CUSTOM_ALLREDUCE_ALGO: str | None = None
@@ -16737,6 +16738,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="''",
         effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_GPU_SYNC_CHECK": env_var(
+        env_with_choices(
+            "VLLM_GPU_SYNC_CHECK", None, ["warn", "error"]
+        ),
+        description=(
+            "GPU sync debug mode: 'warn' logs unintended GPU<->CPU syncs, "
+            "'error' raises. Unset disables."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,

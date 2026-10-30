@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Explicit compact E4M3 scalar attention for SM70 target tail graphs."""
 
-from functools import lru_cache
-
 import torch
 
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -17,6 +15,7 @@ from vllm.v1.attention.ops.sm70_grouped_long import (
     run_six_head_groups,
 )
 
+_builtin_scalar_cache: dict = {}
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_scalar")
 
 
@@ -39,26 +38,33 @@ BUILTIN_SCALAR_MANIFEST = {
 }
 
 
-@lru_cache(maxsize=1)
 def builtin_scalar_tail_attention():
-    try:
-        # The FA2 library loads on first use; resolve it before the lookup.
-        from vllm.vllm_flash_attn.flash_attn_interface import (
-            ensure_fa2_library_loaded,
-        )
+    if "op" not in _builtin_scalar_cache:
+        try:
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                ensure_fa2_library_loaded,
+            )
 
-        ensure_fa2_library_loaded()
-        return getattr(torch.ops._vllm_fa2_C, BUILTIN_SCALAR_OP)
-    except (AttributeError, ImportError):
-        return None
+            ensure_fa2_library_loaded()
+            _builtin_scalar_cache["op"] = getattr(
+                torch.ops._vllm_fa2_C, BUILTIN_SCALAR_OP
+            )
+        except (AttributeError, ImportError):
+            _builtin_scalar_cache["op"] = None
+    return _builtin_scalar_cache["op"]
 
 
 def scalar_tail_attention_available() -> bool:
     return builtin_scalar_tail_attention() is not None
 
 
-@lru_cache(maxsize=4)
+_scalar_tail_cache: dict = {}
+
+
 def load_scalar_tail_attention(manifest_name: str, device: torch.device):
+    cache_key = (manifest_name, device)
+    if cache_key in _scalar_tail_cache:
+        return _scalar_tail_cache[cache_key]
     if manifest_name:
         module, manifest = load_attention_library(manifest_name)
     else:
@@ -77,6 +83,7 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             "long-context route is disabled.",
             scope="process",
         )
+        _scalar_tail_cache[cache_key] = None
         return None
     capability = long_attention_capability(long_manifest)
     if not (
@@ -173,4 +180,5 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         )
         return True
 
+    _scalar_tail_cache[cache_key] = run
     return run

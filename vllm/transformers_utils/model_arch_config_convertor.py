@@ -520,6 +520,14 @@ class LongCatFlashMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
 
 
 class Gemma4MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def __init__(self, hf_config, hf_text_config):
+        super().__init__(hf_config, hf_text_config)
+        _allow = getattr(
+            hf_text_config, "allow_global_per_layer_attribute_access", False
+        )
+        if not _allow:
+            hf_text_config.allow_global_per_layer_attribute_access = True
+
     def get_hidden_size(self) -> int:
         # The speculator buffer must match the backbone (target) model's
         # hidden dimension, not the draft model's smaller dimension.
@@ -532,11 +540,20 @@ class Gemma4MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
 
 
 class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
-    def is_mm_prefix_lm(self) -> bool:
-        return (
-            getattr(self.hf_text_config, "use_bidirectional_attention", None)
-            == "vision"
+    def __init__(self, hf_config, hf_text_config):
+        super().__init__(hf_config, hf_text_config)
+        # Allow global access to per-layer attrs (head_dim, num_kv_heads).
+        _allow = getattr(
+            hf_text_config, "allow_global_per_layer_attribute_access", False
         )
+        if not _allow:
+            hf_text_config.allow_global_per_layer_attribute_access = True
+
+    def is_mm_prefix_lm(self) -> bool:
+        # use_bidirectional_attention="vision" describes the vision
+        # encoder's self-attention pattern, not the text model's.
+        # Gemma-4 text is standard causal — no mm_prefix_lm.
+        return False
 
     def get_head_size(self) -> int:
         # Gemma4 uses dual head dimensions: head_dim (sliding attention)
@@ -558,6 +575,8 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "gemma4": Gemma4ModelArchConfigConvertor,
     "gemma4_mtp": Gemma4MTPModelArchConfigConvertor,
     "gemma4_text": Gemma4ModelArchConfigConvertor,
+    "gemma4_unified": Gemma4ModelArchConfigConvertor,
+    "gemma4_unified_text": Gemma4ModelArchConfigConvertor,
     "glm4_moe_mtp": GLM4MoeMTPModelArchConfigConvertor,
     "glm_ocr_mtp": GLM4MoeMTPModelArchConfigConvertor,
     "longcat_flash_mtp": LongCatFlashMTPModelArchConfigConvertor,
