@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.prefill_overlap import (
     token_range_model_inputs,
 )
 from vllm.v1.worker.ubatching import (
+    cat_ubatch_outputs,
     dbo_overlaps_collectives,
     dbo_run_collective_overlapped,
 )
@@ -206,6 +207,56 @@ def test_halves_overlapping_collectives_match_the_whole_batch():
         output = overlap.run(model, halves, contexts)
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
         assert not dbo_overlaps_collectives()
+
+
+def test_cat_ubatch_outputs_keeps_the_structure_of_the_model_output():
+    first, second = torch.arange(3.0), torch.arange(3.0, 7.0)
+    # A single hidden-states tensor per half.
+    torch.testing.assert_close(
+        cat_ubatch_outputs([first, second]), torch.arange(7.0), rtol=0, atol=0
+    )
+    # A tuple of tensors (EAGLE3 aux output as one tensor).
+    hidden, aux = cat_ubatch_outputs([(first, first + 10), (second, second + 10)])
+    torch.testing.assert_close(hidden, torch.arange(7.0), rtol=0, atol=0)
+    torch.testing.assert_close(aux, torch.arange(7.0) + 10, rtol=0, atol=0)
+    # Hidden states plus a list of aux tensors (DFlash target): the list stays a list.
+    hidden, aux_list = cat_ubatch_outputs(
+        [(first, [first + 10, first + 20]), (second, [second + 10, second + 20])]
+    )
+    assert isinstance(aux_list, list) and len(aux_list) == 2
+    torch.testing.assert_close(hidden, torch.arange(7.0), rtol=0, atol=0)
+    torch.testing.assert_close(aux_list[0], torch.arange(7.0) + 10, rtol=0, atol=0)
+    torch.testing.assert_close(aux_list[1], torch.arange(7.0) + 20, rtol=0, atol=0)
+
+
+class _AuxToyModel(_ToyModel):
+    """Returns hidden states and a list of aux tensors like a DFlash target."""
+
+    def forward(self, input_ids: torch.Tensor):
+        hidden = super().forward(input_ids)
+        return hidden, [hidden + 1, hidden + 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_halves_return_the_aux_hidden_states_of_the_whole_batch():
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    overlap = PrefillOverlap(_overlap_config(), device)
+    model = _AuxToyModel(num_layers=6)
+    input_ids = torch.arange(4096, device=device) % 97
+    with torch.inference_mode():
+        expected_hidden, expected_aux = model(input_ids=input_ids)
+    contexts = [
+        ForwardContext(
+            no_compile_layers={}, attn_metadata={}, slot_mapping={}, ubatch_slices=None
+        )
+        for _ in range(2)
+    ]
+    halves = [{"input_ids": input_ids[:2049]}, {"input_ids": input_ids[2049:]}]
+    hidden, aux = overlap.run(model, halves, contexts)
+    torch.testing.assert_close(hidden, expected_hidden, rtol=0, atol=0)
+    assert isinstance(aux, list) and len(aux) == len(expected_aux)
+    for got, want in zip(aux, expected_aux):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
