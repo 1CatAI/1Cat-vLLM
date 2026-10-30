@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from collections.abc import Sequence
 
 import torch
 
@@ -231,20 +232,23 @@ def dbo_run_collective_overlapped(collective, *args) -> torch.Tensor:
 
 
 def cat_ubatch_outputs(
-    sorted_results: list,
-) -> "torch.Tensor | tuple[torch.Tensor, ...]":
+    sorted_results: Sequence,
+) -> "torch.Tensor | tuple | list":
     """Concatenate per-ubatch model outputs along the batch dim.
 
     Most models return a single hidden-states tensor per ubatch. Target
     models running with auxiliary output (e.g. EAGLE3 speculative decoding,
-    which collects aux hidden states for the drafter) return a tuple of
-    tensors instead. Fan out over tuple components so `torch.cat` sees
-    matching shapes and the caller receives the same structure the model
-    produced for a single ubatch (#40769).
+    which collects aux hidden states for the drafter) return a tuple of the
+    hidden states and a list of aux tensors instead. Fan out over the tuple
+    and list components, nesting as deep as the model's output goes, so
+    `torch.cat` sees matching shapes and the caller receives the same
+    structure the model produced for a single ubatch (#40769).
     """
-    if sorted_results and isinstance(sorted_results[0], tuple):
-        return tuple(torch.cat(parts, dim=0) for parts in zip(*sorted_results))
-    return torch.cat(sorted_results, dim=0)
+    if sorted_results and isinstance(sorted_results[0], (tuple, list)):
+        return type(sorted_results[0])(
+            cat_ubatch_outputs(parts) for parts in zip(*sorted_results)
+        )
+    return torch.cat(list(sorted_results), dim=0)
 
 
 def dbo_register_recv_hook(recv_hook):
