@@ -143,6 +143,33 @@ def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
 
 
 @requires_sm70
+def test_prefill_cublas_scores_survive_unscaled_key_magnitudes(monkeypatch):
+    """The cuBLAS route multiplies by keys with their scale left out, so e4m3
+    values reach 448 and one q . k passes fp16's 65504. Such scores are finite
+    once scaled and must stay finite; with an fp16 score tile they became inf,
+    and NaN where the mixed-sign head weights summed +inf and -inf."""
+    torch.manual_seed(20261031)
+    generator = torch.Generator().manual_seed(20261031)
+    num_queries, num_heads, num_keys = 3, 8, 16
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_cublas", True)
+
+    q, weights = _make_queries(num_queries, num_heads)
+    q[:, :2] = 2.0  # 128 * 2.0 * 448 = 114688 against the full-scale keys
+    weights[:, 0], weights[:, 1] = 1.0, -1.0
+    bits, values = _random_fp8_keys(num_keys, generator)
+    bits[: num_keys // 2] = 0x7E  # e4m3fn 448, the format's largest finite value
+    values[: num_keys // 2] = 448.0
+    scales = torch.full((num_keys,), 2.0**-8, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights
+    )
+    expected = _reference_index_logits(q, weights, values * scales[:, None])
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-2)
+
+
+@requires_sm70
 @pytest.mark.parametrize(
     "relu,fused",
     [
