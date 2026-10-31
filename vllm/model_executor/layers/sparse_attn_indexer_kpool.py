@@ -773,6 +773,7 @@ def sparse_attn_indexer_kpool(
                 indexer_decode_cublas=get_forward_context()
                 .no_compile_layers[k_cache_prefix]
                 .sm70_sparse.indexer_decode_cublas,
+                triton_tensor_cores=triton_tensor_cores,
             )
         else:
             logits = fp8_fp4_paged_mqa_logits(

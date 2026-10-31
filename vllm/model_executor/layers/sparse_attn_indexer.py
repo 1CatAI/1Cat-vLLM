@@ -385,6 +385,7 @@ def sparse_attn_indexer(
                 indexer_decode_cublas=get_forward_context()
                 .no_compile_layers[k_cache_prefix]
                 .sm70_sparse.indexer_decode_cublas,
+                triton_tensor_cores=triton_tensor_cores,
             )
         elif current_platform.is_xpu():
             if padded_q_scale is not None:
