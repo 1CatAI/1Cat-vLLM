@@ -51,8 +51,8 @@ _RELU_BLOCK_M = 32
 # Route prefill scoring through cuBLAS instead of the Triton MMA. Set 0 for an
 # A/B against the Triton kernel above (which stays as the reference shape and
 # is what the decode path still uses, since decode gathers from a paged cache).
-# Cap (MiB) on the [tokens*heads, key_tile] fp16 score tile. At the default
-# 2048-token prefill chunk and 64 heads this is 128 KiB per key, so the tile
+# Cap (MiB) on the [tokens*heads, key_tile] fp32 score tile. At the default
+# 2048-token prefill chunk and 64 heads this is 512 KiB per key, so the tile
 # is what keeps a long-context chunk from asking for gigabytes in one go.
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
@@ -609,16 +609,16 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
         q2 = q2.contiguous()
 
     rows = num_q * num_heads
-    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 2))
+    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 4))
     k_tile = max(_RELU_BLOCK_N, min(num_k, budget // _RELU_BLOCK_N * _RELU_BLOCK_N))
 
     for start in range(0, num_k, k_tile):
         stop = min(start + k_tile, num_k)
         width = stop - start
-        # fp16 out with fp32 accumulate: the epilogue reduces in fp32 and only
-        # the top-k *set* is consumed downstream, so the 5e-4 rounding here is
-        # far below the gap between neighbouring index scores.
-        scores = torch.mm(q2, k_fp16[start:stop].t())
+        # fp32 out: the keys enter unscaled (e4m3 reaches 448), so one q . k can
+        # pass fp16's 65504; an fp16 tile overflowed to inf, and to NaN where
+        # mixed-sign head weights summed +inf and -inf in the epilogue.
+        scores = torch.mm(q2, k_fp16[start:stop].t(), out_dtype=torch.float32)
         _relu_weight_headsum_kernel[(num_q, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
             scores,
             weights,
