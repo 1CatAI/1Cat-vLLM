@@ -392,6 +392,7 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
         block_table,
         max_seq_len,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
 
     reference = _reference_index_logits if relu else _reference_factored_logits
@@ -417,9 +418,13 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
 # block-table row and one length per token. two_requests: the same, twice.
 @pytest.mark.parametrize("layout", ["native", "flattened", "two_requests"])
 @pytest.mark.parametrize("num_rows", [3, 8, 13])
+# fused: the tensor-core scorer on FP8 keys replaces the cuBLAS GEMM and epilogue.
+@pytest.mark.parametrize(
+    "fused", [False, pytest.param(True, marks=requires_tensor_core_triton)]
+)
 @requires_sm70
 def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
-    monkeypatch, padded_blocks, layout, num_rows
+    monkeypatch, padded_blocks, layout, num_rows, fused
 ):
     torch.manual_seed(20260824)
     generator = torch.Generator().manual_seed(20260824)
@@ -480,17 +485,25 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
         graph_width,
         table_rows_per_request,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
 
-    static_workspace = (
-        torch.empty((graph_width, _HEAD_DIM), dtype=torch.float16, device="cuda"),
-        torch.empty((graph_width,), dtype=torch.float32, device="cuda"),
-        torch.empty(
-            (num_rows * num_heads, graph_width),
-            dtype=torch.float32,
-            device="cuda",
-        ),
-    )
+    static_workspace: tuple[torch.Tensor, ...]
+    if fused:
+        static_workspace = (
+            torch.empty((graph_width, _HEAD_DIM), dtype=torch.uint8, device="cuda"),
+            torch.empty((graph_width,), dtype=torch.float32, device="cuda"),
+        )
+    else:
+        static_workspace = (
+            torch.empty((graph_width, _HEAD_DIM), dtype=torch.float16, device="cuda"),
+            torch.empty((graph_width,), dtype=torch.float32, device="cuda"),
+            torch.empty(
+                (num_rows * num_heads, graph_width),
+                dtype=torch.float32,
+                device="cuda",
+            ),
+        )
 
     workspace_requests = []
 
@@ -517,6 +530,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
             graph_width,
             table_rows_per_request,
             indexer_decode_cublas=True,
+            triton_tensor_cores=fused,
         )
 
     capture_stream = torch.cuda.Stream()
@@ -533,7 +547,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
         candidate = candidate_call()
     graph.replay()
     torch.accelerator.synchronize()
-    # Only the cuBLAS route asks for a workspace: this card took it.
+    # Only the cuBLAS and fused routes ask for a workspace: this card took one.
     assert workspace_requests
 
     for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
@@ -558,6 +572,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
         graph_width,
         table_rows_per_request,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
     graph.replay()
     torch.accelerator.synchronize()
@@ -598,6 +613,7 @@ def test_sm70_indexer_decode_valid_logits_do_not_depend_on_workspace_width() -> 
         block_table,
         max_seq_len=16,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
     wide = sm70_indexer_decode_logits(
         q,
@@ -607,6 +623,7 @@ def test_sm70_indexer_decode_valid_logits_do_not_depend_on_workspace_width() -> 
         block_table,
         max_seq_len=64,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
 
     assert narrow.shape == (num_queries, 16)
@@ -672,6 +689,7 @@ def test_decode_cublas_score_tiles_match_one_tile(monkeypatch):
             graph_width,
             rows,
             indexer_decode_cublas=True,
+            triton_tensor_cores=False,
         )
 
     single = decode()
