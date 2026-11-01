@@ -414,6 +414,68 @@ def cap_host_budget_bytes(
     return min(budget_bytes, share)
 
 
+# Host memory kept free beside the hybrid default's pinned PLE share (engine
+# processes, checkpoint loading, page cache of the disk-backed prefill path).
+HYBRID_DEFAULT_HOST_RESERVE_BYTES = 8 << 30
+# Fraction of the PLE table that must fit in pinned host memory; the hybrid
+# placement keeps the rest in device memory beside the weights.
+HYBRID_DEFAULT_HOST_FRACTION = 0.75
+# Per-rank margin below the fair host share when the default fixes the budget.
+HYBRID_DEFAULT_RANK_MARGIN_BYTES = 2 << 30
+
+
+def ple_table_bytes(model_path: str | None) -> int | None:
+    """Checkpoint bytes of the PLE n-gram tables, from a local safetensors index."""
+    import json
+    import os
+
+    try:
+        with open(os.path.join(str(model_path), "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+        files = {f for k, f in weight_map.items() if "ngram_embedding" in k}
+        return sum(os.path.getsize(os.path.join(str(model_path), f)) for f in files)
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
+
+
+def default_hybrid_host_gib(model_path: str | None, tp_size: int) -> float | None:
+    """Per-rank pinned-host PLE budget for the hybrid default, or None for disk.
+
+    Hybrid decode gathers PLE rows on the GPU from local device and pinned-host
+    shards instead of waiting each step for the CPU worker's disk lookup
+    (Flash-Next NVFP4 MTP4 on 4x V100-32GB: 18.3 -> 15.7 ms per round). It is
+    chosen when physical memory less a reserve holds three quarters of the
+    table.
+
+    Both the choice and the budget come from physical memory. Every engine
+    process resolves these defaults, some after others pinned their shares,
+    and a budget derived per process from MemAvailable left the hybrid lane
+    crashing in its first decode graph replay; every startup with a fixed
+    budget was stable.
+    """
+    table = ple_table_bytes(model_path)
+    total = total_host_bytes()
+    if not table or total is None:
+        return None
+    if total - HYBRID_DEFAULT_HOST_RESERVE_BYTES < table * HYBRID_DEFAULT_HOST_FRACTION:
+        return None
+    ranks = max(int(tp_size), 1)
+    share = (total - ple_host_reserve_bytes(total)) // ranks
+    budget = min(table // ranks, share - HYBRID_DEFAULT_RANK_MARGIN_BYTES)
+    return round(budget / (1 << 30), 2) if budget > 0 else None
+
+
+def apply_hybrid_ple_defaults(
+    defaults, model_path: str | None, tp_size: int
+) -> float | None:
+    """Select hybrid placement when the host fits it; return its budget."""
+    host_gib = default_hybrid_host_gib(model_path, tp_size)
+    defaults["VLLM_SM70_QWEN38_HYBRID_PLE"] = "0" if host_gib is None else "1"
+    if host_gib is not None and "VLLM_QWEN4EXP_PLE_HOST_GIB" not in defaults:
+        defaults["VLLM_QWEN4EXP_PLE_HOST_GIB"] = str(host_gib)
+    return host_gib
+
+
 def env_gib_bytes(name: str) -> int | None:
     """Bytes of a GiB-valued PLE variable, or None when it is unset."""
 
