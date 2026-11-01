@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -86,6 +86,49 @@ class GroupedAdmission:
     flash_attn_grouped_fp16_fp32_paged: Any
     flash_attn_grouped_e4m3_fp32_paged: Any
     _flash_v100_window_size: Any
+
+
+class KvHeadView(NamedTuple):
+    """One KV head and the query heads that read it."""
+
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    out: torch.Tensor
+    query_heads: slice
+
+
+def per_kv_head_views(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+) -> list[KvHeadView]:
+    """Split a verifier batch for the grouped kernel, one call per KV head.
+
+    The grouped kernel reads the context once for all query rows, but takes
+    exactly one KV head at a time. With several KV heads per rank (tensor
+    parallelism below the head count) each one gets its own call. The caller
+    writes `out` of a split batch back through `query_heads`.
+    """
+    num_kv_heads = key_cache.shape[2]
+    if num_kv_heads == 1:
+        return [KvHeadView(query, key_cache, value_cache, out, slice(None))]
+    heads_per_kv = query.shape[1] // num_kv_heads
+    views = []
+    for head in range(num_kv_heads):
+        query_heads = slice(head * heads_per_kv, (head + 1) * heads_per_kv)
+        head_query = query[:, query_heads].contiguous()
+        views.append(
+            KvHeadView(
+                head_query,
+                key_cache[:, :, head : head + 1],
+                value_cache[:, :, head : head + 1],
+                torch.empty_like(head_query),
+                query_heads,
+            )
+        )
+    return views
 
 
 class VerificationExecutor:
@@ -345,34 +388,43 @@ class VerificationExecutor:
         partition_size_hint: int | None,
     ) -> None:
         fp16_grouped = self.ops.fp16_grouped
+        kv_heads = (
+            per_kv_head_views(query, key_cache, value_cache, out)
+            if fp16_grouped is not None
+            else ()
+        )
         if (
-            fp16_grouped is not None
+            kv_heads
             and grouped_fp16_fp32_reason(
                 self.grouped_admission,
-                query,
-                key_cache,
-                value_cache,
+                kv_heads[0].query,
+                kv_heads[0].key,
+                kv_heads[0].value,
                 block_table,
                 seq_lens,
                 attn_metadata,
-                out=out,
+                out=kv_heads[0].out,
                 partition_size_hint=partition_size_hint,
             )
             is None
         ):
-            fp16_grouped(
-                query,
-                key_cache,
-                value_cache,
-                attn_metadata.block_table,
-                seq_lens,
-                out=out,
-                softmax_scale=self.config.scale,
-            )
+            for head in kv_heads:
+                fp16_grouped(
+                    head.query,
+                    head.key,
+                    head.value,
+                    attn_metadata.block_table,
+                    seq_lens,
+                    out=head.out,
+                    softmax_scale=self.config.scale,
+                )
+                if head.out is not out:
+                    out[:, head.query_heads].copy_(head.out)
             logger.info_once(
                 "FLASH_ATTN_V100 FP16 KV grouped verifier active "
-                "(FP32 probability/PV/numerator/max/sum, page=%d).",
+                "(FP32 probability/PV/numerator/max/sum, page=%d, KV heads=%d).",
                 key_cache.shape[1],
+                key_cache.shape[2],
                 scope="process",
             )
             _routing.record_route(
