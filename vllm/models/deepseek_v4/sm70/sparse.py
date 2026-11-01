@@ -121,6 +121,12 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
     PREFILL_CHUNK_SIZE = 8
 
     @classmethod
+    def _prefill_chunk_requests(cls, layer: "DeepseekV4MLAAttention") -> int:
+        # A chunk holds whole requests, so an engine with fewer sequences never
+        # fills PREFILL_CHUNK_SIZE rows of the workspace, each one context long.
+        return min(cls.PREFILL_CHUNK_SIZE, layer.max_num_seqs)
+
+    @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
 
@@ -159,7 +165,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             combined_topk = round_up(top_k + layer.window_size, 128)
             current_workspace_manager().get_simultaneous(
                 (
-                    (cls.PREFILL_CHUNK_SIZE, workspace_tokens, q.shape[-1]),
+                    (cls._prefill_chunk_requests(layer), workspace_tokens, q.shape[-1]),
                     torch.float16,
                 ),
                 ((layer.max_num_batched_tokens, combined_topk), torch.int32),
@@ -445,7 +451,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
 
         chunk_plan = swa_metadata.get_prefill_chunk_plan(
             compress_ratio=layer.compress_ratio,
-            prefill_chunk_size=cls.PREFILL_CHUNK_SIZE,
+            prefill_chunk_size=cls._prefill_chunk_requests(layer),
         )
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
         workspace_manager = current_workspace_manager()

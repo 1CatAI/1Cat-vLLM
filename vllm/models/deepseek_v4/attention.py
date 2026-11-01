@@ -795,6 +795,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         # Forward passes run outside the config context, so the engine's
         # sparse attention policy is kept with the layer.
         self.sm70_sparse = vllm_config.kernel_config.sm70_sparse

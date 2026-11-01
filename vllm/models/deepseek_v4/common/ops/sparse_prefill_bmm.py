@@ -40,7 +40,10 @@ _GATHER_SLOTS = 8
 # instead of 128-token passes takes RTX 8000 from 2.45 to 2.19 ms at 640 slots
 # and from 4.21 to 3.86 ms at 1152, V100 from 2.20 to 1.92 ms at 640, for
 # 432 MiB of scores and probabilities at 1152 slots. No swept tile beat these.
-_TC_TOKENS_PER_PASS = 1024
+# Those buffers follow the widest layer, so the context sizes them and they set
+# the workspace of every stage: 1097 MiB at 343k tokens. 512 tokens per pass
+# take half of that for 0.3 % of the first token at 336k tokens.
+_TC_TOKENS_PER_PASS = 512
 _TC_SCORES_SLOTS, _TC_SCORES_DIMS, _TC_SCORES_WARPS, _TC_SCORES_STAGES = 128, 64, 8, 2
 _TC_PV_DIMS, _TC_PV_SLOTS, _TC_PV_WARPS, _TC_PV_STAGES = 256, 32, 8, 1
 
