@@ -14,12 +14,14 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
+    MXFP8_SCALE_ONE,
     MXFP8_VALUE_DTYPE,
 )
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
 )
+from vllm.model_executor.utils import set_weight_attrs
 
 __all__ = ["CompressedTensorsW8A8Mxfp8"]
 
@@ -83,6 +85,7 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        set_weight_attrs(weight_scale, {"padding_value": MXFP8_SCALE_ONE})
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
