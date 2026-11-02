@@ -4,8 +4,7 @@
 // Prefill index scores of the sparse-attention lightning indexer, fused on
 // Turing's m16n8k8 tensor cores:
 //
-//   out[t, key] = scale[key] * sum_h w[t, h]
-//                 * relu(fp16(q[t, h, :] . k[key, :]))
+//   out[t, key] = scale[key] * sum_h w[t, h] * relu(q[t, h, :] . k[key, :])
 //
 // The cuBLAS route stacks the heads into M and writes the [tokens * heads,
 // keys] fp16 scores (64 MiB per 512-token chunk and 1024 keys) before a second
@@ -13,8 +12,9 @@
 // queries for 32 heads in registers, multiplies them with a shared key tile,
 // and reduces the heads in registers and through warp shuffles; only the
 // [tokens, keys] result reaches memory. The keys stay e4m3 in global memory and
-// are widened once per CTA while staged into shared memory. Scores are rounded
-// to fp16 before the relu, as the cuBLAS route stores them.
+// are widened once per CTA while staged into shared memory. The scores stay in
+// the fp32 accumulators: the keys enter without their per-key scale, so one
+// product can pass fp16's 65504.
 
 #include <torch/all.h>
 
@@ -217,8 +217,7 @@ __launch_bounds__(kThreads, 1) void indexer_prefill_scores_sm75_kernel(
         for (int f = 0; f < kFrags; ++f) {
 #pragma unroll
           for (int half_row = 0; half_row < 2; ++half_row) {
-            const float score = __half2float(
-                __float2half_rn(acc[f][j][half_row * 2 + c] * kKeyRebias));
+            const float score = acc[f][j][half_row * 2 + c] * kKeyRebias;
             sum += fmaxf(score, 0.0f) * w[f][half_row];
           }
         }

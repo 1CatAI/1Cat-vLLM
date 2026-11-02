@@ -59,7 +59,8 @@ def _reference_prefill_logits(
     q: torch.Tensor, weights: torch.Tensor, values: torch.Tensor, scales: torch.Tensor
 ) -> torch.Tensor:
     """The prefill routes' arithmetic in fp64: per-head scores of the unscaled
-    keys rounded to fp16 (as the cuBLAS route stores them), then relu, head
+    keys rounded to fp16 (as the cuBLAS route stores them; the fused SM75
+    scorer keeps FP32, well within the tolerance below), then relu, head
     weights, head sum and the per-key scale.
     """
     per_head = torch.einsum("mhd,nd->mhn", q.double(), values.double())
@@ -184,6 +185,40 @@ def test_turing_prefill_takes_the_fused_scorer(monkeypatch):
         q, bits.view(torch.float8_e4m3fn), scales, weights
     )
     _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
+    reason="requires a Turing GPU (SM75)",
+)
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_turing_fused_scorer_survives_unscaled_key_magnitudes(monkeypatch, num_heads):
+    """The fused SM75 scorer multiplies by keys with their scale left out, so
+    e4m3 values reach 448 and one q . k passes fp16's 65504. Its products must
+    stay FP32: rounded to fp16 they became inf, and NaN where the mixed-sign
+    head weights summed +inf and -inf."""
+
+    def cublas_route(*args):
+        raise AssertionError("Turing must take its fused scorer here")
+
+    monkeypatch.setattr(sm70_indexer, "_prefill_logits_cublas", cublas_route)
+    torch.manual_seed(20261102)
+    generator = torch.Generator().manual_seed(20261102)
+    num_queries, num_keys = 3, 80
+    q, weights = _make_queries(num_queries, num_heads)
+    q[:, :2] = 2.0  # 128 * 2.0 * 448 = 114688 against the full-scale keys
+    weights[:, 0], weights[:, 1] = 1.0, -1.0
+    bits, values = _random_fp8_keys(num_keys, generator)
+    bits[: num_keys // 2] = 0x7E  # e4m3fn 448, the format's largest finite value
+    values[: num_keys // 2] = 448.0
+    scales = torch.full((num_keys,), 2.0**-8, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights
+    )
+    expected = _reference_index_logits(q, weights, values * scales[:, None])
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-2)
 
 
 @requires_sm70
