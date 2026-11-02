@@ -11,6 +11,10 @@ from vllm.utils.torch_utils import direct_register_custom_op
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
+# E8M0 code of the scale 1 (exponent bias 127). Rows that pad an MXFP8 weight
+# hold zero codes, so any scale keeps them zero; code 0 would mean 2^-127,
+# outside the exponent range some kernels accept.
+MXFP8_SCALE_ONE = 127
 
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
