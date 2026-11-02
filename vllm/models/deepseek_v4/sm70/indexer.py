@@ -378,14 +378,15 @@ def _prefill_index_scores_kernel(
 ):
     """Prefill index scores, every head of BLOCK_T tokens in one MMA operand.
 
-        out[t, s] = scale[s] * sum_h w[t, h] * relu(fp16(q[t, h] . k[s]))
+        out[t, s] = scale[s] * sum_h w[t, h] * relu(q[t, h] . k[s])
 
     The heads stack into a [BLOCK_T * NUM_HEADS, 128] query operand that every
     key tile of the program reuses (the indexer is MQA). Keys widen to fp16 as
-    value * 2^-8, the product is taken back by 256 and rounded to fp16 as the
-    cuBLAS route stores its scores; relu, head weights and head sum stay in
-    registers and the per-key scale applies to the sum. KEYS_AS_M puts the keys
-    on the MMA's M side instead of the (token, head) rows.
+    value * 2^-8 and the product is taken back by 256 in FP32: without the
+    per-key scale one product can pass fp16's 65504. Relu, head weights and
+    head sum stay in registers and the per-key scale applies to the sum.
+    KEYS_AS_M puts the keys on the MMA's M side instead of the (token, head)
+    rows.
     """
     rows = tl.program_id(0) * BLOCK_T * NUM_HEADS + tl.arange(0, BLOCK_T * NUM_HEADS)
     row_tokens = rows // NUM_HEADS
@@ -413,7 +414,7 @@ def _prefill_index_scores_kernel(
                 other=0,
             )
             k = _e4m3_bits_as_scaled_fp16(raw)
-            scores = (tl.dot(k, q_t) * 256.0).to(tl.float16).to(tl.float32)
+            scores = tl.dot(k, q_t) * 256.0
             scores = tl.maximum(scores, 0.0) * weights[None, :]
             scores = tl.sum(tl.reshape(scores, (BLOCK_K, BLOCK_T, NUM_HEADS)), axis=2)
             scale = tl.load(k_scale_ptr + keys, mask=key_valid, other=0.0)
@@ -437,7 +438,7 @@ def _prefill_index_scores_kernel(
                 other=0,
             )
             k_t = _e4m3_bits_as_scaled_fp16(raw)
-            scores = (tl.dot(q, k_t) * 256.0).to(tl.float16).to(tl.float32)
+            scores = tl.dot(q, k_t) * 256.0
             scores = tl.maximum(scores, 0.0) * weights[:, None]
             scores = tl.sum(tl.reshape(scores, (BLOCK_T, NUM_HEADS, BLOCK_K)), axis=1)
             scale = tl.load(k_scale_ptr + keys, mask=key_valid, other=0.0)
