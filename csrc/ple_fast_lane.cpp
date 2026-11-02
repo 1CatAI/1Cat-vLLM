@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Native PLE request lane for CPU-owned packed IQ4_NL n-gram tables.
+// Native PLE request lane for CPU-owned n-gram tables: packed IQ4_NL rows of a
+// GGUF table, or raw FP8 rows of a checkpoint split into equal mapped shards.
 //
 // TP0's model stream publishes each request (token IDs, query offsets and
 // n-gram context) into a host-mapped buffer and releases a sequence number.
@@ -185,9 +186,13 @@ struct LaneConfig {
   int64_t* request;  // host-mapped request buffer (int64)
   int64_t max_reqs;
   int64_t max_tokens;
-  const uint8_t* table;
+  // Row r lives at shards[r / shard_rows] + (r % shard_rows) * row_bytes. A
+  // single shard holding every row describes one contiguous table.
+  std::vector<const uint8_t*> shards;
+  int64_t shard_rows;
   int64_t row_bytes;
   int64_t num_rows;
+  bool iq4_rows;  // validate packed IQ4_NL rows; raw FP8 rows are copied as is
   uint64_t multipliers[3];
   int64_t sizes[kHeads];
   int64_t offsets[kHeads];
@@ -225,6 +230,11 @@ class Lane {
  private:
   static int64_t load_acquire(const int64_t* address) {
     return __atomic_load_n(address, __ATOMIC_ACQUIRE);
+  }
+
+  const uint8_t* row_ptr(int64_t row) const {
+    return config_.shards[row / config_.shard_rows] +
+           (row % config_.shard_rows) * config_.row_bytes;
   }
 
   void run() {
@@ -370,8 +380,7 @@ class Lane {
           if (row < 0 || row >= config_.num_rows) continue;
           if (cache_.enabled() && cache_.contains(row)) continue;
 #ifdef __linux__
-          uintptr_t address = reinterpret_cast<uintptr_t>(
-              config_.table + row * config_.row_bytes);
+          uintptr_t address = reinterpret_cast<uintptr_t>(row_ptr(row));
           uintptr_t first = address / page * page;
           uintptr_t last = (address + config_.row_bytes - 1) / page * page;
           for (uintptr_t q = first; q <= last; q += page) {
@@ -472,8 +481,7 @@ class Lane {
     static const uintptr_t page =
         static_cast<uintptr_t>(sysconf(_SC_PAGE_SIZE));
     for (int64_t i : misses_) {
-      uintptr_t address =
-          reinterpret_cast<uintptr_t>(config_.table + rows_[i] * row_bytes);
+      uintptr_t address = reinterpret_cast<uintptr_t>(row_ptr(rows_[i]));
       uintptr_t first = address / page * page;
       uintptr_t last = (address + row_bytes - 1) / page * page;
       for (uintptr_t p = first; p <= last; p += page) {
@@ -487,11 +495,12 @@ class Lane {
     }
 #endif
     for (int64_t i : misses_) {
-      const uint8_t* source = config_.table + rows_[i] * row_bytes;
       uint8_t* target = out + i * row_bytes;
-      std::memcpy(target, source, row_bytes);
-      int64_t error = validate_row(target, row_bytes);
-      if (error != kOk) return error;
+      std::memcpy(target, row_ptr(rows_[i]), row_bytes);
+      if (config_.iq4_rows) {
+        int64_t error = validate_row(target, row_bytes);
+        if (error != kOk) return error;
+      }
       if (cache_.enabled()) cache_.insert(rows_[i], target);
     }
     return kOk;
@@ -522,16 +531,27 @@ int64_t ple_fast_lane_start(
     std::vector<int64_t> offsets, int64_t eos, std::vector<int64_t> result_ptrs,
     std::vector<int64_t> flag_ptrs, int64_t cache_bytes, int64_t idle_spin_us,
     bool clamp_tokens, std::optional<torch::Tensor> draft_ring,
-    int64_t ring_reqs, int64_t ring_spec) {
+    int64_t ring_reqs, int64_t ring_spec, std::vector<int64_t> shard_ptrs,
+    int64_t shard_rows, bool iq4_rows) {
   TORCH_CHECK(request.device().is_cpu() && request.scalar_type() == at::kLong &&
                   request.is_contiguous(),
               "PLE fast lane request must be a contiguous CPU int64 tensor");
   TORCH_CHECK(max_reqs > 0 && max_tokens > 0, "PLE fast lane needs capacity");
   TORCH_CHECK(request.numel() >= kHeader + max_reqs * 3 + 1 + max_tokens,
               "PLE fast lane request buffer is too small");
-  TORCH_CHECK(table_ptr != 0 && num_rows > 0 && row_bytes > 0 &&
-                  row_bytes % kBlockBytes == 0,
-              "PLE fast lane requires a packed IQ4_NL table");
+  if (shard_ptrs.empty()) {
+    shard_ptrs.push_back(table_ptr);
+    shard_rows = num_rows;
+  }
+  TORCH_CHECK(num_rows > 0 && row_bytes > 0 && shard_rows > 0 &&
+                  static_cast<int64_t>(shard_ptrs.size()) ==
+                      (num_rows + shard_rows - 1) / shard_rows,
+              "PLE fast lane shards must cover every row");
+  for (int64_t pointer : shard_ptrs) {
+    TORCH_CHECK(pointer != 0, "PLE fast lane shard pointers must be valid");
+  }
+  TORCH_CHECK(!iq4_rows || row_bytes % kBlockBytes == 0,
+              "PLE fast lane requires whole packed IQ4_NL blocks");
   TORCH_CHECK(multipliers.size() == 3 && sizes.size() == kHeads &&
                   offsets.size() == kHeads,
               "PLE fast lane supports trigram tables with 16 heads");
@@ -542,9 +562,13 @@ int64_t ple_fast_lane_start(
   config.request = request.data_ptr<int64_t>();
   config.max_reqs = max_reqs;
   config.max_tokens = max_tokens;
-  config.table = reinterpret_cast<const uint8_t*>(table_ptr);
+  for (int64_t pointer : shard_ptrs) {
+    config.shards.push_back(reinterpret_cast<const uint8_t*>(pointer));
+  }
+  config.shard_rows = shard_rows;
   config.row_bytes = row_bytes;
   config.num_rows = num_rows;
+  config.iq4_rows = iq4_rows;
   for (int i = 0; i < 3; ++i) {
     config.multipliers[i] = static_cast<uint64_t>(multipliers[i]);
   }
