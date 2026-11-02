@@ -24,9 +24,17 @@ def test_volta_kernel_hardware_admission(monkeypatch, minor, expected):
     monkeypatch.setattr(sm70_fp8.current_platform, "is_cuda", lambda: True)
     assert TurboMindFp8LinearKernel.is_supported(70 + minor)[0] is expected
     assert TurboMindNvFp4LinearKernel.is_supported(70 + minor)[0] is expected
+
+
+@pytest.mark.parametrize(
+    "capability,expected",
+    [((7, 0), True), ((7, 2), True), ((7, 5), True), ((8, 0), False)],
+)
+def test_glm5next_sparse_backend_admits_volta_and_turing(capability, expected):
+    # GLM-5.3 runs its sparse MLA on SM70 and SM75 stages of one pipeline.
     assert (
         Glm5NextSM70SparseBackend.supports_compute_capability(
-            DeviceCapability(7, minor)
+            DeviceCapability(*capability)
         )
         is expected
     )
