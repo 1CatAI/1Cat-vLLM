@@ -789,8 +789,8 @@ class KernelConfig:
             raise RuntimeError(
                 "kernel_config.triton_sm7x_tensor_cores is set, but Triton "
                 f"{triton.__version__} ({triton.__file__}) lowers tl.dot to FMA on "
-                f"sm_{capability.to_int()}. Install the sm7x Triton or leave the "
-                "setting off."
+                f"sm_{capability.to_int()}. Install the sm7x Triton (see "
+                "docs/design/sm70_triton_tensor_cores.md) or leave the setting off."
             )
         return True
 
