@@ -1084,6 +1084,16 @@ class KernelConfig:
 
         return ShortConvMetadataProvider(config, device, cache_mode)
 
+    def attach_moe_route_recorder(self, router, gate, layer_name) -> None:
+        """Bind opt-in routing diagnostics without platform logic in the runner."""
+        if not self.sm70_round_cost_diagnostics:
+            return
+        from vllm.sm70_round_cost import attach_route_recorder
+
+        parameter = next(gate.parameters(), None) if gate is not None else None
+        if parameter is not None and parameter.device.type == "cuda":
+            attach_route_recorder(router, layer_name, parameter.device)
+
     def top1_exchange_callback(self):
         if not self.sm70_top1x:
             return None

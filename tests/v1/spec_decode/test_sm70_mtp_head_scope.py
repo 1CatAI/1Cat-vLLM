@@ -53,7 +53,8 @@ def test_draft_head_preserves_shared_target_and_uses_actual_probe_path(monkeypat
     assert torch.equal(shared.weight, original)
 
 
-def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
+@pytest.mark.parametrize("ranking_path", ["", "hot-vocab.json"])
+def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch, ranking_path):
     from vllm.v1.attention.backends import fa_utils
 
     # This CPU load-order test does not exercise an attention backend.
@@ -67,7 +68,9 @@ def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
         _sm70_draft_head=None,
         lm_head=target_head,
         vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(sm70_draft_hot_vocab=True),
+            kernel_config=SimpleNamespace(
+                sm70_draft_hot_vocab=True, sm70_draft_hot_vocab_ids=ranking_path
+            ),
             compilation_config=SimpleNamespace(runtime=GraphPolicy(dual_compile=False)),
         ),
     )
@@ -76,8 +79,9 @@ def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
     )
     seen = []
 
-    def prepare_head(head, hot_vocab):
+    def prepare_head(head, hot_vocab, actual_ranking_path):
         assert hot_vocab
+        assert actual_ranking_path == ranking_path
         seen.append(head)
         return draft_view
 

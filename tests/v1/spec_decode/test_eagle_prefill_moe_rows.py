@@ -304,6 +304,7 @@ def _speculator(num_tokens: int, selector: DraftMoERowSelector | None):
     spec.draft_tokens = torch.full((4, 4), -7, dtype=torch.int64)
     spec.current_draft_step = torch.tensor(0)
     spec.draft_logits = None
+    spec.draft_step_listener = None
     spec.input_buffers = SimpleNamespace(positions=torch.arange(num_tokens))
     if selector is not None:
         spec._enable_prefill_rows(selector)

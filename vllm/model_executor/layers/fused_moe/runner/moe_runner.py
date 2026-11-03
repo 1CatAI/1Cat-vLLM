@@ -345,15 +345,10 @@ class MoERunner(MoERunnerInterface):
         from vllm.config import get_current_vllm_config_or_none
 
         cost_config = get_current_vllm_config_or_none()
-        if (
-            cost_config is not None
-            and cost_config.kernel_config.sm70_round_cost_diagnostics
-        ):
-            from vllm.sm70_round_cost import attach_route_recorder
-
-            parameter = next(gate.parameters(), None) if gate is not None else None
-            if parameter is not None and parameter.device.type == "cuda":
-                attach_route_recorder(self.router, layer_name, parameter.device)
+        if cost_config is not None:
+            cost_config.kernel_config.attach_moe_route_recorder(
+                self.router, gate, layer_name
+            )
 
         self._forward_entry = self._select_forward()
 
