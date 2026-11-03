@@ -51,8 +51,11 @@ def test_on_with_tensor_core_triton(monkeypatch, capability):
 def test_on_with_fma_triton_stops(monkeypatch, capability):
     _device(monkeypatch, capability)
     _compiler(monkeypatch, lowers=False)
-    with pytest.raises(RuntimeError, match=f"lowers tl.dot to FMA on sm_{capability}"):
+    with pytest.raises(
+        RuntimeError, match=f"lowers tl.dot to FMA on sm_{capability}"
+    ) as error:
         ON.use_triton_sm7x_tensor_cores(DEVICE_INDEX)
+    assert "docs/design/sm70_triton_tensor_cores.md" in str(error.value)
 
 
 def test_other_architectures_keep_their_routes(monkeypatch):
