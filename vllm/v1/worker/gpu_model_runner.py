@@ -152,6 +152,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.pp_keep_batch import pp_keep_batch_decision
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -1228,7 +1229,13 @@ class GPUModelRunner(
             self.parallel_config.distributed_executor_backend == "external_launcher"
             and len(get_pp_group().ranks) > 1
         )
-
+        # VLLM_PP_KEEP_BATCH: keep the persistent batch across a fully
+        # empty pipeline step. The scheduler takes the same decision from the
+        # same config (vllm/v1/core/sched/pp_keep_batch.py).
+        self.pp_keep_batch = pp_keep_batch_decision(vllm_config)
+        self._pp_keep_batch_kept_logged = False
+        if self.pp_keep_batch:
+            logger.info("VLLM_PP_KEEP_BATCH active: V1 synchronous PP retention")
         # Model-related.
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
@@ -2263,6 +2270,23 @@ class GPUModelRunner(
         # that they get cleared from the persistent batch before being re-scheduled
         # in the normal resumed request path.
         unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        if self.pp_keep_batch and not scheduled_req_ids:
+            # VLLM_PP_KEEP_BATCH: a fully empty pipeline step (the batch
+            # queue's in-flight cadence) keeps every row except a request
+            # preempted in this step, so the next step neither resends nor
+            # re-adds the history. The scheduler keeps its previous-step
+            # record for the requests still running, the same set.
+            unscheduled_req_ids = cached_req_ids & (
+                scheduler_output.preempted_req_ids or set()
+            )
+            num_kept = len(cached_req_ids) - len(unscheduled_req_ids)
+            if num_kept and not self._pp_keep_batch_kept_logged:
+                self._pp_keep_batch_kept_logged = True
+                logger.info(
+                    "VLLM_PP_KEEP_BATCH: first empty pipeline step kept %d "
+                    "request(s) in the persistent batch.",
+                    num_kept,
+                )
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct

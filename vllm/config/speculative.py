@@ -499,7 +499,7 @@ class SpeculativeConfig:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
 
-        if self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify:
+        if self.uses_tree_verification():
             factors.append(
                 (
                     "dflash_ddtree",
@@ -1693,9 +1693,16 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
+    def uses_tree_verification(self) -> bool:
+        return self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify
+
+    def supports_pp_row_retention(self) -> bool:
+        """Incremental GPU drafting and tree-path acceptance need other state."""
+        return not (self.use_ngram_gpu() or self.use_dflash_ddtree())
+
     def num_speculative_state_tokens(self) -> int:
         num_spec_tokens = self.num_speculative_tokens or 0
-        if self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify:
+        if self.uses_tree_verification():
             return max(num_spec_tokens, self.ddtree_budget or num_spec_tokens)
         return num_spec_tokens
 
