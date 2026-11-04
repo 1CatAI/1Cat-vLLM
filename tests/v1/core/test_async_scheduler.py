@@ -13,7 +13,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.utils import ConstantList
 
-from .utils import create_requests, create_scheduler
+from .utils import create_requests, create_scheduler, pretend_gpu_count
 
 pytestmark = pytest.mark.cpu_test
 
@@ -106,7 +106,7 @@ def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
 
 def test_v2_pp_spec_decode_respects_pipeline_cadence(monkeypatch):
     # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
-    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
+    pretend_gpu_count(monkeypatch, 2)
     scheduler = create_scheduler(
         async_scheduling=True,
         pipeline_parallel_size=2,

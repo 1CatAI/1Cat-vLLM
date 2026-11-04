@@ -37,7 +37,13 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
+from .utils import (
+    EOS_TOKEN_ID,
+    create_requests,
+    create_scheduler,
+    mock_kv,
+    pretend_gpu_count,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -169,8 +175,10 @@ def test_schedule_multimodal_requests():
         assert len(encoder_input) == 1
 
 
-def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
+def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders(monkeypatch):
     """Async scheduling + PP: allow multi-step in-flight scheduling per request"""
+    # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
+    pretend_gpu_count(monkeypatch, 2)
     scheduler = create_scheduler(async_scheduling=True, pipeline_parallel_size=2)
     (req,) = create_requests(num_requests=1, num_tokens=8)
     scheduler.add_request(req)
