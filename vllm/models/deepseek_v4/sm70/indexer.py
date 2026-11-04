@@ -983,7 +983,9 @@ def sm70_indexer_decode_logits(
             table_rows_per_request,
         )
         if blocker is None:
-            logger.info_once("SM70 indexer decode: cuBLAS route on %s.", q.device)
+            logger.info_once(
+                "SM70 indexer decode: cuBLAS route on %s.", q.device, scope="process"
+            )
             return _decode_logits_cublas(
                 q,
                 cache,
@@ -998,6 +1000,7 @@ def sm70_indexer_decode_logits(
             "needs %s.",
             q.device,
             blocker,
+            scope="process",
         )
 
     if native_rows:
