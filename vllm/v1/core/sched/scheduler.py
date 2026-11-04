@@ -712,6 +712,17 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if (
+                num_new_tokens < 0
+                and self.use_pp
+                and not self.scheduler_config.async_scheduling
+            ):
+                # PP>1 without async scheduling: a verify step of this request
+                # is still in flight. Scheduling counted its draft rows as
+                # computed, but its sampled tokens are not appended yet, so the
+                # count goes negative. Same case as 1.(1) below: wait for it.
+                req_index += 1
+                continue
             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
                 request
             )

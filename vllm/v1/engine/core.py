@@ -534,7 +534,13 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+        # Queued PP outputs carry the drafts of their own completed step.
+        if (
+            not self.async_scheduling
+            and self.use_spec_decode
+            and model_executed
+            and self.batch_queue is None
+        ):
             profile_ddtree_engine = (
                 os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE", "0") == "1"
             )
@@ -712,6 +718,20 @@ class EngineCore:
         if trace_log:
             trace_update_ms = (time.perf_counter() - trace_update_t0) * 1000.0
 
+        if (
+            self.use_spec_decode
+            and not self.async_scheduling
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            # Apply only this step's proposals, after its sampled tokens. A later
+            # in-flight step must not replace or delay these proposals.
+            draft_token_ids = model_output.draft_token_ids
+            if draft_token_ids is None:
+                raise RuntimeError(
+                    "PP synchronous speculative decoding: missing step drafts"
+                )
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
@@ -720,8 +740,14 @@ class EngineCore:
             # we need to get the draft token ids from the prior step before
             # we can compute the grammar bitmask for the deferred request.
             if self.use_spec_decode:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
-                assert draft_token_ids is not None
+                if self.async_scheduling:
+                    draft_token_ids = self.model_executor.take_draft_token_ids()
+                else:
+                    draft_token_ids = model_output.draft_token_ids
+                if draft_token_ids is None:
+                    raise RuntimeError(
+                        "PP speculative decoding: missing deferred drafts"
+                    )
                 # Update the draft token ids in the scheduler output to
                 # filter out the invalid spec tokens, which will be padded
                 # with -1 and skipped by the grammar bitmask computation.
