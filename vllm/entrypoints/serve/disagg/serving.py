@@ -27,7 +27,11 @@ from vllm.entrypoints.openai.engine.protocol import (
     RequestResponseMetadata,
     UsageInfo,
 )
-from vllm.entrypoints.openai.engine.serving import OpenAIServing, clamp_prompt_logprobs
+from vllm.entrypoints.openai.engine.serving import (
+    OpenAIServing,
+    clamp_prompt_logprobs,
+    drop_misaligned_logprobs,
+)
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.disagg.mm_serde import decode_mm_kwargs_item
 from vllm.entrypoints.serve.disagg.protocol import (
@@ -458,6 +462,7 @@ class ServingTokens(OpenAIServing):
         """Create OpenAI-style logprobs."""
         logprobs_content: list[ChatCompletionLogProbsContent] = []
 
+        top_logprobs = drop_misaligned_logprobs(token_ids, top_logprobs)
         for i, token_id in enumerate(token_ids):
             token = f"token_id:{token_id}"
             step_top_logprobs = top_logprobs[i]
