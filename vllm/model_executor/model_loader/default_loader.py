@@ -16,7 +16,10 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-from vllm.model_executor.model_loader.direct_io import decoder_layer_filter
+from vllm.model_executor.model_loader.direct_io import (
+    decoder_layer_filter,
+    missing_module_filter,
+)
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
@@ -53,17 +56,15 @@ def _decoder_root(model: nn.Module) -> nn.Module:
     return model
 
 
-def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
-    """[start, end) of the decoder layers this pipeline stage holds, or None
-    when it holds all of them. vLLM decoder stacks keep a full-length
-    `layers` list with placeholders and record their range in
-    start_layer/end_layer.
+def _partial_decoder_stacks(model: nn.Module) -> list[tuple[nn.Module, int, int]]:
+    """The decoder stacks that hold only part of their layers, each with its
+    [start, end). vLLM decoder stacks keep a full-length `layers` list with
+    placeholders and record their range in start_layer/end_layer.
 
     Multimodal models are searched in their language model only: an encoder
     tower built with make_layers carries its own pipeline range, which must
-    not filter the language model's layers. Two different partial ranges
-    are ambiguous and raise instead of skipping the wrong layers."""
-    ranges = set()
+    not filter the language model's layers."""
+    stacks = []
     for module in _decoder_root(model).modules():
         start = getattr(module, "start_layer", None)
         end = getattr(module, "end_layer", None)
@@ -74,7 +75,15 @@ def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
             and layers is not None
             and not (start == 0 and end == len(layers))
         ):
-            ranges.add((start, end))
+            stacks.append((module, start, end))
+    return stacks
+
+
+def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
+    """[start, end) of the decoder layers this pipeline stage holds, or None
+    when it holds all of them. Two different partial ranges are ambiguous and
+    raise instead of skipping the wrong layers."""
+    ranges = {(start, end) for _, start, end in _partial_decoder_stacks(model)}
     if len(ranges) > 1:
         raise ValueError(
             "Direct I/O loading found several pipeline-partial layer stacks "
@@ -82,6 +91,38 @@ def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
             "one the checkpoint's decoder layers belong to"
         )
     return ranges.pop() if ranges else None
+
+
+def _missing_module_filter(model: nn.Module) -> Callable[[str], bool] | None:
+    """Predicate for the tensors of the modules around the decoder stack that
+    this pipeline stage leaves out (PPMissingLayer: the embedding on every
+    stage but the first, the final norm and the LM head on every stage but the
+    last), or None when it holds all of them. The model drops such a tensor
+    only after the loader has read it and run it through weight transforms
+    (MXFP8 dequantization of a whole LM head on the CPU), so it is skipped
+    before it is read."""
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    def missing_children(module: nn.Module) -> set[str]:
+        return {
+            name
+            for name, child in module.named_children()
+            if isinstance(child, PPMissingLayer)
+        }
+
+    stack_modules: set[str] = set()
+    for stack, _, _ in _partial_decoder_stacks(model):
+        stack_modules |= missing_children(stack)
+    language_model_modules = missing_children(_decoder_root(model))
+    if not stack_modules and not language_model_modules:
+        return None
+    logger.info(
+        "This pipeline stage skips the checkpoint tensors of the modules it "
+        "does not hold: decoder stack %s, language model %s",
+        sorted(stack_modules),
+        sorted(language_model_modules),
+    )
+    return missing_module_filter(stack_modules, language_model_modules)
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -394,10 +435,12 @@ class DefaultModelLoader(BaseModelLoader):
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _skip_weight_for(self, model: nn.Module) -> Callable[[str], bool] | None:
-        """The model's own skip predicate, plus, for direct I/O under pipeline
-        parallelism, the decoder layers another stage owns. A memory-mapped
-        shard only reads what a stage touches; direct I/O reads up front, so
-        it must leave those tensors out itself."""
+        """The model's own skip predicate, plus, for mapped and direct loading
+        under pipeline parallelism, the tensors another stage owns: decoder
+        layers outside this stage's range and the modules around the stack it
+        leaves out. A memory-mapped shard only reads what a stage touches, but
+        the loader touches every tensor it hands out; direct I/O reads up
+        front. Either way the tensors are left out before they are read."""
         from vllm.distributed import get_pp_group
 
         skip_weight = getattr(model, "skip_checkpoint_weight", None)
@@ -425,10 +468,16 @@ class DefaultModelLoader(BaseModelLoader):
             return skip_weight
         if layer_range is None:
             return skip_weight
-        other_stage = decoder_layer_filter(*layer_range)
-        if skip_weight is None:
-            return other_stage
-        return lambda name: skip_weight(name) or other_stage(name)
+        skips = [
+            skip
+            for skip in (
+                skip_weight,
+                decoder_layer_filter(*layer_range),
+                _missing_module_filter(model),
+            )
+            if skip is not None
+        ]
+        return lambda name: any(skip(name) for skip in skips)
 
     def get_all_weights(
         self,
