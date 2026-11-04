@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 
@@ -293,6 +293,18 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+
+    # Synchronous PP drafts belong to this output, never a worker's latest slot.
+    # None is used for empty, non-speculative and asynchronous outputs.
+    draft_token_ids: "DraftTokenIds | None" = None
+
+    def set_draft_token_ids(self, drafts: "DraftTokenIds | None") -> None:
+        if drafts is None:
+            raise RuntimeError(
+                "PP synchronous speculative decoding: missing step drafts"
+            )
+        # CPU proposals and tree payloads can outlive the next worker step.
+        self.draft_token_ids = deepcopy(drafts)
 
     # Completed GPU timing only; CUDA events never cross process boundaries.
     mixed_prefill_timing: MixedPrefillTiming | None = None
