@@ -563,6 +563,83 @@ def generate_block_hash_extra_keys(
     return tuple(extra_keys), new_start_mm_idx
 
 
+def generate_lookahead_block_hash_extra_keys(
+    request: Request,
+    start_token_idx: int,
+    end_token_idx: int,
+    start_mm_idx: int,
+) -> tuple[tuple[Any, ...], int]:
+    """Extra keys of a block plus the token right after it and that token's
+    own extra keys, which the EAGLE draft KV at the block's last position
+    depends on."""
+    block_extra_keys, next_block_mm_idx = generate_block_hash_extra_keys(
+        request,
+        start_token_idx,
+        end_token_idx,
+        start_mm_idx,
+    )
+    lookahead_extra_keys, _ = generate_block_hash_extra_keys(
+        request,
+        end_token_idx,
+        end_token_idx + 1,
+        next_block_mm_idx,
+    )
+    return (
+        (
+            block_extra_keys,
+            request.all_token_ids[end_token_idx],
+            lookahead_extra_keys,
+        ),
+        next_block_mm_idx,
+    )
+
+
+def generate_request_block_hash_extra_keys(
+    request: Request,
+    start_token_idx: int,
+    end_token_idx: int,
+    start_mm_idx: int,
+    use_lookahead_block_hashes: bool,
+) -> tuple[tuple[Any, ...] | None, int]:
+    if use_lookahead_block_hashes:
+        return generate_lookahead_block_hash_extra_keys(
+            request,
+            start_token_idx,
+            end_token_idx,
+            start_mm_idx,
+        )
+    return generate_block_hash_extra_keys(
+        request,
+        start_token_idx,
+        end_token_idx,
+        start_mm_idx,
+    )
+
+
+def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether block hashes also cover the token after each block, so EAGLE
+    and MTP prefix hits need no trailing block drop."""
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or not speculative_config.use_eagle_kv_cache()
+        or speculative_config.disable_lookahead_block_hashes
+    ):
+        return False
+    # The hash covers only the next token; multi-module MTP reads further ahead.
+    if speculative_config.use_multi_module_mtp():
+        return False
+    # DSpark keeps the trailing-block drop: with lookahead hashes it drafted
+    # measurably worse on DSv4, also without a prefix hit (edit 5.69 -> 5.66
+    # to 5.67 accepted tokens per round), and gained no first-token time.
+    if speculative_config.use_dspark():
+        return False
+    # KV connectors keep the legacy hashes.
+    if vllm_config.kv_transfer_config is not None:
+        return False
+    return vllm_config.cache_config.enable_prefix_caching
+
+
 def hash_block_tokens(
     hash_function: Callable[[Any], bytes],
     parent_block_hash: BlockHash | None,
@@ -676,14 +753,19 @@ def resolve_kv_cache_block_sizes(
 def get_request_block_hasher(
     block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
+    use_lookahead_block_hashes: bool = False,
 ) -> Callable[[Request], list[BlockHash]]:
     """
     Returns a function which computes the list of un-computed block hashes
-    of a request."""
+    of a request.
+
+    With ``use_lookahead_block_hashes``, each hash also covers the token right
+    after its block, which the EAGLE draft KV at the block's last position
+    depends on, so it is emitted only once that token exists."""
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * block_size
-        num_tokens = request.num_tokens
+        num_tokens = request.num_tokens - int(use_lookahead_block_hashes)
 
         if start_token_idx + block_size > num_tokens:
             # Early stop when there no new full blocks created.
@@ -708,8 +790,12 @@ def get_request_block_hasher(
                 break
 
             # MM and LoRA requests need extra keys for block-hash computation.
-            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                request, start_token_idx, end_token_idx, curr_mm_idx
+            extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
+                request,
+                start_token_idx,
+                end_token_idx,
+                curr_mm_idx,
+                use_lookahead_block_hashes,
             )
 
             # Compute the hash of the current block

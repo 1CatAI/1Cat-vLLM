@@ -55,7 +55,7 @@ def _mamba(pool, block_size, group):
 
 def _prefill(managers, request, block_size, alignment=None, interval=None, eagle=False):
     boundaries = KVCacheCoordinator.get_replay_boundaries(
-        SimpleNamespace(eagle_group_ids={0} if eagle else set()),
+        SimpleNamespace(drop_eagle_group_ids={0} if eagle else set()),
         request,
         alignment or block_size,
     )
@@ -371,7 +371,7 @@ def test_bulk_prefill_materializes_every_admitted_state(eagle, length, interval_
         mamba_state_block_size=block_size,
         mamba_state_retention_interval=interval,
         kv_cache_manager=cm,
-        use_eagle=eagle,
+        use_eagle_block_drop=eagle,
     )
     materialized = {}
     ends = []

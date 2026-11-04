@@ -322,6 +322,17 @@ class SingleTypeKVCacheManager(ABC):
         self.new_block_ids = []
         return ids
 
+    def num_hashed_full_blocks(self, request: Request, num_tokens: int) -> int:
+        """Full blocks within ``num_tokens`` whose block hash exists. Lookahead
+        hashes trail the tokens by one, so the block ending at the last token
+        has no hash until the next token arrives."""
+        num_hashed_blocks = (
+            len(request.block_hashes)
+            * self.block_pool.hash_block_size
+            // self.block_size
+        )
+        return min(num_tokens // self.block_size, num_hashed_blocks)
+
     def cache_blocks(
         self,
         request: Request,
@@ -343,7 +354,7 @@ class SingleTypeKVCacheManager(ABC):
                 future cache hit.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
-        num_full_blocks = num_tokens // self.block_size
+        num_full_blocks = self.num_hashed_full_blocks(request, num_tokens)
 
         if num_cached_blocks >= num_full_blocks:
             return
@@ -1578,7 +1589,7 @@ class MambaManager(SingleTypeKVCacheManager):
         replay_boundaries: Sequence[int] = (),
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        num_full_blocks = num_tokens // self.block_size
+        num_full_blocks = self.num_hashed_full_blocks(request, num_tokens)
         if num_cached_blocks_before >= num_full_blocks:
             return
         boundaries = list(replay_boundaries)
