@@ -475,6 +475,7 @@ if TYPE_CHECKING:
     VLLM_V41_ENGRAM_READERS: str | None = None
     VLLM_V41_EXACT_GEMM: str = "0"
     VLLM_V41_EXPERT_FAST_HIT: str = "1"
+    VLLM_V41_DRAFT_MP_SHARD: bool = False
     VLLM_V41_FP8_GEMV: str = "1"
     VLLM_V41_FREE_SLOTS: str | None = None
     VLLM_V41_FUSED_SPARSE: str = "0"
@@ -7395,6 +7396,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
+    ),
+    "VLLM_V41_DRAFT_MP_SHARD": env_var(
+        lambda: (
+            env_with_choices("VLLM_V41_DRAFT_MP_SHARD", "0", ["0", "1", ""])() == "1"
+        ),
+        description=(
+            "Shard the V4.1 DSpark main projection output rows on the existing "
+            "raw FP8 GEMV path."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DeepSeek V4.1 SM70",),
+        user_visible=True,
     ),
     "VLLM_V41_FP8_GEMV": env_var(
         lambda: os.getenv("VLLM_V41_FP8_GEMV", "1"),
