@@ -115,6 +115,32 @@ AttnTypeStr = Literal[
 ]
 
 
+def mm_limit_hash_factors(mm_config: MultiModalConfig) -> dict[str, Any]:
+    """Compile-cache factors from the per-prompt multimodal limits.
+
+    A limit of zero changes the traced language-model graph: with image and
+    video both at zero the vision tower is replaced by a placeholder, and with
+    every modality at zero (and no precomputed embeddings) the runner feeds
+    input IDs instead of embeddings. Non-zero values (8 vs 16 images) only
+    act at run time, so only the set of zero-limit modalities and
+    `enable_mm_embeds` are hashed, and only when some limit is zero. A config
+    without a zero limit keeps exactly the hash it had before, so existing
+    compile caches stay valid. If a model ever uses the non-zero value of a
+    limit inside the compiled graph, it must be added here.
+    """
+    zero = sorted(
+        modality
+        for modality, opts in mm_config.limit_per_prompt.items()
+        if (opts if isinstance(opts, int) else opts.count) == 0
+    )
+    if not zero:
+        return {}
+    return {
+        "mm_zero_limit_modalities": zero,
+        "mm_enable_mm_embeds": mm_config.enable_mm_embeds,
+    }
+
+
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class ModelConfig:
     """Configuration for the model."""
@@ -430,6 +456,7 @@ class ModelConfig:
         # here early.
         if self.multimodal_config:
             factors["language_model_only"] = self.multimodal_config.language_model_only
+            factors.update(mm_limit_hash_factors(self.multimodal_config))
         return hash_factors(factors)
 
     def _update_nested(
