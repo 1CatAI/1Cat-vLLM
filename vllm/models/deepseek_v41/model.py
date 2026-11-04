@@ -248,6 +248,21 @@ class V41Compressor(nn.Module):
 class V41Indexer(nn.Module):
     def __init__(self, c, quant_config, source, ratio, prefix):
         super().__init__()
+        from vllm.config import get_current_vllm_config
+
+        from .index_tiled import IndexTiledScorer
+
+        policy = get_current_vllm_config().attention_config.v41_index_tiled
+        if not isinstance(policy.enabled, bool):
+            raise RuntimeError("V4.1 tiled index policy was not initialized")
+        if policy.enabled and not _PACKED_KV:
+            raise ValueError("V4.1 tiled index requires packed KV")
+        self.heads = c.index_n_heads // 4
+        # The model adapter binds the effective policy before graph-key creation.
+        policy.active = bool(_PACKED_KV and policy.enabled)
+        self.index_scorer = (
+            IndexTiledScorer(policy.library, self.heads) if policy.active else None
+        )
         kwargs = dict(bias=False, return_bias=False, quant_config=quant_config)
         self.wq_b = ColumnParallelLinear(
             c.q_lora_rank,
@@ -258,7 +273,6 @@ class V41Indexer(nn.Module):
         self.weights_proj = ColumnParallelLinear(
             c.hidden_size, c.index_n_heads, prefix=prefix + ".weights_proj", **kwargs
         )
-        self.heads = c.index_n_heads // 4
         if source:
             self.wk = ReplicatedLinear(512, 128, prefix=prefix + ".wk", **kwargs)
             self.k_norm = V41Norm(128)
@@ -323,6 +337,7 @@ class V41Indexer(nn.Module):
                 valid_tokens,
                 ratio,
                 tensor_model_parallel_all_reduce,
+                scorer=self.index_scorer,
             )
         metadata = source_cache.metadata()
         keys = gather_index_keys(

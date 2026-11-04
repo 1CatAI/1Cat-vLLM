@@ -792,6 +792,7 @@ POLICY_OWNERS = {
     "offload_config.ple": "PlePlacementPolicy",
     "attention_config.flash_v100": "FlashV100Policy",
     "attention_config.sm70_triton": "Sm70TritonAttentionPolicy",
+    "attention_config.v41_index_tiled": "V41IndexTiledPolicy",
     "attention_config.flash_v100.turboquant": "TurboQuantRuntimePolicy",
 }
 

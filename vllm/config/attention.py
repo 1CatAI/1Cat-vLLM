@@ -1,15 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import Field, field_validator
 
 from vllm.config.execution_policy import FlashV100Policy
+from vllm.config.execution_policy_base import ExecutionPolicy
 from vllm.config.sm70_triton_attention import Sm70TritonAttentionPolicy
 from vllm.config.utils import config
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+
+@config
+class V41IndexTiledPolicy(ExecutionPolicy):
+    """Initialization-only selection of the exact packed V4.1 scorer."""
+
+    enabled: bool | None = None
+    """Opt in to the register-tiled packed decode scorer."""
+    library: str | None = None
+    """Library filename; empty selects the repository's v41idx build."""
+    active: bool = Field(default=False, init=False)
+    """Set only by a packed V4.1 indexer before graph compilation."""
+    aliases: ClassVar[dict[str, str]] = {
+        "enabled": "VLLM_V41_INDEX_TILED",
+        "library": "VLLM_V41_INDEX_TILED_LIB",
+    }
 
 
 @config
@@ -23,6 +40,9 @@ class AttentionConfig:
         default_factory=Sm70TritonAttentionPolicy
     )
     """SM70 fallback schedule; independent of the Flash-V100 backend policy."""
+
+    v41_index_tiled: V41IndexTiledPolicy = Field(default_factory=V41IndexTiledPolicy)
+    """Packed V4.1 scorer; inactive models retain their graph hash."""
 
     backend: AttentionBackendEnum | None = None
     """Attention backend to use. Use "auto" or None for automatic selection."""
@@ -108,10 +128,12 @@ class AttentionConfig:
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        ignored_factors: set[str] = set()
+        ignored_factors: set[str] = {"v41_index_tiled"}
         factors = get_hash_factors(self, ignored_factors)
         factors["flash_v100"] = self.flash_v100.compute_hash()
         factors["sm70_triton"] = self.sm70_triton.compute_hash()
+        if self.v41_index_tiled.active:
+            factors["v41_index_tiled"] = self.v41_index_tiled.compute_hash()
         return hash_factors(factors)
 
     @field_validator("backend", mode="before")

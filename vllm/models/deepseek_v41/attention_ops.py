@@ -778,7 +778,16 @@ def _cuda_index_scores():
 
 
 def select_packed_positions(
-    q, weights, keys, positions, valid_tokens, ratio, all_reduce, *, top_k=512
+    q,
+    weights,
+    keys,
+    positions,
+    valid_tokens,
+    ratio,
+    all_reduce,
+    *,
+    top_k=512,
+    scorer=None,
 ):
     """select_compressed_positions over packed, position-addressed index keys."""
     from vllm.models.deepseek_v41.index_topk import index_topk
@@ -789,7 +798,17 @@ def select_packed_positions(
         scores = torch.empty(
             tokens, keys.shape[0], dtype=torch.float16, device=q.device
         )
-        if _cuda_index_scores():
+        if scorer is not None:
+            scorer.scores(
+                scores,
+                q.reshape(-1, 128).contiguous(),
+                weights.reshape(-1).contiguous(),
+                keys,
+                positions.long(),
+                heads,
+                ratio,
+            )
+        elif _cuda_index_scores():
             # Volta: Triton dots fall back to FMA; the CUDA kernel is bounded too.
             torch.ops.v41k.index_scores_decode(
                 scores,
