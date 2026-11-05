@@ -578,6 +578,24 @@ class OffloadingConnectorScheduler:
                             group_hit_tokens,
                         )
                     max_hit_size_tokens = min(max_hit_size_tokens, group_hit_tokens)
+                    if self._mamba_align_size is not None:
+                        # A group with smaller blocks (e.g. a drafter's sliding
+                        # window) can end its hit inside a Mamba page. The
+                        # recurrent lookup would then take the state at the
+                        # end of that page as the state at the hit. Keep the
+                        # hit on the page grid; a sliding-window group cut
+                        # back this way must be looked up again, as its
+                        # window has to end at the new hit.
+                        aligned = round_down(
+                            max_hit_size_tokens, self._mamba_align_size
+                        )
+                        if (
+                            aligned < max_hit_size_tokens
+                            and sliding_window_size_in_blocks is not None
+                            and not lookup_groups
+                        ):
+                            lookup_groups = self._sliding_window_groups
+                        max_hit_size_tokens = aligned
 
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
                 if new_num_hit_tokens < offloaded_block_size:
