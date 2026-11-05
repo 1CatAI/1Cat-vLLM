@@ -315,7 +315,8 @@ async def collect_worker_reports(engine_client, cfg) -> None:
         report["worker_report_reason"] = f"{type(exc).__name__}: {exc}"
         logger.warning("SM70 loaded-route report unavailable: %s", exc)
         return
-    logger.info("SM70 loaded acceleration routes: %s", report["worker_routes"])
+    logger.info("SM70 loaded acceleration route report received.")
+    logger.debug("SM70 loaded acceleration routes: %s", report["worker_routes"])
 
 
 def _row(reason: str | None = None, **values: Any) -> dict[str, Any]:
@@ -1030,7 +1031,14 @@ def log_and_validate(cfg: VllmConfig) -> dict[str, Any]:
                     name,
                     row["reason"],
                 )
-        logger.info("SM70 acceleration status: %s", report)
+        logger.info(
+            "SM70 acceleration status: profile=%s sm70=%s scope=%s failures=%d",
+            report.get("profile"),
+            report.get("sm70"),
+            report.get("scope"),
+            len(failures),
+        )
+        logger.debug("SM70 acceleration report: %s", report)
     report["expected_failures"] = failures
     if cfg.observability_config.runtime_trace.require_profile_acceleration and failures:
         raise ValueError(
