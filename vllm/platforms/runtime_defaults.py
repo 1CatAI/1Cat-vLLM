@@ -496,8 +496,12 @@ def apply_runtime_policy_defaults(self):
                 )
             )
         ):
+            # Host KV already holds history in pinned memory, and the device
+            # shards of a hybrid PLE table leave its state pool too little VRAM.
             host_gib = _apply_sm70_qwen38_disk_ple_defaults(
-                self.parallel_config, defaults=defaults, model=self.model_config.model
+                self.parallel_config,
+                defaults=defaults,
+                model=None if self.kernel_config.qsa_host_kv else self.model_config.model,
             )
             logger.info_once(
                 "Auto-enabling %s PLE for the SM70 Qwen3.8 dual-compile lane: %s.",
