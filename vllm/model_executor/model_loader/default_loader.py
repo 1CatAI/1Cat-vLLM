@@ -36,6 +36,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    raise_on_missing_safetensors_shards,
     safetensors_weights_iterator,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal
@@ -253,6 +254,16 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
+            )
+            # An incomplete download or copy fails here, naming the missing
+            # files, instead of leaving parameters unloaded. A model's own
+            # allow patterns may load a deliberate subset of an index.
+            raise_on_missing_safetensors_shards(
+                hf_folder,
+                index_file,
+                hf_weights_files,
+                ignore_patterns=self.load_config.ignore_patterns,
+                check_index=allow_patterns_overrides is None,
             )
             # A shard the index names but the loader would skip leaves its
             # parameters unloaded without any error; only a model's own
