@@ -491,6 +491,7 @@ if TYPE_CHECKING:
     VLLM_V41_HC_V3: str = "1"
     VLLM_V41_HC_V3_GROUPS: str = "8"
     VLLM_V41_HC_WINDOW: str = "2048"
+    VLLM_V41_HOT_REFILL: str = "1"
     VLLM_V41_HITLOG_RELAXED: str = "1"
     VLLM_V41_INDEX_DECODE_BLOCKS: str = "8"
     VLLM_V41_INDEX_TILE_MB: str = "64"
@@ -507,6 +508,7 @@ if TYPE_CHECKING:
     VLLM_V41_PREFILL_DMA: str = "1"
     VLLM_V41_PREFILL_GROUP: str | None = None
     VLLM_V41_PREFILL_TIMING: str = "0"
+    VLLM_V41_RING_REACH: str = "124"
     VLLM_V41_ROUTED_PREFILL_MAX: str = "1536"
     VLLM_V41_ROUTER_FUSED: str = "1"
     VLLM_V41_ROUTE_TRACE: str | None = None
@@ -7574,6 +7576,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_HOT_REFILL": env_var(
+        lambda: os.getenv("VLLM_V41_HOT_REFILL", "1"),
+        description=(
+            "DS-V4.1 packed KV: on a same-session prefix hit, refill the hot ring"
+            " from the host copy so rows the previous request wrote past the hit"
+            " are not read as current (1Cat #1341). '0' restores the old behaviour."
+        ),
+        category="configuration",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_INDEX_DECODE_BLOCKS": env_var(
         lambda: os.getenv("VLLM_V41_INDEX_DECODE_BLOCKS", "8"),
         description=(
@@ -7737,6 +7753,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="debug",
         declared_default="'0'",
         effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_RING_REACH": env_var(
+        lambda: os.getenv("VLLM_V41_RING_REACH", "124"),
+        description=(
+            "DS-V4.1 session prefix: a hit is admitted only within this many positions"
+            " of the last processed position (window rings hold 256; 5 drafts reach +4;"
+            " 1Cat #1341). Old value 128."
+        ),
+        category="configuration",
+        declared_default="'124'",
+        effective_default="'124'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -20309,6 +20339,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_HC_V3",
         "VLLM_V41_HC_V3_GROUPS",
         "VLLM_V41_HC_WINDOW",
+        "VLLM_V41_HOT_REFILL",
         "VLLM_V41_HITLOG_RELAXED",
         "VLLM_V41_INDEX_DECODE_BLOCKS",
         "VLLM_V41_INDEX_TILE_MB",
@@ -20325,6 +20356,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PREFILL_DMA",
         "VLLM_V41_PREFILL_GROUP",
         "VLLM_V41_PREFILL_TIMING",
+        "VLLM_V41_RING_REACH",
         "VLLM_V41_ROUTED_PREFILL_MAX",
         "VLLM_V41_ROUTER_FUSED",
         "VLLM_V41_ROUTE_TRACE",
