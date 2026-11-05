@@ -330,6 +330,19 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             return None
         return self.greedy_graph(hidden_states, anchor)
 
+    def coupled_draft_tokens(
+        self, base_logits, prev, temperature, keys, positions, scale
+    ):
+        """[B, steps] coupled drafts from the fused keyed Markov kernels, or
+        None when the BF16 Markov head is not prepared."""
+        if self._markov is None or self._markov.vocab != base_logits.shape[-1]:
+            return None
+        from .markov_coupled import coupled_markov_tokens
+
+        return coupled_markov_tokens(
+            self._markov, base_logits, prev, temperature, keys, positions, scale
+        )
+
     def markov_embed(self, token_ids):
         # Under async scheduling a non-sampling step can carry an unfilled
         # anchor (read from the persistent query buffer at a request boundary);
