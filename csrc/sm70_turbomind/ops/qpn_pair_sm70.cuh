@@ -12,8 +12,9 @@ template <class Reader, int Split, bool Gated>
 __global__ void qpn_pair_m16_kernel(const uint8_t* __restrict__ codes,
                                     const void* __restrict__ scales,
                                     const half* __restrict__ input,
-                                    half* __restrict__ output, int width, int k,
-                                    int m, float global_scale) {
+                                    half* __restrict__ output,
+                                    half* __restrict__ k16_output, int width,
+                                    int k, int m, float global_scale) {
   constexpr int kRows = 2;
   constexpr int kElements = kRows * 256;
   extern __shared__ __align__(16) unsigned char storage[];
@@ -101,6 +102,11 @@ __global__ void qpn_pair_m16_kernel(const uint8_t* __restrict__ codes,
         result = __float2half((sum / (1.0f + __expf(-sum))) * up);
       }
       output[static_cast<size_t>(row) * width + tile0 * 32 + e % 32] = result;
+      if constexpr (Gated) {
+        if (k16_output != nullptr) {
+          k16_output[k16_half_index(row, tile0 * 32 + e % 32, m)] = result;
+        }
+      }
       if constexpr (!Gated) {
         output[static_cast<size_t>(row) * width + tile1 * 32 + e % 32] =
             __float2half(up);
@@ -119,17 +125,16 @@ void launch_qpn_pair_m16(torch::Tensor out, torch::Tensor input,
         qpn_pair_m16_kernel<Reader, Split, Gated>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, kShared));
   }
-  auto packed = torch::empty_like(input);
-  auto* a = reinterpret_cast<half*>(packed.data_ptr<at::Half>());
-  pack_k16_input<<<(input.numel() / 2 + 255) / 256, 256, 0, stream>>>(
-      reinterpret_cast<const half*>(input.data_ptr<at::Half>()), a,
-      input.size(0), input.size(1));
+  torch::Tensor packed, twin;
+  auto* a = k16_packed_input(input, packed, stream);
+  half* k16_output = Gated ? k16_twin_for(out, twin) : nullptr;
   qpn_pair_m16_kernel<Reader, Split, Gated>
       <<<out.size(1) / (Gated ? 32 : 64), 32 * Split, kShared, stream>>>(
           reinterpret_cast<const uint8_t*>(codes.data_ptr()), scales.data_ptr(),
-          a, reinterpret_cast<half*>(out.data_ptr<at::Half>()), out.size(1),
-          input.size(1), input.size(0), global_scale);
+          a, reinterpret_cast<half*>(out.data_ptr<at::Half>()), k16_output,
+          out.size(1), input.size(1), input.size(0), global_scale);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (k16_output != nullptr) k16_publish(out, twin);
 }
 
 }  // namespace vllm::sm70

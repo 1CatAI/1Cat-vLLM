@@ -502,6 +502,7 @@ __global__ __launch_bounds__(
                                                     const half* __restrict__ channel_scales,
                                                     const half* __restrict__ input,
                                                     half* __restrict__ output,
+                                                    half* __restrict__ k16_output,
                                                     int n, int k, int m) {
   static_assert(SplitK == 8 || SplitK == 12 || SplitK == 16,
                 "M32 two-phase QPN8 supports split-8, split-12 or split-16");
@@ -633,8 +634,15 @@ __global__ __launch_bounds__(
         const int output_col = element & 31;
         if (output_row < m) {
           if constexpr (Gated) value = (value / (1.0f + __expf(-value))) * up;
+          const half result = __float2half(value);
           output[static_cast<size_t>(output_row) * n + blockIdx.x * 32 +
-                 output_col] = __float2half(value);
+                 output_col] = result;
+          if constexpr (Gated) {
+            if (k16_output != nullptr) {
+              k16_output[vllm::sm70::k16_half_index(
+                  output_row, blockIdx.x * 32 + output_col, m)] = result;
+            }
+          }
         }
       }
     }
@@ -645,7 +653,8 @@ template <int SplitK, bool PackedInput = false, bool Gated = false>
 void launch_fp8_qpn8_m32_twophase_sm70(const uint8_t* codes,
                                        const half* channel_scales,
                                        const half* input, half* output, int n,
-                                       int k, int m, cudaStream_t stream) {
+                                       int k, int m, cudaStream_t stream,
+                                       half* k16_output = nullptr) {
   constexpr int kPhysicalWarps = SplitK / 2;
   auto kernel = fp8_qpn8_m32_twophase_sm70_kernel<SplitK, PackedInput, Gated>;
   if constexpr (PackedInput) {
@@ -654,7 +663,7 @@ void launch_fp8_qpn8_m32_twophase_sm70(const uint8_t* codes,
     }
   }
   kernel<<<(n / 32), (32 * kPhysicalWarps * (Gated ? 2 : 1)), 0, stream>>>(
-      codes, channel_scales, input, output, n, k, m);
+      codes, channel_scales, input, output, k16_output, n, k, m);
 }
 
 void launch_fp8_qpn8_ba_split_sm70(const uint8_t* codes,
@@ -1516,13 +1525,9 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
     // row tiles retain their established unroll tradeoff.
     if (n >= 2048 && ((split_k == 16 && k >= 4096) ||
                       (m == 32 && split_k == 12 && k >= 1536))) {
-      auto packed_input = torch::empty_like(input);
+      torch::Tensor packed_input;
       auto* packed_ptr =
-          reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
-      constexpr int kThreads = 256;
-      vllm::sm70::pack_k16_input<<<
-          (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-          input_ptr, packed_ptr, static_cast<int>(m), static_cast<int>(k));
+          vllm::sm70::k16_packed_input(input, packed_input, stream);
       if (split_k == 12) {
         launch_fp8_qpn8_m32_twophase_sm70<12, true>(
             code_ptr, scale_ptr, packed_ptr, output_ptr, static_cast<int>(n),
@@ -1910,19 +1915,17 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
   }
 
   if (native_m32) {
-    auto packed_input = torch::empty_like(input);
+    torch::Tensor packed_input, twin;
     auto* packed_ptr =
-        reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
-    constexpr int kThreads = 256;
-    vllm::sm70::pack_k16_input<<<(input.numel() / 2 + kThreads - 1) / kThreads,
-                                 kThreads, 0, stream>>>(
-        input_ptr, packed_ptr, static_cast<int>(m), static_cast<int>(k));
+        vllm::sm70::k16_packed_input(input, packed_input, stream);
+    half* k16_output = vllm::sm70::k16_twin_for(out, twin);
     // Keep FP8 gate/up's FP32 SiLU and final FP16 rounding. FP4 has its
     // own established intermediate FP16 rounding and does not share this.
     launch_fp8_qpn8_m32_twophase_sm70<8, true, true>(
         code_ptr, scale_ptr, packed_ptr, output_ptr, static_cast<int>(hidden),
-        static_cast<int>(k), static_cast<int>(m), stream);
+        static_cast<int>(k), static_cast<int>(m), stream, k16_output);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (k16_output != nullptr) vllm::sm70::k16_publish(out, twin);
     return;
   }
 

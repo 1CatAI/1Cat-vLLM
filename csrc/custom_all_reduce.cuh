@@ -1951,8 +1951,8 @@ template <typename WeightT, int Rows>
 __global__
 __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm_batch(
     vllm::RankData buffers, const half* input, const float* residual,
-    const WeightT* weight, half* output, float* residual_out, int rank,
-    const void* local_buffer, float epsilon) {
+    const WeightT* weight, half* output, half* k16_output, float* residual_out,
+    int rank, const void* local_buffer, float epsilon) {
   constexpr int Threads = 128, Parts = kSm70PushNormParts;
   constexpr int Width = kSm70GemmaRmsNormHiddenSize;
   constexpr int Groups = kSm70PushNormRows;
@@ -2123,6 +2123,17 @@ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm_batch(
                    : "l"(reinterpret_cast<P*>(output) + pack[j]), "r"(words[0]),
                      "r"(words[1]), "r"(words[2]), "r"(words[3])
                    : "memory");
+      if (k16_output != nullptr) {
+        const int row = group + j * Groups, slice = column / P::size;
+        asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                     :
+                     : "l"(reinterpret_cast<P*>(k16_output) +
+                           (static_cast<size_t>(slice >> 1) * Rows + row) * 2 +
+                           (slice & 1)),
+                       "r"(words[0]), "r"(words[1]), "r"(words[2]),
+                       "r"(words[3])
+                     : "memory");
+      }
     }
   }
 }
@@ -2573,6 +2584,12 @@ class CustomAllreduce {
 #undef KL
   }
 
+  // Whether sm70_allreduce_gemma_rms_norm will write k16_out for these rows.
+  bool sm70_push_norm_batch_ready(int num_tokens) const {
+    return (num_tokens == 16 || num_tokens == 24 || num_tokens == 32) &&
+           fully_connected_ && sm70_tp4_push_buffers_registered_;
+  }
+
   template <int ngpus, typename ResidualT, typename WeightT>
   void sm70_allreduce_gemma_rms_norm(cudaStream_t stream, half* input,
                                      const ResidualT* residual,
@@ -2580,7 +2597,8 @@ class CustomAllreduce {
                                      half* normalized_out, float* residual_out,
                                      int num_tokens, int hidden_size,
                                      float epsilon,
-                                     bool benchmark_reference = false) {
+                                     bool benchmark_reference = false,
+                                     half* k16_out = nullptr) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2620,7 +2638,8 @@ class CustomAllreduce {
 #define VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(ROWS)                              \
   sm70_push_allreduce_gemma_rms_norm_batch<WeightT, ROWS>                   \
       <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,     \
-                               weight, normalized_out, residual_out, rank_, \
+                               weight, normalized_out, k16_out,             \
+                               residual_out, rank_,                         \
                                sm70_tp4_push_buffers_.ptrs[rank_], epsilon)
         if (num_tokens == 16) {
           VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(16);
