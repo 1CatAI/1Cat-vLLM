@@ -71,7 +71,7 @@ def test_eviction_releases_block_references():
     assert pool.get_num_free_blocks() == free_before
 
 
-def _request(boundaries, reasoning_ended=None):
+def _request(boundaries):
     return Request(
         request_id="r",
         prompt_token_ids=list(range(1000)),
@@ -79,7 +79,6 @@ def _request(boundaries, reasoning_ended=None):
             max_tokens=4, extra_args={"prefix_cache_boundaries": boundaries}
         ),
         pooling_params=None,
-        reasoning_ended=reasoning_ended,
     )
 
 
@@ -87,12 +86,6 @@ def test_request_boundaries_align_to_recurrent_chunks():
     align = PREFIX_CACHE_BOUNDARY_ALIGNMENT
     request = _request([align - 1, align + 5, 3 * align, 999, 1000, 5000])
     assert request.prefix_cache_boundaries == (align, 3 * align, 999 // align * align)
-
-
-def test_reasoning_requests_do_not_cache_output_tokens():
-    assert not _request([], reasoning_ended=False).cache_output_tokens
-    assert _request([], reasoning_ended=True).cache_output_tokens
-    assert _request([]).cache_output_tokens
 
 
 class _Tokenizer:

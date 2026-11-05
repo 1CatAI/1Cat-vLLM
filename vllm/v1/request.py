@@ -174,10 +174,6 @@ class Request:
         )
         # Partial prefix-cache entry selected by the last cache lookup.
         self.partial_prefix_entry: Any = None
-        # A request that starts in reasoning (thinking) mode: chat templates
-        # drop the reasoning from later turns, so its output blocks can never
-        # be a prefix of another request and are not cached.
-        self.cache_output_tokens = reasoning_ended is not False
 
         # Multi-modal related
         self.mm_features = mm_features or []

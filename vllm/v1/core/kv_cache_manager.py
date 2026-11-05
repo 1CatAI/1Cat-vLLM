@@ -739,9 +739,7 @@ class KVCacheManager:
         # "finalized" tokens are cached.
         num_tokens_to_cache = min(
             total_computed_tokens + num_new_tokens,
-            request.num_tokens
-            if request.cache_output_tokens
-            else request.num_prompt_tokens,
+            request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
