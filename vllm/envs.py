@@ -480,6 +480,8 @@ if TYPE_CHECKING:
     VLLM_V41_FREE_SLOTS: str | None = None
     VLLM_V41_FUSED_SPARSE: str = "0"
     VLLM_V41_FUSED_SPARSE_MIN: str = "64"
+    VLLM_V41_FUSE_ATTN_POST: str = "0"
+    VLLM_V41_FUSE_ATTN_PREP: str = "0"
     VLLM_V41_GATE_BF16: str = "1"
     VLLM_V41_GATHER_WPD: str | None = None
     VLLM_V41_HC_COLS: str = "32"
@@ -7440,6 +7442,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="'64'",
         effective_default="'64'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_FUSE_ATTN_POST": env_var(
+        lambda: os.getenv("VLLM_V41_FUSE_ATTN_POST", "0"),
+        description=(
+            "DS-V4.1 decode (1-8 tokens), bitwise: 1 = one launch after attention"
+            " does the window ring insert, the inverse RoPE and the output FP8 QDQ"
+            " (was three launches). 0 = the original kernels."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_FUSE_ATTN_PREP": env_var(
+        lambda: os.getenv("VLLM_V41_FUSE_ATTN_PREP", "0"),
+        description=(
+            "DS-V4.1 decode (1-6 tokens), bitwise: 1 = one launch after wq_b does"
+            " the query RoPE and the window chain kv_norm, RoPE, FP8 QDQ (was four"
+            " launches). 0 = the original kernels."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -20344,6 +20374,8 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_FREE_SLOTS",
         "VLLM_V41_FUSED_SPARSE",
         "VLLM_V41_FUSED_SPARSE_MIN",
+        "VLLM_V41_FUSE_ATTN_POST",
+        "VLLM_V41_FUSE_ATTN_PREP",
         "VLLM_V41_GATE_BF16",
         "VLLM_V41_GATHER_WPD",
         "VLLM_V41_HC_COLS",

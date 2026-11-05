@@ -72,6 +72,7 @@ from .attention_ops import (
     select_compressed_positions,
     select_packed_positions,
 )
+from .attn_fuse import FUSE_ATTN_POST, FUSE_ATTN_PREP, attn_post, attn_prep
 from .cache import V41LatentCache
 from .contract import pp_split_problem, validate_runtime_geometry
 from .norm import short_rms_norm
@@ -575,10 +576,15 @@ class V41Attention(nn.Module):
         pair = dense_tm.fused(self.wq_a, x)
         q_low, kv_low = pair if pair is not None else (self.wq_a(x), self.wkv(x))
         qr = self.q_norm(q_low)
-        query = apply_rope(
-            self.wq_b(qr).view(tokens, self.heads, 512), positions, table
-        )
-        window = attention_qdq(apply_rope(self.kv_norm(kv_low), positions, table))
+        if FUSE_ATTN_PREP:
+            query, window = self._prep_fused(tokens, qr, kv_low, positions, table)
+        else:
+            query = apply_rope(
+                self.wq_b(qr).view(tokens, self.heads, 512), positions, table
+            )
+            window = attention_qdq(apply_rope(self.kv_norm(kv_low), positions, table))
+        if FUSE_ATTN_POST:
+            ring_values = None
         metadata = (
             self.shared.metadata if self.ring_window else self.window_cache.metadata()
         )
@@ -690,8 +696,13 @@ class V41Attention(nn.Module):
                 **arguments,
             )
             if self.ring_window or self.anchor_ring:
-                insert_window_ring(self.window_ring, window, positions, valid)
+                if FUSE_ATTN_POST:
+                    ring_values = (window, valid)
+                else:
+                    insert_window_ring(self.window_ring, window, positions, valid)
         _tmark("a.out_proj", tokens)
+        if FUSE_ATTN_POST:
+            return self._post_fused(output, positions, table, ring_values)
         output = apply_rope(output, positions, table, inverse=True)
         return self.project_output(output)
 
@@ -701,6 +712,52 @@ class V41Attention(nn.Module):
         # Each O group needs only its own 1024 rows. Grouped kernels read
         # those original rows directly; larger prefill batches retain the
         # bounded GEMM path without another weight bank.
+        projected = dense_tm.grouped_wo_a(self.wo_a, output)
+        grouped = getattr(self.wo_a.quant_method, "apply_grouped", None)
+        if projected is None and grouped is not None:
+            projected = grouped(self.wo_a, output)
+        if projected is None:
+            projected = torch.cat(
+                [
+                    self.wo_a(output[:, group].contiguous())[
+                        :, group * 1024 : (group + 1) * 1024
+                    ]
+                    for group in range(self.groups)
+                ],
+                dim=-1,
+            )
+        return self.wo_b(projected)
+
+    def _prep_fused(self, tokens, qr, kv_low, positions, table):
+        # VLLM_V41_FUSE_ATTN_PREP: forward's query and window lines, one launch.
+        q_high = self.wq_b(qr).view(tokens, self.heads, 512)
+        prepared = attn_prep(
+            q_high, kv_low, self.kv_norm.weight, self.kv_norm.eps, positions, table
+        )
+        if prepared is not None:
+            return prepared
+        query = apply_rope(q_high, positions, table)
+        window = attention_qdq(apply_rope(self.kv_norm(kv_low), positions, table))
+        return query, window
+
+    def _post_fused(self, output, positions, table, ring_values):
+        # VLLM_V41_FUSE_ATTN_POST: the deferred window ring insert, the inverse
+        # RoPE and project_output's QDQ in one launch, then its projections.
+        values, valid = ring_values if ring_values is not None else (None, None)
+        ring = self.window_ring if ring_values is not None else None
+        quantized = attn_post(
+            output, positions, table, self.groups, ring, values, valid
+        )
+        if quantized is not None:
+            return self._project_quantized(quantized)
+        if ring_values is not None:
+            insert_window_ring(self.window_ring, values, positions, valid)
+        output = apply_rope(output, positions, table, inverse=True)
+        return self.project_output(output)
+
+    def _project_quantized(self, output):
+        # project_output after its attention_qdq. A copy: project_output stays
+        # as it was for the knob-off path and V41DraftAttention.
         projected = dense_tm.grouped_wo_a(self.wo_a, output)
         grouped = getattr(self.wo_a.quant_method, "apply_grouped", None)
         if projected is None and grouped is not None:
