@@ -1,0 +1,68 @@
+# DS-V4.1 PP2xTP4 (PP2 x TP4 port of 1Cat #1277). Example profile.
+# Stage 1 = layers 0-19 with Engram/hash/ratio-2 state (GPUs 0-3, first NVLink board); stage 2 = layers 20-39, the
+# head and the drafter (GPUs 4-7, second NVLink board). Split 20 is the only admissible one (contract.pp_split_problem).
+# Every expert resident: stage-local shared_original cache with a cold set of zero.
+# Loopback only, port 18042, no API key. Synchronous scheduling (no VLLM_V41_ASYNC).
+# FULL graphs 1-6 per stage, DSpark 5 on stage 2.
+model: /path/to/ds41-models/gguf/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf
+hf-config-path: /path/to/ds41-models/base
+tokenizer: /path/to/ds41-models/base
+tokenizer-mode: deepseek_v41
+served-model-name: deepseek-v4.1-flash
+host: 127.0.0.1
+port: 18042
+dtype: half
+quantization: gguf
+load-format: gguf
+tensor-parallel-size: 4
+pipeline-parallel-size: 2
+max-model-len: 524288
+max-num-seqs: 1
+max-num-batched-tokens: 8192
+kv-cache-memory-bytes: 268435456
+gpu-memory-utilization: 0.96
+no-enforce-eager: true
+compilation-config:
+  mode: 0
+  cudagraph_mode: FULL
+  cudagraph_capture_sizes: [1, 2, 3, 4, 5, 6]
+  max_cudagraph_capture_size: 6
+# This baseline's YAML loader omits false scalar flags; use explicit negations.
+no-async-scheduling: true
+enable-prefix-caching: true
+enable-chunked-prefill: true
+no-disable-custom-all-reduce: true
+enable-auto-tool-choice: true
+tool-call-parser: deepseek_v41
+# Thinking on by default (R1-style <think>...</think>); a request can pass
+# chat_template_kwargs {"thinking": false} or reasoning_effort.
+reasoning-parser: deepseek_v4
+default-chat-template-kwargs: '{"thinking": true}'
+model-loader-extra-config:
+  engram_path: /path/to/ds41-models/gguf/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf
+speculative-config:
+  method: dspark
+  model: /path/to/ds41-dev/dspark-v41
+  quantization: fp8
+  num_speculative_tokens: 5
+  draft_load_config:
+    load_format: safetensors
+  enforce_eager: false
+kernel-config:
+  sm70_ring:
+    enabled: false
+  sm70_gguf:
+    expert_storage: original
+    expert_arena: true
+    expert_cache_host_storage: shared_original
+    # Every expert resident: a cold set of zero takes no spare slots (P2 admits both).
+    expert_cache_offload_fraction: 0
+    expert_cache_spare_slots: 0
+    expert_cache_fraction: 0
+    expert_cache_host_slack: 0
+    expert_load_prefetch_banks: 1
+    expert_cache_prefill_tokens: 4096
+    dense_storage: original
+    embedding_storage: original
+    prefill_min_m: 1
+    dequant_workspace_bytes: 33554432

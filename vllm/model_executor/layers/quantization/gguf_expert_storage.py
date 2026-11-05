@@ -41,8 +41,20 @@ def original_expert_bank(
 
 
 def prepare_original_expert_arena(model, name_map, tensors, device):
-    """Reserve immutable expert banks before replaceable dense loading storage."""
+    """Reserve immutable expert banks before replaceable dense loading storage.
+
+    Under pipeline parallelism only this stage's layers have expert modules;
+    the other stage's are ``PPMissingLayer`` placeholders and are skipped, so
+    the bank list and the whole-bank target map cover the same local layers.
+    """
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
+
     shards = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+    name_map = {
+        raw: name
+        for raw, name in name_map.items()
+        if not is_pp_missing_parameter(name, model)
+    }
     banks = []
     total = 0
     for raw, name in name_map.items():
