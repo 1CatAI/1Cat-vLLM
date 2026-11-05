@@ -1268,6 +1268,38 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
     def compute_logits(self, hidden_states):
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def local_vocab(self) -> tuple[int, int] | None:
+        """(start, n): this rank's vocabulary shard as ``compute_logits``
+        lays it out (gathered columns [start, start + n) are token ids
+        [start, start + n)), or None when the gathered logits are more than
+        the shards side by side (scale, soft cap, added vocabulary, an empty
+        shard) and only the gathered path is exact. Every check is the same
+        on every TP rank, so the ranks agree and their collectives pair up."""
+        head, proc = self.lm_head, self.logits_processor
+        if isinstance(head, PPMissingLayer) or proc.logits_as_input:
+            return None
+        if proc.scale != 1.0 or proc.soft_cap is not None:
+            return None
+        if getattr(head, "bias", None) is not None:  # local_logits passes bias=None
+            return None
+        vocab, per_rank = proc.org_vocab_size, head.num_embeddings_per_partition
+        if head.num_added_embeddings or vocab != head.org_vocab_size:
+            return None
+        tp = get_tensor_model_parallel_world_size()
+        if vocab <= (tp - 1) * per_rank or vocab >= 1 << 24:  # ids exact in FP32
+            return None
+        si = head.shard_indices
+        start = get_tensor_model_parallel_rank() * per_rank
+        # Padding sits only after the last real token (asserted, not assumed).
+        assert si.org_vocab_start_index == si.padded_org_vocab_start_index == start
+        return start, min(si.num_org_elements, vocab - start)
+
+    def local_logits(self, hidden_states, n: int):
+        """This rank's [rows, n] shard of ``compute_logits`` (no all-gather):
+        the same head call, so the values are the gathered ones bit for bit."""
+        logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states, bias=None)
+        return logits[:, :n]
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)
 

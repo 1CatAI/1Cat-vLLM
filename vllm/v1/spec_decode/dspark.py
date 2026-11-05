@@ -150,6 +150,23 @@ class DSparkProposer(DFlashProposer):
         positions = (self.positions[: batch_size * k] + 1).view(batch_size, k)
         return temperature, keys, positions
 
+    def _graph_draft_result(
+        self, tokens: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        """Result of a captured B=1 draft graph (greedy or coupled)."""
+        self._last_confidence_logits = None
+        self._last_verification_lengths = (
+            torch.full(
+                (1,),
+                self._max_verification_tokens,
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            if self.confidence_scheduling_enabled
+            else None
+        )
+        return tokens, None
+
     @override
     def _sample_draft_tokens(
         self,
@@ -179,18 +196,23 @@ class DSparkProposer(DFlashProposer):
         ):
             tokens = greedy_graph(hidden_states, self.input_ids[:1])
             if tokens is not None:
-                self._last_confidence_logits = None
-                self._last_verification_lengths = (
-                    torch.full(
-                        (1,),
-                        self._max_verification_tokens,
-                        dtype=torch.int32,
-                        device=hidden_states.device,
-                    )
-                    if self.confidence_scheduling_enabled
-                    else None
+                return self._graph_draft_result(tokens, hidden_states)
+        coupled_graph = getattr(self.model, "coupled_shard_draft_tokens", None)
+        if (
+            coupled_graph is not None
+            and batch_size == 1
+            and logits is None
+            and not self.collect_confidence_logits
+            and self._static_draft_vocab is None
+        ):
+            coupled = self._coupled_inputs(sampling_metadata, 1)
+            if coupled is not None:
+                temperature, keys, positions = coupled
+                tokens = coupled_graph(
+                    hidden_states, self.input_ids[:1], temperature, keys, positions[0]
                 )
-                return tokens, None
+                if tokens is not None:
+                    return self._graph_draft_result(tokens, hidden_states)
         if logits is None:
             logits = self.model.compute_logits(hidden_states)
         base_logits = logits.view(batch_size, self.num_speculative_tokens, -1)

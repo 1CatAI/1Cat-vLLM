@@ -239,6 +239,194 @@ def keyed_argmax(
     return out
 
 
+# Target-side keyed picks from vocabulary shards (VLLM_V41_COUPLED_LOCAL):
+# each TP rank scores only its shard of the verify logits at the global ids,
+# then one [rows, tp, 2] FP32 all-reduce replaces the logits all-gather.
+@triton.jit
+def _keyed_shard_block(
+    logits,
+    l_stride,
+    temperature,
+    keys,
+    positions,
+    best_val,
+    best_idx,
+    start,
+    N: tl.constexpr,
+    NB: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid, r = tl.program_id(0), tl.program_id(1)
+    v = pid * BLOCK + tl.arange(0, BLOCK)
+    valid = v < N
+    x = tl.load(logits + r.to(tl.int64) * l_stride + v, valid, float("-inf"))
+    x = x.to(tl.float32)
+    if tl.load(temperature + r) > 0:
+        seed = row_seed(tl.load(keys + r), tl.load(positions + r))
+        x = x + gumbel(seed, v.to(tl.int64) + start)  # the global token id
+    x = tl.where(valid, x, float("-inf"))
+    m = tl.max(x, 0)
+    tl.store(best_val + r * NB + pid, m)
+    tl.store(best_idx + r * NB + pid, tl.min(tl.where(x == m, v, 2147483647), 0))
+
+
+@triton.jit
+def _keyed_shard_slot(
+    best_val,
+    best_idx,
+    slots,
+    start,
+    rank,
+    NB: tl.constexpr,
+    PB: tl.constexpr,
+    TP: tl.constexpr,
+    TPP: tl.constexpr,
+):
+    """Row r's shard maximum and its lowest global id into slot [r, rank];
+    the other slots of the row are zero, so a sum all-reduce copies every
+    rank's pair to every rank exactly (ids below 2**24 are exact in FP32)."""
+    r = tl.program_id(0)
+    b = tl.arange(0, PB)
+    valid = b < NB
+    val = tl.load(best_val + r * NB + b, valid, float("-inf"))
+    idx = tl.load(best_idx + r * NB + b, valid, 2147483647)
+    m = tl.max(val, 0)
+    gid = (tl.min(tl.where(val == m, idx, 2147483647), 0) + start).to(tl.float32)
+    t = tl.arange(0, TPP)
+    mine = t == rank
+    tl.store(slots + r * (2 * TP) + 2 * t, tl.where(mine, m, 0.0), t < TP)
+    tl.store(slots + r * (2 * TP) + 2 * t + 1, tl.where(mine, gid, 0.0), t < TP)
+
+
+@triton.jit
+def _keyed_shard_pick(slots, out, TP: tl.constexpr, TPP: tl.constexpr):
+    """Largest shard maximum, lowest global id on ties (shards are in
+    vocabulary order): keyed_argmax's pick over the gathered row."""
+    r = tl.program_id(0)
+    t = tl.arange(0, TPP)
+    valid = t < TP
+    val = tl.load(slots + r * (2 * TP) + 2 * t, valid, float("-inf"))
+    gid = tl.load(slots + r * (2 * TP) + 2 * t + 1, valid, 0.0).to(tl.int32)
+    m = tl.max(val, 0)
+    token = tl.min(tl.where(val == m, gid, 2147483647), 0)
+    tl.store(out + r, token.to(tl.int64))
+
+
+class KeyedShard:
+    """keyed_argmax for the target's verify rows on one TP rank's shard.
+
+    ``local`` holds this rank's columns [start, start + n) of the processed
+    (temperature-scaled) logits; the tokens equal keyed_argmax on the
+    gathered rows whenever no row holds NaN. ``exchange`` sums a
+    [rows, tp, 2] FP32 tensor over the TP group (the engine passes
+    ``tensor_model_parallel_all_reduce``); every rank must call it with the
+    same rows, so the exchanges pair up.
+    """
+
+    def __init__(self, start: int, n: int, rank: int, tp: int, exchange):
+        if n <= 0 or tp < 1 or not 0 <= rank < tp:
+            raise ValueError(f"bad shard start={start} n={n} rank={rank} tp={tp}")
+        if start + n >= 1 << 24:
+            raise ValueError("token ids must stay below 2**24 (exact in FP32)")
+        self.start, self.n, self.rank, self.tp = start, n, rank, tp
+        self.exchange = exchange
+
+    def __call__(
+        self,
+        local: torch.Tensor,
+        temperature: torch.Tensor,
+        keys: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        rows, n = local.shape
+        if n != self.n:
+            raise ValueError(f"shard has {n} columns, expected {self.n}")
+        if local.stride(1) != 1:
+            local = local.contiguous()
+        device = local.device
+        out = torch.empty(rows, dtype=torch.int64, device=device)
+        slots = torch.empty((rows, self.tp, 2), dtype=torch.float32, device=device)
+        if rows == 0:
+            return out
+        nb = triton.cdiv(n, KEYED_BLOCK)
+        best_val = torch.empty((rows, nb), dtype=torch.float32, device=device)
+        best_idx = torch.empty((rows, nb), dtype=torch.int32, device=device)
+        _keyed_shard_block[(nb, rows)](
+            local,
+            local.stride(0),
+            temperature.to(torch.float32),
+            keys.contiguous(),
+            positions.contiguous(),
+            best_val,
+            best_idx,
+            self.start,
+            N=n,
+            NB=nb,
+            BLOCK=KEYED_BLOCK,
+            num_warps=4,
+        )
+        tpp = triton.next_power_of_2(self.tp)
+        _keyed_shard_slot[(rows,)](
+            best_val,
+            best_idx,
+            slots,
+            self.start,
+            self.rank,
+            NB=nb,
+            PB=triton.next_power_of_2(nb),
+            TP=self.tp,
+            TPP=tpp,
+            num_warps=4,
+        )
+        _keyed_shard_pick[(rows,)](
+            self.exchange(slots), out, TP=self.tp, TPP=tpp, num_warps=1
+        )
+        return out
+
+
+def local_fallback(sampling_metadata) -> str | None:
+    """Why this step's verify rows must take the gathered path; None when
+    the shard path gives the same tokens.
+
+    The shard path covers plain temperature only: every row random (no
+    greedy row in the batch), no top-k, top-p or active min_p, no logprobs,
+    penalties, allowed or bad words, no thinking budget and no other active
+    logits processor. Grammar (structured output) is the runner's check: it
+    edits the gathered logits after the forward pass.
+    """
+    m = sampling_metadata
+    if m.all_greedy or not m.all_random:
+        return "greedy_rows"
+    if m.temperature is None:
+        return "no_temperature"
+    if m.top_k is not None:
+        return "top_k"
+    if m.top_p is not None:
+        return "top_p"
+    if m.max_num_logprobs is not None or m.logprob_token_ids:
+        return "logprobs"
+    if not m.no_penalties:
+        return "penalties"
+    if m.allowed_token_ids_mask is not None:
+        return "allowed_token_ids"
+    if m.bad_words_token_ids:
+        return "bad_words"
+    holder = m.thinking_budget_state_holder
+    if holder is not None and holder.has_tracked_requests():
+        return "thinking_budget"
+    for proc in m.logitsprocs.all:
+        # With speculative decoding only min-tokens and min-p are built.
+        if hasattr(proc, "min_p_count"):
+            if proc.min_p_count:
+                return "min_p"
+        elif hasattr(proc, "min_toks"):
+            if proc.min_toks:
+                return "min_tokens"
+        else:
+            return "logits_processor"
+    return None
+
+
 _TRACE_STEP = [0]
 
 

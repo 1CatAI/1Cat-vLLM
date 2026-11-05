@@ -465,6 +465,10 @@ if TYPE_CHECKING:
     VLLM_V41_COUPLED_DRAFT_TEMP: str = "0.5"
     VLLM_V41_COUPLED_TRACE: str = ""
     VLLM_V41_COUPLED_DRAFTS: str = "0"
+    VLLM_V41_COUPLED_SHARD: str = "0"
+    VLLM_V41_COUPLED_SHARD_CHECK: str = "0"
+    VLLM_V41_COUPLED_LOCAL: str = "0"
+    VLLM_V41_COUPLED_LOCAL_CHECK: str = "0"
     VLLM_V41_COORD_DEBUG: str | None = None
     VLLM_V41_DENSE_TM: str = "1"
     VLLM_V41_DMA_DEBUG: str | None = None
@@ -7262,6 +7266,59 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="'0.5'",
         effective_default="'0.5'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_SHARD": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_SHARD", "0"),
+        description=(
+            "Experimental DS-V4.1 coupled drafts: 1 = one-request drafts from "
+            "vocabulary shards in a captured graph (needs VLLM_V41_MARKOV_SHARD=1)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_SHARD_CHECK": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_SHARD_CHECK", "0"),
+        description=(
+            "Debug for VLLM_V41_COUPLED_SHARD: also run the full coupled path "
+            "each round and log rounds whose drafts differ (slow)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_LOCAL": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_LOCAL", "0"),
+        description=(
+            "Experimental DS-V4.1 coupled drafts: 1 = keyed verification of "
+            "plain-temperature steps from the vocabulary shards (no logits "
+            "all-gather); other sampling settings take the gathered path."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_LOCAL_CHECK": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_LOCAL_CHECK", "0"),
+        description=(
+            "Debug for VLLM_V41_COUPLED_LOCAL: also run the gathered keyed "
+            "verification each step and log steps whose output differs (slow)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -20370,6 +20427,10 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_COL_PROJ",
         "VLLM_V41_COUPLED_DRAFTS",
         "VLLM_V41_COUPLED_DRAFT_TEMP",
+        "VLLM_V41_COUPLED_LOCAL",
+        "VLLM_V41_COUPLED_LOCAL_CHECK",
+        "VLLM_V41_COUPLED_SHARD",
+        "VLLM_V41_COUPLED_SHARD_CHECK",
         "VLLM_V41_COUPLED_TRACE",
         "VLLM_V41_COL_W",
         "VLLM_V41_COORD_DEBUG",

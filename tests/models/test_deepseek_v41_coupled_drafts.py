@@ -302,7 +302,7 @@ def test_sampler_runner_and_drafter_glue():
     # greedy batches skip every coupled op; keys copy pinned, only on change
     assert "if _COUPLED_DRAFTS and not sampling_metadata.all_greedy:" in runner
     assert "buffer[:num_reqs].copy_(staged, non_blocking=True)" in runner
-    assert "and not sampling_metadata.all_greedy\n        ):\n" in runner
+    assert "and not sampling_metadata.all_greedy\n            ):\n" in runner
     fused = (
         "sampled = coupled_draw.keyed_argmax(processed, temperature, keys, positions)"
     )

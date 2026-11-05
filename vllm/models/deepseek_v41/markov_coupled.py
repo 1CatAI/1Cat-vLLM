@@ -21,6 +21,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.spec_decode.coupled_draw import gumbel, row_seed
 
 from .markov_fused import ROWS
+from .markov_shard import _markov_shard_slot
 
 
 @triton.jit
@@ -36,11 +37,13 @@ def _markov_keyed_block(
     p_stride,
     best_val,
     best_idx,
+    start,
     V: tl.constexpr,
     K: tl.constexpr,
     NB: tl.constexpr,
     ROWS: tl.constexpr,
 ):
+    # rows v of a vocabulary slice starting at global id `start` (0: full)
     pid, b = tl.program_id(0), tl.program_id(1)
     v = pid * ROWS + tl.arange(0, ROWS)
     k = tl.arange(0, K)
@@ -53,7 +56,7 @@ def _markov_keyed_block(
     t = tl.load(temperature + b)
     if t > 0:
         seed = row_seed(tl.load(keys + b), tl.load(positions + b * p_stride))
-        x = x / (t * scale) + gumbel(seed, v.to(tl.int64))
+        x = x / (t * scale) + gumbel(seed, (v + start).to(tl.int64))
     x = tl.where(valid, x, float("-inf"))
     m = tl.max(x, 0)
     tl.store(best_val + b * NB + pid, m)
@@ -129,6 +132,7 @@ def coupled_markov_tokens(
             positions.stride(0),
             best_val,
             best_idx,
+            0,
             V=vocab,
             K=greedy.rank,
             NB=nb,
@@ -148,4 +152,69 @@ def coupled_markov_tokens(
             PB=triton.next_power_of_2(nb),
             num_warps=4,
         )
+    return tokens
+
+
+def coupled_shard_tokens(
+    shard,
+    local_logits: torch.Tensor,
+    anchor: torch.Tensor,
+    temperature: torch.Tensor,
+    keys: torch.Tensor,
+    positions: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """[steps] int64 coupled drafts for one request from vocabulary shards.
+
+    The keyed twin of ``MarkovShardGreedy.__call__``: each rank scores its
+    rows ``[start, start + n)`` with ``_markov_keyed_block`` (keyed draws at
+    the global ids), reduces them into its exchange slot, and one all-reduce
+    per step picks the token (largest value, lowest global id) and its next
+    Markov row on every rank, exactly as the greedy shard steps do. The
+    drafts equal ``coupled_markov_tokens`` on the gathered logits. Every rank
+    must call it with the same inputs (the exchanges pair up).
+
+    local_logits: this rank's [steps, n] logits; anchor: [1] token id;
+    temperature: [1]; keys: [1] int64; positions: [steps] int64.
+    """
+    tokens = torch.empty(shard.steps, dtype=torch.int64, device=local_logits.device)
+    logits = local_logits.float().contiguous()
+    first = anchor.reshape(-1)[:1].long().clamp(0, shard.vocab - 1)
+    shard.row.copy_(torch.index_select(shard.embed, 0, first).reshape(-1))
+    best_val = shard.best_val.view(1, -1)
+    best_idx = shard.best_idx.view(1, -1)
+    for step in range(shard.steps):
+        _markov_keyed_block[(shard.blocks, 1)](
+            shard.weight,
+            shard.row,
+            logits[step],
+            logits.stride(0),
+            temperature,
+            float(scale),
+            keys,
+            positions[step:],
+            1,
+            best_val,
+            best_idx,
+            shard.start,
+            V=shard.n,
+            K=shard.rank,
+            NB=shard.blocks,
+            ROWS=ROWS,
+            num_warps=4,
+        )
+        _markov_shard_slot[(1,)](
+            shard.best_val,
+            shard.best_idx,
+            shard.slots[step],
+            shard.start,
+            shard.tp_rank,
+            N=shard.n,
+            BLOCKS=shard.blocks,
+            PB=triton.next_power_of_2(shard.blocks),
+            TP=shard.tp,
+            TPP=triton.next_power_of_2(shard.tp),
+            num_warps=4,
+        )
+        shard._pick(shard.exchange(shard.slots[step]), tokens[step : step + 1])
     return tokens

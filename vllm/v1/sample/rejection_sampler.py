@@ -612,6 +612,47 @@ class RejectionSampler(nn.Module):
             logprobs_tensors=None,
         )
 
+    def sample_coupled_local(
+        self,
+        metadata: SpecDecodeMetadata,
+        local_logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        keys: torch.Tensor,
+        positions: torch.Tensor,
+        shard,
+    ) -> SamplerOutput:
+        """_sample_coupled on this rank's vocabulary shard (no all-gather).
+
+        Only for steps coupled_draw.local_fallback clears (plain temperature,
+        every row random): the processing is then the temperature division
+        alone, done as apply_sampling_constraints does it, so the shard holds
+        the gathered processed values bit for bit, and ``shard``
+        (coupled_draw.KeyedShard) picks keyed_argmax's tokens.
+        """
+        # forward() is skipped on this path; clear what it would have cleared.
+        self._last_target_candidate_ids = None
+        num_rows = local_logits.shape[0]
+        assert sampling_metadata.temperature is not None
+        cu = metadata.cu_num_sampled_tokens
+        divisor = expand_batch_to_tokens(
+            sampling_metadata.temperature,
+            cu,
+            num_rows,
+            replace_from=GREEDY_TEMPERATURE,
+            replace_to=1,
+        )
+        processed = local_logits.to(torch.float32)
+        processed.div_(divisor.unsqueeze(-1))
+        temperature = expand_batch_to_tokens(
+            sampling_metadata.temperature, cu, num_rows
+        )
+        keys = expand_batch_to_tokens(keys, cu, num_rows)
+        sampled = shard(processed, temperature, keys, positions)
+        return SamplerOutput(
+            sampled_token_ids=token_match_sample(metadata, sampled),
+            logprobs_tensors=None,
+        )
+
     def _sample_by_token_matching(
         self,
         metadata: SpecDecodeMetadata,
