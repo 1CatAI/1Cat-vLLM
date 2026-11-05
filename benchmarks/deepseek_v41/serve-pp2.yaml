@@ -2,7 +2,7 @@
 # Stage 1 = layers 0-19 with Engram/hash/ratio-2 state (GPUs 0-3, first NVLink board); stage 2 = layers 20-39, the
 # head and the drafter (GPUs 4-7, second NVLink board). Split 20 is the only admissible one (contract.pp_split_problem).
 # Every expert resident: stage-local shared_original cache with a cold set of zero.
-# Loopback only, port 18042, no API key. Synchronous scheduling (no VLLM_V41_ASYNC).
+# Loopback only, port 18000, no API key. Synchronous scheduling (no VLLM_V41_ASYNC).
 # FULL graphs 1-6 per stage, DSpark 5 on stage 2.
 model: /path/to/ds41-models/gguf/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf
 hf-config-path: /path/to/ds41-models/base
@@ -10,7 +10,7 @@ tokenizer: /path/to/ds41-models/base
 tokenizer-mode: deepseek_v41
 served-model-name: deepseek-v4.1-flash
 host: 127.0.0.1
-port: 18042
+port: 18000
 dtype: half
 quantization: gguf
 load-format: gguf
