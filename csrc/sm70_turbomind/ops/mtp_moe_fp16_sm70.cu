@@ -185,8 +185,8 @@ void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
                   padded.scalar_type() == at::kInt,
               "Invalid MTP FP16 MoE dtypes");
   TORCH_CHECK(weights.dim() == 2 && weights.size(1) == 10 &&
-                  (weights.size(0) == 1 || weights.size(0) == 5),
-              "MTP FP16 MoE requires M1/M5, topk=10");
+                  weights.size(0) >= 1 && weights.size(0) <= 80,
+              "MTP FP16 MoE requires M1..80, topk=10");
   const int m = weights.size(0), n = down ? 2560 : 320, k = down ? 160 : 2560;
   TORCH_CHECK(w.sizes() == at::IntArrayRef({512, n, k}) &&
                   x.sizes() == at::IntArrayRef({down ? m * 10 : m, k}) &&

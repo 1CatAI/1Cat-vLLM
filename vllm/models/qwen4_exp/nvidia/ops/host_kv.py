@@ -868,15 +868,11 @@ class HostQSAKV:
         page = self.page_size
         source = self.host if self.host is not None else self.history
         if source.is_cuda:
-            # A few host runs can use DMA without occupying SMs. Count only
-            # runs intersecting this transfer: a fragmented full plan may
-            # still have a contiguous historical prefix. Bound submissions
-            # before copying; heavily fragmented plans retain the gather.
-            if (
-                self._stage_host_run is not None
-                and (last - first) * 2 * page * self.dim * source.element_size()
-                >= 512 * 1024
-            ):
+            # Mapped host history: copy every run on the copy engine. Each run
+            # is at least one whole page (hundreds of KiB), so DMA submission
+            # is cheap, and unlike the SM gather it neither occupies SMs nor
+            # slows the model kernels it overlaps with on the prefetch stream.
+            if self._stage_host_run is not None:
                 copies = []
                 for source_block, target, count in runs:
                     if target >= last:
@@ -884,9 +880,7 @@ class HostQSAKV:
                     lo, hi = max(target, first), min(target + count, last)
                     if lo < hi:
                         copies.append((source_block + lo - target, lo, hi - lo))
-                        if len(copies) > 4:
-                            break
-                if 0 < len(copies) <= 4 and all(
+                if copies and all(
                     self._stage_host_run(source, self.scales, history, scales, *run)
                     for run in copies
                 ):
