@@ -509,6 +509,7 @@ if TYPE_CHECKING:
     VLLM_V41_PREFETCH_EVAL: str | None = None
     VLLM_V41_PREFILL_DMA: str = "1"
     VLLM_V41_PREFILL_GROUP: str | None = None
+    VLLM_V41_PREFILL_SKIP_ROWS: str = "0"
     VLLM_V41_PREFILL_TIMING: str = "0"
     VLLM_V41_ROUTED_PREFILL_MAX: str = "1536"
     VLLM_V41_ROUTER_FUSED: str = "1"
@@ -7767,6 +7768,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Diagnostic: DS-V4.1 prefill MoE segment timers (CUDA events, rank 0)."
         ),
         category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_SKIP_ROWS": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_SKIP_ROWS", "0"),
+        description=(
+            "DS-V4.1 prefill: K > 0 skips the layers after the last KV source"
+            " (21-39) in prefill steps that end at least K rows before the end"
+            " of every scheduled prompt; layer 20's attention still writes its"
+            " KV. 0 = off; 1..2559 is refused (cone of 20 window reaches);"
+            " 3072 recommended. See vllm/models/deepseek_v41/prefill_skip.py."
+        ),
+        category="tuning",
         declared_default="'0'",
         effective_default="'0'",
         automatic_conditions=(),
@@ -20372,6 +20389,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PREFETCH_EVAL",
         "VLLM_V41_PREFILL_DMA",
         "VLLM_V41_PREFILL_GROUP",
+        "VLLM_V41_PREFILL_SKIP_ROWS",
         "VLLM_V41_PREFILL_TIMING",
         "VLLM_V41_ROUTED_PREFILL_MAX",
         "VLLM_V41_ROUTER_FUSED",

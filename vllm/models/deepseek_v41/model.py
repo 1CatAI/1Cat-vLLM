@@ -22,6 +22,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.deepseek_v41_compression import V41C2State
 from vllm.model_executor.kernels.mhc.deepseek_v41 import (
     collapse_hc,
@@ -62,6 +63,7 @@ from vllm.models.deepseek_v41.activations import swiglu
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from . import prefill_skip
 from .attention_ops import (
     WINDOW_RING,
     attend_paged_latents,
@@ -77,6 +79,8 @@ from .contract import pp_split_problem, validate_runtime_geometry
 from .norm import short_rms_norm
 from .pp_commit import StageCommit
 from .quant_rope import apply_rope, attention_qdq, rope_table
+
+logger = init_logger(__name__)
 
 _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
 _ROUTER_FUSED = envs.VLLM_V41_ROUTER_FUSED == "1"
@@ -859,6 +863,28 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self.register_buffer(
             "stage_commit_count", torch.zeros(1, dtype=torch.int64), persistent=False
         )
+        # VLLM_V41_PREFILL_SKIP_ROWS (prefill_skip.py): in a skipped prefill
+        # step the last stage stops after the last KV source's attention.
+        # prefill_skip_bind sets _v41_skip_layer for one forward only.
+        self._v41_skip_rows = prefill_skip.skip_rows()
+        self._v41_skip_after = max(c.kv_source_layer_ids)
+        self._v41_skip_eligible = (
+            self._v41_skip_rows > 0
+            and get_pp_group().is_last_rank
+            and self.end_layer > self._v41_skip_after
+        )
+        self._v41_skip_layer: int | None = None
+        self._v41_skip_steps = 0
+        if self._v41_skip_eligible and get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                "%s=%d active: prefill steps ending >= %d rows before the "
+                "prompt end skip layers %d-%d on this stage.",
+                prefill_skip.KNOB,
+                self._v41_skip_rows,
+                self._v41_skip_rows,
+                max(self.start_layer, self._v41_skip_after + 1),
+                self.end_layer - 1,
+            )
         # M1: called eagerly with (hidden, pre) at a real or simulated stage
         # boundary (benchmarks/deepseek_v41/tools/pp2_m1.py).
         self.pp_boundary_tap: Callable[[torch.Tensor, torch.Tensor], None] | None = None
@@ -976,7 +1002,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         return IntermediateTensors({"hidden": hidden, "pre": pre.contiguous()})
 
     def _forward_reference(self, hidden, positions, pre, metadata, valid, auxiliary):
+        skip = getattr(self, "_v41_skip_layer", None)
         for i in range(self.start_layer, self.end_layer):
+            if skip is not None and i > skip:
+                return self._prefill_skipped(hidden, auxiliary, i)
             layer = self.layers[i]
             if layer.engram is not None and metadata is not None:
                 hidden = layer.engram(hidden, self.engram_io, valid)
@@ -998,7 +1027,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         state = None
         layers = list(self.layers)
         start, end = self.start_layer, self.end_layer
+        skip = getattr(self, "_v41_skip_layer", None)
         for i in range(start, end):
+            if skip is not None and i > skip:
+                return self._prefill_skipped(hidden, auxiliary, i)
             layer = layers[i]
             _tmark("engram", hidden.shape[0])
             if layer.engram is not None and metadata is not None:
@@ -1016,6 +1048,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 inputs, attn_mix = state
             table = self.compressed_rope if layer.attn.ratio else self.window_rope
             y = layer.attn(inputs, positions, table)
+            if skip is not None and i == skip:
+                # The last KV source's attention wrote its KV; its FFN and
+                # the layers after it feed only skipped rows.
+                return self._prefill_skipped(hidden, auxiliary, i + 1)
             _tmark("hc_mid", hidden.shape[0])
             inputs, ffn_mix = hc_transition(
                 hidden,
@@ -1081,6 +1117,40 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     _treport(hidden.shape[0])
                 return result
         raise AssertionError("V4.1 fused forward requires at least one layer")
+
+    def _prefill_skipped(self, hidden, auxiliary, first):
+        """A skipped prefill step (VLLM_V41_PREFILL_SKIP_ROWS) from layer
+        ``first`` on: zero the window rings of the skipped layers (the next
+        executed chunk reads zeros before its start, never stale rows), and
+        return zero rows for the hidden output and the aux taps not taken."""
+        for i in range(max(first, self.start_layer), self.end_layer):
+            ring = getattr(self.layers[i].attn, "window_ring", None)
+            if ring is not None:
+                ring.zero_()
+        tokens, width = hidden.shape[0], hidden.shape[-1]
+        for i in sorted(self.aux_hidden_state_layers):
+            if first <= i < self.end_layer:
+                auxiliary.append(hidden.new_zeros(tokens, width, dtype=torch.float16))
+        return hidden.new_zeros(tokens, width, dtype=torch.float16)
+
+    def prefill_skip_bind(self, skip):
+        """The runner, around one forward: whether this step is a skipped
+        prefill step (prefill_skip.skip_step); False unbinds."""
+        if (
+            skip
+            and self._v41_skip_eligible
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._v41_skip_layer = self._v41_skip_after
+            self._v41_skip_steps += 1
+            if self._v41_skip_steps == 1 and get_tensor_model_parallel_rank() == 0:
+                logger.info(
+                    "%s: first skipped prefill step (layers > %d).",
+                    prefill_skip.KNOB,
+                    self._v41_skip_after,
+                )
+        else:
+            self._v41_skip_layer = None
 
     def _ratio2_states(self):
         for i in range(self.start_layer, self.end_layer):
@@ -1295,6 +1365,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
 
     def restore_prefix(self, cached, prompt_ids):
         self.model.restore_prefix(cached, prompt_ids)
+
+    def prefill_skip_bind(self, skip):
+        self.model.prefill_skip_bind(skip)
 
     def stateful_output_budget(self, max_tokens, prompt_tokens):
         return self.model.output_budget(max_tokens, prompt_tokens)
