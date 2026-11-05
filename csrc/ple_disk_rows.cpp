@@ -8,16 +8,76 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <vector>
 
 #ifdef __linux__
   #include <sys/mman.h>
   #include <unistd.h>
+
+namespace {
+
+// Copies the rows in address order and advises only a bounded window of pages
+// ahead of the copy. Advising every page of a long request up front let
+// reclaim take the read-ahead pages, which enter the oldest LRU generation
+// untouched, before the copy reached them; the copy then read them back one
+// synchronous page at a time (2026-10-18: ~3,500 pages/s from the checkpoint
+// SSD). Only pages covering requested rows are considered, never the whole
+// table. Residency can change after mincore; memcpy remains the ordinary
+// file-backed read if a page is reclaimed anyway.
+void copy_rows_with_prefetch_window(const std::vector<const uint8_t*>& sources,
+                                    int64_t row_bytes,
+                                    int64_t prefetch_window_bytes,
+                                    uint8_t* destination) {
+  const auto system_page_size = sysconf(_SC_PAGE_SIZE);
+  TORCH_CHECK(system_page_size > 0,
+              "PLE disk gather cannot determine page size");
+  const auto page_size = static_cast<uintptr_t>(system_page_size);
+  const auto bytes = static_cast<uintptr_t>(row_bytes);
+  std::vector<size_t> order(sources.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) { return sources[a] < sources[b]; });
+  // Unique pages in copy order and, per copied row, one past its last page.
+  std::vector<uintptr_t> pages;
+  std::vector<size_t> pages_through_row(order.size());
+  for (size_t i = 0; i < order.size(); ++i) {
+    const auto address = reinterpret_cast<uintptr_t>(sources[order[i]]);
+    const auto last_page = (address + bytes - 1) / page_size * page_size;
+    for (auto page = address / page_size * page_size;; page += page_size) {
+      if (pages.empty() || pages.back() < page) pages.push_back(page);
+      if (page == last_page) break;
+    }
+    pages_through_row[i] = pages.size();
+  }
+  const auto window_pages =
+      (static_cast<uintptr_t>(prefetch_window_bytes) + page_size - 1) /
+      page_size;
+  size_t advised = 0;
+  for (size_t i = 0; i < order.size(); ++i) {
+    const auto target =
+        std::min(pages.size(), pages_through_row[i] + window_pages);
+    for (; advised < target; ++advised) {
+      auto* page = reinterpret_cast<void*>(pages[advised]);
+      unsigned char resident = 0;
+      const auto status = mincore(page, page_size, &resident);
+      TORCH_CHECK(status == 0 || errno != ENOMEM,
+                  "PLE disk row page is not mapped");
+      if (status == 0 && !(resident & 1)) {
+        // Advice failure affects performance only, not byte selection/order.
+        madvise(page, page_size, MADV_WILLNEED);
+      }
+    }
+    std::memcpy(destination + order[i] * bytes, sources[order[i]], bytes);
+  }
+}
+
+}  // namespace
 #endif
 
 void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                         int64_t shard_size, int64_t num_rows, int64_t row_bytes,
-                        torch::Tensor out) {
+                        torch::Tensor out, int64_t prefetch_window_bytes) {
   TORCH_CHECK(ids.device().is_cpu() && pointers.device().is_cpu() &&
                   out.device().is_cpu(),
               "PLE disk gather requires CPU tensors");
@@ -30,6 +90,8 @@ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
       "PLE disk gather requires contiguous tensors");
   TORCH_CHECK(shard_size > 0 && num_rows > 0 && row_bytes > 0,
               "PLE disk gather geometry must be positive");
+  TORCH_CHECK(prefetch_window_bytes >= 0,
+              "PLE disk prefetch window must not be negative");
   TORCH_CHECK(
       out.numel() / row_bytes == ids.numel() && out.numel() % row_bytes == 0,
       "PLE disk gather output size mismatch");
@@ -42,13 +104,6 @@ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
   auto* destination = out.data_ptr<uint8_t>();
   std::vector<const uint8_t*> sources;
   sources.reserve(ids.numel());
-  std::vector<uintptr_t> pages;
-#ifdef __linux__
-  const auto system_page_size = sysconf(_SC_PAGE_SIZE);
-  TORCH_CHECK(system_page_size > 0,
-              "PLE disk gather cannot determine page size");
-  const auto page_size = static_cast<uintptr_t>(system_page_size);
-#endif
   for (int64_t row = 0; row < ids.numel(); ++row) {
     const auto index = indices[row];
     TORCH_CHECK_INDEX(index >= 0 && index < num_rows,
@@ -66,33 +121,14 @@ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
         base <= std::numeric_limits<uintptr_t>::max() - offset &&
             base + offset <= std::numeric_limits<uintptr_t>::max() - row_bytes,
         "PLE disk row address overflow");
-    const auto address = base + offset;
-    sources.push_back(reinterpret_cast<const uint8_t*>(address));
-#ifdef __linux__
-    const auto last_page = (address + row_bytes - 1) / page_size * page_size;
-    for (auto page = address / page_size * page_size;; page += page_size) {
-      pages.push_back(page);
-      if (page == last_page) break;
-    }
-#endif
+    sources.push_back(reinterpret_cast<const uint8_t*>(base + offset));
   }
 
 #ifdef __linux__
-  // Only pages covering requested rows are considered. Never populate the
-  // whole table. Residency can change after this snapshot; memcpy remains
-  // the ordinary file-backed read if a page is subsequently reclaimed.
-  std::sort(pages.begin(), pages.end());
-  pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-  for (const auto page : pages) {
-    unsigned char resident = 0;
-    const auto status =
-        mincore(reinterpret_cast<void*>(page), page_size, &resident);
-    TORCH_CHECK(status == 0 || errno != ENOMEM,
-                "PLE disk row page is not mapped");
-    if (status == 0 && !(resident & 1)) {
-      // Advice failure affects performance only, not byte selection/order.
-      madvise(reinterpret_cast<void*>(page), page_size, MADV_WILLNEED);
-    }
+  if (prefetch_window_bytes > 0) {
+    copy_rows_with_prefetch_window(sources, row_bytes, prefetch_window_bytes,
+                                   destination);
+    return;
   }
 #endif
   for (size_t row = 0; row < sources.size(); ++row) {
@@ -104,7 +140,8 @@ void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                                int64_t shard_size, int64_t num_rows,
                                int64_t row_bytes, torch::Tensor out,
                                torch::Tensor cache_ids,
-                               torch::Tensor cache_rows) {
+                               torch::Tensor cache_rows,
+                               int64_t prefetch_window_bytes) {
   TORCH_CHECK(ids.device().is_cpu() && out.device().is_cpu() &&
                   cache_ids.device().is_cpu() && cache_rows.device().is_cpu(),
               "PLE cached gather requires CPU storage");
@@ -148,7 +185,8 @@ void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
   auto miss_ids = torch::tensor(misses, ids.options());
   auto rows = torch::empty({static_cast<int64_t>(misses.size()), row_bytes},
                            out.options());
-  ple_disk_gather_u8(miss_ids, pointers, shard_size, num_rows, row_bytes, rows);
+  ple_disk_gather_u8(miss_ids, pointers, shard_size, num_rows, row_bytes, rows,
+                     prefetch_window_bytes);
   const auto* data = rows.data_ptr<uint8_t>();
   for (size_t i = 0; i < misses.size(); ++i) {
     const auto slot = misses[i] % capacity;

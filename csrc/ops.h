@@ -965,12 +965,13 @@ void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
 
 void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                         int64_t shard_size, int64_t num_rows, int64_t row_bytes,
-                        torch::Tensor out);
+                        torch::Tensor out, int64_t prefetch_window_bytes);
 void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                                int64_t shard_size, int64_t num_rows,
                                int64_t row_bytes, torch::Tensor out,
                                torch::Tensor cache_ids,
-                               torch::Tensor cache_rows);
+                               torch::Tensor cache_rows,
+                               int64_t prefetch_window_bytes);
 
 int64_t ple_fast_lane_start(
     torch::Tensor request, int64_t max_reqs, int64_t max_tokens,

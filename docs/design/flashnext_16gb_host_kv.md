@@ -66,7 +66,10 @@ Startup requires at least 21 GiB of available host memory before loading.
 the shared offload process. The cache stores original bytes, so misses and hits
 use the same official dequantization. Direct-mapped collisions replace cache
 entries without changing requested output order. Allocation is lazy; selected
-cold pages are prefetched rather than faulting the entire table into RAM.
+cold pages are prefetched rather than faulting the entire table into RAM. The
+mapped row reader copies a request's rows in address order and prefetches only
+`ple_disk_prefetch_window_kib` ahead of the copy, so reclaim under memory
+pressure does not drop read-ahead pages before they are copied.
 The profile uses a 512 MiB total CPU budget and an 8192-token GPU KV hot cache.
 
 ## Validation status

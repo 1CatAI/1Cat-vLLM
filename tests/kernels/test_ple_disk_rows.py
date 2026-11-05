@@ -15,9 +15,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# No read-ahead, one page ahead, a window inside the request, the whole request.
+WINDOWS = [0, 1, 1 << 16, 1 << 30]
+
+
 @pytest.mark.parametrize("m", [1, 5, 17, 33])
 @pytest.mark.parametrize("row_bytes", [17, 160, 8193])
-def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes):
+@pytest.mark.parametrize("window", WINDOWS)
+def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes, window):
     shard_size, total = 97, 271
     references, mapped, tensors = [], [], []
     try:
@@ -40,14 +45,14 @@ def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes):
         ids.reshape(-1)[:4] = torch.tensor([0, 96, 97, total - 1])
         output = torch.empty((m, 16, row_bytes), dtype=torch.uint8)
         torch.ops._C.ple_disk_gather_u8(
-            ids, pointers, shard_size, total, row_bytes, output
+            ids, pointers, shard_size, total, row_bytes, output, window
         )
         expected = torch.cat(references)[ids.reshape(-1)].reshape_as(output)
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
         # Reuse the same buffers with different IDs; no stale cache/generation.
         ids.fill_(total - 1)
         torch.ops._C.ple_disk_gather_u8(
-            ids, pointers, shard_size, total, row_bytes, output
+            ids, pointers, shard_size, total, row_bytes, output, window
         )
         torch.testing.assert_close(
             output, references[-1][-1].expand_as(output), rtol=0, atol=0
@@ -61,16 +66,32 @@ def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes):
             region.close()
 
 
-def test_invalid_rows_are_rejected_before_output_writes():
+@pytest.mark.parametrize("window", WINDOWS)
+def test_invalid_rows_are_rejected_before_output_writes(window):
     table = torch.arange(48, dtype=torch.uint8).reshape(3, 16)
     pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
     output = torch.full((2, 16), 123, dtype=torch.uint8)
     for invalid in (-1, 3):
         with pytest.raises(IndexError, match="row id out of range"):
             torch.ops._C.ple_disk_gather_u8(
-                torch.tensor([0, invalid]), pointers, 3, 3, 16, output
+                torch.tensor([0, invalid]), pointers, 3, 3, 16, output, window
             )
         assert torch.all(output == 123)
+
+
+def test_negative_prefetch_window_is_rejected():
+    table = torch.arange(48, dtype=torch.uint8).reshape(3, 16)
+    pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="prefetch window"):
+        torch.ops._C.ple_disk_gather_u8(
+            torch.tensor([0]),
+            pointers,
+            3,
+            3,
+            16,
+            torch.empty((1, 16), dtype=torch.uint8),
+            -1,
+        )
 
 
 def test_strided_ids_do_not_silently_read_adjacent_storage():
@@ -79,7 +100,7 @@ def test_strided_ids_do_not_silently_read_adjacent_storage():
     ids = torch.arange(4)[::2]
     with pytest.raises(RuntimeError, match="contiguous"):
         torch.ops._C.ple_disk_gather_u8(
-            ids, pointers, 4, 4, 16, torch.empty((2, 16), dtype=torch.uint8)
+            ids, pointers, 4, 4, 16, torch.empty((2, 16), dtype=torch.uint8), 0
         )
 
 
@@ -87,7 +108,8 @@ def test_strided_ids_do_not_silently_read_adjacent_storage():
     not hasattr(torch.ops._C, "ple_disk_cached_gather_u8"),
     reason="requires bounded native cache",
 )
-def test_row_cache_preserves_order_under_collisions_and_reuse():
+@pytest.mark.parametrize("window", WINDOWS)
+def test_row_cache_preserves_order_under_collisions_and_reuse(window):
     table = (torch.arange(9 * 17) % 256).to(torch.uint8).reshape(9, 17)
     pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
     keys = torch.full((2,), -1, dtype=torch.int64)
@@ -104,6 +126,7 @@ def test_row_cache_preserves_order_under_collisions_and_reuse():
             output,
             keys,
             rows,
+            window,
         )
         torch.testing.assert_close(output, table[ids], rtol=0, atol=0)
     output = torch.full((2, 17), 123, dtype=torch.uint8)
@@ -117,5 +140,6 @@ def test_row_cache_preserves_order_under_collisions_and_reuse():
             output,
             keys,
             rows,
+            window,
         )
     assert torch.all(output == 123)
