@@ -206,6 +206,14 @@ constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
+// Concurrent MTP4 verification batches of Qwen4Exp/Flash-Next (H2560): two or
+// more requests of five rows each, up to the persistent buffer capacity.
+inline bool sm70_qwen4exp_verify_batch_bytes(size_t bytes) {
+  constexpr size_t request_bytes = 5 * 2560 * sizeof(half);
+  return bytes % request_bytes == 0 && bytes >= 2 * request_bytes &&
+         bytes <= kSm70Tp4PushAllreduceMaxBytes;
+}
+
 inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
                                           size_t bytes,
                                           bool allow_generic = false) {
@@ -257,6 +265,14 @@ inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
       }
     }
     return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
+  }
+  if (batch_enabled && sm70_qwen4exp_verify_batch_bytes(bytes)) {
+    // The push kernels stride over the payload, so larger batches reuse the
+    // persistent per-block epochs.
+    return static_cast<int>(
+        std::min<size_t>(kSm70Tp4PushAllreduceBlocks,
+                         (bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
+                             (kSm70Tp4PushAllreduceThreads * 16)));
   }
   const char* mtp5 =
       policy.raw(CollectivePolicyField::sm70_tp4_push_allreduce_mtp5);
@@ -2783,7 +2799,8 @@ class CustomAllreduce {
           (batch == nullptr || std::strcmp(batch, "1") == 0) &&
           (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
-           bytes == kSm70Tp4PushAllreduceBytes);
+           bytes == kSm70Tp4PushAllreduceBytes ||
+           sm70_qwen4exp_verify_batch_bytes(bytes));
       const char* batch_fastpath =
           policy_.raw(CollectivePolicyField::sm70_qwen38_batch_fastpath);
       const bool qwen38_m2 = bytes == kSm70Tp4PushAllreduceQwen38M2Bytes &&

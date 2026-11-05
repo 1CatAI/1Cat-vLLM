@@ -830,6 +830,12 @@ def invoke_fused_moe_triton_kernel(
     )
 
 
+# Concurrent MTP4 drafts: the first proposer pass covers every request's
+# five-row verifier window (16 requests -> 80 rows); continuation passes have
+# one row per request.
+_SM70_MTP_MOE_MAX_M = 80
+
+
 def _sm70_mtp_moe_fp16_shape_supported(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -842,7 +848,7 @@ def _sm70_mtp_moe_fp16_shape_supported(
     if weights is None or weights.ndim != 2 or weights.shape[1] != 10:
         return False
     m = weights.shape[0]
-    if m not in (1, 5):
+    if not 1 <= m <= _SM70_MTP_MOE_MAX_M:
         return False
     n, k = (2560, 160) if weighted else (320, 2560)
     return (
@@ -920,7 +926,7 @@ def dispatch_fused_moe_kernel(
         and hasattr(torch.ops._C, "sm70_mtp_moe_fp16_out")
     ):
         logger.info_once(
-            "Using exact SM70 FP16 MTP MoE projections (M1/M5, E512, H2560, I160)."
+            "Using exact SM70 FP16 MTP MoE projections (M1..80, E512, H2560, I160)."
         )
         torch.ops._C.sm70_mtp_moe_fp16_out(
             C,
@@ -1314,11 +1320,12 @@ def _get_sm70_mtp_moe_decode_config(
             "num_warps": 4,
             "num_stages": 3,
         }
-    if (E, N, K, topk) == (512, 160, 2560, 10) and M in (1, 5):
+    if (E, N, K, topk) == (512, 160, 2560, 10) and 1 <= M <= _SM70_MTP_MOE_MAX_M:
         # Qwen3.8-Flash-Next TP4 keeps the BF16 MTP expert weights and shards
         # the checkpoint-global I640 expert width to I160 per rank. M5 is the
         # first proposer pass over the verifier window; M1 covers its three
-        # autoregressive continuation passes.
+        # autoregressive continuation passes. Concurrent requests multiply
+        # both (M5c and Mc); the exact kernel computes every route alike.
         return {
             "BLOCK_SIZE_M": 2,
             "BLOCK_SIZE_N": 128,
@@ -1604,9 +1611,17 @@ def _prepare_expert_assignment(
     # activates only a small fraction of total experts
     # Skips moe_align_block_size and activates the `sorted_token_ids is None`
     # path of the fused_moe_kernel kernel
+    # The exact SM70 MTP expert kernel (the only BLOCK_SIZE_M=2 tile) reads
+    # one route per CTA, so it keeps the naive assignment at every draft batch.
+    sm70_mtp_routes = (
+        config.get("BLOCK_SIZE_M") == 2
+        and global_num_experts == 512
+        and top_k_num == 10
+        and num_tokens <= _SM70_MTP_MOE_MAX_M
+    )
     naive_block_assignment = (
         expert_map is None
-        and num_tokens * top_k_num * 4 <= global_num_experts
+        and (num_tokens * top_k_num * 4 <= global_num_experts or sm70_mtp_routes)
         and not (
             (use_int8_w8a16 or use_int4_w4a16)
             and block_shape is not None

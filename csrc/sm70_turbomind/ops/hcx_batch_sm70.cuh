@@ -12,14 +12,17 @@
 
 constexpr int GMAX = MAX_M / 8;
 
-template <bool FULL, int OF>
+// G > 0 fixes the group count at compile time: the per-group loops then have
+// no exits, so independent groups' loads and MMAs interleave. G = 0 keeps the
+// runtime count (producer-fused variants).
+template <bool FULL, int OF, int G = 0>
 __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
   TS(0);
   const int i = blockIdx.x, t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int MT = a.M, rk = a.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
   const unsigned ep = ldv(a.seq), tag = ep + 1;
   const int r8 = (lane & 3) + ((lane & 16) ? 4 : 0), quad = (lane >> 2) & 3;
-  const int groups = (MT + 7) / 8;
+  const int groups = G > 0 ? G : (MT + 7) / 8;
   const int row = warp, col = 32 * i + lane;
   auto rows_of = [&](int g) { return min(8, MT - 8 * g); };
   auto ar = [&](int g, int q) { return a.ar[q] + g * AR_WORDS; };
@@ -234,6 +237,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
       if (lane == 0 && act) sq(g)[(i * 8 + row) * 4 + b] = q;
     }
   }
+  TS(10);
   __syncthreads();
   if (warp < 6) {
     const int tile = warp >> 1, kh = warp & 1;
@@ -264,6 +268,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
                                      2 * kh) = make_float2(acc0[e], acc1[e]);
         }
       }
+      if (g == 0) TS(15);
     }
   }
   TS(3);
@@ -275,18 +280,21 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
   // reduction and lora push over every group's outputs.
   auto valid = [](int q, int n) { return n < 80 || (q == 3 && n < 84); };
   auto gcol = [](int q, int n) { return n < 80 ? q * 80 + n : 320 + n - 80; };
+  float4 qsg[GMAX][3];
+#pragma unroll
+  for (int g = 0; g < GMAX; ++g)
+#pragma unroll
+    for (int j = 0; j < 3; ++j)
+      qsg[g][j] = g < groups && row < rows_of(g) && lane + 32 * j < NC
+                      ? __ldcg(reinterpret_cast<const float4*>(sq(g)) +
+                               (lane + 32 * j) * 8 + row)
+                      : make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
   for (int g = 0; g < GMAX; ++g) {
     if (g >= groups) break;
     if (row >= rows_of(g)) continue;
     const int gr = 8 * g + row;
-    float4 qs[3];
-#pragma unroll
-    for (int j = 0; j < 3; ++j)
-      qs[j] = lane + 32 * j < NC
-                  ? __ldcg(reinterpret_cast<const float4*>(sq(g)) +
-                           (lane + 32 * j) * 8 + row)
-                  : make_float4(0.f, 0.f, 0.f, 0.f);
+    const float4* qs = qsg[g];
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
       auto comp = [&](const float4& f) {
@@ -303,15 +311,35 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     }
   }
   __syncthreads();
-  for (int oi = i + NC * warp; oi < groups * 8 * 96; oi += NC * 8) {
+  TS(11);
+  const int outputs = groups * 8 * 96;
+  for (int oi0 = i + NC * warp; oi0 < outputs; oi0 += 2 * NC * 8) {
+    // Both outputs' partial loads are issued before the first remote store
+    // (whose memory clobber would otherwise serialize the next loads).
+    float4 pvs[2][3];
+    bool live[2];
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      const int oi = oi0 + u * NC * 8;
+      const int gr = oi / 96, n = oi % 96, g = gr / 8, rw = gr % 8;
+      live[u] = oi < outputs && rw < rows_of(g) && valid(rk, n);
+#pragma unroll
+      for (int j = 0; j < 3; ++j)
+        pvs[u][j] = live[u] && lane + 32 * j < NC
+                        ? __ldcg(reinterpret_cast<const float4*>(dpart(g)) +
+                                 ((lane + 32 * j) * 8 + rw) * 96 + n)
+                        : make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+    if (!live[u]) continue;
+    const int oi = oi0 + u * NC * 8;
     const int gr = oi / 96, n = oi % 96, g = gr / 8, rw = gr % 8;
-    if (rw >= rows_of(g) || !valid(rk, n)) continue;
     float pb[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int j = 0; j < 3; ++j)
       if (lane + 32 * j < NC) {
-        const float4 pv = __ldcg(reinterpret_cast<const float4*>(dpart(g)) +
-                                 ((lane + 32 * j) * 8 + rw) * 96 + n);
+        const float4 pv = pvs[u][j];
         pb[0] += pv.x;
         pb[1] += pv.y;
         pb[2] += pv.z;
@@ -336,6 +364,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     if (lane == 1) st2(lora(g, p1) + pos, w, tag);
     if (lane == 2) st2(lora(g, p2) + pos, w, tag);
     if (FULL && lane == 3) st2(lora(g, p3) + pos, w, tag);
+    }
   }
   if (warp >= 3) {
 #pragma unroll
@@ -364,23 +393,57 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
   TS(7);
   // ---- 6. HC up and gate-mix per group from shared lora rows, then push
   // every group's hidden slice.
-  for (int idx = t; idx < groups * 8 * 320; idx += 256) {
-    const int gr = idx / 320, c = idx % 320, g = gr / 8, rw = gr % 8;
-    ls[g][rw][c] = rw < rows_of(g)
-                       ? __ushort_as_half(static_cast<unsigned short>(
-                             __ldcg(lora(g, rk) + rw * LW + c).x))
-                       : __float2half_rn(0.f);
+  {
+    // Two LL words (two halves) per 16-byte load; eight loads are in flight
+    // before their shared-memory stores, instead of one L2 round trip each.
+    constexpr int kPairs = 160, kBatch = 8;
+    const int pairs = groups * 8 * kPairs;
+    for (int base = 0; base < pairs; base += 256 * kBatch) {
+      uint4 w[kBatch];
+#pragma unroll
+      for (int u = 0; u < kBatch; ++u) {
+        const int idx = base + u * 256 + t;
+        const int gr = idx / kPairs, c = (idx % kPairs) * 2;
+        const int g = gr / 8, rw = gr % 8;
+        w[u] = idx < pairs && rw < rows_of(g)
+                   ? __ldcg(reinterpret_cast<const uint4*>(lora(g, rk) +
+                                                           rw * LW + c))
+                   : make_uint4(0, 0, 0, 0);
+      }
+#pragma unroll
+      for (int u = 0; u < kBatch; ++u) {
+        const int idx = base + u * 256 + t;
+        if (idx >= pairs) continue;
+        const int gr = idx / kPairs, c = (idx % kPairs) * 2;
+        const int g = gr / 8, rw = gr % 8;
+        ls[g][rw][c] = __ushort_as_half(static_cast<unsigned short>(w[u].x));
+        ls[g][rw][c + 1] =
+            __ushort_as_half(static_cast<unsigned short>(w[u].z));
+      }
+    }
   }
   if (i == 0 && t < MT * 4) {
     const int gr = t >> 2, g = gr / 8, rw = gr % 8;
     a.inj_out[t] = __ushort_as_half(static_cast<unsigned short>(
         __ldcg(lora(g, rk) + rw * LW + 320 + (t & 3)).x));
   }
+  TS(14);
+  // Mix operands: warp w finalizes MMA element e = w of every group.
+  const int me = warp;
+  const int mrw = (me & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+  const int mhh = (me & 1) | (((lane >> 1) & 1) << 1) | ((me >> 2) << 2);
+  const int mh = 640 * rk + 8 * i + mhh;
+  float xvp[GMAX];
+#pragma unroll
+  for (int g = 0; g < GMAX; ++g)
+    xvp[g] = g < groups && mrw < rows_of(g)
+                 ? __half2float(__ldcg(a.xn + (8 * g + mrw) * KD + quad * HD + mh))
+                 : 0.f;
   __syncthreads();
+  TS(12);
 #pragma unroll
   for (int g = 0; g < GMAX; ++g) {
     if (g >= groups) break;
-    const int M = rows_of(g), r0 = 8 * g;
     if (warp >= 3) {
       const int uw = warp - 3;
       float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -398,31 +461,24 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
       for (int e = 0; e < 8; ++e) red[uw][e][lane] = acc[e];
     }
     __syncthreads();
-    if (warp == 0) {
+    {
+      float acc = red[0][me][lane];
 #pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        float acc = red[0][e][lane];
+      for (int q = 1; q < 5; ++q) acc += red[q][me][lane];
+      const float sg = sigm(__half2float(__float2half_rn(acc)));
+      const float xv = xvp[g];
+      float mixed = 0.f;
 #pragma unroll
-        for (int q = 1; q < 5; ++q) acc += red[q][e][lane];
-        const int rw = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-        const int hh = (e & 1) | (((lane >> 1) & 1) << 1) | ((e >> 2) << 2);
-        const int h = 640 * rk + 8 * i + hh;
-        const float sg = sigm(__half2float(__float2half_rn(acc)));
-        const float xv =
-            rw < M ? __half2float(__ldcg(a.xn + (r0 + rw) * KD + quad * HD + h))
-                   : 0.f;
-        float mixed = 0.f;
-#pragma unroll
-        for (int b = 0; b < 4; ++b) {
-          const int src = (lane & ~12) | (b << 2);
-          mixed = fmaf(__shfl_sync(0xffffffff, sg, src),
-                       __shfl_sync(0xffffffff, xv, src), mixed);
-        }
-        if (quad == 0) tout[g][rw][hh] = __float2half_rn(divf(mixed, 4.0f));
+      for (int b = 0; b < 4; ++b) {
+        const int src = (lane & ~12) | (b << 2);
+        mixed = fmaf(__shfl_sync(0xffffffff, sg, src),
+                     __shfl_sync(0xffffffff, xv, src), mixed);
       }
+      if (quad == 0) tout[g][mrw][mhh] = __float2half_rn(divf(mixed, 4.0f));
     }
     __syncthreads();
   }
+  TS(13);
   if (t < 2 * MT) {
     const int gr = t >> 1, g = gr / 8, rw = gr % 8, h4 = (t & 1) * 4,
               h = 640 * rk + 8 * i + h4;
@@ -434,22 +490,22 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
   }
   TS(8);
   // ---- 7. collect every group's peer hidden slices.
+  if (FULL) {
+    // Every group at once: thread t owns word t % 6 of row t / 6 (all rows).
+    if (t < 6 * MT) {
+      const int gr = t / 6, w = t % 6, k = w % 3;
+      const int src = k == 0 ? p1 : k == 1 ? p2 : p3;
+      const int g = gr / 8, rw = gr % 8;
+      const int h = 640 * src + 8 * i + (w / 3) * 4;
+      const uint2 d = poll4(hb(g, rk) + (rw * HD + h) / 2, tag);
+      *reinterpret_cast<uint2*>(a.blk_out + gr * HD + h) = d;
+    }
+  } else {
 #pragma unroll
   for (int g = 0; g < GMAX; ++g) {
     if (g >= groups) break;
     const int M = rows_of(g), r0 = 8 * g;
-    if (FULL) {
-      if (t >= 32 && t < 32 + 6 * M) {
-        const int u = t - 32, k = u % 3,
-                  src = k == 0   ? p1
-                        : k == 1 ? p2
-                                 : p3,
-                  rw = (u / 3) >> 1;
-        const int h = 640 * src + 8 * i + ((u / 3) & 1) * 4;
-        const uint2 d = poll4(hb(g, rk) + (rw * HD + h) / 2, tag);
-        *reinterpret_cast<uint2*>(a.blk_out + (r0 + rw) * HD + h) = d;
-      }
-    } else {
+    {
       if (t >= 32 && t < 32 + 2 * M) {
         const int u = t - 32, rw = u >> 1, h = 640 * p1 + 8 * i + (u & 1) * 4;
         const uint2 d = poll4(hb(g, rk) + (rw * HD + h) / 2, tag);
@@ -463,6 +519,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
         *reinterpret_cast<uint2*>(a.blk_out + (r0 + rw) * HD + h) = d;
       }
     }
+  }
   }
   __syncthreads();
   TS(9);

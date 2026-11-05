@@ -26,10 +26,12 @@ logger = init_logger(__name__)
 
 HD, KD, LORA, INJ = 2560, 10240, 320, 4
 HCX_MAX_M = 8
-# Concurrent verification batches (up to 8 requests x 5 rows) keep the HCX
-# contract: producers hand over TP partials and the combine runs HCX on row
-# slices of at most HCX_MAX_M (rows are independent).
-HCX_BATCH_M = 40
+# Producers hand over TP partials and the combine runs HCX only for batches
+# that fit one 8-row MMA group (one MTP4 request). HCX walks larger batches
+# group by group, repeating its cross-GPU exchanges per group, which measured
+# no faster than the explicit all-reduce path at four requests and 2.5 ms per
+# round slower at eight; those batches use the explicit path.
+HCX_BATCH_M = 8
 _OUTPUT_PROJECTIONS: dict[str, tuple] = {}
 _MOE_RUNNERS: dict[str, Any] = {}
 _PREFILL_SEQUENCE_PARALLEL: ContextVar[bool] = ContextVar(

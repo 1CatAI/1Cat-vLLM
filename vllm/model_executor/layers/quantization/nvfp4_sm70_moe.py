@@ -572,6 +572,32 @@ def _use_glm53_fused_permute_q8(
     )
 
 
+def _use_qwen38_dense_permute(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    other_route: bool,
+) -> bool:
+    """Fused permute for verification batches past the compact-slot bound."""
+    slots = topk_ids.numel()
+    return bool(
+        not other_route
+        and not getattr(layer, "sm70_glm53_fused_permute_q8", False)
+        and layer.expert_map is None
+        and (
+            int(layer.sm70_nvfp4_num_experts),
+            int(layer.sm70_nvfp4_hidden_size),
+            int(layer.sm70_nvfp4_top_k),
+        )
+        == (512, 2560, 10)
+        and _COMPACT_GROUPED_MAX_SLOTS < slots <= 1024
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.is_contiguous()
+        and hasattr(torch.ops._C, "qwen38_moe_permute_dense_sm70_out")
+    )
+
+
 def _use_compact_grouped(num_tokens: int, top_k: int) -> bool:
     """Bound compact dispatch by its routed-row workload, not batch size."""
     total_slots = num_tokens * top_k
@@ -1387,6 +1413,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             return execute_fp4(
                 layer.sm70_fp4_codec, plan, buffers, x, topk_ids, topk_weights
             )
+        qwen38_dense_permute = _use_qwen38_dense_permute(
+            layer, x, topk_ids, indexed_w13 or direct_single_token
+        )
         if direct_single_token:
             _prepare_single_token_slots(
                 x,
@@ -1397,6 +1426,22 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = top_k
+        elif qwen38_dense_permute:
+            # One sort CTA and one row gather replace the generic route's
+            # copy/fill/radix-sort/offset/expand launches; same stable order.
+            torch.ops._C.qwen38_moe_permute_dense_sm70_out(
+                x,
+                topk_ids,
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                buffers["sorted_row_idx"],
+                buffers["inv_permuted_idx"],
+            )
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 fused dense MoE permute enabled "
+                "(%d routed slots).",
+                topk_ids.numel(),
+            )
         elif glm53_fused_permute_q8:
             self.native_ops.sm70_glm53_moe_permute_q8_out(
                 x,
@@ -1521,7 +1566,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             expert_ids=stage_expert_ids,
             expert_count=stage_experts,
             unpermute_offsets=None
-            if glm53_fused_permute_q8
+            if glm53_fused_permute_q8 or qwen38_dense_permute
             else buffers["expert_offsets64"],
         )
         if diagnostic_history("nvfp4_dflash").get("armed", False) and num_tokens > 1:

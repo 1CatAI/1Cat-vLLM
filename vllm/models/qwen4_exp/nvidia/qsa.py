@@ -418,7 +418,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 query_positions[:num_tokens],
                 sequence_lengths,
                 output[:num_tokens],
-                output_gate,
+                output_gate[:num_tokens] if output_gate is not None else None,
                 attn_metadata,
             )
             return output

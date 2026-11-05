@@ -147,7 +147,8 @@ def test_staging_threshold_and_independent_decode_admission(
     with Calls() as calls:
         result = state.stage_history(table, lengths, 131072)
     torch.accelerator.synchronize()
-    assert calls.copies == int(neighbor >= 0)
+    # Mapped host history always uses the native copy, however small.
+    assert calls.copies == 1
     assert torch.equal(result[0].cpu(), expected[:used])
 
 
@@ -181,13 +182,16 @@ def test_staging_fallbacks_keep_exact_result(fallback, monkeypatch):
     with Calls() as calls:
         result = state.stage_history(table, lengths, 131072)
     torch.accelerator.synchronize()
-    assert calls.copies == int(fallback == "device")
+    # Device history declines on its first run; fragmented host history copies
+    # every run natively; a missing extension never reaches the native op.
+    expected_copies = {"device": 1, "fragmented": pages.numel(), "unavailable": 0}
+    assert calls.copies == expected_copies[fallback]
     assert torch.equal(result[0].cpu(), expected[pages])
 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
-@pytest.mark.parametrize("runs", [3, 4, 5])
-def test_few_run_limit_and_many_run_fallback(dtype, runs):
+@pytest.mark.parametrize("runs", [3, 5, 7])
+def test_every_run_uses_native_copy(dtype, runs):
     expected, source, _, _ = history(dtype, "raw_hostalloc")
     state = HostQSAKV(
         384,
@@ -205,7 +209,7 @@ def test_few_run_limit_and_many_run_fallback(dtype, runs):
     with Calls() as calls:
         result = state.stage_history(table, lengths, 131072)
     torch.accelerator.synchronize()
-    assert calls.copies == (runs if runs <= 4 else 0)
+    assert calls.copies == runs
     assert torch.equal(result[0].cpu(), expected[pages])
 
 

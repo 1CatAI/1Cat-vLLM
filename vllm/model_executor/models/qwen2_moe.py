@@ -78,6 +78,8 @@ from .utils import (
 logger = init_logger(__name__)
 
 _SM70_FUSED_SHARED_GATE_MAX_TOKENS = 16
+# One gate block per row: concurrent MTP4 verification up to 16 requests.
+_SM70_BATCH_SHARED_GATE_MAX_TOKENS = 80
 
 
 def _sm70_dump_qwen_mlp_tensor(
@@ -110,12 +112,13 @@ def _sm70_force_shared_expert_silu_custom_op(prefix: str) -> bool:
 def _sm70_fused_shared_expert_gate_shape_supported(
     x: torch.Tensor,
     out: torch.Tensor,
+    max_tokens: int = _SM70_FUSED_SHARED_GATE_MAX_TOKENS,
 ) -> bool:
-    """Shared shape gate; the fused dot remains M1-only at its call site."""
+    """Shared shape gate for the fused gate kernels (row bound per kernel)."""
     return bool(
         x.ndim == 2
         and out.ndim == 2
-        and 0 < x.shape[0] <= _SM70_FUSED_SHARED_GATE_MAX_TOKENS
+        and 0 < x.shape[0] <= max_tokens
         and out.shape[0] == x.shape[0]
         and x.shape[1] == 2560
         and out.shape[1] == 2560
@@ -223,8 +226,17 @@ class Qwen2MoeMLP(nn.Module):
         used_exact_gate = False
         if (
             self._sm70_exact_shared_expert_gate
-            and x.shape[0] == 1
-            and _sm70_fused_shared_expert_gate_shape_supported(x, out)
+            and (
+                x.shape[0] == 1
+                or (
+                    self._sm70_batch_shared_expert_gate
+                    and use_sm70_decode_graph_semantics()
+                    and x.shape[0] <= _SM70_BATCH_SHARED_GATE_MAX_TOKENS
+                )
+            )
+            and _sm70_fused_shared_expert_gate_shape_supported(
+                x, out, _SM70_BATCH_SHARED_GATE_MAX_TOKENS
+            )
         ):
             from vllm import _sm70_ops as sm70_ops
 
