@@ -474,6 +474,7 @@ if TYPE_CHECKING:
     VLLM_V41_EMPTY_CACHE_TOKENS: str = "2048"
     VLLM_V41_ENGRAM_READERS: str | None = None
     VLLM_V41_EXACT_GEMM: str = "0"
+    VLLM_V41_EXPERT_DIET: str = "0"
     VLLM_V41_EXPERT_FAST: str = "0"
     VLLM_V41_EXPERT_FAST_HIT: str = "1"
     VLLM_V41_FP8_GEMV: str = "1"
@@ -7382,6 +7383,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
             " offsets (slower on SM70)."
         ),
         category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EXPERT_DIET": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_DIET", "0"),
+        description=(
+            "DS-V4.1 EXPERT_FAST kernels, instruction-diet variants (read"
+            " once by v41k.so itself): bit 1 = gate_up_fast runs"
+            " gate_up_diet, bit 2 = down_rows_fast runs down_rows_diet, bit"
+            " 4 = down_rows_diet keeps the activations in shared memory where"
+            " they fit (IQ1_M M <= 4, IQ2 M <= 2). Bitwise identical to the"
+            " fast kernels; only acts with VLLM_V41_EXPERT_FAST=1 and a v41k"
+            " build that has gate_up_diet / down_rows_diet."
+        ),
+        category="tuning",
         declared_default="'0'",
         effective_default="'0'",
         automatic_conditions=(),

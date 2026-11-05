@@ -252,6 +252,61 @@ __device__ __forceinline__ uint32_t ldg16(const uint8_t* p) {
   return __ldg(reinterpret_cast<const unsigned short*>(p));
 }
 
+// Weight loads. Weights are read once per layer; the activations are re-read
+// by every unit of their expert (down) or token (gate/up). L1::evict_first
+// still allocates the weight lines (the fields of one block share sectors)
+// but makes them the first victims, so they do not push the activations out
+// of L1. Non-volatile asm: ptxas schedules these like __ldg.
+__device__ __forceinline__ uint32_t ldw32(const void* p) {
+#if defined(__CUDA_ARCH__)
+  uint32_t v;
+  asm("ld.global.nc.L1::evict_first.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+#else
+  return *static_cast<const uint32_t*>(p);
+#endif
+}
+__device__ __forceinline__ uint32_t ldw16(const void* p) {
+#if defined(__CUDA_ARCH__)
+  unsigned short v;
+  asm("ld.global.nc.L1::evict_first.u16 %0, [%1];" : "=h"(v) : "l"(p));
+  return v;
+#else
+  return *static_cast<const unsigned short*>(p);
+#endif
+}
+__device__ __forceinline__ uint32_t ldw8(const void* p) {
+#if defined(__CUDA_ARCH__)
+  unsigned short v;
+  asm("ld.global.nc.L1::evict_first.u8 %0, [%1];" : "=h"(v) : "l"(p));
+  return v;
+#else
+  return *static_cast<const uint8_t*>(p);
+#endif
+}
+__device__ __forceinline__ uint2 ldw64(const void* p) {
+#if defined(__CUDA_ARCH__)
+  uint2 v;
+  asm("ld.global.nc.L1::evict_first.v2.u32 {%0, %1}, [%2];"
+      : "=r"(v.x), "=r"(v.y)
+      : "l"(p));
+  return v;
+#else
+  return *static_cast<const uint2*>(p);
+#endif
+}
+
+// Prefetch the line holding p into L1 (CCTL.E.PF1 on sm_70): no register,
+// no wait. Activations are prefetched one unit ahead so their loads hit L1
+// instead of exposing L2 / DRAM latency at every K block.
+__device__ __forceinline__ void prefetch_l1(const void* p) {
+#if defined(__CUDA_ARCH__)
+  asm volatile("prefetch.global.L1 [%0];" ::"l"(p));
+#else
+  (void)p;
+#endif
+}
+
 // Raw fields of the 9 K blocks of one (row, sub) of a 2304-wide down row,
 // loaded block by block so the next unit's loads can replace the current
 // unit's as soon as each block is decoded. Ptr holds the per-row base
@@ -294,10 +349,10 @@ struct DnRaw<16> {
   __device__ __forceinline__ void set(const Ptr& p) { a = p.a; }
   __device__ __forceinline__ void load(int j, const Ptr& p) {
     const uint32_t* q = p.words(j);
-    x[j][0] = __ldg(q);
-    x[j][1] = __ldg(q + 1);
-    x[j][2] = __ldg(q + 2);
-    dh[j] = ldg16(p.row + 66 * j);
+    x[j][0] = ldw32(q);
+    x[j][1] = ldw32(q + 1);
+    x[j][2] = ldw32(q + 2);
+    dh[j] = ldw16(p.row + 66 * j);
   }
   __device__ __forceinline__ void decode(int j, const uint32_t* book,
                                          uint32_t lg, uint32_t ls, int,
@@ -325,11 +380,11 @@ struct DnRaw<17> {
   __device__ __forceinline__ void set(const Ptr& p) { a = p.a; }
   __device__ __forceinline__ void load(int j, const Ptr& p) {
     const uint32_t* q = p.words(j);
-    x[j][0] = __ldg(q);
-    x[j][1] = __ldg(q + 1);
-    x[j][2] = __ldg(q + 2);
-    dh[j] = ldg16(p.row + 74 * j);
-    sc[j] = __ldg(p.scp + 74 * j);
+    x[j][0] = ldw32(q);
+    x[j][1] = ldw32(q + 1);
+    x[j][2] = ldw32(q + 2);
+    dh[j] = ldw16(p.row + 74 * j);
+    sc[j] = ldw8(p.scp + 74 * j);
   }
   __device__ __forceinline__ void decode(int j, const uint32_t* book,
                                          uint32_t, uint32_t ls, int,
@@ -357,9 +412,9 @@ struct DnRaw<29> {
   uint32_t qs[9], qh[9], s01[9], s23[9];
   __device__ __forceinline__ void set(const Ptr&) {}
   __device__ __forceinline__ void load(int j, const Ptr& p) {
-    qs[j] = __ldg(reinterpret_cast<const uint32_t*>(p.qsp + 56 * j));
-    qh[j] = ldg16(p.qhp + 56 * j);
-    const uint2 sc = __ldg(reinterpret_cast<const uint2*>(p.row + 56 * j + 48));
+    qs[j] = ldw32(p.qsp + 56 * j);
+    qh[j] = ldw16(p.qhp + 56 * j);
+    const uint2 sc = ldw64(p.row + 56 * j + 48);
     s01[j] = sc.x;
     s23[j] = sc.y;
   }
@@ -396,6 +451,20 @@ __device__ __forceinline__ int act_rank(int j, int sub) {
   return lo[j] + int((j == 2 || j == 4 || j == 6) && sub >= j);
 }
 
+// Activations of route rt (hq 576 B and hd 72 B in each of the 4 rank slots)
+// into L1, one line per lane: lane = slot * 8 + k, k = 0..4 the hq lines from
+// its first byte, 5 its last byte, 6 / 7 the first / last hd byte. Every
+// address is inside the route's own bytes.
+template <int RS, int QB>
+__device__ __forceinline__ void dn_prefetch_route(const uint8_t* gathered,
+                                                  int rt, int lane) {
+  const int k = lane & 7;
+  const int off = k < 5    ? rt * 576 + 128 * k
+                  : k == 5 ? rt * 576 + 575
+                           : QB + rt * 72 + (k == 6 ? 0 : 71);
+  prefetch_l1(gathered + (lane >> 3) * RS + off);
+}
+
 // Row-split down, same contract as down_rows (see v41k.cu) for M tokens x
 // top-6 routes: rows [row_base, row_base + rows_local) of out are written,
 // the other ranks' rows zeroed. 16 rows per CTA (grid = rows_local / 16 = 80,
@@ -404,7 +473,9 @@ __device__ __forceinline__ int act_rank(int j, int sub) {
 // s + 8 j. Each block is decoded once; member 0 of the expert always runs,
 // members 1..5 behind a warp-uniform early exit. Units are claimed
 // dynamically one ahead, and the next unit's raw blocks are loaded into the
-// registers of the current unit's blocks right after each is decoded.
+// registers of the current unit's blocks right after each is decoded; the
+// next unit's member activations are prefetched into L1 when it is claimed
+// (each route belongs to one expert, so they are never already there).
 constexpr int kDnRows = 16, kDnWarps = 16;
 
 template <int Type, int M>
@@ -440,6 +511,12 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
   DnRaw<Type> raw;
   using Ptr = typename DnRaw<Type>::Ptr;
   if (u < units) {
+    const int q0 = u >> 2, c0 = __ldg(plan + 37 + q0);
+#pragma unroll
+    for (int c = 0; c < 6; ++c) {
+      if (c >= c0) break;
+      dn_prefetch_route<RS, QB>(gathered, __ldg(plan + 73 + 6 * q0 + c), lane);
+    }
     const Ptr p0(down + (int64_t(__ldg(plan + 1 + (u >> 2))) * rows_local +
                          row0 + (u & 3) * 4 + r4) *
                             row_stride,
@@ -472,6 +549,14 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
     if (lane == 0) nxt = atomicAdd(&s_next, 1);
     nxt = __shfl_sync(0xffffffffU, nxt, 0);
     const bool more = nxt < units;
+    if (more) {
+      const int qn = nxt >> 2, cn = s_cnt[qn];
+#pragma unroll
+      for (int c = 0; c < 6; ++c) {
+        if (c >= cn) break;
+        dn_prefetch_route<RS, QB>(gathered, s_route[qn][c], lane);
+      }
+    }
     Ptr np(down + (more ? (int64_t(s_e[nxt >> 2]) * rows_local + row0 +
                            (nxt & 3) * 4 + r4) *
                               row_stride

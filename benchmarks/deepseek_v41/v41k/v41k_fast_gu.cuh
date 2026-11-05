@@ -13,7 +13,11 @@
 // half rounding, q8_warp_aligned) is the old code. Only the decode differs:
 // PRMT selectors over the bank-replicated fast table (v41k_fast.cuh, proved
 // equal to Group3 for every code), filled once per CTA while the first
-// weights are in flight, and weights loaded two steps ahead.
+// weights are in flight, and weights loaded two steps ahead. Memory hints
+// that do not touch values: weights are loaded L1::evict_first and the next
+// unit's member activations are prefetched into L1, so activation loads hit
+// L1 instead of exposing L2 latency at every step (the limit measured on
+// down_rows_fast before the same change).
 //
 // Included by v41k.cu after v41k::load_q8 and v41k::q8_warp_aligned.
 #pragma once
@@ -39,9 +43,9 @@ struct GuRaw<29> {  // IQ1_M, 56-byte blocks; a step advances 112 bytes
   };
   uint32_t qs, qh, s01, s23;
   __device__ __forceinline__ void load(const Ptr& p, int i) {
-    qs = __ldg(reinterpret_cast<const uint32_t*>(p.qsp + 112 * i));
-    qh = ldg16(p.qhp + 112 * i);
-    const uint2 sc = __ldg(reinterpret_cast<const uint2*>(p.scp + 112 * i));
+    qs = ldw32(p.qsp + 112 * i);
+    qh = ldw16(p.qhp + 112 * i);
+    const uint2 sc = ldw64(p.scp + 112 * i);
     s01 = sc.x;
     s23 = sc.y;
   }
@@ -75,10 +79,10 @@ struct GuRaw<16> {  // IQ2_XXS, 66-byte blocks; a step advances 132 bytes
   using Ptr = GuPtrIQ2<66>;
   uint32_t x0, x1, x2, dh;
   __device__ __forceinline__ void load(const Ptr& p, int i) {
-    x0 = __ldg(p.pw + 33 * i);
-    x1 = __ldg(p.pw + 33 * i + 1);
-    x2 = __ldg(p.pw + 33 * i + 2);
-    dh = ldg16(p.dp + 132 * i);
+    x0 = ldw32(p.pw + 33 * i);
+    x1 = ldw32(p.pw + 33 * i + 1);
+    x2 = ldw32(p.pw + 33 * i + 2);
+    dh = ldw16(p.dp + 132 * i);
   }
   __device__ __forceinline__ void decode(const uint32_t* book, uint32_t lg,
                                          uint32_t ls, uint32_t sh,
@@ -102,11 +106,11 @@ struct GuRaw<17> {  // IQ2_XS, 74-byte blocks; a step advances 148 bytes
   };
   uint32_t x0, x1, x2, dh, sc;
   __device__ __forceinline__ void load(const Ptr& p, int i) {
-    x0 = __ldg(p.pw + 37 * i);
-    x1 = __ldg(p.pw + 37 * i + 1);
-    x2 = __ldg(p.pw + 37 * i + 2);
-    dh = ldg16(p.dp + 148 * i);
-    sc = __ldg(p.scp + 148 * i);
+    x0 = ldw32(p.pw + 37 * i);
+    x1 = ldw32(p.pw + 37 * i + 1);
+    x2 = ldw32(p.pw + 37 * i + 2);
+    dh = ldw16(p.dp + 148 * i);
+    sc = ldw8(p.scp + 148 * i);
   }
   __device__ __forceinline__ void decode(const uint32_t* book, uint32_t,
                                          uint32_t ls, uint32_t sh,
@@ -134,10 +138,32 @@ __device__ __forceinline__ GuUnit gu_unit(const int* __restrict__ plan,
   return g;
 }
 
+// Q8 activations of a unit's member tokens (xq 5120 B, xd 640 B each) into
+// L1, one line per thread: t = 47 c + k, k = 0..39 the xq lines from its first
+// byte, 40 its last byte, 41..45 the xd lines, 46 its last byte. Threads past
+// 47 cnt do nothing; every address is inside the token's own bytes.
+__device__ __forceinline__ void gu_prefetch(const GuUnit& g,
+                                            const int8_t* xq, const float* xd,
+                                            int t) {
+  const int c = t / 47, k = t - 47 * c;
+  if (c >= g.cnt) return;
+  int base = g.tok[0];  // select tok[c] without a dynamic register index
+#pragma unroll
+  for (int i = 1; i < 6; ++i) base = c == i ? g.tok[i] : base;
+  const char* q = reinterpret_cast<const char*>(xq) + int64_t(base) * 32;
+  const char* d = reinterpret_cast<const char*>(xd + base);
+  prefetch_l1(k < 40    ? q + 128 * k
+              : k == 40 ? q + 5119
+              : k < 46  ? d + 128 * (k - 41)
+                        : d + 639);
+}
+
 // Persistent: gridDim.x CTAs (one per SM) walk units = (distinct expert u,
 // 32-row slab) round-robin, unit = blockIdx.x + k gridDim.x < 18 nu. The
 // table is filled once per CTA. Weights are loaded two steps ahead (even /
 // odd raw sets); the last two steps of a unit load the next unit's first two.
+// The next unit's member activations are prefetched into L1 when the unit
+// starts, the first unit's with its first weights.
 template <int Type>
 __global__ void __launch_bounds__(512, 1)
     gate_up_fast(int8_t* __restrict__ hq, float* __restrict__ hd,
@@ -169,6 +195,7 @@ __global__ void __launch_bounds__(512, 1)
   pu.pin();
   Raw ga, ua, gb, ub;  // steps 2k / 2k + 1
   if constexpr (Type == 29) ga.sub = ua.sub = gb.sub = ub.sub = sub;
+  gu_prefetch(cur, xq, xd, t);
   ga.load(pg, 0);  // in flight while the table is filled
   ua.load(pu, 0);
   gb.load(pg, 1);
@@ -185,6 +212,7 @@ __global__ void __launch_bounds__(512, 1)
     const int nunit = unit + int(gridDim.x);
     const bool more = nunit < units;
     const GuUnit nxt = more ? gu_unit(plan, nunit) : cur;
+    if (more) gu_prefetch(nxt, xq, xd, t);
     float gs[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     float us[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     auto step = [&](Raw& rg, Raw& ru, int i, int ahead) {
