@@ -1352,7 +1352,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
                 )
         logger.debug("Replaced %s patterns", self.matched_count)
         if getattr(self, "sm70_mode", False):
-            logger.info(
+            logger.debug(
                 "SM70 TP%d allreduce-Gemma-RMS fusion replaced %d patterns.",
                 self.tp_size,
                 self.matched_count,

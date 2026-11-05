@@ -433,7 +433,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     torch.accelerator.memory_allocated(),
                     torch.accelerator.memory_reserved(),
                 )
-                logger.info(
+                logger.debug(
                     "Target CUDA storage before speculative loading: %s",
                     loaded_cuda_model_storage({"target": self.model}),
                 )
