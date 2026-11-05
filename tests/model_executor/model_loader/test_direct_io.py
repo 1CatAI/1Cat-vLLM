@@ -22,7 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal
-from vllm.model_executor.models.utils import PPMissingLayer
+from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
 
 
 def _checkpoint(path) -> dict[str, torch.Tensor]:
@@ -330,7 +330,7 @@ def test_ambiguous_stage_ranges_raise():
 
 
 def test_missing_module_filter_matches_only_the_named_modules():
-    missing = missing_module_filter({"embed_tokens", "norm"}, {"lm_head"})
+    missing = missing_module_filter({"embed_tokens", "norm"}, {"lm_head"}, set())
     # Multimodal (GLM-5.3), Llama-style and DeepSeek-V4 checkpoint layouts.
     assert missing("lm_head.weight")
     assert missing("lm_head.weight_scale")
@@ -350,7 +350,17 @@ def test_missing_module_filter_matches_only_the_named_modules():
 
 def test_missing_module_filter_needs_a_module():
     with pytest.raises(ValueError, match="at least one module"):
-        missing_module_filter(set(), set())
+        missing_module_filter(set(), set(), set())
+
+
+def test_missing_module_filter_matches_encoder_towers():
+    missing = missing_module_filter(set(), set(), {"visual"})
+    # GLM-5.3 / Qwen-VL layouts with and without the outer `model.`.
+    assert missing("model.visual.blocks.0.attn.qkv.weight")
+    assert missing("visual.merger.proj.weight")
+    assert not missing("model.language_model.layers.0.mlp.weight")
+    assert not missing("lm_head.weight")
+    assert not missing("model.visual_proj.weight")
 
 
 class _StageStack(_Stack):
@@ -369,9 +379,12 @@ class _StageLanguageModel(nn.Module):
 
 
 class _StageMultimodal(nn.Module, SupportsMultiModal):
-    def __init__(self, start: int, end: int, embedding: bool):
+    def __init__(self, start: int, end: int, embedding: bool, tower: bool = True):
         super().__init__()
-        self.visual = nn.Sequential(nn.LayerNorm(2))
+        tower_module = nn.Sequential(nn.LayerNorm(2))
+        self.visual = (
+            tower_module if tower else StageMissingLayer("vision_tower", tower_module)
+        )
         self.language_model = _StageLanguageModel(start, end, embedding)
 
     def get_language_model(self):
@@ -381,29 +394,41 @@ class _StageMultimodal(nn.Module, SupportsMultiModal):
 _EMBED = "model.language_model.embed_tokens.weight"
 _NORM = "model.language_model.norm.weight"
 _HEAD = "lm_head.weight"
+_TOWER = "model.visual.0.weight"
 
 
 @pytest.mark.parametrize(
-    "start,end,embedding,skipped",
+    "start,end,embedding,tower,skipped",
     [
-        (0, 4, True, {_NORM, _HEAD}),
-        (4, 8, False, {_EMBED, _NORM, _HEAD}),
-        (8, 12, False, {_EMBED}),
+        (0, 4, True, True, {_NORM, _HEAD}),
+        (4, 8, False, True, {_EMBED, _NORM, _HEAD}),
+        (8, 12, False, True, {_EMBED}),
         # A last stage that keeps a replica of the embedding (DFlash drafts
         # on GLM-5.3) reads it.
-        (8, 12, True, set()),
+        (8, 12, True, True, set()),
+        # Stages that do not run the encoder build no tower (Model Runner V2,
+        # or --limit-mm-per-prompt 0).
+        (4, 8, False, False, {_EMBED, _NORM, _HEAD, _TOWER}),
+        (0, 12, True, False, {_TOWER}),
     ],
-    ids=["first", "middle", "last", "last_with_embedding"],
+    ids=[
+        "first",
+        "middle",
+        "last",
+        "last_with_embedding",
+        "middle_without_tower",
+        "single_stage_without_tower",
+    ],
 )
-def test_missing_module_filter_follows_the_stage(start, end, embedding, skipped):
+def test_missing_module_filter_follows_the_stage(start, end, embedding, tower, skipped):
     names = {
         _EMBED,
         _NORM,
         _HEAD,
+        _TOWER,
         "model.language_model.layers.5.mlp.weight",
-        "model.visual.0.weight",
     }
-    missing = _missing_module_filter(_StageMultimodal(start, end, embedding))
+    missing = _missing_module_filter(_StageMultimodal(start, end, embedding, tower))
     if missing is None:
         assert skipped == set()
     else:

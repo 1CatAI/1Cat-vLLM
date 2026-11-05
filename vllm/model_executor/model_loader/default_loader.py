@@ -95,34 +95,43 @@ def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
 
 def _missing_module_filter(model: nn.Module) -> Callable[[str], bool] | None:
     """Predicate for the tensors of the modules around the decoder stack that
-    this pipeline stage leaves out (PPMissingLayer: the embedding on every
-    stage but the first, the final norm and the LM head on every stage but the
-    last), or None when it holds all of them. The model drops such a tensor
-    only after the loader has read it and run it through weight transforms
-    (MXFP8 dequantization of a whole LM head on the CPU), so it is skipped
-    before it is read."""
-    from vllm.model_executor.models.utils import PPMissingLayer
+    this pipeline stage leaves out, or None when it holds all of them:
+    PPMissingLayer stands for the embedding on every stage but the first, for
+    the final norm and the LM head on every stage but the last;
+    StageMissingLayer for an encoder tower on the stages that do not run it
+    (all of them when its modalities are disabled). The model drops such a
+    tensor only after the loader has read it and run it through weight
+    transforms (MXFP8 dequantization of a whole LM head on the CPU), so it is
+    skipped before it is read."""
+    from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
 
     def missing_children(module: nn.Module) -> set[str]:
         return {
             name
             for name, child in module.named_children()
-            if isinstance(child, PPMissingLayer)
+            if isinstance(child, (PPMissingLayer, StageMissingLayer))
         }
 
     stack_modules: set[str] = set()
     for stack, _, _ in _partial_decoder_stacks(model):
         stack_modules |= missing_children(stack)
-    language_model_modules = missing_children(_decoder_root(model))
-    if not stack_modules and not language_model_modules:
+    language_model = _decoder_root(model)
+    language_model_modules = missing_children(language_model)
+    multimodal_modules = (
+        missing_children(model) if language_model is not model else set()
+    )
+    if not stack_modules and not language_model_modules and not multimodal_modules:
         return None
     logger.info(
         "This pipeline stage skips the checkpoint tensors of the modules it "
-        "does not hold: decoder stack %s, language model %s",
+        "does not hold: decoder stack %s, language model %s, multimodal model %s",
         sorted(stack_modules),
         sorted(language_model_modules),
+        sorted(multimodal_modules),
     )
-    return missing_module_filter(stack_modules, language_model_modules)
+    return missing_module_filter(
+        stack_modules, language_model_modules, multimodal_modules
+    )
 
 
 class DefaultModelLoader(BaseModelLoader):
