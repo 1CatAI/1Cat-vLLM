@@ -78,8 +78,23 @@ def get_parallel_draft_model(vllm_config: VllmConfig, model_tag: str) -> nn.Modu
             else vllm_config.cache_config
         ),
     )
+    if speculative_config.moe_backend is not None:
+        # As the V1 proposer (_create_draft_vllm_config) and MRV2 Eagle do.
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            kernel_config=replace(
+                draft_vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            ),
+        )
     with set_model_tag(model_tag):
-        return get_model(vllm_config=draft_vllm_config, model_config=draft_model_config)
+        # A drafter can use another load format than the target (a GGUF target
+        # with a safetensors drafter); None keeps the target's load config.
+        return get_model(
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
+        )
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:

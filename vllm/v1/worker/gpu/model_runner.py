@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -97,6 +98,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
+    DummyPositions,
     InputBatch,
     InputBuffers,
     combine_sampled_and_draft_tokens,
@@ -115,6 +117,7 @@ from vllm.v1.worker.gpu.kv_connector import (
 from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.model_states.deepseek_v41 import DeepseekV41ModelState
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -268,6 +271,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
             device=self.device,
+            dummy_positions=self._dummy_positions(),
         )
         if self.use_pp:
             self.pp_handler = PPHandler(
@@ -336,6 +340,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+        # (pp_before_forward, pp_after_forward), set by load_model.
+        self._pp_stage_hooks: tuple[Any, Any] | None = None
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
 
@@ -474,6 +480,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        self._pp_stage_hooks = self._resolve_pp_stage_hooks()
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model)
         eplb_models_added |= self.eplb.maybe_register_model(
@@ -495,6 +502,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         get_offloader().post_init()
+
+    def _resolve_pp_stage_hooks(self) -> tuple[Any, Any] | None:
+        """Stage hooks of a model whose per-step state lives on a first PP
+        stage that never samples (DeepSeek-V4.1: models/deepseek_v41/
+        pp_commit.py). The V1 runner calls the same hooks
+        (_pp_stage_before_forward / _pp_stage_after_forward)."""
+        if not (self.use_pp and self.is_first_pp_rank and not self.is_last_pp_rank):
+            return None
+        if self.model_config.hf_text_config.model_type != "deepseek_v41_text":
+            return None
+        before = getattr(self.model, "pp_before_forward", None)
+        after = getattr(self.model, "pp_after_forward", None)
+        if before is None or after is None:
+            raise ValueError(
+                "DeepSeek-V4.1 under Model Runner V2 with pipeline parallel "
+                "needs the model's pp_before_forward / pp_after_forward hooks."
+            )
+        logger.info(
+            "DeepSeek-V4.1 Model Runner V2: first-stage commit hooks active "
+            "(pp_before_forward / pp_after_forward around each forward)."
+        )
+        return before, after
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -522,6 +551,54 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def main_stream(self) -> torch.cuda.Stream:
         # Cache the default CUDA stream to avoid lookup overhead.
         return torch.cuda.current_stream(self.device)
+
+    def _dummy_positions(self) -> DummyPositions:
+        """Positions of this runner's dummy and capture batches.
+
+        DeepSeek-V4.1's first stage hashes the batch as one token chain
+        (Engram, _hash_request traps otherwise), so its dummy batches carry
+        0..n-1 as in the V1 runner's _dummy_run; upstream MRV2 zeroes them.
+        Every other model keeps the zeros.
+        """
+        if self.model_config.hf_text_config.model_type != "deepseek_v41_text":
+            return DummyPositions.ZEROS
+        if self.max_num_tokens > self.max_model_len:
+            # V1 wraps at max_model_len; a wrapped batch is not one chain.
+            raise ValueError(
+                "DeepSeek-V4.1 under Model Runner V2 needs "
+                f"max_num_batched_tokens ({self.max_num_tokens}) <= "
+                f"max_model_len ({self.max_model_len}): its dummy batches "
+                "are one token chain."
+            )
+        logger.info_once(
+            "DeepSeek-V4.1 Model Runner V2: dummy and capture batches use "
+            "positions 0..n-1 (one token chain), as in the V1 runner.",
+            scope="local",
+        )
+        return DummyPositions.CHAIN
+
+    def _target_graph_query_len(self) -> int:
+        """Query length that target CUDA graph sizes are rounded to.
+
+        DeepSeek-V4.1 reads its token count from the positions shape, so its
+        single-request graphs must be exact (M1..6), as in the V1 runner
+        (gpu_model_runner.py, graph_query_len). Every other model keeps the
+        uniform decode query length.
+        """
+        if (
+            self.model_config.hf_text_config.model_type == "deepseek_v41_text"
+            and self.max_num_reqs == 1
+            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+            and not self.compilation_config.pass_config.enable_sp
+        ):
+            logger.info_once(
+                "DeepSeek-V4.1 Model Runner V2: exact single-request target "
+                "graph sizes (query length 1, not %d), as in the V1 runner.",
+                self.uniform_decode_query_len,
+                scope="local",
+            )
+            return 1
+        return self.uniform_decode_query_len
 
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
@@ -600,10 +677,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
         )
+        graph_query_len = self._target_graph_query_len()
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             attn_cg_support.min_cg_support,
             attn_cg_support.min_cg_attn_backend,
-            self.uniform_decode_query_len,
+            graph_query_len,
             self.parallel_config.tensor_parallel_size,
             self.kv_cache_config,
             self.max_num_reqs,
@@ -612,7 +690,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             self.device,
             cudagraph_mode,
-            decode_query_len=self.decode_query_len,
+            decode_query_len=graph_query_len,
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1701,37 +1779,62 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         mtp_target_start = self._step_profiler.start_context(mtp_profile_ctx)
 
-        # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            assert self.cudagraph_manager is not None
-            batch_desc = self.cudagraph_manager.select_attention_graph(
-                batch_desc, input_batch.seq_lens_cpu_upper_bound
-            )
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-        else:
-            # For piecewise and eager mode, just call model().
-            batch_descriptor = BatchDescriptor(
-                num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
-            )
+        stage_hooks = None if dummy_run else self._pp_stage_hooks
+        if stage_hooks is not None:
+            # Commit the previous forward's deferred count if its sampled
+            # counts never reached this stage (pp_commit.StageCommit).
+            stage_num_reqs = input_batch.num_reqs
+            stage_req_ids = input_batch.req_ids[:stage_num_reqs]
+            stage_num_computed = input_batch.num_computed_tokens_np[
+                :stage_num_reqs
+            ].tolist()
+            stage_hooks[0](stage_req_ids, stage_num_computed)
 
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
-                batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-            ):
+        # Only V4.1 owns this runtime binding. Capture uses a separate path.
+        with (
+            self.model_state.prefill_skip_context(
+                input_batch, self.req_states, batch_desc.cg_mode
+            )
+            if isinstance(self.model_state, DeepseekV41ModelState)
+            else nullcontext()
+        ):
+            # Run model.
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Use explicit cudagraph replay for FULL mode.
+                # NOTE(woosuk): Here, we don't need to pass the input tensors,
+                # because they are already copied to the CUDA graph input buffers.
+                assert self.cudagraph_manager is not None
+                batch_desc = self.cudagraph_manager.select_attention_graph(
+                    batch_desc, input_batch.seq_lens_cpu_upper_bound
+                )
                 self.kv_connector.pre_forward(scheduler_output)
-                model_output = self.model(**model_inputs)
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            else:
+                # For piecewise and eager mode, just call model().
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                )
 
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                ):
+                    self.kv_connector.pre_forward(scheduler_output)
+                    model_output = self.model(**model_inputs)
+        if stage_hooks is not None:
+            # A prefill commits now; a decode arms for its sampled counts.
+            stage_hooks[1](
+                stage_req_ids,
+                stage_num_computed,
+                input_batch.prefill_len_np[:stage_num_reqs].tolist(),
+            )
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
         self._step_profiler.finish_context(

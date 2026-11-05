@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import enum
 from dataclasses import dataclass
 
 import numpy as np
@@ -9,16 +10,30 @@ from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 
 
+class DummyPositions(enum.Enum):
+    """Positions that dummy (profile, warmup and capture) batches carry."""
+
+    # Upstream MRV2: all zeros.
+    ZEROS = "zeros"
+    # 0..n-1, one token chain, as the V1 runner's _dummy_run writes them
+    # (gpu_model_runner.py). DeepSeek-V4.1's Engram hash traps on any batch
+    # whose positions are not positions[0] + t (deepseek_v41_engram.py,
+    # _hash_request).
+    CHAIN = "chain"
+
+
 class InputBuffers:
     def __init__(
         self,
         max_num_reqs: int,
         max_num_tokens: int,
         device: torch.device,
+        dummy_positions: DummyPositions = DummyPositions.ZEROS,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_num_tokens = max_num_tokens
         self.device = device
+        self.dummy_positions = dummy_positions
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
@@ -148,7 +163,12 @@ class InputBatch:
         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
-        positions = input_buffers.positions[:num_tokens].zero_()
+        positions = input_buffers.positions[:num_tokens]
+        if input_buffers.dummy_positions is DummyPositions.CHAIN:
+            # In place: a captured graph reads this persistent buffer.
+            torch.arange(num_tokens, out=positions)
+        else:
+            positions.zero_()
 
         logits_indices = query_start_loc[1:] - 1
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
