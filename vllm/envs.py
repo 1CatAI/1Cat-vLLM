@@ -504,6 +504,10 @@ if TYPE_CHECKING:
     VLLM_V41_PRED_STATS: str = "0"
     VLLM_V41_PREFETCH: str = "0"
     VLLM_V41_PREFETCH_EVAL: str | None = None
+    VLLM_V41_PREFILL_IQ_GEMM: str = "0"
+    VLLM_V41_PREFILL_IQ_TILES: str = "1,1,1,1,1,1"
+    VLLM_V41_PREFILL_IQ_GRID: str = "160"
+    VLLM_V41_PREFILL_IQ_OBSERVE: str = "0"
     VLLM_V41_PREFILL_DMA: str = "1"
     VLLM_V41_PREFILL_GROUP: str | None = None
     VLLM_V41_PREFILL_TIMING: str = "0"
@@ -1436,6 +1440,62 @@ def _resolve_rust_frontend_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_V41_PREFILL_IQ_GEMM": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_IQ_GEMM", "0"),
+        description=(
+            "DS-V4.1 prefill (more than 6 rows): 1 = the routed-expert IQ1_M,"
+            " IQ2_XXS and IQ2_XS GEMMs run on the v41prefmoe SM70 grouped kernel"
+            " (benchmarks/deepseek_v41/v41prefmoe); 0 = the existing grouped"
+            " prefill GEMM. Decode never enters it."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_IQ_TILES": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_IQ_TILES", "1,1,1,1,1,1"),
+        description=(
+            "DS-V4.1 prefill IQ GEMM: six tile ids 0..5 for IQ1_M gate/up and"
+            " down, IQ2_XXS gate/up and down, IQ2_XS gate/up and down; frozen at"
+            " load. Read only with VLLM_V41_PREFILL_IQ_GEMM=1."
+        ),
+        category="tuning",
+        declared_default="'1,1,1,1,1,1'",
+        effective_default="'1,1,1,1,1,1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_IQ_GRID": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_IQ_GRID", "160"),
+        description=(
+            "DS-V4.1 prefill IQ GEMM launch: 0 = one block per output tile;"
+            " 80 or 160 = a persistent grid of that many blocks."
+        ),
+        category="tuning",
+        declared_default="'160'",
+        effective_default="'160'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_IQ_OBSERVE": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_IQ_OBSERVE", "0"),
+        description=(
+            "DS-V4.1 prefill: 1 = log one descriptor line per grouped expert GEMM"
+            " (shapes and per-expert row counts, no activations) on the existing"
+            " kernel; refused together with VLLM_V41_PREFILL_IQ_GEMM=1."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_SM70_E4M3_LONG_ATTENTION": env_var(
         lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION"),
         description=(
@@ -20322,6 +20382,10 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PRED_STATS",
         "VLLM_V41_PREFETCH",
         "VLLM_V41_PREFETCH_EVAL",
+        "VLLM_V41_PREFILL_IQ_GEMM",
+        "VLLM_V41_PREFILL_IQ_TILES",
+        "VLLM_V41_PREFILL_IQ_GRID",
+        "VLLM_V41_PREFILL_IQ_OBSERVE",
         "VLLM_V41_PREFILL_DMA",
         "VLLM_V41_PREFILL_GROUP",
         "VLLM_V41_PREFILL_TIMING",

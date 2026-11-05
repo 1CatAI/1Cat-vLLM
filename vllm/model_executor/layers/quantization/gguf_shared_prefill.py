@@ -197,6 +197,17 @@ _EXACT_GEMM = envs.VLLM_V41_EXACT_GEMM == "1"
 # startup profile run); later passes reuse the measured family.
 _TUNE_PASSES = int(envs.VLLM_V41_TUNE_PREFILL_PASSES)
 
+_PREFILL_IQ_VALUE = envs.VLLM_V41_PREFILL_IQ_GEMM
+if _PREFILL_IQ_VALUE not in ("0", "1"):
+    raise ValueError("VLLM_V41_PREFILL_IQ_GEMM requires 0 or 1")
+_PREFILL_IQ = _PREFILL_IQ_VALUE == "1"
+_PREFILL_IQ_OBSERVE_VALUE = envs.VLLM_V41_PREFILL_IQ_OBSERVE
+if _PREFILL_IQ_OBSERVE_VALUE not in ("0", "1"):
+    raise ValueError("VLLM_V41_PREFILL_IQ_OBSERVE requires 0 or 1")
+_PREFILL_IQ_OBSERVE = _PREFILL_IQ_OBSERVE_VALUE == "1"
+if _PREFILL_IQ and _PREFILL_IQ_OBSERVE:
+    raise ValueError("Descriptor census and candidate measurement are separate modes")
+
 
 class _DeviceView:
     """Zero-copy torch view of a raw device allocation."""
@@ -864,6 +875,17 @@ class SharedOriginalPrefill:
             (f, min(self.tile_experts, spec.experts - f))
             for f in range(0, spec.experts, self.tile_experts)
         ]
+        iq = None
+        if _PREFILL_IQ_OBSERVE and x.shape[0] > 6:
+            from .gguf_prefill_iq_observe import ObservedBaseline
+
+            iq = ObservedBaseline(self.cache.layers[layer], self.cache.rank, x.shape[0])
+        if _PREFILL_IQ and x.shape[0] > 6:
+            from .gguf_prefill_iq import IqPrefill
+
+            if not self.rows_mode:
+                raise ValueError("Prefill IQ requires TP4 row-split down")
+            iq = IqPrefill(x.shape[0], maximum, x.device)
         host_offsets = [o.tolist() for _, _, o, *_ in routes] if _EXACT_GEMM else None
         tune = self.tuned_passes < _TUNE_PASSES
         ring = self.dma and self.ring
@@ -915,20 +937,36 @@ class SharedOriginalPrefill:
                     lo, hi, rel = 0, count, bounds
                 fmt = info["gu"]
                 self._sub("gu")
-                torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
-                    projection[lo:hi],
-                    x,
-                    rel,
-                    *(t[: expert_count * 16] for t in tables["gu"]),
-                    fmt[0],
-                    fmt[1],
-                    2 * info["rows"],
-                    expert_count,
-                    fmt[2],
-                    False,
-                    tune,
-                    rows[lo:hi],
-                )
+                if iq is not None:
+                    iq.gemm(
+                        projection[lo:hi],
+                        x,
+                        rel,
+                        *(t[: expert_count * 16] for t in tables["gu"]),
+                        fmt[0],
+                        fmt[1],
+                        2 * info["rows"],
+                        expert_count,
+                        fmt[2],
+                        False,
+                        tune,
+                        rows[lo:hi],
+                    )
+                else:
+                    torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
+                        projection[lo:hi],
+                        x,
+                        rel,
+                        *(t[: expert_count * 16] for t in tables["gu"]),
+                        fmt[0],
+                        fmt[1],
+                        2 * info["rows"],
+                        expert_count,
+                        fmt[2],
+                        False,
+                        tune,
+                        rows[lo:hi],
+                    )
                 self._sub("act")
                 if self.rows_mode:
                     parity = self.rows_parity
@@ -987,20 +1025,36 @@ class SharedOriginalPrefill:
                     h = hidden[:count]  # type: ignore[index]
                 fmt = info["dn"]
                 self._sub("dn")
-                torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
-                    down[lo:hi],
-                    h[lo:hi],
-                    rel,
-                    *(t[: expert_count * 16] for t in tables["dn"]),
-                    fmt[0],
-                    fmt[1],
-                    out_n,
-                    expert_count,
-                    fmt[2],
-                    False,
-                    tune,
-                    None,
-                )
+                if iq is not None:
+                    iq.gemm(
+                        down[lo:hi],
+                        h[lo:hi],
+                        rel,
+                        *(t[: expert_count * 16] for t in tables["dn"]),
+                        fmt[0],
+                        fmt[1],
+                        out_n,
+                        expert_count,
+                        fmt[2],
+                        False,
+                        tune,
+                        None,
+                    )
+                else:
+                    torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
+                        down[lo:hi],
+                        h[lo:hi],
+                        rel,
+                        *(t[: expert_count * 16] for t in tables["dn"]),
+                        fmt[0],
+                        fmt[1],
+                        out_n,
+                        expert_count,
+                        fmt[2],
+                        False,
+                        tune,
+                        None,
+                    )
                 # Route probabilities were applied before the FP16 down input.
                 self._sub("accumulate")
                 _v41_prefill_accumulate[(last - first, triton.cdiv(out_n, 1024))](
