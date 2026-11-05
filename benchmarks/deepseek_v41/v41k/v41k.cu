@@ -2531,6 +2531,13 @@ __global__ void __launch_bounds__(256)
 
 }  // namespace v41k
 
+// DMV_X small-M Q5_K / Q8_0 dense (VLLM_V41_DMV_X); see gguf_dmv13_x.cuh.
+#include <cstdint>
+#include <vector>
+namespace v41k_dmvx {
+#include "sm70_turbomind/ops/gguf_dmv13_x.cuh"
+}  // namespace v41k_dmvx
+
 torch::Tensor v41k_table(int64_t type, torch::Device device) {
   int words = 0;
   if (type == 16)
@@ -3401,6 +3408,18 @@ void v41k_peer_gather(int64_t p0, int64_t p1, int64_t p2, int64_t p3,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void v41k_dmv13_x(torch::Tensor x, std::vector<torch::Tensor> codes,
+                  std::vector<torch::Tensor> high,
+                  std::vector<torch::Tensor> scale,
+                  std::vector<torch::Tensor> out, std::vector<int64_t> x_off,
+                  int64_t fmt, int64_t K, int64_t split, int64_t warps,
+                  int64_t acc, torch::Tensor ws, torch::Tensor cnt,
+                  int64_t probe) {
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  v41k_dmvx::dmv13_x_run(x, codes, high, scale, out, x_off, fmt, K, split,
+                         warps, acc, ws, cnt, probe);
+}
+
 void v41k_index_scores_decode(torch::Tensor out, torch::Tensor q,
                               torch::Tensor w, torch::Tensor keys,
                               torch::Tensor positions, int64_t heads,
@@ -3431,6 +3450,11 @@ TORCH_LIBRARY(v41k, m) {
       "flag_offset, "
       "Tensor(a!) epoch) -> ()",
       &v41k_peer_gather);
+  m.def(
+      "dmv13_x(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
+      "Tensor(a!)[] out, int[] x_off, int fmt, int K, int split, int warps, "
+      "int acc, Tensor(b!) ws, Tensor(c!) cnt, int probe) -> ()",
+      &v41k_dmv13_x);
   m.def(
       "gate_up7(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "
       "ids32, Tensor prob, "
