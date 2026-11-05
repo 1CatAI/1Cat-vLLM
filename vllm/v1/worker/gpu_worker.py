@@ -515,7 +515,6 @@ class Worker(WorkerBase):
             )
         self.model_runner.reload_weights(*args, **kwargs)
 
-    @torch.inference_mode()
     def _prefill_graph_reserve(self, activation_peak: int) -> int:
         """Graph pool bytes to keep out of the KV budget without the estimator.
 
@@ -546,6 +545,7 @@ class Worker(WorkerBase):
         )
         return max(0, activation_peak)
 
+    @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
