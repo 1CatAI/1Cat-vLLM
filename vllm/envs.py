@@ -493,6 +493,7 @@ if TYPE_CHECKING:
     VLLM_V41_HC_WINDOW: str = "2048"
     VLLM_V41_HITLOG_RELAXED: str = "1"
     VLLM_V41_INDEX_DECODE_BLOCKS: str = "8"
+    VLLM_V41_INDEX_REDUCE: str = "0"
     VLLM_V41_INDEX_TILE_MB: str = "64"
     VLLM_V41_INDEX_TOPK: str = "1"
     VLLM_V41_JOB_EVENTS: str | None = None
@@ -7582,6 +7583,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="'8'",
         effective_default="'8'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_INDEX_REDUCE": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_REDUCE", "0"),
+        description=(
+            "DS-V4.1 indexer INDEX_REDUCE: decode index scores are reduced across"
+            " the TP4 group over the live key prefix only, by a v41k IPC"
+            " kernel (custom all-reduce 1-stage numerics, graph-safe), instead"
+            " of a whole-store NCCL all-reduce. Needs TP4, a fully connected"
+            " custom all-reduce and a v41k build with index_reduce_live."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,

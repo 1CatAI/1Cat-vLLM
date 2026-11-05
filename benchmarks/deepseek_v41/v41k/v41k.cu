@@ -1726,6 +1726,78 @@ __global__ void __launch_bounds__(128 * WPD)
   }
 }
 
+// ---- INDEX_REDUCE: live-prefix TP4 reduce of decode index scores ---------------
+// Each rank's bank: kRedFlags bytes of per-CTA flags (CTA b, rank r at word
+// b * 4 + r), then that rank's FP16 partial scores [8][n_pad] (written by
+// index_scores_decode into its own bank). CTA b publishes a per-CTA epoch to
+// every peer (release, system scope) and waits for theirs (acquire), so no
+// CTA depends on another CTA of its own grid. It then adds columns [0, end)
+// of the four partials in rank order 0..3 in FP32 and rounds once (custom
+// all-reduce 1-stage numerics; identical on all ranks), end =
+// (positions[T-1] + 1) / ratio as in index_scores_decode, clamped to width.
+// The all-reduces that separate two decode index calls bound rank skew, so
+// one partial slot per rank is enough (as for peer_gather).
+constexpr int kRedCtas = 64;
+constexpr int kRedFlags = kRedCtas * 4 * 4;  // bytes
+
+__global__ void __launch_bounds__(256)
+    index_reduce_live(half* __restrict__ out, uint8_t* p0, uint8_t* p1,
+                      uint8_t* p2, uint8_t* p3, int rank,
+                      unsigned* __restrict__ epochs,
+                      const int64_t* __restrict__ positions, int tokens,
+                      int64_t n_pad, int64_t width, int ratio) {
+  __shared__ unsigned s_epoch;
+  const int b = blockIdx.x;
+  if (threadIdx.x == 0) s_epoch = epochs[b] + 1;
+  __syncthreads();
+  const unsigned epoch = s_epoch;
+  uint8_t* peers[4] = {p0, p1, p2, p3};
+  if (threadIdx.x < 4 && int(threadIdx.x) != rank) {
+    const int r = threadIdx.x;
+    __threadfence_system();  // this rank's partial (previous kernel) first
+    v41k_st_release(reinterpret_cast<unsigned*>(peers[r]) + b * 4 + rank,
+                    epoch);
+    const unsigned* own =
+        reinterpret_cast<const unsigned*>(peers[rank]) + b * 4 + r;
+    while (int(v41k_ld_acquire(own) - epoch) < 0) {
+    }
+  }
+  __syncthreads();
+  int64_t end = (positions[tokens - 1] + 1) / ratio;
+  end = end < 0 ? 0 : (end > width ? width : end);
+  const int64_t chunks = (end + 7) / 8;  // one int4 = 8 halves
+  const int64_t row4 = n_pad / 8;
+  const int4* src[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r)
+    src[r] = reinterpret_cast<const int4*>(peers[r] + kRedFlags);
+  int4* dst = reinterpret_cast<int4*>(out);
+  const int64_t total = int64_t(tokens) * chunks;
+  for (int64_t i = int64_t(b) * blockDim.x + threadIdx.x; i < total;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const int64_t at = (i / chunks) * row4 + i % chunks;
+    float acc[8];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int4 v = __ldcg(src[r] + at);  // L2 only: peer data changes
+      const half2* h = reinterpret_cast<const half2*>(&v);
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const float2 f = __half22float2(h[k]);
+        acc[2 * k] = r ? acc[2 * k] + f.x : f.x;
+        acc[2 * k + 1] = r ? acc[2 * k + 1] + f.y : f.y;
+      }
+    }
+    int4 o;
+    half2* oh = reinterpret_cast<half2*>(&o);
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+      oh[k] = __floats2half2_rn(acc[2 * k], acc[2 * k + 1]);
+    dst[at] = o;
+  }
+  if (threadIdx.x == 0) epochs[b] = epoch;
+}
+
 // ---- G4b decode indexer: scores over packed FP4 index keys ----------------
 // Packed key row (68 B): 64 B E2M1 nibbles (even element in the low nibble)
 // then 4 power-of-two scale exponents (biased) for groups of 32. Rows q/w are
@@ -3401,6 +3473,31 @@ void v41k_peer_gather(int64_t p0, int64_t p1, int64_t p2, int64_t p3,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void v41k_index_reduce_live(torch::Tensor out, int64_t p0, int64_t p1,
+                            int64_t p2, int64_t p3, int64_t rank,
+                            torch::Tensor epochs, torch::Tensor positions,
+                            int64_t ratio, int64_t width) {
+  const at::cuda::OptionalCUDAGuard guard(out.device());
+  const int tokens = out.size(0);
+  TORCH_CHECK(out.scalar_type() == torch::kHalf && out.dim() == 2 &&
+                  out.is_contiguous() && out.size(1) % 8 == 0 && tokens >= 1 &&
+                  tokens <= 8 && width >= 0 && width <= out.size(1) &&
+                  ratio >= 1 && rank >= 0 && rank < 4,
+              "index_reduce_live: bad out/width/ratio/rank");
+  TORCH_CHECK(positions.scalar_type() == torch::kInt64 &&
+                  positions.is_contiguous() && positions.numel() >= tokens &&
+                  epochs.scalar_type() == torch::kInt32 &&
+                  epochs.numel() >= v41k::kRedCtas,
+              "index_reduce_live: bad positions/epochs");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto ptr = [](int64_t v) { return reinterpret_cast<uint8_t*>(v); };
+  v41k::index_reduce_live<<<v41k::kRedCtas, 256, 0, stream>>>(
+      reinterpret_cast<half*>(out.data_ptr()), ptr(p0), ptr(p1), ptr(p2),
+      ptr(p3), int(rank), reinterpret_cast<unsigned*>(epochs.data_ptr<int>()),
+      positions.data_ptr<int64_t>(), tokens, out.size(1), width, int(ratio));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void v41k_index_scores_decode(torch::Tensor out, torch::Tensor q,
                               torch::Tensor w, torch::Tensor keys,
                               torch::Tensor positions, int64_t heads,
@@ -3431,6 +3528,11 @@ TORCH_LIBRARY(v41k, m) {
       "flag_offset, "
       "Tensor(a!) epoch) -> ()",
       &v41k_peer_gather);
+  m.def(
+      "index_reduce_live(Tensor(a!) out, int p0, int p1, int p2, int p3, "
+      "int rank, Tensor(b!) epochs, Tensor positions, int ratio, int width) "
+      "-> ()",
+      &v41k_index_reduce_live);
   m.def(
       "gate_up7(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "
       "ids32, Tensor prob, "

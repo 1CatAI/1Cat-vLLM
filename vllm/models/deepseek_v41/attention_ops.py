@@ -777,18 +777,58 @@ def _cuda_index_scores():
     return _CUDA_INDEX["ok"]
 
 
+def _index_reduce_live(bank, partial, positions, ratio, width):
+    """INDEX_REDUCE: sum the four ranks' partial scores over the live columns only.
+
+    v41k index_reduce_live reads every rank's bank over CUDA IPC (per-CTA
+    epoch flags, release/acquire at system scope) and adds columns
+    [0, (positions[-1] + 1) // ratio) in rank order 0..3 in FP32, rounding
+    once: the custom all-reduce 1-stage numerics, the same on every rank.
+    Columns past the live end are not written; index_topk never reads them.
+    """
+    out = torch.empty_like(partial)
+    torch.ops.v41k.index_reduce_live(
+        out, *bank.pointers, bank.rank, bank.epochs, positions.long(), ratio, width
+    )
+    return out[:, :width]
+
+
 def select_packed_positions(
-    q, weights, keys, positions, valid_tokens, ratio, all_reduce, *, top_k=512
+    q,
+    weights,
+    keys,
+    positions,
+    valid_tokens,
+    ratio,
+    all_reduce,
+    *,
+    top_k=512,
+    bank=None,
 ):
-    """select_compressed_positions over packed, position-addressed index keys."""
+    """select_compressed_positions over packed, position-addressed index keys.
+
+    bank: the store's V41IndexBank (VLLM_V41_INDEX_REDUCE=1) or None. With a
+    bank, decode scores are written into this rank's bank slot and reduced
+    over the live prefix by _index_reduce_live instead of all_reduce.
+    """
     from vllm.models.deepseek_v41.index_topk import index_topk
 
     tokens, heads = q.shape[0], q.shape[1]
     if tokens * heads <= 64:
         # Decode: bounded fused scores over the live keys only (graph-safe).
-        scores = torch.empty(
-            tokens, keys.shape[0], dtype=torch.float16, device=q.device
+        live = (
+            bank is not None
+            and tokens <= bank.partial.shape[0]
+            and keys.shape[0] <= bank.width
+            and _cuda_index_scores()
         )
+        if live:
+            # index_scores_decode uses out.size(1) as the row stride.
+            scores = bank.partial[:tokens]
+        else:
+            scores = torch.empty(
+                tokens, keys.shape[0], dtype=torch.float16, device=q.device
+            )
         if _cuda_index_scores():
             # Volta: Triton dots fall back to FMA; the CUDA kernel is bounded too.
             torch.ops.v41k.index_scores_decode(
@@ -820,7 +860,10 @@ def select_packed_positions(
                 BLOCKS=_DECODE_BLOCKS,
                 num_warps=4,
             )
-        scores = all_reduce(scores)
+        if live:
+            scores = _index_reduce_live(bank, scores, positions, ratio, keys.shape[0])
+        else:
+            scores = all_reduce(scores)
         result = torch.empty(tokens, top_k, dtype=torch.int32, device=q.device)
         if keys.shape[0] > 16384:
             from vllm.models.deepseek_v41.index_topk import index_topk_parallel
