@@ -493,7 +493,7 @@ struct Fp8PairReader {
 // reduction retain the exact p0 + ... + p(SplitK-1) order. Each projection uses
 // (SplitK / 2 + 1) * 4 KiB of reduction storage and reuses B over all 32 rows.
 template <int SplitK, bool PackedInput = false, bool Gated = false,
-          bool FullRows = false>
+          bool FullRows = false, bool FusedBA = false>
 __global__ __launch_bounds__(
     32 * (SplitK / 2) * (Gated ? 2 : 1),
     FullRows
@@ -503,7 +503,8 @@ __global__ __launch_bounds__(
                                                     const half* __restrict__ input,
                                                     half* __restrict__ output,
                                                     half* __restrict__ k16_output,
-                                                    int n, int k, int m) {
+                                                    int n, int k, int m,
+                                                    vllm::sm70::Sm70FusedBa fused_ba) {
   static_assert(SplitK == 8 || SplitK == 12 || SplitK == 16,
                 "M32 two-phase QPN8 supports split-8, split-12 or split-16");
   if constexpr (FullRows) m = 32;
@@ -518,6 +519,15 @@ __global__ __launch_bounds__(
   constexpr int kProjections = Gated ? 2 : 1;
   __shared__ float reduction_storage[kProjections][kPhysicalWarps + 1]
                                     [kOutputElements];
+  if constexpr (FusedBA) {
+    const int tiles = n / 32;
+    if (blockIdx.x >= tiles) {
+      vllm::sm70::fused_ba_tile<kPhysicalWarps>(
+          input, fused_ba, &reduction_storage[0][0][0],
+          (blockIdx.x - tiles) * 8, k, m);
+      return;
+    }
+  }
 
   const int lane = threadIdx.x & 31;
   const int warp =
@@ -635,8 +645,13 @@ __global__ __launch_bounds__(
         if (output_row < m) {
           if constexpr (Gated) value = (value / (1.0f + __expf(-value))) * up;
           const half result = __float2half(value);
-          output[static_cast<size_t>(output_row) * n + blockIdx.x * 32 +
-                 output_col] = result;
+          if constexpr (FusedBA) {
+            vllm::sm70::fused_ba_store(output, fused_ba, n, output_row,
+                                       blockIdx.x * 32 + output_col, result);
+          } else {
+            output[static_cast<size_t>(output_row) * n + blockIdx.x * 32 +
+                   output_col] = result;
+          }
           if constexpr (Gated) {
             if (k16_output != nullptr) {
               k16_output[vllm::sm70::k16_half_index(
@@ -663,7 +678,8 @@ void launch_fp8_qpn8_m32_twophase_sm70(const uint8_t* codes,
     }
   }
   kernel<<<(n / 32), (32 * kPhysicalWarps * (Gated ? 2 : 1)), 0, stream>>>(
-      codes, channel_scales, input, output, k16_output, n, k, m);
+      codes, channel_scales, input, output, k16_output, n, k, m,
+      vllm::sm70::Sm70FusedBa{});
 }
 
 void launch_fp8_qpn8_ba_split_sm70(const uint8_t* codes,
@@ -1777,7 +1793,8 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
   TORCH_CHECK(ba_weight.dim() == 2 && ba_weight.size(0) == ba_n &&
                   ba_weight.size(1) == k,
               "fp8_qpn8_dispatch_ba_split_sm70_out: b/a weight mismatch");
-  TORCH_CHECK(m <= 8 || dense_weight_ptr != 0,
+  const bool fused_batch = m > 8 && m <= 32 && k == 5120;
+  TORCH_CHECK(m <= 8 || fused_batch || dense_weight_ptr != 0,
               "fp8_qpn8_dispatch_ba_split_sm70_out: large-M requires the "
               "dense QPN8 workspace");
 
@@ -1811,6 +1828,40 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
             static_cast<int>(ba_n), static_cast<int>(qkv_n),
             static_cast<int>(n), static_cast<int>(k), static_cast<int>(m),
             true);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+
+  if (fused_batch) {
+    // Verify batches: b/a runs in appended CTAs of the QKVZ launch, which also
+    // writes z directly. This drops the GEMM, its reduction and the tail copy.
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const vllm::sm70::Sm70FusedBa fused{
+        reinterpret_cast<half*>(z_out.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(ba_weight.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(b_out.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(a_out.data_ptr<at::Half>()),
+        static_cast<int>(qkv_n), static_cast<int>(ba_n)};
+    if (m <= 16) {
+      vllm::sm70::launch_qpn_pair_m16_fused_ba<Fp8PairReader, 16>(
+          qkv_out, input, codes, group_scales, static_cast<int>(n), fused,
+          stream);
+      return;
+    }
+    torch::Tensor packed_input;
+    auto* packed_ptr =
+        vllm::sm70::k16_packed_input(input, packed_input, stream);
+    auto kernel =
+        m == 32
+            ? fp8_qpn8_m32_twophase_sm70_kernel<16, true, false, true, true>
+            : fp8_qpn8_m32_twophase_sm70_kernel<16, true, false, false, true>;
+    kernel<<<static_cast<int>(n / 32 + (m + 7) / 8), 256, 0, stream>>>(
+        codes.data_ptr<uint8_t>(),
+        reinterpret_cast<const half*>(group_scales.data_ptr<at::Half>()),
+        packed_ptr, reinterpret_cast<half*>(qkv_out.data_ptr<at::Half>()),
+        nullptr, static_cast<int>(n), static_cast<int>(k), static_cast<int>(m),
+        fused);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
