@@ -1691,6 +1691,7 @@ def _make_scratch_scheduler(*, full_attention_only=False, eagle=False):
     )
     req = MagicMock()
     req.request_id = "scratch"
+    req.skip_reading_prefix_cache = False
     req.kv_transfer_params = None
     req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(4)]
     req.num_computed_tokens = 0
@@ -1949,3 +1950,19 @@ def test_external_junction_not_recorded_without_sparse_groups():
     num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
     assert num_hit == 0
     assert req.shared_prefix_boundary == 0
+
+
+def test_review_skip_reading_prefix_cache_ignores_cpu_hit():
+    scheduler, req, _ = _make_scratch_scheduler()
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(12)]
+    req.num_prompt_tokens = req.num_tokens = 48
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    scheduler.manager.lookup.side_effect = lambda key, ctx: True
+    num_hit, load_async = scheduler.get_num_new_matched_tokens(req, 0)
+    assert num_hit > 0 and load_async  # CPU tier would serve this prompt
+    req.skip_reading_prefix_cache = True
+    scheduler.manager.lookup.reset_mock()
+    num_hit, load_async = scheduler.get_num_new_matched_tokens(req, 0)
+    assert (num_hit, load_async) == (0, False)
+    assert not scheduler.manager.lookup.called
