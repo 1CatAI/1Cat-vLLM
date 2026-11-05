@@ -54,6 +54,10 @@ from vllm.model_executor.warmup.sm70_runtime import (
     warmup_v2_convolution,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.encoder_budget import (
+    MultiModalBudget,
+    get_dummy_encoder_profile_inputs,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -835,6 +839,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        if self.supports_mm_inputs and self.is_first_pp_rank:
+            mm_config = self.model_config.multimodal_config
+            if mm_config is not None and not mm_config.skip_mm_profiling:
+                mm_budget = MultiModalBudget(
+                    self.vllm_config,
+                    self.mm_registry,
+                    enable_cache=False,
+                )
+                dummy_mm_inputs = get_dummy_encoder_profile_inputs(
+                    self.mm_registry,
+                    mm_budget,
+                )
+                self.model_state.encoder_runner.profile_encoder_cache(
+                    dummy_mm_inputs, mm_budget
+                )
+
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -849,6 +869,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
+        self.reset_encoder_cache()
         gc.collect()
 
     def post_kv_cache_wake_up(self) -> None:
