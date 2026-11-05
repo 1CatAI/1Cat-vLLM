@@ -474,6 +474,7 @@ if TYPE_CHECKING:
     VLLM_V41_EMPTY_CACHE_TOKENS: str = "2048"
     VLLM_V41_ENGRAM_READERS: str | None = None
     VLLM_V41_EXACT_GEMM: str = "0"
+    VLLM_V41_EXPERT_FAST: str = "0"
     VLLM_V41_EXPERT_FAST_HIT: str = "1"
     VLLM_V41_FP8_GEMV: str = "1"
     VLLM_V41_FREE_SLOTS: str | None = None
@@ -7381,6 +7382,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
             " offsets (slower on SM70)."
         ),
         category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EXPERT_FAST": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_FAST", "0"),
+        description=(
+            "DS-V4.1 TP4 row-split experts: 1 = gate/up on the v41k"
+            " gate_up_fast kernel and the down projection on down_rows_fast"
+            " (PRMT selector decode, bank-replicated codebooks, one CTA per"
+            " SM). Bit-identical to gate_up7 / gate_up7p and to down_rows at"
+            " row tile rows=4 (the default '4,8'; other tiles raise); needs a"
+            " v41k build with fast_table, gate_up_fast and down_rows_fast,"
+            " otherwise raises at first use."
+        ),
+        category="tuning",
         declared_default="'0'",
         effective_default="'0'",
         automatic_conditions=(),
