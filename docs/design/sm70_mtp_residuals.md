@@ -1,7 +1,7 @@
 # Retained SM70 MTP optimizations
 
 This PR is synchronized with main
-`b2b6b3bb91670750fb15502173212626451f693a`.
+`3c051b52ed873475b01da07be3e9e1fe9ab8ae7e`.
 The full serving comparison remains frozen on main
 `4e5357b59294edd31c46e66ae8219503a843b2bd`. Its measured E commit is
 `d686ca549b6087ad36211d4a2cb771c840399925`. The subsequent report-only rebase
@@ -34,7 +34,7 @@ preserving its enablement and CUDA-parameter checks without increasing generic
 runner coupling. CPU test doubles include the upstream draft-step listener
 and ranked-vocabulary argument.
 
-Validation for this rebase is CPU/static only: 620 targeted tests pass and
+Validation for the 2026-11-03 rebase was CPU/static only: 620 targeted tests pass and
 43 CUDA-dependent cases skip across 27 files. Normal pre-commit checks pass
 over the complete PR diff, including architecture and configuration ownership.
 The CPU bootstrap selects `CpuPlatform`, hides CUDA and uses offline mode.
@@ -43,7 +43,7 @@ initialization disabled; they execute the real configuration and scheduler,
 without model weights or tokenization. CUDA remains uninitialized.
 There is no new native build, GPU test, model run or performance measurement.
 Existing native modules used solely for CPU imports do not qualify the current
-native implementation. Historical performance results do not qualify this head.
+native implementation. Historical performance results do not qualify subsequent heads.
 
 The 2026-11-04 synchronization adds only upstream PR1352's community image
 update. Runtime sources, native sources, tests and build rules remain byte-for-byte
@@ -51,6 +51,18 @@ identical to PR head `cbfff3185afa10b048e73b8e04d49c68c4265966`.
 The prior merge resolutions and contributor fixes are retained. Fresh CPU/static
 validation for this head is reported on PR903; this synchronization adds no
 native build, GPU qualification, performance measurement or deployment.
+
+The 2026-11-05 synchronization adopts upstream PR1369's concurrent MTP route
+for M1-M80. Its tile, native-shape and assignment contracts are kept together
+in the existing SM70 feature owner; the native dispatcher remains upstream-owned.
+The local M40 tile table is removed because its whole range is covered upstream. CPU
+regressions cover concurrent native selection, larger-batch fallback and
+expert-assignment order. Upstream dense MoE permutation and shared-gate paths
+keep priority over retained FUSE47 fallbacks. PR1368's GDN BA verifier handles
+8-32 rows through the existing upstream-first adapter, and PR1340's hybrid PLE
+defaults remain upstream-owned. Prior contributor fixes are preserved.
+This synchronization has CPU/static validation only, reported on PR903; it
+does not add a native build, GPU qualification or performance measurement.
 
 This change retains the parts of PR903 that are absent from main. Ordinary
 upstream collective, graph, GDN projection, attention and native resource
@@ -65,7 +77,7 @@ rules have no residual diff from the base.
 | GDN verification | Fused small speculative recurrence, BA preparation and shared state metadata | Higher-priority context-core and mixed-QKV routes |
 | Auxiliary MTP kernels | Exact shared gate, n-gram, short-convolution and MoE permutation fusions | Native PLE admission and ordinary fallback |
 | Drafter | TP-local greedy exchange, padded-row routing and selective eager prefill MoE | Captured communication policy and full prefill for unsupported topology |
-| MoE tuning | Additional drafter row counts through M40 | Native-compatible M1/M5 tiles and temporary legacy warmup scope |
+| MoE routing regression | Concurrent native dispatch and fallback coverage; no residual tile implementation | Upstream M1-M80 selector, expert assignment and temporary legacy warmup scope |
 | Startup | Request-count/kernel warmup coverage and optional JIT telemetry | Ordinary compilation and loading |
 | Mixed prefill | Existing opt-in fixed-step pacing compatibility | Disabled by default and in the comparison serving configuration |
 
@@ -75,7 +87,7 @@ and omits discarded draft decode for batches whose prompts remain incomplete.
 Graph captures retain the ordinary full path. Tests include unsupported
 topologies, mixed batches, exception cleanup and padded-row scope restoration.
 
-The MoE selector reads the value of upstream's legacy-scope ContextVar.
+The upstream MoE selector reads the value of upstream's legacy-scope ContextVar.
 Treating the ContextVar object as a boolean would disable tuned tiles. The
 selector also uses the initialized upstream MoE policy. GDN/PLE admission
 and diagnostic exclusions consume their corresponding upstream owners.

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU routing checks: tuning must retain upstream M1/M5 native admission."""
+"""CPU routing checks: retain upstream M1-M80 native admission and fallback."""
 
 import pytest
 import torch
@@ -51,7 +51,9 @@ class _CudaMetadataTensor:
         return 16
 
 
-@pytest.mark.parametrize("rows", [1, 5])
+@pytest.mark.parametrize(
+    "rows", [0, 1, 2, 3, 5, 8, 9, 12, 16, 20, 32, 40, 41, 64, 80, 81]
+)
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("native_enabled", [False, True])
 def test_selected_mtp_config_preserves_upstream_projection_dispatch(
@@ -60,8 +62,8 @@ def test_selected_mtp_config_preserves_upstream_projection_dispatch(
     """Exercise the real tile selector and dispatcher for both expert GEMMs.
 
     The dispatcher's tile guard is part of the upstream native-op contract.
-    A fast standalone Triton tile can accidentally make M1 ineligible, even
-    when the native operator and its shape guard remain available.
+    A standalone Triton tile can accidentally make a supported batch ineligible
+    even when the native operator and its shape guard remain available.
     """
     monkeypatch.setattr(moe, "current_platform", _SM70Platform())
     monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1")
@@ -112,8 +114,9 @@ def test_selected_mtp_config_preserves_upstream_projection_dispatch(
     )
 
     assert len(calls) == 1
-    assert calls[0][0] == ("native" if native_enabled else "triton")
-    if native_enabled:
+    use_native = native_enabled and 1 <= rows <= 80
+    assert calls[0][0] == ("native" if use_native else "triton")
+    if use_native:
         assert calls[0][1] == (
             output,
             source,
@@ -123,3 +126,33 @@ def test_selected_mtp_config_preserves_upstream_projection_dispatch(
             padded,
             weighted,
         )
+
+
+@pytest.mark.parametrize("rows", [1, 5, 13, 16, 32, 40, 64, 80, 81])
+@pytest.mark.parametrize("mapped", [False, True])
+def test_mtp_assignment_retains_native_route_order(monkeypatch, rows, mapped):
+    """Concurrent drafts keep route order; larger/mapped batches still align."""
+    monkeypatch.setattr(moe, "current_platform", _SM70Platform())
+    monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    topk_ids = torch.arange(rows * 10, dtype=torch.int32).reshape(rows, 10) % 512
+    config = moe.get_default_config(rows, 512, 160, 2560, 10, None)
+    expert_map = torch.arange(512, dtype=torch.int32) if mapped else None
+    aligned = (torch.empty(0), torch.empty(0), torch.empty(0))
+    calls = []
+
+    def align(*args, **kwargs):
+        calls.append((args, kwargs))
+        return aligned
+
+    monkeypatch.setattr(moe, "moe_align_block_size", align)
+    result = moe._prepare_expert_assignment(topk_ids, config, rows, 10, 512, expert_map)
+    if rows <= 80 and not mapped:
+        assert calls == []
+        assert result[0] is None
+        assert torch.equal(result[1], topk_ids.flatten())
+        assert result[2].tolist() == [rows * 10 * 2]
+    else:
+        assert result is aligned
+        assert len(calls) == 1
+        assert calls[0][0][3] is expert_map

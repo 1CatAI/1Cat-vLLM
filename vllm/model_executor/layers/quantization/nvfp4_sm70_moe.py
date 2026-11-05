@@ -1439,8 +1439,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["inv_permuted_idx"],
             )
             logger.info_once(
-                "SM70 Qwen3.8 NVFP4 fused dense MoE permute enabled "
-                "(%d routed slots).",
+                "SM70 Qwen3.8 NVFP4 fused dense MoE permute enabled (%d routed slots).",
                 topk_ids.numel(),
             )
         elif glm53_fused_permute_q8:
