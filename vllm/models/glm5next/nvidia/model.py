@@ -1600,13 +1600,12 @@ class Glm5NextForConditionalGeneration(
                 # the latter onto text_config (1e-5), silently ignoring the
                 # vision tower's own (1e-6) rms_norm_eps.
                 norm_eps=config.vision_config.rms_norm_eps,
-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
-                # weight_scale_inv for visual.*), so it must NOT inherit the
-                # global fp8 quant_config -- doing so incorrectly quantizes
-                # the tower
-                # and yields NaN image features. Mirrors the MLA/KDA proj
-                # pattern (quant_config=None for BF16 submodules).
-                quant_config=None,
+                # The tower follows the layers the checkpoint names, like the
+                # attention projections: the zai-org FP8 checkpoint ships it in
+                # BF16 (the global fp8 config would quantize it and yield NaN
+                # image features), NVIDIA's FP4-Local quantizes it (MXFP8
+                # attention, W4A16 NVFP4 MLPs and merger).
+                quant_config=declared_quant_config(self.quant_config),
                 prefix=maybe_prefix(prefix, "visual"),
             )
 

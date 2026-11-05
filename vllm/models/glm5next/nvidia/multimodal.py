@@ -149,7 +149,8 @@ class Glm5NextVisionAttention(nn.Module):
             total_num_kv_heads=num_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj" if quant_config else f"{prefix}.qkv",
+            # The checkpoint stores the projection fused under this name.
+            prefix=f"{prefix}.qkv",
             disable_tp=use_data_parallel,
         )
         self.proj = RowParallelLinear(
