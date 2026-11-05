@@ -7,6 +7,7 @@ from typing_extensions import override
 
 from vllm.config import VllmConfig
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode import coupled_draw
 from vllm.v1.spec_decode.dflash import DFlashProposer
 
 
@@ -116,6 +117,39 @@ class DSparkProposer(DFlashProposer):
         )
         return confident_prefix.sum(dim=1).clamp_max_(cap).to(torch.int32)
 
+    def _coupled_inputs(
+        self,
+        sampling_metadata: SamplingMetadata | None,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """V4.1 coupled drafts: per-row (temperature, key, [B, K] positions).
+
+        Draft step s of row r is the token at query position
+        self.positions[r * K + s] + 1, the same output position the target
+        verifies it at; the key is the row's stream key (runner-filled).
+        None (regular draft sampling) when the knob is off or every row is
+        greedy.
+        """
+        if (
+            not coupled_draw.ENABLED
+            or sampling_metadata is None
+            or sampling_metadata.all_greedy
+            or sampling_metadata.temperature is None
+            or self._static_draft_vocab is not None
+            or getattr(self, "_enable_probabilistic_draft_probs", False)
+        ):
+            return None
+        k = self.num_speculative_tokens
+        temperature = sampling_metadata.temperature.to(torch.float32)
+        if temperature.shape[0] < batch_size:
+            pad = batch_size - temperature.shape[0]
+            temperature = torch.nn.functional.pad(temperature, (0, pad))
+        temperature = temperature[:batch_size].contiguous()
+        size = max(batch_size, self.max_batch_size)
+        keys = coupled_draw.keys_buffer(self.device, size)[:batch_size]
+        positions = (self.positions[: batch_size * k] + 1).view(batch_size, k)
+        return temperature, keys, positions
+
     @override
     def _sample_draft_tokens(
         self,
@@ -175,15 +209,39 @@ class DSparkProposer(DFlashProposer):
             [] if collect_confidence_logits else None
         )
         draft_probs: list[torch.Tensor] | None = None
-        for step in range(self.num_speculative_tokens):
+        coupled = self._coupled_inputs(sampling_metadata, batch_size)
+        fused = None
+        if coupled is not None and markov_embeds is None:
+            fused_draft = getattr(self.model, "coupled_draft_tokens", None)
+            if fused_draft is not None:
+                fused = fused_draft(
+                    base_logits, prev, *coupled, coupled_draw.DRAFT_TEMP_SCALE
+                )
+        if fused is not None:
+            draft_tokens = [
+                self.model.map_draft_to_target(fused[:, step])
+                for step in range(self.num_speculative_tokens)
+            ]
+        for step in range(0 if fused is not None else self.num_speculative_tokens):
             markov_embed = self.model.markov_embed(prev)
             if markov_embeds is not None:
                 markov_embeds.append(markov_embed)
             step_logits = base_logits[:, step] + self.model.markov_bias(markov_embed)
-            sampled, step_probs = self._sample_from_logits(
-                step_logits,
-                sampling_metadata,
-            )
+            if coupled is not None:
+                temperature, keys, positions = coupled
+                sampled = coupled_draw.keyed_argmax(
+                    step_logits,
+                    temperature,
+                    keys,
+                    positions[:, step],
+                    coupled_draw.DRAFT_TEMP_SCALE,
+                )
+                step_probs = None
+            else:
+                sampled, step_probs = self._sample_from_logits(
+                    step_logits,
+                    sampling_metadata,
+                )
             prev = self.model.map_draft_to_target(sampled)
             draft_tokens.append(prev)
             if step_probs is not None:

@@ -1085,6 +1085,7 @@ def _non_greedy_rows_carry_drafts(
 
 _V41_TRUNC_CUTOFF = int(envs.VLLM_V41_TRUNC_CUTOFF)
 _V41_TRUNC = envs.VLLM_V41_TRUNC == "1"
+_COUPLED_DRAFTS = os.getenv("VLLM_V41_COUPLED_DRAFTS", "0") == "1"
 
 
 class GPUModelRunner(
@@ -7122,6 +7123,51 @@ class GPUModelRunner(
             self.dynamic_draft_vocab_prefill_topk,
         )
 
+    def _fill_coupled_keys(self) -> None:
+        """V4.1 coupled drafts: this step's per-request stream keys, shared
+        with the drafter through coupled_draw.keys_buffer. Copied (pinned,
+        non-blocking: no stream sync) only when the batch's keys change."""
+        from vllm.v1.spec_decode import coupled_draw
+
+        num_reqs = self.input_batch.num_reqs
+        engine_seed = getattr(self.model_config, "seed", None) or 0
+        keys = []
+        for req_id in self.input_batch.req_ids[:num_reqs]:
+            params = self.requests[req_id].sampling_params
+            seed = None if params is None else params.seed
+            keys.append(coupled_draw.request_key(seed, req_id, engine_seed))
+        buffer = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
+        # The buffer can be replaced (grown), so its address is part of the key.
+        state = (buffer.data_ptr(), keys)
+        if keys and state != getattr(self, "_coupled_keys_state", None):
+            staged = torch.tensor(keys, dtype=torch.int64).pin_memory()
+            buffer[:num_reqs].copy_(staged, non_blocking=True)
+            self._coupled_keys_state = state
+
+    def _set_coupled_rows(
+        self, metadata: SpecDecodeMetadata, logits: torch.Tensor
+    ) -> None:
+        """Per-logits-row output position (and per-request key) for keyed
+        verification.
+
+        Row i of `logits` is the token at self.positions[logits_indices[i]];
+        it predicts the next position. Skipped (regular rejection sampling)
+        when the rows do not follow the standard one-bonus-per-request layout.
+        """
+        from vllm.v1.spec_decode import coupled_draw
+
+        num_reqs = len(metadata.num_draft_tokens)
+        num_rows = sum(metadata.num_draft_tokens) + num_reqs
+        if (
+            logits.shape[0] != num_rows
+            or metadata.logits_indices.numel() != num_rows
+            or metadata.bonus_logits_indices.numel() != num_reqs
+        ):
+            return
+        buffer = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
+        positions = self.positions[metadata.logits_indices.long()] + 1
+        self.rejection_sampler.set_coupled_rows(buffer[:num_reqs], positions)
+
     def _sample(
         self,
         scheduler_output: "SchedulerOutput",
@@ -7132,6 +7178,8 @@ class GPUModelRunner(
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        if _COUPLED_DRAFTS and not sampling_metadata.all_greedy:
+            self._fill_coupled_keys()
         self._ddtree_accepted_rows_cpu_sidecar = None
         self._ddtree_sampled_token_counts_cpu_sidecar = None
         # Update output token ids with tokens sampled in last step
@@ -7632,6 +7680,13 @@ class GPUModelRunner(
                 spec_decode_metadata.draft_token_ids = torch.where(
                     index + 1 >= trunc, torch.full_like(drafts, -1), drafts
                 )
+        if (
+            _COUPLED_DRAFTS
+            and draft_probs is None
+            and logits is not None
+            and not sampling_metadata.all_greedy
+        ):
+            self._set_coupled_rows(spec_decode_metadata, logits)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,

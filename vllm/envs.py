@@ -462,6 +462,9 @@ if TYPE_CHECKING:
     VLLM_V41_COL_BLOCK: str = "256"
     VLLM_V41_COL_PROJ: str = "0"
     VLLM_V41_COL_W: str = "4"
+    VLLM_V41_COUPLED_DRAFT_TEMP: str = "0.5"
+    VLLM_V41_COUPLED_TRACE: str = ""
+    VLLM_V41_COUPLED_DRAFTS: str = "0"
     VLLM_V41_COORD_DEBUG: str | None = None
     VLLM_V41_DENSE_TM: str = "1"
     VLLM_V41_DMA_DEBUG: str | None = None
@@ -7246,6 +7249,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="'4'",
         effective_default="'4'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_DRAFT_TEMP": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_DRAFT_TEMP", "0.5"),
+        description=(
+            "Experimental DS-V4.1 exact coupled drafts with keyed verification: "
+            "drafter temperature scale (> 0)."
+        ),
+        category="experimental",
+        declared_default="'0.5'",
+        effective_default="'0.5'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_TRACE": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_TRACE", ""),
+        description=(
+            "Debug for DS-V4.1 coupled drafts: path prefix of a per-process "
+            "TSV of every keyed verification row (position, winner, runner-up, "
+            "margin, logit bits); host syncs every step. Empty = off."
+        ),
+        category="experimental",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_DRAFTS": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_DRAFTS", "0"),
+        description=(
+            "Experimental DS-V4.1 exact coupled drafts with keyed verification: "
+            "1 = DSpark drafts share the target's keyed draws."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -20325,6 +20368,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_COL_B",
         "VLLM_V41_COL_BLOCK",
         "VLLM_V41_COL_PROJ",
+        "VLLM_V41_COUPLED_DRAFTS",
+        "VLLM_V41_COUPLED_DRAFT_TEMP",
+        "VLLM_V41_COUPLED_TRACE",
         "VLLM_V41_COL_W",
         "VLLM_V41_COORD_DEBUG",
         "VLLM_V41_DENSE_TM",
