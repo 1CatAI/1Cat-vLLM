@@ -55,6 +55,7 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
     clamp_prompt_logprobs,
+    drop_misaligned_logprobs,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
@@ -1630,6 +1631,7 @@ class OpenAIServingChat(OpenAIServing):
             if return_as_token_id is not None
             else self.return_tokens_as_token_ids
         )
+        top_logprobs = drop_misaligned_logprobs(token_ids, top_logprobs)
         for i, token_id in enumerate(token_ids):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None or step_top_logprobs.get(token_id) is None:
