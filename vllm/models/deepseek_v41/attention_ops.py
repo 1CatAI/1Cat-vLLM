@@ -141,6 +141,15 @@ _INDEX_TILE_BYTES = int(envs.VLLM_V41_INDEX_TILE_MB) << 20
 _INDEX_OVERLAP = envs.VLLM_V41_INDEX_OVERLAP == "1"
 _INDEX_SIDE: dict = {}
 
+# VLLM_V41_INDEX_FUSE (index_fuse.py). None = off: the prefill branch of
+# select_packed_positions is unchanged and nothing below runs. index_fuse reads
+# its knobs once here, next to the other indexer knobs.
+from vllm.models.deepseek_v41 import index_fuse  # noqa: E402
+
+_INDEX_FUSE = index_fuse.from_env()
+if _INDEX_FUSE is not None and not _FUSED_TOPK:
+    raise ValueError("VLLM_V41_INDEX_FUSE needs VLLM_V41_INDEX_TOPK=1")
+
 
 def _index_overlap(q, tile):
     return (
@@ -960,8 +969,41 @@ def select_packed_positions(
     _unpack_index_keys[(triton.cdiv(fp16.shape[0], 64),)](
         keys, positions, fp16, fp16.shape[0], positions.numel(), RATIO=ratio, BN=64
     )
+    if _INDEX_FUSE is not None:
+        return _select_fused(
+            q, weights, fp16, end, positions, valid_tokens, ratio, all_reduce, top_k
+        )
     return select_compressed_positions(
         q, weights, fp16, positions, valid_tokens, ratio, all_reduce, top_k=top_k
+    )
+
+
+def _select_fused(
+    q, weights, keys, live, positions, valid_tokens, ratio, all_reduce, top_k
+):
+    """Prefill: index_fuse.select with today's all-reduce tile."""
+    from vllm.models.deepseek_v41.index_topk import index_topk
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("VLLM_V41_INDEX_FUSE is an eager prefill path")
+    tile = index_fuse.today_tile(_INDEX_TILE_BYTES, q.shape[1], keys.shape[0])
+    overlap = _index_overlap(q, tile)
+    return index_fuse.select(
+        q,
+        weights,
+        keys,
+        live,
+        positions,
+        valid_tokens,
+        ratio,
+        all_reduce,
+        top_k=top_k,
+        tile=tile,
+        budget=_INDEX_FUSE.budget,
+        scorer=_INDEX_FUSE.scorer,
+        index_topk=index_topk,
+        side=_on_side_stream if overlap else None,
+        join=(lambda: _join_side_stream(q.device)) if overlap else None,
     )
 
 

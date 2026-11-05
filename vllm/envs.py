@@ -494,6 +494,9 @@ if TYPE_CHECKING:
     VLLM_V41_HC_WINDOW: str = "2048"
     VLLM_V41_HITLOG_RELAXED: str = "1"
     VLLM_V41_INDEX_DECODE_BLOCKS: str = "8"
+    VLLM_V41_INDEX_FUSE: str = "0"
+    VLLM_V41_INDEX_FUSE_LIB: str | None = None
+    VLLM_V41_INDEX_FUSE_MB: str = "64"
     VLLM_V41_INDEX_OVERLAP: str = "0"
     VLLM_V41_INDEX_TILE_MB: str = "64"
     VLLM_V41_INDEX_TOPK: str = "1"
@@ -7585,6 +7588,48 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="'8'",
         effective_default="'8'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_INDEX_FUSE": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_FUSE", "0"),
+        description=(
+            "DS-V4.1 indexer: fused SM70 prefill index scores (v41pidx). 0 = off;"
+            " seq | ilp2 | ilp4 | tree names the FP32 head-sum order that"
+            " matches torch's sum(1) on the GPU bit for bit. Needs"
+            " VLLM_V41_INDEX_TOPK=1 and VLLM_V41_INDEX_FUSE_LIB."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_INDEX_FUSE_LIB": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_FUSE_LIB"),
+        description=(
+            "DS-V4.1 indexer: path of v41pidx.so (benchmarks/deepseek_v41/"
+            "v41pidx/build.py); required when VLLM_V41_INDEX_FUSE is on."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_INDEX_FUSE_MB": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_FUSE_MB", "64"),
+        description=(
+            "DS-V4.1 indexer: FP16 budget in MiB of one fused prefill score"
+            " block (a whole number of all-reduce tiles) under"
+            " VLLM_V41_INDEX_FUSE."
+        ),
+        category="tuning",
+        declared_default="'64'",
+        effective_default="'64'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
