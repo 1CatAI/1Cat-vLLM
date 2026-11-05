@@ -1047,6 +1047,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+    VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE: bool = True
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1433,6 +1434,21 @@ def _resolve_rust_frontend_path() -> str | None:
             "Build with setuptools-rust or set the path explicitly."
         )
     return raw
+
+
+def _get_weight_load_max_split_scope() -> bool:
+    override = os.getenv("VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE")
+    if override is not None:
+        return override != "0"
+    config = os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+    )
+    expandable = False
+    for option in config.split(","):
+        name, _, value = option.partition(":")
+        if name.strip() == "expandable_segments":
+            expandable = value.strip() == "True"
+    return not expandable
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -16441,6 +16457,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE": env_var(
+        _get_weight_load_max_split_scope,
+        description=(
+            "Temporarily set the CUDA allocator max_split_size_mb to 20 during "
+            "model loading, preserving the other allocator options. Disabled "
+            "by default with expandable_segments:True, enabled otherwise. "
+            "Set 0 or 1 to override. Does not change SM70 warmup scoping."
+        ),
+        category="configuration",
+        declared_default="auto",
+        effective_default="False with expandable_segments:True, otherwise True",
+        automatic_conditions=(
+            "Disabled when the effective allocator enables expandable segments.",
+        ),
         acceleration_paths=(),
         user_visible=True,
     ),
