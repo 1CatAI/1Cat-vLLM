@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import PoolingParams, SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
@@ -24,6 +25,15 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+# Generation-config defaults that select sampling kernels.
+_DEFAULT_SAMPLING_FIELDS = (
+    "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "repetition_penalty",
+)
 
 
 def _kernel_prefill_warmup_token_counts(
@@ -46,6 +56,93 @@ def _kernel_prefill_warmup_token_counts(
             ):
                 token_counts.add(token_count)
     return tuple(sorted(token_counts))
+
+
+def _coverage_prefill_limit(
+    model_runner: GPUModelRunner,
+    kv_cache_specs: list[KVCacheSpec],
+) -> int:
+    """Bound full-chunk and extra bucket profiles, including the decode tail."""
+    max_tokens = min(
+        model_runner.scheduler_config.max_num_batched_tokens,
+        model_runner.max_model_len - 1 - model_runner.num_speculative_steps,
+    )
+    for group_spec in kv_cache_specs:
+        specs = (
+            group_spec.kv_cache_specs.values()
+            if isinstance(group_spec, UniformTypeKVCacheSpecs)
+            else (group_spec,)
+        )
+        for spec in specs:
+            if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+                max_tokens = min(max_tokens, spec.block_size)
+    return max_tokens
+
+
+def _coverage_prefill_token_counts(
+    model_runner: GPUModelRunner,
+    default_prompt_len: int,
+    kv_cache_specs: list[KVCacheSpec],
+) -> set[int]:
+    """Prompt lengths that fill each power-of-two per-request query bucket.
+
+    Kernels size per-request blocks from the next power of two of the query
+    length, which a speculative drafter extends by 1 + num_speculative_steps
+    tokens, and Triton specializes lengths divisible by 16 separately. A
+    prefill chunk never crosses an align-mode Mamba block, so the longest
+    profile also leaves room for the following decode step.
+    """
+    num_spec_steps = model_runner.num_speculative_steps
+    lookahead = 1 + num_spec_steps if num_spec_steps > 0 else 0
+    max_tokens = _coverage_prefill_limit(model_runner, kv_cache_specs)
+    token_counts = {max_tokens} if max_tokens > default_prompt_len else set()
+    bucket = 1
+    while bucket - lookahead <= max_tokens:
+        if bucket - lookahead > default_prompt_len:
+            token_counts.add(bucket - lookahead)
+        bucket *= 2
+    return token_counts
+
+
+def _warmup_request_counts(max_num_reqs: int) -> tuple[int, ...]:
+    """Request counts that reach every per-batch kernel specialization.
+
+    Triton specializes integer arguments equal to 1 or divisible by 16, and
+    per-batch constexprs are padded to powers of two, so one request, every
+    power of two, one other count and the maximum cover each class without
+    running every batch size.
+    """
+    counts = {1, max_num_reqs}
+    count = 2
+    while count < max_num_reqs:
+        counts.add(count)
+        count *= 2
+    if max_num_reqs > 3:
+        counts.add(3)
+    return tuple(sorted(counts))
+
+
+def _warmup_sampling_profiles(model_runner: GPUModelRunner) -> list[SamplingParams]:
+    """Greedy decoding and the model's default sampling parameters.
+
+    Requests that leave sampling unset use the generation-config defaults.
+    Those and greedy requests take sampler and rejection-sampler paths, such
+    as compact top-k rejection without penalties, that
+    ``SamplingParams.for_sampler_warmup()`` never selects.
+    """
+    profiles = [SamplingParams(temperature=0.0)]
+    try:
+        defaults = model_runner.model_config.get_diff_sampling_param()
+    except AttributeError:
+        defaults = {}
+    fields = {
+        name: defaults[name]
+        for name in _DEFAULT_SAMPLING_FIELDS
+        if defaults.get(name) is not None
+    }
+    if fields and fields.get("temperature", 1.0) > 0:
+        profiles.append(SamplingParams(**fields))
+    return profiles
 
 
 def _reserved_block_count(
@@ -215,6 +312,8 @@ def warmup_kernels(
     The first iteration simulates a prefill with requests of
     2 + num_spec_steps prompt tokens each. The second iteration simulates
     a decode step with all requests generating 1 + num_spec_steps tokens.
+    Upstream covers ordinary request counts and mixed batches; optional
+    coverage adds greedy/default sampling and remaining query buckets.
     """
     num_spec_steps = model_runner.num_speculative_steps
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
@@ -224,19 +323,16 @@ def warmup_kernels(
     prompt_lengths = _kernel_prefill_warmup_token_counts(
         model_runner, default_prompt_len
     )
-    if not model_runner.is_pooling_model:
-        # A full prefill chunk: long-row kernel variants and Triton's
-        # divisible-by-16 specializations that the short prompts never reach.
-        full_chunk = min(
-            model_runner.scheduler_config.max_num_batched_tokens,
-            model_runner.max_model_len - 1 - num_spec_steps,
-        )
-        if full_chunk > default_prompt_len:
-            prompt_lengths = tuple(sorted({*prompt_lengths, full_chunk}))
-
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     block_count = _warmup_block_counter(model_runner)
     kv_cache_specs = [group.kv_cache_spec for group in kv_cache_groups]
+
+    if not model_runner.is_pooling_model:
+        # A full prefill chunk: long-row kernel variants and Triton's
+        # divisible-by-16 specializations that the short prompts never reach.
+        full_chunk = _coverage_prefill_limit(model_runner, kv_cache_specs)
+        if full_chunk > default_prompt_len:
+            prompt_lengths = tuple(sorted({*prompt_lengths, full_chunk}))
 
     # SamplingParams exercising all sampling features.
     if model_runner.is_pooling_model:
@@ -307,6 +403,47 @@ def warmup_kernels(
                         with_grammar=False,
                         admit_prefill=mixed,
                     )
+        if (
+            envs.VLLM_KERNEL_WARMUP_COVERAGE
+            and not model_runner.is_pooling_model
+            and num_reqs > 0
+        ):
+            # Upstream already warms every ordinary request count and mixed
+            # step. Add only sampling paths and query buckets it does not run.
+            for sampling_idx, profile in enumerate(
+                _warmup_sampling_profiles(model_runner)
+            ):
+                for count in _warmup_request_counts(num_reqs):
+                    _warmup_cycle(
+                        model_runner,
+                        worker_execute_model,
+                        worker_sample_tokens,
+                        f"sampling{sampling_idx}c{count}",
+                        count,
+                        default_prompt_len,
+                        profile,
+                        None,
+                        block_count,
+                        kv_cache_specs,
+                        with_grammar=False,
+                    )
+            bucket_lengths = _coverage_prefill_token_counts(
+                model_runner, default_prompt_len, kv_cache_specs
+            ).difference(prompt_lengths)
+            for prompt_len in sorted(bucket_lengths):
+                _warmup_cycle(
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                    f"bucket{prompt_len}",
+                    1,
+                    prompt_len,
+                    SamplingParams(temperature=0.0),
+                    None,
+                    block_count,
+                    kv_cache_specs,
+                    with_grammar=False,
+                )
     finally:
         model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()

@@ -1,7 +1,7 @@
 # Retained SM70 MTP optimizations
 
 This PR is synchronized with main
-`3c051b52ed873475b01da07be3e9e1fe9ab8ae7e`.
+`c98a8d66482333eb8d8b87be72e8856445ac99ec`.
 The full serving comparison remains frozen on main
 `4e5357b59294edd31c46e66ae8219503a843b2bd`. Its measured E commit is
 `d686ca549b6087ad36211d4a2cb771c840399925`. The subsequent report-only rebase
@@ -64,6 +64,18 @@ defaults remain upstream-owned. Prior contributor fixes are preserved.
 This synchronization has CPU/static validation only, reported on PR903; it
 does not add a native build, GPU qualification or performance measurement.
 
+The 2026-11-06 synchronization adopts PR1402's ordinary request-count, mixed-step
+and full-chunk warmup. The previous parallel warmup loop is removed; retained
+greedy/default-sampling and query-bucket profiles use upstream's `_warmup_cycle`.
+`VLLM_KERNEL_WARMUP_COVERAGE=0` disables these residual profiles while preserving
+upstream warmup. Full-chunk and residual bucket lengths share the model-length
+limit with room for decode and the aligned Mamba block limit, including uniform
+spec wrappers. Kernel-advertised profiles retain their upstream owner's contract.
+The upstream prefix-retention fix, GDN prebuilt fallback and inference-mode
+memory profiling are preserved. Earlier contributor fixes and the November 5
+MTP native contracts remain. Fresh CPU/static results are reported on PR903;
+there is no new native build, GPU qualification, performance run or deployment.
+
 This change retains the parts of PR903 that are absent from main. Ordinary
 upstream collective, graph, GDN projection, attention and native resource
 owners remain authoritative. Core native sources, CMake and package build
@@ -78,7 +90,7 @@ rules have no residual diff from the base.
 | Auxiliary MTP kernels | Exact shared gate, n-gram, short-convolution and MoE permutation fusions | Native PLE admission and ordinary fallback |
 | Drafter | TP-local greedy exchange, padded-row routing and selective eager prefill MoE | Captured communication policy and full prefill for unsupported topology |
 | MoE routing regression | Concurrent native dispatch and fallback coverage; no residual tile implementation | Upstream M1-M80 selector, expert assignment and temporary legacy warmup scope |
-| Startup | Request-count/kernel warmup coverage and optional JIT telemetry | Ordinary compilation and loading |
+| Startup | Greedy/default-sampling and remaining query-bucket warmup; optional JIT telemetry | Upstream cycle, all request counts, mixed batches and full-chunk coverage |
 | Mixed prefill | Existing opt-in fixed-step pacing compatibility | Disabled by default and in the comparison serving configuration |
 
 Selective prefill requires a verified single-block MTP model. It preserves
