@@ -90,7 +90,10 @@ def test_decode_resolve_serves_original_experts(slack):
     for step in range(200):
         layer = LAYERS[step % len(LAYERS)]
         ids = _random_ids(generator, 5)
-        slots = cache.resolve(layer, ids)
+        # `gguf_moe` dispatches the routing weights to every cache
+        # implementation, so the 3-argument shape is the one that ships.
+        weights = torch.ones_like(ids, dtype=torch.float32)
+        slots = cache.resolve(layer, ids, weights)
         _check_decode(cache, original, layer, ids, slots)
     torch.accelerator.synchronize()
     stats = cache.stats()
