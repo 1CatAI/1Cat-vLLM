@@ -48,6 +48,8 @@ def create_scheduler(
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
     long_prefill_token_threshold_adaptive: bool = False,
+    short_prompt_chunk_tokens: int = 0,
+    short_prompt_threshold: int = 0,
     disable_chunked_mm_input: bool = False,
     use_kv_connector: None | bool | str | MockKVConfig = None,
     num_blocks: int = 10000,
@@ -73,6 +75,8 @@ def create_scheduler(
       long_prefill_token_threshold: cap on prefill chunk size
       long_prefill_token_threshold_adaptive: floor the cap at a
                              fair share of the token budget
+      short_prompt_chunk_tokens / short_prompt_threshold: chunk size of
+                             prompts whose uncached part is shorter
 
     Returns:
       {class}`Scheduler` instance
@@ -92,6 +96,8 @@ def create_scheduler(
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
         long_prefill_token_threshold_adaptive=long_prefill_token_threshold_adaptive,
+        short_prompt_chunk_tokens=short_prompt_chunk_tokens,
+        short_prompt_threshold=short_prompt_threshold,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
