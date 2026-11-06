@@ -38,8 +38,10 @@ logger = init_logger(__name__)
 
 
 _V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
-# A hit at P needs window rows [P - 128, P) still in the 256-row rings.
-_V41_RING_REACH = 128
+# A hit at P needs window rows [P - 128, P) still in the 256-row rings. Rejected
+# drafts (5 draft tokens) reach processed + 4 and overwrite the slots of
+# P - 128 .. P - 125 when the hit is 125-128 behind (1Cat #1341): default 124.
+_V41_RING_REACH = int(envs.VLLM_V41_RING_REACH)
 
 
 @dataclass
