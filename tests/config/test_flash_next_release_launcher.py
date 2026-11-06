@@ -39,6 +39,7 @@ def test_flash_launcher_uses_adjacent_cli_and_preserves_overrides(tmp_path):
     assert args[args.index("--kv-cache-dtype") + 1] == "float16"
     assert args[args.index("--max-model-len") + 1] == "262144"
     assert args[args.index("--max-num-seqs") + 1] == "8"
+    assert args[args.index("--prefix-cache-retention-interval") + 1] == "8192"
     assert json.loads(args[args.index("--kernel-config") + 1])["qsa_host_kv"] is True
     assert json.loads(args[args.index("--speculative-config") + 1]) == {
         "method": "mtp",

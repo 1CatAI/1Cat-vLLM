@@ -64,6 +64,7 @@ exec "$vllm_cli" serve "$model" \
   --gpu-memory-utilization 0.89 --attention-backend FLASH_ATTN_V100 \
   --enable-prefix-caching --partial-prefix-cache \
   --block-size 2048 --mamba-block-size 2048 --mixed-prefill-step-latency-ms 0 \
+  --prefix-cache-retention-interval 8192 \
   --mamba-ssm-cache-dtype float32 --enable-prompt-tokens-details \
   --kernel-config "$kernel_config" \
   --speculative-config "$speculative" "${serve_options[@]}"
