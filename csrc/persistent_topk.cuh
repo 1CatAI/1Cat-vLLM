@@ -852,6 +852,8 @@ __device__ void radix_topk(const float* __restrict__ row_input,
       }
     }
   }
+  // The CTA's next row reuses this smem; finish the tie loop before it does.
+  __syncthreads();
 }
 
 // ============================================================================
