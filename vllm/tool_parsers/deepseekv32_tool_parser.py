@@ -75,18 +75,16 @@ class DeepSeekV32ToolParser(ToolParser):
         self._args_started: list[bool] = []
 
         # Regex patterns for complete parsing
-        self.tool_call_complete_regex = re.compile(
-            re.escape(self.tool_call_start_token)
-            + r"(.*?)"
-            + re.escape(self.tool_call_end_token),
-            re.DOTALL,
-        )
         invoke = re.escape(self.invoke_tag_name)
         parameter = re.escape(self.parameter_tag_name)
         # The model sometimes omits </｜DSML｜parameter>. The opener of the
         # next parameter then ends the value too, in both parsing paths, so
         # the value does not swallow that parameter.
         self.parameter_open_marker = f"<｜DSML｜{self.parameter_tag_name} name="
+        # The model sometimes drops the tool-calls wrapper at long context and
+        # opens an invoke directly (upstream issue #48931); the invoke opener
+        # then starts the tool calls as well.
+        self.invoke_open_marker = f'<｜DSML｜{self.invoke_tag_name} name="'
         self.invoke_complete_regex = re.compile(
             rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>(.*?)</｜DSML｜{invoke}>',
             re.DOTALL,
@@ -186,14 +184,30 @@ class DeepSeekV32ToolParser(ToolParser):
     def _json_escape_string_content(text: str) -> str:
         return json.dumps(text, ensure_ascii=False)[1:-1]
 
+    @staticmethod
+    def _find_first_marker(text: str, markers: Sequence[str]) -> int:
+        """Position of the earliest marker in *text*, or -1."""
+        positions = [pos for pos in map(text.find, markers) if pos != -1]
+        return min(positions, default=-1)
+
+    @staticmethod
+    def _marker_overlap(text: str, markers: Sequence[str]) -> int:
+        """Length of the longest suffix of *text* that may start a marker."""
+        return max(partial_tag_overlap(text, marker) for marker in markers)
+
+    def _tool_calls_start_markers(self) -> tuple[str, ...]:
+        return (self.tool_call_start_token, self.invoke_open_marker)
+
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
         """Extract tool calls from complete model output (non-streaming)."""
-        # Quick check
-        if self.tool_call_start_token not in model_output:
+        first_tool_idx = self._find_first_marker(
+            model_output, self._tool_calls_start_markers()
+        )
+        if first_tool_idx == -1:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
@@ -201,31 +215,29 @@ class DeepSeekV32ToolParser(ToolParser):
         try:
             tool_calls = []
 
-            # Find all complete tool_call blocks
-            for tool_call_match in self.tool_call_complete_regex.findall(model_output):
-                # Find all invokes within this tool_call
-                for invoke_name, invoke_content in self.invoke_complete_regex.findall(
-                    tool_call_match
-                ):
-                    param_dict = self._parse_invoke_params(invoke_content)
-                    params = self._convert_params_with_schema(invoke_name, param_dict)
-                    tool_calls.append(
-                        ToolCall(
-                            type="function",
-                            function=FunctionCall(
-                                name=invoke_name,
-                                arguments=json.dumps(params, ensure_ascii=False),
-                            ),
-                        )
+            # Every complete invoke from the first tool marker on is a call,
+            # inside a tool-calls block or not. A tool call ends the turn,
+            # so text between and after the blocks is not content.
+            for invoke_name, invoke_content in self.invoke_complete_regex.findall(
+                model_output, first_tool_idx
+            ):
+                param_dict = self._parse_invoke_params(invoke_content)
+                params = self._convert_params_with_schema(invoke_name, param_dict)
+                tool_calls.append(
+                    ToolCall(
+                        type="function",
+                        function=FunctionCall(
+                            name=invoke_name,
+                            arguments=json.dumps(params, ensure_ascii=False),
+                        ),
                     )
+                )
 
             if not tool_calls:
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
                 )
 
-            # Extract content before first tool call
-            first_tool_idx = model_output.find(self.tool_call_start_token)
             content = model_output[:first_tool_idx] if first_tool_idx > 0 else None
 
             return ExtractedToolCallInformation(
@@ -429,13 +441,14 @@ class DeepSeekV32ToolParser(ToolParser):
         parameter_end_token = f"</｜DSML｜{self.parameter_tag_name}>"
         invoke_end_token = f"</｜DSML｜{self.invoke_tag_name}>"
 
+        start_markers = self._tool_calls_start_markers()
+        between_markers = (*start_markers, self.tool_call_end_token)
+
         while True:
             if not self._in_tool_calls:
-                start_idx = self._buffer.find(self.tool_call_start_token)
+                start_idx = self._find_first_marker(self._buffer, start_markers)
                 if start_idx == -1:
-                    overlap = partial_tag_overlap(
-                        self._buffer, self.tool_call_start_token
-                    )
+                    overlap = self._marker_overlap(self._buffer, start_markers)
                     sendable_idx = len(self._buffer) - overlap
                     if sendable_idx > 0:
                         content_parts.append(self._buffer[:sendable_idx])
@@ -447,27 +460,43 @@ class DeepSeekV32ToolParser(ToolParser):
                     self._buffer = self._buffer[start_idx:]
                     continue
 
-                self._buffer = self._buffer[len(self.tool_call_start_token) :]
+                # From here on the turn is tool calls (as in the batch path).
                 self._in_tool_calls = True
                 continue
 
             if self._active_tool_index is None:
-                stripped_len = len(self._buffer) - len(self._buffer.lstrip())
-                if stripped_len:
-                    self._buffer = self._buffer[stripped_len:]
-                    continue
-
-                if self._buffer.startswith(self.tool_call_end_token):
-                    self._buffer = self._buffer[len(self.tool_call_end_token) :]
-                    self._in_tool_calls = False
+                # Between calls. The wrapper tokens only frame the calls, and
+                # text between or after the blocks is dropped: a tool call
+                # ends the turn (as in the batch path).
+                wrapper_token = next(
+                    (
+                        token
+                        for token in (
+                            self.tool_call_start_token,
+                            self.tool_call_end_token,
+                        )
+                        if self._buffer.startswith(token)
+                    ),
+                    None,
+                )
+                if wrapper_token is not None:
+                    self._buffer = self._buffer[len(wrapper_token) :]
                     continue
 
                 match = self.invoke_start_regex.match(self._buffer)
-                if match is None:
-                    return
+                if match is not None:
+                    self._buffer = self._buffer[match.end() :]
+                    self._begin_streaming_tool_call(match.group(1), tool_call_deltas)
+                    continue
 
-                self._buffer = self._buffer[match.end() :]
-                self._begin_streaming_tool_call(match.group(1), tool_call_deltas)
+                marker_idx = self._find_first_marker(self._buffer, between_markers)
+                if marker_idx == -1:
+                    marker_idx = len(self._buffer) - self._marker_overlap(
+                        self._buffer, between_markers
+                    )
+                if marker_idx == 0:
+                    return  # an opener is still arriving, or nothing to drop
+                self._buffer = self._buffer[marker_idx:]
                 continue
 
             index = self._active_tool_index
