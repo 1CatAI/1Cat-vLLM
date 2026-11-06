@@ -122,6 +122,36 @@ class Qwen3CoderToolParser(ToolParser):
         self.accumulated_params = {}
         self.streaming_request = None
         self.json_tool_calls_streamed = 0
+        # Closed <tool_call> blocks without a function header hold no call, so
+        # the block index runs ahead of current_tool_index by this count, and
+        # content is searched for new tool markers only after the last one.
+        self.skipped_tool_blocks = 0
+        self.content_search_start = 0
+
+    def _current_tool_block(self) -> int:
+        """Index of the <tool_call> block the streaming parser is in."""
+        return self.current_tool_index + self.skipped_tool_blocks
+
+    def _skip_tool_block(
+        self, current_text: str, block_end_idx: int
+    ) -> DeltaMessage | None:
+        """Leave a closed block without a function header and stream the
+        text after it, so neither content nor later calls are lost."""
+        self.skipped_tool_blocks += 1
+        self.content_search_start = block_end_idx + len(self.tool_call_end_token)
+        if self._current_tool_block() < len(self._tool_start_positions(current_text)):
+            # Go on with the next block in this call: it may already be
+            # complete, and a later delta (maybe only EOS) would not get to it.
+            return self._stream_current_tool_block(current_text)
+
+        self.is_tool_call_started = False
+        # Nothing after the block has been emitted yet: while inside it, the
+        # parser swallowed every delta, also text after its end.
+        tail = current_text[self.content_search_start :]
+        held_prefix = self._trailing_tool_marker_prefix(current_text)
+        if held_prefix:
+            tail = tail[: -len(held_prefix)]
+        return DeltaMessage(content=tail) if tail else None
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -633,7 +663,7 @@ class Qwen3CoderToolParser(ToolParser):
         if self.json_closed and not self.in_function:
             # Check if this tool call has ended
             tool_ends = current_text.count(self.tool_call_end_token)
-            if tool_ends > self.current_tool_index:
+            if tool_ends > self._current_tool_block():
                 # This tool has ended, advance to next
                 self.current_tool_index += 1
                 self.header_sent = False
@@ -644,7 +674,7 @@ class Qwen3CoderToolParser(ToolParser):
 
                 # Check if there are more tool calls
                 tool_starts = current_text.count(self.tool_call_start_token)
-                if self.current_tool_index >= tool_starts:
+                if self._current_tool_block() >= tool_starts:
                     # No more tool calls
                     self.is_tool_call_started = False
                 # Continue processing next tool
@@ -656,8 +686,10 @@ class Qwen3CoderToolParser(ToolParser):
             tool_start_candidates = [
                 pos
                 for pos in (
-                    current_text.find(self.tool_call_start_token),
-                    current_text.find(self.tool_call_prefix),
+                    current_text.find(
+                        self.tool_call_start_token, self.content_search_start
+                    ),
+                    current_text.find(self.tool_call_prefix, self.content_search_start),
                 )
                 if pos != -1
             ]
@@ -691,17 +723,20 @@ class Qwen3CoderToolParser(ToolParser):
                 # Normal content, no tool call
                 return DeltaMessage(content=delta_text)
 
+        return self._stream_current_tool_block(current_text)
+
+    def _stream_current_tool_block(self, current_text: str) -> DeltaMessage | None:
+        """Stream the progress of the <tool_call> block the parser is in."""
         # Check if we're between tool calls (waiting for next one)
         # Count tool calls we've seen vs processed
         tool_start_positions = self._tool_start_positions(current_text)
         tool_starts_count = len(tool_start_positions)
-        if self.current_tool_index >= tool_starts_count:
+        if self._current_tool_block() >= tool_starts_count:
             # We're past all tool calls, shouldn't be here
             return None
 
         # We're in a tool call, find the current tool call portion
-        # Need to find the correct tool call based on current_tool_index
-        tool_start_idx = tool_start_positions[self.current_tool_index]
+        tool_start_idx = tool_start_positions[self._current_tool_block()]
         # Find where this tool call ends (or current position if not ended yet)
         tool_end_idx = current_text.find(self.tool_call_end_token, tool_start_idx)
         if tool_end_idx == -1:
@@ -779,6 +814,10 @@ class Qwen3CoderToolParser(ToolParser):
                             )
                         ]
                     )
+            elif tool_end_idx != -1:
+                # Empty or malformed block: it closed without a function
+                # header, so no call will ever start in it.
+                return self._skip_tool_block(current_text, tool_end_idx)
             return None
 
         # We've sent header, now handle function body
