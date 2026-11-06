@@ -91,15 +91,18 @@ class DeepSeekV32ToolParser(ToolParser):
             rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>(.*?)</｜DSML｜{invoke}>',
             re.DOTALL,
         )
+        # The string attribute is optional: the model sometimes omits it, and
+        # without it the parameter would be lost (see _string_attr).
+        parameter_head = (
+            rf'<｜DSML｜{parameter}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
+        )
         self.parameter_complete_regex = re.compile(
-            rf'<｜DSML｜{parameter}\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)'
+            rf"{parameter_head}(.*?)"
             rf"(?:</｜DSML｜{parameter}>|(?={re.escape(self.parameter_open_marker)}))",
             re.DOTALL,
         )
         self.invoke_start_regex = re.compile(rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>')
-        self.parameter_start_regex = re.compile(
-            rf'<｜DSML｜{parameter}\s+name="([^"]+)"\s+string="(true|false)"\s*>'
-        )
+        self.parameter_start_regex = re.compile(parameter_head)
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -129,12 +132,18 @@ class DeepSeekV32ToolParser(ToolParser):
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
+    @staticmethod
+    def _string_attr(value: str | None) -> str:
+        """A missing string attribute counts as string="false", so the tool
+        schema decides the type, as for any non-string DSML value."""
+        return value or "false"
+
     def _parse_invoke_params(self, invoke_str: str) -> dict[str, tuple[str, str]]:
         param_dict: dict[str, tuple[str, str]] = {}
         for param_name, string_attr, param_val in self.parameter_complete_regex.findall(
             invoke_str
         ):
-            param_dict[param_name] = (param_val, string_attr)
+            param_dict[param_name] = (param_val, self._string_attr(string_attr))
         return param_dict
 
     @staticmethod
@@ -559,7 +568,7 @@ class DeepSeekV32ToolParser(ToolParser):
 
             self._buffer = self._buffer[match.end() :]
             name = match.group(1)
-            string_attr = match.group(2)
+            string_attr = self._string_attr(match.group(2))
             self._active_param_name = name
             self._active_param_string_attr = string_attr
 

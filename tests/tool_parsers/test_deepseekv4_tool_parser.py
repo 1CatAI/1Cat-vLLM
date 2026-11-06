@@ -496,3 +496,57 @@ def test_unregistered_dsml_markup_is_content(model_output):
 
     deltas = stream_chunks(make_parser(), list(model_output))
     assert "".join(delta.content or "" for delta in deltas) == model_output
+
+
+def test_missing_string_attribute_keeps_parameter():
+    """The model sometimes omits string=; the parameter must survive, and the
+    stream must not hang on the opener (split across deltas here)."""
+    chunks = [
+        TC_START,
+        f'{INV_START}get_weather">\n',
+        '<｜DSML｜parameter name="loc',
+        'ation">Par',
+        "is",
+        PARAM_END,
+        f'\n{PARAM_START}date" string="true">tomorrow{PARAM_END}\n',
+        INV_END,
+        TC_END,
+    ]
+    expected = {"location": "Paris", "date": "tomorrow"}
+
+    result = make_parser().extract_tool_calls("".join(chunks), make_request())
+    assert json.loads(result.tool_calls[0].function.arguments) == expected
+
+    deltas = stream_chunks(make_parser(), chunks)
+    assert json.loads(reconstruct_args(deltas)) == expected
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_missing_string_attribute_uses_schema_type(streaming):
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            },
+        },
+    )
+    model_output = (
+        f"{TC_START}\n"
+        f'{INV_START}lookup">\n'
+        f'<｜DSML｜parameter name="limit">7{PARAM_END}\n'
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+    parser = make_parser(tools=[tool])
+    if streaming:
+        args = reconstruct_args(stream(parser, model_output))
+    else:
+        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
+        args = result.tool_calls[0].function.arguments
+    limit = json.loads(args)["limit"]
+    assert limit == 7
+    assert isinstance(limit, int)
