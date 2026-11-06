@@ -31,6 +31,7 @@ import torch
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     kpool_compress_and_write_cache,
     kpool_decode_update_and_maybe_write_cache_batched,
+    kpool_seed_tail_cache,
 )
 
 HEAD_DIM = 128
@@ -323,6 +324,52 @@ def test_leading_invalid_tail_slot():
     r_ref = _torch_reference(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     r_kern = _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     _assert_eq(r_ref, r_kern)
+
+
+# The tail cache takes the model dtype: fp16 on Volta/Turing, bf16 elsewhere.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_prefill_seed_honors_padded_tail_block_stride(dtype):
+    """The tail shares a padded indexer allocation in production.
+
+    ``get_kv_cache_config_from_groups`` aliases each tail tensor onto its
+    indexer tensor with the indexer's block stride (38016 B for GLM-5.3-Flash
+    at 1152-token blocks vs a dense 2048 B tail block), so a seed kernel that
+    addresses blocks densely writes into an unrelated indexer block and leaves
+    the request's tail block untouched.
+    """
+    kpool = 4
+    num_blocks = 6
+    logical_block_elems = 2 * kpool * HEAD_DIM
+    padded_block_elems = logical_block_elems + 256
+    sentinel = -123.0
+    backing = torch.full(
+        (num_blocks * padded_block_elems,),
+        sentinel,
+        dtype=dtype,
+        device="cuda",
+    )
+    tail = torch.as_strided(
+        backing,
+        size=(num_blocks, 2, kpool, HEAD_DIM),
+        stride=(padded_block_elems, kpool * HEAD_DIM, HEAD_DIM, 1),
+    )
+
+    block = 3
+    ring_slot = 2
+    key = torch.arange(HEAD_DIM, dtype=dtype, device="cuda").unsqueeze(0)
+    score = (key + 256).to(dtype)
+    tail_slot = torch.tensor(
+        [block * kpool + ring_slot], dtype=torch.int32, device="cuda"
+    )
+
+    kpool_seed_tail_cache(tail, key, score, tail_slot, kpool, HEAD_DIM)
+    torch.accelerator.synchronize()
+
+    assert torch.equal(tail[block, 0, ring_slot], key[0])
+    assert torch.equal(tail[block, 1, ring_slot], score[0])
+
+    compact_offset = (block * 2 * kpool + ring_slot) * HEAD_DIM
+    assert torch.all(backing[compact_offset : compact_offset + HEAD_DIM] == sentinel)
 
 
 @pytest.mark.parametrize(
