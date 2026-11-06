@@ -332,3 +332,35 @@ def test_composed_schema_converts_object_and_array_params():
         "wait": {"type": "for", "minutes": 2880},
         "patches": [{"op": "replace", "path": "/schedule", "value": "quiet"}],
     }
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_integer_schema_accepts_whole_number_float(streaming):
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "round_to",
+            "parameters": {
+                "type": "object",
+                "properties": {"precision": {"type": "integer"}},
+            },
+        },
+    )
+    parser = make_parser(tools=[tool])
+    model_output = (
+        f"{TC_START}\n"
+        f'{INV_START}round_to">\n'
+        f'{PARAM_START}precision" string="false">3.0{PARAM_END}\n'
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+    if streaming:
+        args = reconstruct_args(stream(parser, model_output))
+    else:
+        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
+        assert result.tools_called
+        args = result.tool_calls[0].function.arguments
+    precision = json.loads(args)["precision"]
+    assert precision == 3
+    assert isinstance(precision, int)
