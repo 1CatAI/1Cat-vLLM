@@ -105,6 +105,10 @@ class SingleTypeKVCacheManager(ABC):
         # Cache-hit alignment, set by the coordinator (its ``lcm_block_size``).
         self.alignment_tokens: int | None = None
         self.mamba_replay_lookbehind = False
+        # The coordinator's ``prefix_cache_retention_interval``: a positive
+        # value keeps a Mamba state every that many tokens, which a sliding
+        # window must also keep its run for.
+        self.retention_interval: int | None = None
 
     def take_pending_boundary_state_offloads(
         self,
@@ -479,7 +483,7 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         first_block: int,
         last_block: int,
-        hold: tuple[int, int] | None = None,
+        hold: Sequence[tuple[int, int]] = (),
         reuse_first: bool = False,
     ) -> None:
         """Free blocks in ``[first_block, last_block)`` and replace with null_block.
@@ -488,8 +492,8 @@ class SingleTypeKVCacheManager(ABC):
         earlier blocks in the range were nulled in a prior call.
 
         Args:
-            hold: Block range ``[start, end)`` whose cached entries keep normal
-                eviction priority: the window a repeat of this prompt needs.
+            hold: Block ranges ``[start, end)`` whose cached entries keep normal
+                eviction priority: the windows a later prompt can resume from.
                 Other expired sliding-window blocks can be reused immediately.
             reuse_first: Hand the freed blocks out again before other free
                 blocks (see ``BlockPool.free_blocks``).
@@ -509,7 +513,7 @@ class SingleTypeKVCacheManager(ABC):
                 # should also have been set to null blocks by the previous calls
                 # to this function.
                 break
-            if hold is not None and hold[0] <= i < hold[1]:
+            if any(start <= i < end for start, end in hold):
                 replay.append(blocks[i])
             else:
                 freed.append(blocks[i])
@@ -521,43 +525,50 @@ class SingleTypeKVCacheManager(ABC):
             # the real-held SWA capacity used by admission and pool sizing.
             self.block_pool.free_blocks(replay)
 
-    def _cached_window_at_last_boundary(
-        self, num_prompt_tokens: int | None
-    ) -> tuple[int, int] | None:
-        """Block range a repeat of this prompt will look up, or ``None``.
+    def _cached_windows(self, num_prompt_tokens: int | None) -> list[tuple[int, int]]:
+        """Block ranges a later prompt can resume from.
 
         A hit ends on an ``alignment_tokens`` boundary and, for a sliding
         window, consults only the blocks ``reachable_block_mask`` caches there:
         the ``need``-wide run ending at that boundary, shifted by one when
-        EAGLE peeks past it. Once outside the live attention window, these
-        blocks retain normal cache priority; all other expired blocks are
-        reused first. This preserves the bounded SWA admission reservation.
+        EAGLE peeks past it. Two kinds of boundary can serve a hit: the last
+        one of the prompt, which a repeat looks up, and each Mamba state a
+        positive ``retention_interval`` keeps, which a prompt sharing only an
+        earlier part resumes from. Once outside the live attention window,
+        these blocks retain normal cache priority; all other expired blocks
+        are reused first. This preserves the bounded SWA admission reservation.
         """
         if (
             not self.enable_caching
             or num_prompt_tokens is None
             or self.reuse_window is None
         ):
-            return None
+            return []
         alignment = self.alignment_tokens or self.block_size
         # Lookup recomputes the final token and EAGLE's last matched page.
         # A sparse Mamba checkpoint can require one whole alignment earlier.
         if self.mamba_replay_lookbehind:
-            boundary = max(0, num_prompt_tokens // alignment - 1) * alignment
+            last = max(0, num_prompt_tokens // alignment - 1) * alignment
         else:
             last_match = (
                 num_prompt_tokens - 1 - (self.block_size if self.use_eagle else 0)
             )
-            boundary = max(0, last_match // alignment) * alignment
-        if boundary <= 0:
-            return None
+            last = max(0, last_match // alignment) * alignment
+        boundaries = {last} if last > 0 else set()
+        if self.retention_interval:
+            boundaries.update(
+                range(self.retention_interval, last, self.retention_interval)
+            )
         need = cdiv(self.reuse_window - 1, self.block_size)
         shift = 0
         if self.use_eagle:
             need += 1
             shift = 1
-        end = boundary // self.block_size + shift
-        return (max(0, end - need), end)
+        windows = []
+        for boundary in sorted(boundaries):
+            end = boundary // self.block_size + shift
+            windows.append((max(0, end - need), end))
+        return windows
 
     def remove_skipped_blocks(
         self,
@@ -592,13 +603,13 @@ class SingleTypeKVCacheManager(ABC):
         if self.reuse_window is None:
             self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
             return
-        # Sliding window: blocks the window has moved past can never serve a
-        # future hit, so they are reused first -- otherwise a long prefill
-        # walks the whole free queue and evicts other requests' prefixes. The
-        # one exception is the cached window at the last alignment boundary
-        # of the prompt: a repeat of this prompt looks exactly that up, so it
-        # keeps normal cache priority while remaining evictable.
-        hold = self._cached_window_at_last_boundary(num_prompt_tokens)
+        # Sliding window: blocks the window has moved past can serve no future
+        # hit, so they are reused first -- otherwise a long prefill walks the
+        # whole free queue and evicts other requests' prefixes. The exceptions
+        # are the cached windows a later prompt resumes from (the last
+        # alignment boundary and retained Mamba checkpoints): they keep normal
+        # cache priority while remaining evictable.
+        hold = self._cached_windows(num_prompt_tokens)
         # `num_skipped_tokens` may include tokens that haven't been allocated yet
         # (e.g., when the attention window moves into the external computed tokens
         # range); `_remove_blocks_in_range` caps to the number of blocks that

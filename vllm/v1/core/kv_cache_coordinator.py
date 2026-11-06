@@ -114,6 +114,9 @@ class KVCacheCoordinator(ABC):
                 f"prefix_cache_retention_interval ({interval}) must be a non-negative "
                 f"multiple of the resolved alignment ({alignment})"
             )
+        # Sliding windows keep their run at every retained Mamba checkpoint.
+        for manager in self.single_type_managers:
+            manager.retention_interval = interval
 
     def get_replay_boundaries(
         self, request: Request, alignment: int
