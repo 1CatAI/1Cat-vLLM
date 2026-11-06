@@ -81,16 +81,26 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
 
     warmup_kernels(runner, executions.append, samples.append)
 
-    assert [output.total_num_scheduled_tokens for output in executions] == [
-        24,
-        20,
-        0,
-        33,
-        5,
-        0,
+    tokens = [output.total_num_scheduled_tokens for output in executions]
+    # Full batch, then the 33-token kernel profile and a full prefill chunk
+    # (capped so the decode step fits max_model_len), one request each.
+    assert tokens[:9] == [24, 20, 0, 33, 5, 0, 59, 5, 0]
+    # Every smaller request count: a pure decode step, then a decode step
+    # that also admits a 6-token prefill.
+    assert tokens[9:] == [
+        *(18, 15, 0, 18, 21, 0),
+        *(12, 10, 0, 12, 16, 0),
+        *(6, 5, 0, 6, 11, 0),
     ]
+    mixed = [output for output in executions if output.scheduled_new_reqs][-1]
+    assert len(mixed.scheduled_cached_reqs.req_ids) == 1
+    assert [r.req_id for r in mixed.scheduled_new_reqs] == ["_warmup_c1m_new_"]
+    # Every request a cycle starts is finished by its cleanup step.
+    started = {r.req_id for output in executions for r in output.scheduled_new_reqs}
+    finished = set().union(*(output.finished_req_ids for output in executions))
+    assert started == finished
     assert connector_states == [True, False]
-    assert len(samples) == 4
+    assert len(samples) == 6 + 6 * 2
 
 
 def _speculative_config(method: str) -> SpeculativeConfig:
