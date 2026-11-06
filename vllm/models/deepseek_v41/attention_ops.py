@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FP16 paged latent caches and bounded sparse attention for local TP4."""
 
+import contextlib
+
 import torch
 
 import vllm.envs as envs
@@ -130,6 +132,76 @@ _FUSED_TOPK = envs.VLLM_V41_INDEX_TOPK == "1"
 
 _INDEX_TILE_BYTES = int(envs.VLLM_V41_INDEX_TILE_MB) << 20
 
+# L4: with this knob on, select_compressed_positions hands
+# off to _select_compressed_positions_overlap, where the TP reduction and
+# top-k of score tile i run on a side stream while the main stream scores
+# tile i + 1. Same kernels on the same inputs, and every rank issues the same
+# collectives in the same order. Off by default (the port maps
+# VLLM_V41_INDEX_OVERLAP here); off, none of the code below runs.
+_INDEX_OVERLAP = envs.VLLM_V41_INDEX_OVERLAP == "1"
+_INDEX_SIDE: dict = {}
+
+
+def _index_overlap(q, tile):
+    return (
+        _INDEX_OVERLAP
+        and q.is_cuda
+        and q.shape[0] > tile
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _index_side_stream(device):
+    stream = _INDEX_SIDE.get(device)
+    if stream is None:
+        stream = _INDEX_SIDE[device] = torch.cuda.Stream(device=device)
+    return stream
+
+
+@contextlib.contextmanager
+def _on_side_stream(head):
+    """Fork: the side stream waits for everything queued so far on the main
+    stream, and the allocator keeps ``head`` (allocated on the main stream)
+    until the side stream's work on it is done."""
+    side = _index_side_stream(head.device)
+    side.wait_stream(torch.cuda.current_stream())
+    head.record_stream(side)
+    with torch.cuda.stream(side):
+        yield
+
+
+def _join_side_stream(device):
+    torch.cuda.current_stream().wait_stream(_index_side_stream(device))
+
+
+def _index_tile_topk(
+    head, all_reduce, result, column, positions, valid_tokens, first, last, ratio, top_k
+):
+    """TP-reduce one tile's head sums and write its top-k rows of ``result``
+    (the tail of select_compressed_positions' tile loop)."""
+    width = result.shape[1]
+    scores = all_reduce(head)
+    if _FUSED_TOPK and width == top_k and scores.dtype == torch.float16:
+        from vllm.models.deepseek_v41.index_topk import index_topk
+
+        index_topk(
+            result[first:last],
+            scores.contiguous(),
+            positions[first:last],
+            valid_tokens[first:last],
+            ratio,
+            top_k,
+        )
+        return
+    length = ((positions[first:last] + 1) // ratio)[:, None]
+    scores.masked_fill_(
+        (column >= length) | ~valid_tokens[first:last, None], float("-inf")
+    )
+    indices = scores.topk(width, dim=-1, sorted=False).indices.sort(dim=-1).values
+    indices = torch.where(indices < length, indices, -1)
+    indices = torch.where(valid_tokens[first:last, None], indices, -1)
+    result[first:last].copy_(indices)
+
 
 def select_compressed_positions(
     q, weights, keys, positions, valid_tokens, ratio, all_reduce, *, top_k=512
@@ -140,6 +212,10 @@ def select_compressed_positions(
     ReLU/weight and head-sum boundaries are retained before the TP reduction.
     No full [prefill, heads, context] tensor is materialized.
     """
+    if _INDEX_OVERLAP:
+        return _select_compressed_positions_overlap(
+            q, weights, keys, positions, valid_tokens, ratio, all_reduce, top_k=top_k
+        )
     if (
         q.dtype != torch.float16
         or q.shape[2] != 128
@@ -183,6 +259,54 @@ def select_compressed_positions(
         indices = torch.where(indices < length, indices, -1)
         indices = torch.where(valid_tokens[first:last, None], indices, -1)
         result[first:last].copy_(indices)
+    return result
+
+
+def _select_compressed_positions_overlap(
+    q, weights, keys, positions, valid_tokens, ratio, all_reduce, *, top_k=512
+):
+    """select_compressed_positions with L4: the same score tiles, and tile i's
+    TP reduction and top-k (_index_tile_topk) run on a side stream while the
+    main stream scores tile i + 1. For CPU tensors, a single tile and under
+    stream capture it all stays on the current stream."""
+    if (
+        q.dtype != torch.float16
+        or q.shape[2] != 128
+        or weights.shape != q.shape[:2]
+        or weights.dtype != torch.float16
+        or keys.shape[1] != 128
+    ):
+        raise ValueError("V4.1 indexer requires FP16 queries, keys and weights")
+    width = min(top_k, keys.shape[0])
+    result = torch.empty(q.shape[0], width, device=q.device, dtype=torch.int32)
+    column = torch.arange(keys.shape[0], device=q.device)[None]
+    budget = _INDEX_TILE_BYTES // max(1, q.shape[1] * keys.shape[0] * 2)
+    tile = max(32, min(1024, budget // 32 * 32))
+    overlap = _index_overlap(q, tile)
+    for first in range(0, q.shape[0], tile):
+        last = min(first + tile, q.shape[0])
+        heads = q.shape[1]
+        scores = torch.mm(q[first:last].reshape(-1, 128), keys.T).view(
+            last - first, heads, -1
+        )
+        scores.relu_().mul_(weights[first:last, :, None])
+        head = scores.sum(1)
+        del scores  # the [tile, heads, N] buffer is freed on the main stream
+        with _on_side_stream(head) if overlap else contextlib.nullcontext():
+            _index_tile_topk(
+                head,
+                all_reduce,
+                result,
+                column,
+                positions,
+                valid_tokens,
+                first,
+                last,
+                ratio,
+                top_k,
+            )
+    if overlap:
+        _join_side_stream(q.device)
     return result
 
 

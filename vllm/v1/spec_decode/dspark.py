@@ -55,6 +55,24 @@ class DSparkProposer(DFlashProposer):
         self._last_confidence_logits: torch.Tensor | None = None
         self._last_verification_lengths: torch.Tensor | None = None
 
+    @override
+    def _maybe_share_embeddings(self, target_language_model: torch.nn.Module) -> None:
+        super()._maybe_share_embeddings(target_language_model)
+        # Under pipeline parallelism the legacy contract skips the embedding.
+        # V4.1 DSpark has no table of its own; it binds the target's copy on
+        # this (last) stage. Other DSpark models do not define the hook.
+        bind = getattr(self.model, "bind_pipeline_embedding", None)
+        if bind is not None:
+            bind(target_language_model)
+
+    @override
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        super().load_model(target_model)
+        # V4.1 VLLM_V41_MARKOV_SHARD: checked against the head shared above.
+        prepare = getattr(self.model, "prepare_markov_shard", None)
+        if prepare is not None:
+            prepare()
+
     def take_last_confidence_logits(self) -> torch.Tensor | None:
         confidence_logits = self._last_confidence_logits
         self._last_confidence_logits = None
