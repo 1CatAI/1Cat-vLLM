@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import importlib
+
 import pytest
 import torch
 
@@ -753,3 +755,38 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise(
     torch.testing.assert_close(candidate_residual, baseline_residual, rtol=0, atol=0)
     torch.testing.assert_close(candidate_gemm, baseline_gemm, rtol=0, atol=0)
     torch.testing.assert_close(candidate_sqrsum, baseline_sqrsum, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not (
+        mhc_tilelang.current_platform.is_cuda()
+        and mhc_tilelang.current_platform.get_device_capability()
+        == DeviceCapability(7, 0)
+    ),
+    reason="NVIDIA V100/SM70 required",
+)
+@pytest.mark.parametrize("n_splits", [1, 2, 4, 16])
+@pytest.mark.parametrize("num_tokens", [64, 257])
+def test_mhc_sm70_prenorm_row_staging_matches_column_grid_bitwise(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int, n_splits: int
+) -> None:
+    # Imported by path: `from ...mhc import triton` resolves to the triton package.
+    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
+
+    torch.manual_seed(20261030)
+    device = mhc_tilelang.current_platform.device_type
+    hidden, outputs = 16384, 24
+    x = (torch.randn(num_tokens, hidden, device=device) * 3).half()
+    fn = torch.randn(outputs, hidden, device=device)
+
+    def run(min_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        monkeypatch.setattr(mhc_triton, "_SM70_MHC_ROW_STAGING_MIN_TOKENS", min_tokens)
+        mul = torch.empty(n_splits, num_tokens, outputs, device=device)
+        sqrsum = torch.empty(n_splits, num_tokens, device=device)
+        mhc_triton.sm70_mhc_prenorm_staging(x, fn, mul, sqrsum)
+        return mul, sqrsum
+
+    column_mul, column_sqrsum = run(num_tokens + 1)
+    row_mul, row_sqrsum = run(0)
+    torch.testing.assert_close(row_mul, column_mul, rtol=0, atol=0)
+    torch.testing.assert_close(row_sqrsum, column_sqrsum, rtol=0, atol=0)

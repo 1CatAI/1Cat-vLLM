@@ -73,6 +73,49 @@ def _sm70_mhc_prenorm_staging_kernel(
         )
 
 
+@triton.jit
+def _sm70_mhc_prenorm_staging_rows_kernel(
+    x_ptr,
+    fn_ptr,
+    out_ptr,
+    sqrsum_ptr,
+    x_stride_t,
+    fn_stride_n,
+    out_stride_s,
+    out_stride_t,
+    sqrsum_stride_s,
+    sqrsum_stride_t,
+    N: tl.constexpr,
+    K_PER_SPLIT: tl.constexpr,
+    SQRSUM_MULT: tl.constexpr,
+):
+    # One program per (token, split) loads x once and walks every output column.
+    # The per-column FP32 tl.sum and the split boundaries are unchanged, so the
+    # results are bitwise equal to the per-column grid.
+    token_idx = tl.program_id(0)
+    split_idx = tl.program_id(1)
+    offsets = split_idx * K_PER_SPLIT + tl.arange(0, K_PER_SPLIT)
+    x = tl.load(x_ptr + token_idx * x_stride_t + offsets).to(tl.float32)
+    sqrsum = tl.sum(x * x, axis=0) * SQRSUM_MULT
+    tl.store(
+        sqrsum_ptr + split_idx * sqrsum_stride_s + token_idx * sqrsum_stride_t,
+        sqrsum,
+    )
+    for output_idx in tl.static_range(N):
+        weight = tl.load(fn_ptr + output_idx * fn_stride_n + offsets).to(tl.float32)
+        dot = tl.sum(x * weight, axis=0)
+        tl.store(
+            out_ptr + split_idx * out_stride_s + token_idx * out_stride_t + output_idx,
+            dot,
+        )
+
+
+# The per-column grid re-reads x once per output column. From this many rows
+# up, the row kernel wins on V100 (GLM-5.3 K=16384 N=24, T=2048: 2.2-2.7x);
+# below it the per-column grid's extra parallelism wins (T=8, 1 split: 36 vs 57 us).
+_SM70_MHC_ROW_STAGING_MIN_TOKENS = 64
+
+
 def sm70_mhc_prenorm_staging(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -103,6 +146,25 @@ def sm70_mhc_prenorm_staging(
     k_per_split = x.shape[1] // n_splits
     if k_per_split & (k_per_split - 1):
         raise ValueError("SM70 mHC prenorm split size must be a power of two")
+
+    if x.shape[0] >= _SM70_MHC_ROW_STAGING_MIN_TOKENS and fn.shape[0] > 0:
+        _sm70_mhc_prenorm_staging_rows_kernel[(x.shape[0], n_splits)](
+            x,
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            x.stride(0),
+            fn.stride(0),
+            gemm_out_mul.stride(0),
+            gemm_out_mul.stride(1),
+            gemm_out_sqrsum.stride(0),
+            gemm_out_sqrsum.stride(1),
+            N=fn.shape[0],
+            K_PER_SPLIT=k_per_split,
+            SQRSUM_MULT=sqrsum_mult,
+            num_warps=8,
+        )
+        return
 
     # Larger partials lose occupancy when x stays live for both reductions.
     # Preserve the separate norm launch for those existing split choices.
