@@ -34,7 +34,8 @@ case "$MODEL" in
     draft=$MODEL_DIR/Qwen3.8-27B-DFlash2
     args+=(--served-model-name "${SERVED_MODEL_NAME:-qwen3.8-27b-dflash2}"
       --kv-cache-dtype fp8_e4m3 --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.83}"
-      --mamba-cache-mode align --limit-mm-per-prompt '{"video": 0, "audio": 0}'
+      --mamba-cache-mode align --prefix-cache-retention-interval 8192
+      --limit-mm-per-prompt '{"video": 0, "audio": 0}'
       --default-chat-template-kwargs "${CHAT_TEMPLATE_KWARGS:-$thinking_on}"
       --speculative-config "{\"method\": \"dflash\", \"model\": \"$draft\", \"revision\": \"dedf8df68adfb1afeaf7b7480c0a0243108177b4\", \"num_speculative_tokens\": 7, \"kv_cache_dtype\": \"auto\", \"attention_backend\": \"FLASH_ATTN_V100\", \"draft_sample_method\": \"probabilistic\", \"enforce_eager\": false}")
     ;;
@@ -44,6 +45,7 @@ case "$MODEL" in
     args+=(--served-model-name "${SERVED_MODEL_NAME:-qwen3.8-flash-next-nvfp4}"
       --kv-cache-dtype float16 --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.89}"
       --language-model-only --mamba-ssm-cache-dtype float32
+      --prefix-cache-retention-interval 8192
       --default-chat-template-kwargs "${CHAT_TEMPLATE_KWARGS:-$thinking_off}"
       --kernel-config '{"sm70_hcx": true, "sm70_qsa_prep": true, "sm70_hcx_local_schedule": true, "qsa_host_kv": true, "qsa_host_kv_dtype": "fp8_e4m3", "qsa_host_kv_hot_dtype": "fp8_e4m3", "qsa_host_kv_hot_tokens": 32768, "qsa_host_kv_prefill_stage_tokens": 262144}'
       --speculative-config "{\"method\": \"mtp\", \"model\": \"$draft\", \"num_speculative_tokens\": 4, \"draft_sample_method\": \"greedy\"}")

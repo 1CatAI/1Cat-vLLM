@@ -39,6 +39,7 @@ def test_flash_launcher_uses_adjacent_cli_and_preserves_overrides(tmp_path):
     assert args[args.index("--kv-cache-dtype") + 1] == "float16"
     assert args[args.index("--max-model-len") + 1] == "262144"
     assert args[args.index("--max-num-seqs") + 1] == "8"
+    assert args[args.index("--prefix-cache-retention-interval") + 1] == "8192"
     assert json.loads(args[args.index("--kernel-config") + 1])["qsa_host_kv"] is True
     assert json.loads(args[args.index("--speculative-config") + 1]) == {
         "method": "mtp",
@@ -52,7 +53,9 @@ def test_flash_launcher_separate_draft(tmp_path):
     shutil.copy(ROOT / "scripts" / script.name, script)
     script.chmod(0o755)
     cli = tmp_path / "vllm"
-    cli.write_text(f"#!{sys.executable}\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n")
+    cli.write_text(
+        f"#!{sys.executable}\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n"
+    )
     cli.chmod(0o755)
     draft = tmp_path / 'mtp "draft" dir'
     result = subprocess.run(

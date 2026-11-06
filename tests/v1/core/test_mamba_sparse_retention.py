@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 
 # These tests allocate only block metadata; no device/distributed state exists.
@@ -408,3 +409,63 @@ def test_bulk_prefill_materializes_every_admitted_state(eagle, length, interval_
     if interval == 0:
         assert len(ends) <= length // 8000 + 4
     assert cm.block_pool.get_num_free_blocks() == 999
+
+
+def _draft_window_manager(interval):
+    """Main full attention and Mamba groups beside a draft sliding window.
+
+    Mirrors Qwen3.8-27B + DFlash2: 2048-token main pages, a 1024-token draft
+    page and a 2048-token draft window, scaled down by 64.
+    """
+    main = dict(num_kv_heads=1, head_size=1, dtype=torch.float16)
+    config = KVCacheConfig(
+        1000,
+        [],
+        [
+            KVCacheGroupSpec(["full"], FullAttentionSpec(block_size=32, **main)),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=32,
+                    shapes=((1,),),
+                    dtypes=(torch.float16,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"], SlidingWindowSpec(block_size=16, sliding_window=32, **main)
+            ),
+        ],
+    )
+    return KVCacheManager(
+        config, 100000, 8, use_eagle=False, prefix_cache_retention_interval=interval
+    )
+
+
+@pytest.mark.parametrize("interval", [0, 128])
+def test_draft_window_survives_at_retained_mamba_checkpoints(interval):
+    """A prompt sharing only an earlier part resumes at a retained checkpoint.
+
+    Prefill reuses the blocks a sliding window has moved past first. Without
+    keeping the window run at each retained Mamba checkpoint, the draft group
+    has nothing there and the whole hybrid hit collapses to zero.
+    """
+    cm = _draft_window_manager(interval)
+    request = _request("prompt", 400)
+    for start in range(0, request.num_tokens, 64):
+        end = min(start + 64, request.num_tokens)
+        for manager in cm.coordinator.single_type_managers:
+            manager.new_step_starts()
+            manager.remove_skipped_blocks(request.request_id, start, request.num_tokens)
+            manager.allocate_new_blocks(request.request_id, end, end)
+        cm.coordinator.cache_blocks(request, end)
+    cm.coordinator.free(request.request_id)
+
+    # The same first 300 tokens, then a different tail.
+    edited = _request("edited", 400)
+    edited.block_hashes[: 300 // 8] = request.block_hashes[: 300 // 8]
+    _, hit = cm.get_computed_blocks(edited)
+    # Interval 0 keeps only the prompt's last boundary, which the edit changed.
+    assert hit == (256 if interval else 0)
+    _, repeat = cm.get_computed_blocks(_request("prompt", 400))
+    assert repeat == 384
