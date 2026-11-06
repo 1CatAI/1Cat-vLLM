@@ -164,9 +164,10 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
     metadata builder (token-granular when ``compress_ratio == 1``) but exposes a
     4D K||score shape and unrestricted head/block sizes: the indexer backend
     hard-requires ``head_size in {32,64,128}`` and ``kernel_block_size 64``,
-    which the tail's ``block_size == kpool`` (e.g. 4) violates. The 4D
-    ``[2, block_size, head_dim]`` layout keeps K and score as separate block
-    halves so the connectors' non-MLA K/V half-split transfers them correctly.
+    which the tail's ring-sized block (``block_size`` = ring, e.g. 16)
+    violates. The 4D ``[2, block_size, head_dim]`` layout keeps K and score as
+    separate block halves so the connectors' non-MLA K/V half-split transfers
+    them correctly.
     """
 
     @staticmethod
@@ -179,8 +180,8 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # block_size == kpool; no sub-block splitting (kernel_block_size ==
-        # block_size), so the tensor stays [num_blocks, 2, kpool, head_dim].
+        # block_size == ring; no sub-block splitting (kernel_block_size ==
+        # block_size), so the tensor stays [num_blocks, 2, ring, head_dim].
         return [MultipleOf(1)]
 
     @staticmethod
@@ -292,7 +293,7 @@ def compute_kpool_tail_slot_mapping(
     positions: torch.Tensor,
     num_actual_tokens: int,
     num_reqs: int,
-    kpool: int,
+    ring: int,
 ) -> torch.Tensor:
     """Circular tail slots: every token of request r lands in r's own block.
 
@@ -300,12 +301,13 @@ def compute_kpool_tail_slot_mapping(
     pos % bs`` (``_compute_slot_mappings_kernel``). The tail group's block
     table only ever has its FIRST column written -- ``KpoolTailManager``
     allocates exactly one block per request and never grows -- so for any
-    token at ``pos >= kpool`` that kernel reads a zero column and the slot
+    token at ``pos >= ring`` that kernel reads a zero column and the slot
     collapses onto physical tail block 0. All concurrently running requests
-    then share one ``kpool``-slot ring and corrupt each other's pool
-    compression (seed / stash / completion all target block 0). This maps
-    ``slot = own_block * kpool + pos % kpool`` instead, which is the layout
-    the tail kernels and ``KpoolTailManager`` are designed around.
+    then share one ring and corrupt each other's pool compression (seed /
+    stash / completion all target block 0). This maps
+    ``slot = own_block * ring + pos % ring`` instead, which is the layout the
+    tail kernels and ``KpoolTailManager`` are designed around. ``ring`` is the
+    tail spec's ``block_size``.
 
     Pure torch (no Triton, no device sync): the indexer op consumes the tail
     slot mapping on its eager break, so the returned tensor need not be the
@@ -321,7 +323,7 @@ def compute_kpool_tail_slot_mapping(
     req = req.clamp_(min=0, max=num_reqs - 1)
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
-    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    out[:num_actual_tokens] = own_block * ring + torch.remainder(pos, ring)
     return out
 
 
@@ -330,7 +332,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
 
     The tail is storage-only (no attention / MQA-logits), so it skips the
     DeepseekV32 indexer builder's DeepGEMM paged-MQA path -- which requires
-    ``block_kv in {32,64}`` and asserts on the tail's ``block_size == kpool``.
+    ``block_kv in {32,64}`` and asserts on the tail's ring-sized block.
     It exports only the group's token-granular ``slot_mapping`` plus the
     prefill/decode counts; the indexer op reads
     ``attn_metadata[tail_prefix].slot_mapping``. The slot mapping is
@@ -369,7 +371,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         positions = common_attn_metadata.positions
         if positions is not None:
             # Circular per-request layout; the generic kernel output collapses
-            # onto tail block 0 for pos >= kpool (see compute_... docstring).
+            # onto tail block 0 for pos >= ring (see compute_... docstring).
             slot_mapping = compute_kpool_tail_slot_mapping(
                 slot_mapping,
                 common_attn_metadata.block_table_tensor,
