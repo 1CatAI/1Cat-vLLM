@@ -6,9 +6,13 @@ import pytest
 import torch
 
 from tests.kernels.utils import requires_tensor_core_triton
-from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.model_executor.kernels.mhc.tilelang import mhc_fused_post_pre_tilelang
+from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.kernels.mhc.tilelang import (
+    mhc_fused_post_pre_tilelang,
+    mhc_pre_tilelang,
+)
 from vllm.model_executor.kernels.mhc.triton import mhc_prenorm_tensor_cores
+from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPreOp
 
 HIDDEN = 4096
 HC_MULT = 4
@@ -131,3 +135,63 @@ def test_fused_post_pre_route_keeps_outputs(tokens):
     # noise scales with the streams: bound it by one FP16 step of its row.
     row_step = _fp16_ulp(reference.float().abs().amax(dim=-1, keepdim=True))
     assert ((layer_input.float() - reference.float()).abs() <= row_step).all()
+
+
+@requires_tensor_core_triton
+@pytest.mark.parametrize("route", [False, True])
+def test_layer_ops_take_the_kernel_config_route(route):
+    """GLM-5.3 reaches mHC through the layer ops: they decide the route once
+    from the kernel config and compute what the kernel functions compute."""
+    config = VllmConfig(kernel_config=KernelConfig(triton_sm7x_tensor_cores=route))
+    with set_current_vllm_config(config):
+        pre_op = MHCPreOp()
+        fused_op = MHCFusedPostPreOp()
+    assert pre_op.tensor_cores is route
+    assert fused_op.tensor_cores is route
+
+    tokens = 508
+    gen = _generator(tokens)
+    x = (torch.randn(tokens, HIDDEN, generator=gen, device="cuda") * 2).half()
+    residual = _residual(tokens, gen)
+    post_mix = torch.rand(tokens, HC_MULT, 1, generator=gen, device="cuda") * 2
+    comb_mix = torch.softmax(
+        torch.randn(tokens, HC_MULT, HC_MULT, generator=gen, device="cuda"), -1
+    )
+    fn = _fn(gen)
+    hc_scale = torch.tensor([0.084, 0.041, 0.234], device="cuda")
+    hc_base = torch.randn(MIXES, generator=gen, device="cuda") * 3
+    norm_weight = (1 + 0.1 * torch.randn(HIDDEN, generator=gen, device="cuda")).half()
+    mix_args = (fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 2.0, 20)
+
+    got = pre_op(residual, *mix_args, norm_weight=norm_weight, norm_eps=1e-6)
+    want = mhc_pre_tilelang(
+        residual,
+        *mix_args,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+        tensor_cores=route,
+    )
+    for got_tensor, want_tensor in zip(got, want):
+        assert torch.equal(got_tensor, want_tensor)
+
+    got = fused_op(
+        x,
+        residual,
+        post_mix,
+        comb_mix,
+        *mix_args,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+    )
+    want = mhc_fused_post_pre_tilelang(
+        x,
+        residual,
+        post_mix,
+        comb_mix,
+        *mix_args,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+        tensor_cores=route,
+    )
+    for got_tensor, want_tensor in zip(got, want):
+        assert torch.equal(got_tensor, want_tensor)
