@@ -38,6 +38,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
+from vllm.runtime_resources import share_runtime_resources
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -2065,7 +2066,7 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
-        return base
+        return share_runtime_resources(base, self.vllm_config)
 
     def _get_model(self) -> nn.Module:
         """
