@@ -85,10 +85,19 @@ def build_tool_call(func_name: str, params: dict[str, str]) -> str:
 
 
 def stream(parser: DeepSeekV4ToolParser, full_text: str, chunk_size: int = 7):
+    return stream_chunks(
+        parser,
+        [
+            full_text[start : start + chunk_size]
+            for start in range(0, len(full_text), chunk_size)
+        ],
+    )
+
+
+def stream_chunks(parser: DeepSeekV4ToolParser, chunks: list[str]):
     deltas = []
     previous_text = ""
-    for start in range(0, len(full_text), chunk_size):
-        delta_text = full_text[start : start + chunk_size]
+    for delta_text in chunks:
         current_text = previous_text + delta_text
         delta = parser.extract_tool_calls_streaming(
             previous_text=previous_text,
@@ -332,3 +341,27 @@ def test_composed_schema_converts_object_and_array_params():
         "wait": {"type": "for", "minutes": 2880},
         "patches": [{"op": "replace", "path": "/schedule", "value": "quiet"}],
     }
+
+
+def test_missing_parameter_close_does_not_swallow_next_parameter():
+    """Without </｜DSML｜parameter>, the next parameter's opener ends the value
+    (batch and streaming, the opener split across deltas)."""
+    chunks = [
+        TC_START,
+        f'{INV_START}get_weather">\n',
+        f'{PARAM_START}location" string="true">Paris a<b><｜DSML｜parameter',
+        ' name="date" string="true">tomorrow',
+        PARAM_END,
+        f"\n{INV_END}",
+        f"\n{TC_END}",
+    ]
+    expected = {"location": "Paris a<b>", "date": "tomorrow"}
+
+    result = make_parser().extract_tool_calls("".join(chunks), make_request())
+    assert result.tools_called
+    assert json.loads(result.tool_calls[0].function.arguments) == expected
+
+    deltas = stream_chunks(make_parser(), chunks)
+    arguments = reconstruct_args(deltas)
+    assert "DSML" not in arguments
+    assert json.loads(arguments) == expected

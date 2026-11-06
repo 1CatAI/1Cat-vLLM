@@ -83,12 +83,17 @@ class DeepSeekV32ToolParser(ToolParser):
         )
         invoke = re.escape(self.invoke_tag_name)
         parameter = re.escape(self.parameter_tag_name)
+        # The model sometimes omits </｜DSML｜parameter>. The opener of the
+        # next parameter then ends the value too, in both parsing paths, so
+        # the value does not swallow that parameter.
+        self.parameter_open_marker = f"<｜DSML｜{self.parameter_tag_name} name="
         self.invoke_complete_regex = re.compile(
             rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>(.*?)</｜DSML｜{invoke}>',
             re.DOTALL,
         )
         self.parameter_complete_regex = re.compile(
-            rf'<｜DSML｜{parameter}\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜{parameter}>',
+            rf'<｜DSML｜{parameter}\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)'
+            rf"(?:</｜DSML｜{parameter}>|(?={re.escape(self.parameter_open_marker)}))",
             re.DOTALL,
         )
         self.invoke_start_regex = re.compile(rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>')
@@ -371,6 +376,26 @@ class DeepSeekV32ToolParser(ToolParser):
         for key, value in converted.items():
             self._append_json_param_value(tool_call_deltas, index, key, value)
 
+    def _finish_streaming_param(
+        self,
+        tool_call_deltas: dict[int, DeltaToolCall],
+        index: int,
+        raw_content: str,
+    ) -> None:
+        if self._active_param_mode in ("wrapper", "buffered"):
+            self._active_param_parts.append(raw_content)
+            self._finish_buffered_param(tool_call_deltas, index)
+        elif self._active_param_mode == "string":
+            arguments = self._json_escape_string_content(raw_content) + '"'
+            self._add_tool_call_delta(tool_call_deltas, index, arguments=arguments)
+        else:
+            self._add_tool_call_delta(tool_call_deltas, index, arguments=raw_content)
+
+        self._active_param_name = None
+        self._active_param_string_attr = None
+        self._active_param_mode = None
+        self._active_param_parts.clear()
+
     def _close_streaming_tool_call(
         self,
         tool_call_deltas: dict[int, DeltaToolCall],
@@ -449,29 +474,23 @@ class DeepSeekV32ToolParser(ToolParser):
 
             if self._active_param_mode is not None:
                 end_pos = self._buffer.find(parameter_end_token)
+                next_pos = self._buffer.find(self.parameter_open_marker)
+                if next_pos != -1 and (end_pos == -1 or next_pos < end_pos):
+                    # Implicit close: keep the next opener in the buffer.
+                    raw_content = self._buffer[:next_pos]
+                    self._buffer = self._buffer[next_pos:]
+                    self._finish_streaming_param(tool_call_deltas, index, raw_content)
+                    continue
                 if end_pos != -1:
                     raw_content = self._buffer[:end_pos]
                     self._buffer = self._buffer[end_pos + len(parameter_end_token) :]
-                    if self._active_param_mode in ("wrapper", "buffered"):
-                        self._active_param_parts.append(raw_content)
-                        self._finish_buffered_param(tool_call_deltas, index)
-                    elif self._active_param_mode == "string":
-                        arguments = self._json_escape_string_content(raw_content) + '"'
-                        self._add_tool_call_delta(
-                            tool_call_deltas, index, arguments=arguments
-                        )
-                    else:
-                        self._add_tool_call_delta(
-                            tool_call_deltas, index, arguments=raw_content
-                        )
-
-                    self._active_param_name = None
-                    self._active_param_string_attr = None
-                    self._active_param_mode = None
-                    self._active_param_parts.clear()
+                    self._finish_streaming_param(tool_call_deltas, index, raw_content)
                     continue
 
-                overlap = partial_tag_overlap(self._buffer, parameter_end_token)
+                overlap = max(
+                    partial_tag_overlap(self._buffer, parameter_end_token),
+                    partial_tag_overlap(self._buffer, self.parameter_open_marker),
+                )
                 safe_len = len(self._buffer) - overlap
                 if safe_len > 0:
                     raw_content = self._buffer[:safe_len]
