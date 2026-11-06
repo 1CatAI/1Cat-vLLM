@@ -17,9 +17,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "mma_fragments_sm70.cuh"
 #include "nvfp4_qpn2_layout.cuh"
 
 namespace {
+
+using vllm::sm70::fp4x8_to_half2x4;
 
 constexpr int kPrepareThreads = 256;
 constexpr float kFp4Bias = 16384.0f;
@@ -107,20 +110,6 @@ __global__ void nvfp4_qpn4_prepack_scale_codes_kernel(
   const int tile = static_cast<int>(outer / groups_k16);
   const int col = tile * 32 + qpn_col_from_lane(lane);
   packed_scale_codes[index] = scale_codes[static_cast<size_t>(group) * n + col];
-}
-
-__device__ __forceinline__ void fp4x8_to_half2x4(unsigned x, half2 out[4]) {
-  constexpr unsigned kSign = 0x80008000U;
-  constexpr unsigned kExponentMantissa = 0x0E000E00U;
-  unsigned values[4];
-  values[0] = ((x << 12) & kSign) | ((x << 9) & kExponentMantissa);
-  values[1] = ((x << 8) & kSign) | ((x << 5) & kExponentMantissa);
-  values[2] = ((x << 4) & kSign) | ((x << 1) & kExponentMantissa);
-  values[3] = ((x << 0) & kSign) | ((x >> 3) & kExponentMantissa);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    out[i] = *reinterpret_cast<const half2*>(&values[i]);
-  }
 }
 
 __device__ __forceinline__ void fp4x16_to_half2x8(uint2 packed, half2 out[8]) {
