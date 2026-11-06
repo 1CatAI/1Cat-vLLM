@@ -474,6 +474,8 @@ if TYPE_CHECKING:
     VLLM_V41_EMPTY_CACHE_TOKENS: str = "2048"
     VLLM_V41_ENGRAM_READERS: str | None = None
     VLLM_V41_EXACT_GEMM: str = "0"
+    VLLM_V41_EXPERT_DIET: str = "0"
+    VLLM_V41_EXPERT_FAST: str = "0"
     VLLM_V41_EXPERT_FAST_HIT: str = "1"
     VLLM_V41_FP8_GEMV: str = "1"
     VLLM_V41_FREE_SLOTS: str | None = None
@@ -500,6 +502,7 @@ if TYPE_CHECKING:
     VLLM_V41_MAX_LEN: str = "16384"
     VLLM_V41_MISS_HIST: str = "0"
     VLLM_V41_PACKED_KV: str | None = None
+    VLLM_V41_PLAN_FUSE: str = "0"
     VLLM_V41_PLAN_STATS: str | None = None
     VLLM_V41_PRED_STATS: str = "0"
     VLLM_V41_PREFETCH: str = "0"
@@ -7386,6 +7389,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_EXPERT_DIET": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_DIET", "0"),
+        description=(
+            "DS-V4.1 EXPERT_FAST kernels, instruction-diet variants (read"
+            " once by v41k.so itself): bit 1 = gate_up_fast runs"
+            " gate_up_diet, bit 2 = down_rows_fast runs down_rows_diet, bit"
+            " 4 = down_rows_diet keeps the activations in shared memory where"
+            " they fit (IQ1_M M <= 4, IQ2 M <= 2). Bitwise identical to the"
+            " fast kernels; only acts with VLLM_V41_EXPERT_FAST=1 and a v41k"
+            " build that has gate_up_diet / down_rows_diet."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EXPERT_FAST": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_FAST", "0"),
+        description=(
+            "DS-V4.1 TP4 row-split experts: 1 = gate/up on the v41k"
+            " gate_up_fast kernel and the down projection on down_rows_fast"
+            " (PRMT selector decode, bank-replicated codebooks, one CTA per"
+            " SM). Bit-identical to gate_up7 / gate_up7p and to down_rows at"
+            " row tile rows=4 (the default '4,8'; other tiles raise); needs a"
+            " v41k build with fast_table, gate_up_fast and down_rows_fast,"
+            " otherwise raises at first use."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_EXPERT_FAST_HIT": env_var(
         lambda: os.getenv("VLLM_V41_EXPERT_FAST_HIT", "1"),
         description=("DS-V4.1 SM70 runtime switch (developer)."),
@@ -7662,6 +7701,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PLAN_FUSE": env_var(
+        lambda: os.getenv("VLLM_V41_PLAN_FUSE", "0"),
+        description=(
+            "DS-V4.1 TP4 row-split experts: 1 = build the per-layer expert "
+            "plan inside the q8 activation launch (v41k q8_plan + gate_up7p) "
+            "instead of a separate moe_plan launch; same plan bit for bit."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
