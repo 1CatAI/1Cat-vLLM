@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 import random
 import threading
 import time
+import weakref
 from unittest import mock
 
 import multiprocess as mp
@@ -347,6 +349,26 @@ def worker_fn_test_busy_to_idle():
 
 def test_message_queue_busy_to_idle():
     distributed_run(worker_fn_test_busy_to_idle, 4)
+
+
+def test_reader_in_reference_cycle_is_collected_without_blocking():
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    reader.cycle = reader
+    reader_ref = weakref.ref(reader)
+    del reader
+
+    collector = threading.Thread(target=gc.collect, daemon=True)
+    collector.start()
+    collector.join(timeout=10)
+
+    assert not collector.is_alive()
+    assert reader_ref() is None
 
 
 def test_warning_logs(caplog_vllm):
