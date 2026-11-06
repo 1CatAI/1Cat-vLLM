@@ -87,6 +87,7 @@ def _make_runner(**overrides: Any) -> Any:
     runner.pooling_runner = None
     runner.execute_model_state = None
     runner._sm70_v2_mtp_profile_pending = None
+    runner.prefill_overlap = None
     for key, value in overrides.items():
         setattr(runner, key, value)
     return runner

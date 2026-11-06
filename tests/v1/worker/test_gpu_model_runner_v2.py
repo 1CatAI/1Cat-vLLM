@@ -153,6 +153,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner.max_num_reqs = 1
     runner.max_num_tokens = 2
     runner.device = torch.device("cuda")
+    runner.prefill_overlap = None
 
     raw_spec = CircularBufferSpec(
         block_size=8,
@@ -189,7 +190,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     monkeypatch.setattr(
         mrv2,
         "init_attn_backend",
-        lambda *args: ([], attn_cg_support, [8, 262144]),
+        lambda *args, **kwargs: ([], attn_cg_support, [8, 262144]),
     )
     captured = {}
 
@@ -221,6 +222,7 @@ def test_dcp2_replicated_mamba_keeps_full_block_table_width(monkeypatch):
     runner.max_num_reqs = 1
     runner.max_num_tokens = 4
     runner.device = torch.device("cpu")
+    runner.prefill_overlap = None
     target = FullAttentionSpec(
         block_size=1600,
         num_kv_heads=1,
@@ -254,7 +256,9 @@ def test_dcp2_replicated_mamba_keeps_full_block_table_width(monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        mrv2, "init_attn_backend", lambda *args: ([], SimpleNamespace(), [1600, 1600])
+        mrv2,
+        "init_attn_backend",
+        lambda *args, **kwargs: ([], SimpleNamespace(), [1600, 1600]),
     )
     captured = {}
 
