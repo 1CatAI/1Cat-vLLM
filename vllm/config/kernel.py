@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from pydantic import Field, field_validator, model_validator
 
 from vllm.config.execution_policy import LayerExecutionPolicy
+from vllm.config.execution_policy_base import ExecutionPolicy
 from vllm.config.gdn import GdnConfig
 from vllm.config.legacy_inputs import LegacyInputs
 from vllm.config.sm70_moe import Sm70MoEConfig
@@ -363,6 +364,19 @@ class Sm70AwqConfig(Sm70LinearCompatibility):
                     value = self.use_turbomind(value)
                 setattr(self, field, value)
         self.resolved = True
+
+
+@config
+class V41DraftProjectionPolicy(ExecutionPolicy):
+    """Exact output-row sharding for the V4.1 DSpark main projection."""
+
+    enabled: bool | None = None
+    """Opt in only for the existing raw-FP8 small-M GEMV path."""
+    active: bool = Field(default=False, init=False)
+    """Only a constructed V4.1 drafter binds this computation."""
+    aliases: ClassVar[dict[str, str]] = {
+        "enabled": "VLLM_V41_DRAFT_MP_SHARD",
+    }
 
 
 @config
@@ -765,6 +779,11 @@ class KernelConfig:
 
     sm70_awq: Sm70AwqConfig = Field(default_factory=Sm70AwqConfig)
     """SM70 dense AWQ policy, resolved per engine."""
+
+    v41_draft_projection: V41DraftProjectionPolicy = Field(
+        default_factory=V41DraftProjectionPolicy
+    )
+    """Model-admitted DSpark projection computation; independent of FP8 selection."""
 
     sm70_fp8: Sm70Fp8Config = Field(default_factory=Sm70Fp8Config)
     """SM70 serialized block-FP8 variant policy, resolved per engine."""
@@ -1179,6 +1198,7 @@ class KernelConfig:
                     "ple_disk_cascade_active",
                 }
             )
+        ignored_factors.add("v41_draft_projection")
         if not self.sm70_awq.resolved:
             # An unused format must not perturb another format's graph cache.
             ignored_factors.add("sm70_awq")
@@ -1239,6 +1259,8 @@ class KernelConfig:
             factors["sm70_mxfp4"] = self.sm70_mxfp4.hash_options()
         if self.sm70_marlin.values:
             factors["sm70_marlin"] = self.sm70_marlin.hash_options()
+        if self.v41_draft_projection.active:
+            factors["v41_draft_projection"] = self.v41_draft_projection.compute_hash()
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
 

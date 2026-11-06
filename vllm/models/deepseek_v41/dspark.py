@@ -11,10 +11,13 @@ from torch import nn
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.deepseek_v41 import collapse_hc
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, ReplicatedLinear
@@ -31,6 +34,8 @@ from .markov_fused import MarkovGreedy, markov_bias
 from .model import V41Attention, V41Block, V41MoE, V41Norm, _SharedAttention
 from .quant_rope import apply_rope, attention_qdq, rope_table
 from .query_graph import V41ContextGraphs, V41GreedyDraftGraph, V41QueryGraph
+
+logger = init_logger(__name__)
 
 _MARKOV_FUSED = __import__("os").environ.get("VLLM_V41_MARKOV_FUSED", "1") == "1"
 
@@ -110,6 +115,13 @@ class V41DraftBlock(V41Block):
 class V41DraftModel(nn.Module):
     def __init__(self, vllm_config, prefix):
         super().__init__()
+        policy = vllm_config.kernel_config.v41_draft_projection
+        if not isinstance(policy.enabled, bool):
+            raise RuntimeError("V4.1 draft projection policy was not initialized")
+        # Bound by the model adapter before graph-key creation.
+        policy.active = policy.enabled
+        self.shard_main_projection = policy.enabled
+        self._shard_main_projection_logged = False
         c = vllm_config.model_config.hf_text_config
         self.hidden_size = c.hidden_size
         # The proposer replaces these modules before profiling or generation.
@@ -123,6 +135,19 @@ class V41DraftModel(nn.Module):
             quant_config=vllm_config.quant_config,
             prefix=prefix + ".main_proj",
         )
+        if policy.enabled:
+            from .draft_projection import admit_projection
+            from .fp8_linear import _gemv_ready
+
+            admit_projection(
+                get_tensor_model_parallel_world_size(),
+                _gemv_ready(),
+                self.main_proj.bias is not None,
+                c.hidden_size,
+                c.hidden_size * 3,
+                weight=self.main_proj.weight,
+                scales=getattr(self.main_proj, "weight_scale_inv", None),
+            )
         self.main_norm, self.norm = V41Norm(c.hidden_size), V41Norm(c.hidden_size)
         shared = _SharedAttention()
         self.layers = nn.ModuleList(
@@ -155,6 +180,22 @@ class V41DraftModel(nn.Module):
         # the following RMS normalization removes this common factor.
         if auxiliary.dtype != torch.float16:  # target stores pre-scaled FP16
             auxiliary = (auxiliary * (2.0**-6)).to(torch.float16)
+        if self.shard_main_projection and 1 <= auxiliary.shape[0] <= 8:
+            from .draft_projection import sharded_projection
+
+            if not self._shard_main_projection_logged:
+                logger.info("V4.1 DSpark main_proj: TP-sharded GEMV active")
+                self._shard_main_projection_logged = True
+            return self.main_norm(
+                sharded_projection(
+                    auxiliary,
+                    self.main_proj.weight,
+                    self.main_proj.weight_scale_inv,
+                    get_tensor_model_parallel_rank(),
+                    get_tensor_model_parallel_world_size(),
+                    tensor_model_parallel_all_gather,
+                )
+            )
         return self.main_norm(self.main_proj(auxiliary))
 
     def precompute_and_store_context_kv(self, states, positions, slots=None):

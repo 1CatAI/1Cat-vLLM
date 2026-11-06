@@ -787,6 +787,7 @@ class PlePlacementPolicy(ExecutionPolicy):
 POLICY_OWNERS = {
     "compilation_config.runtime": "GraphPolicy",
     "kernel_config.layer_execution": "LayerExecutionPolicy",
+    "kernel_config.v41_draft_projection": "V41DraftProjectionPolicy",
     "kernel_config.sm70_sparse": "Sm70SparseConfig",
     "parallel_config.communication": "CommunicationPolicy",
     "offload_config.ple": "PlePlacementPolicy",
