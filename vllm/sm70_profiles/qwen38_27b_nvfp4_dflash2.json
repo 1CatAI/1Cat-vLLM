@@ -23,7 +23,7 @@
     "attention_backend": "FLASH_ATTN_V100",
     "kv_cache_dtype": "fp8_e4m3",
     "max_model_len": 262144,
-    "gpu_memory_utilization": 0.86,
+    "gpu_memory_utilization": 0.83,
     "max_num_batched_tokens": 4096,
     "max_num_seqs": 8,
     "mixed_prefill_step_latency_ms": 0,
