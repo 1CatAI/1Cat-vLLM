@@ -711,7 +711,7 @@ def fp8_qpn8_prepare_sm70(
     scales: torch.Tensor,
     native_policy: tuple[str, ...] = (),
 ) -> list[torch.Tensor]:
-    """Pack checkpoint-native block/channel FP8 weights into QPN8 layout."""
+    """Pack checkpoint-native block/channel/row-group FP8 weights into QPN8 layout."""
     return call_native(
         _qwen38_qpn8_op("fp8_qpn8_prepare_sm70"), native_policy, qweight, scales
     )
@@ -728,7 +728,13 @@ if hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
         n = qweight.size(0)
         k = qweight.size(1)
         codes = torch.empty((k, n), dtype=torch.uint8, device=qweight.device)
-        scale_shape = (1, n) if scales.shape == (n, 1) else (k // 128, n // 32)
+        if scales.shape == (n, 1):
+            scale_shape = (1, n)
+        elif scales.shape == (n, k // 32):
+            # MXFP8: one scale per column and 32 K.
+            scale_shape = (k // 32, n)
+        else:
+            scale_shape = (k // 128, n // 32)
         group_scales = torch.empty(
             scale_shape, dtype=torch.float16, device=scales.device
         )
@@ -888,6 +894,41 @@ if hasattr(torch.ops._C, "fp8_qpn8_gemm_sm70_out"):
         accumulator_chains: int,
         fast_decoder: bool,
         prefetch_codes: bool,
+        native_policy: tuple[str, ...] = (),
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_mma_sm75_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    native_policy: tuple[str, ...] = (),
+) -> None:
+    """Run the SM75 tensor-core GEMM on QPN8 block-FP8 codes into ``out``.
+
+    Turing only; the operator picks its tile and split-K from M, N, K and
+    the device's SM count.
+    """
+    call_native(
+        _op("fp8_qpn8_mma_sm75_out"),
+        native_policy,
+        out,
+        input,
+        codes,
+        group_scales,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_mma_sm75_out"):
+
+    @register_fake("_C::fp8_qpn8_mma_sm75_out")
+    def _fp8_qpn8_mma_sm75_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
         native_policy: tuple[str, ...] = (),
     ) -> None:
         return None

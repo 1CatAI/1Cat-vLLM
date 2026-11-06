@@ -9,6 +9,7 @@ from numbers import Number
 from typing import Any, NamedTuple
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch._prims_common import TensorLikeType
 
@@ -17,8 +18,24 @@ from vllm.model_executor.custom_op import op_registry
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.triton_utils.mma_probe import lowers_dot_to_mma
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.attention.backend import AttentionType
+
+
+def _tensor_core_triton() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7:
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return lowers_dot_to_mma(major * 10 + minor)
+
+
+# The precondition of the `triton_sm7x_tensor_cores` routes: with stock Triton
+# their tiles take the FMA layout, which does not fit Turing.
+requires_tensor_core_triton = pytest.mark.skipif(
+    not _tensor_core_triton(),
+    reason="requires a Triton that lowers tl.dot to tensor cores on this GPU",
+)
 
 # For now, disable "test_aot_dispatch_dynamic" since there are some
 # bugs related to this test in PyTorch 2.4.

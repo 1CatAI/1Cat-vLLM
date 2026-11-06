@@ -14,18 +14,14 @@ from __future__ import annotations
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.cache_utils import needs_software_fp8
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp32_to_fp8_e4m3fn_bits,
 )
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
-
-
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
 
 
 # Hadamard-128 rotation
@@ -149,7 +145,7 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert q.dtype in (torch.bfloat16, torch.float16)
     assert q.is_contiguous()
     n_rows = q.shape[0]
-    software_fp8 = _is_exact_sm70_cuda()
+    software_fp8 = needs_software_fp8()
     q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
     q_scale = torch.empty((n_rows, 1), dtype=torch.float32, device=q.device)
     if n_rows == 0:
@@ -458,7 +454,7 @@ def kpool_compress_and_write_cache(
             )
         return None
 
-    software_fp8 = _is_exact_sm70_cuda()
+    software_fp8 = needs_software_fp8()
     buf_fp8 = buf if software_fp8 else buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     # bytes per page (last dim of kv_cache) viewed as uint8
@@ -829,7 +825,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 
     page_size = kv_cache.shape[1]
     buf = kv_cache
-    software_fp8 = _is_exact_sm70_cuda()
+    software_fp8 = needs_software_fp8()
     buf_fp8 = buf if software_fp8 else buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
 

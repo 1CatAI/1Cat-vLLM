@@ -130,6 +130,7 @@ class WhisperModelState(ModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_id: int = 0,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
@@ -165,6 +166,7 @@ class WhisperModelState(ModelState):
             model_specific_attn_metadata=whisper_attn_metadata,
             for_cudagraph_capture=for_capture,
             prefix_anchor_lens=input_batch.prefix_anchor_lens,
+            ubatch_id=ubatch_id,
         )
         return attn_metadata
 

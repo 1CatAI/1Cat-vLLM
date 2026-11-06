@@ -226,6 +226,9 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                             int64_t split_k, int64_t accumulator_chains,
                             bool fast_decoder, bool prefetch_codes);
 
+void fp8_qpn8_mma_sm75_out(torch::Tensor out, torch::Tensor input,
+                           torch::Tensor codes, torch::Tensor group_scales);
+
 void fp8_qpn8_gemm_ba_split_sm70_out(torch::Tensor qkv_out, torch::Tensor z_out,
                                      torch::Tensor b_out, torch::Tensor a_out,
                                      torch::Tensor input, torch::Tensor codes,
@@ -316,13 +319,33 @@ torch::Tensor skinny_qpn_gemm_sm70(torch::Tensor x, torch::Tensor qcodes,
                                    torch::Tensor qscales, double gscale,
                                    int64_t n);
 
-void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
-                         torch::Tensor qscales, torch::Tensor gscales,
-                         torch::Tensor perm, torch::Tensor gids,
-                         torch::Tensor goff, int64_t topk,
-                         torch::Tensor y_slots, bool x_slot_major,
-                         int64_t num_tokens, int64_t splitk, int64_t nacc,
-                         int64_t scale_mode);
+void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
+                                  torch::Tensor k_cache, torch::Tensor v_cache,
+                                  torch::Tensor cu_seqlens_q,
+                                  torch::Tensor seqused_k,
+                                  torch::Tensor block_table,
+                                  int64_t max_seqlen_q, double softmax_scale,
+                                  int64_t num_kv_splits);
+
+void indexer_prefill_scores_sm75(torch::Tensor out, torch::Tensor q,
+                                 torch::Tensor weights, torch::Tensor keys,
+                                 torch::Tensor key_scales);
+
+void csf32_expand_sm70(torch::Tensor out, torch::Tensor bases,
+                       torch::Tensor codes, torch::Tensor page_bases,
+                       torch::Tensor offsets, torch::Tensor exceptions,
+                       torch::Tensor exception_start, torch::Tensor entries,
+                       torch::Tensor gids, torch::Tensor goff, int64_t rows,
+                       int64_t groups, int64_t projections, int64_t group_rows,
+                       int64_t pairs_per_program, int64_t runs);
+
+void skinny_moe_qpn_sm70(
+    torch::Tensor x, torch::Tensor qcodes, torch::Tensor qscales,
+    torch::Tensor gscales, torch::Tensor perm, torch::Tensor gids,
+    torch::Tensor goff, int64_t topk, torch::Tensor y_slots, bool x_slot_major,
+    int64_t num_tokens, int64_t splitk, int64_t scale_mode,
+    int64_t fragment_order, std::optional<torch::Tensor> s5_base,
+    std::optional<torch::Tensor> s5_nib, std::optional<torch::Tensor> s5_hi);
 
 void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,

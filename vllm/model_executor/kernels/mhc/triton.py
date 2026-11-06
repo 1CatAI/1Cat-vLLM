@@ -138,6 +138,165 @@ def sm70_mhc_prenorm_staging(
     )
 
 
+# One tile for every card of the triton_sm7x_tensor_cores route, measured from
+# 17 to 4096 tokens. 16-wide K blocks keep each truncating tensor-core
+# accumulation chain short; four of them per step keep the loads wide.
+_TC_PRENORM_SPLITS = 32
+_TC_PRENORM_BLOCK_M = 64
+_TC_PRENORM_BLOCK_N = 16
+_TC_PRENORM_BLOCK_K = 16
+_TC_PRENORM_K_BLOCKS_PER_STEP = 4
+_TC_PRENORM_WARPS = 4
+
+
+@triton.jit
+def _mhc_prenorm_tensor_core_kernel(
+    x_ptr,
+    fn_ptr,
+    partial_ptr,
+    partial_sqrsum_ptr,
+    num_tokens,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    K_PER_SPLIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_BLOCKS_PER_STEP: tl.constexpr,
+):
+    # x is FP16, so x * w is exact on FP16 tensor cores once w is: w = hi +
+    # lo * 2^-11 with FP16 hi and lo keeps 22 of its 24 mantissa bits.
+    n_block = tl.program_id(0)
+    m_block = tl.program_id(1)
+    split = tl.program_id(2)
+    rows = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_ok = rows < num_tokens
+    col_ok = cols < N
+    zero = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    sqrsum = tl.zeros((BLOCK_M,), tl.float32)
+    for k_step in range(0, K_PER_SPLIT, BLOCK_K * K_BLOCKS_PER_STEP):
+        # Tensor cores truncate their FP32 accumulation: every K block starts
+        # from zero and the block sums add round-to-nearest, in two levels.
+        # fma is no addf, so Triton cannot fold `step +=` into the MMA chain.
+        step = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        step_sqrsum = tl.zeros((BLOCK_M,), tl.float32)
+        for i in tl.static_range(K_BLOCKS_PER_STEP):
+            ks = split * K_PER_SPLIT + k_step + i * BLOCK_K + tl.arange(0, BLOCK_K)
+            w = tl.load(
+                fn_ptr + cols[None, :] * K + ks[:, None],
+                mask=col_ok[None, :],
+                other=0.0,
+            )
+            x = tl.load(
+                x_ptr + rows[:, None] * K + ks[None, :],
+                mask=row_ok[:, None],
+                other=0.0,
+            )
+            w_hi = w.to(tl.float16)
+            w_lo = ((w - w_hi.to(tl.float32)) * 2048.0).to(tl.float16)
+            step += tl.fma(tl.dot(x, w_lo, zero), 1.0 / 2048.0, tl.dot(x, w_hi, zero))
+            if n_block == 0:
+                x_fp32 = x.to(tl.float32)
+                step_sqrsum += tl.sum(x_fp32 * x_fp32, axis=1)
+        acc += step
+        sqrsum += step_sqrsum
+    tl.store(
+        partial_ptr + (split * num_tokens + rows[:, None]) * N + cols[None, :],
+        acc,
+        mask=row_ok[:, None] & col_ok[None, :],
+    )
+    if n_block == 0:
+        tl.store(partial_sqrsum_ptr + split * num_tokens + rows, sqrsum, mask=row_ok)
+
+
+@triton.jit
+def _mhc_split_sum_kernel(
+    partial_ptr, out_ptr, numel, SPLITS: tl.constexpr, BLOCK: tl.constexpr
+):
+    # Each thread holds all splits of its elements, so an FP32 sum would be one
+    # sequential chain; summing in FP64 rounds once.
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ok = offsets < numel
+    partials = tl.load(
+        partial_ptr + tl.arange(0, SPLITS)[:, None] * numel + offsets[None, :],
+        mask=ok[None, :],
+        other=0.0,
+    )
+    total = tl.sum(partials.to(tl.float64), axis=0)
+    tl.store(out_ptr + offsets, total.to(tl.float32), mask=ok)
+
+
+def _mhc_split_sum(partials: torch.Tensor, out: torch.Tensor) -> None:
+    numel = out.numel()
+    block = 256
+    _mhc_split_sum_kernel[(triton.cdiv(numel, block),)](
+        partials, out, numel, SPLITS=partials.shape[0], BLOCK=block, num_warps=4
+    )
+
+
+def mhc_prenorm_tensor_cores(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+) -> None:
+    """FP32 mHC logits and square sums from FP16 tensor cores.
+
+    Serves the ``triton_sm7x_tensor_cores`` route, whose Triton lowers
+    ``tl.dot`` to MMA on its cards. Writes a single split:
+    ``gemm_out_mul`` is ``(1, tokens, n)``, ``gemm_out_sqrsum`` ``(1, tokens)``.
+    """
+    if x.dtype != torch.float16 or fn.dtype != torch.float32:
+        raise TypeError("mHC tensor-core prenorm requires FP16 input, FP32 weights")
+    if not (x.is_contiguous() and fn.is_contiguous()):
+        raise ValueError("mHC tensor-core prenorm requires contiguous inputs")
+    num_tokens, k = x.shape
+    n = fn.shape[0]
+    if fn.shape[1] != k:
+        raise ValueError("mHC tensor-core prenorm K dimensions do not match")
+    if gemm_out_mul.shape != (1, num_tokens, n) or gemm_out_sqrsum.shape != (
+        1,
+        num_tokens,
+    ):
+        raise ValueError("mHC tensor-core prenorm writes exactly one split")
+    k_per_step = _TC_PRENORM_BLOCK_K * _TC_PRENORM_K_BLOCKS_PER_STEP
+    if k % (_TC_PRENORM_SPLITS * k_per_step):
+        raise ValueError(
+            f"mHC tensor-core prenorm needs K divisible by "
+            f"{_TC_PRENORM_SPLITS * k_per_step}, got {k}"
+        )
+    partials = torch.empty(
+        _TC_PRENORM_SPLITS, num_tokens, n, dtype=torch.float32, device=x.device
+    )
+    partial_sqrsum = torch.empty(
+        _TC_PRENORM_SPLITS, num_tokens, dtype=torch.float32, device=x.device
+    )
+    grid = (
+        triton.cdiv(n, _TC_PRENORM_BLOCK_N),
+        triton.cdiv(num_tokens, _TC_PRENORM_BLOCK_M),
+        _TC_PRENORM_SPLITS,
+    )
+    _mhc_prenorm_tensor_core_kernel[grid](
+        x,
+        fn,
+        partials,
+        partial_sqrsum,
+        num_tokens,
+        N=n,
+        K=k,
+        K_PER_SPLIT=k // _TC_PRENORM_SPLITS,
+        BLOCK_M=_TC_PRENORM_BLOCK_M,
+        BLOCK_N=_TC_PRENORM_BLOCK_N,
+        BLOCK_K=_TC_PRENORM_BLOCK_K,
+        K_BLOCKS_PER_STEP=_TC_PRENORM_K_BLOCKS_PER_STEP,
+        num_warps=_TC_PRENORM_WARPS,
+    )
+    _mhc_split_sum(partials, gemm_out_mul)
+    _mhc_split_sum(partial_sqrsum, gemm_out_sqrsum)
+
+
 @triton.jit
 def _sm70_mhc_post_kernel(
     x_ptr,

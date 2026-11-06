@@ -3,7 +3,10 @@
 """Grouped NVFP4 and MXFP4 MoE over the skinny QPN kernels (SM70/SM75).
 
 The backend oracle admits compatible configurations by default. Expert weights
-are permuted in place into mma.m8n8k4 fragment order at load time. Device-side
+are permuted in place at load time into the fragment order of the card's
+tensor-core MMA: mma.m8n8k4 on SM70, mma.m16n8k8 from SM75 on, which Turing
+runs at twice its m8n8k4 rate. Each layer's weights live on one card, so one
+order per card covers every serving path. Device-side
 routing handles both scale formats; chunking bounds native CUDA grid dimensions
 and temporary bytes without a fixed token or concurrency admission limit.
 
@@ -12,24 +15,42 @@ codes, MXFP4 one E8M0 scale per 32; the codes, their packing and the fragment
 order are the same, so both formats share the kernels.
 """
 
+import dataclasses
 from dataclasses import dataclass
+from enum import IntEnum
 
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
     Nvfp4QuantizationEmulationTritonExperts,
 )
+from vllm.model_executor.layers.fused_moe.experts.skinny_moe_triton import (
+    TRITON_MIN_ROWS_PER_EXPERT,
+    skinny_moe_e8m0_m8n8k4_triton,
+)
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
-from vllm.model_executor.layers.fused_moe.sm70.reduction import weighted_reduce_rows
+from vllm.model_executor.layers.fused_moe.sm70.reduction import _mtp_weighted_reduce
+from vllm.model_executor.layers.fused_moe.sm70.routing import group_routing
+from vllm.model_executor.layers.quantization.utils.csf32_expand import (
+    CsfExpertScales,
+    expand_csf32_experts,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
     kNvfp4Dynamic,
     kNvfp4Static,
+)
+from vllm.model_executor.layers.quantization.utils.s5_scales import (
+    S5_MAX_SPREAD,
+    S5Scales,
+    encode_s5,
+    scale_spread,
 )
 from vllm.platforms import current_platform
 
@@ -40,12 +61,70 @@ _CUDA_GRID_Y_LIMIT = 65535
 _QPN_MAX_M = 16
 
 
-def grouped_splitk(k: int, preferred: int) -> int:
-    """Choose only launch specializations that divide the actual K groups."""
-    for split in dict.fromkeys((preferred, 16, 8, 10)):
+class QpnFragmentOrder(IntEnum):
+    """Register order of the packed expert weights, one per MMA shape.
+
+    The values are the native operator's ``fragment_order`` argument.
+    """
+
+    M8N8K4 = 0
+    M16N8K8 = 1
+
+
+def qpn_fragment_order(device_id: int) -> QpnFragmentOrder:
+    """The order the given card's kernels read: m16n8k8 where the card has it."""
+    if current_platform.has_device_capability(75, device_id=device_id):
+        return QpnFragmentOrder.M16N8K8
+    return QpnFragmentOrder.M8N8K4
+
+
+def grouped_splitk(k: int, order: QpnFragmentOrder) -> int:
+    """Split-K warps per CTA for a GEMM that reduces over ``k``.
+
+    Picks the most preferred specialization the native kernel instantiates
+    that divides the actual K groups. Both kernels prefer 8 warps (tuning
+    sweeps 2026-10-21); Turing's m16n8k8 kernel takes 4 where 8 would leave a
+    warp fewer than 16 groups, Volta's m8n8k4 kernel 16 or 10 where 8 does
+    not divide K.
+    """
+    if order == QpnFragmentOrder.M8N8K4:
+        preference: tuple[int, ...] = (8, 16, 10)
+    else:
+        preference = (8, 4) if k >= 2048 else (4, 8)
+    for split in preference:
         if k > 0 and k % 64 == 0 and (k // 16) % split == 0:
             return split
     raise ValueError(f"skinny grouped MoE has no split-K specialization for K={k}")
+
+
+def _fragment_tables(
+    order: QpnFragmentOrder, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Where each packed code and scale byte of a tile comes from.
+
+    Returns the output column [32 lanes, 16 codes] and the K offset inside the
+    16-code group [32, 16] of every code a lane holds (codes in nibble order,
+    low nibble first), and the column [32] of each of a scale group's 32
+    scale bytes. The m16n8k8 tables mirror m16n8k8_fp4_column and
+    m16n8k8_fp4_k in csrc/sm70_turbomind/ops/mma_fragments_sm70.cuh.
+    """
+    lane = torch.arange(32, device=device).view(32, 1)
+    if order == QpnFragmentOrder.M8N8K4:
+        # Lane holds one column; its 16 K values interleaved so the decoder's
+        # (i, i + 4) output is the adjacent-k B register pair.
+        col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
+        korder = torch.tensor(
+            [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15], device=device
+        )
+        return col.expand(32, 16), korder.view(1, 16).expand(32, 16), col.view(32)
+    # Code word w covers A tile w; nibble n sits at column 16w + l/4 + 8(n&1)
+    # and K 4(l%4) + 2((n>>1)&1) + (n>>2). Scale byte r is column r/4 + 8(r%4).
+    position = torch.arange(16, device=device).view(1, 16)
+    word, nibble = position >> 3, position & 7
+    col = 16 * word + (lane >> 2) + 8 * (nibble & 1)
+    k = 4 * (lane & 3) + 2 * ((nibble >> 1) & 1) + (nibble >> 2)
+    entry = torch.arange(32, device=device)
+    return col, k, (entry >> 2) + 8 * (entry & 3)
 
 
 def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
@@ -60,23 +139,40 @@ def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
     return None
 
 
+def qpn_scale_entries(order: QpnFragmentOrder, device: torch.device) -> torch.Tensor:
+    """Raster position of each tile row's scale byte, int32 [32].
+
+    The inverse of the scale column table of ``_fragment_tables``; the CSF
+    expansion writes compressed expert scales through it.
+    """
+    _, _, scale_col = _fragment_tables(order, device)
+    entries = torch.empty(32, dtype=torch.int32, device=device)
+    entries[scale_col] = torch.arange(32, dtype=torch.int32, device=device)
+    return entries
+
+
 def qpn_prepack(
-    codes: torch.Tensor, scales: torch.Tensor, scale_group: int = 16
-) -> tuple[torch.Tensor, torch.Tensor]:
+    codes: torch.Tensor,
+    scales: torch.Tensor | None,
+    scale_group: int,
+    order: QpnFragmentOrder,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Permute one weight matrix into the fragment order the QPN kernels read.
 
     Codes become [tile N/32][group K/16][lane 32] x 8 bytes, with the nibbles
-    interleaved so that the decoder's (i, i + 4) output pair is exactly the
-    adjacent-k B fragment register pair; scales become
-    [tile N/32][group K/scale_group][lane 32]. A pure permutation of the
+    placed so that the decoder's (i, i + 4) output pairs are exactly the MMA
+    operand registers of the given order; scales become
+    [tile N/32][group K/scale_group][32 bytes]. A pure permutation of the
     checkpoint bytes.
 
     Args:
         codes: [N, K/2] uint8, two e2m1 codes per byte, low nibble first.
-        scales: [N, K/scale_group] uint8 scale bytes.
+        scales: [N, K/scale_group] uint8 scale bytes, or None to permute only
+            the codes (compressed scales are expanded into this order later).
         scale_group: codes per scale, 16 for NVFP4 (fp8-e4m3) and 32 for
             MXFP4 (E8M0). The code layout is the same for both: a 32-code
             MXFP4 block is two adjacent 16-code groups sharing one scale.
+        order: the MMA fragment order of the card the weights serve on.
 
     Returns:
         The permuted codes and scales, both flat and contiguous.
@@ -89,36 +185,39 @@ def qpn_prepack(
         )
     dev = codes.device
     tiles, groups = n // 32, k // scale_group
-    lane = torch.arange(32, device=dev)
-    col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
-    korder = torch.tensor(
-        [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15], device=dev
-    )
+    code_col, code_k, scale_col = _fragment_tables(order, dev)
     nib = torch.stack([codes & 0xF, codes >> 4], dim=-1).view(n, k)
     cgroups = k // 16  # code groups: always 16 codes per fragment pair
     g = torch.arange(groups, device=dev)
     cg = torch.arange(cgroups, device=dev)
-    kidx = cg.view(cgroups, 1) * 16 + korder.view(1, 16)
+    kidx = cg.view(cgroups, 1, 1) * 16 + code_k.view(1, 32, 16)
     qc = torch.empty(tiles, cgroups, 32, 8, dtype=torch.uint8, device=dev)
-    qs = torch.empty(tiles, groups, 32, dtype=torch.uint8, device=dev)
+    qs = (
+        None
+        if scales is None
+        else torch.empty(tiles, groups, 32, dtype=torch.uint8, device=dev)
+    )
     # Chunk the gather: the int64 index intermediates are 16x the payload,
     # so cap the transients at ~300 MB.
     chunk = max(1, 36864 // max(groups, cgroups))
     for t0 in range(0, tiles, chunk):
         t1 = min(t0 + chunk, tiles)
         tt = t1 - t0
-        ncol = torch.arange(t0, t1, device=dev).view(tt, 1) * 32 + col.view(1, 32)
+        tile_col = torch.arange(t0, t1, device=dev).view(tt, 1, 1) * 32
+        ncol = tile_col + code_col.view(1, 32, 16)
         nb = nib[
-            ncol.view(tt, 1, 32, 1).expand(tt, cgroups, 32, 16),
-            kidx.view(1, cgroups, 1, 16).expand(tt, cgroups, 32, 16),
+            ncol.view(tt, 1, 32, 16).expand(tt, cgroups, 32, 16),
+            kidx.view(1, cgroups, 32, 16).expand(tt, cgroups, 32, 16),
         ]
         qc[t0:t1] = nb[..., 0::2] | (nb[..., 1::2] << 4)
-        qs[t0:t1] = scales[
-            ncol.view(tt, 1, 32).expand(tt, groups, 32),
-            g.view(1, groups, 1).expand(tt, groups, 32),
-        ]
+        if qs is not None and scales is not None:
+            scol = tile_col.view(tt, 1) + scale_col.view(1, 32)
+            qs[t0:t1] = scales[
+                scol.view(tt, 1, 32).expand(tt, groups, 32),
+                g.view(1, groups, 1).expand(tt, groups, 32),
+            ]
     del nib
-    return qc.view(-1).contiguous(), qs.view(-1).contiguous()
+    return qc.view(-1).contiguous(), None if qs is None else qs.view(-1).contiguous()
 
 
 def _expert_gemm(
@@ -298,11 +397,37 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         self._w2_block_scales: torch.Tensor = w2_scale
         # 0 = NVFP4 (fp8-e4m3 per 16 codes), 1 = MXFP4 (E8M0 per 32)
         self._scale_mode: int = 0
+        # From this worker's own card: a node may mix card generations.
+        self._fragment_order = qpn_fragment_order(
+            torch.accelerator.current_device_index()
+        )
+        # Prefill chunks with many rows per expert can take the tensor-core
+        # Triton projection; decided once, for this worker's card.
+        self._triton_tensor_cores = (
+            get_current_vllm_config().kernel_config.use_triton_sm7x_tensor_cores()
+        )
         self.quant_config._w1.scale = None
         self.quant_config._w2.scale = None
         self.quantization_emulation = False
         # Built on first apply (weights live on the GPU then).
         self._scale_caches: _ScaleCaches | None = None
+        # csf_32x2_v1 planes (w13, w2): the block scales above are then shared
+        # rasters that each grouped call fills for its routed experts.
+        self._csf_planes: (
+            tuple[CsfExpertScales | None, CsfExpertScales | None] | None
+        ) = None
+        self._csf_scale_entries: torch.Tensor | None = None
+        # The same scales as five-bit planes (s5_scales.py), which the kernels
+        # read in place; a projection whose rows span more than five bits carry
+        # keeps its csf planes (above) and is expanded to the raster per call.
+        self._s5: tuple[S5Scales | None, S5Scales | None] | None = None
+
+    def attach_csf_scales(self, w13: CsfExpertScales, w2: CsfExpertScales) -> None:
+        """Serve compressed expert scales; call before process_weights_after_loading."""
+        self._csf_planes = (w13, w2)
+        self._csf_scale_entries = qpn_scale_entries(
+            self._fragment_order, w13.bases.device
+        )
 
     @property
     def quant_dtype(self) -> torch.dtype | str | None:
@@ -392,12 +517,29 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                     f"(N % 32, K % 64); got {name} N={w.size(1)} "
                     f"K={w.size(2) * 2}"
                 )
+        if self._csf_planes is not None:
+            # The shared rasters take the expanded scales in this card's order.
+            for e in range(w13.size(0)):
+                w13[e].view(-1).copy_(
+                    qpn_prepack(w13[e], None, 16, self._fragment_order)[0]
+                )
+                w2[e].view(-1).copy_(
+                    qpn_prepack(w2[e], None, 16, self._fragment_order)[0]
+                )
+            self._s5 = self._csf_to_s5()
+            logger.info_once(
+                "Skinny MoE: expert codes re-permuted to QPN fragment order; "
+                "csf_32x2_v1 scales re-encoded as five-bit planes (%d experts)",
+                w13.size(0),
+            )
+            return
         s13, s2, sg = self._scale_rasters(layer)
+        order = self._fragment_order
         for e in range(w13.size(0)):
-            qc, qs = qpn_prepack(w13[e], s13[e], sg)
+            qc, qs = qpn_prepack(w13[e], s13[e], sg, order)
             w13[e].view(-1).copy_(qc)
             s13[e].view(-1).copy_(qs)
-            qc, qs = qpn_prepack(w2[e], s2[e], sg)
+            qc, qs = qpn_prepack(w2[e], s2[e], sg, order)
             w2[e].view(-1).copy_(qc)
             s2[e].view(-1).copy_(qs)
         if sg == 32:
@@ -405,11 +547,84 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             self._w2_block_scales = s2
             self._scale_mode = 1
         logger.info_once(
-            "Skinny MoE: expert weights re-permuted to QPN fragment order in "
+            "Skinny MoE: expert weights re-permuted to %s fragment order in "
             "place (%d experts, one scale per %d codes)",
+            order.name.lower(),
             w13.size(0),
             sg,
         )
+
+    def _csf_to_s5(
+        self,
+    ) -> tuple[S5Scales | None, S5Scales | None]:
+        """Re-encode the csf planes as five-bit planes where the rows fit.
+
+        Each projection set is expanded for all experts into its shared raster
+        (the expansion kernel the csf planes always went through) and measured;
+        a set whose rows span at most `S5_MAX_SPREAD` is packed and its csf
+        planes are dropped, any other keeps them.
+        """
+        assert self._csf_planes is not None and self._csf_scale_entries is not None
+        scales = self._get_scale_caches()
+        converted: list[S5Scales | None] = []
+        kept: list[CsfExpertScales | None] = []
+        spreads: list[int] = []
+        for planes, raster in zip(
+            self._csf_planes, (scales.w1_scales_u8, scales.w2_scales_u8)
+        ):
+            assert planes is not None
+            experts = raster.shape[0]
+            routed = torch.arange(experts, dtype=torch.int32, device=raster.device)
+            expand_csf32_experts(
+                raster.view(experts, -1),
+                planes,
+                routed,
+                torch.arange(experts + 1, dtype=torch.int32, device=raster.device),
+                self._csf_scale_entries,
+            )
+            spread = scale_spread(raster.view(experts, -1), planes.groups)
+            spreads.append(spread)
+            fits = spread <= S5_MAX_SPREAD
+            converted.append(
+                encode_s5(raster.view(experts, -1), planes.groups) if fits else None
+            )
+            kept.append(None if fits else planes)
+        if all(plane is None for plane in kept):
+            self._csf_planes = None
+            self._csf_scale_entries = None
+        else:
+            self._csf_planes = (kept[0], kept[1])
+        if any(plane is not None for plane in kept):
+            logger.info(
+                "Skinny MoE: csf scales stay compressed where five bits do not "
+                "carry them (row spans %d / %d, limit %d)",
+                spreads[0],
+                spreads[1],
+                S5_MAX_SPREAD,
+            )
+        self._release_rasters((converted[0], converted[1]))
+        return converted[0], converted[1]
+
+    def _release_rasters(self, packed: tuple[S5Scales | None, S5Scales | None]) -> None:
+        """Let go of the shared raster of every projection now served from five-bit
+        planes (the kernels read the planes and ignore the raster argument); the
+        last layer of a card to do so frees the raster."""
+        caches = self._get_scale_caches()
+        placeholder = caches.w1_scales_u8.new_empty(0)
+        if packed[0] is not None:
+            self._w1_block_scales = placeholder
+            self.quant_config._w1.scale = placeholder
+            caches = dataclasses.replace(caches, w1_scales_u8=placeholder)
+        if packed[1] is not None:
+            self._w2_block_scales = placeholder
+            self.quant_config._w2.scale = placeholder
+            caches = dataclasses.replace(caches, w2_scales_u8=placeholder)
+        self._scale_caches = caches
+
+    def scale_rasters_released(self) -> tuple[bool, bool]:
+        """Which projections no longer need a raster (served from five-bit planes)."""
+        s5 = self._s5 if self._s5 is not None else (None, None)
+        return s5[0] is not None, s5[1] is not None
 
     def _scale_rasters(
         self, layer: torch.nn.Module
@@ -442,8 +657,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        # The kernels are written for SM70 (mma.m8n8k4) and tested on SM70 and
-        # SM75. The capability comes from this worker's own device: on a node
+        # The kernels run mma.m8n8k4 on SM70 and m16n8k8 on SM75, tested on
+        # both. The capability comes from this worker's own device: on a node
         # that mixes card generations, device 0 answers for another card.
         if not current_platform.is_cuda() or not torch.accelerator.is_available():
             return False
@@ -471,12 +686,13 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         kernel_config.sm70_skinny_moe_applicable = True
         if not kernel_config.sm70_skinny_moe:
             return False, "disabled by kernel_config.sm70_skinny_moe"
+        order = qpn_fragment_order(torch.accelerator.current_device_index())
         for name, k in (
             ("hidden", moe_config.hidden_dim),
             ("intermediate", moe_config.intermediate_size_per_partition),
         ):
             try:
-                grouped_splitk(k, 16)
+                grouped_splitk(k, order)
             except ValueError as exc:
                 return False, f"{name} dimension: {exc}"
         if moe_config.in_dtype != torch.float16:
@@ -537,7 +753,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         top_k = topk_ids.size(1)
         if not 0 < top_k <= _CUDA_GRID_Y_LIMIT:
             raise ValueError("routing width exceeds the native CUDA grid-y limit")
-        bytes_per_token = top_k * (2 * (w1.size(1) + w2.size(1)) + 4 * w2.size(1))
+        bytes_per_token = top_k * 2 * (w1.size(1) + w2.size(1))
         chunk = min(_CUDA_GRID_Y_LIMIT // top_k, max(1, (128 << 20) // bytes_per_token))
         for start in range(0, hidden_states.size(0), chunk):
             end = start + chunk
@@ -605,32 +821,30 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         num_tokens, top_k = topk_ids.shape
         inter_dim = self.adjust_N_for_activation(w1.size(1), activation)
         device = hidden_states.device
-        # Compact device-side routing (all fixed shapes, CUDA-graph safe):
-        # slots sorted by expert; consecutive equal experts form a group.
-        # gids[g] = group's expert, goff[g]..goff[g+1] = its slot range;
-        # unused group slots stay empty (goff = S) and the kernel skips
-        # them -- the launch never scales with the expert count.
-        flat = topk_ids.reshape(-1).to(torch.int64)
-        num_slots = flat.numel()
-        perm = torch.argsort(flat, stable=True).to(torch.int32)
-        sorted_e = flat[perm.long()]
-        new_group = torch.ones(num_slots, dtype=torch.bool, device=device)
-        new_group[1:] = sorted_e[1:] != sorted_e[:-1]
-        gidx = torch.cumsum(new_group, 0) - 1
-        goff = torch.full((num_slots + 1,), num_slots, dtype=torch.int64, device=device)
-        goff.scatter_reduce_(
-            0,
-            gidx,
-            torch.arange(num_slots, dtype=torch.int64, device=device),
-            reduce="amin",
-        )
-        gids = torch.zeros(num_slots, dtype=torch.int64, device=device)
-        gids.scatter_(0, gidx, sorted_e)
-        gids32, goff32 = gids.to(torch.int32), goff.to(torch.int32)
+        # Compact device-side routing (all fixed shapes, CUDA-graph safe): the
+        # kernel launches min(S, experts) group rows and skips the empty ones.
+        num_slots = topk_ids.numel()
+        perm, gids32, goff32 = group_routing(topk_ids)
+        s5_w13, s5_w2 = self._s5 if self._s5 is not None else (None, None)
+        if self._csf_planes is not None:
+            # Projections without five-bit planes: csf expanded to the raster here.
+            assert self._csf_scale_entries is not None
+            for planes, raster, five_bit, projection in (
+                (self._csf_planes[0], scales.w1_scales_u8, s5_w13, w1),
+                (self._csf_planes[1], scales.w2_scales_u8, s5_w2, w2),
+            ):
+                if five_bit is None and planes is not None:
+                    expand_csf32_experts(
+                        raster.view(projection.size(0), -1),
+                        planes,
+                        gids32,
+                        goff32,
+                        self._csf_scale_entries,
+                    )
         y13 = torch.empty(
             (num_slots, w1.size(1)), dtype=hidden_states.dtype, device=device
         )
-        torch.ops._C.skinny_moe_qpn_sm70(
+        self._grouped_projection(
             hidden_states,
             w1,
             scales.w1_scales_u8,
@@ -642,14 +856,12 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y13,
             False,
             num_tokens,
-            grouped_splitk(hidden_states.size(1), 16),
-            1,
-            self._scale_mode,
+            s5_w13,
         )
         inter = torch.empty((num_slots, inter_dim), dtype=y13.dtype, device=device)
         self.activation(activation, inter, y13)
         y2 = torch.empty((num_slots, w2.size(1)), dtype=y13.dtype, device=device)
-        torch.ops._C.skinny_moe_qpn_sm70(
+        self._grouped_projection(
             inter,
             w2,
             scales.w2_scales_u8,
@@ -661,16 +873,64 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             y2,
             True,
             num_tokens,
-            grouped_splitk(inter_dim, 8),
-            1,
-            self._scale_mode,
+            s5_w2,
         )
-        output.copy_(
-            weighted_reduce_rows(
-                y2.view(num_tokens, top_k, -1),
-                topk_weights,
-                output.dtype,
+        # One pass over the slot rows straight into the output (the reduction
+        # moe_unpermute computes) instead of writing and re-reading two FP32
+        # copies of y2.
+        _mtp_weighted_reduce(y2, topk_weights, output)
+
+    def _grouped_projection(
+        self,
+        x: torch.Tensor,
+        w: torch.Tensor,
+        scales_u8: torch.Tensor,
+        global_scales: torch.Tensor,
+        perm: torch.Tensor,
+        gids: torch.Tensor,
+        goff: torch.Tensor,
+        top_k: int,
+        y: torch.Tensor,
+        x_slot_major: bool,
+        num_tokens: int,
+        s5: S5Scales | None = None,
+    ) -> None:
+        """y[slot] = x[row] @ W[expert].T over the expert groups of the slots.
+
+        With five-bit scale planes ``scales_u8`` is only the raster the op fills
+        for launches that do not decode the planes in place.
+        """
+        # Volta's hand kernel decodes every weight tile again for each 8-row
+        # block; past 13 rows per expert on average the Triton kernel, which
+        # decodes a tile once per row block, is faster.
+        if (
+            self._triton_tensor_cores
+            and self._fragment_order == QpnFragmentOrder.M8N8K4
+            and self._scale_mode == 1
+            and y.size(0) > TRITON_MIN_ROWS_PER_EXPERT * w.size(0)
+        ):
+            skinny_moe_e8m0_m8n8k4_triton(
+                x, w, scales_u8, global_scales, perm, gids, goff, top_k, y, x_slot_major
             )
+            return
+        torch.ops._C.skinny_moe_qpn_sm70(
+            x,
+            w,
+            scales_u8,
+            global_scales,
+            perm,
+            gids,
+            goff,
+            top_k,
+            y,
+            x_slot_major,
+            num_tokens,
+            grouped_splitk(x.size(1), self._fragment_order),
+            self._scale_mode,
+            self._fragment_order,
+            None if s5 is None else s5.base,
+            None if s5 is None else s5.nib,
+            None if s5 is None else s5.hi,
         )
 
 

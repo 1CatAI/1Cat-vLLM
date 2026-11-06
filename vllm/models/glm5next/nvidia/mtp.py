@@ -323,6 +323,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             name = self._rewrite_spec_layer_name(spec_layer, name)
 
             if _try_load_fp8_indexer_wk(
+                self,
                 name,
                 loaded_weight,
                 _pending_wk_fp8,
@@ -337,6 +338,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # so the checkpoint's block-FP8 weight + weight_scale_inv for these
             # has no param home and would KeyError without this dequant.
             if _try_load_fp8_attn_proj(
+                self,
                 name,
                 loaded_weight,
                 _pending_wk_fp8,

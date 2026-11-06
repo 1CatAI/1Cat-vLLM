@@ -44,6 +44,18 @@ from vllm.models.deepseek_v4.common.ops import fused_q_kv_rmsnorm
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+# The tower runs every token-wise step (projections, q/k norm, rotary, MLPs,
+# merger) over at most this many rows at a time; only the attention itself
+# sees the whole sequence. A maximum-size image has 31,684 patches, and their
+# MLP and merger intermediates in one piece were 1.3 GiB on the first
+# pipeline stage, which the KV cache then lacks. Each row is computed exactly
+# as before.
+_ROWS_PER_CHUNK = 4096
+
+
+def _row_chunks(num_rows: int) -> range:
+    return range(0, num_rows, _ROWS_PER_CHUNK)
+
 
 class Glm5NextVisionPatchEmbed(nn.Module):
     def __init__(
@@ -149,7 +161,8 @@ class Glm5NextVisionAttention(nn.Module):
             total_num_kv_heads=num_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj" if quant_config else f"{prefix}.qkv",
+            # The checkpoint stores the projection fused under this name.
+            prefix=f"{prefix}.qkv",
             disable_tp=use_data_parallel,
         )
         self.proj = RowParallelLinear(
@@ -181,14 +194,13 @@ class Glm5NextVisionAttention(nn.Module):
         q, k, v = (x.view(*new_shape) for x in (q, k, v))
         return q, k, v
 
-    def forward(
+    def _project_qkv(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb_cos: torch.Tensor,
-        rotary_pos_emb_sin: torch.Tensor,
-        max_seqlen: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        rotary_pos_emb_cos: torch.Tensor | None,
+        rotary_pos_emb_sin: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """q, k, v as [batch, seq, heads, head_dim] for the rows of x."""
         x, _ = self.qkv(x)
         q, k, v = self.split_qkv(x)
 
@@ -215,6 +227,34 @@ class Glm5NextVisionAttention(nn.Module):
                 rotary_pos_emb_sin,
             )
             q, k = torch.chunk(qk_rotated, 2, dim=0)
+        return q, k, v
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        max_seqlen: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        seq_len, batch_size, _ = x.shape
+        q, k, v = (
+            x.new_empty(
+                batch_size,
+                seq_len,
+                self.num_attention_heads_per_partition,
+                self.hidden_size_per_attention_head,
+            )
+            for _ in range(3)
+        )
+        has_rotary = rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None
+        for start in _row_chunks(seq_len):
+            rows = slice(start, start + _ROWS_PER_CHUNK)
+            q[:, rows], k[:, rows], v[:, rows] = self._project_qkv(
+                x[rows],
+                rotary_pos_emb_cos[rows] if has_rotary else None,
+                rotary_pos_emb_sin[rows] if has_rotary else None,
+            )
 
         context_layer = self.attn(
             query=q,
@@ -223,9 +263,13 @@ class Glm5NextVisionAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-        context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
+        del q, k, v
+        context_layer = rearrange(context_layer, "b s h d -> s b (h d)")
 
-        output, _ = self.proj(context_layer)
+        output = x.new_empty(seq_len, batch_size, self.proj.output_size)
+        for start in _row_chunks(seq_len):
+            rows = slice(start, start + _ROWS_PER_CHUNK)
+            output[rows], _ = self.proj(context_layer[rows].contiguous())
         return output
 
 
@@ -277,8 +321,10 @@ class Glm5NextVisionBlock(nn.Module):
             max_seqlen=max_seqlen,
         )
         x_fused_norm, residual = self.norm2(x, residual=x_attn)
-        x = residual + self.mlp(x_fused_norm)
-        return x
+        for start in _row_chunks(residual.shape[0]):
+            rows = slice(start, start + _ROWS_PER_CHUNK)
+            residual[rows] += self.mlp(x_fused_norm[rows])
+        return residual
 
 
 class Glm5NextPatchMerger(nn.Module):
@@ -324,13 +370,20 @@ class Glm5NextPatchMerger(nn.Module):
         self.act_fn = SiluAndMulWithClamp(swiglu_limit=swiglu_limit)
         self.extra_activation_func = nn.GELU()
 
-    def forward(self, x: torch.Tensor):
+    def _forward_rows(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.proj(x)
         x = self.extra_activation_func(self.post_projection_norm(x))
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def forward(self, x: torch.Tensor):
+        output = x.new_empty(x.shape[0], self.hidden_size)
+        for start in _row_chunks(x.shape[0]):
+            rows = slice(start, start + _ROWS_PER_CHUNK)
+            output[rows] = self._forward_rows(x[rows])
+        return output
 
 
 class Glm5NextVisionTransformer(nn.Module):
