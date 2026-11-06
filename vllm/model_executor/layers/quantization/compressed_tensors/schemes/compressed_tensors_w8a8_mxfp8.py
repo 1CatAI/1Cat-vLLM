@@ -4,19 +4,24 @@ from collections.abc import Callable
 
 import torch
 
-from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+from vllm.model_executor.kernels.linear import (
+    Mxfp8LinearLayerConfig,
+    init_mxfp8_linear_kernel,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
+    MXFP8_SCALE_ONE,
     MXFP8_VALUE_DTYPE,
 )
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
 )
+from vllm.model_executor.utils import set_weight_attrs
 
 __all__ = ["CompressedTensorsW8A8Mxfp8"]
 
@@ -34,9 +39,6 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
     - Activations dynamically quantized to MXFP8 during inference
     """
 
-    def __init__(self):
-        self.kernel = init_mxfp8_linear_kernel()
-
     @classmethod
     def get_min_capability(cls) -> int:
         return 75
@@ -51,6 +53,11 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
+        self.kernel = init_mxfp8_linear_kernel(
+            Mxfp8LinearLayerConfig(
+                (output_size_per_partition, input_size_per_partition)
+            )
+        )
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -78,6 +85,7 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        set_weight_attrs(weight_scale, {"padding_value": MXFP8_SCALE_ONE})
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

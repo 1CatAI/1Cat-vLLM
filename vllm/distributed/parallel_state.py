@@ -758,6 +758,16 @@ class GroupCoordinator:
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        # Imported here: ubatching -> forward_context -> dp_utils -> this module.
+        from vllm.v1.worker.ubatching import (
+            dbo_overlaps_collectives,
+            dbo_run_collective_overlapped,
+        )
+
+        if dbo_overlaps_collectives():
+            return dbo_run_collective_overlapped(
+                self.device_communicator.all_reduce, input_
+            )
         return self.device_communicator.all_reduce(input_)
 
     def all_reduce_sum2(
@@ -777,7 +787,29 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        from vllm.v1.worker.ubatching import (
+            dbo_overlaps_collectives,
+            dbo_run_collective_overlapped,
+        )
+
+        if dbo_overlaps_collectives():
+            return dbo_run_collective_overlapped(
+                self.device_communicator.all_reduce_sum2, input_a, input_b
+            )
         return self.device_communicator.all_reduce_sum2(input_a, input_b)
+
+    def _reject_overlapped_fused_norm(self) -> None:
+        # The fused all-reduce + norm runs its collective on the compute stream,
+        # where it would race the other micro-batch's all-reduce on the comm
+        # stream of the same communicator.
+        from vllm.v1.worker.ubatching import dbo_overlaps_collectives
+
+        if dbo_overlaps_collectives():
+            raise RuntimeError(
+                "The fused all-reduce + RMSNorm cannot run inside overlapped "
+                "micro-batches (kernel_config.tp_prefill_overlap_min_tokens); "
+                "disable one of them."
+            )
 
     def _sm70_tp2_all_reduce_gemma_rms_norm_out_place(
         self,
@@ -788,6 +820,7 @@ class GroupCoordinator:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        self._reject_overlapped_fused_norm()
         fused_op = getattr(
             self.device_communicator,
             "sm70_tp2_all_reduce_gemma_rms_norm",
@@ -806,6 +839,7 @@ class GroupCoordinator:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        self._reject_overlapped_fused_norm()
         fused_op = getattr(
             self.device_communicator,
             "sm70_tp4_all_reduce_gemma_rms_norm",

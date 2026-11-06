@@ -15,6 +15,7 @@ from vllm.diagnostics import diagnostic_history
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fla.ops.gdn_chunk_kernels import bind_kda_kernels
 from vllm.model_executor.layers.fla.ops.kda import (
     FusedRMSNormGated,
     chunk_kda_with_fused_gate,
@@ -44,6 +45,7 @@ from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
+from vllm.models.glm5next.nvidia.quant import declared_quant_config
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -316,6 +318,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config.quant_config = None
         super().__init__(config, vllm_config, prefix)
         vllm_config.quant_config = saved_quant_config
+        self.chunk_kernels = bind_kda_kernels(vllm_config)
+        self._prefill_kernels_warmed_up = False
 
         # Linear-attention head config: read the flattened top-level fields when
         # present (new schema); fall back to the legacy linear_attn_config dict
@@ -369,9 +373,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if self._use_sm70_exact_kda_gemv
             else None
         )
+        # FP16-only cards (Volta, Turing) keep the recurrent output in FP32
+        # through the gated RMSNorm.
         self._use_sm70_fp32_recurrent_output = (
             current_platform.is_cuda()
-            and current_platform.get_device_capability() == (7, 0)
+            and current_platform.get_device_capability(
+                torch.accelerator.current_device_index()
+            )
+            in ((7, 0), (7, 5))
             and self.head_dim == 128
         )
         self._use_sm70_glm53_tp8_cublaslt = (
@@ -383,25 +392,65 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             and _sm70_glm53_tp8_cublaslt_enabled()
         )
 
-        # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
-        # Order matches checkpoint's fused_qkvbfg_a_proj convention.
-        # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
-        self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
-            self.hidden_size,
-            [
-                projection_size,  # q (shard 0)
-                projection_size,  # k (shard 1)
-                projection_size,  # v (shard 2)
-                self.num_heads,  # b (shard 3)
-                self.head_dim,  # f_a (shard 4, replicated)
-                self.head_dim,  # g_a (shard 5, replicated)
-            ],
-            replicated_shard_ids=(4, 5),
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvbfg_a",
+        # A checkpoint that names its quantized layers (ModelOpt mixed precision)
+        # keeps those projections packed. The exact FP16 paths above multiply a
+        # dequantized FP16 weight, so there the projections stay dequantized, as
+        # they do for checkpoints that name no layers.
+        exact_fp16_projection = (
+            self._use_sm70_exact_kda_gemv or self._use_sm70_glm53_tp8_cublaslt
         )
+        declared_config = (
+            None if exact_fp16_projection else declared_quant_config(saved_quant_config)
+        )
+        self.quant_config = declared_config
+        # q/k/v split from b/f_a/g_a: those three stay BF16 in the checkpoint.
+        self.split_qkv = declared_config is not None and (
+            declared_config.is_quantized(f"{prefix}.in_proj_qkv")
+        )
+
+        if self.split_qkv:
+            # q, k, v are packed MXFP8; b, f_a, g_a are BF16 and small. Shards 1
+            # (f_a) and 2 (g_a) of the second projection are replicated across
+            # TP ranks.
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                self.hidden_size,
+                [projection_size] * 3,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            self.in_proj_bfg_a = _Glm5NextMergedColumnParallelLinear(
+                self.hidden_size,
+                [self.num_heads, self.head_dim, self.head_dim],
+                replicated_shard_ids=(1, 2),
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_bfg_a",
+            )
+        else:
+            # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
+            # Order matches checkpoint's fused_qkvbfg_a_proj convention.
+            # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
+            self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
+                self.hidden_size,
+                [
+                    projection_size,  # q (shard 0)
+                    projection_size,  # k (shard 1)
+                    projection_size,  # v (shard 2)
+                    self.num_heads,  # b (shard 3)
+                    self.head_dim,  # f_a (shard 4, replicated)
+                    self.head_dim,  # g_a (shard 5, replicated)
+                ],
+                replicated_shard_ids=(4, 5),
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvbfg_a",
+            )
+            self.in_proj_qkvbfg_a._sm70_glm53_tp8_cublaslt = (
+                self._use_sm70_glm53_tp8_cublaslt
+            )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -468,9 +517,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.in_proj_qkvbfg_a._sm70_glm53_tp8_cublaslt = (
-            self._use_sm70_glm53_tp8_cublaslt
-        )
         self.o_proj._sm70_glm53_tp8_cublaslt = self._use_sm70_glm53_tp8_cublaslt
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -504,12 +550,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
+    def _project_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         num_tokens = hidden_states.size(0)
+        if self.split_qkv:
+            qkv = self.in_proj_qkv(hidden_states)[0]
+            _debug_dflash_kda_finite(self.prefix, "projection", qkv)
+            beta_raw, f_a, g_a = self.in_proj_bfg_a(hidden_states)[0].split(
+                [self.local_num_heads, self.head_dim, self.head_dim], dim=-1
+            )
+            return qkv, beta_raw, f_a, g_a
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         weight = self.in_proj_qkvbfg_a.weight
         use_sm70_exact_gemv = (
@@ -552,6 +603,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             ],
             dim=-1,
         )
+        return qkv, beta_raw, f_a, g_a
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.size(0)
+        qkv, beta_raw, f_a, g_a = self._project_inputs(hidden_states)
 
         # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
         # at load (SIGMOID_BETA), and only the chunked prefill path needs the
@@ -639,6 +699,49 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         return projected_output
 
+    def _warmup_prefill_kernels(self, qkv_proj_states: torch.Tensor) -> None:
+        """Tune the chunked prefill kernels at the profile run's token count.
+
+        Their autotuners key on chunk constants and dtypes, not on the
+        sequence length, so the first prefill fixes the choice for all of
+        them. Left to the first request, a short prompt picks among configs
+        that tie at a few tokens; at a 512-token chunk the KKT sub-chunk
+        kernel then runs up to six times slower on Volta and Turing. The
+        inputs are bounded and carry the dtypes of a real prefill, which are
+        part of the autotune keys.
+        """
+        if self._prefill_kernels_warmed_up:
+            return
+        self._prefill_kernels_warmed_up = True
+        num_tokens = qkv_proj_states.size(0)
+        device, dtype = qkv_proj_states.device, qkv_proj_states.dtype
+        shape = (1, num_tokens, self.local_num_heads, self.head_dim)
+        q = torch.full(shape, 1.0e-3, device=device, dtype=dtype)
+        k = torch.full(shape, 1.0e-3, device=device, dtype=dtype)
+        v = torch.full(shape, 1.0e-3, device=device, dtype=dtype)
+        raw_g = torch.zeros(shape, device=device, dtype=dtype)
+        beta = torch.full(shape[:3], 0.5, device=device, dtype=torch.float32)
+        _, state_dtype = self.get_state_dtype()
+        _, state_shape = self.get_state_shape()
+        initial_state = torch.zeros((1, *state_shape), device=device, dtype=state_dtype)
+        cu_seqlens = torch.tensor([0, num_tokens], device=device, dtype=torch.int32)
+        chunk_kda_with_fused_gate(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            beta=beta,
+            A_log=self.A_log,
+            g_bias=self.dt_bias,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+            safe_gate=self.kda_safe_gate,
+            lower_bound=self.kda_lower_bound,
+            kernels=self.chunk_kernels,
+        )
+
     @eager_break_during_capture
     def _forward(
         self,
@@ -652,6 +755,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         if attn_metadata_raw is None:
             #     # V1 profile run
+            self._warmup_prefill_kernels(qkv_proj_states)
             return
 
         assert isinstance(attn_metadata_raw, dict)

@@ -593,7 +593,9 @@ class VocabParallelEmbedding(PluggableLayer):
         # Copy the data. Select chunk corresponding to current shard.
         loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
-        param[loaded_weight.shape[0] :].data.fill_(0)
+        # The rows past the checkpoint's vocabulary pad the shard. Weights pad
+        # with zero; a scale parameter names its own neutral value.
+        param[loaded_weight.shape[0] :].data.fill_(getattr(param, "padding_value", 0))
 
     def forward(self, input_):
         if self.tp_size > 1:

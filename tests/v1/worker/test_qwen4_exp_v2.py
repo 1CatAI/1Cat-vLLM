@@ -232,6 +232,7 @@ def test_qsa_circular_group_uses_one_block_and_custom_slot_mapping(
     runner.cp_interleave = 1
     runner.cache_config = SimpleNamespace(enable_prefix_caching=False)
     runner.vllm_config = SimpleNamespace()
+    runner.prefill_overlap = None
     runner.max_num_reqs = 1
     runner.max_num_tokens = 2
     runner.device = torch.device("cpu")
@@ -280,7 +281,7 @@ def test_qsa_circular_group_uses_one_block_and_custom_slot_mapping(
     monkeypatch.setattr(
         mrv2,
         "init_attn_backend",
-        lambda *args: ([], SimpleNamespace(), [8, 16]),
+        lambda *args, **kwargs: ([], SimpleNamespace(), [8, 16]),
     )
     captured: dict[str, object] = {}
 

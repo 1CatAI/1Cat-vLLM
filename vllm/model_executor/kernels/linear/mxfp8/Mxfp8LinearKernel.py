@@ -12,10 +12,12 @@ class Mxfp8LinearLayerConfig:
     """Configuration for an MXFP8 linear layer.
 
     All MXFP8 layers share the same structure: FP8-E4M3 weights with
-    uint8 (E8M0) per-block scales at block size 32.
+    uint8 (E8M0) per-block scales at block size 32. ``partition_weight_shape``
+    is the layer's ``(N, K)`` on this rank, so that a kernel with shape limits
+    declines a layer before its weights load.
     """
 
-    pass
+    partition_weight_shape: tuple[int, int]
 
 
 class Mxfp8LinearKernel(ABC):

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm.model_executor.layers.fused_moe.experts import skinny_sm70_moe
 from vllm.model_executor.layers.quantization import modelopt
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
@@ -116,6 +117,8 @@ def test_pure_nvfp4_glm53_moe_uses_turbomind_w4a16_on_sm70():
         patch.object(modelopt, "RoutedExperts", FakeRoutedExperts),
         patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
         patch.object(sm70_tm, "should_use_nvfp4_moe_turbomind", return_value=True),
+        # The automatic backend keeps TurboMind when the skinny kernel declines.
+        patch.object(skinny_sm70_moe, "skinny_backend_admitted", return_value=False),
     ):
         method = config.get_quant_method(
             FakeRoutedExperts(), "model.layers.3.mlp.experts"
@@ -123,3 +126,29 @@ def test_pure_nvfp4_glm53_moe_uses_turbomind_w4a16_on_sm70():
 
     assert isinstance(method, ModelOptNvFp4SM70MoEMethod)
     assert method.use_a16
+
+
+def test_csf_scales_need_experts_that_expand_them(monkeypatch):
+    """csf_32x2_v1 block scales stay compressed on the GPU; a backend whose
+    experts cannot expand them is rejected when the method is built, not at
+    the first forward."""
+
+    class PlainExperts:  # not a CsfScaleConsumer
+        pass
+
+    backend = SimpleNamespace(value="plain")
+    monkeypatch.setattr(
+        modelopt, "select_nvfp4_moe_backend", lambda **kwargs: (backend, PlainExperts)
+    )
+    monkeypatch.setattr(
+        modelopt, "is_global_sf_supported_for_nvfp4_backend", lambda backend: False
+    )
+    config = ModelOptNvFp4Config(
+        quant_method="NVFP4", is_checkpoint_nvfp4_serialized=True
+    )
+    with pytest.raises(ValueError, match="need MoE experts that serve compressed"):
+        modelopt.ModelOptNvFp4FusedMoE(
+            config,
+            _glm53_moe_contract(),
+            scale_encoding=modelopt.CSF32_SCALE_ENCODING,
+        )

@@ -313,13 +313,80 @@ def test_fp8_scratch_is_owned_by_each_invocation(monkeypatch):
     )
     x = torch.empty(9, 128, dtype=torch.float16)
     for _ in range(2):
-        qpn._turing_fp8_qpn8_linear(x, torch.empty(0), torch.empty(0), 32, 8, 2, False)
+        qpn._turing_fp8_qpn8_linear(
+            x, torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
+        )
     workspaces = [tensor for tensor in allocations if tensor.shape == (128, 32)]
     assert len(workspaces) == 2
     assert dispatched == [tensor.data_ptr() for tensor in workspaces]
     assert dispatched[0] != dispatched[1]
     dispatched.clear()
     assert qpn._turing_fp8_qpn8_linear(
-        x[:0], torch.empty(0), torch.empty(0), 32, 8, 2, False
+        x[:0], torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
     ).shape == (0, 32)
     assert dispatched == []
+
+
+@pytest.mark.parametrize(
+    ("sms", "threads", "k", "n", "split_k", "expected"),
+    [
+        # RTX 8000, 160 CTAs spill 16 past the 144 split-16 slots: one wave at
+        # split 8.
+        (72, 1024, 3072, 5120, 16, 8),
+        (72, 1024, 8704, 5120, 16, 8),
+        # 224 CTAs keep 80 in the second wave, so split 16 stays.
+        (72, 1024, 5120, 7168, 16, 16),
+        # Grids within one wave keep their split, small ones included.
+        (72, 1024, 4096, 512, 16, 16),
+        (72, 1024, 4096, 1024, 16, 16),
+        (72, 1024, 1024, 4096, 16, 16),
+        # Only split 16 is narrowed.
+        (72, 1024, 1536, 5376, 12, 12),
+        # V100: 320 split-16 slots hold 160 CTAs, split 8 loses on spills.
+        (80, 2048, 3072, 5120, 16, 16),
+        (80, 2048, 4096, 10752, 16, 16),
+        (80, 2048, 4096, 1024, 16, 16),
+    ],
+)
+def test_qpn8_split_k_follows_device_occupancy(
+    monkeypatch, sms, threads, k, n, split_k, expected
+):
+    from vllm.model_executor.layers.quantization import sm70_turbomind as tm
+
+    properties = NS(multi_processor_count=sms, max_threads_per_multi_processor=threads)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: properties)
+    device = torch.device("cuda", 0)
+    assert tm.fp8_qpn8_occupancy_split_k(k, n, split_k, device) == expected
+
+
+def test_qpn8_per_tensor_launch_config_is_the_table_split():
+    from vllm.model_executor.layers.quantization import sm70_turbomind as tm
+
+    assert tm.fp8_qpn8_launch_config(4096) == (16, 2, False)
+    assert tm.fp8_qpn8_launch_config(576) == (12, 2, False)
+
+
+def test_qpn8_per_tensor_op_picks_the_split_by_m(monkeypatch):
+    from vllm import _sm70_ops as ops
+
+    # RTX 8000, K 3072 / N 5120: split 8 fits the M <= 8 grid into one wave;
+    # the M16 and M32 bodies keep the table split (M=17..32 takes 12 or 16).
+    splits = []
+    monkeypatch.setattr(
+        ops,
+        "fp8_qpn8_dispatch_sm70_out",
+        lambda out, ptr, x, codes, scales, split_k, *rest: splits.append(split_k),
+    )
+    for m in (1, 8, 9, 16, 17, 32):
+        x = torch.empty(m, 128, dtype=torch.float16)
+        qpn._turing_fp8_qpn8_linear(
+            x, torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
+        )
+    assert splits == [
+        8,
+        8,
+        16,
+        16,
+        16,
+        16,
+    ]
