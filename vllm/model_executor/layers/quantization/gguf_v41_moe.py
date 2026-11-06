@@ -9,8 +9,11 @@ import torch
 
 import vllm.envs as envs
 from vllm._sm70.policy import register_policy_op
+from vllm.logger import init_logger
 
 from .gguf_native import native_dense
+
+logger = init_logger(__name__)
 
 
 def v41_fp16_experts(
@@ -145,6 +148,33 @@ _EM7 = envs.VLLM_V41_EM7 == "1"
 os.environ.setdefault("VLLM_V41_EM8", "0")  # single-barrier down: no gain measured
 
 
+_PLAN_FUSE = envs.VLLM_V41_PLAN_FUSE == "1"
+_PLAN_FUSE_LOGGED = False
+
+
+def _q8_and_plan(xq, xd, x, ids32, plan):
+    """Quantize x for the expert rows path and build this layer's expert plan.
+
+    Returns the gate/up op to call next: gate_up7 builds the plan itself in a
+    separate moe_plan launch; with VLLM_V41_PLAN_FUSE=1 q8_plan builds the
+    same plan inside the quantization launch and gate_up7p skips moe_plan.
+    """
+    if not _PLAN_FUSE:
+        torch.ops.v41k.q8_aligned(xq, xd, x)
+        return torch.ops.v41k.gate_up7
+    if not hasattr(torch.ops.v41k, "q8_plan"):
+        raise RuntimeError(
+            "VLLM_V41_PLAN_FUSE=1 needs a v41k.so with q8_plan and gate_up7p "
+            "(rebuild benchmarks/deepseek_v41/v41k); loaded: " + default_v41k_library()
+        )
+    global _PLAN_FUSE_LOGGED
+    if not _PLAN_FUSE_LOGGED:
+        _PLAN_FUSE_LOGGED = True
+        logger.info("VLLM_V41_PLAN_FUSE=1: expert plan built in q8_plan, gate_up7p")
+    torch.ops.v41k.q8_plan(xq, xd, x, ids32, plan)
+    return torch.ops.v41k.gate_up7p
+
+
 def _plan(device):
     key = ("plan", device)
     if key not in _EM["books"]:  # type: ignore[operator]
@@ -197,15 +227,15 @@ def _v41_experts_rows(
     stride = (routes * 648 + 255) // 256 * 256
     xq = torch.empty((m, 160, 32), dtype=torch.int8, device=x.device)
     xd = torch.empty((m, 160), dtype=torch.float32, device=x.device)
-    torch.ops.v41k.q8_aligned(xq, xd, x.contiguous())
+    plan = _plan(x.device)
+    gate_up7 = _q8_and_plan(xq, xd, x.contiguous(), ids32, plan)
     peer = _PEER.get(x.device)
     if peer is not None and hasattr(torch.ops.v41k, "peer_gather"):
         rank, pointers, own, epoch = peer
         slot = own[rank * stride : rank * stride + routes * 648]
         hq = slot[: routes * 576].view(torch.int8).view(routes, 18, 32)
         hd = slot[routes * 576 :].view(torch.float32).view(routes, 18)
-        plan = _plan(x.device)
-        torch.ops.v41k.gate_up7(
+        gate_up7(
             xq,
             xd,
             hq,
@@ -238,8 +268,7 @@ def _v41_experts_rows(
     packed = torch.empty(stride, dtype=torch.uint8, device=x.device)
     hq = packed[: routes * 576].view(torch.int8).view(routes, 18, 32)
     hd = packed[routes * 576 : routes * 648].view(torch.float32).view(routes, 18)
-    plan = _plan(x.device)
-    torch.ops.v41k.gate_up7(
+    gate_up7(
         xq,
         xd,
         hq,
