@@ -2440,13 +2440,15 @@ class VllmConfig:
                 "eagle3",
                 "mtp",
                 "dflash",
+                "dspark",
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (required by PEagle)
+            parallel_drafting_methods = ("dflash", "dspark")
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method != "dflash"
+                and speculative_config.method not in parallel_drafting_methods
             ):
                 unsupported.append("parallel drafting for speculative decoding")
 
