@@ -1,22 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The GLM-5.3 vision budgets must cover every image the real processor emits
-with the checkpoint's settings."""
+"""The GLM-5.3 vision budgets (encoder cache, rotary table) must cover every
+grid the real processors emit with the checkpoint's settings."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
-from vllm.models.glm5next.nvidia.multimodal import Glm5NextProcessingInfo
+from vllm.models.glm5next.nvidia.multimodal import (
+    Glm5NextProcessingInfo,
+    max_grid_side,
+)
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.transformers_utils.processors.glm5next import (
     Glm5NextImageProcessor,
+    Glm5NextProcessor,
     Glm5NextVideoProcessor,
+    smart_resize,
 )
 
-# GLM-5.3-Flash checkpoint: vision_config of config.json and the image
-# processor of processor_config.json.
+# GLM-5.3-Flash checkpoint: vision_config of config.json and the processors
+# of processor_config.json.
 _VISION_CONFIG = {"patch_size": 14, "spatial_merge_size": 2, "temporal_patch_size": 2}
 _IMAGE_PROCESSOR = {
     "patch_size": 14,
@@ -26,6 +32,7 @@ _IMAGE_PROCESSOR = {
     "min_image_tokens": 16,
     "max_image_tokens": 8000,
 }
+_VIDEO_PROCESSOR = {**_IMAGE_PROCESSOR, "max_image_tokens": 240000}
 
 
 class _Context:
@@ -84,3 +91,47 @@ def test_profiling_image_reaches_processor_ceiling():
 
     assert info.get_max_image_tokens() == _IMAGE_PROCESSOR["max_image_tokens"]
     assert _processed_tokens(size.width, size.height) == info.get_max_image_tokens()
+
+
+def test_rotary_rows_cover_longest_grid(tmp_path):
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps(
+            {"image_processor": _IMAGE_PROCESSOR, "video_processor": _VIDEO_PROCESSOR}
+        )
+    )
+    image_processor, video_processor = (
+        Glm5NextProcessor.media_processors_from_pretrained(str(tmp_path))
+    )
+    image_rows = max_grid_side(image_processor)
+    # The video processor serves under its 30,000-token cap.
+    video_rows = max_grid_side(video_processor)
+
+    assert (image_rows, video_rows) == (16000, 60000)
+
+    # The longest image is one aligned cell high and the whole budget wide;
+    # a 20 px strip shows the side real uploads can reach past 8192 rows.
+    for width, height, longest_side in [
+        (224000, 28, 16000),
+        (28, 224000, 16000),
+        (200000, 20, 14286),
+    ]:
+        image = Image.new("RGB", (width, height))
+        grid = image_processor(image, return_tensors="pt")["image_grid_thw"][0]
+        assert max(grid[1:].tolist()) == longest_side <= image_rows
+
+    # Two frames, one cell high: a video canvas of exactly video_rows patches
+    # fits the capped budget unchanged, a longer strip is refit below it.
+    def video_canvas_width(width: int) -> int:
+        return smart_resize(
+            t=2,
+            h=28,
+            w=width,
+            t_factor=2,
+            h_factor=28,
+            w_factor=28,
+            min_pixels=1,
+            max_pixels=video_processor.max_image_tokens * 2 * 28 * 28,
+        )[1]
+
+    assert video_canvas_width(video_rows * 14) == video_rows * 14
+    assert video_canvas_width(10**7) // 14 <= video_rows
