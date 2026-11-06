@@ -5,6 +5,7 @@ import torch
 # this import will also register the custom ops
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
+from vllm.config import get_current_vllm_config
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
@@ -35,6 +36,14 @@ class MHCPreOp(CustomOp):
     """
 
     # --8<-- [end:mhc_pre]
+    def __init__(self) -> None:
+        super().__init__()
+        # Decided once for this layer's card: with the sm7x Triton route,
+        # prefill chunks take the tensor-core projection.
+        self.tensor_cores = (
+            get_current_vllm_config().kernel_config.use_triton_sm7x_tensor_cores()
+        )
+
     @classmethod
     def enabled(cls) -> bool:
         return True
@@ -82,6 +91,7 @@ class MHCPreOp(CustomOp):
             n_splits,
             norm_weight,
             norm_eps,
+            self.tensor_cores,
         )
 
     def forward_hip(
@@ -342,6 +352,14 @@ class MHCFusedPostPreOp(CustomOp):
     """
 
     # --8<-- [end:mhc_fused_post_pre]
+    def __init__(self) -> None:
+        super().__init__()
+        # Decided once for this layer's card: with the sm7x Triton route,
+        # prefill chunks take the tensor-core projection.
+        self.tensor_cores = (
+            get_current_vllm_config().kernel_config.use_triton_sm7x_tensor_cores()
+        )
+
     @classmethod
     def enabled(cls) -> bool:
         return True
@@ -401,6 +419,7 @@ class MHCFusedPostPreOp(CustomOp):
             tile_n,
             norm_weight,
             norm_eps,
+            self.tensor_cores,
         )
 
     def forward_hip(
