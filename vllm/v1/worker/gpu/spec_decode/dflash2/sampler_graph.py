@@ -127,7 +127,9 @@ def _copy_dense_slot(
 
 def _capture_headroom(device: torch.device) -> bool:
     free, _ = torch.cuda.mem_get_info(device)
-    idle = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    idle = torch.accelerator.memory_reserved(device) - (
+        torch.accelerator.memory_allocated(device)
+    )
     return free + idle >= CAPTURE_HEADROOM_BYTES
 
 
