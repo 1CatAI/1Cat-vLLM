@@ -5,7 +5,6 @@
 import hashlib
 import importlib.util
 import json
-from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -14,6 +13,7 @@ from vllm.config.execution_policy import flash_v100_options
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
+_builtin_long_attention_cache: dict = {}
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
 
 # Capacity the shipped operator was qualified for. This is a claim about the
@@ -50,18 +50,20 @@ BUILTIN_MANIFEST = {
 }
 
 
-@lru_cache(maxsize=1)
 def builtin_long_attention():
-    try:
-        # The FA2 library loads on first use; resolve it before the lookup.
-        from vllm.vllm_flash_attn.flash_attn_interface import (
-            ensure_fa2_library_loaded,
-        )
+    if "op" not in _builtin_long_attention_cache:
+        try:
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                ensure_fa2_library_loaded,
+            )
 
-        ensure_fa2_library_loaded()
-        return getattr(torch.ops._vllm_fa2_C, BUILTIN_OP)
-    except (AttributeError, ImportError):
-        return None
+            ensure_fa2_library_loaded()
+            _builtin_long_attention_cache["op"] = getattr(
+                torch.ops._vllm_fa2_C, BUILTIN_OP
+            )
+        except (AttributeError, ImportError):
+            _builtin_long_attention_cache["op"] = None
+    return _builtin_long_attention_cache["op"]
 
 
 # Explicit opt-out. The accelerated route is on by default, so an operator needs
@@ -78,8 +80,12 @@ def long_attention_enabled(policy=None) -> bool:
     return bool(policy.e4m3_long_manifest) or builtin_long_attention() is not None
 
 
-@lru_cache(maxsize=4)
+_attention_library_cache: dict = {}
+
+
 def load_attention_library(manifest_name: str):
+    if manifest_name in _attention_library_cache:
+        return _attention_library_cache[manifest_name]
     manifest_path = Path(manifest_name).resolve()
     manifest = json.loads(manifest_path.read_text())
     library = Path(manifest["library"])
@@ -103,11 +109,16 @@ def load_attention_library(manifest_name: str):
     loaded_file = module.__file__
     if loaded_file is None or Path(loaded_file).resolve() != library:
         raise RuntimeError("Long-attention native extension module alias")
+    _attention_library_cache[manifest_name] = (module, manifest)
     return module, manifest
 
 
-@lru_cache(maxsize=1)
+_long_attention_cache: dict = {}
+
+
 def load_long_attention(manifest_name: str):
+    if manifest_name in _long_attention_cache:
+        return _long_attention_cache[manifest_name]
     module, manifest = load_attention_library(manifest_name)
     # Split counts change both arithmetic and workspace geometry.
     if manifest.get("splits", 80) != 80 or manifest["head_groups"] != 1:
@@ -122,6 +133,7 @@ def load_long_attention(manifest_name: str):
         query_rows,
         scope="process",
     )
+    _long_attention_cache[manifest_name] = (module.run, manifest)
     return module.run, manifest
 
 

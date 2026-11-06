@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -255,8 +256,14 @@ class Gemma4Config(VerifyAndUpdateConfig):
         with different head dimensions for prefill-decode disaggregation.
         """
         hf_text_config = vllm_config.model_config.hf_text_config
-        head_dim = getattr(hf_text_config, "head_dim", None)
-        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+        # head_dim is per-layer; __dict__ bypasses the heterogeneity guard.
+        head_dim = hf_text_config.__dict__.get("head_dim")
+        # global_head_dim only lives in per_layer_config.
+        per_layer = getattr(hf_text_config, "per_layer_config", None)
+        global_head_dim = None
+        if per_layer is not None:
+            with contextlib.suppress(ValueError, IndexError, AttributeError):
+                global_head_dim = per_layer["full_attention"].head_dim
 
         # Only force Triton when head dimensions actually differ AND the
         # larger one exceeds FlashAttention's kernel limit (head_size <= 256).
@@ -863,6 +870,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma3TextModel": Gemma3TextModelConfig,
     "Gemma4ForCausalLM": Gemma4Config,
     "Gemma4ForConditionalGeneration": Gemma4Config,
+    "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,
