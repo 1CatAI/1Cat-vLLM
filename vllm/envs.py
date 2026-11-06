@@ -451,6 +451,7 @@ if TYPE_CHECKING:
     VLLM_PYNCCL_ALLGATHER: str = "1"
     VLLM_V41_ATTN_TIMING: str = "0"
     VLLM_V41_MARKOV_FUSED: str | None = None
+    VLLM_V41_MARKOV_SHARD: str = "0"
     VLLM_SM70_MXFP4_GROUPED_ANY: str | None = None
     VLLM_V41K_LIB: str | None = None
     VLLM_V41_ACT_PROGRAMS: str = "1024"
@@ -493,6 +494,7 @@ if TYPE_CHECKING:
     VLLM_V41_HC_WINDOW: str = "2048"
     VLLM_V41_HITLOG_RELAXED: str = "1"
     VLLM_V41_INDEX_DECODE_BLOCKS: str = "8"
+    VLLM_V41_INDEX_OVERLAP: str = "0"
     VLLM_V41_INDEX_TILE_MB: str = "64"
     VLLM_V41_INDEX_TOPK: str = "1"
     VLLM_V41_JOB_EVENTS: str | None = None
@@ -501,6 +503,7 @@ if TYPE_CHECKING:
     VLLM_V41_MISS_HIST: str = "0"
     VLLM_V41_PACKED_KV: str | None = None
     VLLM_V41_PLAN_STATS: str | None = None
+    VLLM_V41_PP_BOUNDARY_SIM: str | None = None
     VLLM_V41_PRED_STATS: str = "0"
     VLLM_V41_PREFETCH: str = "0"
     VLLM_V41_PREFETCH_EVAL: str | None = None
@@ -7586,6 +7589,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_INDEX_OVERLAP": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_OVERLAP", "0"),
+        description=(
+            "DS-V4.1 indexer L4: each score tile's TP all-reduce and top-k on a"
+            " side stream while the next tile is scored (bit-identical; eager"
+            " prefill only, never under graph capture)."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_INDEX_TILE_MB": env_var(
         lambda: os.getenv("VLLM_V41_INDEX_TILE_MB", "64"),
         description=("DS-V4.1 indexer: FP16 score budget per query tile in MiB."),
@@ -7669,6 +7686,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V41_PLAN_STATS": env_var(
         lambda: os.getenv("VLLM_V41_PLAN_STATS"),
         description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PP_BOUNDARY_SIM": env_var(
+        lambda: os.getenv("VLLM_V41_PP_BOUNDARY_SIM"),
+        description=(
+            "DS-V4.1: on a single stage, take the pipeline-boundary branch "
+            "(expand in place, reference mixes and collapse) before this target "
+            "layer, as PP2 does at its stage boundary. Reference for the PP2 "
+            "bit-identity check; unset in production."
+        ),
         category="tuning",
         declared_default="None",
         effective_default="None",
@@ -8094,6 +8126,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_MARKOV_SHARD": env_var(
+        lambda: os.getenv("VLLM_V41_MARKOV_SHARD", "0"),
+        description=(
+            "Experimental DS-V4.1 DSpark: 1 = one-request greedy drafts from "
+            "vocabulary shards (markov_shard.py); read in "
+            "models/deepseek_v41/dspark.py."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -20269,6 +20315,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",
         "VLLM_V41_MARKOV_FUSED",
+        "VLLM_V41_MARKOV_SHARD",
         "VLLM_SM70_MXFP4_GROUPED_ANY",
         "VLLM_V41K_LIB",
         "VLLM_V41_ACT_PROGRAMS",
@@ -20319,6 +20366,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_MISS_HIST",
         "VLLM_V41_PACKED_KV",
         "VLLM_V41_PLAN_STATS",
+        "VLLM_V41_PP_BOUNDARY_SIM",
         "VLLM_V41_PRED_STATS",
         "VLLM_V41_PREFETCH",
         "VLLM_V41_PREFETCH_EVAL",

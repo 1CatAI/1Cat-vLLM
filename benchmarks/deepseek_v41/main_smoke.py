@@ -106,6 +106,15 @@ def create_llm(
         raise ValueError("Expected the audited backbone and explicit Engram sidecar")
     if kv_cache_mib is None:
         kv_cache_mib = 256 if draft is not None else 384
+    # PP2 bench overrides (no VLLM_ prefix: they are not engine envs). V41_BENCH_PP=2
+    # runs PP2xTP4; V41_BENCH_OFFLOAD replaces the caller's offload (0 = every expert
+    # resident); V41_BENCH_EXPERT_HOST=rank_local selects the plain arena (cache off).
+    pipeline_parallel_size = int(os.environ.get("V41_BENCH_PP", "1"))
+    if "V41_BENCH_OFFLOAD" in os.environ:
+        offload = float(os.environ["V41_BENCH_OFFLOAD"])
+    host_storage = os.environ.get("V41_BENCH_EXPERT_HOST", "shared_original")
+    # A cold set of zero has nothing to swap, so it takes no spare slots.
+    spare = {"expert_cache_spare_slots": 0} if offload == 0 else {}
     return LLM(
         model=str(paths[0]),
         hf_config_path=str(root / "base"),
@@ -114,6 +123,7 @@ def create_llm(
         quantization="gguf",
         load_format="gguf",
         tensor_parallel_size=4,
+        pipeline_parallel_size=pipeline_parallel_size,
         max_model_len=int(os.environ.get("VLLM_V41_MAX_LEN", "16384")),
         max_num_seqs=1,
         max_num_batched_tokens=chunk,
@@ -152,7 +162,7 @@ def create_llm(
             "sm70_gguf": {
                 "expert_storage": "original",
                 "expert_arena": True,
-                "expert_cache_host_storage": "shared_original",
+                "expert_cache_host_storage": host_storage,
                 "expert_cache_offload_fraction": offload,
                 "expert_cache_fraction": 0,
                 "expert_cache_host_slack": 0,
@@ -162,6 +172,7 @@ def create_llm(
                 "embedding_storage": "original",
                 "prefill_min_m": 1,
                 "dequant_workspace_bytes": 32 * 1024**2,
+                **spare,
             },
         },
     )
