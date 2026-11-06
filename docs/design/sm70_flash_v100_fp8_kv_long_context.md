@@ -298,6 +298,10 @@ attention shape is covered by the bitwise operator regression.
 ## Runtime Controls
 
 - `VLLM_FLASH_V100_FP8_PREFILL_BRIDGE=0`: disable the prefill bridge.
+- `VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS=N`: force sequential KV-head
+  groups for the existing FP8 prefill bridge (`1` forces one unsplit pass).
+- `VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES=N`: override the automatic
+  bridge conversion/scratch envelope in bytes (`0` selects native FP8).
 - `VLLM_FLASH_V100_DECODE_USE_XQA=0`: disable all XQA decode.
 - `VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN=8192`: non-graph FP8 XQA
   crossover threshold.
@@ -305,11 +309,67 @@ attention shape is covered by the bitwise operator regression.
 The bridge and FP8 XQA are enabled by default under their strict shape and
 dtype gates. FP8 E4M3 is not routed through either E5M2 implementation.
 
+Long-context prefill needs a large FP16 K/V conversion workspace. Grouping
+reduces this storage while retaining the fast bridge, but adds conversion/
+attention passes and query/output copies. Therefore the automatic policy keeps
+one pass when it fits and otherwise selects the smallest valid KV-head divisor;
+it is a memory/latency tradeoff, not a universal throughput improvement.
+
+The default cap is **1/32 of the engine's configured GPU-memory allowance**:
+the existing worker startup snapshot computes
+`ceil(total_device_memory * gpu_memory_utilization)`, and automatic bridge
+planning uses that allowance divided by 32 (integer bytes). This is a chosen
+memory/latency policy, not a measured universal optimum or a guarantee of free
+memory. It scales with device capacity and the user's utilization setting, not
+with one model's observed allocation. The snapshot is worker-local and reused
+by subsequent layers; CPU configuration construction never queries a device.
+`fp8_bridge_workspace_bytes` overrides this derivation. An explicit head-group
+count overrides both the cap and automatic selection.
+
+The initialization-time projection uses the configured maximum model context,
+rounded through input KV pages and native 784-token conversion pages, and the
+maximum scheduler-admitted query chunk (bounded by model context). It includes FP16 K/V,
+the int32 remap table, retained 64-token tail-padding Q/output, and grouped
+Q/output copies. A group is admitted only when this complete envelope fits the
+per-engine cap. If even one KV head per group cannot fit, native FP8 paged
+attention is used. No request-time free-memory probe influences the decision.
+Hybrid KV grouping can enlarge a layer's physical page after weight loading.
+The final per-layer KV-group page refines the provisional constructor plan
+before profiling and again at backend initialization for fixed-KV-budget
+startup. Selected kernel pages divide that physical page, so its padding is a
+conservative bound; the global cache default is not assumed to be the final
+input page. A deferred page is not replaced with a guessed size. The native
+conversion contract requires covering the padded input block table, not only
+the live sequence length.
+Normal model memory profiling materializes the selected maximum workspace so
+KV-cache sizing accounts for it; forced KV-cache byte sizing remains the user's
+responsibility. Growth is bounded by these configured capacities, not just the
+current request. Workspace banks remain isolated by engine and CUDA stream;
+the envelope describes one stream/head geometry, not an aggregate cap across
+arbitrarily many concurrent streams or heterogeneous attention geometries.
+The profile reserves each geometry bank actually used by that engine.
+
+```bash
+vllm serve <model> --attention-config \
+  '{"backend":"FLASH_ATTN_V100","flash_v100":{"options":{"fp8_bridge_workspace_bytes":536870912}}}'
+```
+
+Omitting `fp8_bridge_head_groups` is distinct from explicitly setting `1`.
+Typed group counts override the retained environment input and the automatic
+budget. Counts below one or counts that do not divide the KV-head count retain
+the legacy unsplit behavior. Independent callers without engine dimensions also
+retain unsplit behavior. Neither eligibility nor FP8 scale interpretation
+changes. Allocation failure still falls back to native FP8 paged attention.
+Automatic grouped query/output scratch is reused; explicit legacy grouping
+retains its allocation-failure contract.
+
 ## Tests And Artifacts
 
 Tests:
 
 - `tests/kernels/attention/test_sm70_flash_v100_varlen_layout.py`
+- `tests/config/test_flash_v100_lifecycle.py` (budget boundaries, overrides,
+  worker snapshot ownership, and bounded backing storage)
 - `tests/quantization/test_fp8.py`
 - `tests/v1/attention/test_sm70_flash_v100_policy.py`
 - `tests/v1/spec_decode/test_static_draft_vocab.py`

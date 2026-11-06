@@ -29,7 +29,7 @@ _sm70_fa2_cu_seqlens_cache: dict[
 ] = {}
 
 
-_FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
+_FP8_PREFILL_BRIDGE_PAGE_SIZE = _config.FP8_PREFILL_BRIDGE_PAGE_SIZE
 _SM70_79T_CORE_QUERY_LEN = 8000
 _SM70_79T_MAX_QUERY_LEN = 8192
 # Native Q4096 specialization for 4096-token chunks; 4000..4095 are
@@ -46,6 +46,10 @@ _fp8_prefill_bridge_workspaces: dict[
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
 _fp8_prefill_bridge_tail_workspaces: dict[
+    tuple[int, int, torch.dtype, int, int],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
+_fp8_prefill_bridge_group_workspaces: dict[
     tuple[int, int, torch.dtype, int, int],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
@@ -83,6 +87,7 @@ def clear_flash_attn_v100_workspaces(config=None) -> None:
     _sm70_fa2_cu_seqlens_cache.clear()
     _fp8_prefill_bridge_workspaces.clear()
     _fp8_prefill_bridge_tail_workspaces.clear()
+    _fp8_prefill_bridge_group_workspaces.clear()
     _kv_layout._prefill_gather_dense_workspaces.clear()
     _prefill_dense_splitkv3_workspaces.clear()
     _prefill_dense_splitkv_workspaces.clear()
@@ -855,6 +860,7 @@ def profile_sm70_long_prefix_workspaces(
     max_model_len: int | None,
     kv_block_size: int | None,
     fp8_bridge: bool,
+    fp8_bridge_plan: _config.Fp8BridgeWorkspacePlan | None,
 ) -> None:
     """Reserve the long-prefix prefill workspaces during memory profiling.
 
@@ -879,30 +885,11 @@ def profile_sm70_long_prefix_workspaces(
         return
     profiled = workspace_cache("prefill_profiled", _sm70_prefill_profiled_workspaces)
     if fp8_bridge:
-        blocks = _masks.cdiv_int(
-            _masks.cdiv_int(max_model_len, kv_block_size) * kv_block_size,
-            _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+        profile_fp8_prefill_bridge_workspace(
+            query, num_kv_heads, fp8_bridge_plan
         )
-        cache_key = (query.device, "fp8_bridge", blocks)
-        if cache_key not in profiled:
-            layout = torch.empty(
-                (1, 1, num_kv_heads, 256), dtype=torch.uint8, device=query.device
-            )
-            if get_fp8_prefill_bridge_workspace(layout, blocks) is not None:
-                profiled.add(cache_key)
-                logger.info_once(
-                    "SM70 FP8 prefill bridge workspace for %d prefix tokens "
-                    "included in memory profiling.",
-                    blocks * _FP8_PREFILL_BRIDGE_PAGE_SIZE,
-                )
     chunk = int(query.shape[0])
     padded = _masks.cdiv_int(chunk, 64) * 64
-    if fp8_bridge and padded != chunk:
-        cache_key = (query.device, "fp8_bridge_tail", padded)
-        if cache_key not in profiled:
-            shaped = query.new_empty((1, chunk, query.shape[1], 256))
-            if get_fp8_prefill_bridge_tail_workspace(shaped, padded) is not None:
-                profiled.add(cache_key)
     if (
         fp8_bridge
         and num_kv_heads == 1
@@ -937,9 +924,42 @@ def profile_sm70_long_prefix_workspaces(
                 )
 
 
+def profile_fp8_prefill_bridge_workspace(
+    query: torch.Tensor,
+    num_kv_heads: int,
+    plan: _config.Fp8BridgeWorkspacePlan | None,
+) -> None:
+    """Expose the selected conversion/scratch envelope to KV memory profiling."""
+    if plan is None or plan.head_groups == 0 or not query.is_cuda:
+        return
+    groups = plan.head_groups
+    group_query = query.unsqueeze(0)[:, :, :query.shape[1] // groups]
+    key = torch.empty(
+        (0, _FP8_PREFILL_BRIDGE_PAGE_SIZE, num_kv_heads // groups, query.shape[2]),
+        dtype=torch.uint8,
+        device=query.device,
+    )
+    blocks = plan.max_kv_tokens // _FP8_PREFILL_BRIDGE_PAGE_SIZE
+    if get_fp8_prefill_bridge_workspace(key, blocks, max_blocks=blocks) is None:
+        return
+    padded_query_len = (plan.max_query_tokens + 63) // 64 * 64
+    if get_fp8_prefill_bridge_tail_workspace(
+        group_query, padded_query_len, max_query_len=padded_query_len
+    ) is None:
+        return
+    if groups > 1:
+        get_fp8_prefill_bridge_tail_workspace(
+            group_query,
+            plan.max_query_tokens,
+            max_query_len=plan.max_query_tokens,
+            group_scratch=True,
+        )
+
+
 def get_fp8_prefill_bridge_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
+    max_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     cache = workspace_cache(
         "fp8_prefill_bridge_workspaces", _fp8_prefill_bridge_workspaces
@@ -974,6 +994,9 @@ def get_fp8_prefill_bridge_workspace(
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
     capacity = max(required_blocks, previous_capacity * 2)
+    if max_blocks is not None:
+        # Do not reserve more pages than the full input block table addresses.
+        capacity = min(capacity, max(required_blocks, int(max_blocks)))
     shape = (
         capacity,
         _FP8_PREFILL_BRIDGE_PAGE_SIZE,
@@ -1019,9 +1042,15 @@ def get_fp8_prefill_bridge_workspace(
 def get_fp8_prefill_bridge_tail_workspace(
     query: torch.Tensor,
     padded_query_len: int,
+    *,
+    max_query_len: int | None = None,
+    group_scratch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     cache = workspace_cache(
-        "fp8_prefill_bridge_tail_workspaces", _fp8_prefill_bridge_tail_workspaces
+        "fp8_prefill_bridge_group_workspaces"
+        if group_scratch else "fp8_prefill_bridge_tail_workspaces",
+        _fp8_prefill_bridge_group_workspaces
+        if group_scratch else _fp8_prefill_bridge_tail_workspaces,
     )
     device_index = (
         query.device.index
@@ -1051,6 +1080,8 @@ def get_fp8_prefill_bridge_tail_workspace(
 
     previous_capacity = workspace[0].shape[1] if workspace is not None else 0
     capacity = max(padded_query_len, previous_capacity * 2)
+    if max_query_len is not None:
+        capacity = min(capacity, max(padded_query_len, max_query_len))
     shape = (1, capacity, query.shape[2], query.shape[3])
 
     def _allocate() -> tuple[torch.Tensor, ...]:

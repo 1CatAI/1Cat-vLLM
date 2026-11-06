@@ -973,3 +973,341 @@ def test_sm70_flash_v100_fp8_e4m3_g6_routes_wave_partitions_exactly(
     ).float()
     assert torch.all(delta <= torch.maximum(one_ulp, torch.full_like(delta, 1e-4)))
     assert float(delta.mean()) <= 1e-5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "cache_dtype,torch_dtype",
+    [("fp8_e4m3", torch.float8_e4m3fn), ("fp8_e5m2", torch.float8_e5m2)],
+)
+@pytest.mark.parametrize("k_scale,v_scale", [(1.0, 1.0), (0.75, 1.25)])
+@pytest.mark.parametrize(
+    "head_groups,num_q_heads,num_kv_heads,input_page_size,seq_len,query_len",
+    [
+        (1, 12, 4, 1568, 1700, 32),
+        (2, 24, 4, 1568, 1700, 32),
+        (4, 4, 4, 1056, 2048, 48),
+        (3, 12, 6, 1088, 4096, 1024),
+        (2, 6, 1, 1056, 1700, 32),  # MQA cannot be split.
+        (3, 12, 4, 1568, 2048, 48),  # Non-divisor stays unsplit.
+        (8, 12, 4, 1088, 1700, 32),  # More groups than KV heads.
+        (0, 12, 4, 1568, 1700, 32),
+        (-2, 12, 4, 1056, 2048, 48),
+        ("auto1", 12, 4, 1568, 1700, 32),
+        ("auto2", 24, 4, 1568, 1700, 32),
+        ("auto4", 4, 4, 1056, 2048, 48),
+        ("auto3", 12, 6, 1088, 4096, 1024),
+    ],
+)
+@torch.inference_mode()
+def test_sm70_flash_v100_fp8_bridge_head_groups_exact(
+    monkeypatch,
+    cache_dtype,
+    torch_dtype,
+    k_scale,
+    v_scale,
+    head_groups,
+    num_q_heads,
+    num_kv_heads,
+    input_page_size,
+    seq_len,
+    query_len,
+):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
+    pytest.importorskip("flash_attn_v100")
+
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    automatic = isinstance(head_groups, str)
+    monkeypatch.setenv(
+        "VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS",
+        "1" if automatic else str(head_groups),
+    )
+    monkeypatch.setenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1")
+    impl = FlashAttnV100Impl(
+        num_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=256,
+        scale=256**-0.5,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype=cache_dtype,
+    )
+    # Match the production operator owner: E4M3 uses the FA2 bridge, not the
+    # similarly named conversion wrapper exported by flash_attn_v100.
+    if cache_dtype == "fp8_e4m3":
+        if impl.fp8_e4m3_paged_kv_to_fp16 is None:
+            pytest.skip(
+                "installed FA2 extension lacks "
+                "_vllm_fa2_C.sm70_v37_e4m3_bridge"
+            )
+    elif impl.fp8_e5m2_paged_kv_to_fp16 is None:
+        pytest.skip("installed Flash-V100 extension lacks the E5M2 bridge")
+    torch.manual_seed(20261026)
+    input_blocks = math.ceil(seq_len / input_page_size)
+    shape = (input_blocks, input_page_size, num_kv_heads, 256)
+    key_cache = (
+        torch.randn(shape, dtype=torch.float16, device="cuda")
+        .to(torch_dtype)
+        .view(torch.uint8)
+    )
+    value_cache = (
+        torch.randn(shape, dtype=torch.float16, device="cuda")
+        .to(torch_dtype)
+        .view(torch.uint8)
+    )
+    query = torch.randn(
+        1, query_len, num_q_heads, 256, dtype=torch.float16, device="cuda"
+    )
+    # Reverse physical pages and retain a partial final page to catch indexing
+    # errors independently of the GQA head ranges.
+    block_table = torch.arange(
+        input_blocks - 1, -1, -1, dtype=torch.int32, device="cuda"
+    ).unsqueeze(0)
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+    assert impl._should_use_fp8_prefill_bridge(
+        q_len=query_len,
+        head_dim=256,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        causal=True,
+        window_size=(-1, -1),
+    )
+    arguments = dict(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        seq_len=seq_len,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        causal=True,
+        window_size=(-1, -1),
+    )
+    unsplit = impl._run_fp8_prefill_bridge(
+        **arguments, out=torch.empty_like(query), head_groups=1
+    )
+    assert unsplit is not None
+    # The grouped execution reuses workspace; preserve the reference output.
+    expected = unsplit[0].clone()
+    if automatic:
+        from types import SimpleNamespace
+
+        from vllm.config import set_current_vllm_config
+        from vllm.config.execution_policy import FlashV100Policy, GraphPolicy
+        from vllm.config.flash_v100 import FlashV100Diagnostics, FlashV100Options
+        from vllm.config.sm70_runtime import RuntimeTraceConfig
+        from vllm.v1.attention.backends.flash_v100.config import (
+            FP8_PREFILL_BRIDGE_PAGE_SIZE,
+        )
+
+        head_groups = int(head_groups.removeprefix("auto"))
+        page_size = FP8_PREFILL_BRIDGE_PAGE_SIZE
+        kv_tokens = math.ceil(
+            input_blocks * input_page_size / page_size
+        ) * page_size
+        projected = (
+            4 * kv_tokens * (num_kv_heads // head_groups) * 256
+            + kv_tokens // page_size * 4
+            + 4 * math.ceil(query_len / 64) * 64
+            * (num_q_heads // head_groups) * 256
+            + (
+                4 * query_len * (num_q_heads // head_groups) * 256
+                if head_groups > 1 else 0
+            )
+        )
+        monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS")
+        policy = FlashV100Policy(
+            options=FlashV100Options(fp8_bridge_workspace_bytes=projected)
+        )
+        policy.resolve()
+        policy.options.finalize(
+            GraphPolicy(), FlashV100Diagnostics(), cache_dtype=cache_dtype
+        )
+        engine = SimpleNamespace(
+            attention_config=SimpleNamespace(flash_v100=policy),
+            model_config=SimpleNamespace(max_model_len=seq_len),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=query_len),
+            cache_config=SimpleNamespace(block_size=16),
+            observability_config=SimpleNamespace(runtime_trace=RuntimeTraceConfig()),
+        )
+        with set_current_vllm_config(engine):
+            impl._initialize_prefill_policy()
+        from vllm.v1.attention.backends.flash_v100.config import (
+            configure_fp8_bridge_workspace_plans,
+        )
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+        configure_fp8_bridge_workspace_plans(
+            engine,
+            [KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=input_page_size, num_kv_heads=num_kv_heads,
+                    head_size=256, dtype=torch.uint8,
+                ),
+            )],
+            {"attention": SimpleNamespace(impl=impl)},
+        )
+        assert impl.fp8_bridge_head_groups == head_groups
+    from contextlib import nullcontext
+
+    from vllm.runtime_resources import release_runtime_resources
+
+    context = set_current_vllm_config(engine) if automatic else nullcontext()
+    try:
+        with context:
+            if automatic:
+                from vllm.v1.attention.backends.flash_v100.runtime import (
+                    prepare_prefill_runtime,
+                )
+
+                prepare_prefill_runtime(torch.ops._vllm_fa2_C)
+            if automatic:
+                from vllm.v1.attention.backends.flash_v100 import dense_prefill
+                from vllm.v1.attention.ops.sm70_workspaces import workspace_cache
+
+                dense_prefill.profile_fp8_prefill_bridge_workspace(
+                    query[0], num_kv_heads, impl.fp8_bridge_workspace_plan
+                )
+            out = torch.full_like(query, float("nan"))
+            grouped = impl._run_fp8_prefill_bridge(**arguments, out=out)
+            assert grouped is not None
+            if head_groups > 1 and num_kv_heads % head_groups == 0:
+                assert grouped[0] is out
+                assert grouped[1]
+            torch.accelerator.synchronize()
+            assert torch.equal(grouped[0], expected)
+            if automatic:
+                retained_bytes = sum(
+                    tensor.untyped_storage().nbytes()
+                    for name in (
+                        "fp8_prefill_bridge_workspaces",
+                        "fp8_prefill_bridge_tail_workspaces",
+                        "fp8_prefill_bridge_group_workspaces",
+                    )
+                    for buffers in workspace_cache(name, {}).values()
+                    for tensor in buffers
+                )
+                plan = impl.fp8_bridge_workspace_plan
+                assert retained_bytes == plan.projected_bytes <= plan.budget_bytes
+    finally:
+        if automatic:
+            release_runtime_resources(engine)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "failed_buffer", ["query", "output", "budget", "auto_query", "auto_output"]
+)
+@pytest.mark.parametrize(
+    "cache_dtype,torch_dtype",
+    [("fp8_e4m3", torch.float8_e4m3fn), ("fp8_e5m2", torch.float8_e5m2)],
+)
+@torch.inference_mode()
+def test_sm70_flash_v100_grouped_bridge_oom_falls_back(
+    monkeypatch, failed_buffer, cache_dtype, torch_dtype
+):
+    import weakref
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.flash_v100.impl import FlashAttnV100Impl
+    from vllm.v1.attention.backends.flash_v100.prefill_candidates import (
+        Fp8BridgePrefill,
+    )
+
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
+    pytest.importorskip("flash_attn_v100")
+    monkeypatch.setenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", "2")
+    impl = FlashAttnV100Impl(
+        num_heads=24,
+        num_kv_heads=4,
+        head_size=256,
+        scale=256**-0.5,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype=cache_dtype,
+    )
+    automatic = failed_buffer.startswith("auto_")
+    if failed_buffer == "budget" or automatic:
+        from vllm.v1.attention.backends.flash_v100.config import (
+            Fp8BridgeWorkspacePlan,
+        )
+
+        impl.fp8_bridge_workspace_plan = Fp8BridgeWorkspacePlan.build(
+            budget_bytes=6 * 1024**2 if automatic else 0,
+            max_model_len=1700, max_query_tokens=32,
+            block_size=1056, num_kv_heads=4, num_heads=24, head_size=256,
+        )
+        impl.fp8_bridge_head_groups = impl.fp8_bridge_workspace_plan.head_groups
+        if automatic:
+            assert impl.fp8_bridge_head_groups == 2
+            failed_buffer = failed_buffer.removeprefix("auto_")
+    torch.manual_seed(127)
+    query = torch.randn(1, 32, 24, 256, device="cuda", dtype=torch.float16)
+    key = torch.randn(2, 1056, 4, 256, device="cuda").to(torch_dtype).view(torch.uint8)
+    value = torch.randn_like(key, dtype=torch.float16).to(torch_dtype).view(torch.uint8)
+    blocks = torch.tensor([[1, 0]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([1700], device="cuda", dtype=torch.int32)
+    expected = impl.flash_attn_prefill_paged(
+        query,
+        key,
+        value,
+        blocks,
+        lengths,
+        softmax_scale=256**-0.5,
+        kv_cache_dtype=cache_dtype,
+        k_scale=0.75,
+        v_scale=1.25,
+        causal=True,
+        window_size=(-1, -1),
+    ).clone()
+    request = SimpleNamespace(
+        q_seq=query,
+        key_cache=key,
+        value_cache=value,
+        attn_metadata=SimpleNamespace(block_table=blocks, seq_lens=lengths),
+        i=0,
+        start=0,
+        end=32,
+        seq_len=1700,
+        layer=SimpleNamespace(_k_scale_float=0.75, _v_scale_float=1.25),
+        causal=True,
+        window_size=(-1, -1),
+        out_view=torch.full_like(query[0], float("nan")),
+    )
+    executor = SimpleNamespace(
+        ops=SimpleNamespace(
+            bridge=impl._run_fp8_prefill_bridge,
+            paged=impl.flash_attn_prefill_paged,
+        ),
+        config=SimpleNamespace(scale=256**-0.5, kv_cache_dtype=cache_dtype),
+    )
+    group_shape = (1, 32, 12, 256)
+    empty, empty_like = torch.empty, torch.empty_like
+    scratch_refs = []
+
+    def allocate_query(*args, **kwargs):
+        if args and isinstance(args[0], tuple) and args[0] == group_shape:
+            if failed_buffer == "query":
+                raise torch.OutOfMemoryError("group query scratch")
+            tensor = empty(*args, **kwargs)
+            scratch_refs.append(weakref.ref(tensor))
+            return tensor
+        return empty(*args, **kwargs)
+
+    def allocate_output(tensor, *args, **kwargs):
+        if tuple(tensor.shape) == group_shape and failed_buffer == "output":
+            raise torch.OutOfMemoryError("group output scratch")
+        return empty_like(tensor, *args, **kwargs)
+
+    with monkeypatch.context() as allocation_failure:
+        allocation_failure.setattr(torch, "empty", allocate_query)
+        allocation_failure.setattr(torch, "empty_like", allocate_output)
+        result = Fp8BridgePrefill(executor).run(request, lambda *args, **kwargs: None)
+    torch.accelerator.synchronize()
+    assert torch.equal(result.output, expected)
+    assert all(reference() is None for reference in scratch_refs)

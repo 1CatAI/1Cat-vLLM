@@ -11547,6 +11547,27 @@ class GPUModelRunner(
         max_task = max(output_size.items(), key=lambda x: x[1])[0]
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
+    def _configure_attention_workspace_plans(self, kv_cache_groups=None) -> None:
+        layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        if not any(
+            hasattr(getattr(layer, "impl", None), "configure_fp8_bridge_workspace")
+            for layer in layers.values()
+        ):
+            return
+        from vllm.v1.attention.backends.flash_v100.config import (
+            configure_fp8_bridge_workspace_plans,
+        )
+
+        if kv_cache_groups is None:
+            from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+            kv_cache_groups = get_kv_cache_groups(
+                self.vllm_config, self.get_kv_cache_spec()
+            )
+        configure_fp8_bridge_workspace_plans(
+            self.vllm_config, kv_cache_groups, layers
+        )
+
     def profile_run(self) -> None:
         profile_start = time.perf_counter()
         _sm70_profile_trace(
@@ -11554,6 +11575,10 @@ class GPUModelRunner(
             self.max_num_tokens,
             self.scheduler_config.max_num_seqs,
         )
+        # Hybrid grouping can enlarge physical attention pages after weight
+        # loading. Bind that final envelope before metadata=None profiling
+        # reserves optional bridge storage for KV-memory admission.
+        self._configure_attention_workspace_plans()
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -12130,6 +12155,8 @@ class GPUModelRunner(
         Initialize the attention backends and attention metadata builders.
         """
         assert len(self.attn_groups) == 0, "Attention backends are already initialized"
+        # This path also runs when fixed KV bytes skip memory profiling.
+        self._configure_attention_workspace_plans(kv_cache_config.kv_cache_groups)
 
         class AttentionGroupKey(NamedTuple):
             """Deduplication key for attention groups within a KV cache group.

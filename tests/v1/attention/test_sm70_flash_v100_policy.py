@@ -2819,6 +2819,7 @@ def test_flash_v100_fp8_prefill_bridge_prefers_logical_dense_exact(monkeypatch):
     impl = object.__new__(FlashAttnV100Impl)
     impl.kv_cache_dtype = "fp8_e5m2"
     impl.scale = 256**-0.5
+    impl.fp8_bridge_head_groups = 1
     bridge_calls = []
     exact_calls = []
 
@@ -2840,7 +2841,7 @@ def test_flash_v100_fp8_prefill_bridge_prefers_logical_dense_exact(monkeypatch):
     monkeypatch.setattr(
         mod,
         "_get_fp8_prefill_bridge_workspace",
-        lambda key_cache, required_blocks: (
+        lambda key_cache, required_blocks, max_blocks=None: (
             key_workspace,
             value_workspace,
             output_block_table,
