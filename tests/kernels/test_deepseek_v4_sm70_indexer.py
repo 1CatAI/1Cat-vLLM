@@ -55,6 +55,27 @@ def _reference_index_logits(
     return torch.einsum("mhn,mh->mn", torch.relu(per_head), weights.float())
 
 
+def _reference_prefill_logits(
+    q: torch.Tensor, weights: torch.Tensor, values: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor:
+    """The prefill routes' arithmetic in fp64: per-head scores of the unscaled
+    keys rounded to fp16 (as the cuBLAS route stores them; the fused SM75
+    scorer keeps FP32, well within the tolerance below), then relu, head
+    weights, head sum and the per-key scale.
+    """
+    per_head = torch.einsum("mhd,nd->mhn", q.double(), values.double())
+    per_head = per_head.float().half().double()
+    summed = torch.einsum("mhn,mh->mn", torch.relu(per_head), weights.double())
+    return summed * scales.double()
+
+
+def _assert_close_to_max(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Accumulation order only moves an fp16 rounding boundary now and then, so
+    the error is judged against the largest score, not element by element."""
+    error = (actual.double() - expected).abs().max() / expected.abs().max()
+    assert error < 1e-3, f"max |actual - expected| / max |expected| = {error:.2e}"
+
+
 def _reference_factored_logits(
     q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor
 ) -> torch.Tensor:
@@ -121,6 +142,83 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
     # function, which is what broke long-context top-k selection.
     factored = _reference_factored_logits(q, weights, k)
     assert not torch.allclose(expected, factored, rtol=1e-2, atol=1e-2)
+
+
+@requires_sm70
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_prefill_model_head_counts_match_the_reference(num_heads, weight_dtype):
+    """32 and 64 heads are the model head counts (16-head indexers pad to 32);
+    on Turing they take the fused tensor-core scorer. 37 queries and 1100 keys
+    leave a partial token group, a partial key tile and a second key range.
+    """
+    torch.manual_seed(20261021)
+    generator = torch.Generator().manual_seed(20261021)
+    num_queries, num_keys = 37, 1100
+
+    q, weights = _make_queries(num_queries, num_heads)
+    weights = weights.to(weight_dtype)
+    bits, values = _random_fp8_keys(num_keys, generator)
+    scales = torch.linspace(0.5, 2.0, num_keys, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights
+    )
+    _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
+    reason="requires a Turing GPU (SM75)",
+)
+def test_turing_prefill_takes_the_fused_scorer(monkeypatch):
+    def cublas_route(*args):
+        raise AssertionError("Turing must not stage scores through cuBLAS")
+
+    monkeypatch.setattr(sm70_indexer, "_prefill_logits_cublas", cublas_route)
+    generator = torch.Generator().manual_seed(20261021)
+    q, weights = _make_queries(512, 64)
+    bits, values = _random_fp8_keys(300, generator)
+    scales = torch.linspace(0.5, 2.0, 300, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights
+    )
+    _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
+    reason="requires a Turing GPU (SM75)",
+)
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_turing_fused_scorer_survives_unscaled_key_magnitudes(monkeypatch, num_heads):
+    """The fused SM75 scorer multiplies by keys with their scale left out, so
+    e4m3 values reach 448 and one q . k passes fp16's 65504. Its products must
+    stay FP32: rounded to fp16 they became inf, and NaN where the mixed-sign
+    head weights summed +inf and -inf."""
+
+    def cublas_route(*args):
+        raise AssertionError("Turing must take its fused scorer here")
+
+    monkeypatch.setattr(sm70_indexer, "_prefill_logits_cublas", cublas_route)
+    torch.manual_seed(20261102)
+    generator = torch.Generator().manual_seed(20261102)
+    num_queries, num_keys = 3, 80
+    q, weights = _make_queries(num_queries, num_heads)
+    q[:, :2] = 2.0  # 128 * 2.0 * 448 = 114688 against the full-scale keys
+    weights[:, 0], weights[:, 1] = 1.0, -1.0
+    bits, values = _random_fp8_keys(num_keys, generator)
+    bits[: num_keys // 2] = 0x7E  # e4m3fn 448, the format's largest finite value
+    values[: num_keys // 2] = 448.0
+    scales = torch.full((num_keys,), 2.0**-8, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights
+    )
+    expected = _reference_index_logits(q, weights, values * scales[:, None])
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-2)
 
 
 @requires_sm70

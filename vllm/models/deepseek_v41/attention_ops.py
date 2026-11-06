@@ -1089,8 +1089,9 @@ def attend_paged_latents(
                 scores,
             )
             continue
-        logits = torch.empty(n, heads, width + 1, dtype=torch.float32, device=q.device)
-        probabilities = torch.empty_like(logits)
+        # attend_gathered_keys expects zeros in the unused slots, which this
+        # gather leaves as read.
+        keys.masked_fill_(unused[:, :, None], 0)
         attend_gathered_keys(
             q[first:last],
             keys,
@@ -1099,8 +1100,7 @@ def attend_paged_latents(
             attn_sink,
             result[first:last],
             scores,
-            logits,
-            probabilities,
+            torch.empty(n, heads, width, dtype=keys.dtype, device=q.device),
         )
     return result
 
@@ -1199,11 +1199,10 @@ def attend_draft_latents(q, kv, positions, valid, cache, table, sink, block_size
     )
     scores = torch.empty(n, heads, width, dtype=torch.float32, device=q.device)
     result = torch.empty_like(q)
+    keys.masked_fill_(unused[:, :, None], 0)
     if _ATTN_FUSED:
-        keys.masked_fill_(unused[:, :, None], 0)
         _attend_fused(q, keys, unused, 512**-0.5, sink, result, scores)
         return result
-    logits = torch.empty(n, heads, width + 1, dtype=torch.float32, device=q.device)
     attend_gathered_keys(
         q,
         keys,
@@ -1212,7 +1211,6 @@ def attend_draft_latents(q, kv, positions, valid, cache, table, sink, block_size
         sink,
         result,
         scores,
-        logits,
-        torch.empty_like(logits),
+        torch.empty(n, heads, width, dtype=keys.dtype, device=q.device),
     )
     return result

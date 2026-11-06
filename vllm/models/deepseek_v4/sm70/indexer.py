@@ -56,6 +56,12 @@ _RELU_BLOCK_M = 32
 # is what keeps a long-context chunk from asking for gigabytes in one go.
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
+# The prefill epilogue reads fp16 scores. Eight keys per thread make 16-byte
+# loads; at two per thread (BLOCK_K 256 over 4 warps) it read the score tile at
+# 105 GB/s on RTX 8000 and 184 GB/s on V100, against 562 and 782 GB/s here.
+# The fp32 decode scores already load 8 bytes per thread with the shared one.
+_PREFILL_EPILOGUE_BLOCK_K = 512
+_PREFILL_EPILOGUE_WARPS = 2
 
 # At long context the paged Triton decode kernel rescans the same FP8 MQA keys
 # once for every verifier row and head. For a bounded one-request verifier
@@ -619,7 +625,9 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
         # the top-k *set* is consumed downstream, so the 5e-4 rounding here is
         # far below the gap between neighbouring index scores.
         scores = torch.mm(q2, k_fp16[start:stop].t())
-        _relu_weight_headsum_kernel[(num_q, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
+        _relu_weight_headsum_kernel[
+            (num_q, triton.cdiv(width, _PREFILL_EPILOGUE_BLOCK_K))
+        ](
             scores,
             weights,
             k_scales[start:stop],
@@ -630,11 +638,23 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
             out.stride(0),
             width,
             num_heads=num_heads,
-            BLOCK_K=_EPILOGUE_BLOCK_K,
+            BLOCK_K=_PREFILL_EPILOGUE_BLOCK_K,
             BLOCK_H=_EPILOGUE_BLOCK_H,
-            num_warps=4,
+            num_warps=_PREFILL_EPILOGUE_WARPS,
         )
     return out
+
+
+def _turing_fused_prefill_scores(q: torch.Tensor) -> bool:
+    """Whether Turing's fused tensor-core scorer takes this prefill chunk.
+
+    It computes scores, relu, head weights, head sum and key scales in one
+    kernel, so the [tokens * heads, keys] score tile of the cuBLAS route never
+    reaches memory. Its warps hold 32 heads each.
+    """
+    return q.shape[1] in (32, 64) and current_platform.is_device_capability(
+        (7, 5), device_id=q.device.index
+    )
 
 
 def sm70_indexer_prefill_logits(
@@ -650,10 +670,30 @@ def sm70_indexer_prefill_logits(
     k_scales = k_scale_storage.view(torch.float32).reshape(-1)
     assert k_scales.shape[0] == k_quant.shape[0]
 
+    if policy.value("indexer_relu") and _turing_fused_prefill_scores(q):
+        logger.info_once(
+            "SM70 indexer prefill: fused SM75 scorer on %s.", q.device, scope="process"
+        )
+        out = torch.empty(
+            (q.shape[0], k_quant.shape[0]), dtype=torch.float32, device=q.device
+        )
+        torch.ops._C.indexer_prefill_scores_sm75(
+            out, q, weights, k_quant.view(torch.uint8), k_scales
+        )
+        return out
+
     if policy.value("indexer_relu") and policy.value("indexer_prefill_cublas"):
+        logger.info_once(
+            "SM70 indexer prefill: cuBLAS route on %s.", q.device, scope="process"
+        )
         return _prefill_logits_cublas(q, k_quant, k_scales, weights)
 
     if policy.value("indexer_relu"):
+        logger.info_once(
+            "SM70 indexer prefill: per-head Triton kernel on %s.",
+            q.device,
+            scope="process",
+        )
         num_q, num_heads, _ = q.shape
         num_k = k_quant.shape[0]
         out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)

@@ -659,6 +659,36 @@ class Sm70RingConfig:
 
 
 @config
+class HostReduceConfig:
+    """Two-rank FP16 all-reduce through pinned host memory for GPU pairs without
+    peer access; exact, the same bits as NCCL's two-rank sum."""
+
+    enabled: bool = True
+    """Admit the operator for two-rank groups whose GPUs NCCL cannot connect
+    peer to peer."""
+
+    max_bytes: int = Field(default=262144, gt=0, le=4194304, multiple_of=16)
+    """Largest payload of the kernel mode (decode)."""
+
+    copy_engine_max_bytes: int = Field(default=0, ge=0, multiple_of=16)
+    """Largest payload of the copy-engine mode for prefill-sized all-reduces:
+    the copy engines move both tensors through the host buffer, ordered by
+    stream memory operations, so no SM polls host memory and computation on
+    other streams keeps its speed. Eager calls only; it pins four slots of
+    this size in shared host memory. 0 leaves payloads above max_bytes on
+    NCCL."""
+
+    def __post_init__(self) -> None:
+        # The copy-engine mode serves payloads above max_bytes; a smaller limit
+        # would never be reached.
+        if 0 < self.copy_engine_max_bytes <= self.max_bytes:
+            raise ValueError(
+                "host_reduce.copy_engine_max_bytes must be 0 or exceed "
+                f"max_bytes ({self.max_bytes}), got {self.copy_engine_max_bytes}"
+            )
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -784,6 +814,16 @@ class KernelConfig:
     """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
     sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
     """Read the FP16 checkpoint router directly or retain its packed duplicate."""
+
+    host_reduce: HostReduceConfig = Field(default_factory=HostReduceConfig)
+    """Two-rank host-memory all-reduce policy, resolved from peer access."""
+
+    tp_prefill_overlap_min_tokens: int = Field(default=0, ge=0)
+    """Prefill batches of at least this many tokens run as two interleaved
+    halves on a tensor-parallel engine without pipeline stages: while one half
+    all-reduces on a side stream, the other half computes. 0 keeps batches
+    whole. Every collective in the model's forward must be an all-reduce."""
+
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -1160,6 +1200,10 @@ class KernelConfig:
             "qsa_host_kv_reason",
             "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
             "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
+            # Collective transport chosen outside the compiled graph.
+            "host_reduce",
+            # Micro-batch interleaving around the same compiled graph.
+            "tp_prefill_overlap_min_tokens",
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active
