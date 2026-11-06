@@ -53,7 +53,9 @@ def test_flash_launcher_separate_draft(tmp_path):
     shutil.copy(ROOT / "scripts" / script.name, script)
     script.chmod(0o755)
     cli = tmp_path / "vllm"
-    cli.write_text(f"#!{sys.executable}\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n")
+    cli.write_text(
+        f"#!{sys.executable}\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n"
+    )
     cli.chmod(0o755)
     draft = tmp_path / 'mtp "draft" dir'
     result = subprocess.run(
