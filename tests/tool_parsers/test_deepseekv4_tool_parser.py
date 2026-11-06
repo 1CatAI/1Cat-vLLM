@@ -451,3 +451,48 @@ def test_wrapped_block_after_orphan_invoke():
         if tool_call.function and tool_call.function.name
     ] == [0, 1]
     assert not any(delta.content for delta in deltas)
+
+
+_WEATHER_BLOCK_BODY = (
+    f'{INV_START}get_weather">\n'
+    f'{PARAM_START}city" string="true">Seoul{PARAM_END}\n'
+    f"{INV_END}\n"
+    f"{TC_END}"
+)
+
+
+@pytest.mark.parametrize("wrapper", DeepSeekV4ToolParser.tool_call_start_token_variants)
+@pytest.mark.parametrize("preamble", ["", "Let me check.\n"])
+def test_misspelled_wrapper_behaves_like_real_one(wrapper, preamble):
+    """Upstream issue #51914: known misspellings of the opener open a block
+    like the real wrapper, so the markup never reaches the content."""
+    model_output = f"{preamble}{wrapper}\n{_WEATHER_BLOCK_BODY}"
+    reference = make_parser().extract_tool_calls(
+        f"{preamble}{TC_START}\n{_WEATHER_BLOCK_BODY}", make_request()
+    )
+
+    result = make_parser().extract_tool_calls(model_output, make_request())
+    assert [call.function.name for call in result.tool_calls] == ["get_weather"]
+    assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
+    assert result.content == reference.content
+
+    deltas = stream_chunks(make_parser(), list(model_output))
+    assert json.loads(reconstruct_args(deltas)) == {"city": "Seoul"}
+    assert "".join(delta.content or "" for delta in deltas) == (reference.content or "")
+
+
+@pytest.mark.parametrize(
+    "model_output",
+    [
+        "see <｜DSML｜foo> and <｜DSML｜tool_call> here",
+        "see <｜DSML｜ here\nnext line",
+        "see <|DSML|tool> and <|DSML|toolcalls> there",
+    ],
+)
+def test_unregistered_dsml_markup_is_content(model_output):
+    result = make_parser().extract_tool_calls(model_output, make_request())
+    assert not result.tools_called
+    assert result.content == model_output
+
+    deltas = stream_chunks(make_parser(), list(model_output))
+    assert "".join(delta.content or "" for delta in deltas) == model_output

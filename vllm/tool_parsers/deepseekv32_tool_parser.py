@@ -52,6 +52,8 @@ class DeepSeekV32ToolParser(ToolParser):
     """
 
     tool_call_start_token: str = "<｜DSML｜function_calls>"
+    # Misspelled openers a model is known to emit; they open a block too.
+    tool_call_start_token_variants: tuple[str, ...] = ()
     tool_call_end_token: str = "</｜DSML｜function_calls>"
     invoke_tag_name: str = "invoke"
     parameter_tag_name: str = "parameter"
@@ -195,8 +197,11 @@ class DeepSeekV32ToolParser(ToolParser):
         """Length of the longest suffix of *text* that may start a marker."""
         return max(partial_tag_overlap(text, marker) for marker in markers)
 
+    def _tool_call_start_tokens(self) -> tuple[str, ...]:
+        return (self.tool_call_start_token, *self.tool_call_start_token_variants)
+
     def _tool_calls_start_markers(self) -> tuple[str, ...]:
-        return (self.tool_call_start_token, self.invoke_open_marker)
+        return (*self._tool_call_start_tokens(), self.invoke_open_marker)
 
     def extract_tool_calls(
         self,
@@ -472,7 +477,7 @@ class DeepSeekV32ToolParser(ToolParser):
                     (
                         token
                         for token in (
-                            self.tool_call_start_token,
+                            *self._tool_call_start_tokens(),
                             self.tool_call_end_token,
                         )
                         if self._buffer.startswith(token)
