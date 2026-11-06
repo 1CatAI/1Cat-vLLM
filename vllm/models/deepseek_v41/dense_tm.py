@@ -40,10 +40,15 @@ def _segment_shapes(model, extra=()):
     return shapes
 
 
+def _blocks(model):
+    """This pipeline stage's decoder layers (the others are PPMissingLayer)."""
+    return [model.layers[i] for i in range(model.start_layer, model.end_layer)]
+
+
 def _targets(model, extra=()):
     """Groups of linears per decoder layer; each group shares one input."""
     yield from extra
-    for block in model.layers:
+    for block in _blocks(model):
         attn = block.attn
         yield (attn.wq_a, attn.wkv)
         yield (attn.wq_b,)
@@ -219,7 +224,7 @@ def prepare(model, extra_groups=()) -> dict:
 
     extra = tuple(tuple(g) for g in extra_groups)
     try:  # diagnostics: where the shared expert down weights live
-        d = model.layers[0].ffn.shared_experts.down_proj
+        d = _blocks(model)[0].ffn.shared_experts.down_proj
         names = {
             n: (tuple(t.shape), str(t.dtype))
             for n, t in list(d.named_parameters()) + list(d.named_buffers())
@@ -262,7 +267,7 @@ def prepare(model, extra_groups=()) -> dict:
             for m in group[1:]:
                 m.v41_small_m_peer = group[0]
     # Block-diagonal wo_a: one runner per O group over its own 1024 rows.
-    for block in model.layers:
+    for block in _blocks(model):
         wo_a = block.attn.wo_a
         if getattr(wo_a, "gguf_tm_projections", None):
             p = wo_a.gguf_tm_projections[0]

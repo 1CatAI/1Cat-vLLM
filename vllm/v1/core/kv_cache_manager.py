@@ -9,6 +9,7 @@ from typing import Literal, overload
 import vllm.envs as envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.models.deepseek_v41 import prefill_skip as v41_prefill_skip
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -40,6 +41,9 @@ logger = init_logger(__name__)
 _V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
 # A hit at P needs window rows [P - 128, P) still in the 256-row rings.
 _V41_RING_REACH = 128
+# VLLM_V41_PREFILL_SKIP_ROWS: a request freed inside or just after its skipped
+# prefill chunks leaves window rings that no hit may read (prefill_skip.py).
+_V41_PREFILL_SKIP_ROWS = v41_prefill_skip.skip_rows()
 
 
 @dataclass
@@ -767,7 +771,17 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         if _V41_SESSION_PREFIX:
-            self._v41_last = (list(request.all_token_ids), request.num_computed_tokens)
+            if _V41_PREFILL_SKIP_ROWS and not v41_prefill_skip.session_record_ok(
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                _V41_PREFILL_SKIP_ROWS,
+            ):
+                self._v41_last = None
+            else:
+                self._v41_last = (
+                    list(request.all_token_ids),
+                    request.num_computed_tokens,
+                )
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

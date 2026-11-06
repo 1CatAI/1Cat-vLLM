@@ -492,6 +492,36 @@ class GGUFModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         model.load_weights(self.get_all_weights(model_config, model))
 
+    def _stage_weights_map(self, adapter, model, name_map):
+        """Keep only this pipeline stage's tensors, before any payload is read.
+
+        Other stages' layers are ``PPMissingLayer`` placeholders. An adapter
+        may also drop stage-owned globals (``keep_on_stage``); V4.1 keeps its
+        Engram hash tensors on the first stage only.
+        """
+        from vllm.distributed import get_pp_group
+        from vllm.model_executor.models.utils import is_pp_missing_parameter
+
+        pp = get_pp_group()
+        if pp.world_size == 1:
+            return name_map
+        keep = getattr(adapter, "keep_on_stage", None)
+        result = {
+            raw: name
+            for raw, name in name_map.items()
+            if not is_pp_missing_parameter(name, model)
+            and (keep is None or keep(raw, pp.is_first_rank, pp.is_last_rank))
+        }
+        logger.info(
+            "PP stage %d/%d loads %d of %d GGUF tensors",
+            pp.rank_in_group,
+            pp.world_size,
+            len(result),
+            len(name_map),
+        )
+        self._gguf_prepared_weights_map = result
+        return result
+
     @staticmethod
     def _start_load_sampler():
         """Diagnostic (VLLM_GGUF_LOAD_PROFILE=1): sample the loading thread's
@@ -656,6 +686,10 @@ class GGUFModelLoader(BaseModelLoader):
             model._gguf_model_path = local_model_path
             weight_model = native_gguf_language_model(model, adapter)
             weight_model._gguf_model_path = local_model_path
+            if adapter is not None:
+                gguf_weights_map = self._stage_weights_map(
+                    adapter, weight_model, gguf_weights_map
+                )
             if (
                 adapter is not None
                 and quant_config.native_expert_storage

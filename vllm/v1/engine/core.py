@@ -534,7 +534,16 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+        # With a batch queue (pipeline parallelism) the drafts are taken in
+        # step_with_batch_queue once the step that produced them has been
+        # applied by update_from_output; taking them here could attach a
+        # later in-flight step's drafts before its sampled token is known.
+        if (
+            not self.async_scheduling
+            and self.use_spec_decode
+            and model_executed
+            and self.batch_queue is None
+        ):
             profile_ddtree_engine = (
                 os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE", "0") == "1"
             )
@@ -711,6 +720,22 @@ class EngineCore:
         )
         if trace_log:
             trace_update_ms = (time.perf_counter() - trace_update_t0) * 1000.0
+        if (
+            self.use_spec_decode
+            and not self.async_scheduling
+            and not deferred_scheduler_output
+            and not any(
+                queued.total_num_scheduled_tokens for _, queued, _ in batch_queue
+            )
+        ):
+            # No later step with tokens is in flight (empty steps neither run
+            # the drafter nor clear its drafts), so the worker's latest drafts
+            # belong to the step just applied, whose sampled token is now
+            # appended. A request scheduled with drafts but without that token
+            # would get fewer query rows than draft_len + 1.
+            draft_token_ids = self.model_executor.take_draft_token_ids()
+            if draft_token_ids is not None:
+                self.scheduler.update_draft_token_ids(draft_token_ids)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
