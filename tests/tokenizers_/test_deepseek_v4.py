@@ -96,6 +96,108 @@ def test_deepseek_v4_enables_thinking_with_compatible_kwargs(kwargs):
     assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜><think>")
 
 
+@pytest.mark.parametrize(
+    ("enable_thinking", "thinking_token"),
+    [(False, "</think>"), (True, "<think>")],
+)
+def test_deepseek_v4_appends_assistant_transition_after_trailing_system(
+    enable_thinking, thinking_token
+):
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "system", "content": "Be concise."},
+        ],
+        tokenize=False,
+        enable_thinking=enable_thinking,
+        reasoning_effort="low",
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜>You are helpful."
+        f"<｜User｜>What is 2+2?Be concise.<｜Assistant｜>{thinking_token}"
+    )
+
+
+def test_deepseek_v4_does_not_transition_after_mid_conversation_system():
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "user", "content": "What is 3+3?"},
+            {"role": "assistant", "content": "6"},
+            {"role": "system", "content": "Answer in French."},
+            {"role": "user", "content": "What is 5+5?"},
+        ],
+        tokenize=False,
+        enable_thinking=False,
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜><｜User｜>What is 3+3?"
+        "<｜Assistant｜></think>6<｜end▁of▁sentence｜>"
+        "Answer in French.<｜User｜>What is 5+5?"
+        "<｜Assistant｜></think>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("enable_thinking", "expected"),
+    [
+        (
+            False,
+            (
+                "<｜begin▁of▁sentence｜>rules<｜Assistant｜></think>answer"
+                "<｜end▁of▁sentence｜>"
+            ),
+        ),
+        (
+            True,
+            (
+                "<｜begin▁of▁sentence｜>rules<｜Assistant｜><think>reason</think>answer"
+                "<｜end▁of▁sentence｜>"
+            ),
+        ),
+    ],
+)
+def test_deepseek_v4_transitions_from_system_to_assistant(enable_thinking, expected):
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "rules"},
+            {
+                "role": "assistant",
+                "reasoning": "reason",
+                "content": "answer",
+            },
+        ],
+        tokenize=False,
+        enable_thinking=enable_thinking,
+        reasoning_effort="low",
+    )
+
+    assert prompt == expected
+
+
+def test_deepseek_v4_opens_assistant_turn_after_compressed_history_summary():
+    """AIfred's history compression yields system prompt, summary as system,
+    then the remaining turns, which may start with assistant."""
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "You are AIfred."},
+            {"role": "system", "content": "[Summary]\nEarlier: weather."},
+            {"role": "assistant", "content": "It will be sunny."},
+            {"role": "user", "content": "And tomorrow?"},
+        ],
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜>You are AIfred.[Summary]\nEarlier: weather."
+        "<｜Assistant｜></think>It will be sunny.<｜end▁of▁sentence｜>"
+        "<｜User｜>And tomorrow?<｜Assistant｜><think>"
+    )
+
+
 def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     tools = [
         {
