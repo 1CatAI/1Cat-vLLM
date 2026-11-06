@@ -29,6 +29,17 @@ COPY 1cat_vllm-*.whl /tmp/
 RUN pip install -U pip -i "$PIP_INDEX_URL" \
     && pip install /tmp/1cat_vllm-*.whl -i "$PIP_INDEX_URL" \
     && rm /tmp/1cat_vllm-*.whl
+# TileLang kernels (FlashQLA GDN prefill) compile with nvcc at first use; pip's
+# nvidia-cuda-nvcc-cu12 ships only ptxas. Install the CUDA 12.8 compiler and
+# runtime headers matching the wheel's toolkit.
+ARG CUDA_REPO=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64
+RUN curl -fsSL -o /tmp/cuda-keyring.deb "$CUDA_REPO/cuda-keyring_1.1-1_all.deb" \
+    && dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb \
+    && apt-get update && apt-get install -y --no-install-recommends cuda-nvcc-12-8 cuda-cudart-dev-12-8 \
+    && rm -rf /var/lib/apt/lists/*
+ENV CUDA_HOME=/usr/local/cuda-12.8
+ENV PATH=$CUDA_HOME/bin:$PATH
+
 # No GPU driver at build time: check the install without importing CUDA modules.
 RUN python -c "import importlib.metadata as m; print(m.version('1cat-vllm'))"
 
