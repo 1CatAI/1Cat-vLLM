@@ -609,6 +609,9 @@ class CollectiveNativeConfig:
     sm70_profile_trace: str | int | bool | None = None
     """Initialization override for VLLM_SM70_PROFILE_TRACE."""
 
+    sm70_tp4_sum2_push_any: bool | None = None
+    """Opt in to bounded generic FP16 sum2 push (VLLM_V41_SUM2_PUSH_ANY)."""
+
     aliases: ClassVar[dict[str, str]] = {
         "sm70_tp4_push_allreduce_small_messages": (
             "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES"
@@ -636,6 +639,7 @@ class CollectiveNativeConfig:
         "custom_allreduce_algo": "VLLM_CUSTOM_ALLREDUCE_ALGO",
         "sm70_tp4_push_allreduce_sum2_m1": "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1",
         "sm70_profile_trace": "VLLM_SM70_PROFILE_TRACE",
+        "sm70_tp4_sum2_push_any": "VLLM_V41_SUM2_PUSH_ANY",
     }
 
     values: tuple[str, ...] = Field(default=(), init=False)
