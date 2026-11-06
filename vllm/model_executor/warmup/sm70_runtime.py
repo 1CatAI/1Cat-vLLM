@@ -56,8 +56,26 @@ def warmup_v2_convolution(static_forward_context, logger, *, enabled: bool) -> N
         logger.info_once("SM70 MRV2 GDN causal-conv warmup finished.")
 
 
-def speculator_warmup_tasks(speculator, dummy_run) -> list[WarmupTask]:
+def speculator_warmup_tasks(
+    speculator, dummy_run, *, runner=None, logger=None
+) -> list[WarmupTask]:
+    tasks = []
     warmup = getattr(speculator, "warmup_sm70_mtp_moe_kernels", None)
-    if warmup is None:
-        return []
-    return [WarmupTask("mtp_moe", lambda: warmup(dummy_run))]
+    if warmup is not None:
+        tasks.append(WarmupTask("mtp_moe", lambda: warmup(dummy_run)))
+    if runner is not None:
+        from vllm.v1.worker.gpu.sm70_runner_ops import warmup_smallq_metadata
+
+        tasks.append(
+            warmup_boolean(
+                "dflash2_smallq_metadata",
+                lambda: warmup_smallq_metadata(runner, logger),
+            )
+        )
+    return tasks
+
+
+def note_runner_dispatch(*args):
+    from vllm.v1.worker.gpu.sm70_runner_ops import note_dispatch
+
+    note_dispatch(*args)

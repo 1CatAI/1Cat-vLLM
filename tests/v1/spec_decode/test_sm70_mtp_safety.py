@@ -11,6 +11,7 @@ import vllm.distributed.parallel_state as parallel_state
 import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer_module
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config.observability import ObservabilityConfig
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.llm_base_proposer import (
@@ -106,7 +107,8 @@ def test_prepare_next_token_padded_counts_only_contiguous_prefix():
     )
 
 
-def test_prepare_inputs_padded_does_not_alias_target_seq_lens():
+@pytest.mark.parametrize("exact_cpu_seq_lens", [False, True])
+def test_prepare_inputs_padded_does_not_alias_target_seq_lens(exact_cpu_seq_lens):
     device = torch.device(DEVICE_TYPE)
     query_start_loc = torch.tensor([0, 3, 6, 9], dtype=torch.int32, device=device)
     common_attn_metadata = CommonAttentionMetadata(
@@ -134,9 +136,13 @@ def test_prepare_inputs_padded_does_not_alias_target_seq_lens():
     original_dcp_lens = common_attn_metadata.dcp_local_seq_lens.clone()
     original_upper_bound = common_attn_metadata.seq_lens_cpu_upper_bound.clone()
 
+    policy = SpeculativeSamplingPolicy(exact_draft_seq_lens_cpu=exact_cpu_seq_lens)
+    policy.resolve()
+    proposer = SimpleNamespace(_sampling_policy=policy)
+
     output_metadata, _, num_rejected_tokens_gpu = (
         SpecDecodeBaseProposer.prepare_inputs_padded(
-            None,
+            proposer,
             common_attn_metadata,
             spec_decode_metadata,
             valid_sampled_tokens_count,

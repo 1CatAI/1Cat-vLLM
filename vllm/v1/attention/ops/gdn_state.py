@@ -227,34 +227,55 @@ def build_state_contract(
             return spec_sequence_masks_cpu
         return spec_sequence_masks_cpu.to(tensor.device, non_blocking=True)
 
+    num_rows = spec_sequence_masks_cpu.numel()
+    mask_row_indices: dict[tuple[bool, torch.device], torch.Tensor] = {}
+
+    def _rows(tensor: torch.Tensor, speculative: bool) -> torch.Tensor:
+        if spec_sequence_masks_cpu.device.type != "cpu":
+            mask = _mask_for(tensor)
+            return tensor[mask] if speculative else tensor[~mask]
+        if tensor.shape[0] != num_rows:
+            raise IndexError(
+                f"mask of length {num_rows} does not match tensor rows "
+                f"{tensor.shape[0]}"
+            )
+        key = (speculative, tensor.device)
+        index = mask_row_indices.get(key)
+        if index is None:
+            mask = spec_sequence_masks_cpu if speculative else ~spec_sequence_masks_cpu
+            index = mask.nonzero(as_tuple=True)[0].to(tensor.device, non_blocking=True)
+            mask_row_indices[key] = index
+        return tensor.index_select(0, index)
+
+    if block_table_tensor.shape[0] != num_rows:
+        raise IndexError(
+            f"mask of length {num_rows} does not match tensor rows "
+            f"{block_table_tensor.shape[0]}"
+        )
     if spec_state_slot_selectors is None:
         spec_state_slot_selectors = num_accepted_tokens
 
     all_spec_rows = False
     if current_state_block_ids is not None:
-        current_mask = _mask_for(current_state_block_ids)
-        accepted_mask = _mask_for(num_accepted_tokens)
         state_block_ids = current_state_block_ids[:, : num_spec + 1]
-        spec_state_indices_tensor = state_block_ids[current_mask]
-        non_spec_source = state_block_ids[~current_mask]
+        spec_state_indices_tensor = _rows(state_block_ids, True)
+        non_spec_source = _rows(state_block_ids, False)
         non_spec_state_indices_tensor = select_state_block_ids(
             non_spec_source,
-            num_accepted_tokens[~accepted_mask],
+            _rows(num_accepted_tokens, False),
             num_spec,
             legacy_slot0=legacy_slot0,
         )
     elif is_mamba_cache_all:
-        block_mask = _mask_for(block_table_tensor)
-        seq_mask = _mask_for(seq_lens)
         spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[block_mask],
-            seq_lens[seq_mask],
+            _rows(block_table_tensor, True),
+            _rows(seq_lens, True),
             block_size,
             num_spec + 1,
         )
         non_spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            seq_lens[~seq_mask],
+            _rows(block_table_tensor, False),
+            _rows(seq_lens, False),
             block_size,
             1,
         ).squeeze(1)
@@ -301,10 +322,8 @@ def build_state_contract(
             spec_num_accepted_tokens = _select_rows(num_accepted_tokens, True)
             spec_state_slot_selectors = _select_rows(spec_state_slot_selectors, True)
     else:
-        accepted_mask = _mask_for(num_accepted_tokens)
-        selector_mask = _mask_for(spec_state_slot_selectors)
-        spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
-        spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
+        spec_num_accepted_tokens = _rows(num_accepted_tokens, True)
+        spec_state_slot_selectors = _rows(spec_state_slot_selectors, True)
     if assert_contract:
         if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
             raise AssertionError(

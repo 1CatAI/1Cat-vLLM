@@ -18,6 +18,7 @@ from unittest.mock import patch
 import torch
 
 from vllm import _sm70_ops, envs
+from vllm._sm70.policy import NativeBindings
 from vllm.config import CompilationConfig, set_current_vllm_config
 from vllm.config.kernel import KernelConfig
 from vllm.model_executor.kernels import linear
@@ -187,6 +188,18 @@ def probe(module, cfg, role, k, n, *, missing_qpn8=False, workspace=True, bmm=Fa
         with ExitStack() as stack:
             contexts = (
                 set_current_vllm_config(cfg),
+                # This snapshot records dispatch with meta/native doubles.
+                # Native policy ownership is exercised by the dedicated ABI
+                # and engine-workspace tests, not by these fake operators.
+                patch(
+                    "vllm.config.sm70_native.capture_linear_native_config",
+                    return_value=NS(values=()),
+                ),
+                patch("vllm._sm70.runtime.bind_native_runtime", return_value=None),
+                patch(
+                    "vllm.model_executor.kernels.linear.qpn.fp8.NativeBindings",
+                    lambda values=(): NativeBindings(),
+                ),
                 patch.object(module, "current_platform", platform),
                 patch.object(sm70_fp8, "current_platform", platform),
                 patch.object(target, "current_platform", platform),

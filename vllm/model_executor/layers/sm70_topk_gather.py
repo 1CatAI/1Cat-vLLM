@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Gather compact vocabulary candidates with one lossless TP message."""
 
+from collections.abc import Callable
+
 import torch
 
 from vllm.distributed import (
@@ -124,3 +126,27 @@ def gather_topk_pairs(
         256,
     )
     return result_values, result_ids
+
+
+def capture_top1_transport() -> Callable[[torch.Tensor, int, int], torch.Tensor | None]:
+    """Resolve policy at layer construction; forward never reads process env."""
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.execution_policy import communication_policy
+    from vllm.model_executor.layers import sm70_draft47
+
+    cfg = get_current_vllm_config_or_none()
+    enabled = (
+        "d1a" in cfg.kernel_config.sm70_draft.units
+        if cfg is not None
+        else sm70_draft47.enabled("d1a")
+    )
+    custom_ar = communication_policy(cfg).top1_custom_ar
+
+    def transport(logits, vocab_start, tp_size):
+        if tp_size <= 1 or not enabled:
+            return None
+        return sm70_draft47.top_tokens(
+            logits, vocab_start, tp_size, custom_ar=custom_ar
+        )
+
+    return transport

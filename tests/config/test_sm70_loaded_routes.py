@@ -73,6 +73,7 @@ def test_policies_are_discovered_from_existing_configuration():
         "sm70_moe",
         "sm70_mxfp4",
         "sm70_runtime",
+        "sm70_draft",
     }
     assert all(row["status"] == "runtime_guarded" for row in policies.values())
 

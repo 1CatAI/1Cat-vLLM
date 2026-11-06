@@ -59,8 +59,9 @@ def test_verify_fusion_reaches_opaque_input_boundaries(monkeypatch, boundary):
 
 
 def test_verify_fusion_reaches_qwen35_override(monkeypatch):
-    from types import SimpleNamespace
+    from types import MethodType, SimpleNamespace
 
+    from vllm.config.gdn_projection import GdnProjectionConfig
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
     from vllm.model_executor.layers.quantization import sm70_gdn_ba_verify as ba
     from vllm.model_executor.models import qwen3_5
@@ -83,6 +84,7 @@ def test_verify_fusion_reaches_qwen35_override(monkeypatch):
         num_v_heads=48,
         head_v_dim=128,
         prefix="test.layer",
+        gdn_policy=SimpleNamespace(projection=GdnProjectionConfig()),
     )
     calls = []
 
@@ -102,6 +104,12 @@ def test_verify_fusion_reaches_qwen35_override(monkeypatch):
         assert actual_z.shape == (8, 12, 128) and rows == 8
         return core
 
+    layer._allocate_core_attn_out = MethodType(
+        qwen3_5.Qwen3_5GatedDeltaNet._allocate_core_attn_out, layer
+    )
+    monkeypatch.setattr(
+        gdn, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None)
+    )
     layer._output_projection = project
     monkeypatch.setattr(ba, "apply_gdn_ba_verify", fused)
     monkeypatch.setattr(qwen3_5, "_qwen_gdn_run_recurrent_core", recurrent)

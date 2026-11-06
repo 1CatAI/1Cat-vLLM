@@ -38,6 +38,8 @@ def test_prepared_provider_preserves_dispatch_and_shared_output_contract(
     monkeypatch, kind, flags, name, contiguous, rows
 ):
     calls = []
+    invocations = []
+    policy_arguments = ("prepared-test-policy",)
     state = SM70TurboMindLinearState(
         torch.empty(4, 8),
         torch.empty(1),
@@ -64,11 +66,19 @@ def test_prepared_provider_preserves_dispatch_and_shared_output_contract(
     elif kind == "nvfp4_qpn2_dense":
 
         def qpn2(inp, codes, scales, global_scale, n, k, split_k, nacc, policy):
+            assert policy == policy_arguments
             return write(torch.empty((inp.shape[0], n), dtype=inp.dtype), inp)
 
         monkeypatch.setattr(nvfp4_dequant, name, qpn2)
+
+    def invoke(operation, *args):
+        invocations.append(operation)
+        return operation(*args)
+
     state.native_ops = SimpleNamespace(
-        arguments=(), **{name: lambda out, inp, *args: write(out, inp)}
+        arguments=policy_arguments,
+        invoke=invoke,
+        **{name: lambda out, inp, *args: write(out, inp)},
     )
     result = apply_prepared(state, x, bias, "layer")
     expected = (
@@ -76,6 +86,7 @@ def test_prepared_provider_preserves_dispatch_and_shared_output_contract(
     )
     assert torch.equal(result, expected.reshape(2, rows, 6))
     assert len(calls) == 1
+    assert invocations == ([qpn2] if kind == "nvfp4_qpn2_dense" else [])
     if rows:
         assert calls[0][1] == (1 if contiguous else 2)
 

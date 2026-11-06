@@ -8,6 +8,8 @@ draft mismatch (or the bonus position), and ``num_sampled`` counts the leading
 matches plus one.
 """
 
+from types import SimpleNamespace
+
 import torch
 
 from vllm.logger import init_logger
@@ -84,6 +86,8 @@ def maybe_sample_greedy(
     grammar_output,
     sampler_output,
     cached_logits,
+    *,
+    speculator=None,
 ):
     sm70_greedy_decode = (
         sampler_output is None
@@ -134,4 +138,21 @@ def maybe_sample_greedy(
             num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
         )
         logger.info_once("SM70 MRv2 greedy TP-local pair path enabled.")
+    if sampler_output is None and cached_logits is None and capability_enabled:
+        from vllm.v1.worker.gpu.sm70_runner_ops import try_target_sample
+
+        # Keep the retained exact verifier behind the upstream sampling owner.
+        # Capability admission already excludes LoRA and non-Volta execution.
+        sampler_output = try_target_sample(
+            SimpleNamespace(
+                model=model,
+                sampler=sampler,
+                rejection_sampler=rejection_sampler,
+                speculator=speculator,
+                lora_config=None,
+            ),
+            sample_hidden_states,
+            input_batch,
+            grammar_output,
+        )
     return sampler_output
