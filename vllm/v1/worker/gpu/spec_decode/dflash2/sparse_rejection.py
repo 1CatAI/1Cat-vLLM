@@ -42,16 +42,123 @@ _TARGET_PROBE_K = 64
 
 
 @triton.jit
+def _penalize_probe_kernel(
+    values,
+    ids,
+    floors,
+    row_stride: tl.constexpr,
+    expanded_idx_mapping,
+    token_ids,
+    expanded_local_pos,
+    repetition_penalty,
+    frequency_penalty,
+    presence_penalty,
+    prompt_bin_mask,
+    prompt_bin_mask_stride,
+    output_bin_counts,
+    output_bin_counts_stride,
+    width: tl.constexpr,
+    block: tl.constexpr,
+):
+    # The same arithmetic as _penalties_kernel, on the probe's candidates only.
+    row = tl.program_id(0)
+    col = tl.arange(0, block)
+    mask = col < width
+    logits = tl.load(values + row * row_stride + col, mask, float("inf"))
+    # Every token outside the probe ranks at or below its smallest logit before
+    # penalties, and these penalties never raise a logit.
+    tl.store(floors + row, tl.min(logits, 0))
+
+    request = tl.load(expanded_idx_mapping + row)
+    rep_penalty = tl.load(repetition_penalty + request)
+    freq_penalty = tl.load(frequency_penalty + request)
+    pres_penalty = tl.load(presence_penalty + request)
+    use_rep_penalty = rep_penalty != 1.0
+    if not (use_rep_penalty or freq_penalty != 0.0 or pres_penalty != 0.0):
+        return
+
+    tokens = tl.load(ids + row * row_stride + col, mask, 0)
+    counts = tl.load(
+        output_bin_counts + request * output_bin_counts_stride + tokens, mask, 0
+    )
+    # Earlier rows of this request verify draft tokens that count as output.
+    pos = tl.load(expanded_local_pos + row)
+    start = row - pos
+    for prev_pos in tl.range(pos):
+        prev_token = tl.load(token_ids + start + prev_pos + 1)
+        counts = counts + (tokens == prev_token).to(tl.int32)
+    output_mask = counts > 0
+
+    if use_rep_penalty:
+        packed = tl.load(
+            prompt_bin_mask + request * prompt_bin_mask_stride + tokens // 32, mask, 0
+        )
+        in_prompt = ((packed >> (tokens % 32)) & 1).to(tl.int1)
+        scale = tl.where(in_prompt | output_mask, rep_penalty, 1.0)
+        logits *= tl.where(logits > 0, 1.0 / scale, scale)
+    logits -= freq_penalty * counts
+    logits -= pres_penalty * output_mask
+    tl.store(values + row * row_stride + col, logits, mask)
+
+
+def _penalize_probe(
+    values: torch.Tensor,
+    ids: torch.Tensor,
+    penalties_state: Any,
+    expanded_idx_mapping: torch.Tensor,
+    token_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+) -> torch.Tensor:
+    """Penalize probe logits in place and return each row's pre-penalty floor.
+
+    The caller re-sorts the probe and passes the floor to the cutoff guard.
+    """
+    rows, width = values.shape
+    floors = torch.empty(rows, device=values.device, dtype=torch.float32)
+    _penalize_probe_kernel[(rows,)](
+        values,
+        ids,
+        floors,
+        values.stride(0),
+        expanded_idx_mapping,
+        token_ids,
+        expanded_local_pos,
+        penalties_state.repetition_penalty.gpu,
+        penalties_state.frequency_penalty.gpu,
+        penalties_state.presence_penalty.gpu,
+        penalties_state.prompt_bin_mask,
+        penalties_state.prompt_bin_mask.stride(0),
+        penalties_state.output_bin_counts,
+        penalties_state.output_bin_counts.stride(0),
+        width,
+        triton.next_power_of_2(width),
+        num_warps=1,
+    )
+    return floors
+
+
+def _monotone_penalties(penalties_state: Any, idx: np.ndarray) -> bool:
+    """Whether every request's penalties can only lower logits."""
+    return bool(
+        np.all(penalties_state.repetition_penalty.np[idx] >= 1.0)
+        and np.all(penalties_state.frequency_penalty.np[idx] >= 0.0)
+        and np.all(penalties_state.presence_penalty.np[idx] >= 0.0)
+    )
+
+
+@triton.jit
 def _compact_target_reference_rows_kernel(
     probe,
     temperatures,
     top_ps,
     row_to_request,
     reference_rows,
+    floors,
     row_stride: tl.constexpr,
     width: tl.constexpr,
     top_k: tl.constexpr,
     block: tl.constexpr,
+    has_floor: tl.constexpr,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, block)
@@ -61,7 +168,11 @@ def _compact_target_reference_rows_kernel(
     values = tl.load(probe + row * row_stride + col, col < width, -float("inf"))
     first = tl.load(probe + row * row_stride) / temperature
     cutoff = tl.load(probe + row * row_stride + top_k - 1) / temperature
-    last = tl.load(probe + row * row_stride + width - 1) / temperature
+    if has_floor:
+        # Penalized probes: unprobed tokens may reach the pre-penalty floor.
+        last = tl.load(floors + row) / temperature
+    else:
+        last = tl.load(probe + row * row_stride + width - 1) / temperature
     logits = values / temperature
     keep = (col < width) & (logits >= cutoff)
     logits = tl.where(keep, logits, -float("inf"))
@@ -92,6 +203,7 @@ def _compact_target_reference_flags(
     temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
+    floors: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute graph-capturable fallback flags with the request-slot map."""
     rows, width = probe.shape
@@ -102,10 +214,12 @@ def _compact_target_reference_flags(
         top_ps,
         row_to_request,
         result,
+        probe if floors is None else floors,
         probe.stride(0),
         width,
         _TARGET_TOP_K,
         triton.next_power_of_2(width),
+        floors is not None,
         num_warps=1,
     )
     return result
@@ -116,10 +230,13 @@ def _compact_target_reference_rows_gpu(
     temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
+    floors: torch.Tensor | None = None,
 ) -> np.ndarray:
     """Copy only fallback decisions, preserving the request-slot parameter map."""
     return (
-        _compact_target_reference_flags(probe, temperatures, top_ps, row_to_request)
+        _compact_target_reference_flags(
+            probe, temperatures, top_ps, row_to_request, floors
+        )
         .cpu()
         .numpy()
     )
@@ -355,8 +472,15 @@ def _maybe_dump_selector_alignment(
 def _supports_sparse_sampling_contract(
     rejection_sampler: RejectionSampler,
     input_batch: InputBatch,
+    *,
+    allow_penalties: bool = False,
 ) -> bool:
-    """Whether compact logits preserve every requested sampling transform."""
+    """Whether compact logits preserve every requested sampling transform.
+
+    With allow_penalties, the caller penalizes its wide probe and guards the
+    cutoff with the pre-penalty floor, which needs that probe: at least two
+    logit rows over a large vocabulary.
+    """
     if rejection_sampler.rejection_sample_method != "standard":
         return False
     # Every request must be in the uniform decode verifier phase. The compact
@@ -379,7 +503,13 @@ def _supports_sparse_sampling_contract(
     if np.any(states.min_p.np[idx] != 0.0):
         return False
 
-    if np.any(sampler.penalties_state.use_penalty[idx]):
+    penalties = sampler.penalties_state
+    if np.any(penalties.use_penalty[idx]) and not (
+        allow_penalties
+        and int(input_batch.cu_num_logits_np[-1]) >= 2
+        and getattr(states, "vocab_size", 0) >= 32768
+        and _monotone_penalties(penalties, idx)
+    ):
         return False
     if np.any(sampler.logit_bias_state.use_logit_bias[idx]):
         return False
@@ -417,7 +547,9 @@ def try_dflash2_sparse_target_rejection(
         return None
     if not hasattr(model, "get_topk_tokens_and_logits"):
         return None
-    if not _supports_sparse_sampling_contract(rejection_sampler, input_batch):
+    if not _supports_sparse_sampling_contract(
+        rejection_sampler, input_batch, allow_penalties=True
+    ):
         return None
 
     sparse_draft_logits = speculator.get_sparse_draft_logits()
@@ -462,6 +594,18 @@ def try_dflash2_sparse_target_rejection(
         target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
             sample_hidden_states, probe_k
         )
+    floors = None
+    penalties = rejection_sampler.sampler.penalties_state
+    if np.any(penalties.use_penalty[idx]):
+        # The contract admits penalties only on this wide, tie-retaining probe.
+        floors = _penalize_probe(
+            target_topk_logits,
+            target_topk_ids,
+            penalties,
+            input_batch.expanded_idx_mapping,
+            input_batch.input_ids[input_batch.logits_indices],
+            input_batch.expanded_local_pos,
+        )
     if retain_ties:
         target_topk_logits, target_topk_ids = sort_topk_with_vocab_ties(
             target_topk_logits,
@@ -477,6 +621,7 @@ def try_dflash2_sparse_target_rejection(
             states.temperature.gpu,
             states.top_p.gpu,
             input_batch.expanded_idx_mapping,
+            floors,
         )
     else:
         num_logits = np.diff(input_batch.cu_num_logits_np)

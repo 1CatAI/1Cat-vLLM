@@ -180,7 +180,7 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
     monkeypatch.setattr(
-        sparse_rejection, "_supports_sparse_sampling_contract", lambda *args: True
+        sparse_rejection, "_supports_sparse_sampling_contract", lambda *a, **k: True
     )
     probe = torch.ones(3, 21)
     probe[:, :2] = 2.0
@@ -199,7 +199,12 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
     result = sparse_rejection.try_dflash2_sparse_target_rejection(
         SimpleNamespace(get_topk_tokens_and_logits=lambda *args: (None, probe)),
         Speculator(),
-        SimpleNamespace(sampler=SimpleNamespace(sampling_states=states)),
+        SimpleNamespace(
+            sampler=SimpleNamespace(
+                sampling_states=states,
+                penalties_state=SimpleNamespace(use_penalty=np.zeros(3, dtype=bool)),
+            )
+        ),
         SimpleNamespace(device=SimpleNamespace(type="cuda")),
         batch,
         None,

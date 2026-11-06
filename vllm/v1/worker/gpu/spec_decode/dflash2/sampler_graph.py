@@ -143,8 +143,10 @@ def _all_ranks_support(status: int) -> bool:
 
 
 class _RejectionGraph:
-    def __init__(self, model, speculator, rejection, hidden, batch, sparse):
+    def __init__(self, model, speculator, rejection, hidden, batch, sparse, penalties):
         self.requests = batch.num_reqs
+        # Penalties are a trace constant: graphs without them launch no kernel.
+        self.penalties = penalties
         rows = self.requests * ROWS_PER_REQUEST
         self.hidden = torch.empty_like(hidden)
         self.inputs = torch.empty_like(batch.input_ids[:rows])
@@ -226,7 +228,7 @@ class _RejectionGraph:
         self.speculator.draft_logits.record_stream(torch.cuda.current_stream())
 
     def _probe(self):
-        from .sparse_rejection import _compact_target_reference_flags
+        from .sparse_rejection import _compact_target_reference_flags, _penalize_probe
 
         probe = getattr(
             self.model,
@@ -236,12 +238,23 @@ class _RejectionGraph:
         self.ids, self.values, self.fallback = probe(self.hidden, 64)
         if self.fallback is None:
             return False
-        states = self.rejection.sampler.sampling_states
+        sampler = self.rejection.sampler
+        states = sampler.sampling_states
+        floors = None
+        if self.penalties:
+            floors = _penalize_probe(
+                self.values,
+                self.ids,
+                sampler.penalties_state,
+                self.expanded,
+                self.inputs,
+                self.local,
+            )
         self.values, self.ids = sort_topk_with_vocab_ties(
             self.values, self.ids, vocab_size=states.vocab_size, descending=True
         )
         self.flags = _compact_target_reference_flags(
-            self.values, states.temperature.gpu, states.top_p.gpu, self.expanded
+            self.values, states.temperature.gpu, states.top_p.gpu, self.expanded, floors
         )
         return True
 
@@ -393,6 +406,7 @@ def try_graph_rejection(
         return None
     states = rejection.sampler.sampling_states
     idx = batch.idx_mapping_np
+    penalties = bool(np.any(rejection.sampler.penalties_state.use_penalty[idx]))
     # CPU dispatch choices are trace constants; numeric parameters and request
     # slots remain live GPU inputs. Private input storage makes cache decisions
     # independent of the allocator and the target graph's output lifetime.
@@ -410,6 +424,7 @@ def try_graph_rejection(
         bool(np.any(states.temperature.np[idx] != 1.0)),
         bool(np.any(states.top_p.np[idx] != 1.0)),
         rejection.sampler.use_fp64_gumbel,
+        penalties,
         tuple((t.dtype, tuple(t.shape), tuple(t.stride())) for t in tensors),
     )
     graphs = getattr(rejection, "_sm70_dflash2_rejection_graphs", None)
@@ -422,7 +437,9 @@ def try_graph_rejection(
         if not _all_ranks_support(0 if _capture_headroom(hidden.device) else 801):
             graphs[key] = None
             return None
-        candidate = _RejectionGraph(model, speculator, rejection, hidden, batch, sparse)
+        candidate = _RejectionGraph(
+            model, speculator, rejection, hidden, batch, sparse, penalties
+        )
         graphs[key] = candidate if candidate.capture() else None
     graph = graphs[key]
     if graph is None:
