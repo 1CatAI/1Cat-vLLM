@@ -47,6 +47,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.pp_keep_batch import pp_keep_batch_decision
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -290,6 +291,13 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # VLLM_PP_KEEP_BATCH: keep the previous-step record across a fully
+        # empty pipeline step, so a running request's history is not resent.
+        # The runner takes the same decision (pp_keep_batch.py).
+        self.pp_keep_batch = pp_keep_batch_decision(vllm_config)
+        self._pp_keep_batch_kept_logged = False
+        if self.pp_keep_batch:
+            logger.info("VLLM_PP_KEEP_BATCH active: V1 synchronous PP retention")
         self.current_step = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
@@ -712,6 +720,17 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if (
+                num_new_tokens < 0
+                and self.use_pp
+                and not self.scheduler_config.async_scheduling
+            ):
+                # PP>1 without async scheduling: a verify step of this request
+                # is still in flight. Scheduling counted its draft rows as
+                # computed, but its sampled tokens are not appended yet, so the
+                # count goes negative. Same case as 1.(1) below: wait for it.
+                req_index += 1
+                continue
             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
                 request
             )
@@ -1322,8 +1341,11 @@ class Scheduler(SchedulerInterface):
             )
 
         # Record the request ids that were scheduled in this step.
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+        if self.pp_keep_batch and not num_scheduled_tokens:
+            self._keep_prev_step_record_on_empty_step()
+        else:
+            self.prev_step_scheduled_req_ids.clear()
+            self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         new_block_ids_to_zero = (
             (self.kv_cache_manager.take_new_block_ids() or None)
@@ -1511,6 +1533,27 @@ class Scheduler(SchedulerInterface):
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _keep_prev_step_record_on_empty_step(self) -> None:
+        """VLLM_PP_KEEP_BATCH: this step scheduled no request at all.
+
+        The runner keeps its persistent batch across such a step, so a request
+        that ran in the step before it is still held there and needs no
+        resend of its history. Keep the record for the requests that are still
+        running: a request preempted or finished meanwhile leaves the record,
+        so a resumed request is never treated as held.
+        """
+        if self.prev_step_scheduled_req_ids:
+            running_ids = {request.request_id for request in self.running}
+            kept = self.prev_step_scheduled_req_ids
+            kept.intersection_update(running_ids)
+            if kept and not self._pp_keep_batch_kept_logged:
+                self._pp_keep_batch_kept_logged = True
+                logger.info(
+                    "VLLM_PP_KEEP_BATCH: first empty pipeline step kept the "
+                    "previous-step record of %d running request(s).",
+                    len(kept),
+                )
 
     def _make_cached_request_data(
         self,

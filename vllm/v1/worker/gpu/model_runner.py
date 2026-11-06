@@ -1983,6 +1983,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.use_async_scheduling:
             return async_output
+        if self.use_pp and self.num_speculative_steps:
+            model_runner_output.set_draft_token_ids(self.take_draft_token_ids())
         return async_output.get_output()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
