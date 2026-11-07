@@ -30,9 +30,15 @@ FP4_DTYPE = torch.uint8
 
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
 
-FUSED_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.silu_and_mul_quant.default,  # noqa: E501
-}
+# silu_and_mul_quant is only registered when activation_kernels.cu is compiled
+# in (SM80+ builds); SM70-only builds compile the registrations out, so this
+# fusion is skipped entirely (mirror of the nvfp4 hasattr check below).
+silu_and_mul_quant_supported = current_platform.is_cuda() and hasattr(
+    torch.ops._C, "silu_and_mul_quant"
+)
+FUSED_OPS: dict[QuantKey, OpOverload] = {}
+if silu_and_mul_quant_supported:
+    FUSED_OPS[kFp8StaticTensorSym] = torch.ops._C.silu_and_mul_quant.default  # noqa: E501
 silu_and_mul_nvfp4_quant_supported = current_platform.is_cuda() and hasattr(
     torch.ops._C, "silu_and_mul_nvfp4_quant"
 )
