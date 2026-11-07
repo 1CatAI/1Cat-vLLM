@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configs derived for a drafter borrow the target's worker-local resources."""
 
+from types import SimpleNamespace
+
 from vllm.config import ModelConfig, VllmConfig, replace
 from vllm.runtime_resources import runtime_resources_for, share_runtime_resources
 
@@ -32,3 +34,32 @@ def test_derived_config_borrows_the_parent_resources():
     owners = runtime_resources_for(derived).setdefault("execution_context_owners", [])
     owners.append(object())
     assert runtime_resources_for(parent)["execution_context_owners"] is owners
+
+
+def test_v1_proposers_load_their_drafter_with_the_target_resources(monkeypatch):
+    # V1 subclasses (DFlash, draft model, Gemma4, Step3.5 MTP) derive the
+    # base draft config once more with replace(), so the sharing has to sit
+    # where the drafter is built.
+    from vllm.v1.spec_decode import draft_model, llm_base_proposer
+
+    parent = _config()
+    built = []
+
+    def get_model(*, vllm_config, **kwargs):
+        built.append(vllm_config)
+
+    monkeypatch.setattr(llm_base_proposer, "get_model", get_model)
+    monkeypatch.setattr(draft_model, "get_model", get_model)
+    proposer = SimpleNamespace(
+        vllm_config=parent,
+        speculative_config=SimpleNamespace(
+            draft_model_config=None, draft_load_config=None
+        ),
+        _create_draft_vllm_config=lambda: replace(parent, is_speculative_draft=True),
+    )
+    llm_base_proposer.SpecDecodeBaseProposer._get_model(proposer)
+    draft_model.DraftModelProposer._get_model(proposer)
+    assert len(built) == 2
+    for config in built:
+        assert config.is_speculative_draft
+        assert runtime_resources_for(config) is runtime_resources_for(parent)

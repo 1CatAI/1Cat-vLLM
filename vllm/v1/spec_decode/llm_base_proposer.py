@@ -2066,7 +2066,7 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
-        return share_runtime_resources(base, self.vllm_config)
+        return base
 
     def _get_model(self) -> nn.Module:
         """
@@ -2075,7 +2075,11 @@ class SpecDecodeBaseProposer:
         """
         from vllm.compilation.backends import set_model_tag
 
-        draft_vllm_config = self._create_draft_vllm_config()
+        # Subclasses derive the draft config further with replace(), which drops
+        # the worker-local resources; share them where the drafter is built.
+        draft_vllm_config = share_runtime_resources(
+            self._create_draft_vllm_config(), self.vllm_config
+        )
         with set_model_tag("eagle_head"):
             model = get_model(
                 vllm_config=draft_vllm_config,

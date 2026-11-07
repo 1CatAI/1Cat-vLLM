@@ -9,6 +9,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import replace
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.runtime_resources import share_runtime_resources
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
 logger = init_logger(__name__)
@@ -69,7 +70,9 @@ class DraftModelProposer(SpecDecodeBaseProposer):
     def _get_model(self) -> nn.Module:
         from vllm.compilation.backends import set_model_tag
 
-        draft_vllm_config = self._create_draft_vllm_config()
+        draft_vllm_config = share_runtime_resources(
+            self._create_draft_vllm_config(), self.vllm_config
+        )
         with set_model_tag("draft_model"):
             model = get_model(
                 vllm_config=draft_vllm_config,
