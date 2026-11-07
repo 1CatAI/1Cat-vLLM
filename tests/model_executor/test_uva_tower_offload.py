@@ -67,7 +67,8 @@ def test_tower_registration_uses_single_component_wrapper() -> None:
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda _modality: 1)
-        )
+        ),
+        use_v2_model_runner=False,
     )
 
     set_offloader(offloader)
