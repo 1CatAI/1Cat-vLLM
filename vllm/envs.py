@@ -475,6 +475,8 @@ if TYPE_CHECKING:
     VLLM_V41_ENGRAM_READERS: str | None = None
     VLLM_V41_EXACT_GEMM: str = "0"
     VLLM_V41_EXPERT_FAST_HIT: str = "1"
+    VLLM_V41_INDEX_TILED: bool = False
+    VLLM_V41_INDEX_TILED_LIB: str = ""
     VLLM_V41_FP8_GEMV: str = "1"
     VLLM_V41_FREE_SLOTS: str | None = None
     VLLM_V41_FUSED_SPARSE: str = "0"
@@ -7395,6 +7397,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
+    ),
+    "VLLM_V41_INDEX_TILED": env_var(
+        lambda: env_with_choices("VLLM_V41_INDEX_TILED", "0", ["0", "1", ""])() == "1",
+        description="Enable the exact SM70 packed V4.1 tiled decode index scorer.",
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DeepSeek V4.1 SM70",),
+        user_visible=True,
+    ),
+    "VLLM_V41_INDEX_TILED_LIB": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_TILED_LIB", ""),
+        description=(
+            "Library for the SM70 packed V4.1 tiled index scorer; empty "
+            "selects the repository build."
+        ),
+        category="experimental",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=("DeepSeek V4.1 SM70",),
+        user_visible=True,
     ),
     "VLLM_V41_FP8_GEMV": env_var(
         lambda: os.getenv("VLLM_V41_FP8_GEMV", "1"),
