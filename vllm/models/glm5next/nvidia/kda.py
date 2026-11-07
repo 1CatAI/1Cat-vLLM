@@ -621,13 +621,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         if core_output_dtype != hidden_states.dtype:
-            core_attn_out = self.o_norm(
+            # `custom_ops` defaults to "none" and the SM70 decode graph is not
+            # compiled, so the CustomOp dispatch would run the decomposed norm
+            # eagerly: eight kernels, about 25 us per layer in-graph. The Triton
+            # op computes the same values (bit-identical at the 1- and 4-token
+            # decode shapes) in about 4 us.
+            core_attn_out = self.o_norm.forward_cuda(
                 core_attn_out,
                 g2,
                 out_dtype=hidden_states.dtype,
             )
             logger.info_once(
-                "SM70 GLM KDA keeps recurrent output in FP32 through RMSNorm."
+                "SM70 GLM KDA keeps recurrent output in FP32 through the "
+                "Triton gated RMSNorm."
             )
         else:
             core_attn_out = self.o_norm(core_attn_out, g2)
