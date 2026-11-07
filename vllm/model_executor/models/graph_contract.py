@@ -33,9 +33,20 @@ class GraphModelContract:
         short = self.index_topk * min(self.compress_ratios)
         if short <= 0 or self.max_model_len <= short:
             return ()
-        buckets = tuple(
-            short * m for m in (1, 2, 8, 32, 64) if short * m < self.max_model_len
-        )
+        buckets = [m * short for m in (1, 2) if m * short < self.max_model_len]
+        # A decode round costs time with the width of its bucket, not with the
+        # context, so a context just above a bucket pays for the whole gap to
+        # the next one. From 8 * short on, the buckets are a step apart that
+        # starts at 8 * short and doubles each time the bucket passes four
+        # times the bucket where the step last changed.
+        bucket = step = 8 * short
+        widen_at = 4 * bucket
+        while bucket < self.max_model_len:
+            buckets.append(bucket)
+            if bucket >= widen_at:
+                step *= 2
+                widen_at *= 4
+            bucket += step
         # Above the largest bucket a decode graph would be bound by the model's
         # maximum length, which keeps the indexer off its cuBLAS decode route;
         # a last bucket at the maximum length keeps it on.
