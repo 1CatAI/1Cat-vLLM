@@ -689,13 +689,10 @@ def get_request_block_hasher(
             # Early stop when there no new full blocks created.
             return []
 
+        # Start at the first mm input also when continuing: a block completed
+        # with generated tokens can still hold several mm inputs. Passed inputs
+        # are skipped, and blocks after the last one return early.
         curr_mm_idx = 0
-        if start_token_idx > 0:
-            # Set curr_mm_idx = -1 to indicate the last mm input.
-            # Note that since we reach to this branch only when the block is
-            # completed with generated tokens, we only need to consider the
-            # last mm input.
-            curr_mm_idx = -1
 
         prev_block_hash_value = (
             request.block_hashes[-1] if request.block_hashes else None
