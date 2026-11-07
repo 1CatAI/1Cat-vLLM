@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import enum
 from dataclasses import dataclass
 
 import numpy as np
@@ -9,16 +10,30 @@ from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 
 
+class DummyPositions(enum.Enum):
+    """Positions that dummy (profile, warmup and capture) batches carry."""
+
+    # Upstream MRV2: all zeros.
+    ZEROS = "zeros"
+    # 0..n-1, one token chain, as the V1 runner's _dummy_run writes them
+    # (gpu_model_runner.py). DeepSeek-V4.1's Engram hash traps on any batch
+    # whose positions are not positions[0] + t (deepseek_v41_engram.py,
+    # _hash_request).
+    CHAIN = "chain"
+
+
 class InputBuffers:
     def __init__(
         self,
         max_num_reqs: int,
         max_num_tokens: int,
         device: torch.device,
+        dummy_positions: DummyPositions = DummyPositions.ZEROS,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_num_tokens = max_num_tokens
         self.device = device
+        self.dummy_positions = dummy_positions
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
@@ -99,6 +114,9 @@ class InputBatch:
     is_incomplete_prefilling_np: np.ndarray | None = None
     # Dummy profiling and graph-capture inputs must never write KV slots.
     is_dummy_batch: bool = False
+    # Context bound a context-bucket graph is captured at; the attention
+    # metadata is built for this length instead of the model's maximum.
+    capture_context_len: int | None = None
 
     @classmethod
     def make_dummy(
@@ -106,7 +124,13 @@ class InputBatch:
         num_reqs: int,
         num_tokens: int,
         input_buffers: InputBuffers,
+        context_len: int | None = None,
     ) -> "InputBatch":
+        """Dummy batch for profiling and graph capture.
+
+        ``context_len`` (a context-bucket graph's bound) gives every request
+        that sequence length; otherwise seq_len equals query_len.
+        """
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
 
@@ -139,13 +163,27 @@ class InputBatch:
         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
-        positions = input_buffers.positions[:num_tokens].zero_()
+        positions = input_buffers.positions[:num_tokens]
+        if input_buffers.dummy_positions is DummyPositions.CHAIN:
+            # In place: a captured graph reads this persistent buffer.
+            torch.arange(num_tokens, out=positions)
+        else:
+            positions.zero_()
 
         logits_indices = query_start_loc[1:] - 1
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
         # Dummy: seq_len == query_len (fresh-prefill shape).
         seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
+        num_computed_tokens_np = np.zeros(num_reqs, dtype=np.int32)
+        if context_len is not None:
+            assert context_len >= int(num_scheduled_tokens.max())
+            # query_start_loc above already holds the query offsets.
+            input_buffers.seq_lens[:num_reqs] = context_len
+            seq_lens_cpu_upper_bound = torch.full(
+                (num_reqs,), context_len, dtype=torch.int32
+            )
+            num_computed_tokens_np = context_len - num_scheduled_tokens
         return cls(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -164,7 +202,7 @@ class InputBatch:
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=None,
-            num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+            num_computed_tokens_np=num_computed_tokens_np,
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
@@ -176,6 +214,7 @@ class InputBatch:
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=False,
             is_dummy_batch=True,
+            capture_context_len=context_len,
         )
 
 

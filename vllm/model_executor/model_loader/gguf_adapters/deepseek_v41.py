@@ -219,6 +219,13 @@ class DeepseekV41Adapter:
         return result
 
     @staticmethod
+    def keep_on_stage(raw, first_stage, last_stage):
+        """Pipeline stages: the Engram hash tensors belong to the first stage
+        (``pp_split_problem``); layer tensors follow their PPMissingLayer."""
+        del last_stage
+        return first_stage or not raw.startswith("engram_")
+
+    @staticmethod
     def is_linear(name):
         return name == "lm_head.weight" or name.endswith(_PROJECTIONS)
 

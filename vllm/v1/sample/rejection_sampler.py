@@ -165,6 +165,31 @@ def _token_matching_sampling_enabled(
     )
 
 
+def _coupled_sampling_enabled(sampling_metadata: SamplingMetadata) -> bool:
+    """Keyed-draw verification covers temperature, top-k, top-p and min_p.
+
+    Seeded requests are fine (their key is the seed); anything that edits
+    logits per token or needs logprobs takes the regular path.
+    """
+    if sampling_metadata.max_num_logprobs is not None:
+        return False
+    if sampling_metadata.logprob_token_ids:
+        return False
+    if not sampling_metadata.no_penalties:
+        return False
+    if sampling_metadata.allowed_token_ids_mask is not None:
+        return False
+    if sampling_metadata.bad_words_token_ids:
+        return False
+    holder = sampling_metadata.thinking_budget_state_holder
+    if holder is not None and holder.has_tracked_requests():
+        return False
+    return all(
+        _combined_bonus_processor_safe(processor)
+        for processor in sampling_metadata.logitsprocs.all
+    )
+
+
 def _combined_bonus_sampling_enabled(
     sampling_metadata: SamplingMetadata,
     needs_output_logprobs: bool,
@@ -251,6 +276,13 @@ class RejectionSampler(nn.Module):
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
         self._last_target_candidate_ids: torch.Tensor | None = None
+        # V4.1 coupled drafts: per-request keys and per-logits-row output
+        # positions for the next forward(), set by the runner, consumed once.
+        self._coupled_rows: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def set_coupled_rows(self, keys: torch.Tensor, positions: torch.Tensor) -> None:
+        """keys: [num_reqs] int64 stream keys; positions: [num_rows] int64."""
+        self._coupled_rows = (keys, positions)
 
     def _capture_dynamic_draft_candidates(
         self,
@@ -304,6 +336,17 @@ class RejectionSampler(nn.Module):
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
         self._last_target_candidate_ids = None
+        coupled_rows, self._coupled_rows = self._coupled_rows, None
+        if (
+            coupled_rows is not None
+            and draft_probs is None
+            and not self.synthetic_mode
+            and not sampling_metadata.all_greedy
+            and _coupled_sampling_enabled(sampling_metadata)
+        ):
+            return self._sample_coupled(
+                metadata, logits, sampling_metadata, *coupled_rows
+            )
 
         if (
             draft_probs is None
@@ -532,6 +575,81 @@ class RejectionSampler(nn.Module):
         )
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
+            logprobs_tensors=None,
+        )
+
+    def _sample_coupled(
+        self,
+        metadata: SpecDecodeMetadata,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        keys: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> SamplerOutput:
+        """Keyed-draw verification: every row takes its keyed target sample;
+        the longest matching draft prefix is accepted (exact)."""
+        from vllm.v1.spec_decode import coupled_draw
+
+        num_rows = logits.shape[0]
+        processed = apply_sampling_constraints(
+            logits.to(torch.float32),
+            metadata.cu_num_sampled_tokens,
+            sampling_metadata,
+            runtime=self._topk_runtime,
+        )
+        assert sampling_metadata.temperature is not None
+        temperature = expand_batch_to_tokens(
+            sampling_metadata.temperature,
+            metadata.cu_num_sampled_tokens,
+            num_rows,
+        )
+        keys = expand_batch_to_tokens(keys, metadata.cu_num_sampled_tokens, num_rows)
+        sampled = coupled_draw.keyed_argmax(processed, temperature, keys, positions)
+        if coupled_draw.TRACE:
+            coupled_draw.trace_rows(processed, temperature, keys, positions, sampled)
+        return SamplerOutput(
+            sampled_token_ids=token_match_sample(metadata, sampled),
+            logprobs_tensors=None,
+        )
+
+    def sample_coupled_local(
+        self,
+        metadata: SpecDecodeMetadata,
+        local_logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        keys: torch.Tensor,
+        positions: torch.Tensor,
+        shard,
+    ) -> SamplerOutput:
+        """_sample_coupled on this rank's vocabulary shard (no all-gather).
+
+        Only for steps coupled_draw.local_fallback clears (plain temperature,
+        every row random): the processing is then the temperature division
+        alone, done as apply_sampling_constraints does it, so the shard holds
+        the gathered processed values bit for bit, and ``shard``
+        (coupled_draw.KeyedShard) picks keyed_argmax's tokens.
+        """
+        # forward() is skipped on this path; clear what it would have cleared.
+        self._last_target_candidate_ids = None
+        num_rows = local_logits.shape[0]
+        assert sampling_metadata.temperature is not None
+        cu = metadata.cu_num_sampled_tokens
+        divisor = expand_batch_to_tokens(
+            sampling_metadata.temperature,
+            cu,
+            num_rows,
+            replace_from=GREEDY_TEMPERATURE,
+            replace_to=1,
+        )
+        processed = local_logits.to(torch.float32)
+        processed.div_(divisor.unsqueeze(-1))
+        temperature = expand_batch_to_tokens(
+            sampling_metadata.temperature, cu, num_rows
+        )
+        keys = expand_batch_to_tokens(keys, cu, num_rows)
+        sampled = shard(processed, temperature, keys, positions)
+        return SamplerOutput(
+            sampled_token_ids=token_match_sample(metadata, sampled),
             logprobs_tensors=None,
         )
 

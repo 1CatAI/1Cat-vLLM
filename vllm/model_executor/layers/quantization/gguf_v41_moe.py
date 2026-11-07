@@ -9,8 +9,11 @@ import torch
 
 import vllm.envs as envs
 from vllm._sm70.policy import register_policy_op
+from vllm.logger import init_logger
 
 from .gguf_native import native_dense
+
+logger = init_logger(__name__)
 
 
 def v41_fp16_experts(
@@ -138,6 +141,14 @@ def _expert_major_ready():
             if os.path.exists(path):
                 torch.ops.load_library(path)
                 _EM["loaded"] = True  # type: ignore[assignment]
+            else:
+                # The fallback original-expert kernels are TP1-only; under TP
+                # they fail at graph capture ("Invalid original down storage").
+                logger.warning(
+                    "VLLM_V41_EM=1 but the v41k library is missing at %s; "
+                    "using the original (TP1-only) expert kernels",
+                    path,
+                )
     return _EM["loaded"]
 
 

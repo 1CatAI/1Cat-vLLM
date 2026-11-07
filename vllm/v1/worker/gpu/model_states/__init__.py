@@ -23,6 +23,14 @@ def init_model_state(
 
         return WhisperModelState(vllm_config, model, encoder_cache, device)
 
+    hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    if getattr(hf_text_config, "model_type", None) == "deepseek_v41_text":
+        from vllm.v1.worker.gpu.model_states.deepseek_v41 import (
+            DeepseekV41ModelState,
+        )
+
+        return DeepseekV41ModelState(vllm_config, model, encoder_cache, device)
+
     if vllm_config.model_config.is_hybrid:
         from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 

@@ -26,6 +26,7 @@ def graph_pair():
     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, 8, 1, 8)
     bounded = replace(ordinary, attention_context_bucket=BUILTIN_MAX_CONTEXT)
     manager._qsa_short_graphs = {}
+    manager._compressed_context_graphs = {}
     manager._long_attention_graphs = {ordinary: bounded}
     manager.graphs = {ordinary: object(), bounded: object()}
     return manager, ordinary, bounded
@@ -51,6 +52,7 @@ def test_request_major_q8_context_boundary(num_reqs):
     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_reqs * 8, num_reqs, 8)
     bounded = replace(ordinary, attention_context_bucket=BUILTIN_MAX_CONTEXT)
     manager._qsa_short_graphs = {}
+    manager._compressed_context_graphs = {}
     manager._long_attention_graphs = {ordinary: bounded}
     manager.graphs = {ordinary: object(), bounded: object()}
 
@@ -89,6 +91,7 @@ def test_scalar_graph_retains_short_and_oversized_fallback():
     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1, 1)
     bounded = replace(ordinary, attention_context_bucket=262144)
     manager._qsa_short_graphs = {}
+    manager._compressed_context_graphs = {}
     manager._long_attention_graphs = {ordinary: bounded}
     manager.graphs = {ordinary: object(), bounded: object()}
     for upper in (1, 1024, 131071, 262145):

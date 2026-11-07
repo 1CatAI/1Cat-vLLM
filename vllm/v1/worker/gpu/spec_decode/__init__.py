@@ -46,6 +46,18 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
         return DFlashSpeculator(vllm_config, device)
+    if speculative_config.method == "dspark":
+        draft_config = speculative_config.draft_model_config
+        draft_text_config = getattr(draft_config, "hf_text_config", None)
+        if getattr(draft_text_config, "model_type", None) == "deepseek_v41_text":
+            from vllm.v1.worker.gpu.spec_decode.dspark.v41 import (
+                V41DSparkSpeculator,
+            )
+
+            return V41DSparkSpeculator(vllm_config, device)
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+        return DSparkSpeculator(vllm_config, device)
     if speculative_config.use_eagle():
         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 

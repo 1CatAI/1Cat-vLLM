@@ -623,9 +623,57 @@ class ModelCudaGraphManager(CudaGraphManager):
                 scope="process",
             )
 
+        # Compressed-index (DeepSeek-V4) decode graphs captured at each context
+        # bucket, as the V1 dispatcher does: the indexer and sparse attention
+        # are bounded by the bucket instead of the model's maximum length.
+        self._compressed_context_graphs: dict[
+            BatchExecutionDescriptor, tuple[BatchExecutionDescriptor, ...]
+        ] = {}
+        from vllm.platforms.sm70.graph_policy import resolve_graph_plan
+
+        compressed_buckets = resolve_graph_plan(vllm_config).compressed_buckets
+        if compressed_buckets:
+            descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+            for desc in list(descs):
+                # One request with one decode (or verification) block.
+                if (
+                    desc.attention_context_bucket is None
+                    and desc.num_reqs == 1
+                    and desc.num_tokens == self.decode_query_len
+                ):
+                    variants = tuple(
+                        replace(desc, attention_context_bucket=bucket)
+                        for bucket in compressed_buckets
+                    )
+                    self._compressed_context_graphs[desc] = variants
+                    descs.extend(variants)
+            logger.info_once(
+                "Compressed-index decode graph variants captured at context "
+                "buckets %s for %d decode shapes.",
+                compressed_buckets,
+                len(self._compressed_context_graphs),
+                scope="process",
+            )
+        self._compressed_bucket_descs = {
+            variant
+            for variants in self._compressed_context_graphs.values()
+            for variant in variants
+        }
+
     def select_attention_graph(
         self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
     ) -> BatchExecutionDescriptor:
+        variants = self._compressed_context_graphs.get(desc)
+        if variants:
+            # The smallest captured bucket that covers the live context.
+            if cpu_upper_bounds.device.type == "cpu" and cpu_upper_bounds.numel():
+                upper = int(cpu_upper_bounds.max())
+                for bucket_desc in variants:
+                    bucket = bucket_desc.attention_context_bucket
+                    assert bucket is not None
+                    if 0 < upper <= bucket and bucket_desc in self.graphs:
+                        return bucket_desc
+            return desc
         short = self._qsa_short_graphs.get(desc)
         if (
             short is not None
@@ -724,6 +772,11 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
+                context_len=(
+                    desc.attention_context_bucket
+                    if desc in self._compressed_bucket_descs
+                    else None
+                ),
             )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
@@ -813,8 +866,11 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     skip_attn: bool = False,
+    context_len: int | None = None,
 ) -> CapturedAttentionState:
-    input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+    input_batch = InputBatch.make_dummy(
+        num_reqs, num_tokens, input_buffers, context_len=context_len
+    )
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(
