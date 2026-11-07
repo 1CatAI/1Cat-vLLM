@@ -712,6 +712,30 @@ def _score_tile(turing: bool, num_heads: int) -> _ScoreTile:
     return _ScoreTile(4, 32, 1024, True, 4, 2)
 
 
+def _decode_score_tile(turing: bool, num_heads: int, num_keys: int) -> _ScoreTile:
+    """Tile of `_prefill_index_scores_kernel` for one request's verifier rows.
+
+    The prefill tile spans 1024 or 2048 keys per program, so a decode over a
+    context bucket's keys starts too few programs, and Volta's four tokens per
+    program leave a quarter of the MMA rows empty for six verifier rows.
+    Swept in CUDA graphs for 6 rows and 64 heads over 1k to 125k keys (the C4
+    keys of the decode context buckets): Turing keeps its tile with 256 keys
+    per program up to 16k keys and 512 above (bit-identical scores), Volta
+    takes two tokens per program. Other head counts keep the prefill tile.
+    """
+    if num_heads != 64:
+        return _score_tile(turing, num_heads)
+    if turing:
+        return _ScoreTile(2, 64, 256 if num_keys <= 16384 else 512, False, 4, 1)
+    if num_keys <= 16384:
+        return _ScoreTile(2, 128, 256, True, 8, 2)
+    return _ScoreTile(2, 64, 256, True, 4, 1)
+
+
+def _on_turing(tensor: torch.Tensor) -> bool:
+    return current_platform.is_device_capability((7, 5), device_id=tensor.device.index)
+
+
 # Without tensor-core Triton (only `indexer_prefill_cublas=False`) the operands
 # take the FMA layout through shared memory; this tile fits both cards.
 _FMA_SCORE_TILE = _ScoreTile(2, 64, 1024, False, 4, 1)
@@ -722,14 +746,12 @@ def _prefill_scores_triton(
     k_quant,
     k_scales,
     weights,
-    tensor_cores: bool,
+    tile: _ScoreTile,
     out: torch.Tensor | None = None,
 ):
     num_q, num_heads, head_dim = q.shape
     num_k = k_quant.shape[0]
     assert q.stride(2) == 1 and weights.stride(1) == 1
-    turing = current_platform.is_device_capability((7, 5), device_id=q.device.index)
-    tile = _score_tile(turing, num_heads) if tensor_cores else _FMA_SCORE_TILE
     # One MMA needs 16 (token, head) rows; small head counts take more tokens.
     block_t = max(tile.block_t, 16 // num_heads)
     if out is None:
@@ -769,9 +791,7 @@ def _turing_fused_prefill_scores(q: torch.Tensor) -> bool:
     kernel, so the [tokens * heads, keys] score tile of the cuBLAS route never
     reaches memory. Its warps hold 32 heads each.
     """
-    return q.shape[1] in (32, 64) and current_platform.is_device_capability(
-        (7, 5), device_id=q.device.index
-    )
+    return q.shape[1] in (32, 64) and _on_turing(q)
 
 
 def sm70_indexer_prefill_logits(
@@ -825,9 +845,12 @@ def sm70_indexer_prefill_logits(
             triton_tensor_cores,
             scope="process",
         )
-        return _prefill_scores_triton(
-            q, k_quant, k_scales, weights, tensor_cores=triton_tensor_cores
+        tile = (
+            _score_tile(_on_turing(q), q.shape[1])
+            if triton_tensor_cores
+            else _FMA_SCORE_TILE
         )
+        return _prefill_scores_triton(q, k_quant, k_scales, weights, tile)
 
     weighted_q = _combine_index_queries(q, weights)
     k_fp16 = torch.empty(k_quant.shape, dtype=torch.float16, device=k_quant.device)
@@ -957,6 +980,7 @@ def _decode_logits_fused(
         ((max_seq_len,), torch.float32),
     )
     out = torch.empty((total_rows, max_seq_len), dtype=torch.float32, device=q.device)
+    tile = _decode_score_tile(_on_turing(q), q.shape[1], max_seq_len)
     for request in range(num_requests):
         first = request * rows
         _gather_request_index_k(
@@ -973,7 +997,7 @@ def _decode_logits_fused(
             gathered_k,
             k_scales,
             weights[first : first + rows],
-            tensor_cores=True,
+            tile,
             out=out[first : first + rows],
         )
     return out

@@ -422,15 +422,18 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
 @pytest.mark.parametrize(
     "fused", [False, pytest.param(True, marks=requires_tensor_core_triton)]
 )
+# The second shape crosses the 16k-key switch of the decode score tile
+# (_decode_score_tile) on Volta and Turing.
+@pytest.mark.parametrize(
+    "live_seq_len,graph_width", [(1017, 2048), (16437, 20480)], ids=["2k", "20k"]
+)
 @requires_sm70
 def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
-    monkeypatch, padded_blocks, layout, num_rows, fused
+    monkeypatch, padded_blocks, layout, num_rows, fused, live_seq_len, graph_width
 ):
     torch.manual_seed(20260824)
     generator = torch.Generator().manual_seed(20260824)
     num_heads = 64
-    live_seq_len = 1017
-    graph_width = 2048
     blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
 
     bits, _ = _random_fp8_keys(blocks * _BLOCK_SIZE, generator)
