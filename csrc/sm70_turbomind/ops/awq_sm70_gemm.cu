@@ -964,8 +964,8 @@ void validate_fp8_inputs(const torch::Tensor& qweight,
               "fp8_sm70_prepare: scales must be float32.");
   TORCH_CHECK(qweight.dim() == 2, "fp8_sm70_prepare: qweight must be 2D.");
   TORCH_CHECK(scales.dim() == 2, "fp8_sm70_prepare: scales must be 2D.");
-  TORCH_CHECK(group_size == 128,
-              "fp8_sm70_prepare: only group_size=128 is supported.");
+  TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+              "fp8_sm70_prepare: only group_size=32, 64 or 128 is supported.");
 }
 
 void validate_f16_weight(const torch::Tensor& weight, const char* op_name) {
@@ -4268,8 +4268,8 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
               "fp8_gemm_sm70: scales must be float16.");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16,
               "fp8_gemm_sm70: output must be float16.");
-  TORCH_CHECK(group_size == 128,
-              "fp8_gemm_sm70: only group_size=128 is supported.");
+  TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+              "fp8_gemm_sm70: only group_size=32, 64 or 128 is supported.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_feats));
   const int device = in_feats.get_device();
