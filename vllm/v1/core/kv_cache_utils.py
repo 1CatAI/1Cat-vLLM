@@ -1803,7 +1803,8 @@ def _glm5_next_tensor_layout(
         tail_names = list(tail_group.layer_names)
         # The tail spec is padded to idx_page (co-owns the indexer tensor), so
         # page_size_bytes returns idx_page. Callers need the *logical* tail page
-        # (2048 B) for transfer sizing and accounting; use unpadded.
+        # (ring * 2 * head_dim elements) for transfer sizing and accounting;
+        # use unpadded.
         tail_pages = {
             cast(KpoolTailSpec, s).real_page_size_bytes
             for s in cast(
