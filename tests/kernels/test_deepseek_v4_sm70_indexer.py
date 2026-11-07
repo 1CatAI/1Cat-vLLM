@@ -445,19 +445,25 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
 # block-table row and one length per token. two_requests: the same, twice.
 @pytest.mark.parametrize("layout", ["native", "flattened", "two_requests"])
 @pytest.mark.parametrize("num_rows", [3, 8, 13])
-@pytest.mark.parametrize("graph_width", [2048, 8192])
 # fused: the tensor-core scorer on FP8 keys replaces the cuBLAS GEMM and epilogue.
 @pytest.mark.parametrize(
     "fused", [False, pytest.param(True, marks=requires_tensor_core_triton)]
 )
+# The 20k shape crosses the 16k-key switch of the decode score tile
+# (_decode_score_tile) on Volta and Turing; live_seq_len is graph_width // 2 - 7
+# for the 2k and 8k shapes.
+@pytest.mark.parametrize(
+    "live_seq_len,graph_width",
+    [(1017, 2048), (4089, 8192), (16437, 20480)],
+    ids=["2k", "8k", "20k"],
+)
 @requires_sm70
 def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
-    monkeypatch, padded_blocks, layout, num_rows, graph_width, fused
+    monkeypatch, padded_blocks, layout, num_rows, fused, live_seq_len, graph_width
 ):
     torch.manual_seed(20260824)
     generator = torch.Generator().manual_seed(20260824)
     num_heads = 64
-    live_seq_len = graph_width // 2 - 7
     blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
 
     bits, _ = _random_fp8_keys(blocks * _BLOCK_SIZE, generator)
