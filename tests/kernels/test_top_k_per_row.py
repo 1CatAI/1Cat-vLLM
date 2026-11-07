@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+
 import numpy as np
 import pytest
 import torch
 
+from vllm.model_executor.layers.sparse_attn_indexer import RADIX_TOPK_WORKSPACE_SIZE
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -843,6 +846,194 @@ def test_persistent_topk_padded_stride(top_k: int) -> None:
                 f"Row {i}: persistent_topk with padded stride doesn't match. "
                 f"seq_len={sl}, stride={padded_stride}"
             )
+
+
+def _run_persistent_topk(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    indices: torch.Tensor,
+    top_k: int,
+    max_seq_len: int,
+) -> None:
+    workspace = torch.empty(
+        RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device=logits.device
+    )
+    torch.ops._C.persistent_topk(
+        logits, lengths, indices, workspace, top_k, max_seq_len
+    )
+
+
+# Rows longer than RADIX_THRESHOLD (32768) take the multi-CTA radix path; for the
+# C4 and kpool indexers that is a context above about 131k tokens. Most lengths
+# are not multiples of 4, so the last CTA of a group loads a ragged chunk tail.
+RADIX_ROW_LENGTHS = [
+    32769,
+    32770,
+    32771,
+    65541,
+    98307,
+    125001,
+    131071,
+    131073,
+    131074,
+    131075,
+    163843,
+]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize("num_rows", [1, 8, 32])
+@pytest.mark.parametrize("distribution", ["randn", "ties", "all_equal"])
+@pytest.mark.parametrize("vec_size", [4, 2, 1])
+@torch.inference_mode()
+def test_persistent_topk_radix_rows_match_reference(
+    top_k: int, num_rows: int, distribution: str, vec_size: int
+) -> None:
+    """Every radix row is an exact top-k of its own length, ties included.
+
+    With 8 and 32 rows there are fewer CTA groups than rows on V100 and
+    RTX 8000, so a CTA loads its next row right after the tie scan of the
+    previous one. The CTA barriers in radix_topk guard races that depend on
+    warp scheduling, so the kernel runs several times on the same data.
+    """
+    set_random_seed(0)
+    num_launches = 8
+    row_lengths = [
+        RADIX_ROW_LENGTHS[row % len(RADIX_ROW_LENGTHS)] for row in range(num_rows)
+    ]
+    max_len = max(row_lengths)
+    # topk.cu picks the vector width of the chunk loads from the row stride.
+    row_width = max_len + 1
+    while math.gcd(row_width, 4) != vec_size:
+        row_width += 1
+
+    if distribution == "randn":
+        logits = torch.randn(num_rows, row_width, device="cuda")
+    elif distribution == "ties":
+        # 256 exact values: hundreds of entries share the pivot value.
+        logits = torch.randint(0, 256, (num_rows, row_width), device="cuda") / 16.0
+    else:
+        logits = torch.ones(num_rows, row_width, device="cuda")
+    lengths = torch.tensor(row_lengths, dtype=torch.int32, device="cuda")
+    columns = torch.arange(row_width, device="cuda")
+    past_row = columns.unsqueeze(0) >= lengths.unsqueeze(1)
+    # Scores past a row's length beat every real score, so selecting one
+    # fails the value check below.
+    logits.masked_fill_(past_row, 1e4)
+    expected = logits.masked_fill(past_row, float("-inf")).topk(top_k, dim=1).values
+
+    # One spare row behind the output catches writes past the last row's top_k.
+    sentinel = -2
+    output = torch.empty((num_rows + 1) * top_k, dtype=torch.int32, device="cuda")
+    indices = output[: num_rows * top_k].view(num_rows, top_k)
+    for launch in range(num_launches):
+        output.fill_(sentinel)
+        _run_persistent_topk(logits, lengths, indices, top_k, max_len)
+
+        assert (output[num_rows * top_k :] == sentinel).all(), (
+            f"launch {launch}: wrote past the last row"
+        )
+        in_row = ((indices >= 0) & (indices < lengths.unsqueeze(1))).all(dim=1)
+        assert in_row.all(), (
+            f"launch {launch}: rows {(~in_row).nonzero().flatten().tolist()} "
+            "hold indices outside [0, length)"
+        )
+        sorted_indices = indices.sort(dim=1).values
+        unique = (sorted_indices[:, 1:] > sorted_indices[:, :-1]).all(dim=1)
+        assert unique.all(), (
+            f"launch {launch}: rows {(~unique).nonzero().flatten().tolist()} "
+            "hold duplicate indices"
+        )
+        selected = logits.gather(1, indices.long()).sort(dim=1, descending=True)
+        exact = (selected.values == expected).all(dim=1)
+        assert exact.all(), (
+            f"launch {launch}: rows {(~exact).nonzero().flatten().tolist()} "
+            "differ from torch.topk"
+        )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_persistent_topk_reused_group_after_short_row() -> None:
+    """A short row must not advance a group's radix histogram ring."""
+    set_random_seed(0)
+
+    top_k = 2048
+    long_seq_len = 32769
+    radix = 256
+    fixed_smem = ((radix + radix + 5) * 4 + 15) & ~15
+    # topk.cu sizes the grid from the current device's properties.
+    props = torch.cuda.get_device_properties(torch.accelerator.current_device_index())
+    max_smem = props.shared_memory_per_block_optin
+    if max_smem <= props.shared_memory_per_multiprocessor // 2:
+        pytest.skip("Cannot force one persistent_topk CTA per SM")
+
+    max_chunk = ((max_smem - fixed_smem) // 4 // 4) * 4
+    ctas_per_group = max(
+        (props.multi_processor_count - 1 + 9) // 10,
+        (long_seq_len + max_chunk - 1) // max_chunk,
+    )
+    if ctas_per_group >= props.multi_processor_count:
+        pytest.skip("Not enough SMs to construct a reused CTA group")
+
+    stride = ctas_per_group * max_chunk
+    num_groups = max(1, (props.multi_processor_count - 1) // ctas_per_group)
+    num_rows = 3 * num_groups
+    lengths = torch.full((num_rows,), top_k, dtype=torch.int32, device="cuda")
+    target_row = 2 * num_groups
+    lengths[0] = long_seq_len
+    lengths[num_groups] = long_seq_len - 1
+    lengths[target_row] = long_seq_len
+
+    logits = torch.randn(num_rows, stride, dtype=torch.float32, device="cuda")
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    _run_persistent_topk(logits, lengths, indices, top_k, stride)
+    torch.accelerator.synchronize()
+
+    expected = logits[target_row, :long_seq_len].topk(top_k).indices
+    assert set(indices[target_row].cpu().tolist()) == set(expected.cpu().tolist())
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("extra", [1, 2, 3, 4])
+@pytest.mark.parametrize("num_finite", [0, 100])
+@pytest.mark.parametrize("fill", [float("-inf"), -1e30])
+@torch.inference_mode()
+def test_persistent_topk_masked_row_tail(
+    top_k: int, extra: int, num_finite: int, fill: float
+) -> None:
+    """Rows with fewer than k scores above the -inf bin put the 2048-bin
+    threshold in the -inf bin. The float4 tail lanes past a row whose length
+    is not a multiple of 4 must not be selected."""
+    set_random_seed(0)
+    num_rows = 4
+    seq_len = top_k + extra
+    stride = seq_len + 8
+    # Finite padding past each row; it must never be read or selected.
+    logits = torch.zeros(num_rows, stride, dtype=torch.float32, device="cuda")
+    logits[:, :seq_len] = fill
+    finite_cols = torch.stack(
+        [torch.randperm(seq_len, device="cuda")[:num_finite] for _ in range(num_rows)]
+    )
+    if num_finite:
+        logits.scatter_(
+            1, finite_cols, torch.randn(num_rows, num_finite, device="cuda")
+        )
+    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
+    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device="cuda")
+    _run_persistent_topk(logits, lengths, indices, top_k, stride)
+    torch.accelerator.synchronize()
+
+    for row in range(num_rows):
+        selected = indices[row].cpu().tolist()
+        assert all(0 <= i < seq_len for i in selected), (
+            f"row {row}: indices outside [0, {seq_len}): "
+            f"{sorted(i for i in selected if not 0 <= i < seq_len)}"
+        )
+        assert len(set(selected)) == top_k
+        assert set(finite_cols[row].cpu().tolist()) <= set(selected)
 
 
 def _qsa_lexicographic_topk_reference(
