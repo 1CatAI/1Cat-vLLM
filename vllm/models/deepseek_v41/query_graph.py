@@ -134,6 +134,71 @@ class V41GreedyDraftGraph:
         return self.output
 
 
+class V41CoupledDraftGraph:
+    """The coupled (keyed) twin of V41GreedyDraftGraph for one request.
+
+    Captures the shared head and the five keyed Markov shard steps. The
+    hidden rows, anchor, temperature, stream key and draft positions are
+    copied into owned graph inputs every round, so the graph never holds an
+    address of a per-round temporary.
+    """
+
+    def __init__(self, forward):
+        self.forward = forward
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.inputs: tuple[torch.Tensor, ...] | None = None
+        self.output: torch.Tensor | None = None
+        self.captures = self.replays = 0
+
+    def __call__(self, hidden, anchor, temperature, keys, positions):
+        if (
+            hidden.ndim != 2
+            or hidden.shape[0] != 5
+            or not hidden.is_cuda
+            or anchor.shape != (1,)
+            or anchor.dtype not in (torch.int32, torch.int64)
+            or temperature.shape != (1,)
+            or temperature.dtype != torch.float32
+            or keys.shape != (1,)
+            or keys.dtype != torch.int64
+            or positions.shape != (5,)
+            or positions.dtype != torch.int64
+            or any(
+                t.device != hidden.device
+                for t in (anchor, temperature, keys, positions)
+            )
+        ):
+            raise ValueError(
+                "V4.1 coupled draft graph requires M5, one anchor, temperature "
+                "and key, and five int64 positions"
+            )
+        args = (hidden, anchor, temperature, keys, positions)
+        if self.graph is None:
+            self.inputs = tuple(t.clone() for t in args)
+            self.forward(*self.inputs)
+            torch.accelerator.synchronize(hidden.device)
+            self.graph = torch.cuda.CUDAGraph()
+            with (
+                graph_capture(device=hidden.device) as context,
+                torch.cuda.graph(
+                    self.graph,
+                    pool=current_platform.get_global_graph_pool(),
+                    stream=context.stream,
+                ),
+            ):
+                self.output = self.forward(*self.inputs)
+            self.captures += 1
+        else:
+            assert self.inputs is not None
+            for owned, new in zip(self.inputs, args):
+                if _storage(new)[1:] != _storage(owned)[1:]:
+                    raise ValueError("V4.1 coupled graph input geometry changed")
+                owned.copy_(new)
+        self.graph.replay()
+        self.replays += 1
+        return self.output
+
+
 class V41ContextGraphs:
     """Bounded M1..6 context-insertion graphs with fresh owned inputs."""
 

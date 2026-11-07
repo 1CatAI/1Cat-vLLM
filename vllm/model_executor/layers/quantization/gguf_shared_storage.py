@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Loader and lifetime owner for one local TP4 original GGUF cold pool."""
+"""Loader and lifetime owner for one local TP4 original GGUF cold pool.
+
+Under pipeline parallelism every stage owns one such pool for its own layers,
+over its own TP4 group and GPUs (stage 2 of PP2 runs TP ranks 0-3 on cuda:4-7).
+"""
 
 import atexit
 import json
@@ -23,6 +27,8 @@ from .gguf_shared_copy import swap_original_experts
 from .gguf_shared_layout import SharedExpertBudget
 from .gguf_shared_runtime import (
     SHARDS,
+    ResidentExpertOwner,
+    ResidentExpertRank,
     SharedExpertLayerSpec,
     SharedExpertOwner,
     SharedExpertRank,
@@ -99,6 +105,61 @@ def _join_shared_group(specs, group, owner_factory=None):
         raise
 
 
+def _pipeline_size():
+    from vllm.distributed import parallel_state
+
+    if not parallel_state.model_parallel_is_initialized():
+        return 1
+    return parallel_state.get_pp_group().world_size
+
+
+def stage_device_problem(tp_world, tp_device, device, current, world, pp_size):
+    """Why this process cannot own a stage-local shared pool (None when it can).
+
+    The pool belongs to one TP4 group per pipeline stage. The device is this
+    process's own GPU: the group's device and the current device, never the TP
+    rank (PP2 stage 2 runs TP ranks 0-3 on cuda:4-7). ``world`` is None when no
+    global process group exists (single-process tests).
+    """
+    if tp_world != 4:
+        return "the tensor-parallel group must have four ranks"
+    if device.type != "cuda" or device.index is None:
+        return "the pool needs an indexed CUDA device"
+    if tp_device is not None and device != tp_device:
+        return f"{device} is not the TP group's device {tp_device}"
+    if device.index != current:
+        return f"{device} is not the current device cuda:{current}"
+    if world is not None and world != 4 * pp_size:
+        return f"world size {world} is not 4 x {pp_size} pipeline stages"
+    return None
+
+
+def stage_truncation_problem(pp_size, all_resident, swap_free, trunc_cutoff):
+    """Why verify truncation would be unsafe here (None when it is safe).
+
+    The native planner truncates a verify block when a cold expert finds no
+    free host allocation (free-slot exchange, ``VLLM_V41_SWAP_FREE=1``) or sits
+    past a static cutoff (``VLLM_V41_TRUNC_CUTOFF``). The limit lives in this
+    process only: the last stage's sampler reads ``current_trunc`` of its own
+    ranks, so a position an earlier stage truncated could still be accepted.
+    Under pipeline parallelism a nonzero cold set therefore needs a planner
+    that never truncates. A cold set of zero has no misses and no planner.
+    """
+    if pp_size <= 1 or all_resident:
+        return None
+    if (swap_free or "")[:1] == "1":
+        return (
+            "set VLLM_V41_SWAP_FREE=0: free-slot verify truncation does not "
+            "cross pipeline stages"
+        )
+    if int(trunc_cutoff or "0") != 0:
+        return (
+            "set VLLM_V41_TRUNC_CUTOFF=0: cutoff truncation does not cross "
+            "pipeline stages"
+        )
+    return None
+
+
 class SharedOriginalExpertCache:
     """One canonical cold allocation, raw GPU TP carriers and one workspace.
 
@@ -120,13 +181,16 @@ class SharedOriginalExpertCache:
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.accelerator.current_device_index())
-        if (
-            group.world_size != 4
-            or self.device.type != "cuda"
-            or self.device.index != self.rank
-            or (dist.is_initialized() and dist.get_world_size() != 4)
-        ):
-            raise ValueError("shared_original currently requires local GPU 0-3, TP4")
+        problem = stage_device_problem(
+            group.world_size,
+            getattr(group, "device", None),
+            self.device,
+            torch.accelerator.current_device_index(),
+            dist.get_world_size() if dist.is_initialized() else None,
+            _pipeline_size(),
+        )
+        if problem is not None:
+            raise ValueError(f"shared_original requires a local TP4 stage: {problem}")
         config.validate_shared_expert_storage()
         self.layers = [index for index, *_ in layers]
         if len(set(self.layers)) != len(layers):
@@ -166,6 +230,14 @@ class SharedOriginalExpertCache:
             tuple(s.expert_bytes for s in specs),
             config.expert_cache_spare_slots,
         )
+        problem = stage_truncation_problem(
+            _pipeline_size(),
+            self.budget.all_resident,
+            envs.VLLM_V41_SWAP_FREE,
+            envs.VLLM_V41_TRUNC_CUTOFF,
+        )
+        if problem is not None:
+            raise ValueError(f"shared_original with pipeline stages: {problem}")
         # Each projection bank has one upstream-reader tail, independently
         # of the number of slots. Keep a single aligned allocation for all.
         allocations, total = [], 0
@@ -202,10 +274,33 @@ class SharedOriginalExpertCache:
                     geometry.device_row_bytes,
                 )
                 self.arena[offset + size : offset + size + geometry.guard_bytes].zero_()
-            self.owner, self.data, self.control = _join_shared_group(specs, group)
-            self.runtime = SharedExpertRank(
-                self.data, self.control, self.rank, self.specs, self.banks
-            )
+            if self.budget.all_resident:
+                # Cold set of zero: no coordinator, no decode plan (slot = id).
+                self.owner, self.data, self.control = _join_shared_group(
+                    specs,
+                    group,
+                    lambda: ResidentExpertOwner(
+                        tuple(specs), self.budget.exchange_bytes
+                    ),
+                )
+                self.runtime = ResidentExpertRank(
+                    self.data,
+                    self.control,
+                    self.rank,
+                    self.specs,
+                    self.banks,
+                    self.device,
+                )
+            else:
+                self.owner, self.data, self.control = _join_shared_group(specs, group)
+                self.runtime = SharedExpertRank(
+                    self.data,
+                    self.control,
+                    self.rank,
+                    self.specs,
+                    self.banks,
+                    self.device,
+                )
             self.exchange_offset = self.budget.cold_bytes
             self._load_slots = torch.arange(8, dtype=torch.int32, device=device)
             self._load_offsets = torch.empty(8, dtype=torch.int64, device=device)

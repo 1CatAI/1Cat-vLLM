@@ -11,10 +11,12 @@ from torch import nn
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.deepseek_v41 import collapse_hc
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, ReplicatedLinear
@@ -22,17 +24,36 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import Mxfp4SM70MoEMethod
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.shared_weights import bind_shared
+from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 
 from .attention_ops import attend_draft_latents, insert_context_slots
 from .contract import validate_runtime_geometry
 from .fp8_linear import V41Fp8LinearMethod
 from .markov_fused import MarkovGreedy, markov_bias
+from .markov_shard import MarkovShardGreedy
 from .model import V41Attention, V41Block, V41MoE, V41Norm, _SharedAttention
 from .quant_rope import apply_rope, attention_qdq, rope_table
-from .query_graph import V41ContextGraphs, V41GreedyDraftGraph, V41QueryGraph
+from .query_graph import (
+    V41ContextGraphs,
+    V41CoupledDraftGraph,
+    V41GreedyDraftGraph,
+    V41QueryGraph,
+)
 
 _MARKOV_FUSED = __import__("os").environ.get("VLLM_V41_MARKOV_FUSED", "1") == "1"
+# Greedy B=1 drafts from vocabulary shards (markov_shard.py); see
+# DSparkDeepseekV41ForCausalLM.prepare_markov_shard.
+_MARKOV_SHARD = __import__("os").environ.get("VLLM_V41_MARKOV_SHARD", "0") == "1"
+# Coupled (keyed) B=1 drafts from vocabulary shards in their own graph; needs
+# VLLM_V41_MARKOV_SHARD=1. The check runs the full fused coupled path too and
+# counts rounds whose drafts differ (debug: one all-gather and a sync per round).
+_COUPLED_SHARD = __import__("os").environ.get("VLLM_V41_COUPLED_SHARD", "0") == "1"
+_COUPLED_SHARD_CHECK = (
+    __import__("os").environ.get("VLLM_V41_COUPLED_SHARD_CHECK", "0") == "1"
+)
+
+logger = init_logger(__name__)
 
 
 class V41DraftQuantConfig(Fp8Config):
@@ -256,6 +277,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         self.lm_head = nn.Identity()
         self.logits_processor = LogitsProcessor(c.vocab_size)
         self._markov = None
+        self._markov_shard = None
         self.query_graph = (
             None
             if vllm_config.speculative_config.enforce_eager
@@ -271,9 +293,34 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             if vllm_config.speculative_config.enforce_eager
             else V41ContextGraphs(self.model.precompute_and_store_context_kv)
         )
+        self.coupled_graph = (
+            None
+            if vllm_config.speculative_config.enforce_eager
+            else V41CoupledDraftGraph(self._coupled_shard_draft)
+        )
+        self._coupled_check = [0, 0]  # rounds checked, rounds with different drafts
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)
+
+    def bind_pipeline_embedding(self, target_language_model):
+        """Borrow the target's embedding when the proposer's sharing did not.
+
+        The draft has no embedding table (``embed_tokens`` is an Identity
+        placeholder). The proposer's legacy sharing contract skips the
+        embedding whenever pipeline parallelism is on, but V4.1 builds
+        ``embed_tokens`` on every stage, including the last one, where the
+        drafter runs. Returns True if it bound the target's module here.
+        """
+        if not isinstance(self.model.embed_tokens, nn.Identity):
+            return False  # already shared (one stage)
+        embed = getattr(target_language_model.model, "embed_tokens", None)
+        if embed is None or isinstance(embed, PPMissingLayer):
+            raise ValueError(
+                "V4.1 DSpark needs the target embedding on the drafter's stage"
+            )
+        bind_shared(self.model, "embed_tokens", embed)
+        return True
 
     def combine_hidden_states(self, auxiliary):
         return self.model.combine_hidden_states(auxiliary)
@@ -311,7 +358,15 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             self.lm_head, self.model.norm(hidden_states).to(torch.float16)
         )
 
+    def local_logits(self, hidden_states):
+        """This rank's vocabulary shard of ``compute_logits`` (no all-gather)."""
+        return self.lm_head.quant_method.apply(
+            self.lm_head, self.model.norm(hidden_states).to(torch.float16), bias=None
+        )
+
     def _greedy_draft(self, hidden_states, anchor):
+        if self._markov_shard is not None:
+            return self._markov_shard(self.local_logits(hidden_states), anchor)
         logits = self.compute_logits(hidden_states)
         if self._markov is not None:
             return self._markov(logits, anchor)
@@ -329,6 +384,88 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         if self.greedy_graph is None:
             return None
         return self.greedy_graph(hidden_states, anchor)
+
+    def _coupled_shard_draft(self, hidden_states, anchor, temperature, keys, positions):
+        from vllm.v1.spec_decode.coupled_draw import DRAFT_TEMP_SCALE
+
+        from .markov_coupled import coupled_shard_tokens
+
+        return coupled_shard_tokens(
+            self._markov_shard,
+            self.local_logits(hidden_states),
+            anchor,
+            temperature,
+            keys,
+            positions,
+            DRAFT_TEMP_SCALE,
+        )
+
+    def coupled_shard_draft_tokens(
+        self, hidden_states, anchor, temperature, keys, positions
+    ):
+        """[5] coupled drafts for one request from vocabulary shards (graph),
+        or None unless VLLM_V41_COUPLED_SHARD=1 and the shard path is on."""
+        if not _COUPLED_SHARD or self._markov_shard is None:
+            return None
+        run = self.coupled_graph or self._coupled_shard_draft
+        tokens = run(hidden_states, anchor, temperature, keys, positions)
+        if _COUPLED_SHARD_CHECK:
+            self._coupled_shard_check(
+                hidden_states, anchor, temperature, keys, positions, tokens
+            )
+        return tokens
+
+    def _coupled_shard_check(
+        self, hidden_states, anchor, temperature, keys, positions, tokens
+    ):
+        """Debug: the full fused coupled drafts for the same round must equal
+        the shard drafts; logs the running count of rounds that differ."""
+        from vllm.v1.spec_decode.coupled_draw import DRAFT_TEMP_SCALE
+
+        from .markov_coupled import coupled_markov_tokens
+
+        steps = positions.shape[0]
+        full = coupled_markov_tokens(
+            self._markov,
+            self.compute_logits(hidden_states).view(1, steps, -1),
+            anchor,
+            temperature,
+            keys,
+            positions.view(1, steps),
+            DRAFT_TEMP_SCALE,
+        )[0]
+        same = bool(torch.equal(full, tokens))
+        self._coupled_check[0] += 1
+        self._coupled_check[1] += int(not same)
+        checked, differ = self._coupled_check
+        if not same:
+            logger.warning(
+                "V4.1 coupled shard self-check: drafts differ (shard %s, full %s); "
+                "%d of %d rounds differ",
+                tokens.tolist(),
+                full.tolist(),
+                differ,
+                checked,
+            )
+        elif checked % 200 == 0:
+            logger.info(
+                "V4.1 coupled shard self-check: %d of %d rounds differ",
+                differ,
+                checked,
+            )
+
+    def coupled_draft_tokens(
+        self, base_logits, prev, temperature, keys, positions, scale
+    ):
+        """[B, steps] coupled drafts from the fused keyed Markov kernels, or
+        None when the BF16 Markov head is not prepared."""
+        if self._markov is None or self._markov.vocab != base_logits.shape[-1]:
+            return None
+        from .markov_coupled import coupled_markov_tokens
+
+        return coupled_markov_tokens(
+            self._markov, base_logits, prev, temperature, keys, positions, scale
+        )
 
     def markov_embed(self, token_ids):
         # Under async scheduling a non-sampling step can carry an unfilled
@@ -413,3 +550,163 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         head.weight = nn.Parameter(
             torch.empty(0, dtype=torch.float32, device=weight.device), False
         )
+
+    def prepare_markov_shard(self):
+        """VLLM_V41_MARKOV_SHARD=1 (default 0): greedy drafts from vocab shards.
+
+        The greedy B=1 draft graph then never builds full-vocabulary logits:
+        each TP rank scores its own vocabulary rows (``markov_shard``) and one
+        small all-reduce per step exchanges the ranks' best rows. Other draft
+        paths are unchanged. The proposer calls this once after sharing the
+        target's head. It checks the layout, then compares the shard path with
+        the full fused path (local logits bit for bit; tokens from random hidden
+        states and anchors and from forced ties, -inf and NaN; the winning
+        values). Any problem on any rank makes every rank raise. Returns True
+        when the shard path is on.
+        """
+        if not _MARKOV_SHARD:
+            return False
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        shard = None
+        try:
+            problems = self._markov_shard_layout(tp, rank)
+            if not problems:
+                shard = MarkovShardGreedy(
+                    self._markov, rank, tp, tensor_model_parallel_all_reduce
+                )
+                shard.warm()  # a rank-local launch failure becomes a problem
+        except Exception as error:  # noqa: BLE001 - it must reach the all-reduce
+            problems = [f"{type(error).__name__}: {error}"]
+        self._markov_shard_agree(problems, "cannot run")
+        assert shard is not None
+        failures, cases = self._markov_shard_check(shard)
+        self._markov_shard_agree(failures, "self-check failed")
+        self._markov_shard = shard
+        logger.info(
+            "VLLM_V41_MARKOV_SHARD=1: greedy drafts score vocabulary rows %d-%d "
+            "on TP rank %d of %d; self-check passed (%d cases)",
+            shard.start,
+            shard.start + shard.n - 1,
+            rank,
+            tp,
+            cases,
+        )
+        return True
+
+    def _markov_shard_layout(self, tp, rank):
+        """Problems that keep the shard path from equalling the full path."""
+        if self._markov is None:
+            return ["it needs the fused Markov path (VLLM_V41_MARKOV_FUSED=1, CUDA)"]
+        problems = []
+        vocab = self._markov.vocab
+        n, start = vocab // tp, rank * (vocab // tp)
+        head, lp = self.lm_head, self.logits_processor
+        indices = getattr(head, "shard_indices", None)
+        if (
+            vocab % tp
+            or indices is None
+            or head.org_vocab_size != vocab
+            or head.num_embeddings_padded != vocab
+            or head.num_embeddings_per_partition != n
+            or indices.org_vocab_start_index != start
+            or indices.org_vocab_end_index != start + n
+            or indices.num_org_vocab_padding
+        ):
+            problems.append(f"the head is not {tp} unpadded vocab shards in order")
+        if (
+            lp.logits_as_input
+            or lp.soft_cap is not None
+            or lp.scale != 1.0
+            or not lp.use_all_gather
+            or lp.org_vocab_size != vocab
+        ):
+            problems.append("the logits processor is not a plain all-gather")
+        return problems
+
+    def _markov_shard_agree(self, problems, what):
+        """Raise on every TP rank when any rank reports a problem."""
+        device = self.model.norm.weight.device
+        flag = torch.tensor([float(len(problems))], device=device)
+        total = int(tensor_model_parallel_all_reduce(flag).item())
+        if total:
+            raise RuntimeError(
+                f"VLLM_V41_MARKOV_SHARD=1 {what}: {total} problem(s) across the "
+                f"TP group; this rank: {problems[:6] or 'none'}"
+            )
+
+    def _markov_shard_check(self, shard):
+        """This rank's failures of the shard path against the full fused path.
+
+        Every rank runs the same cases in the same order (one CPU seed), so
+        the collectives pair up. Returns (failures, number of cases).
+        """
+        markov, vocab, n, start = self._markov, shard.vocab, shard.n, shard.start
+        device, steps, tp = markov.weight.device, shard.steps, shard.tp
+        gen = torch.Generator(device="cpu").manual_seed(41)
+        failures, cases = [], 0
+
+        def bits(t):  # bitwise: signed zeros and NaN payloads included
+            return t.contiguous().view(torch.uint8)
+
+        def tokens(name, full, local, anchor, top=False):
+            nonlocal cases
+            cases += 1
+            anchor = torch.tensor([anchor], dtype=torch.int64, device=device)
+            want = markov(full, anchor)
+            want_top = markov.best_val.max()  # the last step's winning value
+            got = shard(local, anchor)
+            if not torch.equal(want, got):
+                failures.append(f"{name}: tokens {got.tolist()} != {want.tolist()}")
+            if top:  # every rank's last-step slot, then the largest maximum
+                slots = tensor_model_parallel_all_reduce(shard.slots[-1].clone())
+                if not bool(slots[:, 0].max() == want_top):
+                    failures.append(f"{name}: winning value")
+
+        hidden = int(self.config.hidden_size)
+        for case in range(3):
+            h = (torch.randn((steps, hidden), generator=gen) * 4.0).to(torch.float16)
+            h = h.to(device)
+            full = self.compute_logits(h)
+            local = self.local_logits(h)
+            if not torch.equal(bits(full[:, start : start + n]), bits(local)):
+                failures.append(f"hidden {case}: local logits")
+            picks = torch.randint(0, vocab, (2,), generator=gen).tolist()
+            for anchor in (*picks, 0, vocab - 1, -1, vocab + 3):
+                top = anchor in picks
+                tokens(f"hidden {case} anchor {anchor}", full, local, anchor, top)
+
+        def rows():
+            return (torch.randn((steps, vocab), generator=gen) * 8.0).half()
+
+        inf, nan = float("inf"), float("nan")
+        fixtures = {}
+        r = fixtures["inf tie across ranks 0|1"] = rows()
+        r[:, n - 1] = r[:, n] = inf
+        r = fixtures["inf in rank 1 and the last rank"] = rows()
+        r[:, n + n // 2] = r[:, vocab - 2] = inf
+        r = fixtures["inf twice in the last rank"] = rows()
+        r[:, (tp - 1) * n + 10] = r[:, (tp - 1) * n + 20] = inf
+        r = fixtures["inf tie at each boundary"] = rows()
+        for step in range(steps):
+            edge = (step % (tp - 1) + 1) * n
+            r[step, edge - 1] = r[step, edge] = inf
+        fixtures["all -inf"] = torch.full((steps, vocab), -inf).half()
+        r = fixtures["NaN every 7th row"] = rows()
+        r[:, ::7] = nan
+        r = fixtures["rank 1 all NaN"] = rows()
+        r[:, n : 2 * n] = nan
+        r = fixtures["NaN, then -inf in the last rank"] = rows()
+        r[:, : (tp - 1) * n] = nan
+        r[:, (tp - 1) * n :] = -inf
+        r = fixtures["rank 0 NaN, the rest -inf"] = rows()
+        r[:, :n] = nan
+        r[:, n:] = -inf
+        r = fixtures["NaN against +inf"] = rows()
+        r[:, 5] = nan
+        r[:, vocab - 3] = inf
+        for name, full in fixtures.items():
+            anchor = int(torch.randint(0, vocab, (1,), generator=gen))
+            full = full.to(device)
+            tokens(name, full, full[:, start : start + n], anchor)
+        return failures, cases

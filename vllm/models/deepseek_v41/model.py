@@ -7,7 +7,7 @@ pre-mix are not compatible. The initial implementation deliberately admits
 one request and at most 16K total tokens, with prefix caching disabled.
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 import vllm.envs as envs
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -46,11 +47,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
-from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    SupportsEagle3,
+    SupportsPP,
+)
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    maybe_prefix,
+)
 from vllm.models.deepseek_v41 import dense_tm
 from vllm.models.deepseek_v41.activations import swiglu
 from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
 
 from .attention_ops import (
     WINDOW_RING,
@@ -63,8 +73,9 @@ from .attention_ops import (
     select_packed_positions,
 )
 from .cache import V41LatentCache
-from .contract import validate_runtime_geometry
+from .contract import pp_split_problem, validate_runtime_geometry
 from .norm import short_rms_norm
+from .pp_commit import StageCommit
 from .quant_rope import apply_rope, attention_qdq, rope_table
 
 _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
@@ -462,6 +473,9 @@ def _treport(tokens):
 _PACKED_KV = (envs.VLLM_V41_PACKED_KV or "0") == "1"
 _EMPTY_CACHE_TOKENS = int(envs.VLLM_V41_EMPTY_CACHE_TOKENS)
 _WINDOW_RINGS = envs.VLLM_V41_WINDOW_RING == "1"
+# Reference for the PP2 bit-identity check (M1): one stage takes the pipeline
+# boundary branch before this target layer. 0: off.
+_PP_BOUNDARY_SIM = int(envs.VLLM_V41_PP_BOUNDARY_SIM or 0)
 
 
 class V41Attention(nn.Module):
@@ -498,11 +512,30 @@ class V41Attention(nn.Module):
             torch.empty(self.heads, dtype=torch.float32), requires_grad=False
         )
         self.attn_sink.weight_loader = self._load_sink
-        # Layer 0 keeps the paged window cache: it anchors the per-step
-        # metadata. Other target layers keep their window in a private ring
-        # instead of a full-length KV-manager allocation (G4).
-        self.ring_window = _WINDOW_RINGS and self.ring_capable and layer > 0
-        if self.ring_window:
+        # The first layer of each pipeline stage keeps the paged window
+        # cache: it anchors the per-step metadata (layer 0; layer 20 on the
+        # second PP2 stage). Other target layers keep their window in a
+        # private ring instead of a full-length KV-manager allocation (G4).
+        # A simulated boundary layer keeps a paged cache too, as it would
+        # as the first layer of the second stage.
+        self.ring_window = (
+            _WINDOW_RINGS
+            and self.ring_capable
+            and layer > v41_stage_bounds(c)[0]
+            and layer != _PP_BOUNDARY_SIM
+        )
+        # A compressed anchor (layer 20 on the second PP2 stage, or the
+        # simulated boundary) keeps its paged cache for the metadata, but
+        # the packed attention path reads window keys only from a ring, so
+        # it also keeps a ring, filled after every step like the others.
+        self.anchor_ring = (
+            _WINDOW_RINGS
+            and self.ring_capable
+            and not self.ring_window
+            and layer > 0
+            and bool(self.ratio)
+        )
+        if self.ring_window or self.anchor_ring:
             self.register_buffer(
                 "window_ring",
                 torch.zeros(
@@ -515,7 +548,7 @@ class V41Attention(nn.Module):
                 ),
                 persistent=False,
             )
-        else:
+        if not self.ring_window:
             self.window_cache = V41LatentCache(
                 prefix + ".window_cache", sliding_window=c.sliding_window + 6
             )
@@ -633,6 +666,10 @@ class V41Attention(nn.Module):
                         topk=self.shared.topk,
                         packed=(store, self.source),
                     )
+                    if self.anchor_ring:
+                        arguments.update(
+                            window_ring=self.window_ring, window_values=window
+                        )
                 else:
                     compressed_metadata = source.compressor.cache.metadata()
                     arguments.update(
@@ -652,7 +689,7 @@ class V41Attention(nn.Module):
                 self.attn_sink,
                 **arguments,
             )
-            if self.ring_window:
+            if self.ring_window or self.anchor_ring:
                 insert_window_ring(self.window_ring, window, positions, valid)
         _tmark("a.out_proj", tokens)
         output = apply_rope(output, positions, table, inverse=True)
@@ -724,6 +761,25 @@ class V41Block(nn.Module):
         return expand_hc(self.ffn(inputs), x, post, comb), next_pre
 
 
+def v41_stage_bounds(config):
+    """[start, end) of this PP stage's target layers, after the split rule.
+
+    Every boundary must satisfy ``pp_split_problem`` (the KV20 rule): only the
+    four-stream HC residual crosses a stage boundary. For 40 layers and two
+    stages the only admissible split is 20.
+    """
+    from vllm.distributed.utils import get_pp_indices
+
+    pp = get_pp_group()
+    layers = config.num_hidden_layers
+    for rank in range(1, pp.world_size):
+        split = get_pp_indices(layers, rank, pp.world_size)[0]
+        problem = pp_split_problem(config, split)
+        if problem is not None:
+            raise ValueError(f"V4.1 pipeline split at layer {split}: {problem}")
+    return get_pp_indices(layers, pp.rank_in_group, pp.world_size)
+
+
 class DeepseekV41Model(nn.Module, EagleModelMixin):
     def __init__(self, vllm_config, prefix):
         super().__init__()
@@ -736,9 +792,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             prefix=prefix + ".embed_tokens",
         )
         shared = _SharedAttention()
+        # Global layer ids are kept: list index == checkpoint layer id, and
+        # layers owned by the other stage are PPMissingLayer placeholders.
+        self.start_layer, self.end_layer = v41_stage_bounds(c)
         self.layers = nn.ModuleList(
             [
                 V41Block(vllm_config, i, shared, prefix + f".layers.{i}")
+                if self.start_layer <= i < self.end_layer
+                else PPMissingLayer()
                 for i in range(c.num_hidden_layers)
             ]
         )
@@ -747,13 +808,21 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
             from .kv_store import V41PackedKV
 
+            # One store per stage over its own KV sources ({2, 8, 14} | {20});
+            # the memfd handshake is per TP group, so stages never share it.
             shared.store = V41PackedKV(
-                {layer: c.compress_ratios[layer] for layer in c.kv_source_layer_ids},
+                {
+                    layer: c.compress_ratios[layer]
+                    for layer in c.kv_source_layer_ids
+                    if self.start_layer <= layer < self.end_layer
+                },
                 vllm_config.model_config.max_model_len,
                 torch.device("cuda", torch.accelerator.current_device_index()),
                 get_tp_group(),
             )
-        self.norm = V41Norm(c.hidden_size)
+        self.norm = (
+            V41Norm(c.hidden_size) if get_pp_group().is_last_rank else PPMissingLayer()
+        )
         for name, shape, dtype in (
             ("token_map", (c.vocab_size,), torch.int32),
             ("primes", (2, 24), torch.int64),
@@ -779,9 +848,30 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         )
         self.hash_state: V41EngramHashState | None = None
         self.engram_io: SharedEngramIO | None = None
+        # PP: the first stage owns the committed per-step state (Engram hash,
+        # ratio-2 compressors). When it is not also the last stage it never
+        # samples, so it commits its own forwards (pp_commit.py).
+        self.stage_commit = (
+            StageCommit()
+            if self.start_layer == 0 and self.end_layer < c.num_hidden_layers
+            else None
+        )
+        self.register_buffer(
+            "stage_commit_count", torch.zeros(1, dtype=torch.int64), persistent=False
+        )
+        # M1: called eagerly with (hidden, pre) at a real or simulated stage
+        # boundary (benchmarks/deepseek_v41/tools/pp2_m1.py).
+        self.pp_boundary_tap: Callable[[torch.Tensor, torch.Tensor], None] | None = None
+        if _PP_BOUNDARY_SIM and not 0 < _PP_BOUNDARY_SIM < c.num_hidden_layers:
+            raise ValueError(
+                f"VLLM_V41_PP_BOUNDARY_SIM={_PP_BOUNDARY_SIM} is not a layer "
+                f"boundary inside 1..{c.num_hidden_layers - 1}"
+            )
 
     def prepare_postload(self):
-        if self.hash_state is not None:
+        # Engram, its hash state and the sidecar reader belong to the first
+        # pipeline stage only; later stages never open the Engram sidecar.
+        if self.hash_state is not None or not get_pp_group().is_first_rank:
             return
         c = self.config
         maximum = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -797,68 +887,119 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         path = self.vllm_config.load_config.model_loader_extra_config["engram_path"]
         self.engram_io = SharedEngramIO(path, max_tokens=maximum)
 
-    def forward(self, input_ids, positions, inputs_embeds=None):
+    def forward(
+        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+    ):
+        tokens = positions.numel()
         if (
             _EMPTY_CACHE_TOKENS
-            and input_ids.numel() >= _EMPTY_CACHE_TOKENS
+            and tokens >= _EMPTY_CACHE_TOKENS
             and not torch.cuda.is_current_stream_capturing()
         ):
             # Long prefill passes fragment the caching allocator; return the
             # previous pass's free segments so driver-free VRAM stays >= 1 GB.
             torch.accelerator.empty_cache()
-        metadata = self.layers[0].attn.window_cache.metadata()
-        self.layers[0].attn.shared.metadata = metadata
-        valid = (
-            metadata.slot_mapping[: input_ids.numel()] >= 0
-            if metadata is not None
-            else None
-        )
-        self.layers[0].attn.shared.valid = valid
+        # This stage's first layer anchors the per-step metadata.
+        anchor = self.layers[self.start_layer].attn
+        metadata = anchor.window_cache.metadata()
+        anchor.shared.metadata = metadata
+        valid = metadata.slot_mapping[:tokens] >= 0 if metadata is not None else None
+        anchor.shared.valid = valid
         if metadata is not None:
-            assert (
-                self.hash_state is not None
-                and self.engram_io is not None
-                and self.engram_io.runtime is not None
-            )
-            hashes = self.hash_state(input_ids, positions, valid)
-            self.engram_io.runtime.prefetch(hashes)
-            self.pending_length.fill_(input_ids.numel())
+            if self.start_layer == 0:
+                # Engram and its hash state live on the first stage only.
+                assert (
+                    self.hash_state is not None
+                    and self.engram_io is not None
+                    and self.engram_io.runtime is not None
+                )
+                hashes = self.hash_state(input_ids, positions, valid)
+                self.engram_io.runtime.prefetch(hashes)
+            # Every stage: the first commits from these, the last clips its
+            # samples with them (output_budget).
+            self.pending_length.fill_(tokens)
             self.pending_position.copy_(positions[:1])
             self.pending_prefill.copy_(metadata.is_prefilling[:1])
-        hidden = (
-            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        )
-        # FP16 cannot carry the full HC residual range of valid special
-        # tokens. Keep only this stream in FP32; collapse+RMSNorm returns
-        # FP16 at every dense/attention/expert input boundary.
-        hidden = hidden.float()[:, None].expand(-1, 4, -1).contiguous()
-        pre = torch.zeros(hidden.shape[0], 4, device=hidden.device, dtype=torch.float32)
-        pre[:, 0] = 1
+        if intermediate_tensors is None:
+            if self.start_layer != 0:
+                raise ValueError("V4.1 pipeline stage needs the previous HC residual")
+            hidden = (
+                self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+            )
+            # FP16 cannot carry the full HC residual range of valid special
+            # tokens. Keep only this stream in FP32; collapse+RMSNorm returns
+            # FP16 at every dense/attention/expert input boundary.
+            hidden = hidden.float()[:, None].expand(-1, 4, -1).contiguous()
+            pre = torch.zeros(tokens, 4, device=hidden.device, dtype=torch.float32)
+            pre[:, 0] = 1
+        else:
+            # The previous stage's expanded residual and the collapse weights
+            # of its last FFN; this stage starts with the reference mixes.
+            hidden, pre = intermediate_tensors["hidden"], intermediate_tensors["pre"]
         auxiliary: Any = []
         if _HC_FUSED:
             result = self._forward_fused(
                 hidden, positions, pre, metadata, valid, auxiliary
             )
             _join_expert_writebacks()
-            return (result, auxiliary) if auxiliary else result
-        for i, layer in enumerate(self.layers):
+        else:
+            result = self._forward_reference(
+                hidden, positions, pre, metadata, valid, auxiliary
+            )
+            _join_expert_writebacks()
+        if isinstance(result, IntermediateTensors):
+            return result
+        return (result, auxiliary) if auxiliary else result
+
+    def _stage_boundary(self, i):
+        """Whether the residual leaves after layer i: at the end of a stage
+        that is not the last, or before VLLM_V41_PP_BOUNDARY_SIM."""
+        following = i + 1
+        return following < len(self.layers) and (
+            following == self.end_layer or following == _PP_BOUNDARY_SIM
+        )
+
+    def _hand_off(self, i, hidden, pre):
+        """Stage boundary after layer i (expanded residual and collapse weights).
+
+        Returns the next stage's inputs at a real boundary, else None.
+        """
+        assert hidden.dtype == pre.dtype == torch.float32
+        tap = self.pp_boundary_tap
+        if tap is not None and not torch.cuda.is_current_stream_capturing():
+            tap(hidden, pre)
+        if i + 1 < self.end_layer:
+            return None
+        _tmark("end", hidden.shape[0])
+        if _ATT_T["on"]:
+            _treport(hidden.shape[0])
+        return IntermediateTensors({"hidden": hidden, "pre": pre.contiguous()})
+
+    def _forward_reference(self, hidden, positions, pre, metadata, valid, auxiliary):
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
             if layer.engram is not None and metadata is not None:
                 hidden = layer.engram(hidden, self.engram_io, valid)
             if i in self.aux_hidden_state_layers:
                 auxiliary.append(hidden.mean(1).mul_(2.0**-6).half())
             table = self.compressed_rope if layer.attn.ratio else self.window_rope
             hidden, pre = layer(hidden, positions, pre, table)
-        result = collapse_hc(hidden, pre, self.norm.weight)
-        _join_expert_writebacks()
-        return (result, auxiliary) if auxiliary else result
+            if self._stage_boundary(i):
+                handed = self._hand_off(i, hidden, pre)
+                if handed is not None:
+                    return handed
+        return collapse_hc(hidden, pre, self.norm.weight)
 
     def _forward_fused(self, hidden, positions, pre, metadata, valid, auxiliary):
         # Each sublayer boundary is one fused transition (in-place expand, the
         # next sublayer's mixes, delayed collapse). A boundary falls back to the
-        # reference mixes/collapse only when Engram rewrites the residual.
+        # reference mixes/collapse when Engram rewrites the residual, and at a
+        # pipeline stage boundary (the next layer's parameters are elsewhere).
         state = None
         layers = list(self.layers)
-        for i, layer in enumerate(layers):
+        start, end = self.start_layer, self.end_layer
+        for i in range(start, end):
+            layer = layers[i]
             _tmark("engram", hidden.shape[0])
             if layer.engram is not None and metadata is not None:
                 hidden = layer.engram(hidden, self.engram_io, valid)
@@ -889,19 +1030,33 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             )
             if _PRED_STATS:
                 layer.ffn._v41_index = i
-                _predict_next(layers, i, inputs)
+                _predict_next(layers[:end], i, inputs)
             if _PREFETCH_HINTS:
                 gates = getattr(self, "_v41_gates", None)
                 if gates is None:
-                    gates = [(l.ffn.gate.weight, l.ffn.gate.bias) for l in layers]  # noqa: E741
+                    # Routers of this stage's layers; hint() bounds by len().
+                    gates = (
+                        [None] * start
+                        + [
+                            (l.ffn.gate.weight, l.ffn.gate.bias)  # noqa: E741
+                            for l in layers[start:end]  # noqa: E741
+                        ]
+                    )
                     self._v41_gates = gates
                 publish_prefetch_hints(gates, i, inputs)
             _tmark("ffn(moe+shared)", hidden.shape[0])
             y = layer.ffn(inputs)
             _tmark("hc_post", hidden.shape[0])
             pre = ffn_mix[0]
-            following = layers[i + 1] if i + 1 < len(layers) else None
-            if following is not None and following.engram is None:
+            boundary = self._stage_boundary(i)
+            following = layers[i + 1] if i + 1 < end else None
+            if boundary:
+                hidden = expand_hc(y, hidden, ffn_mix[1], ffn_mix[2], inplace=True)
+                state = None
+                handed = self._hand_off(i, hidden, pre)
+                if handed is not None:
+                    return handed
+            elif following is not None and following.engram is None:
                 inputs, mix = hc_transition(
                     hidden,
                     y,
@@ -927,24 +1082,57 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 return result
         raise AssertionError("V4.1 fused forward requires at least one layer")
 
+    def _ratio2_states(self):
+        for i in range(self.start_layer, self.end_layer):
+            compressor = getattr(self.layers[i].attn, "compressor", None)
+            if compressor is not None and compressor.ratio == 2:
+                yield compressor.state
+
     def commit(self, accepted_counts):
+        """Sampled-count commit (the runner, after sampling)."""
+        if self.start_layer != 0:
+            return  # later PP stages hold no committed state
+        if self.stage_commit is not None and not self.stage_commit.take_sampled():
+            return  # this stage already committed the forward (a prefill)
+        self._commit(accepted_counts)
+
+    def _commit(self, accepted_counts):
         assert self.hash_state is not None
         selected = torch.where(
             self.pending_prefill, self.pending_length, accepted_counts.to(torch.int64)
         )
         self.hash_state.commit(selected)
-        for layer in self.layers:
-            compressor = getattr(layer.attn, "compressor", None)
-            if compressor is not None and compressor.ratio == 2:
-                compressor.state.commit(selected)
+        for state in self._ratio2_states():
+            state.commit(selected)
+
+    def pp_after_forward(self, req_ids, num_computed, num_prompt):
+        """A first PP stage that is not the last, after each forward."""
+        if self.stage_commit is None:
+            return
+        if self.stage_commit.after_forward(req_ids, num_computed, num_prompt):
+            self._commit(self.pending_length)
+
+    def pp_before_forward(self, req_ids, num_computed):
+        """A first PP stage that is not the last, before each forward."""
+        if self.stage_commit is None:
+            return
+        count = self.stage_commit.before_forward(req_ids, num_computed)
+        if count is not None:
+            self._commit(self.stage_commit_count.fill_(count))
 
     def restore_prefix(self, cached, prompt_ids):
         """Rewind per-sequence device state to a same-session prefix hit.
 
         The scheduler only admits hits that continue the last executed
-        sequence at an even position inside the window rings' reach.
+        sequence at an even position inside the window rings' reach, so the
+        rings need no rewind. Later PP stages hold nothing else.
         """
-        assert self.hash_state is not None and cached % 2 == 0
+        assert cached % 2 == 0
+        if self.stage_commit is not None:
+            self.stage_commit.reset()
+        if self.start_layer != 0:
+            return
+        assert self.hash_state is not None
         device = self.hash_state.history.device
         tail = [prompt_ids[i] if i >= 0 else -1 for i in range(cached - 3, cached)]
         ids = torch.tensor([max(t, 0) for t in tail], dtype=torch.long, device=device)
@@ -955,14 +1143,11 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self.hash_state.history[:3].copy_(mapped)
         self.hash_state.history[3] = cached
         self.hash_state.metadata[2] = 0
-        for layer in self.layers:
-            compressor = getattr(layer.attn, "compressor", None)
-            if compressor is not None and compressor.ratio == 2:
-                # Even positions start a new pair: the partial row is unused.
-                state = compressor.state
-                state.partial.zero_()
-                state.position.fill_(cached)
-                state.metadata[2] = 0
+        for state in self._ratio2_states():
+            # Even positions start a new pair: the partial row is unused.
+            state.partial.zero_()
+            state.position.fill_(cached)
+            state.metadata[2] = 0
 
     def output_budget(self, max_tokens, prompt_tokens):
         # CPU request lists can contain optimistic placeholders under async
@@ -976,7 +1161,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         return (max_tokens - before).clamp_min(0)
 
 
-class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3):
+class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
         c = self.config = vllm_config.model_config.hf_text_config
@@ -986,7 +1171,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3):
             or not current_platform.is_device_capability(70)
             or vllm_config.model_config.dtype != torch.float16
             or get_tensor_model_parallel_world_size() != 4
-            or p.pipeline_parallel_size != 1
+            or p.pipeline_parallel_size not in (1, 2)
             or p.data_parallel_size != 1
             or p.enable_expert_parallel
             or s.max_num_seqs != 1
@@ -1000,8 +1185,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3):
             )
         ):
             raise ValueError(
-                "V4.1 first version requires SM70 FP16 TP4, one request, "
-                "<=16K, chunks <=16384, synchronous scheduling, no prefix caching"
+                "V4.1 first version requires SM70 FP16 TP4 (PP 1 or 2), one "
+                "request, <=16K, chunks <=16384, synchronous scheduling, no "
+                "prefix caching"
             )
         if (
             c.model_type != "deepseek_v41_text"
@@ -1035,12 +1221,15 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3):
                 "for bounded FP16 dense GEMMs; MMVQ is outside this profile"
             )
         self.model = DeepseekV41Model(vllm_config, maybe_prefix(prefix, "model"))
-        self.lm_head = ParallelLMHead(
-            c.vocab_size,
-            c.hidden_size,
-            quant_config=vllm_config.quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                c.vocab_size,
+                c.hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(c.vocab_size)
 
     def embed_input_ids(self, input_ids):
@@ -1049,12 +1238,67 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3):
     def forward(
         self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None
     ):
-        if intermediate_tensors is not None:
-            raise ValueError("V4.1 pipeline parallelism is not admitted")
-        return self.model(input_ids, positions, inputs_embeds)
+        if intermediate_tensors is None:
+            return self.model(input_ids, positions, inputs_embeds)
+        return self.model(
+            input_ids,
+            positions,
+            inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
+        )
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        # The PP hand-off is the FP32 four-stream HC residual plus the
+        # collapse weights of the last stage-1 FFN (``pre``), whatever the
+        # model dtype: FP16 cannot carry the residual range (see forward).
+        del dtype
+        return IntermediateTensors(
+            {
+                "hidden": torch.zeros(
+                    (batch_size, 4, self.config.hidden_size),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "pre": torch.zeros((batch_size, 4), dtype=torch.float32, device=device),
+            }
+        )
 
     def compute_logits(self, hidden_states):
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def local_vocab(self) -> tuple[int, int] | None:
+        """(start, n): this rank's vocabulary shard as ``compute_logits``
+        lays it out (gathered columns [start, start + n) are token ids
+        [start, start + n)), or None when the gathered logits are more than
+        the shards side by side (scale, soft cap, added vocabulary, an empty
+        shard) and only the gathered path is exact. Every check is the same
+        on every TP rank, so the ranks agree and their collectives pair up."""
+        head, proc = self.lm_head, self.logits_processor
+        if isinstance(head, PPMissingLayer) or proc.logits_as_input:
+            return None
+        if proc.scale != 1.0 or proc.soft_cap is not None:
+            return None
+        if getattr(head, "bias", None) is not None:  # local_logits passes bias=None
+            return None
+        vocab, per_rank = proc.org_vocab_size, head.num_embeddings_per_partition
+        if head.num_added_embeddings or vocab != head.org_vocab_size:
+            return None
+        tp = get_tensor_model_parallel_world_size()
+        if vocab <= (tp - 1) * per_rank or vocab >= 1 << 24:  # ids exact in FP32
+            return None
+        si = head.shard_indices
+        start = get_tensor_model_parallel_rank() * per_rank
+        # Padding sits only after the last real token (asserted, not assumed).
+        assert si.org_vocab_start_index == si.padded_org_vocab_start_index == start
+        return start, min(si.num_org_elements, vocab - start)
+
+    def local_logits(self, hidden_states, n: int):
+        """This rank's [rows, n] shard of ``compute_logits`` (no all-gather):
+        the same head call, so the values are the gathered ones bit for bit."""
+        logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states, bias=None)
+        return logits[:, :n]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)
@@ -1068,11 +1312,18 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3):
                     if torch.equal(narrow.float(), module.weight.data):
                         module.weight.data = narrow
         dense_tm.prepare(self.model)
-        dense_tm.attach_lm_head(self.lm_head)
+        if not isinstance(self.lm_head, PPMissingLayer):
+            dense_tm.attach_lm_head(self.lm_head)
         self.model.prepare_postload()
 
     def commit_speculative_state(self, accepted_counts):
         self.model.commit(accepted_counts)
+
+    def pp_after_forward(self, req_ids, num_computed, num_prompt):
+        self.model.pp_after_forward(req_ids, num_computed, num_prompt)
+
+    def pp_before_forward(self, req_ids, num_computed):
+        self.model.pp_before_forward(req_ids, num_computed)
 
     def restore_prefix(self, cached, prompt_ids):
         self.model.restore_prefix(cached, prompt_ids)
