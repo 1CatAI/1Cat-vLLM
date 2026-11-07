@@ -172,6 +172,15 @@ class MambaHybridModelState(DefaultModelState):
         )
         self._dflash2_grouped_smallq_metadata_logged = False
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        if (
+            vllm_config.kernel_config.tp_prefill_overlap_min_tokens
+            and self.cache_config.mamba_cache_mode == "all"
+        ):
+            # Per-block states would land in different blocks for the halves.
+            raise ValueError(
+                "kernel_config.tp_prefill_overlap_min_tokens supports the "
+                "'none' and 'align' mamba cache modes."
+            )
         from vllm.model_executor.layers.mamba.gdn.spec_replay import (
             SpecReplayState,
             set_spec_replay_state,
@@ -328,6 +337,25 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.query_start_loc,
         )
 
+    def align_ubatch_split(self, input_batch: InputBatch, split_token: int) -> int:
+        if not self._align_mode:
+            return split_token
+        # Align mode keeps one recurrent state slot per request and step: the
+        # state block holding the chunk end. A request split between the two
+        # micro-batches reads and writes that slot from both halves only if
+        # the first half also ends inside that block.
+        assert self._mamba_spec is not None, "preprocess_state resolves the spec"
+        query_start_loc = input_batch.query_start_loc_np
+        req = int(np.searchsorted(query_start_loc, split_token, side="right")) - 1
+        if query_start_loc[req] == split_token:
+            return split_token
+        num_computed = int(input_batch.num_computed_tokens_np[req])
+        seq_end = num_computed + int(input_batch.num_scheduled_tokens[req])
+        block_size = self._mamba_spec.block_size
+        last_block_start = (seq_end - 1) // block_size * block_size
+        first_half_end = num_computed + split_token - int(query_start_loc[req])
+        return split_token + max(0, last_block_start + 1 - first_half_end)
+
     def _get_dflash2_gdn_builders(
         self,
         attn_groups: list[list[AttentionGroup]],
@@ -365,6 +393,7 @@ class MambaHybridModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_id: int = 0,
     ) -> dict[str, Any]:
         if self._spec_replay is not None and not self._spec_replay.group_of:
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
@@ -532,6 +561,7 @@ class MambaHybridModelState(DefaultModelState):
             for_cudagraph_capture=for_capture,
             is_dummy_batch=input_batch.is_dummy_batch or for_capture,
             prefix_anchor_lens=input_batch.prefix_anchor_lens,
+            ubatch_id=ubatch_id,
         )
         if common_gdn_metadata is not None:
             assert common_gdn_metadata.spec_query_start_loc.numel() == (

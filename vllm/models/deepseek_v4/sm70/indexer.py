@@ -3,6 +3,8 @@
 
 """DeepSeek V4 C4 indexer fallback using FP16 HMMA on SM70."""
 
+from typing import NamedTuple
+
 import torch
 
 from vllm.config import CUDAGraphMode
@@ -46,16 +48,20 @@ _LOGITS_BLOCK_N = 32
 # multiply, so the key tile has to be at least one 16x16x16 HMMA fragment
 # wide; 64 keeps the [64 heads, 128] x [128, N] shape efficient.
 _RELU_BLOCK_N = 64
-_RELU_BLOCK_M = 32
 
-# Route prefill scoring through cuBLAS instead of the Triton MMA. Set 0 for an
-# A/B against the Triton kernel above (which stays as the reference shape and
-# is what the decode path still uses, since decode gathers from a paged cache).
+# Without tensor-core Triton, prefill scoring routes through cuBLAS on Volta
+# (`indexer_prefill_cublas`, 0 takes `_prefill_index_scores_kernel` for an A/B).
 # Cap (MiB) on the [tokens*heads, key_tile] fp16 score tile. At the default
 # 2048-token prefill chunk and 64 heads this is 128 KiB per key, so the tile
 # is what keeps a long-context chunk from asking for gigabytes in one go.
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
+# The prefill epilogue reads fp16 scores. Eight keys per thread make 16-byte
+# loads; at two per thread (BLOCK_K 256 over 4 warps) it read the score tile at
+# 105 GB/s on RTX 8000 and 184 GB/s on V100, against 562 and 782 GB/s here.
+# The fp32 decode scores already load 8 bytes per thread with the shared one.
+_PREFILL_EPILOGUE_BLOCK_K = 512
+_PREFILL_EPILOGUE_WARPS = 2
 
 # At long context the paged Triton decode kernel rescans the same FP8 MQA keys
 # once for every verifier row and head. For a bounded one-request verifier
@@ -222,8 +228,13 @@ def _gather_paged_index_k_unscaled_kernel(
     head_dim: tl.constexpr,
     MAX_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    DEQUANT_FP16: tl.constexpr,
 ):
     """Gather one request's live paged keys once for all verifier rows.
+
+    DEQUANT_FP16 widens the keys to fp16 for the cuBLAS route; otherwise the
+    FP8 bytes are copied as they are, for the fused scorer that widens them in
+    registers.
 
     ``max_seq_len`` is a CUDA-graph bucket and can be much wider than the
     currently allocated request. Derive the live bound on device from the
@@ -264,11 +275,15 @@ def _gather_paged_index_k_unscaled_kernel(
         other=0,
     )
     scales = tl.load(scale_ptr, mask=valid, other=0.0).to(tl.float32)
-    tl.store(
-        out_k_ptr + key_offsets[:, None] * out_k_stride0 + dim_offsets[None, :],
-        fp8_e4m3fn_bits_to_fp32(packed).to(tl.float16),
-        mask=in_bucket[:, None],
-    )
+    out_k_ptrs = out_k_ptr + key_offsets[:, None] * out_k_stride0 + dim_offsets[None, :]
+    if DEQUANT_FP16:
+        tl.store(
+            out_k_ptrs,
+            fp8_e4m3fn_bits_to_fp32(packed).to(tl.float16),
+            mask=in_bucket[:, None],
+        )
+    else:
+        tl.store(out_k_ptrs, packed, mask=in_bucket[:, None])
     tl.store(out_scale_ptr + key_offsets, scales, mask=in_bucket)
 
 
@@ -339,74 +354,108 @@ def _paged_index_logits_kernel(
 
 
 @triton.jit
-def _contiguous_index_logits_relu_kernel(
+def _e4m3_bits_as_scaled_fp16(raw):
+    """E4M3 bit patterns as fp16 holding value * 2^-8, bit-exactly.
+
+    Shifting e4m3's exponent and mantissa into fp16's keeps normals and
+    subnormals exact at a fixed 2^-8; the cache holds no NaN codes.
+    """
+    bits = raw.to(tl.uint16)
+    return (((bits & 0x80) << 8) | ((bits & 0x7F) << 7)).to(tl.float16, bitcast=True)
+
+
+@triton.jit
+def _prefill_index_scores_kernel(
     q_ptr,
     w_ptr,
     k_ptr,
     k_scale_ptr,
     out_ptr,
+    num_q,
+    num_k,
     q_stride0,
     q_stride1,
     w_stride0,
     k_stride0,
     out_stride0,
-    num_q,
-    num_k,
-    num_heads,
-    head_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    KEYS_PER_PROGRAM: tl.constexpr,
+    KEYS_AS_M: tl.constexpr,
 ):
-    """Prefill index scores, per head, with the relu inside the head sum.
+    """Prefill index scores, every head of BLOCK_T tokens in one MMA operand.
 
-    Reference shape for the scoring, and the A/B fallback for the cuBLAS path
-    (`VLLM_SM70_INDEXER_PREFILL_CUBLAS=0`). It is not the fast path: Triton's
-    `tl.dot` does not reach Volta's tensor cores, so this tops out near 3.3
-    TFLOP/s no matter how the tile is shaped -- folding heads into the M
-    dimension to get a [256, 128] x [128, 64] MMA instead of a per-head
-    [32, 128] x [128, 64] one measured 3.34 vs 3.39 TFLOP/s, i.e. nothing.
-    cuBLAS does the same shape at 54.
+        out[t, s] = scale[s] * sum_h w[t, h] * relu(q[t, h] . k[s])
 
-    The key tile is loaded once and reused by every head (the indexer is MQA).
-    FP8 keys are widened to FP16 *unscaled* -- e4m3 maxes out at 448, which
-    fp16 holds exactly -- and the per-key scale is applied to the finished
-    accumulator. That keeps `k * scale` out of fp16 entirely, where a large
-    ue8m0 scale could otherwise overflow.
+    The heads stack into a [BLOCK_T * NUM_HEADS, 128] query operand that every
+    key tile of the program reuses (the indexer is MQA). Keys widen to fp16 as
+    value * 2^-8 and the product is taken back by 256 in FP32: without the
+    per-key scale one product can pass fp16's 65504. Relu, head weights and
+    head sum stay in registers and the per-key scale applies to the sum.
+    KEYS_AS_M puts the keys on the MMA's M side instead of the (token, head)
+    rows.
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    dim_offsets = tl.arange(0, head_dim)
-    m_valid = offs_m < num_q
-    n_valid = offs_n < num_k
-
-    packed = tl.load(
-        k_ptr + offs_n[:, None] * k_stride0 + dim_offsets[None, :],
-        mask=n_valid[:, None],
-        other=0,
-    )
-    k_t = tl.trans(fp8_e4m3fn_bits_to_fp32(packed).to(tl.float16))
-    scale = tl.load(k_scale_ptr + offs_n, mask=n_valid, other=0.0).to(tl.float32)
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for head in range(num_heads):
-        q = tl.load(
-            q_ptr
-            + offs_m[:, None] * q_stride0
-            + head * q_stride1
-            + dim_offsets[None, :],
-            mask=m_valid[:, None],
+    rows = tl.program_id(0) * BLOCK_T * NUM_HEADS + tl.arange(0, BLOCK_T * NUM_HEADS)
+    row_tokens = rows // NUM_HEADS
+    row_valid = row_tokens < num_q
+    q_offsets = row_tokens * q_stride0 + (rows % NUM_HEADS) * q_stride1
+    weights = tl.load(
+        w_ptr + row_tokens * w_stride0 + rows % NUM_HEADS, mask=row_valid, other=0.0
+    ).to(tl.float32)
+    tokens = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    dims = tl.arange(0, HEAD_DIM)
+    key_start = tl.program_id(1) * KEYS_PER_PROGRAM
+    key_stop = tl.minimum(key_start + KEYS_PER_PROGRAM, num_k)
+    if KEYS_AS_M:
+        q_t = tl.load(
+            q_ptr + q_offsets[None, :] + dims[:, None],
+            mask=row_valid[None, :],
             other=0.0,
         )
-        w = tl.load(w_ptr + offs_m * w_stride0 + head, mask=m_valid, other=0.0)
-        acc += tl.maximum(tl.dot(q, k_t), 0.0) * w[:, None].to(tl.float32)
-
-    tl.store(
-        out_ptr + offs_m[:, None] * out_stride0 + offs_n[None, :],
-        acc * scale[None, :],
-        mask=m_valid[:, None] & n_valid[None, :],
-    )
+        for start in range(key_start, key_stop, BLOCK_K):
+            keys = start + tl.arange(0, BLOCK_K)
+            key_valid = keys < num_k
+            raw = tl.load(
+                k_ptr + keys[:, None] * k_stride0 + dims[None, :],
+                mask=key_valid[:, None],
+                other=0,
+            )
+            k = _e4m3_bits_as_scaled_fp16(raw)
+            scores = tl.dot(k, q_t) * 256.0
+            scores = tl.maximum(scores, 0.0) * weights[None, :]
+            scores = tl.sum(tl.reshape(scores, (BLOCK_K, BLOCK_T, NUM_HEADS)), axis=2)
+            scale = tl.load(k_scale_ptr + keys, mask=key_valid, other=0.0)
+            tl.store(
+                out_ptr + tokens[None, :] * out_stride0 + keys[:, None],
+                scores * scale[:, None],
+                mask=(tokens[None, :] < num_q) & key_valid[:, None],
+            )
+    else:
+        q = tl.load(
+            q_ptr + q_offsets[:, None] + dims[None, :],
+            mask=row_valid[:, None],
+            other=0.0,
+        )
+        for start in range(key_start, key_stop, BLOCK_K):
+            keys = start + tl.arange(0, BLOCK_K)
+            key_valid = keys < num_k
+            raw = tl.load(
+                k_ptr + keys[None, :] * k_stride0 + dims[:, None],
+                mask=key_valid[None, :],
+                other=0,
+            )
+            k_t = _e4m3_bits_as_scaled_fp16(raw)
+            scores = tl.dot(q, k_t) * 256.0
+            scores = tl.maximum(scores, 0.0) * weights[:, None]
+            scores = tl.sum(tl.reshape(scores, (BLOCK_T, NUM_HEADS, BLOCK_K)), axis=1)
+            scale = tl.load(k_scale_ptr + keys, mask=key_valid, other=0.0)
+            tl.store(
+                out_ptr + tokens[:, None] * out_stride0 + keys[None, :],
+                scores * scale[None, :],
+                mask=(tokens[:, None] < num_q) & key_valid[None, :],
+            )
 
 
 @triton.jit
@@ -429,7 +478,7 @@ def _paged_index_logits_relu_kernel(
     BLOCK_N: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
-    """Decode counterpart of `_contiguous_index_logits_relu_kernel`.
+    """Decode counterpart of `_prefill_index_scores_kernel`.
 
     Same static-grid property as `_paged_index_logits_kernel`: the grid is
     (rows, NUM_SPLITS) and only the trip count follows the live `seq_len`, so
@@ -581,9 +630,9 @@ def _dequant_index_k_unscaled_kernel(
 def _prefill_logits_cublas(q, k_quant, k_scales, weights):
     """Prefill index scores through cuBLAS, with the relu inside the head sum.
 
-    Triton's `tl.dot` does not reach Volta's tensor cores: on the exact shape
-    this needs it measures 3.3 TFLOP/s, against 54 TFLOP/s for cuBLAS fp16 and
-    13 TFLOP/s for plain fp32 CUDA cores. The relu blocks the one-GEMM
+    Stock Triton's `tl.dot` does not reach Volta's tensor cores: on the exact
+    shape this needs it measures 3.3 TFLOP/s, against 54 TFLOP/s for cuBLAS fp16
+    and 13 TFLOP/s for plain fp32 CUDA cores. The relu blocks the one-GEMM
     factorisation, but it does not block cuBLAS -- stacking heads into the M
     dimension turns the scoring into a single [tokens*heads, 128] x [128, keys]
     GEMM whose output is reduced over heads afterwards. Keys are tiled so that
@@ -619,7 +668,9 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
         # the top-k *set* is consumed downstream, so the 5e-4 rounding here is
         # far below the gap between neighbouring index scores.
         scores = torch.mm(q2, k_fp16[start:stop].t())
-        _relu_weight_headsum_kernel[(num_q, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
+        _relu_weight_headsum_kernel[
+            (num_q, triton.cdiv(width, _PREFILL_EPILOGUE_BLOCK_K))
+        ](
             scores,
             weights,
             k_scales[start:stop],
@@ -630,11 +681,117 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
             out.stride(0),
             width,
             num_heads=num_heads,
-            BLOCK_K=_EPILOGUE_BLOCK_K,
+            BLOCK_K=_PREFILL_EPILOGUE_BLOCK_K,
             BLOCK_H=_EPILOGUE_BLOCK_H,
-            num_warps=4,
+            num_warps=_PREFILL_EPILOGUE_WARPS,
         )
     return out
+
+
+class _ScoreTile(NamedTuple):
+    block_t: int
+    block_k: int
+    keys_per_program: int
+    keys_as_m: bool
+    num_warps: int
+    num_stages: int
+
+
+def _score_tile(turing: bool, num_heads: int) -> _ScoreTile:
+    """Tile of `_prefill_index_scores_kernel`, measured on each architecture.
+
+    Sweep of 216 tiles per card in CUDA graphs over 512-token chunks with 4.8k
+    to 76.8k keys. Turing is best at 2048 score elements per warp for 64 and
+    32 heads alike (within 0.2 %); Volta has no such rule, so its two model
+    head counts keep their own tile.
+    """
+    if turing:
+        return _ScoreTile(2, min(128, 2048 * 4 // (2 * num_heads)), 2048, False, 4, 1)
+    if num_heads >= 64:
+        return _ScoreTile(4, 128, 1024, True, 8, 2)
+    return _ScoreTile(4, 32, 1024, True, 4, 2)
+
+
+def _decode_score_tile(turing: bool, num_heads: int, num_keys: int) -> _ScoreTile:
+    """Tile of `_prefill_index_scores_kernel` for one request's verifier rows.
+
+    The prefill tile spans 1024 or 2048 keys per program, so a decode over a
+    context bucket's keys starts too few programs, and Volta's four tokens per
+    program leave a quarter of the MMA rows empty for six verifier rows.
+    Swept in CUDA graphs for 6 rows and 64 heads over 1k to 125k keys (the C4
+    keys of the decode context buckets): Turing keeps its tile with 256 keys
+    per program up to 16k keys and 512 above (bit-identical scores), Volta
+    takes two tokens per program. Other head counts keep the prefill tile.
+    """
+    if num_heads != 64:
+        return _score_tile(turing, num_heads)
+    if turing:
+        return _ScoreTile(2, 64, 256 if num_keys <= 16384 else 512, False, 4, 1)
+    if num_keys <= 16384:
+        return _ScoreTile(2, 128, 256, True, 8, 2)
+    return _ScoreTile(2, 64, 256, True, 4, 1)
+
+
+def _on_turing(tensor: torch.Tensor) -> bool:
+    return current_platform.is_device_capability((7, 5), device_id=tensor.device.index)
+
+
+# Without tensor-core Triton (only `indexer_prefill_cublas=False`) the operands
+# take the FMA layout through shared memory; this tile fits both cards.
+_FMA_SCORE_TILE = _ScoreTile(2, 64, 1024, False, 4, 1)
+
+
+def _prefill_scores_triton(
+    q,
+    k_quant,
+    k_scales,
+    weights,
+    tile: _ScoreTile,
+    out: torch.Tensor | None = None,
+):
+    num_q, num_heads, head_dim = q.shape
+    num_k = k_quant.shape[0]
+    assert q.stride(2) == 1 and weights.stride(1) == 1
+    # One MMA needs 16 (token, head) rows; small head counts take more tokens.
+    block_t = max(tile.block_t, 16 // num_heads)
+    if out is None:
+        out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
+    assert out.shape == (num_q, num_k) and out.dtype == torch.float32
+    _prefill_index_scores_kernel[
+        (triton.cdiv(num_q, block_t), triton.cdiv(num_k, tile.keys_per_program))
+    ](
+        q,
+        weights,
+        k_quant.view(torch.uint8),
+        k_scales,
+        out,
+        num_q,
+        num_k,
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        k_quant.stride(0),
+        out.stride(0),
+        NUM_HEADS=num_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_T=block_t,
+        BLOCK_K=tile.block_k,
+        KEYS_PER_PROGRAM=tile.keys_per_program,
+        KEYS_AS_M=tile.keys_as_m,
+        num_warps=tile.num_warps,
+        num_stages=tile.num_stages,
+    )
+    return out
+
+
+def _turing_fused_prefill_scores(q: torch.Tensor) -> bool:
+    """Whether Turing's fused tensor-core scorer takes this prefill chunk.
+
+    It computes scores, relu, head weights, head sum and key scales in one
+    kernel, so the [tokens * heads, keys] score tile of the cuBLAS route never
+    reaches memory. Its warps hold 32 heads each.
+    """
+    return q.shape[1] in (32, 64) and _on_turing(q)
 
 
 def sm70_indexer_prefill_logits(
@@ -642,44 +799,58 @@ def sm70_indexer_prefill_logits(
     k_quant: torch.Tensor,
     k_scale_storage: torch.Tensor,
     weights: torch.Tensor,
+    *,
+    triton_tensor_cores: bool,
 ) -> torch.Tensor:
-    """Compute all prefill index scores; caller supplies causal row bounds."""
+    """Compute all prefill index scores; caller supplies causal row bounds.
+
+    Turing takes its fused native scorer for 32 and 64 heads, also with
+    ``triton_tensor_cores``: summed over long-context chunks it is faster there
+    than the Triton kernel. Otherwise ``triton_tensor_cores`` (Triton lowers
+    ``tl.dot`` to MMA on this card) selects the Triton kernel, and without it
+    the cuBLAS route or the per-head Triton kernel scores.
+    """
     policy = sparse_policy()
     assert k_quant.dtype == torch.float8_e4m3fn
     assert k_quant.ndim == 2 and k_quant.shape[1] == _INDEX_HEAD_DIM
     k_scales = k_scale_storage.view(torch.float32).reshape(-1)
     assert k_scales.shape[0] == k_quant.shape[0]
 
-    if policy.value("indexer_relu") and policy.value("indexer_prefill_cublas"):
+    if policy.value("indexer_relu") and _turing_fused_prefill_scores(q):
+        logger.info_once(
+            "SM70 indexer prefill: fused SM75 scorer on %s.", q.device, scope="process"
+        )
+        out = torch.empty(
+            (q.shape[0], k_quant.shape[0]), dtype=torch.float32, device=q.device
+        )
+        torch.ops._C.indexer_prefill_scores_sm75(
+            out, q, weights, k_quant.view(torch.uint8), k_scales
+        )
+        return out
+
+    if (
+        policy.value("indexer_relu")
+        and not triton_tensor_cores
+        and policy.value("indexer_prefill_cublas")
+    ):
+        logger.info_once(
+            "SM70 indexer prefill: cuBLAS route on %s.", q.device, scope="process"
+        )
         return _prefill_logits_cublas(q, k_quant, k_scales, weights)
 
     if policy.value("indexer_relu"):
-        num_q, num_heads, _ = q.shape
-        num_k = k_quant.shape[0]
-        out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
-        block_m, block_n = _RELU_BLOCK_M, _RELU_BLOCK_N
-        _contiguous_index_logits_relu_kernel[
-            (triton.cdiv(num_q, block_m), triton.cdiv(num_k, block_n))
-        ](
-            q,
-            weights,
-            k_quant.view(torch.uint8),
-            k_scales,
-            out,
-            q.stride(0),
-            q.stride(1),
-            weights.stride(0),
-            k_quant.stride(0),
-            out.stride(0),
-            num_q,
-            num_k,
-            num_heads,
-            head_dim=_INDEX_HEAD_DIM,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            num_warps=8,
+        logger.info_once(
+            "SM70 indexer prefill: Triton scorer on %s (tensor cores: %s).",
+            q.device,
+            triton_tensor_cores,
+            scope="process",
         )
-        return out
+        tile = (
+            _score_tile(_on_turing(q), q.shape[1])
+            if triton_tensor_cores
+            else _FMA_SCORE_TILE
+        )
+        return _prefill_scores_triton(q, k_quant, k_scales, weights, tile)
 
     weighted_q = _combine_index_queries(q, weights)
     k_fp16 = torch.empty(k_quant.shape, dtype=torch.float16, device=k_quant.device)
@@ -753,6 +924,85 @@ def _decode_logits_cublas(
     return out
 
 
+def _gather_request_index_k(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    flat_lens: torch.Tensor,
+    max_seq_len: int,
+    gathered_k: torch.Tensor,
+    k_scales: torch.Tensor,
+    dequant_fp16: bool,
+) -> None:
+    """Gather one request's paged keys and scales for all of its verifier rows."""
+    block_n = 16
+    _gather_paged_index_k_unscaled_kernel[(triton.cdiv(max_seq_len, block_n),)](
+        cache,
+        block_table,
+        flat_lens,
+        gathered_k,
+        k_scales,
+        cache.stride(0),
+        gathered_k.stride(0),
+        cache.shape[1],
+        max_seq_len,
+        flat_lens.shape[0],
+        head_dim=gathered_k.shape[1],
+        MAX_ROWS=triton.next_power_of_2(flat_lens.shape[0]),
+        BLOCK_N=block_n,
+        DEQUANT_FP16=dequant_fp16,
+        num_warps=4,
+    )
+
+
+def _decode_logits_fused(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    weights: torch.Tensor,
+    flat_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seq_len: int,
+    table_rows_per_request: int,
+) -> torch.Tensor:
+    """Score each request's verifier rows against one shared FP8 key gather.
+
+    Same shapes and masking as `_decode_logits_cublas`, but the keys stay FP8
+    and one tensor-core kernel scores every row and head of the request:
+    relu, head weights, head sum and key scales stay in registers, so the
+    [rows * heads, keys] FP32 score tile of the cuBLAS route (101 MB for six
+    rows, 64 heads and 66k keys) never reaches memory. The products stay
+    FP32, as in the cuBLAS route.
+    """
+    total_rows, _, head_dim = q.shape
+    num_requests = block_table.shape[0] // table_rows_per_request
+    rows = total_rows // num_requests
+    gathered_k, k_scales = current_workspace_manager().get_simultaneous(
+        ((max_seq_len, head_dim), torch.uint8),
+        ((max_seq_len,), torch.float32),
+    )
+    out = torch.empty((total_rows, max_seq_len), dtype=torch.float32, device=q.device)
+    tile = _decode_score_tile(_on_turing(q), q.shape[1], max_seq_len)
+    for request in range(num_requests):
+        first = request * rows
+        _gather_request_index_k(
+            cache,
+            block_table[request * table_rows_per_request],
+            flat_lens[first : first + rows],
+            max_seq_len,
+            gathered_k,
+            k_scales,
+            False,
+        )
+        _prefill_scores_triton(
+            q[first : first + rows],
+            gathered_k,
+            k_scales,
+            weights[first : first + rows],
+            tile,
+            out=out[first : first + rows],
+        )
+    return out
+
+
 def _score_request_cublas(
     q: torch.Tensor,
     cache: torch.Tensor,
@@ -766,22 +1016,8 @@ def _score_request_cublas(
     out: torch.Tensor,
 ) -> None:
     total_rows, num_heads, head_dim = q.shape
-    block_n = 16
-    _gather_paged_index_k_unscaled_kernel[(triton.cdiv(max_seq_len, block_n),)](
-        cache,
-        block_table,
-        flat_lens,
-        gathered_k,
-        k_scales,
-        cache.stride(0),
-        gathered_k.stride(0),
-        cache.shape[1],
-        max_seq_len,
-        total_rows,
-        head_dim=head_dim,
-        MAX_ROWS=triton.next_power_of_2(total_rows),
-        BLOCK_N=block_n,
-        num_warps=4,
+    _gather_request_index_k(
+        cache, block_table, flat_lens, max_seq_len, gathered_k, k_scales, True
     )
 
     q2 = q.reshape(total_rows * num_heads, head_dim)
@@ -939,6 +1175,7 @@ def sm70_indexer_decode_logits(
     table_rows_per_request: int = 1,
     *,
     indexer_decode_cublas: bool,
+    triton_tensor_cores: bool,
 ) -> torch.Tensor:
     """Gather paged FP8 index keys and compute batched decode scores.
 
@@ -946,7 +1183,9 @@ def sm70_indexer_decode_logits(
     to one request: 1 in the native layout, the verifier length when a uniform
     speculative decode was flattened to one row per token.
     `indexer_decode_cublas` is the engine's `KernelConfig.sm70_sparse` setting;
-    callers pass it because the forward pass runs outside the config context."""
+    callers pass it because the forward pass runs outside the config context.
+    `triton_tensor_cores` (the layer's `triton_sm7x_tensor_cores` route) swaps
+    the cuBLAS route's GEMM and epilogue for the fused tensor-core scorer."""
     policy = sparse_policy()
     assert cache.dtype == torch.uint8 and cache.ndim == 3
     assert cache.shape[-1] >= _INDEX_CACHE_BYTES
@@ -982,6 +1221,21 @@ def sm70_indexer_decode_logits(
             native_rows,
             table_rows_per_request,
         )
+        if blocker is None and triton_tensor_cores:
+            logger.info_once(
+                "SM70 indexer decode: fused multi-row scorer on %s.",
+                q.device,
+                scope="process",
+            )
+            return _decode_logits_fused(
+                q,
+                cache,
+                weights,
+                flat_lens,
+                block_table,
+                max_seq_len,
+                table_rows_per_request,
+            )
         if blocker is None:
             logger.info_once("SM70 indexer decode: cuBLAS route on %s.", q.device)
             return _decode_logits_cublas(
