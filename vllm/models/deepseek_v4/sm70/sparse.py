@@ -15,6 +15,7 @@ from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     sparse_attn_decode_bmm,
     sparse_attn_prefill_bmm,
+    sparse_attn_prefill_tensor_cores,
     sparse_decode_bmm_workspace_specs,
     sparse_prefill_bmm_workspace_specs,
 )
@@ -270,7 +271,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 q, layer.swa_cache_layer.kv_cache, compressed_cache
             )
         if bmm_reason is None:
-            keys, scores, logits, probs = current_workspace_manager().get_simultaneous(
+            keys, scores, probs = current_workspace_manager().get_simultaneous(
                 *sparse_decode_bmm_workspace_specs(
                     num_decode_tokens,
                     q.shape[1],
@@ -294,7 +295,6 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 output,
                 keys,
                 scores,
-                logits,
                 probs,
             )
             return
@@ -398,6 +398,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             q.shape[-1],
             combined_topk,
             torch.float16,
+            tensor_cores=layer.sparse_tensor_cores,
         )
 
     @classmethod
@@ -508,7 +509,12 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 out=(combined_indices_out, combined_lens_out),
             )
             if bmm_buffers:
-                sparse_attn_prefill_bmm(
+                prefill_attention = (
+                    sparse_attn_prefill_tensor_cores
+                    if layer.sparse_tensor_cores
+                    else sparse_attn_prefill_bmm
+                )
+                prefill_attention(
                     q[query_start:query_end],
                     kv_workspace[:current_chunk].reshape(-1, q.shape[-1]),
                     combined_indices,

@@ -46,6 +46,16 @@ class AttentionConfig:
     context (query heads x tokens packed per KV head, no mask) and the new
     tokens (causal), merged by their log-sum-exp. 0 disables the split."""
 
+    flash_attn_turing_prefill_min_query_len: int = Field(default=65, ge=0)
+    """On Turing, causal head-dim-256 attention over an fp16 paged KV cache
+    runs a dedicated m16n8k8 kernel (``paged_prefill_attention_sm75``) once a
+    request in the batch brings at least this many query tokens. FA2's Turing
+    build reaches about 23 TFLOPS on these prefills, this kernel about 61;
+    below the threshold it splits the context across CTAs and stays faster
+    (Quadro RTX 8000, 150k context: 64 tokens FA2 5.3 ms vs 19.9 ms, 96 tokens
+    24.6 ms vs 19.8 ms, 2048 tokens 165.8 ms vs 61.5 ms). 0 disables the
+    kernel."""
+
     tq_max_kv_splits_for_cuda_graph: int = 32
     """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
     Fixes the split count so grid dimensions are constant across captures,

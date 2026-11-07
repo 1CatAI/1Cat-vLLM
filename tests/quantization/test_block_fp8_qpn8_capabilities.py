@@ -28,8 +28,12 @@ from vllm.platforms.interface import DeviceCapability
 def native_contract(monkeypatch):
     monkeypatch.setattr(linear.current_platform, "_enum", PlatformEnum.CUDA)
     monkeypatch.setattr(linear.current_platform, "is_cuda", lambda: True)
+    # can_implement asks the capability of the worker's own device.
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
-        linear.current_platform, "get_device_capability", lambda: DeviceCapability(7, 0)
+        linear.current_platform,
+        "get_device_capability",
+        lambda device_id=0: DeviceCapability(7, 0),
     )
     ops = SimpleNamespace(
         fp8_qpn8_prepare_sm70=lambda: None,
