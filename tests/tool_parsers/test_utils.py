@@ -76,6 +76,20 @@ class TestCoerceToSchemaType:
         def test_long_alias(self):
             assert coerce_to_schema_type("100", "long") == 100
 
+        @pytest.mark.parametrize(("value", "expected"), [("3.0", 3), ("1e3", 1000)])
+        def test_whole_number_float_returns_int(self, value, expected):
+            result = coerce_to_schema_type(value, "integer")
+            assert result == expected
+            assert isinstance(result, int)
+
+        def test_fractional_value_is_not_rounded(self):
+            assert coerce_to_schema_type("3.5", "integer") == 3.5
+            assert coerce_to_schema_type("3.5", ["integer", "number"]) == 3.5
+
+        @pytest.mark.parametrize("value", ["inf", "NaN"])
+        def test_non_finite_value_stays_string(self, value):
+            assert coerce_to_schema_type(value, "integer") == value
+
     class TestNumberType:
         def test_number_type(self):
             assert coerce_to_schema_type("3.14", "number") == 3.14

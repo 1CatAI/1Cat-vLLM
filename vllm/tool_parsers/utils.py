@@ -548,6 +548,26 @@ def _is_json_finite(obj: Any) -> bool:
         return False
 
 
+def _parse_finite_number(value: str) -> int | float | None:
+    """Parse a finite JSON number; whole values (also "3.0", "1e3") as int.
+
+    int() comes first so that integers above 2**53 stay exact. inf/-inf/nan
+    are not valid JSON numbers and give None (int(float("inf")) would raise
+    OverflowError, json.dumps(inf) would emit invalid JSON "Infinity").
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        pass
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
 def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
     """Best-effort coercion of a raw string value to a JSON Schema type.
 
@@ -589,26 +609,17 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
         if candidate_type == "string":
             return value
         if candidate_type == "integer":
-            try:
-                return int(value)
-            except (ValueError, TypeError):
-                continue
+            number = _parse_finite_number(value)
+            # JSON Schema integers include whole numbers written as floats.
+            if isinstance(number, int):
+                return number
+            continue
         if candidate_type == "number":
-            try:
-                return int(value)
-            except (ValueError, TypeError):
-                pass
-            try:
-                val = float(value)
-            except (ValueError, TypeError):
-                continue
-            if not math.isfinite(val):
-                # inf/-inf/nan are not valid JSON numbers. Fall through so
-                # the value is preserved as a string instead of crashing
-                # (int(float("inf")) raises OverflowError) or emitting
-                # invalid JSON (json.dumps(inf) -> "Infinity").
-                continue
-            return val if val != int(val) else int(val)
+            number = _parse_finite_number(value)
+            if number is not None:
+                return number
+            # Not a number, or inf/nan: try the next type.
+            continue
         if candidate_type == "boolean":
             lower_val = value.lower().strip()
             if lower_val in ("true", "1"):
