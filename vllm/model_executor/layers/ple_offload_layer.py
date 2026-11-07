@@ -159,6 +159,35 @@ class CpuGpuSemaphore:
         )
 
 
+class _EarlyResultRelease:
+    """Per-forward switch owned by the connector of this GPU worker.
+
+    The custom op runs eagerly in forwards without CUDA graph replay, so it can
+    read this state at run time; graph captures never see ``active``.
+    """
+
+    def __init__(self) -> None:
+        self.active = False
+        self.released: set[int] = set()
+
+
+_early_result_release = _EarlyResultRelease()
+
+
+def begin_early_result_release(active: bool) -> None:
+    """Arm or disarm the mapped early release for the next forward."""
+    _early_result_release.active = active
+    _early_result_release.released.clear()
+
+
+def finish_early_result_release() -> set[int]:
+    """Disarm and return the flag addresses that the forward already reset."""
+    released = set(_early_result_release.released)
+    _early_result_release.active = False
+    _early_result_release.released.clear()
+    return released
+
+
 # ---------------------------------------------------------------------------
 # Custom op: vllm::ple_offload_wait
 # ---------------------------------------------------------------------------
@@ -176,7 +205,7 @@ def _ple_offload_wait_impl(
     cpu_output_buffer: torch.Tensor | None = None,
     num_tokens: int = 0,
 ) -> None:
-    """Wait for the CPU result without releasing its output buffer."""
+    """Wait for the CPU result; release a mapped result only when armed."""
     stream = torch.cuda.current_stream()
     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
     dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())
@@ -207,6 +236,23 @@ def _ple_offload_wait_impl(
             ),
             "cuMemcpyHtoDAsync(PLE consumer result)",
         )
+        if (
+            _early_result_release.active
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # The consumer copy above is the only read of the mapped result.
+            # Releasing it in stream order lets the worker gather the next
+            # chunk while this forward still runs.
+            _cuda_check(
+                cuda_driver.cuStreamWriteValue32(
+                    cuda_stream,
+                    dev_ptr,
+                    CpuGpuSemaphore.RESET_VALUE,
+                    0,
+                ),
+                "cuStreamWriteValue32(early release)",
+            )
+            _early_result_release.released.add(sem_flag_tensor.data_ptr())
 
 
 def _ple_offload_wait_fake(

@@ -1014,6 +1014,10 @@ class KernelConfig:
     """Serve eligible CPU PLE requests from a native owner thread."""
     ple_draft_prefetch: bool = True
     """Read PLE table pages of drafted tokens into page cache while drafting."""
+    ple_prefill_early_request: bool = False
+    """Send prompt-only PLE batches from host token copies at scheduling time and
+    release mapped results right after their consumer copy, so the CPU worker
+    gathers the next prefill chunk while the GPU still runs the current one."""
     ple_row_cache_mib: int = Field(default=1536, ge=0)
     """Packed-row cache (MiB) for CPU-owned GGUF PLE: the native fast lane's
     cache when it serves requests, otherwise the mapped row reader's."""
@@ -1155,6 +1159,7 @@ class KernelConfig:
             "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
             "ple_draft_prefetch",  # Page-cache readahead; results unchanged
             "ple_fast_lane",  # Same packed rows through a native owner thread
+            "ple_prefill_early_request",  # Request timing only; same rows
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",

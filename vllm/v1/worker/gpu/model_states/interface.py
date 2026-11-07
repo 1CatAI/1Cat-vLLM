@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,9 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.ple_offload.protocol import PleCpuInputs
 
 
 class ModelSpecificAttnMetadata:
@@ -61,6 +64,10 @@ class ModelState(ABC):
         return None
 
     def apply_staged_writes(self) -> None:
+        return None
+
+    def ple_cpu_inputs(self, input_batch: InputBatch) -> "PleCpuInputs | None":
+        """Host PLE inputs for an early request; None keeps the device path."""
         return None
 
     def preprocess_state(
