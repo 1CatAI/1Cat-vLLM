@@ -60,7 +60,9 @@ class SharedExpertLayerSpec:
 
     def __post_init__(self):
         object.__setattr__(self, "kinds", tuple(self.kinds))
-        if not 0 < self.resident < self.experts or len(self.kinds) != 3:
+        # resident == experts is a cold set of zero (ResidentExpertOwner); the
+        # native coordinator still requires a nonempty cold set.
+        if not 0 < self.resident <= self.experts or len(self.kinds) != 3:
             raise ValueError("Invalid shared expert layer specification")
         for rank in range(4):
             self.layouts(rank)
@@ -174,6 +176,145 @@ class SharedExpertOwner:
         self.close()
 
 
+class ResidentExpertOwner:
+    """A cold set of zero: the exchange reserve without a native coordinator.
+
+    The native planner requires a nonempty cold set. With every expert in its
+    own GPU slot there is no decode plan, so only rank 0's start-up reads pass
+    through this memfd. The one-page control arena carries the layer
+    fingerprint so every rank checks the same metadata.
+    """
+
+    def __init__(
+        self,
+        specs: tuple[SharedExpertLayerSpec, ...],
+        exchange_bytes=512 * 1024**2,
+    ):
+        self.specs = tuple(specs)
+        if not specs or any(s.resident != s.experts for s in specs):
+            raise ValueError("A resident expert owner requires all-resident layers")
+        self.data = SharedHostArena.create(exchange_bytes, "vllm-expert-exchange")
+        self.control = None
+        try:
+            self.control = SharedHostArena.create(4096, "vllm-expert-control")
+            struct.pack_into("=q", self.control.buffer, 7 * 8, _spec_fingerprint(specs))
+        except BaseException:
+            self.close()
+            raise
+
+    def send(self, connection: socket.socket):
+        if self.control is None:
+            raise RuntimeError("Resident expert owner is closed")
+        self.data.send(connection)
+        self.control.send(connection)
+
+    def close(self):
+        if self.control is not None:
+            self.control.close()
+            self.control = None
+        self.data.close()
+
+
+def resident_tables(specs, device=None):
+    """(slot table, cold offsets) of an all-resident layer set: slot = expert."""
+    experts = max(s.experts for s in specs)
+    table = torch.full((len(specs), experts), -1, dtype=torch.int32)
+    for i, spec in enumerate(specs):
+        if spec.resident != spec.experts:
+            raise ValueError("Resident tables require all-resident layers")
+        table[i, : spec.experts] = torch.arange(spec.experts, dtype=torch.int32)
+    cold = torch.full((len(specs), experts), -1, dtype=torch.int64)
+    return table.to(device), cold.to(device)
+
+
+class ResidentExpertRank:
+    """Per-rank view of an all-resident layer set (cold set of zero).
+
+    Slots never change, so decode routes resolve to themselves: no resolve
+    kernel, no control mapping and no host thread. ``mapped`` aliases the
+    exchange reserve for the start-up loads; ``table`` and ``cold_offsets``
+    give the shared prefill an identity residency with no cold expert.
+    """
+
+    def __init__(
+        self,
+        data: SharedHostArena,
+        control: SharedHostArena,
+        rank: int,
+        specs: tuple[SharedExpertLayerSpec, ...],
+        banks: dict,
+        device: torch.device,
+    ):
+        device = torch.device(device)
+        if (
+            not specs
+            or rank not in range(4)
+            or device.type != "cuda"
+            or torch.accelerator.current_device_index() != device.index
+        ):
+            raise ValueError("Select this TP rank's CUDA device before registration")
+        if struct.unpack_from("=q", control.buffer, 7 * 8)[0] != _spec_fingerprint(
+            specs
+        ):
+            raise ValueError("Shared expert TP ranks have different layer metadata")
+        self.data, self.control, self.rank = data, control, rank
+        self.specs, self.banks, self.device = specs, banks, device
+        self.experts = max(s.experts for s in specs)
+        self.native = _native()
+        self._registered: list[int] = []
+        self.host = self.mapped = None
+        self.ready = False
+        try:
+            for i, spec in enumerate(specs):
+                for shard, geometry in zip(SHARDS, spec.layouts(rank)):
+                    bank = banks[i, shard]
+                    if (
+                        bank.device != device
+                        or bank.dtype != torch.uint8
+                        or bank.ndim != 3
+                        or bank.shape[0] != spec.experts
+                        or bank.shape[1:]
+                        != (geometry.device_rows, geometry.device_row_bytes)
+                    ):
+                        raise ValueError("GPU bank does not match the shared layer")
+            self.host = torch.frombuffer(data.buffer, dtype=torch.uint8)
+            self.native.host_register(self.host.data_ptr(), self.host.numel())
+            self._registered.append(self.host.data_ptr())
+            self.mapped = self.native.mapped_view(self.host, device.index)
+            self.table, self.cold_offsets = resident_tables(specs, device)
+        except BaseException:
+            self.close()
+            raise
+
+    def warmup(self):
+        self.ready = True
+
+    def resolve(self, layer: int, ids: torch.Tensor, weights=None):
+        if not self.ready:
+            raise RuntimeError("Warm up shared expert kernels before resolving routes")
+        if (
+            not 0 <= layer < len(self.specs)
+            or ids.device != self.device
+            or ids.dtype not in (torch.int32, torch.int64)
+            or not ids.is_contiguous()
+            or not 0 < ids.numel() <= self.specs[layer].experts
+        ):
+            raise ValueError("Invalid resident expert routes")
+        return ids
+
+    def close(self):
+        try:
+            if self._registered:
+                torch.accelerator.synchronize(self.device)
+        finally:
+            self.mapped = None
+            for pointer in reversed(self._registered):
+                self.native.host_unregister(pointer)
+            self._registered.clear()
+            self.host = None
+            self.ready = False
+
+
 _INPLACE_RANKS: Any = []
 _ALL_RANKS: Any = []
 
@@ -270,17 +411,22 @@ class SharedExpertRank:
         rank: int,
         specs: tuple[SharedExpertLayerSpec, ...],
         banks: dict,
+        device: torch.device | None = None,
     ):
+        # ``rank`` is the TP rank in the group; ``device`` is this process's
+        # CUDA device, which differs on later pipeline stages (cuda:4-7).
+        device = torch.device("cuda", rank) if device is None else torch.device(device)
         if (
             not specs
             or rank not in range(4)
-            or torch.accelerator.current_device_index() != rank
+            or device.type != "cuda"
+            or torch.accelerator.current_device_index() != device.index
         ):
             raise ValueError("Select this TP rank's CUDA device before registration")
         self.data, self.control, self.rank = data, control, rank
         self.specs, self.banks = specs, banks
         self.geometries = [spec.layouts(rank) for spec in specs]
-        self.device = torch.device("cuda", rank)
+        self.device = device
         self.experts = max(s.experts for s in specs)
         self.native = _native()
         layout = self.native.shared_expert_control_layout()
@@ -319,8 +465,10 @@ class SharedExpertRank:
                     tensor.data_ptr(), tensor.numel() * tensor.element_size()
                 )
                 self._registered.append(tensor.data_ptr())
-            self.mapped = self.native.mapped_view(self.host, rank)
-            self.control_view = self.native.mapped_view(self.control_host, rank)
+            self.mapped = self.native.mapped_view(self.host, self.device.index)
+            self.control_view = self.native.mapped_view(
+                self.control_host, self.device.index
+            )
             table = torch.full((len(specs), self.experts), -1, dtype=torch.int32)
             cold = torch.full((len(specs), self.experts), -1, dtype=torch.int64)
             cold_base = 0

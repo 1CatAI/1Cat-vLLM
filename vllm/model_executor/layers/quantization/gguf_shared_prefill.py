@@ -304,7 +304,9 @@ class SharedOriginalPrefill:
         # Cold experts: DMA of each rank's original slice into a GPU staging
         # bank (device-carrier layout), double buffered and prefetched one
         # tile ahead on a copy stream, instead of mapped zero-copy reads.
-        self.dma = envs.VLLM_V41_PREFILL_DMA == "1"
+        # A cold set of zero has nothing to stage: no staging bank, no ring.
+        self.all_resident = cache.budget.all_resident
+        self.dma = envs.VLLM_V41_PREFILL_DMA == "1" and not self.all_resident
         self.timing = envs.VLLM_V41_PREFILL_TIMING == "1" and cache.rank == 0
         self._t = []  # (layer, kind, event) of the current pass
         self._s = []  # (kind, event) GEMM-loop sub-steps of the current pass
@@ -742,7 +744,7 @@ class SharedOriginalPrefill:
         ):
             bank = runtime.banks[layer, shard]
             hot_sources.append(bank.data_ptr() + slots.long() * bank[0].numel())
-            if not staged:
+            if not staged and not self.all_resident:
                 cold_sources.append(
                     runtime.mapped.data_ptr()
                     + cold
@@ -770,10 +772,10 @@ class SharedOriginalPrefill:
         ):
             fmt = info[key]
             weights, stats = self.bank(key, fmt)
-            for resident, ids, count, pointers in (
-                (True, self.hot_ids, self.hot_count, hot_sources),
-                (False, self.cold_ids, self.cold_count, cold_sources),
-            ):
+            passes = [(True, self.hot_ids, self.hot_count, hot_sources)]
+            if not self.all_resident:  # else the cold count is always zero
+                passes.append((False, self.cold_ids, self.cold_count, cold_sources))
+            for resident, ids, count, pointers in passes:
                 if not resident and staged and key == "gu":
                     self._mark(layer, "wait0")
                     torch.cuda.current_stream(cache.device).wait_event(
