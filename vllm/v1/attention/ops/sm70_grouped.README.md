@@ -14,7 +14,13 @@ return types. Backend callers import from this owner.
 | E4M3 | 1–16 | B1: 2–8; B>1: B×8 | positive multiple of 16 | uint8 | D256/GQA6, aligned cache; batch requires revision 6 |
 | E4M3 explicit groups | 1–16 | G×8, padded rows allowed | positive multiple of 16 | uint8 | compact group table and device row lengths |
 
-All three contracts retain the 266240-token capacity ceiling. The E4M3
+FP16 and ordinary E4M3 calls retain the 266240-token capacity ceiling. A qualified
+E4M3 graph uses the served `max_model_len` when the loaded grouped operator reports
+the dynamic-context ABI; old binaries remain limited to 256K. The long-context
+owner resolves this window for graph capture, table admission and scalar workspace
+planning. Scalar partitions cover 1024 tokens each, with a fixed-size tiled FP32
+reduction; there is no separate length environment variable or 1M ceiling.
+Both wrappers admit only the page-rounded table for the resolved window. The E4M3
 predicate retains its existing CPU descriptor admission for policy tests; the
 native loader determines availability. FP16's CUDA guard, query/output
 alignment and narrower shape limits are unchanged. Preserve the legacy
@@ -28,8 +34,9 @@ its predicates re-export the common wrappers. `sm70_grouped_scalar.py` and
 `sm70_grouped_long.py` own the existing specialized family members. Their old
 `sm70_e4m3_{scalar,long}` paths alias the same module objects, preserving mutable
 state, caches and patches; original logger names remain unchanged. Their
-arithmetic, manifests, workspace geometry, launch ABI and route policies have
-not been generalized or numerically changed by this admission refactor.
+six-head FP32 state remains unchanged. The dynamic scalar workspace and native
+ABI compatibility are described in
+`docs/design/sm70_e4m3_dynamic_context.md`.
 
 Adding an entry declares admission and a provider; it does not implement a new
 native storage reader or ABI. An unsupported codec fails closed. Native INT8

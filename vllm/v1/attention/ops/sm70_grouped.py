@@ -225,7 +225,35 @@ def grouped_fp32_reason(
         return "kv_shape_or_unmeasured_page"
     if contract.early_cache_dtype and not codec.stores(k, v):
         return "kv_layout"
-    if not 0 < parent.shape[1] * k.shape[1] <= MAX_CONTEXT:
+    context_limit = MAX_CONTEXT
+    if codec is FP8_E4M3 and parent.shape[1] * k.shape[1] > MAX_CONTEXT:
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+        from vllm.v1.attention.ops.sm70_grouped_long import (
+            builtin_dynamic_context,
+            long_attention_graph_contract,
+        )
+
+        descriptor = (
+            get_forward_context().batch_descriptor
+            if is_forward_context_available()
+            else None
+        )
+        bucket = getattr(descriptor, "attention_context_bucket", None)
+        if bucket is not None and bucket > 0:
+            capacity, _ = long_attention_graph_contract(bucket)
+            if (
+                capacity is not None
+                and bucket <= capacity
+                and builtin_dynamic_context()
+            ):
+                context_limit = max(
+                    context_limit,
+                    ((capacity + k.shape[1] - 1) // k.shape[1]) * k.shape[1],
+                )
+    if not 0 < parent.shape[1] * k.shape[1] <= context_limit:
         return "context_capacity"
     if not explicit and (parent_seq is None or parent_seq.shape != (groups,)):
         return "request_metadata"
