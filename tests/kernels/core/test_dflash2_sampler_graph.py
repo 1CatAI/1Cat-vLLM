@@ -94,7 +94,7 @@ def test_graph_matches_existing_rejection_with_live_slots(
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
     monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *a: True)
     monkeypatch.setattr(
-        sparse_rejection, "_supports_sparse_sampling_contract", lambda *a: True
+        sparse_rejection, "_supports_sparse_sampling_contract", lambda *a, **k: True
     )
     monkeypatch.setattr(sampler_graph, "_all_ranks_support", lambda status: status == 0)
     original_graph_try = sampler_graph.try_graph_rejection

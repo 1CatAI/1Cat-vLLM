@@ -90,13 +90,13 @@ def test_single_request_cutoff_ties_preserve_dense_tokens(
 
     class Speculator:
         draft_logits = draft_dense
+        _trace = SimpleNamespace(value=lambda name: False)
 
         def get_sparse_draft_logits(self):
             return draft_ids, draft_scores
 
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
     monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *args: True)
-    monkeypatch.setattr(sparse_rejection.envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
     monkeypatch.setattr(
         sparse_rejection, "_supports_sparse_sampling_contract", lambda *a, **k: True
     )
@@ -248,15 +248,13 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
 
     class Speculator:
         draft_logits = draft_dense
+        _trace = SimpleNamespace(value=lambda name: False)
 
         def get_sparse_draft_logits(self):
             return draft_ids, draft_scores
 
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
-    monkeypatch.setattr(
-        sparse_rejection.envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True
-    )
-    monkeypatch.setattr(sparse_rejection.envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
+    monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *args: True)
     monkeypatch.setattr(
         sparse_rejection, "_supports_sparse_sampling_contract", lambda *a, **k: True
     )
