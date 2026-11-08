@@ -146,7 +146,7 @@ from vllm.v1.attention.backends.gdn_attn import (
 )
 from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
 from vllm.v1.attention.ops.gdn_state import GdnMetadataOverride
-from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
+from vllm.v1.worker.gpu.spec_decode import uses_sm70_short_window_verifier
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -544,7 +544,9 @@ def _sm70_qwen_gdn_spec_method(vllm_config: object) -> str | None:
 
 
 def _is_dflash2_spec_config(vllm_config: object) -> bool:
-    return uses_dflash_selector_engine(vllm_config)
+    # Short-window verifier contract shared by DFlash2 and native MTP; the
+    # historical name is kept for its callers.
+    return uses_sm70_short_window_verifier(vllm_config)
 
 
 def _sm70_current_device_is_volta() -> bool:

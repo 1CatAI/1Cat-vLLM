@@ -22,7 +22,10 @@ from vllm.v1.attention.backends.flash_v100.spec import (
 )
 from vllm.v1.attention.backends.flash_v100.spec.features import prepare_verification
 from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import metadata_view
-from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
+from vllm.v1.worker.gpu.spec_decode import (
+    uses_dflash_selector_engine,
+    uses_sm70_short_window_verifier,
+)
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
@@ -96,14 +99,19 @@ def initialize_builder(self: Any, spec_config) -> None:
         and get_dflash_model_draft_tokens(spec_config) == 7
         and selector_engine
     )
+    # Native MTP targets verify the same short causal windows as DFlash2.
+    mtp_target = bool(
+        getattr(spec_config, "method", None) == "mtp"
+        and not self._is_speculative_draft_model
+        and uses_sm70_short_window_verifier(self.vllm_config)
+    )
     self._use_sm70_dflash2_fused_smallq_metadata = bool(
         sm70_dflash2_enabled(
             "fused_smallq_metadata", capture_sm70_dflash2_config(self.vllm_config)
         )
         and self.device.type == "cuda"
         and current_platform.is_device_capability(70)
-        and use_dflash
-        and selector_engine
+        and ((use_dflash and selector_engine) or mtp_target)
     )
     if self._use_sm70_dflash2_fused_smallq_metadata:
         logger.info_once("SM70 DFlash2 fused Flash-V100 small-query metadata active.")

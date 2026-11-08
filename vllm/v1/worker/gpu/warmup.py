@@ -273,6 +273,18 @@ def warmup_kernels(
                 num_reqs = profile_reqs
             if profile_reqs <= 0:
                 continue
+            profile_params = sampling_params
+            if (
+                profile_params is not None
+                and profile_params.prompt_logprobs
+                and prompt_len > default_prompt_len
+            ):
+                # Prompt logprobs gather full-vocabulary logits per 1024-row
+                # chunk (about 0.5 GiB at a 248K vocabulary), which does not
+                # fit beside a 16 GB card's KV pool. The short profile already
+                # exercises that path; long profiles only warm the kernels.
+                profile_params = profile_params.clone()
+                profile_params.prompt_logprobs = None
             _warmup_cycle(
                 model_runner,
                 worker_execute_model,
@@ -280,7 +292,7 @@ def warmup_kernels(
                 f"{profile_idx}",
                 profile_reqs,
                 prompt_len,
-                sampling_params,
+                profile_params,
                 pooling_params,
                 block_count,
                 kv_cache_specs,

@@ -154,7 +154,7 @@ class MambaHybridModelState(DefaultModelState):
         self._dflash2_gdn_group_descriptor: DFlash2GDNGroupDescriptor | None = None
         self._dflash2_fused_gdn_metadata_logged = False
         self._use_dflash2_grouped_smallq_metadata = bool(
-            self._use_dflash2_common_gdn_metadata
+            self._use_common_gdn_metadata
             and sm70_dflash2_enabled(
                 "fused_smallq_metadata", capture_sm70_dflash2_config(vllm_config)
             )

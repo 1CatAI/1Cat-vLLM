@@ -30,6 +30,27 @@ def uses_dflash_selector_engine(vllm_config: object) -> bool:
         return False
 
 
+def uses_sm70_short_window_verifier(vllm_config: object) -> bool:
+    """Return whether the target verifies a short causal draft window per request.
+
+    The DFlash2 selector engine and native MTP (one to seven drafts) share the
+    target-side contract: each speculative request carries at most eight query
+    rows, recurrent-state slots selected by the accepted length, and the same
+    GDN/attention metadata. Each fused operator still checks its live shape and
+    falls back on its own.
+    """
+    if uses_dflash_selector_engine(vllm_config):
+        return True
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if getattr(speculative_config, "method", None) != "mtp":
+        return False
+    try:
+        steps = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return 1 <= steps <= 7
+
+
 def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
