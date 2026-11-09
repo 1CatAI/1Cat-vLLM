@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -26,6 +27,7 @@ def _prepare_dflash_inputs_to_capture(
     num_tokens: int,
     input_buffers: InputBuffers,
     block_tables: BlockTables,
+    query_slot_mappings: torch.Tensor,
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     max_model_len: int,
@@ -34,7 +36,11 @@ def _prepare_dflash_inputs_to_capture(
 ) -> CapturedAttentionState:
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+    # DFlash owns a K+1 query batch which can be wider than the target token
+    # budget. Keep its persistent graph input independent from the target
+    # BlockTables slot-mapping allocation.
+    query_slot_mappings.fill_(PAD_SLOT_ID)
+    slot_mappings = query_slot_mappings[:, :num_tokens]
     slot_mappings_by_layer = build_slot_mappings_by_layer(
         slot_mappings, kv_cache_config
     )
@@ -81,6 +87,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
         forward_fn: Callable,
         input_buffers: InputBuffers,
         block_tables: BlockTables,
+        query_slot_mappings: torch.Tensor,
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
@@ -102,6 +109,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 num_tokens,
                 input_buffers,
                 block_tables,
+                query_slot_mappings,
                 attn_groups,
                 kv_cache_config,
                 max_model_len,

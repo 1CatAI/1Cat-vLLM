@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026, 1CatAI.
+
+// The raw endpoint assumes zero-shift exponentials and FP16 numerators fit.
+// Model scores violate both assumptions. Keep block masses and the online
+// accumulator in FP32, and bound each FP16 PV operation by scaling V.
+__device__ float const* g_79t_tail_row_max = nullptr;
+__device__ int* g_79t_prefix_outliers = nullptr;
+__device__ int* g_79t_score_recovery = nullptr;
+// FP32 accumulation alone does not protect an FP16 score workspace. Outside
+// the finite range, recompute the affected 64-token query tile from original
+// Q/K with FP32 logits, avoiding both storage overflow and coarse rounding.
+// Reuse centered/scaled V and restore only after FP32 normalization.
+constexpr float kStableCompactScoreLimit = 65504.0f;
+constexpr int kStableRecoveryRows = 64 * 6;
+// Keep the established normal-range shift and V scaling. Recovery corrects
+// unsafe tiles without changing these rounding choices for unaffected tiles.
+constexpr float kStableScoreMargin = 4.0f;
+constexpr float kStableValueCenterThreshold = 0.05f;
+constexpr float kStableMaxExpInput = 10.0f;
+constexpr float kStableValueHeadroom = 64.0f;
+
+#if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+using StablePrefixPartial = float;
+__device__ __forceinline__ float stable_partial_to_float(float value) {
+  return value;
+}
+#else
+using StablePrefixPartial = __half;
+__device__ __forceinline__ float stable_partial_to_float(__half value) {
+  return __half2float(value);
+}
+#endif
+
+__device__ __forceinline__ float stable_exp(float value, float maximum) {
+  return exp2f(fminf(value - maximum, kStableMaxExpInput) *
+               1.4426950408889634f);
+}
+
+__device__ __forceinline__ int stable_tail_query_tile() {
+  constexpr int kTailTiles =
+      PREFIX_TORCH_QUERY_TOKENS / PREFIX_BATCHED_TAIL_TILE_TOKENS;
+  constexpr int kGroupTiles = PREFIX_TAIL_FINE_PV_GROUP_TILES;
+  int task = pv_task_index();
+  int first = 0;
+  int tasks = kTailTiles;
+  while (task >= tasks) {
+    task -= tasks;
+    first += kGroupTiles;
+    tasks -= kGroupTiles;
+  }
+  return first + task;
+}
+
+__device__ __forceinline__ float stable_value_scale(float maximum) {
+  maximum = fmaxf(maximum, 1.0f);
+  int exponent;
+  float mantissa = frexpf(maximum, &exponent);
+  return ldexpf(1.0f, exponent - (mantissa == 0.5f)) * kStableValueHeadroom;
+}
+
+__global__ void stable_value_center(__half const* values, float* center,
+                                    int total_kv) {
+  int d = threadIdx.x;
+  if (d >= 256) return;
+  int samples = min(total_kv, 4096);
+  float sum = 0.0f;
+  for (int token = 0; token < samples; ++token)
+    sum += __half2float(values[int64_t(token) * 256 + d]);
+  float mean = sum / samples;
+  center[d] = fabsf(mean) >= kStableValueCenterThreshold ? mean : 0.0f;
+}
+
+__global__ void stable_value_amax(__half const* values, float const* center,
+                                  float* maximum, int elements) {
+  float local = 0.0f;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < elements;
+       i += blockDim.x * gridDim.x) {
+    local = fmaxf(local, fabsf(__half2float(values[i]) - center[i & 255]));
+  }
+  for (int offset = 16; offset; offset >>= 1)
+    local = fmaxf(local, __shfl_down_sync(0xffffffffu, local, offset));
+  __shared__ float warp_max[8];
+  if ((threadIdx.x & 31) == 0) warp_max[threadIdx.x >> 5] = local;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float value = 0.0f;
+    for (int i = 0; i < 8; ++i) value = fmaxf(value, warp_max[i]);
+    atomicMax(reinterpret_cast<unsigned int*>(maximum), __float_as_uint(value));
+  }
+}
+
+__global__ void stable_scale_values(__half const* input, __half* output,
+                                    float const* center, float const* maximum,
+                                    int elements) {
+  __shared__ float inverse;
+  if (threadIdx.x == 0) inverse = 1.0f / stable_value_scale(*maximum);
+  __syncthreads();
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < elements;
+       i += blockDim.x * gridDim.x)
+    output[i] =
+        __float2half_rn((__half2float(input[i]) - center[i & 255]) * inverse);
+}
+
+__global__ void stable_restore_recovered(float const* recovered,
+                                         float const* center,
+                                         float const* maximum,
+                                         int const* recovery_tiles,
+                                         __half* output) {
+  int tile = blockIdx.x;
+  if (!recovery_tiles[tile]) return;
+  int d = threadIdx.x;
+  float scale = stable_value_scale(*maximum);
+  float bias = center[d];
+  for (int local = 0; local < kStableRecoveryRows; ++local) {
+    int row = tile * kStableRecoveryRows + local;
+    int64_t index = int64_t(row) * 256 + d;
+    output[index] = __float2half_rn(recovered[index] * scale + bias);
+  }
+}
+
+// Each lane reads a pair of adjacent query rows. K tiles stay independent,
+// preserving coalesced loads from the transposed cuBLAS score workspace.
+template <bool Tail, bool Repair = false>
+__global__ void stable_row_max_partials(__half const* scores, float* partials,
+                                        int rows, int width) {
+  int row = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (row >= rows) return;
+  if constexpr (Repair) {
+    if (!g_79t_prefix_outliers[row / PVThreadblockShape::kM]) return;
+  }
+  int stride = rows;
+  int local_row = row;
+  int64_t base = 0;
+  if constexpr (Tail) {
+    constexpr int tile_tokens = PREFIX_BATCHED_TAIL_TILE_TOKENS;
+    constexpr int tile_rows = tile_tokens * 6;
+    int tile = row / tile_rows;
+    local_row = row % tile_rows;
+    stride = tile_rows;
+    width = (tile + 1) * tile_tokens;
+    base = int64_t(tile_rows) * tile_tokens * tile * (tile + 1) / 2;
+  }
+  float2 maximum = {-CUDART_INF_F, -CUDART_INF_F};
+  float2 sampled = {-CUDART_INF_F, -CUDART_INF_F};
+  int end = min(width, int(blockIdx.y + 1) * 8192);
+  // Tail numerators are stored in FP16, so their shift always uses every key.
+  // Prefix PV detects missed peaks while reading all scores; flagged tiles are
+  // rescanned completely and recomputed before their output can be merged.
+  constexpr int kStride = (Tail || Repair) ? 1 : 8;
+#pragma unroll 4
+  for (int col = int(blockIdx.y) * 8192; col < end; col += kStride) {
+    float2 value = __half22float2(*reinterpret_cast<__half2 const*>(
+        scores + base + int64_t(col) * stride + local_row));
+    maximum.x = fmaxf(maximum.x, value.x);
+    maximum.y = fmaxf(maximum.y, value.y);
+    if constexpr (Tail) {
+      if (col % 8 == 0) {
+        sampled.x = fmaxf(sampled.x, value.x);
+        sampled.y = fmaxf(sampled.y, value.y);
+      }
+    }
+  }
+  int64_t offset = int64_t(blockIdx.y) * rows + row;
+  partials[offset] = maximum.x;
+  partials[offset + 1] = maximum.y;
+  if constexpr (Tail) {
+    int64_t sample_offset = int64_t(gridDim.y + blockIdx.y) * rows + row;
+    partials[sample_offset] = sampled.x;
+    partials[sample_offset + 1] = sampled.y;
+  }
+}
+
+template <bool Tail, bool Repair = false>
+__global__ void stable_finish_max(float const* partials, float* maxima,
+                                  int rows, int tiles) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  if constexpr (Repair) {
+    if (!g_79t_prefix_outliers[row / PVThreadblockShape::kM]) return;
+  }
+  float value = -CUDART_INF_F;
+  for (int tile = 0; tile < tiles; ++tile)
+    value = fmaxf(value, partials[int64_t(tile) * rows + row]);
+  float shift_value = value;
+  if constexpr (Tail) {
+    float sampled = -CUDART_INF_F;
+    for (int tile = 0; tile < tiles; ++tile)
+      sampled = fmaxf(sampled, partials[int64_t(tiles + tile) * rows + row]);
+    // Keep the sampled shift only when its margin bounds every tail score.
+    // A missed peak can overflow the FP16 numerator before normalization.
+    if (isfinite(sampled) && value <= sampled + kStableScoreMargin)
+      shift_value = sampled;
+  }
+  maxima[row] = shift_value + kStableScoreMargin;
+  // A prefix sample can miss a peak by at most kStableMaxExpInput without
+  // triggering the complete-max repair. Reserve that gap in the admission
+  // bound; the repair and tail scans already see the complete maximum.
+  constexpr float upper =
+      kStableCompactScoreLimit - ((Tail || Repair) ? 0.0f : kStableMaxExpInput);
+  if (!isfinite(value) || value > upper || value < -kStableCompactScoreLimit) {
+    atomicExch(g_79t_score_recovery + row / kStableRecoveryRows, 1);
+  }
+  if constexpr (!Tail) {
+    if constexpr (Repair) {
+      // The replacement PV must overwrite both numerator and denominator.
+      g_row_sum_out[row] = 0.0f;
+    } else if (row % PVThreadblockShape::kM == 0) {
+      g_79t_prefix_outliers[row / PVThreadblockShape::kM] = 0;
+    }
+  }
+}
+
+__global__ void stable_merge_prefix(StablePrefixPartial const* partial,
+                                    float* block_sum, float const* block_max,
+                                    float* accumulator, float* sum,
+                                    float* maximum, bool first) {
+  constexpr int kRowsPerBlock = 4;
+  constexpr int kThreadsPerRow = 64;
+  int group = threadIdx.x / kThreadsPerRow;
+  int lane = threadIdx.x % kThreadsPerRow;
+  int row = blockIdx.x * kRowsPerBlock + group;
+  bool valid = row < g_rows;
+  __shared__ float scales[kRowsPerBlock][2];
+  if (lane == 0 && valid) {
+    float old_max = first ? -CUDART_INF_F : maximum[row];
+    float next = fmaxf(old_max, block_max[row]);
+    scales[group][0] = first ? 0.0f : expf(old_max - next);
+    scales[group][1] = expf(block_max[row] - next);
+    sum[row] = (first ? 0.0f : sum[row] * scales[group][0]) +
+               block_sum[row] * scales[group][1];
+    maximum[row] = next;
+    block_sum[row] = 0.0f;
+  }
+  __syncthreads();
+  if (!valid) return;
+#pragma unroll
+  for (int d = lane; d < 256; d += kThreadsPerRow) {
+    int64_t index = int64_t(row) * 256 + d;
+    accumulator[index] =
+        (first ? 0.0f : accumulator[index] * scales[group][0]) +
+        stable_partial_to_float(partial[index]) * scales[group][1];
+  }
+}
+
+__global__ void stable_merge_final(float const* prefix, float const* prefix_sum,
+                                   float const* prefix_max, __half const* tail,
+                                   float const* tail_sum, float const* tail_max,
+                                   float const* value_center,
+                                   float const* value_max, __half* output,
+                                   int repaired_rows, bool has_prefix) {
+  int row = blockIdx.x;
+  int d = threadIdx.x;
+  __shared__ float coefficients[3];
+  if (d == 0) {
+    float pm = has_prefix ? prefix_max[row] : -CUDART_INF_F;
+    float tm = tail_max[row];
+    float m = fmaxf(pm, tm);
+    float ps = has_prefix ? expf(pm - m) : 0.0f;
+    float ts = expf(tm - m);
+    float mass =
+        (has_prefix ? prefix_sum[row] * ps : 0.0f) + tail_sum[row] * ts;
+    coefficients[0] = ps;
+    coefficients[1] = row < repaired_rows ? ts * tail_sum[row] : ts;
+    coefficients[2] = stable_value_scale(*value_max) / mass;
+  }
+  __syncthreads();
+  int64_t index = int64_t(row) * 256 + d;
+  float p = has_prefix ? prefix[index] * coefficients[0] : 0.0f;
+  output[index] = __float2half_rn(
+      (p + __half2float(tail[index]) * coefficients[1]) * coefficients[2] +
+      value_center[d]);
+}

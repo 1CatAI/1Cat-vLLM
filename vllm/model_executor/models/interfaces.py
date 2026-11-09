@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import weakref
 from collections.abc import (
     AsyncGenerator,
     Callable,
@@ -74,6 +75,19 @@ The output embeddings must be one of the following formats:
 - A single 3D tensor, with the batch dimension grouping the 2D tensors.
 """
 
+MambaStateShapes: TypeAlias = (
+    tuple[tuple[int, int]]
+    | tuple[tuple[int, int, int]]
+    | tuple[tuple[int, int], tuple[int, int]]
+    | tuple[tuple[int, int], tuple[int, int, int]]
+    | tuple[
+        tuple[int, int],
+        tuple[int, int, int],
+        tuple[int, int, int],
+        tuple[int, int, int],
+    ]
+)
+
 
 def _require_is_multimodal(is_multimodal: Tensor | None) -> Tensor:
     """
@@ -91,8 +105,11 @@ def _require_is_multimodal(is_multimodal: Tensor | None) -> Tensor:
     return is_multimodal
 
 
-# Cache results of `SupportsMultiModal.get_language_model`
-_language_model_by_module = dict[nn.Module, VllmModel]()
+# Cache results of `SupportsMultiModal.get_language_model` without pinning the
+# outer model (and therefore its weights/KV cache) for the interpreter lifetime.
+_language_model_by_module: weakref.WeakKeyDictionary[nn.Module, VllmModel] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 @runtime_checkable
@@ -815,7 +832,7 @@ class IsHybrid(Protocol):
     def get_mamba_state_shape_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    ) -> MambaStateShapes:
         """Calculate shapes for Mamba's convolutional and state caches.
 
         Args:
@@ -1306,6 +1323,7 @@ def supports_any_eagle(
 
 class EagleModelMixin:
     aux_hidden_state_layers: tuple[int, ...] = ()
+    aux_hidden_state_dtype: torch.dtype | None = None
 
     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.aux_hidden_state_layers = layers
@@ -1322,7 +1340,17 @@ class EagleModelMixin:
             # Keep a stable snapshot for Eagle3/DFlash. Some optimized model
             # paths reuse or mutate hidden-state storage across layers, which
             # can otherwise make every collected aux tensor alias the final one.
-            aux_hidden_states.append(value.clone())
+            # A drafter may request the dtype it already uses at its projection
+            # boundary. Only convert when storage shrinks; widening a copy can
+            # also change a compiler's intermediate rounding. Never cast the
+            # target's hidden states or residuals.
+            aux_hidden_states.append(
+                value.to(dtype=self.aux_hidden_state_dtype, copy=True)
+                if self.aux_hidden_state_dtype is not None
+                and torch.finfo(self.aux_hidden_state_dtype).bits
+                < 8 * value.element_size()
+                else value.clone()
+            )
         return aux_hidden_states
 
 

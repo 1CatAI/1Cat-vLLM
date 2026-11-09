@@ -8,6 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode
+from vllm.config.execution_policy import CommunicationPolicy
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -15,6 +16,8 @@ from vllm.v1.worker.gpu_worker import Worker
 
 
 def _worker() -> SimpleNamespace:
+    policy = CommunicationPolicy()
+    policy.resolve()
     model_config = SimpleNamespace(
         dtype=torch.float16,
     )
@@ -34,6 +37,7 @@ def _worker() -> SimpleNamespace:
         ),
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(
+                communication=policy,
                 pipeline_parallel_size=2,
                 tensor_parallel_size=4,
                 enable_dbo=False,

@@ -6,21 +6,38 @@ from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
-from vllm.platforms import current_platform
-from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
-    _should_share,
-    get_target_lm_head,
+from vllm.model_executor.models.interfaces import EagleModelMixin
+from vllm.model_executor.models.shared_weights import (
+    DFLASH_DRAFT_WEIGHTS,
+    share_embeddings,
+    share_lm_head,
+    validate_dflash_shared_weights,
 )
+from vllm.model_executor.models.shared_weights import (
+    get_target_lm_head as get_target_lm_head,
+)
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
 
+def _validate_dflash_shared_weights(
+    dflash_model: nn.Module,
+    shared_embed: bool,
+    shared_lm_head: bool,
+) -> None:
+    validate_dflash_shared_weights(
+        dflash_model,
+        shared_embed,
+        shared_lm_head,
+        is_last_rank=get_pp_group().is_last_rank,
+        log=logger,
+    )
+
+
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
-    from vllm.model_executor.models.qwen3_dflash import (
-        dflash_has_any_non_causal,
-        dflash_target_rope_is_neox_style,
-    )
+    from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -37,15 +54,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             "Using FP16 draft KV cache for SM70 DFlash while the target uses %s.",
             vllm_config.cache_config.cache_dtype,
         )
-    # The drafter must rotate Q/K the way its target does. Take that from the
-    # built target before super() constructs the draft.
-    is_neox_style = dflash_target_rope_is_neox_style(target_model)
-    if is_neox_style is not None:
-        draft_model_config.hf_config.is_neox_style = is_neox_style
     # Select an attention backend that supports the drafter's attention: mixing
     # a non-causal layer onto a causal-only backend would fail.
     draft_vllm_config = replace(
         vllm_config,
+        is_speculative_draft=True,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
@@ -70,32 +83,33 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    # MuseGlimmerForCausalLM marks its inner MuseGlimmerModel as the language
-    # model, so get_language_model() already returns the inner module and has
-    # no .model of its own.
-    target_inner = getattr(target_language_model, "model", target_language_model)
-    draft_inner = dflash_model.model
+    shared_embed = share_embeddings(
+        dflash_model,
+        target_language_model,
+        DFLASH_DRAFT_WEIGHTS,
+        log=logger,
+    )
+    shared_lm_head = share_lm_head(
+        dflash_model,
+        target_model,
+        target_language_model,
+        DFLASH_DRAFT_WEIGHTS,
+        log=logger,
+    )
 
-    # Skip embedding sharing under PP — each rank owns its own embedding.
-    if get_pp_group().world_size == 1:
-        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
-            target_inner, "embedding", None
+    _validate_dflash_shared_weights(dflash_model, shared_embed, shared_lm_head)
+
+    # Keep only the precision the loaded drafter consumes. This affects the
+    # auxiliary snapshots, never the target model's hidden/residual tensors.
+    # Other drafters retain their existing auxiliary-state contract.
+    get_aux_dtype = getattr(dflash_model, "get_aux_hidden_state_dtype", None)
+    aux_dtype = get_aux_dtype() if get_aux_dtype is not None else None
+    if aux_dtype is not None:
+        for module in target_model.modules():
+            if isinstance(module, EagleModelMixin):
+                module.aux_hidden_state_dtype = aux_dtype
+        logger.info(
+            "DFlash auxiliary snapshot compaction uses projection dtype %s.", aux_dtype
         )
-        draft_embed = getattr(draft_inner, "embed_tokens", None)
-        if target_embed is not None and _should_share(
-            dflash_model, "has_own_embed_tokens", draft_embed, target_embed
-        ):
-            if draft_embed is not None:
-                del draft_inner.embed_tokens
-            draft_inner.embed_tokens = target_embed
-
-    target_lm_head = get_target_lm_head(target_model, target_language_model)
-    draft_lm_head = getattr(dflash_model, "lm_head", None)
-    if target_lm_head is not None and _should_share(
-        dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
-    ):
-        if draft_lm_head is not None:
-            del dflash_model.lm_head
-        dflash_model.lm_head = target_lm_head
 
     return dflash_model

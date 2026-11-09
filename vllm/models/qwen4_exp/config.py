@@ -64,6 +64,16 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
         rope_scaling = kwargs.get("rope_scaling")
         rope_theta = kwargs.get("rope_theta", 10_000.0)
+        # Newer Qwen4Exp exports spell the QSA attention layers
+        # "qwen_sparse_attention"; older ones say "full_attention". They select
+        # the same path (Qwen4ExpQSAAttention is used whenever indexer_n_heads
+        # is set), so normalize here -- one place covers the decoder layers, the
+        # MTP head and the KV-cache spec.
+        if layer_types is not None:
+            layer_types = [
+                "full_attention" if lt == "qwen_sparse_attention" else lt
+                for lt in layer_types
+            ]
         super().__init__(layer_types=layer_types, **kwargs)
 
         normalized_rope_parameters = self.rope_parameters

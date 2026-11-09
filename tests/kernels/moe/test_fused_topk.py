@@ -55,9 +55,10 @@ def torch_topk(
 @pytest.mark.parametrize(
     "case", ["random", "ties", "signed_zero", "nan", "inf", "negative_inf"]
 )
-def test_sm70_qwen38_router_topk(case: str):
+@pytest.mark.parametrize("num_tokens", range(1, 17))
+def test_sm70_qwen38_router_topk(case: str, num_tokens: int):
     torch.manual_seed(0)
-    gating_output = torch.randn(1, 512, dtype=torch.float16, device="cuda")
+    gating_output = torch.randn(num_tokens, 512, dtype=torch.float16, device="cuda")
     if case == "ties":
         gating_output[:, :16] = 1.0
     elif case == "signed_zero":
@@ -70,8 +71,8 @@ def test_sm70_qwen38_router_topk(case: str):
     elif case == "negative_inf":
         gating_output.fill_(-float("inf"))
 
-    expected_weights = torch.empty(1, 10, dtype=torch.float32, device="cuda")
-    expected_ids = torch.empty(1, 10, dtype=torch.int32, device="cuda")
+    expected_weights = torch.empty(num_tokens, 10, dtype=torch.float32, device="cuda")
+    expected_ids = torch.empty(num_tokens, 10, dtype=torch.int32, device="cuda")
     expected_rows = torch.empty_like(expected_ids)
     ops.topk_softmax(
         expected_weights,

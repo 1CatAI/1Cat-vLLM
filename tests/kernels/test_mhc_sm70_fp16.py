@@ -3,6 +3,8 @@
 import pytest
 import torch
 
+import vllm._sm70_ops as sm70_ops
+from vllm import envs
 from vllm.model_executor.kernels.mhc import tilelang as mhc_tilelang
 from vllm.model_executor.kernels.mhc.torch import (
     mhc_fused_post_pre_torch,
@@ -254,20 +256,28 @@ def test_mhc_sm70_fallback_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     ),
     reason="native NVIDIA V100/SM70 mHC CUDA op required",
 )
-def test_mhc_sm70_native_final_stage_graph_matches_eager_bitwise() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 8])
+def test_mhc_sm70_native_final_stage_graph_matches_eager_bitwise(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+) -> None:
     torch.manual_seed(20260831)
     device = mhc_tilelang.current_platform.device_type
     n_splits = 8
-    gemm_mul = torch.randn((n_splits, 1, 24), device=device, dtype=torch.float32).mul_(
-        0.01
-    )
-    gemm_sqrsum = torch.rand((n_splits, 1), device=device, dtype=torch.float32).add_(
-        4096
-    )
+    gemm_mul = torch.randn(
+        (n_splits, num_tokens, 24), device=device, dtype=torch.float32
+    ).mul_(0.01)
+    gemm_sqrsum = torch.rand(
+        (n_splits, num_tokens), device=device, dtype=torch.float32
+    ).add_(4096)
     scale = torch.tensor([0.5, 0.75, 0.25], device=device, dtype=torch.float32)
     base = torch.randn((24,), device=device, dtype=torch.float32).mul_(0.1)
-    residual = torch.randn((1, 4, 4096), device=device, dtype=torch.float16).mul_(0.1)
+    residual = torch.randn(
+        (num_tokens, 4, 4096), device=device, dtype=torch.float16
+    ).mul_(0.1)
     norm_weight = torch.randn((4096,), device=device, dtype=torch.float16).mul_(0.1)
+    monkeypatch.setenv("VLLM_SM70_GLM53_MHC_NATIVE_VERIFY", "1")
+    envs.disable_envs_cache()
 
     def run(
         post_mix: torch.Tensor,
@@ -293,9 +303,9 @@ def test_mhc_sm70_native_final_stage_graph_matches_eager_bitwise() -> None:
         )
 
     eager_outputs = (
-        torch.empty((1, 4), device=device, dtype=torch.float32),
-        torch.empty((1, 4, 4), device=device, dtype=torch.float32),
-        torch.empty((1, 4096), device=device, dtype=torch.float16),
+        torch.empty((num_tokens, 4), device=device, dtype=torch.float32),
+        torch.empty((num_tokens, 4, 4), device=device, dtype=torch.float32),
+        torch.empty((num_tokens, 4096), device=device, dtype=torch.float16),
     )
     run(*eager_outputs)
     expected = tuple(output.clone() for output in eager_outputs)
@@ -311,6 +321,98 @@ def test_mhc_sm70_native_final_stage_graph_matches_eager_bitwise() -> None:
 
     for output, reference in zip(graph_outputs, expected):
         torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    envs.disable_envs_cache()
+
+
+@pytest.mark.skipif(
+    not (
+        mhc_tilelang.current_platform.is_cuda()
+        and has_tilelang()
+        and mhc_tilelang.current_platform.get_device_capability()
+        == DeviceCapability(7, 0)
+        and hasattr(torch.ops._C, "sm70_glm_mhc_post_dot_q8_out")
+    ),
+    reason="native NVIDIA V100/SM70 mHC post+dot op and TileLang required",
+)
+def test_mhc_sm70_native_q8_post_dot_matches_fp32_stage_bitwise() -> None:
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        sm70_mhc_dot_from_fp32_stage_tilelang,
+        sm70_mhc_post_fp32_stage_tilelang,
+    )
+
+    torch.manual_seed(20260902)
+    device = mhc_tilelang.current_platform.device_type
+    num_tokens = 8
+    hidden_size = 4096
+    hc_mult = 4
+    hc_out = 24
+    n_splits = 4
+    tile_n = 6
+    x = torch.randn((num_tokens, hidden_size), device=device, dtype=torch.float16)
+    residual = torch.randn(
+        (num_tokens, hc_mult, hidden_size), device=device, dtype=torch.float16
+    )
+    post_mix = torch.sigmoid(
+        torch.randn((num_tokens, hc_mult), device=device, dtype=torch.float32)
+    )
+    comb_mix = torch.softmax(
+        torch.randn((num_tokens, hc_mult, hc_mult), device=device, dtype=torch.float32),
+        dim=1,
+    )
+    fn = torch.randn(
+        (hc_out, hc_mult, hidden_size), device=device, dtype=torch.float32
+    ).mul_(1e-4)
+
+    staged_fp32 = torch.empty_like(residual, dtype=torch.float32)
+    staged_residual = torch.empty_like(residual)
+    staged_gemm = torch.empty(
+        (n_splits, num_tokens, hc_out), device=device, dtype=torch.float32
+    )
+    staged_sqrsum = torch.empty(
+        (n_splits, num_tokens), device=device, dtype=torch.float32
+    )
+    sm70_mhc_post_fp32_stage_tilelang(
+        comb_mix,
+        residual,
+        post_mix,
+        x,
+        staged_fp32,
+        staged_residual,
+        staged_sqrsum,
+        hidden_size,
+        hc_mult,
+        n_splits=n_splits,
+    )
+    sm70_mhc_dot_from_fp32_stage_tilelang(
+        staged_fp32,
+        fn,
+        staged_gemm,
+        hidden_size,
+        hc_mult,
+        hc_out,
+        tile_n=tile_n,
+        n_splits=n_splits,
+    )
+
+    native_residual = torch.empty_like(staged_residual)
+    native_gemm = torch.empty_like(staged_gemm)
+    native_sqrsum = torch.empty_like(staged_sqrsum)
+    sm70_ops.sm70_glm_mhc_post_dot_q8_out(
+        native_residual,
+        native_gemm,
+        native_sqrsum,
+        comb_mix,
+        residual,
+        post_mix,
+        x,
+        fn,
+        tile_n,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(native_residual, staged_residual, rtol=0, atol=0)
+    torch.testing.assert_close(native_gemm, staged_gemm, rtol=0, atol=0)
+    torch.testing.assert_close(native_sqrsum, staged_sqrsum, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 17])
@@ -582,7 +684,7 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise(
     hidden_size = 4096
     hc_mult = 4
     hc_out = 24
-    tile_n = 2 if num_tokens < 8 else 3
+    tile_n = 2 if num_tokens < 8 else 12
     n_splits = 8 if num_tokens < 8 else 4
     device = mhc_tilelang.current_platform.device_type
 

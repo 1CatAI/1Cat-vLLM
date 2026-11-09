@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.envs import VLLM_ENFORCE_STRICT_TOOL_CALLING
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
@@ -25,6 +26,7 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
+from vllm.tool_parsers.qwen_xml_tool_grammar import adjust_qwen_xml_tool_request
 from vllm.tool_parsers.structural_tag_registry import (
     get_enable_structured_outputs_in_reasoning,
     get_model_structural_tag,
@@ -391,6 +393,19 @@ class Qwen3CoderToolParser(ToolParser):
         if current_prefix:
             return pending_and_delta[: -len(current_prefix)]
         return pending_and_delta
+
+    def _complete_unstreamed_arguments(self, tool_text: str) -> str | None:
+        """Arguments of a function that closed before any of them were sent."""
+        if self.streamed_args_for_tool[self.current_tool_index]:
+            return None
+        func_start = tool_text.find(self.tool_call_prefix) + len(self.tool_call_prefix)
+        func_content_end = tool_text.find(self.function_end_token, func_start)
+        if func_content_end == -1:
+            return None
+        parsed_tool = self._parse_xml_function_call(
+            tool_text[func_start:func_content_end]
+        )
+        return parsed_tool.function.arguments if parsed_tool is not None else None
 
     def _finish_streaming_function(self, tool_text: str) -> None:
         """Finalize one streamed XML function and its JSON argument state."""
@@ -775,6 +790,30 @@ class Qwen3CoderToolParser(ToolParser):
             # json_started from what was actually streamed.
             if not self.json_started:
                 self.json_started = True
+                complete_arguments = self._complete_unstreamed_arguments(tool_text)
+                if complete_arguments is not None:
+                    # A burst completed the function after its header was sent.
+                    # Emit the whole body with the brace: the stream may end
+                    # before another delta brings the parser back here.
+                    self.json_closed = True
+                    self.in_function = False
+                    self.accumulated_params = {}
+                    self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                        complete_arguments
+                    )
+                    self.streamed_args_for_tool[self.current_tool_index] = (
+                        complete_arguments
+                    )
+                    return DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_index,
+                                function=DeltaFunctionCall(
+                                    arguments=complete_arguments
+                                ),
+                            )
+                        ]
+                    )
                 self.streamed_args_for_tool[self.current_tool_index] += "{"
                 return DeltaMessage(
                     tool_calls=[
@@ -918,6 +957,14 @@ class Qwen3CoderToolParser(ToolParser):
                 return result
 
         return None
+
+    def adjust_request(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        if adjust_qwen_xml_tool_request(request, logger):
+            return request
+        return super().adjust_request(request)
 
     def get_structural_tag(self, request: ChatCompletionRequest):
         return get_model_structural_tag(

@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator
 
+from vllm.config.execution_policy import FlashV100Policy
+from vllm.config.sm70_triton_attention import Sm70TritonAttentionPolicy
 from vllm.config.utils import config
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -13,6 +15,14 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 @config
 class AttentionConfig:
     """Configuration for attention mechanisms in vLLM."""
+
+    flash_v100: FlashV100Policy = Field(default_factory=FlashV100Policy)
+    """Per-engine execution decisions and initialization provenance."""
+
+    sm70_triton: Sm70TritonAttentionPolicy = Field(
+        default_factory=Sm70TritonAttentionPolicy
+    )
+    """SM70 fallback schedule; independent of the Flash-V100 backend policy."""
 
     backend: AttentionBackendEnum | None = None
     """Attention backend to use. Use "auto" or None for automatic selection."""
@@ -27,6 +37,14 @@ class AttentionConfig:
 
     flash_attn_max_num_splits_for_cuda_graph: int = 32
     """Flash Attention max number splits for cuda graph decode."""
+
+    flash_attn_pack_gqa_max_query_len: int = Field(default=16, ge=0)
+    """FA2 packs the query heads that share a KV head only for one query token
+    per request, so a uniform multi-token decode batch (speculative decoding
+    verification) reads the KV cache once per query head. For such batches up
+    to this many tokens per request, split the attention into the request
+    context (query heads x tokens packed per KV head, no mask) and the new
+    tokens (causal), merged by their log-sum-exp. 0 disables the split."""
 
     tq_max_kv_splits_for_cuda_graph: int = 32
     """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
@@ -92,6 +110,8 @@ class AttentionConfig:
 
         ignored_factors: set[str] = set()
         factors = get_hash_factors(self, ignored_factors)
+        factors["flash_v100"] = self.flash_v100.compute_hash()
+        factors["sm70_triton"] = self.sm70_triton.compute_hash()
         return hash_factors(factors)
 
     @field_validator("backend", mode="before")

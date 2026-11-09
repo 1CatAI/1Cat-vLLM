@@ -492,6 +492,7 @@ def is_layer_skipped(
     fused_mapping: Mapping[str, list[str]] = MappingProxyType({}),
     *,
     skip_with_substr: bool = False,
+    match_mode: str = "exact",
 ) -> bool:
     def prefix_full_match(prefix: str, ignored_layers: list[str]) -> bool:
         return prefix in ignored_layers
@@ -500,7 +501,20 @@ def is_layer_skipped(
     def substr_match(prefix: str, ignored_layers: list[str]) -> bool:
         return any(layer in prefix for layer in ignored_layers)
 
-    match_func = substr_match if skip_with_substr else prefix_full_match
+    def suffix_match(prefix: str, ignored_layers: list[str]) -> bool:
+        return any(
+            prefix == layer or prefix.endswith("." + layer) for layer in ignored_layers
+        )
+
+    if match_mode not in ("exact", "suffix"):
+        raise ValueError(f"Unsupported ignored-layer match mode: {match_mode}")
+    match_func = (
+        substr_match
+        if skip_with_substr
+        else suffix_match
+        if match_mode == "suffix"
+        else prefix_full_match
+    )
 
     # prefix: model.layers.0.self_attn.q_proj
     # proj_name: q_proj
@@ -528,7 +542,7 @@ def is_layer_skipped(
                     "are quantized. All shards of fused layers "
                     "to have the same precision."
                 )
-    elif "experts" in prefix and not skip_with_substr:
+    elif "experts" in prefix and not skip_with_substr and match_mode == "exact":
         expert_ignore_layers = filter(
             lambda layer_name: "experts" in layer_name, ignored_layers
         )

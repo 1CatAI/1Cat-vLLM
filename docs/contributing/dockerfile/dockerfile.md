@@ -3,6 +3,13 @@
 We provide a [docker/Dockerfile](../../../docker/Dockerfile) to construct the image for running an OpenAI compatible server with vLLM.
 More information about deploying with Docker can be found [here](../../deployment/docker.md).
 
+SM70 builds include CPython-specific extensions and produce wheels for the
+build interpreter (for example, `cp312-cp312` for Python 3.12). `setup.py`
+automatically overrides `--py-limited-api=cp38` for these wheels, including
+when the final stage reuses precompiled extensions. Build with the same Python
+minor version as the intended runtime. Builds containing only stable-ABI
+extensions retain the requested `abi3` tag.
+
 Below is a visual representation of the multi-stage Dockerfile. The build graph contains the following nodes:
 
 - All build stages

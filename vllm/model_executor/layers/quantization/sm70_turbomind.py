@@ -1,19 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from vllm import envs
+from vllm.config.execution_policy import layer_policy
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    register_layer_workspace,
+    workspace_pool,
+)
 from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm._sm70.policy import NativeBindings
+    from vllm.model_executor.kernels.linear.sm70_provider import PreparedLinearProvider
 
 U4_GROUP_SIZES = (32, 64, 128)
 GPTQ_GROUP_SIZES = (128,)
 COMPRESSED_UINT4_GROUP_SIZES = (32, 128)
 MXFP4_GROUP_SIZE = 32
 NVFP4_GROUP_SIZE = 16
+# SM70 packed NVFP4 GEMM needs complete 32-column tiles. N=8240 (Qwen
+# GDN on TP2) is 16-aligned but corrupts the result without this padding.
+NVFP4_OUTPUT_ALIGNMENT = 32
 NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS = 5120 * 8704
 STATE_ATTR = "_sm70_turbomind_linear"
 SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
@@ -27,57 +38,193 @@ class SM70TurboMindLinearState:
     k_ld: int
     q_ld: int
     output_size: int
-    op_kind: Literal["uint4", "mxfp4", "nvfp4", "nvfp4_qpn4"]
+    op_kind: Literal["uint4", "fp8", "mxfp4", "nvfp4", "nvfp4_qpn4", "nvfp4_qpn2_dense"]
     gated_silu: bool = False
-    dense_weight_ptr: int = 0
     global_scale: float = 0.0
     use_scale_code: bool = False
+    padded_output_size: int = 0
+    prescaled_scales: bool = False
+    # QPN2 launch configuration (split-K, independent accumulator chains).
+    split_k: int = 0
+    accumulator_chains: int = 0
+    native_ops: "NativeBindings" = field(init=False, repr=False, compare=False)
+    provider: "PreparedLinearProvider" = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        from vllm._sm70.policy import NativeBindings
+        from vllm.config.sm70_native import capture_linear_native_config
+
+        family = "awq" if self.op_kind == "uint4" else self.op_kind.split("_", 1)[0]
+        self.native_ops = NativeBindings(capture_linear_native_config(family).values)
+        self.refresh_provider()
+
+    def refresh_provider(self) -> None:
+        """Bind after the final weight layout is known, including QPN2 reuse."""
+        from vllm.model_executor.kernels.linear.sm70_provider import (
+            bind_prepared_provider,
+        )
+
+        self.provider = bind_prepared_provider(self)
 
 
-# States retain only data_ptr(), so this cache owns the bounded allocation.
-_nvfp4_qpn4_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+# Owns the bounded allocations the registered layer workspaces refer to.
+_nvfp4_qpn4_dense_workspaces: dict[tuple, torch.Tensor] = {}
+
+
+def clear_sm70_turbomind_workspaces() -> None:
+    """Release process-global NVFP4 QPN4 dense workspaces."""
+    workspace_pool("_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces).clear()
+    from vllm.model_executor.kernels.linear.qpn.nvfp4_dequant import (
+        clear_nvfp4_qpn2_dense_workspaces,
+    )
+
+    clear_nvfp4_qpn2_dense_workspaces()
 
 
 def quant_backend() -> SM70QuantBackend:
-    return envs.get_sm70_quant_backend()
+    return layer_policy().value("quant_backend")
 
 
 def use_turbomind(default_enabled: bool) -> bool:
-    return envs.use_sm70_turbomind(default_enabled)
+    backend = quant_backend()
+    return backend == "turbomind" or (backend == "auto" and bool(default_enabled))
+
+
+def format_option(family: str, field: str) -> bool:
+    """Loader admission from B's canonical format owner, before weight preparation.
+
+    Raw enabled flags are retained for the two historical AWQMarlin gates that
+    intentionally did not consult the shared backend selector.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.kernel import (
+        SM70_AWQ_LINEAR_ALIASES,
+        SM70_FP8_LINEAR_ALIASES,
+        SM70_LOADER_ALIASES,
+        Sm70AwqConfig,
+        Sm70Fp8Config,
+        Sm70NvFp4Config,
+    )
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is None:
+        cls = {"awq": Sm70AwqConfig, "fp8": Sm70Fp8Config, "nvfp4": Sm70NvFp4Config}[
+            family
+        ]
+        policy = cls()
+        policy.capture_inputs()
+    else:
+        policy = getattr(cfg.kernel_config, "sm70_" + family)
+    value = getattr(policy, field)
+    source = policy.sources.get(field)
+    if value is not None and (field != "enabled" or source in (None, "configuration")):
+        return bool(value)
+    aliases = dict(SM70_LOADER_ALIASES[family])
+    aliases.update(
+        {"awq": SM70_AWQ_LINEAR_ALIASES, "fp8": SM70_FP8_LINEAR_ALIASES}.get(family, {})
+    )
+    return bool(policy.legacy.value(aliases[field]))
+
+
+def format_enabled(family: str) -> bool:
+    """Explicit format configuration wins over a conflicting legacy backend."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    value = format_option(family, "enabled")
+    cfg = get_current_vllm_config_or_none()
+    if cfg is not None:
+        policy = getattr(cfg.kernel_config, "sm70_" + family)
+        if policy.enabled is not None and policy.sources.get("enabled") in (
+            None,
+            "configuration",
+        ):
+            return value
+    return use_turbomind(value)
+
+
+def use_batched_gemm_layouts() -> bool:
+    """Prepare compatible batch GEMM layouts once on SM70.
+
+    Format-specific callers validate their own local weights and operators.
+    Model name, quantization label, speculative method/width and max_num_seqs
+    do not restrict this shared policy. Small-M kernels retain their existing
+    packed layouts; larger batches consume prepared TurboMind weights/scales.
+    """
+    return bool(layer_policy().batch_gemm_layouts) and is_exact_sm70_cuda_platform()
+
+
+def use_native_qpn_layouts() -> bool:
+    """Use one native layout for the qualified TP4, at-most-M32 verifier.
+
+    Larger batch capacities retain their existing prepared batch GEMMs until
+    the packed-only fallback is admitted at those decode shapes.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None or config.speculative_config is None:
+        return False
+    text = config.model_config.hf_text_config
+    return bool(
+        is_exact_sm70_cuda_platform()
+        and config.parallel_config.tensor_parallel_size == 4
+        and config.scheduler_config.max_num_seqs <= 4
+        and config.speculative_config.num_speculative_tokens == 7
+        and getattr(text, "hidden_size", None) == 5120
+        and getattr(text, "model_type", None) == "qwen3_5_text"
+    )
+
+
+def fp8_backend_enabled() -> bool:
+    """Shared serialized/channel/ModelOpt admission to the FP8 provider."""
+    if not is_exact_sm70_cuda_platform():
+        return False
+    from vllm.config.kernel import capture_sm70_fp8_linear_config
+
+    policy = capture_sm70_fp8_linear_config()
+    return bool(policy.enabled and not policy.force_marlin)
 
 
 def forces_marlin() -> bool:
-    return envs.force_sm70_marlin()
+    return quant_backend() == "marlin"
 
 
 def is_exact_sm70_cuda(tensor: torch.Tensor, enabled: bool) -> bool:
     if not enabled or not tensor.is_cuda:
         return False
-    return torch.cuda.get_device_capability(tensor.device) == (7, 0)
+    return torch.cuda.get_device_capability(tensor.device) in ((7, 0), (7, 2))
 
 
 def is_exact_sm70_cuda_platform() -> bool:
-    """Return true only for Volta SM70 CUDA workers.
+    """Return true for supported Volta SM70/SM72 CUDA workers.
 
     Quant-method selection runs before a layer owns a CUDA tensor, so it
     cannot use :func:`is_exact_sm70_cuda`. Keep this platform check separate
     from the tensor-based helpers used by linear weight preparation.
+
+    The capability is read from the device this worker builds its layers on.
+    Probing device 0 of the visibility list answers for a different card on a
+    heterogeneous node: with a Turing card first the Volta workers lose their
+    SM70 routes, and with a Volta first the Turing workers take them.
     """
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    if not current_platform.is_cuda():
+        return False
+    device_id = torch.accelerator.current_device_index()
+    return current_platform.is_device_capability((7, 0), device_id=device_id) or (
+        current_platform.is_device_capability((7, 2), device_id=device_id)
+    )
 
 
 def should_use_mxfp4_moe_turbomind() -> bool:
     """Select the native MXFP4 MoE path only on exact SM70."""
     return is_exact_sm70_cuda_platform() and use_turbomind(
-        envs.VLLM_SM70_MXFP4_TURBOMIND
+        layer_policy().value("mxfp4_turbomind")
     )
 
 
 def should_use_nvfp4_moe_turbomind() -> bool:
     """Select the native NVFP4 MoE path only on exact SM70."""
-    return is_exact_sm70_cuda_platform() and use_turbomind(
-        envs.VLLM_SM70_NVFP4_TURBOMIND
-    )
+    return is_exact_sm70_cuda_platform() and format_enabled("nvfp4")
 
 
 def should_prepare_turbomind(
@@ -92,6 +239,50 @@ def should_prepare_turbomind_or_marlin(
     default_enabled: bool,
 ) -> bool:
     return is_exact_sm70_cuda(tensor, use_turbomind(default_enabled) or forces_marlin())
+
+
+def is_turing_cuda(tensor: torch.Tensor, enabled: bool) -> bool:
+    if not enabled or not tensor.is_cuda:
+        return False
+    return torch.cuda.get_device_capability(tensor.device) == (7, 5)
+
+
+def is_pre_ampere_cuda_platform() -> bool:
+    """Return true for Volta and Turing workers, judged on the worker's device.
+
+    Quant-method selection runs before a layer owns a CUDA tensor. The
+    capability is read from the device this process computes on: on a node
+    that mixes card generations, device 0 of the visibility list answers for
+    another card.
+    """
+    if not current_platform.is_cuda():
+        return False
+    device_id = torch.accelerator.current_device_index()
+    return current_platform.has_device_capability(70, device_id=device_id) and (
+        not current_platform.has_device_capability(80, device_id=device_id)
+    )
+
+
+def is_turing_cuda_platform() -> bool:
+    """Return true for Turing workers, judged on the worker's device."""
+    if not current_platform.is_cuda():
+        return False
+    device_id = torch.accelerator.current_device_index()
+    return current_platform.is_device_capability((7, 5), device_id=device_id)
+
+
+def should_prepare_turing_qpn2(
+    tensor: torch.Tensor,
+    default_enabled: bool,
+) -> bool:
+    """Turing takes the QPN2 decode kernels with a dense fp16 prefill.
+
+    The TurboMind GEMMs are registered for exact SM70 only (``Sm70`` is
+    ``Arch<700, 750>``), so Turing cannot take the Volta path; the QPN2
+    kernels and the dequantization do not depend on the TurboMind registry.
+    The same switches as on Volta apply.
+    """
+    return is_turing_cuda(tensor, use_turbomind(default_enabled))
 
 
 def _get_u4_slices(x: torch.Tensor, dtype: torch.dtype) -> list[torch.Tensor]:
@@ -153,11 +344,16 @@ def _store_state(
     meta: torch.Tensor | None,
     group_size: int,
     output_size: int,
-    op_kind: Literal["uint4", "mxfp4", "nvfp4", "nvfp4_qpn4"],
+    op_kind: Literal[
+        "uint4", "fp8", "mxfp4", "nvfp4", "nvfp4_qpn4", "nvfp4_qpn2_dense"
+    ],
     gated_silu: bool = False,
-    dense_weight_ptr: int = 0,
     global_scale: float = 0.0,
     use_scale_code: bool = False,
+    padded_output_size: int = 0,
+    prescaled_scales: bool = False,
+    split_k: int = 0,
+    accumulator_chains: int = 0,
 ) -> None:
     state = SM70TurboMindLinearState(
         weight=weight,
@@ -168,9 +364,12 @@ def _store_state(
         output_size=output_size,
         op_kind=op_kind,
         gated_silu=gated_silu,
-        dense_weight_ptr=dense_weight_ptr,
         global_scale=global_scale,
         use_scale_code=use_scale_code,
+        padded_output_size=padded_output_size,
+        prescaled_scales=prescaled_scales,
+        split_k=split_k,
+        accumulator_chains=accumulator_chains,
     )
     setattr(layer, STATE_ATTR, state)
 
@@ -277,9 +476,18 @@ def prepare_mxfp4_linear(
     )
 
 
+def _prescale_nvfp4_batch_scales(scales: torch.Tensor) -> bool:
+    """Fold the exact FP4 conversion factor into the existing scale allocation."""
+    if not float(scales.abs().amax()) <= 65504.0 / 16384.0:
+        return False
+    scales.mul_(16384.0)
+    return True
+
+
 def prepare_nvfp4_linear(
     layer: torch.nn.Module,
     interleave_gated_silu: bool = False,
+    prescale_for_batch: bool = False,
 ) -> None:
     if not hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
         raise RuntimeError(
@@ -297,8 +505,38 @@ def prepare_nvfp4_linear(
         .to(torch.float16)
         .contiguous()
     )
+    output_size = qweight.size(1)
+    padded_output_size = (
+        (output_size + NVFP4_OUTPUT_ALIGNMENT - 1) // NVFP4_OUTPUT_ALIGNMENT
+    ) * NVFP4_OUTPUT_ALIGNMENT
+    if padded_output_size != output_size:
+        if interleave_gated_silu:
+            raise RuntimeError(
+                "SM70 TurboMind NVFP4 gated-SiLU does not support output padding."
+            )
+        padded_qweight = torch.zeros(
+            (qweight.size(0), padded_output_size),
+            dtype=qweight.dtype,
+            device=qweight.device,
+        )
+        padded_scales = torch.zeros(
+            (scales.size(0), padded_output_size),
+            dtype=scales.dtype,
+            device=scales.device,
+        )
+        padded_qweight[:, :output_size].copy_(qweight)
+        padded_scales[:, :output_size].copy_(scales)
+        qweight = padded_qweight
+        scales = padded_scales
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
         qweight, scales, NVFP4_GROUP_SIZE, interleave_gated_silu
+    )
+    # QPN2 retains its independent compressed scales for M<=32. Larger decode
+    # and prefill use the same scaled TM buffer, without a second allocation.
+    prescaled_scales = bool(
+        prescale_for_batch
+        and hasattr(torch.ops._C, "nvfp4_gemm_sm70_prescaled_out")
+        and _prescale_nvfp4_batch_scales(tm_scales)
     )
     _store_state(
         layer,
@@ -306,29 +544,244 @@ def prepare_nvfp4_linear(
         tm_scales,
         meta,
         NVFP4_GROUP_SIZE,
-        qweight.size(1),
+        output_size,
         "nvfp4",
         interleave_gated_silu,
+        padded_output_size=padded_output_size,
+        prescaled_scales=prescaled_scales,
     )
+
+
+# Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu: rows up to this
+# take the QPN2 decode kernels, larger M takes the dense prefill.
+QPN2_DISPATCH_MAX_ROWS = 32
+QPN2_GROUP_SIZE = 16
+
+# Launch configurations (split-K, accumulator chains) measured on the
+# Qwen3.8 TP2 shapes; other shapes take the heuristic below.
+_QPN2_LAUNCH_TABLE: dict[tuple[int, int], tuple[int, int]] = {
+    (1536, 5120): (16, 2),
+    (4352, 5120): (16, 2),
+    (5120, 8704): (8, 2),
+    (5120, 4096): (16, 2),
+    (5120, 2048): (32, 2),
+    (5120, 62080): (8, 1),
+    (5120, 3584): (16, 2),
+}
+
+
+def qpn2_launch_config(k: int, n: int) -> tuple[int, int]:
+    """Split-K and accumulator chains for a QPN2 GEMM of ``[n, k]``."""
+    groups = k // QPN2_GROUP_SIZE
+    config = _QPN2_LAUNCH_TABLE.get((k, n))
+    if config is not None and groups % config[0] == 0:
+        return config
+    # Smallest split that puts about 640 warps in flight (80 SMs x 8).
+    for split_k in (8, 16, 32):
+        if groups % split_k == 0 and (n // 32) * split_k >= 640:
+            return split_k, 2 if split_k >= 16 else 1
+    for split_k in (16, 8):
+        if groups % split_k == 0:
+            return split_k, 2 if split_k >= 16 else 1
+    raise RuntimeError(f"no QPN2 launch configuration for K={k}, N={n}")
+
+
+def pad_qpn2_output_rows(
+    weight: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pad checkpoint-native output rows to QPN2's 32-column contract."""
+    logical_n = weight.shape[0]
+    physical_n = (logical_n + 31) // 32 * 32
+    if physical_n == logical_n:
+        return weight, scales, physical_n
+    padded_weight = weight.new_zeros((physical_n, weight.shape[1]))
+    padded_scales = scales.new_zeros((physical_n, scales.shape[1]))
+    padded_weight[:logical_n].copy_(weight)
+    padded_scales[:logical_n].copy_(scales)
+    return padded_weight, padded_scales, physical_n
+
+
+def prepare_nvfp4_qpn2_dense_linear(
+    layer: torch.nn.Module, *, bundle_scales: bool = False
+) -> None:
+    """Prepare the QPN2 prepack as the only resident layout of an NVFP4 linear.
+
+    Decode (M <= ``QPN2_DISPATCH_MAX_ROWS``) runs the QPN2 kernels on it;
+    larger M dequantizes into a transient fp16 buffer and runs cuBLAS. No
+    TurboMind weight is built, so this does not need the TurboMind registry.
+    """
+    if not hasattr(torch.ops._C, "nvfp4_qpn2_prepare_sm70"):
+        raise RuntimeError(
+            "The pre-Ampere NVFP4 QPN2 path requires a build with CUDA arch "
+            "7.0 and the SM70 TurboMind NVFP4 extension."
+        )
+    from vllm import _sm70_ops as sm70_ops
+
+    # Registers the dispatch op now, at weight loading, so it exists before
+    # the first forward is traced.
+    from vllm.model_executor.layers.quantization.utils import (  # noqa: F401
+        nvfp4_qpn2_dequant,
+    )
+
+    weight, scales, padded_output_size = pad_qpn2_output_rows(
+        layer.weight.data, layer.weight_scale.data
+    )
+    codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(weight, scales)
+    if bundle_scales and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70"):
+        codes, qpn2_scales = sm70_ops.nvfp4_qpn2_bundle_sm70(codes, qpn2_scales)
+    output_size = int(layer.weight.shape[0])
+    input_size = int(layer.weight.shape[1]) * 2
+    split_k, accumulator_chains = qpn2_launch_config(input_size, padded_output_size)
+    _store_state(
+        layer,
+        codes,
+        qpn2_scales,
+        None,
+        QPN2_GROUP_SIZE,
+        output_size,
+        "nvfp4_qpn2_dense",
+        global_scale=float(layer.weight_global_scale.item()),
+        padded_output_size=padded_output_size,
+        split_k=split_k,
+        accumulator_chains=accumulator_chains,
+    )
+
+
+# FP8 weights on Turing: QPN8 decode kernels plus the QPN8 dense prefill
+# (dequantization into a transient fp16 [K, N] workspace and cuBLAS), both
+# provided by fp8_qpn8_sm70.cu without the TurboMind registry.
+FP8_QPN8_STATE_ATTR = "_sm70_fp8_qpn8_state"
+
+
+class FP8QPN8LinearState:
+    def __init__(
+        self,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        output_size: int,
+        split_k: int,
+        accumulator_chains: int,
+        prefetch_codes: bool,
+    ) -> None:
+        self.codes = codes
+        self.group_scales = group_scales
+        self.output_size = output_size
+        self.split_k = split_k
+        self.accumulator_chains = accumulator_chains
+        self.prefetch_codes = prefetch_codes
+
+
+def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
+    """Split-K, accumulator chains and code prefetch for a QPN8 GEMM.
+
+    The dispatcher admits split-K up to 16; the measured Qwen3.8 shapes use
+    16 (K = 5120) and 12 (K = 1536) with two accumulator chains.
+    """
+    groups = k // QPN2_GROUP_SIZE
+    for split_k in (16, 12, 8):
+        if groups % split_k == 0:
+            return split_k, 2, False
+    raise RuntimeError(f"no QPN8 launch configuration for K={k}")
+
+
+def prepare_fp8_qpn8_dense_linear(
+    layer: torch.nn.Module, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> None:
+    """Prepare a per-tensor FP8 linear as QPN8 codes with channel scales.
+
+    ``weight`` is the checkpoint-native fp8-e4m3fn ``[N, K]`` tensor,
+    ``weight_scale`` its single scale. The QPN8 prepack takes channel scales,
+    so the scale is broadcast over the rows; the dequantization is then the
+    same product the reference path computes.
+    """
+    if not hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
+        raise RuntimeError(
+            "The Turing FP8 QPN8 path requires a build with CUDA arch 7.0 and "
+            "the SM70 TurboMind FP8 extension."
+        )
+    from vllm import _sm70_ops as sm70_ops
+
+    n, k = (int(dim) for dim in weight.shape)
+    if n % 32 != 0 or k % 16 != 0:
+        raise RuntimeError(f"QPN8 needs N % 32 == 0 and K % 16 == 0, got N={n}, K={k}.")
+    channel_scales = (
+        weight_scale.to(torch.float32).reshape(1, 1).expand(n, 1).contiguous()
+    )
+    codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(
+        weight.contiguous(), channel_scales
+    )
+    layer.register_buffer("_sm70_turing_fp8_packed_codes", codes, persistent=False)
+    layer.register_buffer(
+        "_sm70_turing_fp8_packed_scales", group_scales, persistent=False
+    )
+    split_k, accumulator_chains, prefetch_codes = fp8_qpn8_launch_config(k)
+    setattr(
+        layer,
+        FP8_QPN8_STATE_ATTR,
+        FP8QPN8LinearState(
+            codes,
+            group_scales,
+            n,
+            split_k,
+            accumulator_chains,
+            prefetch_codes,
+        ),
+    )
+
+
+def has_prepared_fp8_qpn8_linear(layer: torch.nn.Module) -> bool:
+    return getattr(layer, FP8_QPN8_STATE_ATTR, None) is not None
+
+
+def apply_prepared_fp8_qpn8_linear(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    state = getattr(layer, FP8_QPN8_STATE_ATTR)
+    if x.dtype != torch.float16:
+        raise RuntimeError(
+            f"The Turing FP8 QPN8 path requires float16 activations, got {x.dtype}."
+        )
+    reshaped_x = x.reshape(-1, x.shape[-1])
+    if reshaped_x.stride(-1) != 1:
+        reshaped_x = reshaped_x.contiguous()
+    out = torch.ops.vllm.turing_fp8_qpn8_linear(
+        reshaped_x,
+        state.codes,
+        state.group_scales,
+        state.output_size,
+        state.split_k,
+        state.accumulator_chains,
+        state.prefetch_codes,
+    )
+    if bias is not None:
+        out.add_(bias)
+    return out.reshape(x.shape[:-1] + (state.output_size,))
 
 
 def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    cache_key = (device_index, torch.float16)
-    workspace = _nvfp4_qpn4_dense_workspaces.get(cache_key)
+    elements = max(NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 2)
+    cache_key = (device_index, torch.float16, elements)
+    workspace = workspace_pool(
+        "_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces
+    ).get(cache_key)
     if workspace is not None:
         return workspace
     try:
         workspace = torch.empty(
-            (NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS,),
+            (elements,),
             dtype=torch.float16,
             device=weight.device,
         )
     except torch.OutOfMemoryError:
         return None
-    _nvfp4_qpn4_dense_workspaces[cache_key] = workspace
+    workspace_pool("_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces)[
+        cache_key
+    ] = workspace
     return workspace
 
 
@@ -341,7 +794,7 @@ def prepare_nvfp4_qpn4_linear(
     from vllm import _sm70_ops as sm70_ops
 
     qweight = unpack_mxfp4_weight(layer.weight.data)
-    use_scale_code = gated_silu or envs.VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE
+    use_scale_code = gated_silu or format_option("nvfp4", "down_scale_code")
     global_scale = 0.0
     if use_scale_code:
         global_scale = float(layer.weight_global_scale.detach().float().item())
@@ -361,6 +814,7 @@ def prepare_nvfp4_qpn4_linear(
         packed_weight, packed_scales = sm70_ops.nvfp4_qpn4_prepare_sm70(
             qweight, fp16_scales
         )
+    register_layer_workspace(layer, workspace, family="nvfp4")
     _store_state(
         layer,
         packed_weight,
@@ -370,7 +824,6 @@ def prepare_nvfp4_qpn4_linear(
         qweight.size(1),
         "nvfp4_qpn4",
         gated_silu=gated_silu,
-        dense_weight_ptr=workspace.data_ptr(),
         global_scale=global_scale,
         use_scale_code=use_scale_code,
     )
@@ -381,128 +834,20 @@ def apply_prepared_linear(
     x: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    state = getattr(layer, STATE_ATTR)
-    reshaped_x = x.reshape(-1, x.shape[-1])
-    out_shape = x.shape[:-1] + (state.output_size,)
-    out = torch.empty(
-        (reshaped_x.shape[0], state.output_size),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    from vllm import _sm70_ops as sm70_ops
+    from vllm.model_executor.kernels.linear.sm70_provider import apply_prepared
 
-    if state.op_kind == "uint4":
-        sm70_ops.awq_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "mxfp4":
-        sm70_ops.mxfp4_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "nvfp4":
-        sm70_ops.nvfp4_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "nvfp4_qpn4":
-        if reshaped_x.dtype != torch.float16:
-            raise RuntimeError(
-                f"SM70 NVFP4 QPN4 requires float16 activations, got {reshaped_x.dtype}."
-            )
-        if reshaped_x.stride(-1) != 1:
-            reshaped_x = reshaped_x.contiguous()
-        sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
-            out,
-            state.dense_weight_ptr,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.use_scale_code,
-            False,
-        )
-    else:
-        raise AssertionError(f"unknown SM70 TurboMind op kind: {state.op_kind}")
-    if state.gated_silu and state.op_kind == "nvfp4":
-        out_features = state.output_size // 2
-        out = (
-            out.reshape(reshaped_x.shape[0], out_features, 2)
-            .transpose(1, 2)
-            .reshape(reshaped_x.shape[0], state.output_size)
-        )
-    if bias is not None:
-        out.add_(bias)
-    return out.reshape(out_shape)
+    return apply_prepared(
+        getattr(layer, STATE_ATTR), x, bias, getattr(layer, "prefix", "")
+    )
 
 
 def apply_prepared_fused_silu_and_mul(
     layer: torch.nn.Module,
     x: torch.Tensor,
 ) -> torch.Tensor | None:
+    from vllm.model_executor.kernels.linear.sm70_provider import apply_prepared
+
     state = getattr(layer, STATE_ATTR, None)
-    if (
-        state is None
-        or state.op_kind not in ("nvfp4", "nvfp4_qpn4")
-        or not state.gated_silu
-    ):
+    if state is None:
         return None
-    if x.dtype != torch.float16:
-        raise RuntimeError(
-            "SM70 TurboMind NVFP4 gated-SiLU requires float16 activations, "
-            f"got {x.dtype}."
-        )
-
-    reshaped_x = x.reshape(-1, x.shape[-1])
-    if reshaped_x.stride(-1) != 1:
-        reshaped_x = reshaped_x.contiguous()
-    out_features = state.output_size // 2
-    out = torch.empty(
-        (reshaped_x.shape[0], out_features),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    if reshaped_x.shape[0] == 0:
-        return out.reshape(*x.shape[:-1], out_features)
-
-    from vllm import _sm70_ops as sm70_ops
-
-    if state.op_kind == "nvfp4_qpn4":
-        sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
-            out,
-            state.dense_weight_ptr,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.use_scale_code,
-            True,
-        )
-    else:
-        sm70_ops.nvfp4_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-            True,
-        )
-    return out.reshape(*x.shape[:-1], out_features)
+    return apply_prepared(state, x, None, getattr(layer, "prefix", ""), gated=True)

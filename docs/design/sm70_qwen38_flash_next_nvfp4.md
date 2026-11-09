@@ -4,18 +4,34 @@
 
 - Status: source bring-up, pinned-host PLE, native Qwen4Exp MTP, and
   prefix-cache configuration are implemented; focused CPU/configuration gates
-  pass and the local ModelScope snapshot is fully verified. The current
-  accepted no-MTP TP4 candidate reaches 82.274 steady decode tokens/s on the
-  8192x512 contract, with exact arithmetic and Chinese quality gates. Its
-  direct NVFP4 ten-route QPN-M1 MoE route is now the default for the exact
-  SM70/TP4/B1 contract. The preceding 77.370-token/s graph-node trace remains
-  the detailed optimization control. Native MTP4 also completes TP4 model
-  load, graph
-  capture, warmup, and two 1024x256 requests; its separate acceptance and
-  cycle-cost evidence remains recorded below.
-- Integration line: public `origin/main`, through Draft PR
-  [#345](https://github.com/1CatAI/1Cat-vLLM/pull/345).
-- Base SHA: `d63e9490f65f9e01f6649053c1ab72922034b931`.
+  pass and the local ModelScope snapshot is fully verified. The historical
+  no-MTP TP4 online-QPN8 candidate reaches 82.274 steady decode tokens/s on the
+  8192x512 contract, but online QPN8 requantizes dense checkpoint weights and
+  is now experimental opt-in. Its matched 96-request GSM8K screen keeps 96/96
+  answers correct in both arms but changes 88/96 token sequences and contains
+  a large long-output/repetition outlier. The exact, byte-preserving NVFP4
+  ten-route QPN-M1 MoE remains default-on; online QPN8 is default-off. The
+  precision-preserving no-MTP control is about 67.6 tokens/s, so reaching 80
+  tokens/s without online QPN8 remains an open optimization target. Corrected
+  native MTP4 is stable across an 11-request TP4 transition run, and the
+  no-thinking HumanEval8 gate reaches
+  4.747 mean accepted length, 93.676% draft acceptance, 126.81 warmed pure
+  decode tokens/s, and 8/8 standard semantic executions. The V2 M16 plus
+  M5/M1 warmup also removes the first-request MTP `fused_moe_kernel` JIT. The
+  current direct-NVFP4 MTP5 verifier route raises the matched HumanEval8 result
+  to 150.17 tokens/s with 4.8125 mean accepted length, 95.3125% draft
+  acceptance, and 8/8 semantic executions. Its steady verifier wall is 23.409
+  ms, passing the 20% reduction gate below. A separate single-start,
+  official-thinking 64-prompt audit reaches 82.13 weighted pure decode
+  tokens/s, 2.671 global MTP4 mean accepted length, and 40/48 strict passes on
+  the three benchmark-valid suites. Its long-reasoning results are recorded
+  separately below and do not replace the matched greedy HumanEval8 control.
+- Integration line: public `main`; Qwen3.8 bring-up
+  [#345](https://github.com/1CatAI/1Cat-vLLM/pull/345) and initial decode work
+  [#361](https://github.com/1CatAI/1Cat-vLLM/pull/361) are merged. The compact
+  MTP loader, exact SM70 MTP tile, and V2 warmup are the current follow-up.
+- Current correctness-audit base SHA:
+  `62ad1e02693f4c857f3b7547cef1860ee54e8053`.
 - Model: `RadixArk/Qwen3.8-Flash-Next-NVFP4` at revision
   `7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 - Model download: `/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4`.
@@ -126,9 +142,9 @@ graphs, workspaces, NCCL, allocator fragmentation, and loader transients. This
 explains why TP4 is plausible, but it is not evidence that the maximum context
 will load safely.
 
-## No-MTP TP4 decode control and architecture audit
+## No-MTP TP4 decode performance and quality audit
 
-The current unprofiled control is
+The retained experimental online-QPN8 performance candidate is
 `.artifacts/qwen38_flash_next_nvfp4_20260826/results/target80-qpn-m1-mtp-off-8192x512.json`.
 It uses one request, TP4/PP1, FP16 activations, MTP off, V2, CUDA graphs, the
 direct QPN-M1 NVFP4 experts, online channel-QPN8 attention/GR projections,
@@ -176,8 +192,94 @@ microseconds. A second screen spans expert IDs 0 through 470 and 16 random
 inputs; the final weighted MoE output differs by at most 4.768e-7. Together
 with removal of the traced 0.107-ms input-prepare work, the trace projection is
 about 12.36 ms/token, or 80.9 tokens/s. The fixed resident-model measurement
-above exceeds that projection at 82.274 tokens/s and is the acceptance
+above exceeds that projection at 82.274 tokens/s and is the performance
 evidence; no MTP or speculative decoding is enabled in this result.
+
+### Decode output-quality A/B (2026-08-28)
+
+The published NVFP4 checkpoint quantizes only the routed experts. Online QPN8
+also converts six dense projection roles to row-wise FP8 E4M3 at model load.
+A retained real-weight screen reports 2.44% to 2.75% relative L2 error against
+the original FP16 projections across mHC, GDN, and QSA. That is useful
+numerical diagnostics, but it is not by itself a model-output quality result.
+
+The matched model-level gate uses 32 fixed GSM8K questions with three indexed
+sampling seeds per question (96 sequential requests), temperature 0.6,
+top-p 0.95, top-k 20, natural EOS, and an 8192-token output limit. Both arms
+run source `f4040b8f`, TP4/PP1, V2, no MTP, FP16 activation/KV,
+FlashAttention-V100/FlashQLA, and FULL+PIECEWISE graphs; only online QPN8 and
+its dependent GDN BA split differ. A boxed-first scorer gives 96/96 for both
+arms, with zero invalid, replacement-character, NUL, or non-`stop` outputs.
+QPN8 raises mean steady decode from 67.627 to 79.105 tokens/s (+16.97%) and
+median steady decode from 67.640 to 79.369 tokens/s (+17.34%).
+
+Only 8/96 token hashes match. The mean absolute output-length delta is 133.5
+tokens and the maximum is 4477. One sample remains correct but grows from 1653
+tokens and a repeated-4-gram ratio of 0.199 with QPN8 off to 3626 tokens and
+0.507 with QPN8 on. A short GSM8K score therefore does not establish that
+requantizing the checkpoint's dense BF16 projections preserves general output
+quality. Online QPN8 is default-off and requires the explicit experimental
+opt-in `VLLM_SM70_QWEN4_EXP_ONLINE_QPN8=1`; accepted no-MTP quality and speed
+baselines must report the flag and must not attribute an opt-in QPN8 result to
+the precision-preserving default route.
+
+The fixed A/B execution SHA predates the compressed-QSA zeroing repair merged
+as PR #373 (`ddd8c0b601`). A compressed QSA scheduler block is logically 784
+tokens but stores one 98-row physical page. The old zeroer multiplied the
+compression ratio a second time and could clear the wrong range when a block
+was reused. Current main derives zeroing from `storage_block_size`, clears
+exactly the selected physical page, and is covered by a real V100 page test
+and a TP4 1K/4K generation smoke. Both A/B arms intentionally use the same old
+binary to isolate QPN8, while this branch includes the QSA repair.
+
+### Upstream correctness sync (2026-08-29)
+
+The correctness audit starts from public `main` at
+`62ad1e02693f4c857f3b7547cef1860ee54e8053` in the isolated branch
+`codex/v100-qwen38-correctness-upstream-20260828-152418`. It adapts the
+request-layout fix from vLLM PR #53896, the Mamba state-grid fixes from vLLM
+PRs #53802 and #54076, and the EAGLE cache-drop fix from vLLM PR #48375. The
+local adaptations also reject the unvalidated Qwen4Exp V1 runner override,
+stop QSA from claiming batch-invariant split-K reductions, and make online
+QPN8 experimental opt-in.
+
+The retained source/unit evidence is:
+
+- 124 focused Qwen4Exp, hybrid-cache, prefix-cache, QSA, and QPN policy tests
+  passed; one separately executed native QPN operator test also passed.
+- Seven V100 packed-GDN tests passed, including an exact FP32-beta state check.
+- Changed-file pre-commit passed every applicable hook, including Ruff,
+  markdownlint, mypy, SPDX, forbidden-import, configuration, and API checks.
+- The downloaded RadixArk safetensors index assigns 296,475 tensors across 206
+  files; comparing every file's actual keys found zero extra or missing keys,
+  so vLLM PR #54230 does not affect this checkpoint and was not duplicated.
+- vLLM PR #51599's async Mamba accepted-count race is already covered by the
+  local MRV2 runner-owned snapshots and request-ID remapping; `InputBatch` is
+  not an asynchronous D2H destination on this path.
+- vLLM PR #53520 fixes prompt-logprob lifetime in the legacy runner. Qwen4Exp
+  now rejects that runner, while MRV2 computes prompt logprobs before invoking
+  its padded model drafter, so the vulnerable ordering is absent.
+- vLLM PR #53122 configures quantized standalone DFlash draft models. Native
+  Qwen4Exp MTP already calls `configure_quant_config` with `Qwen4ExpMTP`, so
+  importing the DFlash guard would not change this checkpoint's route.
+- vLLM issue #53982's narrow circular-table read is avoided in both local
+  runners: QSA circular groups skip the generic slot-mapping kernel and build
+  ring slots from logical positions in their metadata builder.
+
+Two separate risks remain explicit. 1Cat PR #406 owns the independent
+`KVBlockZeroer` asynchronous H2D staging-lifetime fix and should merge before a
+high-concurrency prefix-cache acceptance run. Upstream issue #54199 still has
+no proven fix for a donor-lifecycle overlap in Mamba prefix-cache precopy; a
+bounds-only workaround would trade a crash for silent recurrent-state
+corruption and is therefore not accepted without a reproducer and state
+oracle.
+
+The checkpoint also carries multimodal `mrope_section` and
+`mrope_interleaved` fields in its text config. The initial SM70 route requires
+`language_model_only` and removes those fields before constructing text RoPE.
+For text-only positions the three MRoPE axes are identical, so this reduces to
+the same one-dimensional rotation; warnings emitted while the raw config is
+first validated do not indicate an unknown runtime RoPE implementation.
 
 ### Upstream methods and SM70 decisions
 
@@ -200,12 +302,12 @@ unrelated upstream platform changes. The
 describes the production HC strategy more precisely: low-M Mix uses split-K
 GEMMs with SiLU in the down epilogue and sigmoid/four-stream reduction in the
 up epilogue, while Combine splits the hidden dimension to expose more CTAs.
-The accepted QPN8 HC route already mirrors those two epilogue fusions and the
-SM70 Combine kernel already partitions the hidden dimension; importing the
+The experimental QPN8 HC route already mirrors those two epilogue fusions and
+the SM70 Combine kernel already partitions the hidden dimension; importing the
 SM100-only CuTeDSL implementation from
 [FlashInfer PR 4266](https://github.com/flashinfer-ai/flashinfer/pull/4266)
 would therefore add no V100 kernel. The exact V100 screen also rejects
-collapsing the accepted two-QPN8-kernel path into one persistent launch. The
+collapsing the two-QPN8-kernel experiment into one persistent launch. The
 [SGLang day-zero HC kernel](https://github.com/sgl-project/sglang/blob/02d38b77db92699e5d4f1a78226bf711e9cc762a/python/sglang/srt/layers/hc_mix_triton.py)
 replaces the FP16 down-GEMV, SiLU, up-GEMV, sigmoid, and four-branch mean with
 one persistent kernel. A V100 form preserves the existing QPN8 weights and
@@ -256,8 +358,8 @@ The currently admitted candidates are deliberately narrow:
   `SM70 Qwen3.8 E512/K10 router top-k path enabled` marker.
 - GR/HC persistent launch: rejected despite bitwise output and clean replay
   state because it is 3.072 microseconds slower per call in the checkpoint-
-  shape cold-cache screen, a projected 0.298-ms/token regression. The accepted
-  split-QPN8 down/reduce/up implementation remains unchanged.
+  shape cold-cache screen, a projected 0.298-ms/token regression. The
+  experimental split-QPN8 down/reduce/up implementation remains unchanged.
 - MRv2 greedy sampling: the active V2 runner always materialized globally
   gathered logits and then launched Gumbel sampling, even for the exact
   temperature-zero single-request decode used here. The new SM70-only route
@@ -268,12 +370,11 @@ The currently admitted candidates are deliberately narrow:
   kernel and 0.044-ms full-logit all-gather before accounting for the local
   argmax cost.
 
-The QSA scorer, router, and V2 greedy projections together expose about
-0.90-1.01 ms/token of gross trace cost, which is enough on paper to cross the
-immediate 80 tokens/s gate after allowing for the pair-gather argmax overhead.
-A single resident-model run will validate them together; the model will not be
-restarted separately for each micro-optimization. The rejected persistent GR
-candidate is not included in that run.
+The QSA scorer, router, and V2 greedy projections expose about 0.90-1.01
+ms/token in the historical online-QPN8 trace. That trace is useful for kernel
+ranking but no longer proves the precision-preserving 80 tokens/s target; the
+next optimization cycle must use a fresh no-QPN8 trace and retain the exact
+checkpoint weights. The rejected persistent GR candidate is not included.
 
 ## Native MTP4 TP4 validation snapshot
 
@@ -403,14 +504,282 @@ the draft loader fail closed if either routed-expert parameter is absent, so a
 future mapping regression cannot masquerade as a successful model start. The
 focused loader gate is 21 passed tests plus Ruff and format checks.
 
-The next GPU gate is one TP4, prefix-cache-on, four-prompt native MTP4 run with
-greedy local argmax and QSA index sharing explicitly enabled. It uses the same
-prompts, order, sampling, and output cap as the completed four-request baseline
-and records per-request and per-position accepted length, code output quality,
-emitted tokens/s, and peak memory. MTP3 is not an optimization candidate for
-this gate. A subsequent Nsight trace is warranted only after the corrected
-MTP4 acceptance result is stable; it will report proposal time, five-token
-target verification time, and cycle cost per emitted token separately.
+### Corrected MTP4 acceptance, quality, and warmup closure
+
+The standalone drafter now prefers the four compact `model-bf16-*` shards that
+contain all 33 required MTP/shared parameters instead of rescanning all 206
+target shards. The complete-expert validation remains fail closed, and generic
+safetensors/bin/pt patterns remain compatibility fallbacks. In the accepted
+11-request transition artifact
+`.artifacts/qwen4_exp_mtp_tp4_20260827/mtp4_transition9_v16_storage_ratio_natural4_same7_gpu4567.json`,
+target loading reads 206 shards once and MTP reads only four shards / 14.91 GiB
+in 5.04 seconds. All requests complete without a new GPU Xid or cross-request
+state drift.
+
+That run emits 2,816 tokens with 2.9159 mean accepted length including the
+target token, 47.8972% draft-token acceptance, and 72.8972%, 50.2596%,
+38.5254%, and 29.9065% position acceptance. The ten warmed requests average
+78.98 pure decode tokens/s. Minimum host `MemAvailable` is 47.46 GiB, peak swap
+use is 8.03 GiB, and process exit restores roughly 115--120 GiB available with
+no vLLM worker left behind.
+
+Matched QSA index-sharing A/B/A did not expose an acceptance defect: sharing
+is 0.0359 accepted tokens better overall than recomputing indices. SGLang's
+causal-tail refresh candidate is also rejected because it loses 0.0322 accepted
+tokens and reduces decode speed. The retained natural-prompt control measures
+2.762 mean accepted length and 44.05% draft acceptance, inside the published
+NVFP4 range. Conditional acceptance after the first draft is roughly 70--74%,
+so the weakest event is the first proposal rather than accumulated MTP-step
+drift.
+
+The corrected no-thinking HumanEval8 artifact is
+`.artifacts/qwen4_exp_mtp_tp4_20260827/mtp4_transition16_v23_q38_moe_warmup_humaneval8_nothink_gpu0123.json`.
+It emits 797 tokens. Global MTP4 acceptance is 4.747 mean length and 93.676%
+draft acceptance, with 98.82%, 95.88%, 91.76%, and 88.24% by position.
+Excluding the cold first request gives 4.696 mean length, 92.407% draft
+acceptance, and 126.81 weighted pure decode tokens/s. The standard semantic
+policy preserves each task's imports and signature and passes 8/8 in the
+sandboxed executor. Minimum host `MemAvailable` is 48.08 GiB, peak swap use is
+7.98 GiB, and each GPU peaks at 32,179 MiB; the post-exit audit finds no
+persistent worker or host-memory leak.
+
+The exact TP4-local BF16 draft-MoE shape is
+`E=512, N=160, K=2560, topk=10`. An exact-shape SM70 tile of
+`BM=2, BN=128, BK=64, G=1`, four warps, and three stages reduces M5 from
+1492.500 to 283.853 microseconds (5.26x) and M1 from 425.789 to 272.415
+microseconds (1.56x), with bitwise-identical output. The route is bounded by
+the exact SM70 TP4 local MoE shape (currently exercised by Qwen3.8), is enabled
+by default, and can be rolled back with
+`VLLM_SM70_MTP_MOE_TUNED_CONFIG=0`.
+
+V2 needs one additional prefill specialization beyond its faithful M5/M1
+decode warmup. The real HumanEval prompt first runs the draft model at M152;
+existing M8 and M18 captures do not cover the sorted-assignment,
+`M * topk`-divisible-by-16 specialization. A fresh-cache V100 microtest records
+two new compilations and 526.97 ms at M152 without M16. Adding only M16 reduces
+M152 to zero new compilations and 4.51 ms. The final TP4 integration run logs
+KV-zero, M16, and M5/M1 warmup before request monitoring and has no first-
+request `fused_moe_kernel` JIT. Its artifact is
+`.artifacts/qwen4_exp_mtp_tp4_20260827/mtp4_transition19_v26_q38_v2_m16_moe_warmup_humaneval1_nothink_gpu0123.json`.
+It emits the same 173 token IDs as the earlier quality run, keeps 4.943 mean
+accepted length / 98.571% draft acceptance, and reaches 138.26 steady decode
+tokens/s.
+
+The accepted Nsight control still identifies target verification as the next
+MTP cost center: one 43.348-ms speculative round spends 30.040 ms in the
+five-token verifier, versus 2.733 ms in the first draft graph and 5.603 ms of
+critical GPU service in the remaining draft/sampling passes. Further MTP speed
+work should reduce verifier cost without trading away the now-validated
+acceptance or code quality. The separate no-MTP final target remains at least
+100 tokens/s; its last accepted control is 82.274 tokens/s.
+
+### MTP4 verifier-cost reduction campaign
+
+Draft PR [#398](https://github.com/1CatAI/1Cat-vLLM/pull/398) isolates the
+five-row target-verifier work on public `main`. Its hard gate is a 20% reduction
+from the retained 30.040-ms verifier wall, or at most 24.032 ms, while retaining
+TP4, V2, MTP4, prefix caching, FP16 activations/KV, checkpoint-native NVFP4
+routed weights, FlashAttention-V100/FlashQLA, and the HumanEval acceptance and
+quality gates above. Online QPN8 and any new activation or weight quantization
+are explicitly disabled for this campaign.
+
+The first admitted operator pair is bounded to the exact verifier shape rather
+than changing generic inference:
+
+- A native NVFP4 direct-MTP5 MoE consumes the existing packed W13/W2 weights
+  and 50 routed rows directly. It skips input expansion, expert sorting, and
+  final unpermute, uses W13 split-K four and bitwise-equal W2 split-K one, and
+  performs the weighted reduction in the direct kernel. Across the complete
+  path, maximum final-output error is `4.768e-7`; relative L2 is `7.773e-5`
+  with ten overlapping experts and `1.051e-4` with 50 distinct experts.
+- The 50-route path has its own `nvfp4_moe_qpn_mtp5_sm70_out` capability
+  schema. Source overlays therefore fail closed with an older ten-route M=1
+  extension instead of sending an unsupported shape to it. The operator
+  benchmark resolves only the production `_C` or `_C_qwen38` namespace.
+- Warm-cache projection saves 2.259 ms and 1.695 ms per 48-layer verifier for
+  those two routing patterns. The corresponding cold-weight projections save
+  5.505 ms and 4.964 ms. The cold figures are the relevant planning range:
+  each real verifier advances through 48 different layer/expert weight sets,
+  and one selected layer's weight working set already exceeds V100 L2. Only
+  the full-model gate may convert this projection into an endpoint claim.
+- The exact M=5, E=512, top-10 router falls from 0.635 to 0.254 ms per 48
+  layers, saving 0.381 ms (`2.496x`). Dynamic captured inputs preserve routed
+  rows and IDs exactly and keep weights within `1e-7` tolerance.
+
+Together, the cold direct-MoE and router screens project 5.345--5.886 ms of the
+required 6.008-ms saving. The exact TP4 25-KiB MTP5 push all-reduce is
+graph-only, SM70-only, opt-in, and tested through a full-lifecycle sidecar so
+communicator construction, buffer registration, graph IPC metadata, and
+disposal all come from the same implementation. A prior partial sidecar is
+invalid evidence: mixing its `all_reduce` methods with the installed
+extension's object lifecycle produced zero registered graph addresses and a
+process crash. The repaired sidecar is built against the same Torch
+2.10.0+cu128 ABI as the runtime.
+
+The final TP4 collective A/B captures 48 ordinary plus 48 shared/routed sum2
+reductions per replay. Pull takes 1.1326 ms and push takes 0.3637 ms, saving
+0.7689 ms (`3.114x`, `67.89%`). All four ranks are bitwise equal for dynamic
+integer, signed-zero, and model-scale random inputs. Combining this result with
+the conservative 50-distinct-expert cold direct-MoE result and router gives
+`4.9644 + 0.3805 + 0.7689 = 6.1138 ms`, projecting the retained 30.040-ms
+verifier to 23.926 ms (`20.352%` lower). This closes the operator budget. The
+direct V2 verifier measurement below supersedes the composition as the final
+acceptance result.
+
+One guarded HumanEval8 endpoint startup then validates the combined route. It
+hits the M=5 router, direct NVFP4 expert path, 25-KiB custom-AR registration,
+FlashAttention-V100/FlashQLA, and V2 FULL+PIECEWISE graphs with online QPN8
+disabled. Weighted pure decode is 150.17 tokens/s over all eight requests and
+150.12 tokens/s excluding the first, versus the retained 129.28/126.81
+controls (`+16.16%/+18.38%`). Mean accepted length is 4.8125, draft acceptance
+is 95.3125%, and per-position acceptance is
+99.31%/97.92%/93.75%/90.28%; none regress from the retained quality run. Six
+outputs are token-exact, and the two shorter alternate implementations also
+pass the official HumanEval tests, giving 8/8 semantic execution.
+
+The endpoint's aggregate decode time per verification round falls from 35.899
+to 31.214 ms (`13.05%`). That statistic contains proposal, sampling, state
+updates, and bookkeeping and therefore is not the target-verifier wall; it
+must not be presented as either passing or failing the separate 20% verifier
+gate.
+
+The original profiler lived only in the legacy V1 runner, while this route
+uses the new V2 `vllm.v1.worker.gpu.model_runner.GPUModelRunner`. An opt-in V2
+profiler now measures only real five-token MTP verification steps and remains
+completely disabled in ordinary inference. Its diagnostic-only target fence
+makes the verifier wall directly comparable without adding a production
+synchronization. The first profiled call is excluded because it contains the
+one-time QSA/Triton JIT, visible in the same log. Across the last eight steady
+rounds, verifier wall is 23.409 ms versus the retained 30.040-ms control, a
+22.07% reduction that passes the required 24.032-ms ceiling. The final
+four-round interval reaches 23.187 ms (`22.81%` lower). Steady GPU service is
+23.332 ms: 22.543 ms target forward, 0.762 ms sampling, and 0.027 ms state
+update. That GPU-service figure is 17.71% below the separate 28.352-ms control
+and is deliberately not relabeled as a 20% GPU-service result. The short
+profile keeps MTP4 acceptance at 4.846 mean accepted length / 96.154% draft
+acceptance and emits the same correct HumanEval/0 implementation. No additional
+Nsight or model startup is needed to close the wall-cost gate.
+
+Peak device memory is 30,435/30,433/30,433/30,433 MiB across TP4. Minimum host
+`MemAvailable` is 25.397 GiB and minimum free swap is 205.096 GiB during the
+load/capture/run. After exit, every GPU returns to 5 MiB, host available memory
+returns to about 117 GiB, swap use returns to about 1.7 GiB, and no worker
+remains. This is high transient swap traffic but not a retained host-memory
+leak.
+
+The shorter V2 profiler run peaks at 30,433 MiB on each of GPU 0--3, with
+30.093 GiB minimum host `MemAvailable` and 188.077 GiB minimum free swap. After
+exit, GPU 0--3 again return to 5 MiB and no process from this worktree remains;
+GPU 4--7 are occupied by a separate prefill audit and are outside this run.
+
+Several plausible imports have already failed the exact-shape gate and must not
+trigger another model startup:
+
+- The current Triton QSA verifier is 0.0921 ms per layer. Grouped Page4
+  FlashAttention-V100 takes 0.6816 ms and XQA Flash takes 0.2317 ms, so the
+  five-row verifier remains on Triton. FlashAttention-V100 and FlashQLA remain
+  active for the target/draft attention and recurrent paths where they win.
+- Replacing the dense FP16 verifier projections without online quantization
+  projects only 0.190 ms (`2.77%`) total saving and cannot close this gate.
+- A V100 port of SGLang PR #36497's persistent HC-mix kernel takes 1191.1 us
+  versus 29.41 us for the existing FP16 path (`40.5x` slower), a projected
+  111.5-ms regression over 96 calls. SGLang's newer HC split-K implementation
+  is FlashInfer/SM100-specific and is not a V100 kernel.
+
+The latest upstream audit uses vLLM PRs
+[#53896](https://github.com/vllm-project/vllm/pull/53896) and
+[#53899](https://github.com/vllm-project/vllm/pull/53899), plus SGLang PR
+[#36497](https://github.com/sgl-project/sglang/pull/36497). vLLM's stable fused
+GDN-MTP CUDA path is guarded for SM80+ and uses `cp.async`; PR #53899 mainly
+adds PLE-offload metadata and cross-process host-offload support, not a V100
+verifier kernel. SGLang's Triton GDN projection helper fuses
+split/reshape/concatenate work but not the dense projections, while its QSA
+indexer fuses Q normalization/RoPE/store and K compression/store. Those are
+small follow-ups only if the TP4 reduction and real endpoint still leave a
+measured gap; they are not justification for speculative model restarts.
+
+### Single-start mixed quality and long-output audit
+
+The unprofiled mixed audit at source `1caa4b0112` uses one engine startup for
+one warmup followed by 64 sequential prompts: GSM8K, MATH500, HumanEval, and
+MBPP suite indices 8--23 in round-robin order. It keeps TP4/PP1, V2, native
+MTP4, the five-row verifier, prefix caching, FP16 activations and KV cache,
+checkpoint-native NVFP4 routed weights, FlashAttention-V100/FlashQLA, and
+FULL+PIECEWISE CUDA graphs. Online QPN8 and the verifier profiler are disabled.
+Generation follows the model's sampling configuration with thinking enabled
+at `xhigh`: temperature 1.0, top-p 0.95, top-k 20, fixed sampling seed
+20260828, natural EOS enabled, and a 4096-token ceiling. The exact prompt set
+has SHA-256
+`641bc719ec195537115ee0eb2b3e8e88f38fca83c238f160739aa246c6c02c99`.
+
+The 64 scored requests emit 80,730 tokens in 1000.412 seconds. Weighted pure
+decode, calculated from per-request steady decode tokens and decode time, is
+82.132 tokens/s. The unweighted mean request rate is 95.955 tokens/s and the
+endpoint rate including prefill and request overhead is 80.697 tokens/s.
+Median/p90 TTFT are 200.86/230.75 ms and median/p90 prefill time is
+176.44/203.97 ms. The loaded extension predates the fused-SwiGLU prefill op,
+so these TTFT figures retain the standalone activation route and are not a
+final prefill baseline. Pure decode excludes that startup/prefill difference.
+
+| suite | output tokens | weighted pure decode | mean request decode | MTP4 mean accepted length | draft acceptance | natural EOS | strict quality |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GSM8K | 10,329 | 89.25 tok/s | 109.64 tok/s | 2.925 | 48.12% | 15/16 | 14/16 |
+| MATH500 | 28,434 | 85.63 tok/s | 97.54 tok/s | 2.778 | 44.46% | 12/16 | 12/16 |
+| HumanEval | 18,367 | 75.74 tok/s | 84.89 tok/s | 2.457 | 36.43% | 14/16 | 14/16 |
+| MBPP diagnostic | 23,600 | 80.64 tok/s | 91.75 tok/s | 2.627 | 40.68% | 13/16 | 12/16 semantic |
+| all | 80,730 | 82.13 tok/s | 95.95 tok/s | 2.671 | 41.78% | 54/64 | see protocol note |
+
+The strict gate requires both the task oracle and natural EOS; every
+`finish_reason=length` result fails even if a partial answer happens to pass.
+On the three valid benchmark protocols, 40/48 pass strictly. Among their 41
+naturally stopped outputs, 40 pass; the sole natural-stop error is a GSM8K
+off-by-one interpretation. MATH500's 12 natural completions and HumanEval's 14
+natural completions all pass their exact-answer or executable-test oracles.
+Ten requests reach 4096 tokens; nine remain inside `<think>`, so merely doubling
+the ceiling would risk extending runaway reasoning rather than establishing a
+better quality result.
+
+The frozen MBPP mixture exposes only its natural-language prompt while its
+hidden tests require undisclosed historical names such as `subject_marks` and
+`get_equal`. Exact-name `0/16` is therefore protocol-invalid and must not be
+reported as an MBPP benchmark score. A resource-limited diagnostic aliases
+each generated top-level callable to the hidden entrypoint and executes the
+original tests: 12/16 pass strictly, three fail the 4096-token gate, and one
+naturally stopped implementation incorrectly returns a string instead of the
+required integer. Any future accepted MBPP run must expose the required
+assertions or entrypoint in its prompt; the alias diagnostic remains explicitly
+non-official.
+
+Across all four suites, global MTP4 mean accepted length is 2.671 and draft
+acceptance is 41.777%; per-position acceptance is
+63.56%/44.38%/33.29%/25.88%. The 54 natural completions aggregate to 2.888
+accepted length, 47.207% draft acceptance, and 88.69 weighted pure decode
+tokens/s. The ten capped requests fall to 2.489, 37.228%, and 76.64 tokens/s
+and account for more verifier rounds than all natural requests combined. At
+request level, accepted length and pure decode rate have Pearson correlation
+0.995. Long stochastic reasoning therefore exposes a real acceptance-limited
+path: this 82.13-token/s result does not meet 100 tokens/s and must not be
+interchanged with the 150.17-token/s no-thinking greedy HumanEval8 contract.
+
+Prefix caching is enabled, but this round-robin workload records 2,066 queries
+and zero hits because every prompt is different and the shared ChatML prefix
+is shorter than one aligned cache block. The run hits V2, FlashAttention-V100,
+FlashQLA GDN, exact M=5 routing, direct NVFP4 experts, local draft argmax,
+MTP index sharing, and the 25-KiB TP4 push all-reduce route. Four runtime Triton
+JIT warnings occur only in the warmup request; no later quality request adds a
+JIT warning.
+
+Peak sampled device memory is 30,473 MiB on each GPU. Minimum host
+`MemAvailable` is 45.195 GiB and minimum free swap is 246.376 GiB. After exit,
+all eight GPUs are at 5 MiB, host available memory is about 119 GiB, free swap
+is about 254 GiB, and no engine or worker remains. Python reports four
+semaphore and two shared-memory objects to the resource tracker at shutdown,
+but it cleans them during exit; the post-run resource check shows no retained
+host or device leak.
+
+The complete result, contract, one-second GPU/host samples, strict audit, and
+per-case hashes are under
+`.artifacts/qwen38_mtp4_verifier_m5/mtp5_direct_mixed64_s8_23_official_xhigh_max4096_gpu0123*`.
 
 ## Acceptance gates
 

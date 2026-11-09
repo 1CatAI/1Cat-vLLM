@@ -8,14 +8,19 @@
 #include <torch/all.h>
 
 #include "custom_all_reduce.cuh"
+#include "sm70_turbomind/ops/activation_pack_sm70.cuh"
+#if !defined(USE_ROCM)
+  #include "sm70_qwen38_hc_batch.cuh"
+#endif
 
 // Fake pointer type, must match fptr_t type in ops.h.
 // We use this type alias to indicate when pointers are passed in as int64_t.
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-bool sm70_profile_trace_enabled() {
-  const char* value = std::getenv("VLLM_SM70_PROFILE_TRACE");
+bool sm70_profile_trace_enabled(const vllm::CustomAllreduce& owner) {
+  const char* value =
+      owner.policy_.raw(vllm::CollectivePolicyField::sm70_profile_trace);
   return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
@@ -45,9 +50,10 @@ const char* capture_status_name(cudaStreamCaptureStatus status) {
   }
 }
 
-fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
-                      torch::Tensor& rank_data, int64_t rank,
-                      bool fully_connected) {
+static fptr_t init_custom_ar_impl(const std::vector<fptr_t>& fake_ipc_ptrs,
+                                  torch::Tensor& rank_data, int64_t rank,
+                                  bool fully_connected,
+                                  const vllm::CollectivePolicy& policy) {
   int world_size = fake_ipc_ptrs.size();
   if (world_size > 8)
     throw std::invalid_argument("world size > 8 is not supported");
@@ -62,7 +68,22 @@ fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
   }
   return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data.data_ptr(),
                                             rank_data.numel(), rank, world_size,
-                                            fully_connected);
+                                            fully_connected, policy);
+}
+
+fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
+                      torch::Tensor& rank_data, int64_t rank,
+                      bool fully_connected) {
+  return init_custom_ar_impl(fake_ipc_ptrs, rank_data, rank, fully_connected,
+                             vllm::CollectivePolicy::legacy());
+}
+
+fptr_t init_custom_ar_configured(const std::vector<fptr_t>& fake_ipc_ptrs,
+                                 torch::Tensor& rank_data, int64_t rank,
+                                 bool fully_connected,
+                                 const std::vector<std::string>& policy) {
+  return init_custom_ar_impl(fake_ipc_ptrs, rank_data, rank, fully_connected,
+                             vllm::CollectivePolicy(policy));
 }
 
 /**
@@ -86,6 +107,401 @@ bool _is_weak_contiguous(torch::Tensor& t) {
          (t.storage().nbytes() - t.storage_offset() * t.element_size() ==
           t.numel() * t.element_size());
 }
+
+#if !defined(USE_ROCM)
+namespace vllm {
+
+constexpr int kQwen38HcDownLocalElements = 88;
+constexpr int kQwen38HcDownLiveElements = 84;
+constexpr int kQwen38HcDownLocalLoraElements = 80;
+constexpr int kQwen38HcDownLocalInjectionElements = 1;
+constexpr int kQwen38HcDownLocalPaddingElements = 3;
+constexpr int kQwen38HcDownGatheredElements =
+    kQwen38HcDownLiveElements * kSm70Tp4PushAllreduceWorldSize;
+constexpr int kQwen38HcGateLocalElements = 2560;
+constexpr int kQwen38HcGateGatheredElements =
+    kQwen38HcGateLocalElements * kSm70Tp4PushAllreduceWorldSize;
+constexpr int kQwen38HcOutputLocalElements =
+    kQwen38HcGateLocalElements / kSm70Tp4PushAllreduceWorldSize;
+
+template <int ngpus, int Rank>
+__global__ void __launch_bounds__(128, 1)
+    sm70_qwen38_hc_down_push_allgather(RankData push_buffers,
+                                       const half* __restrict__ input,
+                                       half* __restrict__ output) {
+  static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
+  using P = typename packed_t<half>::P;
+  constexpr int kElementsPerPack = P::size;
+  constexpr int kPackedElements = kQwen38HcDownLocalElements / kElementsPerPack;
+  constexpr int kPackedStride = kSm70Qwen38HcDownPushBytes / sizeof(P);
+  static_assert(kPackedElements <= kPackedStride);
+
+  auto* local_storage =
+      const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[Rank]));
+  auto* local_epochs = reinterpret_cast<uint32_t*>(
+      local_storage + kSm70Qwen38HcPushSignalOffset);
+  const uint32_t epoch = local_epochs[kSm70Qwen38HcDownEpochIndex];
+  const int epoch_offset = epoch * ngpus * kPackedStride;
+  const int offset = threadIdx.x;
+
+  if (offset < kPackedElements) {
+    P value = reinterpret_cast<const P*>(input)[offset];
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      sm70_push_escape_sentinel(value.data[element]);
+    }
+
+  #pragma unroll
+    for (int destination_rank = 0; destination_rank < ngpus;
+         ++destination_rank) {
+      if (destination_rank == Rank) continue;
+      auto* destination_base = const_cast<char*>(
+          reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
+      void* destination = destination_base + kSm70Qwen38HcDownPushOffset +
+                          (epoch_offset + Rank * kPackedStride) * sizeof(P);
+      sm70_push_store_volatile_16b(value, destination, offset);
+    }
+
+    P peer_values[ngpus];
+    peer_values[Rank] = value;
+    while (true) {
+      bool has_empty_slot = false;
+  #pragma unroll
+      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+        if (source_rank == Rank) continue;
+        const void* source =
+            local_storage + kSm70Qwen38HcDownPushOffset +
+            (epoch_offset + source_rank * kPackedStride) * sizeof(P);
+        sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
+  #pragma unroll
+        for (int element = 0; element < P::size; ++element) {
+          has_empty_slot |=
+              sm70_push_is_sentinel(peer_values[source_rank].data[element]);
+        }
+      }
+      if (!has_empty_slot) break;
+    }
+
+    // The first 80 values are contiguous low-rank rows. Keep them packed:
+    // scalar per-element routing otherwise emits dozens of predicated U16
+    // stores for every source rank. Only the last pack needs injection/padding
+    // scatter. Preserve support for a weak-contiguous unaligned output view.
+    static_assert(kQwen38HcDownLocalLoraElements % kElementsPerPack == 0);
+    static_assert(kQwen38HcDownLocalElements - kQwen38HcDownLocalLoraElements ==
+                  kElementsPerPack);
+  #pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      if (offset < kQwen38HcDownLocalLoraElements / kElementsPerPack) {
+        auto* destination =
+            output + source_rank * kQwen38HcDownLocalLoraElements;
+        if (reinterpret_cast<uintptr_t>(destination) % alignof(P) == 0) {
+          reinterpret_cast<P*>(destination)[offset] = peer_values[source_rank];
+        } else {
+  #pragma unroll
+          for (int element = 0; element < kElementsPerPack; ++element) {
+            destination[offset * kElementsPerPack + element] =
+                peer_values[source_rank].data[element];
+          }
+        }
+      } else {
+        output[ngpus * kQwen38HcDownLocalLoraElements + source_rank] =
+            peer_values[source_rank].data[0];
+  #pragma unroll
+        for (int padding = 0; padding < kQwen38HcDownLocalPaddingElements;
+             ++padding) {
+          output[ngpus * (kQwen38HcDownLocalLoraElements +
+                          kQwen38HcDownLocalInjectionElements) +
+                 source_rank * kQwen38HcDownLocalPaddingElements + padding] =
+              peer_values[source_rank].data[1 + padding];
+        }
+      }
+    }
+
+    P empty;
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      *reinterpret_cast<uint16_t*>(&empty.data[element]) =
+          kSm70Tp4PushAllreduceSentinel;
+    }
+  #pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      if (source_rank == Rank) continue;
+      void* source = local_storage + kSm70Qwen38HcDownPushOffset +
+                     (epoch_offset + source_rank * kPackedStride) * sizeof(P);
+      sm70_push_store_volatile_16b(empty, source, offset);
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    local_epochs[kSm70Qwen38HcDownEpochIndex] =
+        (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
+  }
+}
+
+DINLINE float qwen38_hc_sigmoid_fp32(float value) {
+  constexpr uint32_t kLog2E = 0x3fb8aa3b;
+  const float log2e = __uint_as_float(kLog2E);
+  const float negated = __fsub_rn(0.0f, value);
+  const float exponent = __fmul_rn(negated, log2e);
+  float exp2;
+  asm volatile("ex2.approx.f32 %0, %1;" : "=f"(exp2) : "f"(exponent));
+  const float denominator = __fadd_rn(exp2, 1.0f);
+  float result;
+  asm volatile("div.full.f32 %0, %1, %2;"
+               : "=f"(result)
+               : "f"(1.0f), "f"(denominator));
+  return result;
+}
+
+DINLINE float qwen38_hc_divide_by_count(float value) {
+  float result;
+  asm volatile("div.full.f32 %0, %1, %2;"
+               : "=f"(result)
+               : "f"(value), "f"(4.0f));
+  return result;
+}
+
+// Stream-ordered TP4 HC calls share per-CTA counters. Cooperative launch
+// keeps every CTA eligible to make progress while polling its remote peers.
+// Pack an exact FP16 output and its 16-bit generation into one aligned word:
+// readiness never escapes or changes a floating-point value (including NaNs).
+// Two slots are sufficient: a rank cannot produce generation g+2 until every
+// peer has produced g+1, hence completed its reads of g. Tag wrap is safe for
+// the same reason; only adjacent generations can be in flight.
+__device__ __forceinline__ uint4 qwen38_hc_load8(const half* p) {
+  uint4 v;
+  asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+}
+__device__ __forceinline__ float qwen38_hc_half_at(uint4 v, int i) {
+  const uint32_t word = i < 2 ? v.x : i < 4 ? v.y : i < 6 ? v.z : v.w;
+  return __half2float(__ushort_as_half((word >> ((i & 1) * 16)) & 0xffffu));
+}
+
+__global__ void __launch_bounds__(256)
+    sm70_qwen38_hc_up_mix_push(const half* lora, const half* weight,
+                               const half* branches, half* output,
+                               RankData peers, int rank) {
+  constexpr int Hidden = 4;
+  // Constant parameter indices avoid materializing RankData in local memory.
+  const void* local_peer = rank == 0   ? peers.ptrs[0]
+                           : rank == 1 ? peers.ptrs[1]
+                           : rank == 2 ? peers.ptrs[2]
+                                       : peers.ptrs[3];
+  auto* local = const_cast<char*>(reinterpret_cast<const char*>(local_peer));
+  auto* counters =
+      reinterpret_cast<uint32_t*>(local + kSm70Qwen38HcUpFusedEpochOffset);
+  __shared__ float gates[Hidden * 4];
+  __shared__ float partial[Hidden * 4][2];
+  const int t = threadIdx.x;
+  const int lane = t & 31, warp = t >> 5;
+  const int pair = warp >> 1, kg = warp & 1, kp = kg * 32 + lane;
+  uint4 lora_values;
+  if (kp < 40) lora_values = qwen38_hc_load8(lora + kp * 8);
+  // Same 8-term FMA chain, XOR tree, cross-warp add and FP16 gate boundary
+  // as the accepted Triton up projection. Only the row assignment changes.
+  #pragma unroll
+  for (int group = 0; group < Hidden / 2; ++group) {
+    const int a = group * 8 + pair, b = a + 4;
+    const int ra = (a % 4) * 2560 + rank * 640 + blockIdx.x * Hidden + a / 4;
+    const int rb = (b % 4) * 2560 + rank * 640 + blockIdx.x * Hidden + b / 4;
+    float va = 0.f, vb = 0.f;
+    if (kp < 40) {
+      const int k = kp * 8;
+      const uint4 wa = qwen38_hc_load8(weight + ra * 320 + k);
+      const uint4 wb = qwen38_hc_load8(weight + rb * 320 + k);
+      const float x1 = qwen38_hc_half_at(lora_values, 1);
+      va = __fmul_rn(x1, qwen38_hc_half_at(wa, 1));
+      vb = __fmul_rn(x1, qwen38_hc_half_at(wb, 1));
+      va = __fmaf_rn(qwen38_hc_half_at(lora_values, 0),
+                     qwen38_hc_half_at(wa, 0), va);
+      vb = __fmaf_rn(qwen38_hc_half_at(lora_values, 0),
+                     qwen38_hc_half_at(wb, 0), vb);
+  #pragma unroll
+      for (int e = 2; e < 8; ++e) {
+        const float x = qwen38_hc_half_at(lora_values, e);
+        va = __fmaf_rn(x, qwen38_hc_half_at(wa, e), va);
+        vb = __fmaf_rn(x, qwen38_hc_half_at(wb, e), vb);
+      }
+    }
+  #pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+      va = __fadd_rn(va, __shfl_xor_sync(0xffffffff, va, d));
+      vb = __fadd_rn(vb, __shfl_xor_sync(0xffffffff, vb, d));
+    }
+    if (lane == 0) {
+      partial[a][kg] = va;
+      partial[b][kg] = vb;
+    }
+  }
+  __syncthreads();
+  if (t < Hidden * 4)
+    gates[t] = qwen38_hc_sigmoid_fp32(
+        __half2float(__float2half_rn(__fadd_rn(partial[t][0], partial[t][1]))));
+  __syncthreads();
+  if (t < Hidden) {
+    const int h = blockIdx.x * Hidden + t;
+    float mixed = 0.f;
+  #pragma unroll
+    for (int branch = 0; branch < 4; ++branch)
+      mixed = __fmaf_rn(gates[t * 4 + branch],
+                        __half2float(branches[branch * 2560 + rank * 640 + h]),
+                        mixed);
+    float scaled;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(scaled) : "f"(mixed), "f"(4.f));
+    const half value = __float2half_rn(scaled);
+    {
+      const uint32_t generation = counters[blockIdx.x] + 1u;
+      const uint32_t tag = generation & 0xffffu;
+      const uint32_t packet = (tag << 16) | __half_as_ushort(value);
+      const int slot = (generation & 1u) * 4 * 640;
+  #pragma unroll
+      for (int dest = 0; dest < 4; ++dest) {
+        if (dest == rank) continue;
+        auto* p = reinterpret_cast<uint32_t*>(
+                      const_cast<char*>(
+                          reinterpret_cast<const char*>(peers.ptrs[dest])) +
+                      kSm70Qwen38HcUpFusedPacketOffset) +
+                  slot + rank * 640 + h;
+        asm volatile("st.volatile.global.u32 [%0], %1;" ::"l"(p), "r"(packet)
+                     : "memory");
+      }
+      output[rank * 640 + h] = value;
+  #pragma unroll
+      for (int src = 0; src < 4; ++src) {
+        if (src == rank) continue;
+        auto* p = reinterpret_cast<uint32_t*>(
+                      local + kSm70Qwen38HcUpFusedPacketOffset) +
+                  slot + src * 640 + h;
+        uint32_t received;
+        do {
+          asm volatile("ld.volatile.global.u32 %0, [%1];"
+                       : "=r"(received)
+                       : "l"(p)
+                       : "memory");
+        } while ((received >> 16) != tag);
+        output[src * 640 + h] = __ushort_as_half(received & 0xffffu);
+      }
+    }
+  }
+  {
+    __syncthreads();
+    if (t == 0) counters[blockIdx.x] += 1;
+  }
+}
+
+template <int ngpus, int Rank, bool GatherOutput = false>
+__global__ void __launch_bounds__(512, 1)
+    sm70_qwen38_hc_gate_push_mix(RankData push_buffers,
+                                 const half* __restrict__ local_gate,
+                                 const half* __restrict__ branches,
+                                 half* __restrict__ output,
+                                 int packed_elements) {
+  static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
+  using P = typename packed_t<half>::P;
+  constexpr int kPackedStride = kSm70Qwen38HcGatePushBytes / sizeof(P);
+
+  auto* local_storage =
+      const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[Rank]));
+  auto* local_epochs = reinterpret_cast<uint32_t*>(
+      local_storage + kSm70Qwen38HcPushSignalOffset);
+  const int epoch_index = kSm70Qwen38HcGateEpochIndexBase + blockIdx.x;
+  const uint32_t epoch = local_epochs[epoch_index];
+  const int epoch_offset = epoch * ngpus * kPackedStride;
+  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (offset < packed_elements) {
+    P value = reinterpret_cast<const P*>(local_gate)[offset];
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      sm70_push_escape_sentinel(value.data[element]);
+    }
+
+  #pragma unroll
+    for (int destination_rank = 0; destination_rank < ngpus;
+         ++destination_rank) {
+      if (destination_rank == Rank) continue;
+      auto* destination_base = const_cast<char*>(
+          reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
+      void* destination = destination_base + kSm70Qwen38HcGatePushOffset +
+                          (epoch_offset + Rank * kPackedStride) * sizeof(P);
+      sm70_push_store_volatile_16b(value, destination, offset);
+    }
+
+    P peer_values[ngpus];
+    peer_values[Rank] = value;
+    while (true) {
+      bool has_empty_slot = false;
+  #pragma unroll
+      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+        if (source_rank == Rank) continue;
+        const void* source =
+            local_storage + kSm70Qwen38HcGatePushOffset +
+            (epoch_offset + source_rank * kPackedStride) * sizeof(P);
+        sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
+  #pragma unroll
+        for (int element = 0; element < P::size; ++element) {
+          has_empty_slot |=
+              sm70_push_is_sentinel(peer_values[source_rank].data[element]);
+        }
+      }
+      if (!has_empty_slot) break;
+    }
+
+    if constexpr (GatherOutput) {
+      // Up already mixed all branches for 640 hidden coordinates. Gather
+      // these final FP16 values, without a second arithmetic/rounding step.
+      // Reuse the isolated HC gate channel and its existing epoch protocol;
+      // the MoE/shared-expert stream uses a separate channel.
+  #pragma unroll
+      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+        reinterpret_cast<P*>(
+            output + source_rank * kQwen38HcOutputLocalElements)[offset] =
+            peer_values[source_rank];
+      }
+    } else {
+  #pragma unroll
+      for (int element = 0; element < P::size; ++element) {
+        const int hidden = offset * P::size + element;
+        float result = 0.0f;
+  #pragma unroll
+        for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+          const float gate =
+              __half2float(peer_values[source_rank].data[element]);
+          const float branch = __half2float(
+              branches[source_rank * kQwen38HcGateLocalElements + hidden]);
+          result = __fmaf_rn(qwen38_hc_sigmoid_fp32(gate), branch, result);
+        }
+        output[hidden] = __float2half_rn(qwen38_hc_divide_by_count(result));
+      }
+    }
+
+    P empty;
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      *reinterpret_cast<uint16_t*>(&empty.data[element]) =
+          kSm70Tp4PushAllreduceSentinel;
+    }
+  #pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      if (source_rank == Rank) continue;
+      void* source = local_storage + kSm70Qwen38HcGatePushOffset +
+                     (epoch_offset + source_rank * kPackedStride) * sizeof(P);
+      sm70_push_store_volatile_16b(empty, source, offset);
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    local_epochs[epoch_index] = (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
+  }
+}
+
+}  // namespace vllm
+#endif
 
 /**
  * Performs an out-of-place allreduce and stores result in out.
@@ -147,7 +563,8 @@ void sm70_all_reduce_gemma_rms_norm_impl(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t _reg_buffer,
-    int64_t reg_buffer_sz_bytes, double epsilon) {
+    int64_t reg_buffer_sz_bytes, double epsilon,
+    bool benchmark_reference = false) {
   constexpr int64_t kHiddenSize = vllm::kSm70GemmaRmsNormHiddenSize;
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
@@ -193,7 +610,14 @@ void sm70_all_reduce_gemma_rms_norm_impl(
 
   const auto input_size = inp.numel() * inp.element_size();
   auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
-  if (reg_buffer) {
+  // The push path consumes the original pointer directly, including in graphs.
+  // Legacy pull paths still require IPC registration or a staging copy.
+  const bool push_norm = kWorldSize == 4 && inp.size(0) == 8 &&
+                         fa->fully_connected_ &&
+                         fa->sm70_tp4_push_buffers_registered_;
+  if (push_norm) {
+    reg_buffer = inp.data_ptr();
+  } else if (reg_buffer) {
     TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
     AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size,
                                   cudaMemcpyDeviceToDevice, stream));
@@ -206,14 +630,12 @@ void sm70_all_reduce_gemma_rms_norm_impl(
   const float epsilon_f = static_cast<float>(epsilon);
 
   if constexpr (kWorldSize == 4) {
-    static const bool trace_enabled = sm70_profile_trace_enabled();
-    static std::atomic<bool> logged_route{false};
-    if (trace_enabled) {
+    if (sm70_profile_trace_enabled(*fa)) {
       cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
       AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
       bool expected = false;
       if (capture_status == cudaStreamCaptureStatusActive &&
-          logged_route.compare_exchange_strong(expected, true)) {
+          fa->logged_norm_route_.compare_exchange_strong(expected, true)) {
         std::cerr << "SM70 TP4 all_reduce_gemma_rms_norm op reached"
                   << " rank=" << fa->rank_ << " num_tokens=" << num_tokens
                   << " residual=" << scalar_type_name(residual.scalar_type())
@@ -229,29 +651,42 @@ void sm70_all_reduce_gemma_rms_norm_impl(
 
   if (residual.scalar_type() == at::ScalarType::Float) {
     auto residual_ptr = reinterpret_cast<const float*>(residual.data_ptr());
+    // The batch kernel writes the K16 twin the next projection would pack.
+    torch::Tensor k16_twin;
+    half* k16_out = nullptr;
+    if constexpr (kWorldSize == 4) {
+      if (!benchmark_reference && fa->sm70_push_norm_batch_ready(num_tokens)) {
+        k16_out = vllm::sm70::k16_twin_for(normalized_out, k16_twin);
+      }
+    }
     if (weight.scalar_type() == at::ScalarType::Float) {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, float>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference, k16_out);
     } else {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, half>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference, k16_out);
     }
+    if (k16_out != nullptr) vllm::sm70::k16_publish(normalized_out, k16_twin);
   } else if constexpr (kWorldSize == 2) {
     auto residual_ptr = reinterpret_cast<const half*>(residual.data_ptr());
     if (weight.scalar_type() == at::ScalarType::Float) {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, half, float>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     } else {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, half, half>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     }
   }
 }
@@ -276,6 +711,16 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
   sm70_all_reduce_gemma_rms_norm_impl<4>(
       _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
       reg_buffer_sz_bytes, epsilon);
+}
+
+void sm70_tp4_all_reduce_gemma_rms_norm_reference(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon) {
+  sm70_all_reduce_gemma_rms_norm_impl<4>(
+      _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
+      reg_buffer_sz_bytes, epsilon, true);
 }
 
 void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
@@ -371,10 +816,9 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
   TORCH_CHECK(_is_weak_contiguous(inp_b));
   TORCH_CHECK(_is_weak_contiguous(out));
 
-  static std::atomic<bool> logged_sum2_route{false};
   bool expected = false;
-  if (sm70_profile_trace_enabled() &&
-      logged_sum2_route.compare_exchange_strong(expected, true)) {
+  if (sm70_profile_trace_enabled(*fa) &&
+      fa->logged_sum2_route_.compare_exchange_strong(expected, true)) {
     std::cerr << "SM70 custom all_reduce_sum2 op reached"
               << " rank=" << fa->rank_ << " world_size=" << fa->world_size_
               << " numel=" << out.numel()
@@ -413,6 +857,359 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
   }
 }
 
+void sm70_qwen38_hc_down_local(torch::Tensor input, torch::Tensor packed,
+                               torch::Tensor partials, torch::Tensor output,
+                               int64_t rank) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(input.is_cuda() && rank >= 0 && rank < 4,
+              "Local batch HC requires CUDA and a TP4 rank");
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
+                  input.dim() == 2 && input.size(0) >= 2 &&
+                  input.size(0) <= 16 && input.size(1) == 10240,
+              "Local batch HC requires SM70 [2..16, 10240] input");
+  const int m = input.size(0);
+  for (const auto& tensor : {input, packed, output})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == input.device() &&
+                    tensor.scalar_type() == at::kHalf &&
+                    tensor.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "Local batch HC requires aligned contiguous FP16 tensors");
+  TORCH_CHECK(packed.sizes() == at::IntArrayRef({3, 640, 2, 32, 8}) &&
+                  output.sizes() == at::IntArrayRef({m, 336}) &&
+                  partials.is_cuda() && partials.device() == input.device() &&
+                  partials.scalar_type() == at::kFloat &&
+                  partials.is_contiguous() &&
+                  partials.sizes() == at::IntArrayRef({20, m, 96}),
+              "Invalid local batch HC down geometry");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  vllm::qwen38_hc_batch::hc_down_partials<false, 1, false, 96>
+      <<<dim3(3, (m + 7) / 8, 20), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(input.data_ptr()),
+          reinterpret_cast<const half*>(packed.data_ptr()),
+          partials.data_ptr<float>(), m);
+  vllm::qwen38_hc_batch::
+      down_local_packet<<<(m * 336 + 127) / 128, 128, 0, stream>>>(
+          partials.data_ptr<float>(),
+          reinterpret_cast<half*>(output.data_ptr()), rank, m);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qwen38_hc_up_local(torch::Tensor lora, torch::Tensor packed,
+                             torch::Tensor branches, torch::Tensor output,
+                             int64_t rank) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(branches.is_cuda() && rank >= 0 && rank < 4,
+              "Local batch HC requires CUDA and a TP4 rank");
+  const at::cuda::OptionalCUDAGuard guard(device_of(branches));
+  TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
+                  branches.dim() == 2 && branches.size(0) >= 2 &&
+                  branches.size(0) <= 16 && branches.size(1) == 10240,
+              "Local batch HC requires SM70 [2..16, 10240] input");
+  const int m = branches.size(0);
+  for (const auto& tensor : {lora, packed, branches, output})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == branches.device() &&
+                    tensor.scalar_type() == at::kHalf &&
+                    tensor.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "Local batch HC requires aligned contiguous FP16 tensors");
+  TORCH_CHECK(lora.sizes() == at::IntArrayRef({m, 320}) &&
+                  packed.sizes() == at::IntArrayRef({80, 20, 2, 4, 8, 8}) &&
+                  output.sizes() == at::IntArrayRef({m, 2560}),
+              "Invalid local batch HC up geometry");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  CUDACHECK(cudaMemsetAsync(output.data_ptr(), 0, output.numel() * sizeof(half),
+                            stream));
+  vllm::qwen38_hc_batch::hc_up_batch<false, 1, 4, true, true>
+      <<<dim3(80, (m + 7) / 8), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(lora.data_ptr()),
+          reinterpret_cast<const half*>(packed.data_ptr()),
+          reinterpret_cast<const half*>(branches.data_ptr()),
+          reinterpret_cast<half*>(output.data_ptr()), m, 640, rank * 640);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qwen38_hc_replicated(torch::Tensor input, torch::Tensor packed_down,
+                               torch::Tensor packed_up, torch::Tensor partials,
+                               torch::Tensor lora, torch::Tensor output,
+                               torch::Tensor injection) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(input.is_cuda(), "Replicated batch HC requires CUDA");
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
+                  input.dim() == 2 && input.size(0) >= 2 &&
+                  input.size(0) <= 20 && input.size(1) == 10240,
+              "Replicated batch HC requires SM70 [2..20, 10240] input");
+  const int m = input.size(0);
+  for (const auto& tensor :
+       {input, packed_down, packed_up, lora, output, injection})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == input.device() &&
+                    tensor.scalar_type() == at::kHalf &&
+                    tensor.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "Replicated batch HC requires aligned contiguous FP16 tensors");
+  TORCH_CHECK(packed_down.sizes() == at::IntArrayRef({11, 640, 2, 32, 8}) &&
+                  packed_up.sizes() == at::IntArrayRef({320, 20, 2, 4, 8, 8}) &&
+                  lora.sizes() == at::IntArrayRef({m, 320}) &&
+                  output.sizes() == at::IntArrayRef({m, 2560}) &&
+                  injection.sizes() == at::IntArrayRef({m, 4}) &&
+                  partials.is_cuda() && partials.device() == input.device() &&
+                  partials.scalar_type() == at::kFloat &&
+                  partials.is_contiguous() &&
+                  partials.sizes() == at::IntArrayRef({20, m, 352}),
+              "Invalid replicated batch HC geometry");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  vllm::qwen38_hc_batch::hc_down_partials<false, 1, false, 352>
+      <<<dim3(11, (m + 7) / 8, 20), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(input.data_ptr()),
+          reinterpret_cast<const half*>(packed_down.data_ptr()),
+          partials.data_ptr<float>(), m);
+  vllm::qwen38_hc_batch::
+      down_replicated_reduce<<<(m * 324 + 127) / 128, 128, 0, stream>>>(
+          partials.data_ptr<float>(), reinterpret_cast<half*>(lora.data_ptr()),
+          reinterpret_cast<half*>(injection.data_ptr()), m);
+  vllm::qwen38_hc_batch::hc_up_batch<false, 1, 4, true>
+      <<<dim3(320, (m + 7) / 8), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(lora.data_ptr()),
+          reinterpret_cast<const half*>(packed_up.data_ptr()),
+          reinterpret_cast<const half*>(input.data_ptr()),
+          reinterpret_cast<half*>(output.data_ptr()), m, 2560, 0);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
+                          torch::Tensor packed_down, torch::Tensor packed_up,
+                          torch::Tensor partials, torch::Tensor lora,
+                          torch::Tensor local_output, torch::Tensor output,
+                          torch::Tensor injection, bool round_down_partials,
+                          bool cooperative, bool full_unroll, bool fused_chain,
+                          int64_t cta_split_warps) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(_fa != 0 && input.is_cuda(),
+              "Invalid batch HC communicator/input");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  auto* fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK(fa->world_size_ == 4 && fa->fully_connected_ &&
+                  fa->sm70_tp4_push_buffers_registered_ &&
+                  vllm::custom_allreduce_current_device_is_sm70(),
+              "Batch HC requires a registered fully-connected SM70 TP4 group");
+  TORCH_CHECK(input.dim() == 2 && input.size(0) >= 2 && input.size(0) <= 16 &&
+                  input.size(1) == 10240,
+              "Batch HC requires [2..16, 10240] input");
+  const int m = input.size(0);
+  for (const auto& t :
+       {input, packed_down, packed_up, lora, local_output, output, injection}) {
+    TORCH_CHECK(
+        t.is_cuda() && t.device() == input.device() &&
+            t.scalar_type() == at::kHalf && t.is_contiguous() &&
+            reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+        "Batch HC requires same-device aligned contiguous FP16 storage");
+  }
+  TORCH_CHECK(packed_down.sizes() == at::IntArrayRef({3, 640, 2, 32, 8}) &&
+                  packed_up.sizes() == at::IntArrayRef({80, 20, 2, 4, 8, 8}),
+              "Invalid batch HC packed weights");
+  TORCH_CHECK(partials.is_cuda() && partials.device() == input.device() &&
+                  partials.scalar_type() == at::kFloat &&
+                  partials.is_contiguous() &&
+                  partials.sizes() == at::IntArrayRef({20, m, 96}),
+              "Invalid batch HC FP32 partial workspace");
+  TORCH_CHECK(lora.sizes() == at::IntArrayRef({m, 320}) &&
+                  local_output.sizes() == at::IntArrayRef({m, 640}) &&
+                  output.sizes() == at::IntArrayRef({m, 2560}) &&
+                  injection.sizes() == at::IntArrayRef({m, 4}),
+              "Invalid batch HC output geometry");
+  vllm::qwen38_hc_batch::launch(
+      fa->sm70_tp4_push_buffers_, fa->rank_,
+      reinterpret_cast<const half*>(input.data_ptr()),
+      reinterpret_cast<const half*>(packed_down.data_ptr()),
+      reinterpret_cast<const half*>(packed_up.data_ptr()),
+      partials.data_ptr<float>(), reinterpret_cast<half*>(lora.data_ptr()),
+      reinterpret_cast<half*>(local_output.data_ptr()),
+      reinterpret_cast<half*>(output.data_ptr()),
+      reinterpret_cast<half*>(injection.data_ptr()), m, round_down_partials,
+      cooperative, full_unroll, c10::cuda::getCurrentCUDAStream().stream(),
+      fused_chain, cta_split_warps);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qwen38_hc_down_allgather(fptr_t _fa, torch::Tensor& input,
+                                   torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 HC all-gather is unavailable on ROCm");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  TORCH_CHECK_EQ(fa->world_size_, vllm::kSm70Tp4PushAllreduceWorldSize);
+  TORCH_CHECK(fa->fully_connected_ && fa->sm70_tp4_push_buffers_registered_);
+  TORCH_CHECK_EQ(input.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(output.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(input.numel(), vllm::kQwen38HcDownLocalElements);
+  TORCH_CHECK_EQ(output.numel(), vllm::kQwen38HcDownGatheredElements);
+  TORCH_CHECK(_is_weak_contiguous(input) && _is_weak_contiguous(output));
+  #define VLLM_LAUNCH_QWEN38_HC_DOWN(RANK)                                   \
+    vllm::sm70_qwen38_hc_down_push_allgather<4, RANK><<<1, 32, 0, stream>>>( \
+        fa->sm70_tp4_push_buffers_,                                          \
+        reinterpret_cast<const half*>(input.data_ptr()),                     \
+        reinterpret_cast<half*>(output.data_ptr()))
+  switch (fa->rank_) {
+    case 0:
+      VLLM_LAUNCH_QWEN38_HC_DOWN(0);
+      break;
+    case 1:
+      VLLM_LAUNCH_QWEN38_HC_DOWN(1);
+      break;
+    case 2:
+      VLLM_LAUNCH_QWEN38_HC_DOWN(2);
+      break;
+    default:
+      VLLM_LAUNCH_QWEN38_HC_DOWN(3);
+      break;
+  }
+  #undef VLLM_LAUNCH_QWEN38_HC_DOWN
+#endif
+}
+
+void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
+                             torch::Tensor& branches, torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 HC gate-mix is unavailable on ROCm");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(local_gate));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  TORCH_CHECK_EQ(fa->world_size_, vllm::kSm70Tp4PushAllreduceWorldSize);
+  TORCH_CHECK(fa->fully_connected_ && fa->sm70_tp4_push_buffers_registered_);
+  TORCH_CHECK_EQ(local_gate.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(branches.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(output.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(local_gate.numel(), vllm::kQwen38HcGateLocalElements);
+  TORCH_CHECK_EQ(branches.numel(), vllm::kQwen38HcGateGatheredElements);
+  TORCH_CHECK_EQ(output.numel(), vllm::kQwen38HcGateLocalElements);
+  TORCH_CHECK(_is_weak_contiguous(local_gate) &&
+              _is_weak_contiguous(branches) && _is_weak_contiguous(output));
+  constexpr int kPackedElements =
+      vllm::kQwen38HcGateLocalElements / vllm::packed_t<half>::P::size;
+  constexpr int kThreads = 32;
+  constexpr int kBlocks = (kPackedElements + kThreads - 1) / kThreads;
+  #define VLLM_LAUNCH_QWEN38_HC_GATE(RANK)                        \
+    vllm::sm70_qwen38_hc_gate_push_mix<4, RANK>                   \
+        <<<kBlocks, kThreads, 0, stream>>>(                       \
+            fa->sm70_tp4_push_buffers_,                           \
+            reinterpret_cast<const half*>(local_gate.data_ptr()), \
+            reinterpret_cast<const half*>(branches.data_ptr()),   \
+            reinterpret_cast<half*>(output.data_ptr()), kPackedElements)
+  switch (fa->rank_) {
+    case 0:
+      VLLM_LAUNCH_QWEN38_HC_GATE(0);
+      break;
+    case 1:
+      VLLM_LAUNCH_QWEN38_HC_GATE(1);
+      break;
+    case 2:
+      VLLM_LAUNCH_QWEN38_HC_GATE(2);
+      break;
+    default:
+      VLLM_LAUNCH_QWEN38_HC_GATE(3);
+      break;
+  }
+  #undef VLLM_LAUNCH_QWEN38_HC_GATE
+#endif
+}
+
+void sm70_qwen38_hc_up_mix_allgather(fptr_t _fa, torch::Tensor& lora,
+                                     torch::Tensor& weight,
+                                     torch::Tensor& branches,
+                                     torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 HC up/mix is unavailable on ROCm");
+#else
+  TORCH_CHECK(lora.is_cuda());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(lora));
+  for (const auto* tensor : {&lora, &weight, &branches, &output}) {
+    TORCH_CHECK(tensor->device() == lora.device());
+    TORCH_CHECK(tensor->scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(tensor->is_contiguous());
+  }
+  TORCH_CHECK(lora.numel() == 336 && weight.numel() == 10240 * 320 &&
+              branches.numel() == 10240 && output.numel() == 2560);
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(lora.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0);
+  auto* fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK(fa->world_size_ == 4 && fa->fully_connected_ &&
+              fa->sm70_tp4_push_buffers_registered_);
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const half* lp = reinterpret_cast<const half*>(lora.data_ptr());
+  const half* wp = reinterpret_cast<const half*>(weight.data_ptr());
+  const half* xp = reinterpret_cast<const half*>(branches.data_ptr());
+  half* out = reinterpret_cast<half*>(output.data_ptr());
+  auto peers = fa->sm70_tp4_push_buffers_;
+  int rank = fa->rank_;
+  void* args[] = {&lp, &wp, &xp, &out, &peers, &rank};
+  CUDACHECK(cudaLaunchCooperativeKernel(
+      reinterpret_cast<void*>(vllm::sm70_qwen38_hc_up_mix_push),
+      dim3(vllm::kSm70Qwen38HcUpFusedBlocks), dim3(256), args, 0, stream));
+#endif
+}
+
+void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
+                                     torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false,
+              "SM70 Qwen3.8 HC output all-gather is unavailable on ROCm");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK(local_block.is_cuda() && output.is_cuda());
+  TORCH_CHECK(local_block.device() == output.device());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(local_block));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  TORCH_CHECK_EQ(fa->world_size_, vllm::kSm70Tp4PushAllreduceWorldSize);
+  TORCH_CHECK(fa->fully_connected_ && fa->sm70_tp4_push_buffers_registered_);
+  TORCH_CHECK_EQ(local_block.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(output.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(local_block.numel(), vllm::kQwen38HcOutputLocalElements);
+  TORCH_CHECK_EQ(output.numel(), vllm::kQwen38HcGateLocalElements);
+  TORCH_CHECK(local_block.is_contiguous() && output.is_contiguous());
+  constexpr int kPackedElements =
+      vllm::kQwen38HcOutputLocalElements / vllm::packed_t<half>::P::size;
+  constexpr int kThreads = 32;
+  constexpr int kBlocks = (kPackedElements + kThreads - 1) / kThreads;
+  #define VLLM_LAUNCH_QWEN38_HC_OUTPUT(RANK)                                \
+    vllm::sm70_qwen38_hc_gate_push_mix<4, RANK, true>                       \
+        <<<kBlocks, kThreads, 0, stream>>>(                                 \
+            fa->sm70_tp4_push_buffers_,                                     \
+            reinterpret_cast<const half*>(local_block.data_ptr()), nullptr, \
+            reinterpret_cast<half*>(output.data_ptr()), kPackedElements)
+  switch (fa->rank_) {
+    case 0:
+      VLLM_LAUNCH_QWEN38_HC_OUTPUT(0);
+      break;
+    case 1:
+      VLLM_LAUNCH_QWEN38_HC_OUTPUT(1);
+      break;
+    case 2:
+      VLLM_LAUNCH_QWEN38_HC_OUTPUT(2);
+      break;
+    default:
+      VLLM_LAUNCH_QWEN38_HC_OUTPUT(3);
+      break;
+  }
+  #undef VLLM_LAUNCH_QWEN38_HC_OUTPUT
+#endif
+}
+
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
                  fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
@@ -421,8 +1218,9 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
 
   TORCH_CHECK(input_pair.scalar_type() == at::ScalarType::Float);
   TORCH_CHECK(output.scalar_type() == at::ScalarType::Long);
-  TORCH_CHECK(input_pair.numel() == 2);
-  TORCH_CHECK(output.numel() == 1);
+  TORCH_CHECK(input_pair.numel() >= 2 && input_pair.numel() <= 256 &&
+              input_pair.numel() % 2 == 0);
+  TORCH_CHECK(output.numel() == input_pair.numel() / 2);
   TORCH_CHECK(_is_weak_contiguous(input_pair));
   TORCH_CHECK(_is_weak_contiguous(output));
 
@@ -437,7 +1235,8 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
   }
 
   fa->top1_argmax(stream, reinterpret_cast<float*>(reg_buffer),
-                  reinterpret_cast<int64_t*>(output.data_ptr()));
+                  reinterpret_cast<int64_t*>(output.data_ptr()),
+                  input_pair.numel() / 2);
 }
 
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
@@ -579,6 +1378,10 @@ int64_t sm70_tp4_push_allreduce_buffer_size() {
   return vllm::kSm70Tp4PushAllreduceBufferBytes;
 }
 
+int64_t sm70_tp8_hierarchical_push_allreduce_buffer_size() {
+  return vllm::kSm70Tp8HierarchicalPushBufferBytes;
+}
+
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
@@ -600,6 +1403,19 @@ void register_sm70_tp4_push_allreduce_buffer(
     ipc_ptrs[peer] = reinterpret_cast<void*>(fake_ipc_ptrs[peer]);
   }
   fa->register_sm70_tp4_push_buffer(ipc_ptrs);
+}
+
+void register_sm70_tp8_hierarchical_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK_EQ(fake_ipc_ptrs.size(),
+                 static_cast<size_t>(vllm::kSm70Tp8HierarchicalPushWorldSize));
+  TORCH_CHECK_EQ(fake_ipc_ptrs.size(), static_cast<size_t>(fa->world_size_));
+  void* ipc_ptrs[vllm::kSm70Tp8HierarchicalPushWorldSize];
+  for (size_t peer = 0; peer < fake_ipc_ptrs.size(); ++peer) {
+    ipc_ptrs[peer] = reinterpret_cast<void*>(fake_ipc_ptrs[peer]);
+  }
+  fa->register_sm70_tp8_hierarchical_push_buffer(ipc_ptrs);
 }
 
 // Use vector<int64_t> to represent byte data for python binding compatibility.

@@ -5,6 +5,7 @@
 import asyncio
 import concurrent.futures
 import fnmatch
+import functools
 import glob
 import hashlib
 import json
@@ -13,7 +14,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
@@ -35,10 +36,20 @@ from vllm.config.load import (
     LoadConfig,
 )
 from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
+from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
+)
+from vllm.model_executor.model_loader.direct_io import (
+    RunSharing,
+    _group_ready,
+    cgroup_available_bytes,
+    direct_io_capability,
+    direct_io_weights,
+    is_decoder_layer_weight,
+    released_mapped_weights,
 )
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
@@ -320,12 +331,17 @@ def get_quant_config(
     # if hf_quant_config is None, we will try to get config from
     # hf_overrides
     hf_overrides = model_config.hf_overrides
+    if callable(hf_overrides):
+        # A callable hf_overrides is a config-to-config transform (e.g. the
+        # one SpeculativeConfig installs on draft model configs); it cannot
+        # carry quantization config entries, so treat it as no overrides.
+        hf_overrides = {}
     if not isinstance(hf_overrides, dict):
         raise ValueError(
             "hf_overrides must be a dict for get_quant_config "
             "to get the quantization config from it."
         )
-    quantization_config_file = hf_overrides.get("quantization_config_file", None)
+    quantization_config_file = hf_overrides.get("quantization_config_file")
     if quantization_config_file is not None:
         if hasattr(quant_cls, "from_config_file"):
             return quant_cls.from_config_file(quantization_config_file)
@@ -335,7 +351,7 @@ def get_quant_config(
                 "but quant_cls.from_config_file is not implemented in "
                 f"{quant_cls}"
             )
-    quantization_config_json = hf_overrides.get("quantization_config_dict_json", None)
+    quantization_config_json = hf_overrides.get("quantization_config_dict_json")
     if quantization_config_json is not None:
         if hasattr(quant_cls, "from_config_dict_json"):
             return quant_cls.from_config_dict_json(quantization_config_json)
@@ -673,6 +689,160 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+def _index_shards(hf_folder: str, index_file: str) -> set[str] | None:
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return None
+    with open(index_file_name) as f:
+        return set(json.load(f)["weight_map"].values())
+
+
+def indexed_shards_in_subfolders(
+    hf_folder: str, index_file: str, pattern: str
+) -> list[str]:
+    """Shards the checkpoint index keeps in subfolders whose file name matches
+    a top-level ``pattern``: the folder glob does not reach them.
+
+    (GLM-5.3-Flash-FP4-Local stores its BF16 attention tensors in
+    ``tensors/native-QB.safetensors``.)
+    """
+    shards = _index_shards(hf_folder, index_file)
+    if shards is None or "/" in pattern:
+        return []
+    return sorted(
+        os.path.join(hf_folder, shard)
+        for shard in shards
+        if os.path.dirname(shard) and fnmatch.fnmatch(os.path.basename(shard), pattern)
+    )
+
+
+def indexed_shards_not_selected(
+    hf_folder: str, index_file: str, hf_weights_files: list[str]
+) -> list[str]:
+    """Shards the checkpoint index names that are not among the files to load."""
+    shards = _index_shards(hf_folder, index_file)
+    if shards is None:
+        return []
+    selected = {os.path.normpath(path) for path in hf_weights_files}
+    return sorted(
+        shard
+        for shard in shards
+        if os.path.normpath(os.path.join(hf_folder, shard)) not in selected
+    )
+
+
+_SHARD_NAME = re.compile(r"^(?P<stem>.+)-(?P<idx>\d+)-of-(?P<total>\d+)\.safetensors$")
+
+
+def raise_on_missing_safetensors_shards(
+    hf_folder: str,
+    index_file: str,
+    hf_weights_files: list[str],
+    ignore_patterns: list[str] | str | None = None,
+    check_index: bool = True,
+) -> None:
+    """Fail before loading when a sharded safetensors checkpoint is incomplete.
+
+    With a checkpoint index, every file its ``weight_map`` names must exist
+    (``check_index=False`` skips this, for callers that load a deliberate
+    subset). Without an index, each ``<stem>-NNNNN-of-MMMMM.safetensors``
+    family among ``hf_weights_files`` must have all ``MMMMM`` members. Files
+    that match ``ignore_patterns`` may be absent. Only file names are checked;
+    no tensor data is read.
+    """
+    if isinstance(ignore_patterns, str):
+        ignore_patterns = [ignore_patterns]
+    ignore_patterns = ignore_patterns or []
+
+    def ignored(rel_path: str) -> bool:
+        return any(fnmatch.fnmatch(rel_path, pat) for pat in ignore_patterns)
+
+    shards = _index_shards(hf_folder, index_file)
+    if shards is not None:
+        if not check_index:
+            return
+        missing = sorted(
+            shard
+            for shard in shards
+            if not ignored(shard) and not os.path.isfile(os.path.join(hf_folder, shard))
+        )
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing)} safetensors shard(s) named by "
+                f"{os.path.join(hf_folder, index_file)} are missing: {missing[:8]}"
+            )
+        return
+
+    families: dict[tuple[str, str, int, int], set[int]] = defaultdict(set)
+    for path in hf_weights_files:
+        match = _SHARD_NAME.match(os.path.basename(path))
+        if match is None:
+            continue
+        total = int(match["total"])
+        key = (os.path.dirname(path), match["stem"], len(match["idx"]), total)
+        families[key].add(int(match["idx"]))
+    missing = []
+    for (folder, stem, width, total), present in sorted(families.items()):
+        for idx in range(1, total + 1):
+            if idx in present:
+                continue
+            name = f"{stem}-{idx:0{width}d}-of-{total:0{width}d}.safetensors"
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                continue
+            if ignored(os.path.relpath(path, hf_folder)):
+                continue
+            missing.append(path)
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} safetensors shard(s) missing from {hf_folder} "
+            f"(no {index_file}): {[os.path.basename(m) for m in missing[:8]]}"
+        )
+
+
+def get_safetensors_index_weights_by_file(
+    hf_folder: str, index_file: str, hf_weights_files: list[str]
+) -> dict[str, set[str]] | None:
+    """Return per-shard tensor allowlists, but only when the index needs them.
+
+    A safetensors shard can contain tensors that are not referenced by the
+    checkpoint index (for example, when a checkpoint reuses part of another
+    model's shard).  The index is authoritative in that case: loading every
+    tensor from an otherwise referenced file can inject stale or incompatible
+    weights into the model.
+
+    Almost every checkpoint stores in each shard exactly the tensors the index
+    assigns to it, and for those this returns ``None`` so that all loader paths
+    keep their current behavior, including the accelerated backends that cannot
+    filter within a shard.  An allowlist is returned only when a shard actually
+    stores tensors the index did not assign to it.  Detecting this reads
+    safetensors headers, not tensor data.
+    """
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return None
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    weights_by_file: dict[str, set[str]] = defaultdict(set)
+    for weight_name, filename in weight_map.items():
+        shard_path = os.path.normpath(os.path.join(hf_folder, filename))
+        weights_by_file[shard_path].add(weight_name)
+
+    for st_file in hf_weights_files:
+        indexed_weights = weights_by_file.get(os.path.normpath(st_file))
+        if indexed_weights is None:
+            # Shard is not covered by the index, so there is nothing to
+            # enforce. Leave the existing behavior untouched.
+            return None
+        with safe_open(st_file, framework="pt") as f:
+            stored_weights = set(f.keys())
+        if stored_weights - indexed_weights:
+            return dict(weights_by_file)
+    return None
+
+
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
     """
     Exclude files that are not needed for inference.
@@ -762,7 +932,9 @@ def _get_available_ram_bytes() -> int:
     """Return the available RAM in bytes."""
     import psutil
 
-    return psutil.virtual_memory().available
+    available = psutil.virtual_memory().available
+    group_available = cgroup_available_bytes()
+    return available if group_available is None else min(available, group_available)
 
 
 def _get_fs_type(files: list[str]) -> str:
@@ -890,12 +1062,63 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _keep_weight(
+    name: str,
+    indexed_weights: set[str] | None,
+    local_expert_ids: set[int] | None,
+    skip_weight: Callable[[str], bool] | None,
+) -> bool:
+    """Decide from the name alone whether a tensor is read at all."""
+    if indexed_weights is not None and name not in indexed_weights:
+        return False
+    if should_skip_weight(name, local_expert_ids):
+        return False
+    return skip_weight is None or not skip_weight(name)
+
+
+def _direct_io_sharing(local_expert_ids: set[int] | None) -> RunSharing | None:
+    """The tensor-parallel group reads the same decoder tensors, so its first
+    rank reads them for all; not under expert parallelism, where each rank
+    keeps other experts."""
+    if local_expert_ids is not None or not model_parallel_is_initialized():
+        return None
+    tp_group = get_tp_group()
+    if tp_group.world_size == 1:
+        return None
+    return RunSharing(tp_group.cpu_group, tp_group.first_rank, tp_group.is_first_rank)
+
+
+def _keep_direct_weight(
+    name: str,
+    *,
+    indexed_weights: set[str] | None,
+    local_expert_ids: set[int] | None,
+    skip_weight: Callable[[str], bool] | None,
+    map_weight: Callable[[str], bool] | None,
+    read_directly: bool,
+) -> bool:
+    """Whether a kept tensor goes through O_DIRECT (*read_directly*) or the
+    memory map: decoder-layer tensors are read directly unless the model
+    wants them mapped; everything else is mapped, so that a pipeline stage
+    reads only the embeddings, heads or MTP layers it actually uses."""
+    if not _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
+        return False
+    direct = is_decoder_layer_weight(name) and not (
+        map_weight is not None and map_weight(name)
+    )
+    return direct == read_directly
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
     local_expert_ids: set[int] | None = None,
     *,
+    indexed_weights_by_file: Mapping[str, set[str]] | None = None,
+    skip_weight: Callable[[str], bool] | None = None,
+    map_weight: Callable[[str], bool] | None = None,
+    auto_direct: bool = True,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -904,12 +1127,28 @@ def safetensors_weights_iterator(
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP.
+
+    When *skip_weight* is provided, every tensor whose name it accepts is
+    skipped the same way. It lets a model that loads only part of a shared
+    checkpoint (e.g. a drafter shipped inside its target's checkpoint) avoid
+    reading the rest.
+
+    With the "direct" strategy only decoder-layer tensors are read with
+    O_DIRECT; the rest and those *map_weight* accepts are yielded
+    memory-mapped after them, and their pages are released once consumed.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
-
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
+    if indexed_weights_by_file is not None:
+        logger.info_once(
+            "Restricting safetensors loading to %d tensor entries assigned "
+            "by the checkpoint index across %d shards.",
+            sum(len(names) for names in indexed_weights_by_file.values()),
+            len(indexed_weights_by_file),
+        )
 
     fs_type = _get_fs_type(sorted_files)
     is_net_fs = fs_type in ("nfs", "nfs4", "lustre")
@@ -926,6 +1165,32 @@ def safetensors_weights_iterator(
         total_bytes / 1024**3,
         avail_bytes / 1024**3,
     )
+
+    if safetensors_load_strategy is None and auto_direct:
+        direct_ok = not fits_in_ram and fs_type not in ("tmpfs", "ramfs")
+        reason: str | None = (
+            "checkpoint fits the available-RAM budget"
+            if fits_in_ram
+            else "checkpoint storage is memory-backed"
+        )
+        if direct_ok:
+            reason = None
+            for path in sorted_files:
+                direct_ok, reason = direct_io_capability(path)
+                if not direct_ok:
+                    break
+        sharing = _direct_io_sharing(local_expert_ids)
+        if sharing is not None and not _group_ready(direct_ok, sharing):
+            direct_ok = False
+            reason = reason or "a tensor-parallel peer does not qualify"
+        if direct_ok:
+            safetensors_load_strategy = "direct"
+            logger.info_once(
+                "Auto direct I/O enabled: checkpoint exceeds the available-RAM "
+                "budget and aligned storage reads are supported."
+            )
+        else:
+            logger.info_once("Auto direct I/O unavailable: %s.", reason)
 
     should_prefetch = safetensors_load_strategy == "prefetch"
     if safetensors_load_strategy is None:
@@ -982,12 +1247,36 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
     ):
+        indexed_weights = None
+        if indexed_weights_by_file is not None:
+            indexed_weights = indexed_weights_by_file.get(os.path.normpath(st_file))
+            if indexed_weights is None:
+                raise ValueError(
+                    f"Safetensors shard {st_file!r} is not present in the "
+                    "checkpoint index"
+                )
         if safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
+                if _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
                     yield name, param
+        elif safetensors_load_strategy == "direct":
+            keep = functools.partial(
+                _keep_direct_weight,
+                indexed_weights=indexed_weights,
+                local_expert_ids=local_expert_ids,
+                skip_weight=skip_weight,
+                map_weight=map_weight,
+            )
+            yield from direct_io_weights(
+                st_file,
+                functools.partial(keep, read_directly=True),
+                _direct_io_sharing(local_expert_ids),
+            )
+            yield from released_mapped_weights(
+                st_file, functools.partial(keep, read_directly=False)
+            )
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
             # instead we reconstruct the subclasses here before returning
@@ -1003,7 +1292,9 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if not _keep_weight(
+                        name, indexed_weights, local_expert_ids, skip_weight
+                    ):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -1021,7 +1312,9 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if not _keep_weight(
+                        name, indexed_weights, local_expert_ids, skip_weight
+                    ):
                         continue
                     param = f.get_tensor(name)
                     yield name, param
@@ -1031,11 +1324,22 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     max_workers: int = 4,
+    indexed_weights_by_file: Mapping[str, set[str]] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
 
     def _load_file(st_file: str):
         result = load_file(st_file, device="cpu")
+        if indexed_weights_by_file is not None:
+            indexed_weights = indexed_weights_by_file.get(os.path.normpath(st_file))
+            if indexed_weights is None:
+                raise ValueError(
+                    f"Safetensors shard {st_file!r} is not present in the "
+                    "checkpoint index"
+                )
+            for name in list(result):
+                if name not in indexed_weights:
+                    del result[name]
         return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1257,7 +1561,9 @@ def multi_thread_pt_weights_iterator(
 def get_gguf_extra_tensor_names(
     gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str]
 ) -> list[str]:
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    reader = GGUFReader(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
     exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
     extra_keys = expected_gguf_keys - exact_gguf_keys
@@ -1270,9 +1576,11 @@ def get_gguf_weight_type_map(
     """
     Return GGUF mapped weight's name and its quant type
     """
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, quant_type_name
+
+    reader = GGUFReader(gguf_file)
     return {
-        gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
+        gguf_to_hf_name_map[tensor.name]: quant_type_name(tensor.tensor_type)
         for tensor in reader.tensors
         if tensor.name in gguf_to_hf_name_map
     }
@@ -1290,7 +1598,9 @@ def gguf_quant_weights_iterator(
     layer with different quant types.
     """
 
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    reader = GGUFReader(gguf_file)
 
     for tensor in reader.tensors:
         if tensor.name in gguf_to_hf_name_map:
@@ -1334,7 +1644,9 @@ def gguf_quant_weights_iterator_multi(
     before yielding any weights data to avoid issues with packed layers
     that have different quant types.
     """
-    readers = [gguf.GGUFReader(f) for f in gguf_files]
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    readers = [GGUFReader(f) for f in gguf_files]
 
     # First pass: yield all weight types across all shards
     for reader in readers:

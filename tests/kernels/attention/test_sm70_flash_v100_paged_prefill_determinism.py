@@ -109,6 +109,8 @@ def test_sm70_flash_v100_paged_prefill_d128_replay_is_bit_exact(
             True,
             -1,
             -1,
+            None,
+            0,
         )
         torch.accelerator.synchronize()
         direct_outputs.append(direct_output)

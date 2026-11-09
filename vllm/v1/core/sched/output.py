@@ -216,6 +216,12 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # Nonzero only for a latency-controlled mixed step. Pure decode incurs no
+    # GPU timing events and retains its uniform FULL-graph route.
+    mixed_prefill_tokens: int = 0
+    mixed_decode_tokens: int = 0
+    mixed_prefill_budget: int = 0
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
@@ -245,6 +251,11 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # (source, destination) block IDs the worker copies after zeroing new
+    # blocks and before the forward pass: partial prefix-cache entries and
+    # their copy-on-write targets.
+    kv_block_copies: list[tuple[int, int]] | None = None
 
     # Exact Mamba ``align`` boundary-state sources offered to a KV connector:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]}.

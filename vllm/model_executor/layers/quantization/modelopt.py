@@ -18,6 +18,11 @@ from vllm.model_executor.kernels.linear import (
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.qpn.pre_ampere import (
+    TuringNvFp4LinearLayerConfig,
+    TuringQpn2NvFp4LinearKernel,
+    TuringQpn8Fp8LinearKernel,
+)
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -37,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -54,6 +60,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
@@ -98,6 +105,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Backported from vllm-project/vllm#55513: canonical name and legacy alias.
+_BLOCK_FP8_MOE_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
+
 QUANT_ALGOS = [
     # FP8 (per-tensor weight + optional static activation scale).
     "FP8",
@@ -115,6 +125,22 @@ QUANT_ALGOS = [
     "MIXED_PRECISION",
 ]
 KV_CACHE_QUANT_ALGOS = ["FP8", "NVFP4"]
+
+
+def _sm70_moe_backend_requested_explicitly(layer) -> bool:
+    """Use the oracle for explicit choices or an admitted skinny MoE kernel.
+
+    Unsupported automatic configurations retain the existing TurboMind path.
+    """
+    moe_config = getattr(layer, "moe_config", None)
+    backend = getattr(moe_config, "moe_backend", "auto")
+    if moe_config is not None and backend == "auto":
+        from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+            skinny_backend_admitted,
+        )
+
+        return skinny_backend_admitted(moe_config)
+    return isinstance(backend, str) and backend.lower() not in ("", "auto")
 
 
 class ModelOptKVCacheMethod(BaseKVCacheMethod):
@@ -453,10 +479,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.out_dtype = torch.get_default_dtype()
         self.input_dtype = get_current_vllm_config().model_config.dtype
-        self.use_sm70_fp8_turbomind = (
-            sm70_tm.is_exact_sm70_cuda_platform()
-            and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-        )
+        self.use_sm70_fp8_turbomind = sm70_tm.fp8_backend_enabled()
+        # Turing takes the QPN8 kernels with the QPN8 dense prefill; the
+        # TurboMind GEMMs are registered for exact SM70 only.
+        self.use_sm75_fp8_qpn8 = False
 
     def create_weights(
         self,
@@ -472,6 +498,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
+        layer.orig_dtype = params_dtype
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         weight_dtype = (
@@ -517,6 +544,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
         )
+        self.use_sm75_fp8_qpn8 = isinstance(self.fp8_linear, TuringQpn8Fp8LinearKernel)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight
@@ -552,11 +580,35 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             replace_parameter(layer, "weight", tm_weight)
             replace_parameter(layer, "weight_scale", tm_scales)
             layer.input_scale = None
+            setattr(
+                layer,
+                sm70_tm.STATE_ATTR,
+                sm70_tm.SM70TurboMindLinearState(
+                    tm_weight,
+                    tm_scales,
+                    block_size,
+                    int(meta[0].item()),
+                    int(meta[1].item()),
+                    layer.output_size_per_partition,
+                    "fp8",
+                ),
+            )
             layer.sm70_modelopt_fp8_turbomind = True
             layer.sm70_modelopt_fp8_group_size = block_size
             layer.sm70_modelopt_fp8_k_ld = int(meta[0].item())
             layer.sm70_modelopt_fp8_q_ld = int(meta[1].item())
             logger.info_once("SM70 ModelOpt FP8 TurboMind W8A16 dense path enabled.")
+            return
+
+        if self.use_sm75_fp8_qpn8:
+            replace_parameter(layer, "weight", weight.t())
+            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            self.fp8_linear.process_weights_after_loading(layer)
+            layer.input_scale = None
+            logger.info_once(
+                "SM75 ModelOpt FP8 QPN8 W8A16 dense path enabled "
+                "(QPN8 decode kernels, dense fp16 prefill)."
+            )
             return
 
         layer.weight = Parameter(weight.t(), requires_grad=False)
@@ -575,26 +627,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 raise TypeError(
                     "ModelOpt FP8 TurboMind on SM70 requires FP16 activations."
                 )
-            from vllm import _sm70_ops as sm70_ops
-
-            x_2d = x.reshape(-1, x.shape[-1])
-            out = torch.empty(
-                (x_2d.shape[0], layer.output_size_per_partition),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            sm70_ops.fp8_gemm_sm70_out(
-                out,
-                x_2d,
-                layer.weight,
-                layer.weight_scale,
-                layer.sm70_modelopt_fp8_group_size,
-                layer.sm70_modelopt_fp8_k_ld,
-                layer.sm70_modelopt_fp8_q_ld,
-            )
-            if bias is not None:
-                out.add_(bias)
-            return out.reshape(*x.shape[:-1], layer.output_size_per_partition)
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
+        if sm70_tm.has_prepared_fp8_qpn8_linear(layer):
+            return sm70_tm.apply_prepared_fp8_qpn8_linear(layer, x, bias)
         return self.fp8_linear.apply_weights(layer, x, bias)
 
 
@@ -1095,15 +1130,28 @@ def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
     ``amax / (6 * 448)`` (the Marlin multiplier). TurboMind combine is
     ``block * global``. Do not infer convention from scale magnitude.
     """
-    if not sm70_tm.should_prepare_turbomind(
-        layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-    ):
+    if sm70_tm.is_exact_sm70_cuda(layer.weight, sm70_tm.format_enabled("nvfp4")):
+        logger.info_once(
+            "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
+            "(weight-only; activations remain half)."
+        )
+        sm70_tm.prepare_nvfp4_linear(layer)
+    elif sm70_tm.is_turing_cuda_platform():
+        config = TuringNvFp4LinearLayerConfig(
+            input_dtype=get_current_vllm_config().model_config.dtype,
+            weight_shape=tuple(layer.weight.shape),
+            scale_shape=tuple(layer.weight_scale.shape),
+            weight_dtype=layer.weight.dtype,
+            scale_dtype=layer.weight_scale.dtype,
+        )
+        kernel = init_nvfp4_linear_kernel(config)
+        if not isinstance(kernel, TuringQpn2NvFp4LinearKernel):
+            return False
+        kernel.process_weights_after_loading(layer)
+        layer.sm75_nvfp4_kernel = kernel
+        return True
+    else:
         return False
-    logger.info_once(
-        "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
-        "(weight-only; activations remain half)."
-    )
-    sm70_tm.prepare_nvfp4_linear(layer)
     layer.weight = Parameter(
         torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
         requires_grad=False,
@@ -1168,6 +1216,7 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
             isinstance(layer, RoutedExperts)
             and not self.is_layer_excluded(prefix)
             and sm70_tm.is_exact_sm70_cuda_platform()
+            and not _sm70_moe_backend_requested_explicitly(layer)
         ):
             if not sm70_tm.should_use_nvfp4_moe_turbomind():
                 raise NotImplementedError(
@@ -1190,10 +1239,7 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         # admitted only when a proven software backend is selected.
         # Exact-device routing still happens later via
         # sm70_tm.should_prepare_turbomind (capability == (7, 0)).
-        if (
-            sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND)
-            or sm70_tm.forces_marlin()
-        ):
+        if sm70_tm.format_enabled("nvfp4") or sm70_tm.forces_marlin():
             return 70
         if _explicit_nvfp4_emulation_requested():
             return 70
@@ -1261,7 +1307,9 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptNvFp4Config) -> None:
         self.quant_config = quant_config
         self.marlin_input_dtype = None
-        self.kernel = init_nvfp4_linear_kernel()
+        self.kernel = (
+            None if sm70_tm.is_turing_cuda_platform() else init_nvfp4_linear_kernel()
+        )
 
     def create_weights(
         self,
@@ -1336,6 +1384,16 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         )
 
         layer.register_parameter("weight_scale", weight_scale)
+        if self.kernel is None:
+            self.kernel = init_nvfp4_linear_kernel(
+                TuringNvFp4LinearLayerConfig(
+                    input_dtype=get_current_vllm_config().model_config.dtype,
+                    weight_shape=tuple(layer.weight.shape),
+                    scale_shape=tuple(layer.weight_scale.shape),
+                    weight_dtype=layer.weight.dtype,
+                    scale_dtype=layer.weight_scale.dtype,
+                )
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if (
@@ -1368,9 +1426,12 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         )
 
         if _try_prepare_sm70_modelopt_nvfp4(layer):
+            if hasattr(layer, "sm75_nvfp4_kernel"):
+                self.kernel = layer.sm75_nvfp4_kernel
             return
 
         # Convert layer to NVFP4 linear kernel format
+        assert self.kernel is not None
         self.kernel.process_weights_after_loading(layer)
 
     def apply(
@@ -1381,6 +1442,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if sm70_tm.has_prepared_linear(layer):
             return sm70_tm.apply_prepared_linear(layer, x, bias)
+        assert self.kernel is not None
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 
@@ -1546,6 +1608,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self,
         quant_config: ModelOptNvFp4Config,
         moe_config: FusedMoEConfig,
+        *,
+        allow_skinny: bool = True,
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
@@ -1560,6 +1624,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             config=self.moe,
             weight_key=kNvfp4Static,
             activation_key=None if self.use_a16 else kNvfp4Dynamic,
+            allow_skinny=allow_skinny,
         )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
@@ -1701,6 +1766,42 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
+
+        if self.nvfp4_backend == NvFp4MoeBackend.SM70_SKINNY:
+            from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+                nvfp4_skinny_scale_reason,
+            )
+
+            reason = nvfp4_skinny_scale_reason(
+                layer.w13_weight_scale_2, layer.w2_weight_scale_2
+            )
+            if reason is not None:
+                if self.moe.moe_backend != "auto":
+                    raise ValueError(reason)
+                fallback: FusedMoEMethodBase
+                if sm70_tm.is_exact_sm70_cuda_platform():
+                    from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+                        ModelOptNvFp4SM70MoEMethod,
+                    )
+
+                    fallback = ModelOptNvFp4SM70MoEMethod(self.quant_config, self.moe)
+                else:
+                    fallback = ModelOptNvFp4FusedMoE(
+                        self.quant_config, self.moe, allow_skinny=False
+                    )
+                logger.info_once("Skinny MoE fallback: %s", reason)
+                get_current_vllm_config().kernel_config.moe_kernel_selections[
+                    f"Nvfp4SkinnySm70Experts:{self.moe.hidden_dim}:"
+                    f"{self.moe.intermediate_size_per_partition}"
+                ] = {
+                    "enabled": False,
+                    "reason": reason,
+                    "scope": "loaded_scale_capability",
+                }
+                fallback.process_weights_after_loading(layer)
+                layer._replace_quant_method(fallback)
+                layer.base_quant_method = fallback
+                return
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(
@@ -2366,6 +2467,29 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
 
+        block_sizes = {
+            int(layer_info.get("group_size", 128))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper() in _BLOCK_FP8_MOE_ALGOS
+        }
+        if len(block_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION currently requires all block-FP8 MoE layers "
+                f"to use one group_size, got {sorted(block_sizes)}."
+            )
+        block_size = next(iter(block_sizes), 128)
+        self.fp8_block_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[block_size, block_size],
+        )
+
+    def has_blocked_weights(self) -> bool:
+        return any(
+            info.get("quant_algo", "").upper() in _BLOCK_FP8_MOE_ALGOS
+            for info in self.quantized_layers.values()
+        )
+
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"
 
@@ -2375,9 +2499,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     @classmethod
     def get_min_capability(cls) -> int:
         if (
-            sm70_tm.is_exact_sm70_cuda_platform()
-            and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-            and sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND)
+            sm70_tm.is_pre_ampere_cuda_platform()
+            and sm70_tm.format_enabled("fp8")
+            and sm70_tm.format_enabled("nvfp4")
         ):
             return 70
         return 89
@@ -2564,13 +2688,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return UnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):
+            if quant_algo in _BLOCK_FP8_MOE_ALGOS:
+                return Fp8MoEMethod(self.fp8_block_config, layer)
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(
                     quant_config=self.fp8_config,
                     moe_config=layer.moe_config,
                 )
             if quant_algo == "NVFP4":
-                if sm70_tm.is_exact_sm70_cuda_platform():
+                if sm70_tm.is_exact_sm70_cuda_platform() and not (
+                    _sm70_moe_backend_requested_explicitly(layer)
+                ):
                     if not sm70_tm.should_use_nvfp4_moe_turbomind():
                         raise NotImplementedError(
                             "ModelOpt NVFP4 MoE on SM70 requires the TurboMind backend."
@@ -2588,7 +2716,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     moe_config=layer.moe_config,
                 )
             if quant_algo == "W4A16_NVFP4":
-                if sm70_tm.is_exact_sm70_cuda_platform():
+                if sm70_tm.is_exact_sm70_cuda_platform() and not (
+                    _sm70_moe_backend_requested_explicitly(layer)
+                ):
                     if not sm70_tm.should_use_nvfp4_moe_turbomind():
                         raise NotImplementedError(
                             "ModelOpt W4A16 NVFP4 MoE on SM70 requires the "

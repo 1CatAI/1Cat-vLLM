@@ -1,3 +1,4 @@
+#include "sm70_policy.h"
 
 #include "moe_permute_unpermute_kernel.h"
 #include <cstdlib>
@@ -67,29 +68,54 @@ namespace {
 
 constexpr int kSingleTokenFastPathMaxTopK = 32;
 
-bool envFlagEnabled(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw != nullptr && std::atoi(raw) != 0;
+bool policyFlagEnabled(vllm::sm70::PolicyField field) {
+  return vllm::sm70::policy_atoi(field, 0) != 0;
 }
 
 bool singleTokenPermuteFastPathEnabled() {
-  static const bool enabled = []() {
-    if (envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH")) {
+  const bool enabled = []() {
+    if (policyFlagEnabled(
+            vllm::sm70::PolicyField::moe_single_token_permute_fastpath)) {
       return true;
     }
-    return envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH");
+    return policyFlagEnabled(
+        vllm::sm70::PolicyField::moe_single_token_fastpath);
   }();
   return enabled;
 }
 
 bool singleTokenUnpermuteFastPathEnabled() {
-  static const bool enabled = []() {
-    if (envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH")) {
+  const bool enabled = []() {
+    if (policyFlagEnabled(
+            vllm::sm70::PolicyField::moe_single_token_unpermute_fastpath)) {
       return true;
     }
-    return envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH");
+    return policyFlagEnabled(
+        vllm::sm70::PolicyField::moe_single_token_fastpath);
   }();
   return enabled;
+}
+
+template <bool CHECK_SKIPPED>
+__global__ void buildMoePermuteMetadataKernel(
+    int const* expanded_dest_row_to_expanded_source_row,
+    int* expanded_source_row_to_expanded_dest_row, int* permuted_idx,
+    int* input_row_indices, int64_t num_expanded_rows,
+    int64_t const* num_valid_tokens_ptr, int topk) {
+  const int64_t expanded_dest_row =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (expanded_dest_row >= num_expanded_rows) {
+    return;
+  }
+
+  const int expanded_source_row =
+      __ldg(expanded_dest_row_to_expanded_source_row + expanded_dest_row);
+  expanded_source_row_to_expanded_dest_row[expanded_source_row] =
+      static_cast<int>(expanded_dest_row);
+  if (!CHECK_SKIPPED || expanded_dest_row < *num_valid_tokens_ptr) {
+    permuted_idx[expanded_dest_row] = expanded_source_row;
+    input_row_indices[expanded_dest_row] = expanded_source_row / topk;
+  }
 }
 
 template <typename T>
@@ -207,6 +233,27 @@ __global__ void singleTokenMoeUnpermuteKernel(
 }
 
 }  // namespace
+
+void buildMoePermuteMetadataLauncher(
+    int const* expanded_dest_row_to_expanded_source_row,
+    int* expanded_source_row_to_expanded_dest_row, int* permuted_idx,
+    int* input_row_indices, int64_t num_expanded_rows,
+    int64_t const* num_valid_tokens_ptr, int topk, cudaStream_t stream) {
+  constexpr int kThreads = 256;
+  const int blocks =
+      static_cast<int>((num_expanded_rows + kThreads - 1) / kThreads);
+  if (num_valid_tokens_ptr == nullptr) {
+    buildMoePermuteMetadataKernel<false><<<blocks, kThreads, 0, stream>>>(
+        expanded_dest_row_to_expanded_source_row,
+        expanded_source_row_to_expanded_dest_row, permuted_idx,
+        input_row_indices, num_expanded_rows, nullptr, topk);
+  } else {
+    buildMoePermuteMetadataKernel<true><<<blocks, kThreads, 0, stream>>>(
+        expanded_dest_row_to_expanded_source_row,
+        expanded_source_row_to_expanded_dest_row, permuted_idx,
+        input_row_indices, num_expanded_rows, num_valid_tokens_ptr, topk);
+  }
+}
 
 bool canUseSingleTokenMoePermuteFastPath(int64_t n_token, int64_t topk,
                                          bool has_expert_map, int64_t n_expert,

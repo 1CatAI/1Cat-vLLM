@@ -8,7 +8,8 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
-from vllm.config.vllm import VllmConfig
+from vllm.config.execution_policy import flash_v100_policy
+from vllm.config.vllm import VllmConfig, checkpoint_kv_quant_allowed
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
@@ -171,17 +172,28 @@ def _init_kv_cache_quant(
                 current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and envs.VLLM_SM70_FLASH_ATTN_V100
+                and flash_v100_policy().enabled
             )
-            uses_base_scale_processing = (
-                type(quant_method).process_weights_after_loading
-                is BaseKVCacheMethod.process_weights_after_loading
+            # Lazy import: the quantization package imports Attention at module
+            # scope, so importing it here avoids a circular import.
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+                CompressedTensorsKVCacheMethod,
+            )
+
+            # Both implementations honor the unit-scale override. Check the
+            # effective method so a subclass with different scale processing
+            # does not silently inherit permission to ignore checkpoint scales.
+            uses_unit_scale_processing = type(
+                quant_method
+            ).process_weights_after_loading in (
+                BaseKVCacheMethod.process_weights_after_loading,
+                CompressedTensorsKVCacheMethod.process_weights_after_loading,
             )
             has_checkpoint_kv_scheme = (
                 getattr(quant_method.quant_config, "kv_cache_scheme", None) is not None
             )
             unit_scale_compatible = (
-                uses_base_scale_processing or not has_checkpoint_kv_scheme
+                uses_unit_scale_processing or not has_checkpoint_kv_scheme
             )
             if not sm70_flash_v100 or not unit_scale_compatible:
                 raise ValueError(
@@ -262,8 +274,15 @@ class Attention(nn.Module, AttentionLayerBase):
         # The "auto" case is normally resolved upstream in
         # resolve_kv_cache_dtype_string, but we re-apply here defensively in
         # case anything bypassed that path.
+        # The same pre-Ampere policy as VllmConfig applies here, so a
+        # compressed-tensors checkpoint cannot quantize the cache on a device
+        # where the resolve path just refused to.
         kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
-        if kv_cache_scheme is not None and kv_cache_dtype == "auto":
+        if (
+            kv_cache_scheme is not None
+            and kv_cache_dtype == "auto"
+            and checkpoint_kv_quant_allowed(vllm_config)
+        ):
             kv_cache_dtype = "fp8"
             calculate_kv_scales = False
             if cache_config is not None:
@@ -513,6 +532,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
+        kv_cache_updated: bool = False,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -560,7 +580,8 @@ class Attention(nn.Module, AttentionLayerBase):
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                not kv_cache_updated
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
@@ -580,7 +601,8 @@ class Attention(nn.Module, AttentionLayerBase):
             # Skip this if sharing KV cache with an earlier attention layer.
             encoded = _encode_layer_name(self.layer_name)
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                not kv_cache_updated
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
@@ -679,9 +701,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 decode_sliding_window=anchored_window,
             )
         if self.sliding_window is not None:
-            assert not vllm_config.model_config.use_mla, (
-                "MLA is not supported for slidingwindow"
-            )
+            assert getattr(self, "is_dflash_draft_attn", False) or not (
+                vllm_config.model_config.use_mla
+            ), "MLA is not supported for slidingwindow"
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

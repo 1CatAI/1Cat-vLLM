@@ -27,11 +27,21 @@ def _config(window: int = 128) -> SimpleNamespace:
         ),
         model_config=SimpleNamespace(dtype=torch.float16, use_mla=False),
         parallel_config=SimpleNamespace(
+            distributed_executor_backend="uni",
+            data_parallel_backend="mp",
+            world_size=1,
+            local_world_size=1,
+            nnodes_within_dp=1,
+            data_parallel_rank_local=0,
+            data_parallel_index=0,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
         kv_transfer_config=None,
         speculative_config=None,
+        device_config=SimpleNamespace(device=torch.device("cuda")),
     )
 
 
@@ -42,7 +52,8 @@ def sm70_platform(monkeypatch: pytest.MonkeyPatch) -> None:
         "current_platform",
         SimpleNamespace(
             is_cuda=lambda: True,
-            is_device_capability=lambda capability: capability == (7, 0),
+            device_count=lambda: 1,
+            is_device_capability=lambda capability, device_id=0: capability == (7, 0),
         ),
     )
 
@@ -113,7 +124,8 @@ def test_engine_contract_rejects_non_sm70(monkeypatch: pytest.MonkeyPatch):
         "current_platform",
         SimpleNamespace(
             is_cuda=lambda: True,
-            is_device_capability=lambda capability: False,
+            device_count=lambda: 1,
+            is_device_capability=lambda capability, device_id=0: False,
         ),
     )
 

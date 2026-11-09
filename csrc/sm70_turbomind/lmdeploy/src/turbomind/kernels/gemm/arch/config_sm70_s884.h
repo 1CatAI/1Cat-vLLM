@@ -15,6 +15,7 @@
 #include "src/turbomind/kernels/gemm/thread_group_map.h"
 #include "src/turbomind/kernels/gemm/tiled_mma.h"
 #include "src/turbomind/kernels/gemm/transform.h"
+#include "src/turbomind/kernels/gemm/lattice_transform.h"
 #include "src/turbomind/kernels/gemm/types.h"
 
 namespace turbomind::gemm::sm70_s884 {
@@ -38,7 +39,8 @@ struct Sm70_s884 {
   template <int CTA_M, int CTA_N, int CTA_K, int TG_M, int TG_N, int TG_K,
             class PolicyA, class PolicyB, int Stages, bool SplitK,
             int GroupSizeU = 1, int GroupSizeV = 1, int TILE_C_M_ = -1,
-            int TILE_C_N_ = -1, int GmemLookahead = 1, bool FullTiles = false>
+            int TILE_C_N_ = -1, int GmemLookahead = 1, bool FullTiles = false,
+            bool MaskM = false>
   struct Type {
     // (TM, TN, TK) = R(MMA_Atom, SmemCopy_Atom)
     using MMA_Atom = SM70_MMA_884;
@@ -50,7 +52,8 @@ struct Sm70_s884 {
     using MMA = Tiled_MMA_v2<MMA_Atom, MMA_Map>;
 
     using IteratorA =
-        std::conditional_t<FullTiles, IteratorSm70FullTile<MODE_A, PolicyA>,
+        std::conditional_t<FullTiles && !MaskM,
+                           IteratorSm70FullTile<MODE_A, PolicyA>,
                            IteratorSm70<MODE_A, PolicyA>>;
     using IteratorB =
         std::conditional_t<FullTiles, IteratorSm70FullTile<MODE_B, PolicyB>,
@@ -109,6 +112,51 @@ using Config_U4_g = Sm70_s884<Operand_A<half>,           // A
                               raster_order, 0>;
 
 template <Order raster_order, int group_axis = -1>
+using Config_U2_Affine =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<uint2_t>, Transform_HMMA_SIMT_B,
+              Operand_V_Pack<uint32_t>, kRowMajor, half, raster_order, group_axis>;
+
+template <Order raster_order, int group_axis = -1>
+using Config_U8_Affine =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<uint8_t>, Transform_HMMA_SIMT_B,
+              Operand_V_Pack<uint32_t>, kRowMajor, half, raster_order, group_axis>;
+
+template <Order raster_order, int group_axis = -1>
+using Config_GgufCenteredBitPlane3 =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<uint2_t>, Transform_HMMA_SM70_CenteredBitPlane3,
+              Operand_V_Pack<uint32_t>, kRowMajor, half, raster_order, group_axis>;
+
+template<int LowBits, int HighBits, int GroupSize, Order raster_order,
+         int group_axis = -1>
+using Config_GgufBitPlane =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<std::conditional_t<LowBits == 2, uint2_t, uint4_t>>,
+              Transform_HMMA_SM70_BitPlane<LowBits, HighBits, GroupSize>,
+              Operand_V_Pack<uint64_t>, kRowMajor, half, raster_order, group_axis>;
+
+template<int Type, int GroupSize, Order raster_order, int group_axis = -1>
+using Config_GgufLattice = Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+    Operand_B_Pack<uint2_t>, Transform_HMMA_SM70_Lattice<Type,GroupSize>,
+    Operand_V_Pack<std::conditional_t<Type == 18 || Type == 21,uint64_t,
+        std::conditional_t<Type == 19 || Type == 29,uint16_t,uint32_t>>>,
+    kRowMajor, half, raster_order, group_axis>;
+
+template <Order raster_order, int group_axis = -1>
+using Config_GgufLut4_IQ =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<uint4_t>, Transform_HMMA_SM70_Lut4<0>,
+              Operand_V_Pack<uint16_t>, kRowMajor, half, raster_order, group_axis>;
+
+template <Order raster_order, int group_axis = -1>
+using Config_GgufLut4_E2M1 =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<uint4_t>, Transform_HMMA_SM70_Lut4<1>,
+              Operand_V_Pack<uint16_t>, kRowMajor, half, raster_order, group_axis>;
+
+template <Order raster_order, int group_axis = -1>
 using Config_MXF4 = Sm70_s884<Operand_A<half>,             // A
                               Transform_Default,           // tarnsform A
                               VoidOperand,                 // U
@@ -140,6 +188,21 @@ using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
                               kRowMajor,                   // order_C
                               half,                        // Tc
                               raster_order, group_axis>;
+
+// Dense batch FP4/FP8 share the activation supply and warp tiling policy.
+// Their packed weights and numerical transforms are the existing ones.
+template <class Weight, Order raster_order,
+          class Transform = Transform_HMMA_SIMT_B>
+using Config_QuantizedBatch =
+    Sm70_s884<Operand_A_BatchPadded<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<Weight>, Transform, Operand_V_Pack<uint16_t>,
+              kRowMajor, half, raster_order, -1>;
+
+template <Order raster_order>
+using Config_NVF4_Prescaled =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<fp4_e2m1_t>, Transform_HMMA_SIMT_B_PrescaledE2M1,
+              Operand_V_Pack<uint16_t>, kRowMajor, half, raster_order, 0>;
 
 template <Order raster_order, int group_axis = -1>
 using Config_E4M3_Prescaled =

@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MRV2 warmup must reserve the same speculative KV tail as the scheduler."""
 
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
 import torch
 
@@ -13,11 +16,91 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.worker.gpu.warmup import _reserved_block_count
+from vllm.v1.worker.gpu.warmup import (
+    _kernel_prefill_warmup_token_counts,
+    _reserved_block_count,
+    warmup_kernels,
+)
 
 BLOCK_SIZE = 16
 MAX_MODEL_LEN = 1024
 NUM_SPEC_TOKENS = 7
+
+
+def test_kernel_prefill_warmup_profiles_are_capability_advertised() -> None:
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+        max_model_len=64,
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "plain": object(),
+                "qsa_0": SimpleNamespace(
+                    kernel_warmup_prefill_token_counts=(33, 257, True, -1)
+                ),
+                "qsa_1": SimpleNamespace(kernel_warmup_prefill_token_counts=(33,)),
+            }
+        ),
+    )
+
+    assert _kernel_prefill_warmup_token_counts(runner, 6) == (6, 33)
+
+
+def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector_states: list[bool] = []
+    attention_spec = _full_attention_spec()
+    runner = SimpleNamespace(
+        num_speculative_steps=4,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=4,
+            max_num_batched_tokens=128,
+        ),
+        max_model_len=64,
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "profile": SimpleNamespace(kernel_warmup_prefill_token_counts=(33,))
+            }
+        ),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=attention_spec)],
+            num_blocks=64,
+        ),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=4),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=SimpleNamespace(
+            set_disabled=lambda disabled: connector_states.append(disabled)
+        ),
+    )
+    executions: list[Any] = []
+    samples: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    warmup_kernels(runner, executions.append, samples.append)
+
+    tokens = [output.total_num_scheduled_tokens for output in executions]
+    # Full batch, then the 33-token kernel profile and a full prefill chunk
+    # (capped so the decode step fits max_model_len), one request each.
+    assert tokens[:9] == [24, 20, 0, 33, 5, 0, 59, 5, 0]
+    # Every smaller request count: a pure decode step, then a decode step
+    # that also admits a 6-token prefill.
+    assert tokens[9:] == [
+        *(18, 15, 0, 18, 21, 0),
+        *(12, 10, 0, 12, 16, 0),
+        *(6, 5, 0, 6, 11, 0),
+    ]
+    mixed = [output for output in executions if output.scheduled_new_reqs][-1]
+    assert len(mixed.scheduled_cached_reqs.req_ids) == 1
+    assert [r.req_id for r in mixed.scheduled_new_reqs] == ["_warmup_c1m_new_"]
+    # Every request a cycle starts is finished by its cleanup step.
+    started = {r.req_id for output in executions for r in output.scheduled_new_reqs}
+    finished = set().union(*(output.finished_req_ids for output in executions))
+    assert started == finished
+    assert connector_states == [True, False]
+    assert len(samples) == 6 + 6 * 2
 
 
 def _speculative_config(method: str) -> SpeculativeConfig:

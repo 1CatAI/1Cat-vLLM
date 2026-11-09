@@ -13,6 +13,8 @@ from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -82,6 +84,16 @@ RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
+def _get_dflash2_checkpoint_draft_tokens(hf_config: Any) -> int | None:
+    """Return the checkpoint-native DFlash2 draft width when declared."""
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
+    block_size = int(dflash_config.get("block_size", 0) or 0)
+    if selector_top_k <= 0 or block_size <= 1:
+        return None
+    return block_size - 1
+
+
 def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
     """Return the block width produced by the DFlash checkpoint itself.
 
@@ -96,10 +108,8 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
 
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     hf_config = getattr(draft_model_config, "hf_config", None)
-    dflash_config = getattr(hf_config, "dflash_config", None) or {}
-    trained_tokens = int(dflash_config.get("block_size", 0) or 0) - 1
-    has_selector = int(dflash_config.get("selector_top_k", 0) or 0) > 0
-    if has_selector and 0 < trained_tokens < verify_tokens:
+    trained_tokens = _get_dflash2_checkpoint_draft_tokens(hf_config)
+    if trained_tokens is not None and trained_tokens < verify_tokens:
         return trained_tokens
     return verify_tokens
 
@@ -114,6 +124,35 @@ def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
     )
 
 
+def match_target_rope_scaling(target, draft) -> bool:
+    """Rotate MTP draft positions exactly like a window-extended target.
+
+    The stock MTP checkpoint ships its target's native RoPE. When the target
+    serves a longer window with scaled RoPE (YaRN), the draft attends over the
+    same positions and must use the same scaling and position range. Returns
+    whether the draft config was changed.
+    """
+    if target is None or draft is None:
+        return False
+    target_text, draft_text = target.hf_text_config, draft.hf_text_config
+    target_rope = dict(getattr(target_text, "rope_parameters", None) or {})
+    draft_rope = dict(getattr(draft_text, "rope_parameters", None) or {})
+    if target_rope.get("rope_type", "default") == "default":
+        return False
+    if draft_rope.get("rope_type", "default") != "default":
+        return False
+    if target_rope.get("rope_theta") != draft_rope.get("rope_theta"):
+        return False
+    draft_text.rope_parameters = target_rope
+    draft_text.max_position_embeddings = target_text.max_position_embeddings
+    logger.info(
+        "MTP draft RoPE follows the target's %s scaling over %d positions.",
+        target_rope.get("rope_type"),
+        target_text.max_position_embeddings,
+    )
+    return True
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
@@ -123,7 +162,8 @@ class SpeculativeConfig:
     # General speculative decoding control
     num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
-    number in the draft model config if present, otherwise, it is required."""
+    number in the draft model config if present; selector-based DFlash2 uses
+    checkpoint ``block_size - 1``. Otherwise, it is required."""
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""
@@ -143,6 +183,12 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
+    mtp_expert_quantization: Literal["fp8"] | None = None
+    """Opt in to FP8-resident Qwen4Exp MTP experts on SM70 with an AWQ or
+    ModelOpt checkpoint whose MTP experts are unquantized. Serialized block-FP8
+    MTP experts use their checkpoint scales without this online-conversion flag.
+    Target weights are unchanged.
+    """
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
@@ -181,11 +227,18 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
-    use_local_argmax_reduction: bool = False
+    disable_eagle_block_drop: bool = False
+    """Keep the trailing hashed prefix-cache page on an EAGLE/MTP hit.
+    Backport of vllm-project/vllm#53388. Default ``False`` matches current
+    1Cat behavior. Hybrid-model MTP pages can be thousands of tokens, so the
+    stock drop recomputes a full page on every prefix hit."""
+    use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
-    non-tree speculation."""
+    non-tree speculation. ``None`` automatically enables the SM70
+    FP16 Qwen4Exp TP4 MTP route with greedy drafts. Explicit booleans override
+    automatic selection; other routes retain full-logits selection."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -351,6 +404,31 @@ class SpeculativeConfig:
     DSpark still generates the checkpoint's complete block; only a prefix is
     scheduled, so values below the checkpoint block size remain lossless."""
 
+    sampling_policy: SpeculativeSamplingPolicy = Field(
+        default_factory=SpeculativeSamplingPolicy
+    )
+    """Per-engine proposal/rejection policy captured before worker transfer."""
+
+    sm70_dflash2: Sm70DFlash2Config = Field(default_factory=Sm70DFlash2Config)
+    """Per-engine SM70 DFlash2 verifier policy; automatic when not specified."""
+
+    def resolve_execution_policy(self) -> None:
+        """Bind sampling and enabled assistance before worker serialization."""
+        self.sampling_policy.resolve(
+            draft=self.draft_sample_method == "probabilistic",
+            vocab=True,
+            vocab_default=self.method == "mtp",
+        )
+        self.sm70_dflash2.resolve_lookup(self)
+
+    diagnostic_confidence_logits: bool = Field(default=False, init=False)
+    """Bound extra confidence output contract; only affects DSpark compilation."""
+
+    def bind_diagnostic_output(self, alignment: bool | None) -> None:
+        self.diagnostic_confidence_logits = self.method == "dspark" and bool(
+            self.dspark_confidence_threshold > 0.0 or alignment
+        )
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -363,7 +441,28 @@ class SpeculativeConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        factors: list[Any] = []
+        factors: list[Any] = [
+            ("use_local_argmax_reduction", self.use_local_argmax_reduction)
+        ]
+        if self.method == "dspark":
+            factors.append(
+                ("diagnostic_confidence_logits", self.diagnostic_confidence_logits)
+            )
+        if self.sm70_dflash2.resolved and (
+            self.use_dflash_family() or self.sm70_dflash2.explicit_fields
+        ):
+            factors.append(("sm70_dflash2", self.sm70_dflash2.graph_options()))
+        if self.sampling_policy.sources:
+            factors.append(
+                (
+                    "sampling_policy",
+                    self.sampling_policy.compute_hash(
+                        draft=self.draft_sample_method == "probabilistic",
+                        vocab=self.method == "mtp",
+                        aux_hidden=self.use_dflash_family(),
+                    ),
+                )
+            )
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (
@@ -376,6 +475,12 @@ class SpeculativeConfig:
             or self.use_dspark()
         )
         factors.append(uses_aux_hidden_states)
+
+        # Online FP8 changes the draft expert kernels and padded weight layout.
+        # Include None too: old MTP artifacts may have been compiled with FP8
+        # under the same key as FP16, before this field was hashed.
+        if self.method == "mtp":
+            factors.append(("mtp_expert_quantization", self.mtp_expert_quantization))
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -419,6 +524,10 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        # Configs that define their own MTP draft form rewrite themselves.
+        get_mtp_draft_config = getattr(hf_config, "get_mtp_draft_config", None)
+        if callable(get_mtp_draft_config):
+            return get_mtp_draft_config()
         initial_architecture = hf_config.architectures[0]
         if hf_config.model_type in (
             "deepseek_v3",
@@ -879,8 +988,9 @@ class SpeculativeConfig:
                     self.method = "mlp_speculator"
                 elif self.draft_model_config.hf_config.model_type in get_args(
                     MTPModelTypes
-                ):
+                ) or getattr(self.draft_model_config.hf_config, "is_mtp_draft", False):
                     self.method = "mtp"
+                    self._inherit_target_rope_for_extended_native_mtp()
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
@@ -924,8 +1034,11 @@ class SpeculativeConfig:
 
                 if self.use_dspark():
                     draft_hf_config = self.draft_model_config.hf_config
-                    draft_hf_config.model_type = "deepseek_v4"
-                    draft_hf_config.architectures = ["DSparkDraftModel"]
+                    if draft_hf_config.model_type == "deepseek_v41_text":
+                        draft_hf_config.architectures = ["DSparkDeepseekV41ForCausalLM"]
+                    else:
+                        draft_hf_config.model_type = "deepseek_v4"
+                        draft_hf_config.architectures = ["DSparkDraftModel"]
                     self.update_arch_()
 
                 if self.use_dflash_family() or self.use_dspark():
@@ -953,6 +1066,18 @@ class SpeculativeConfig:
                         raise ValueError(
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"
+                        )
+
+                if self.num_speculative_tokens is None and self.use_dflash():
+                    native_draft_tokens = _get_dflash2_checkpoint_draft_tokens(
+                        self.draft_model_config.hf_config
+                    )
+                    if native_draft_tokens is not None:
+                        self.num_speculative_tokens = native_draft_tokens
+                        logger.info_once(
+                            "Defaulting DFlash2 num_speculative_tokens to %d "
+                            "from checkpoint block_size.",
+                            native_draft_tokens,
                         )
 
                 if self.num_speculative_tokens is None:
@@ -1015,6 +1140,24 @@ class SpeculativeConfig:
                     )
                 )
 
+                if self.method == "mtp" and match_target_rope_scaling(
+                    self.target_model_config, self.draft_model_config
+                ):
+                    # The draft now covers the target's extended positions.
+                    self.draft_model_config.max_model_len = max(
+                        self.draft_model_config.max_model_len,
+                        self.target_model_config.max_model_len,
+                    )
+                if (
+                    self.method == "dspark"
+                    and __import__("os").environ.get("VLLM_V41_PACKED_KV", "0") == "1"
+                ):
+                    # V4.1 DSpark attends only its sliding window and rotates
+                    # RoPE on the fly past its table: it covers the target length.
+                    self.draft_model_config.max_model_len = max(
+                        self.draft_model_config.max_model_len,
+                        self.target_model_config.max_model_len,
+                    )
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,
@@ -1027,11 +1170,11 @@ class SpeculativeConfig:
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config,
                         self.draft_tensor_parallel_size,
-                        # The runner constructs the complete DSpark drafter on
-                        # the target model's final PP rank. It is local to that
+                        # MRV2 constructs complete DFlash/DSpark drafters on the
+                        # target model's final PP rank. They are local to that
                         # stage rather than partitioned across target PP ranks.
                         speculative_draft_pipeline_parallel_size=(
-                            1 if self.use_dspark() else None
+                            1 if self.use_dspark() or self.use_dflash() else None
                         ),
                     )
                 )
@@ -1044,7 +1187,28 @@ class SpeculativeConfig:
             self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
                 self.index_share_for_mtp_iteration
             )
+        self._resolve_local_argmax_reduction()
         return self
+
+    def _resolve_local_argmax_reduction(self) -> None:
+        if self.use_local_argmax_reduction is not None:
+            return
+        import torch
+
+        from vllm.platforms import current_platform
+
+        draft_config = self.draft_model_config
+        self.use_local_argmax_reduction = bool(
+            self.method == "mtp"
+            and self.draft_sample_method == "greedy"
+            and not self.parallel_drafting
+            and draft_config is not None
+            and draft_config.hf_config.architectures == ["Qwen4ExpMTP"]
+            and draft_config.dtype == torch.float16
+            and self.draft_parallel_config.tensor_parallel_size == 4
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
 
     def _verify_dspark_final_stage_ownership(self) -> None:
         """Validate the layer contract for a final-stage-local drafter."""
@@ -1052,7 +1216,12 @@ class SpeculativeConfig:
 
         pp_size = self.target_parallel_config.pipeline_parallel_size
         num_layers = self.target_model_config.get_total_num_hidden_layers()
-        last_start, last_end = get_pp_indices(num_layers, pp_size - 1, pp_size)
+        last_start, last_end = get_pp_indices(
+            num_layers,
+            pp_size - 1,
+            pp_size,
+            partition=self.target_parallel_config.communication.pp_layer_partition,
+        )
         layer_ids = tuple(
             getattr(
                 self.draft_model_config.hf_config,
@@ -1070,6 +1239,96 @@ class SpeculativeConfig:
                 f"stage [{last_start}, {last_end}); got {layer_ids}. Adjust "
                 "VLLM_PP_LAYER_PARTITION or the DSpark layer contract."
             )
+
+    def _inherit_target_rope_for_extended_native_mtp(self) -> None:
+        """Validate and inherit target YaRN for an extended native drafter."""
+        if (
+            self.method != "mtp"
+            or self.max_model_len is None
+            or self.target_model_config is None
+            or self.draft_model_config is None
+            or self.model != self.target_model_config.model
+        ):
+            return
+
+        draft_text_config = get_hf_text_config(self.draft_model_config.hf_config)
+        draft_native_limit = getattr(draft_text_config, "max_position_embeddings", None)
+        if draft_native_limit is None or self.max_model_len <= draft_native_limit:
+            return
+
+        target_text_config = get_hf_text_config(self.target_model_config.hf_config)
+        rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        # A checkpoint may already carry valid scaling (including non-YaRN
+        # scaling). Preserve it when both models agree and its derived limit
+        # covers the request. Only missing extensions need target inheritance.
+        if (
+            getattr(draft_text_config, "rope_parameters", None) == rope_parameters
+            and self.max_model_len <= self.draft_model_config.get_and_verify_max_len(-1)
+        ):
+            return
+        if (
+            not isinstance(rope_parameters, dict)
+            or rope_parameters.get("rope_type") != "yarn"
+        ):
+            raise ValueError(
+                "Extending native MTP beyond max_position_embeddings requires "
+                "explicit target YaRN rope_parameters; got "
+                f"{rope_parameters!r}."
+            )
+
+        original_limit = rope_parameters.get("original_max_position_embeddings")
+        factor = rope_parameters.get("factor")
+        try:
+            if original_limit is None or factor is None:
+                raise TypeError("YaRN original limit and factor must be present")
+            original_limit_value = float(original_limit)
+            factor_value = float(factor)
+            draft_native_limit_value = float(draft_native_limit)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "Native MTP YaRN extension requires numeric "
+                "original_max_position_embeddings and factor."
+            ) from error
+
+        if (
+            not math.isfinite(original_limit_value)
+            or not math.isfinite(factor_value)
+            or original_limit_value <= 0
+            or factor_value <= 1
+            or original_limit_value != draft_native_limit_value
+        ):
+            raise ValueError(
+                "Native MTP YaRN extension requires the target's positive "
+                "original_max_position_embeddings to match the drafter's "
+                "native max_position_embeddings and factor to be greater "
+                f"than one; got original={original_limit!r}, "
+                f"native={draft_native_limit!r}, factor={factor!r}."
+            )
+
+        scaled_limit = original_limit_value * factor_value
+        if not math.isfinite(scaled_limit):
+            raise ValueError(
+                "Native MTP YaRN extension requires a finite scaled limit."
+            )
+        validated_yarn_limit = int(scaled_limit)
+        validated_limit = min(
+            validated_yarn_limit,
+            self.target_model_config.max_model_len,
+        )
+        if self.max_model_len > validated_limit:
+            raise ValueError(
+                f"Native MTP max_model_len={self.max_model_len} exceeds the "
+                f"validated target YaRN limit={validated_limit}."
+            )
+
+        draft_text_config.rope_parameters = copy.deepcopy(rope_parameters)
+        logger.info(
+            "Extended native MTP context from %s to %s with validated target "
+            "YaRN parameters (factor=%s).",
+            draft_native_limit,
+            self.max_model_len,
+            factor,
+        )
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():
@@ -1280,6 +1539,7 @@ class SpeculativeConfig:
                     "dflash_ddtree tree verification is enabled."
                 )
 
+        self._verify_mtp_expert_quantization()
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1304,6 +1564,23 @@ class SpeculativeConfig:
 
         self.verify_equal_vocab_size_if_draft_model()
         return self
+
+    def _verify_mtp_expert_quantization(self):
+        if self.mtp_expert_quantization is None:
+            return
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda() or not current_platform.is_device_capability(
+            (7, 0)
+        ):
+            raise ValueError("mtp_expert_quantization currently requires CUDA SM70")
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if self.method != "mtp" or getattr(hf_config, "architectures", []) != [
+            "Qwen4ExpMTP"
+        ]:
+            raise ValueError("mtp_expert_quantization currently requires Qwen4Exp MTP")
+        if self.rejection_sample_method != "standard":
+            raise ValueError("FP8 MTP requires standard rejection sampling")
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
@@ -1344,6 +1621,19 @@ class SpeculativeConfig:
             slots_per_req += 1
         return slots_per_req
 
+    @property
+    def max_num_new_target_slots_for_drafting(self) -> int:
+        """Return extra slots inserted into the target runner's input batch.
+
+        MRV2 DFlash builds its K+1 query batch in a separate ``InputBuffers``
+        instance. Its K draft slots therefore consume draft-runner capacity,
+        not the target scheduler's prefill budget. Other proposers retain the
+        existing shared-batch accounting.
+        """
+        if self.use_dflash():
+            return 0
+        return self.max_num_new_slots_for_drafting
+
     def use_gemma4_mtp(self) -> bool:
         return (
             self.method == "mtp"
@@ -1383,7 +1673,13 @@ class SpeculativeConfig:
         # so dropping an additional target block is both unnecessary and can
         # eliminate all prefix hits when hybrid page unification makes blocks
         # large. Keep DDTree and DSpark on their established V1 semantics.
-        return self.use_eagle() and not self.use_dflash()
+        # disable_eagle_block_drop is the #53388 opt-in: keep the trailing
+        # hashed page (hybrid-model MTP pages can be 2048+ tokens).
+        return (
+            self.use_eagle()
+            and not self.use_dflash()
+            and not self.disable_eagle_block_drop
+        )
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

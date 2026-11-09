@@ -174,6 +174,28 @@ class TestResponsesUtils:
             message["tool_calls"][0]["function"]["arguments"] == '{"code": "123+456"}'
         )
 
+    def test_message_transport_metadata_is_removed_before_chat_rendering(self):
+        item = {
+            "type": "message",
+            "id": "msg_developer_1",
+            "status": "completed",
+            "phase": "commentary",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn_1"},
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "Follow policy."}],
+            "name": "policy",
+            "task": "coding",
+        }
+
+        message = _single_chat_message(item)
+
+        assert message == {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "Follow policy."}],
+            "name": "policy",
+            "task": "coding",
+        }
+
     def test_construct_chat_messages_preserves_single_item_conversions(self):
         item = ResponseReasoningItem(
             id="lol",

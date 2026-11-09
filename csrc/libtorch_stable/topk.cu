@@ -8,6 +8,7 @@
 
 #ifndef USE_ROCM
   #include "../persistent_topk.cuh"
+  #include "../qsa_lexicographic_topk.cuh"
 #endif
 
 namespace {
@@ -272,5 +273,58 @@ void persistent_topk(const torch::stable::Tensor& logits,
   }
 #else
   STD_TORCH_CHECK(false, "persistent_topk is not supported on ROCm");
+#endif
+}
+
+void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
+                            const torch::stable::Tensor& lengths,
+                            torch::stable::Tensor& output, int64_t k,
+                            bool decode_batch) {
+#ifndef USE_ROCM
+  STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
+  STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
+  STD_TORCH_CHECK(output.is_cuda(), "output must be CUDA tensor");
+  STD_TORCH_CHECK(logits.scalar_type() == torch::headeronly::ScalarType::Float,
+                  "Only float32 logits are supported");
+  STD_TORCH_CHECK(lengths.scalar_type() == torch::headeronly::ScalarType::Int,
+                  "lengths must be int32");
+  STD_TORCH_CHECK(output.scalar_type() == torch::headeronly::ScalarType::Int,
+                  "output must be int32");
+  STD_TORCH_CHECK(logits.dim() == 2, "logits must be 2D");
+  STD_TORCH_CHECK(logits.stride(1) == 1,
+                  "logits must be contiguous in the column dimension");
+  STD_TORCH_CHECK(lengths.dim() == 1, "lengths must be 1D");
+  STD_TORCH_CHECK(lengths.is_contiguous(), "lengths must be contiguous");
+  STD_TORCH_CHECK(output.dim() == 2, "output must be 2D");
+  STD_TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+  STD_TORCH_CHECK(k == 512,
+                  "qsa_lexicographic_topk supports only k=512, got k=", k);
+
+  const int64_t num_rows = logits.size(0);
+  STD_TORCH_CHECK(
+      num_rows <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+      "logits row count exceeds uint32 range");
+  STD_TORCH_CHECK(lengths.numel() == num_rows, "lengths size mismatch");
+  STD_TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,
+                  "output size mismatch");
+  STD_TORCH_CHECK(logits.size(1) <= static_cast<int64_t>(
+                                        std::numeric_limits<uint32_t>::max()),
+                  "logits width exceeds uint32 range");
+  STD_TORCH_CHECK(logits.stride(0) <= static_cast<int64_t>(
+                                          std::numeric_limits<uint32_t>::max()),
+                  "logits row stride exceeds uint32 range");
+  if (num_rows == 0) return;
+
+  vllm::qsa::launch_qsa_lexicographic_topk<512>(
+      logits.const_data_ptr<float>(), lengths.const_data_ptr<int32_t>(),
+      output.mutable_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
+      static_cast<uint32_t>(logits.size(1)),
+      static_cast<uint32_t>(logits.stride(0)), get_current_cuda_stream(),
+      decode_batch);
+  const cudaError_t err = cudaGetLastError();
+  STD_TORCH_CHECK(err == cudaSuccess,
+                  "qsa_lexicographic_topk failed: ", cudaGetErrorString(err));
+#else
+  STD_TORCH_CHECK(false, "qsa_lexicographic_topk is not supported on ROCm");
 #endif
 }

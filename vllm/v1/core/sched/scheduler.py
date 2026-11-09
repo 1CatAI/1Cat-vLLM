@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -30,6 +31,8 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -37,6 +40,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -50,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -117,7 +121,16 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_scheduled_tokens
             else self.scheduler_config.max_num_batched_tokens
         )
+        self.adaptive_long_prefill_threshold = (
+            self.scheduler_config.long_prefill_token_threshold_adaptive
+        )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.mixed_prefill_budget = MixedPrefillBudget(
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.mixed_prefill_step_latency_ms,
+            self.scheduler_config.mixed_prefill_min_tokens,
+        )
+        self.mixed_prefill_enabled = current_platform.device_type == "cuda"
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -267,6 +280,8 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
+            prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
+            partial_prefix_cache=self.cache_config.partial_prefix_cache,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -275,6 +290,7 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self.current_step = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -283,6 +299,46 @@ class Scheduler(SchedulerInterface):
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+        )
+        self.balanced_prefill_chunks = envs.VLLM_BALANCED_PREFILL_CHUNKS
+        # A Mamba state is materialized only when a scheduler chunk ends on
+        # the Mamba group's own block grid. The global cache block size can be
+        # much smaller in heterogeneous layouts (Qwen3.8 uses 16-token hashes
+        # with an 816-token recurrent-state block), so it is not a valid grid.
+        mamba_specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        mamba_state_block_sizes = {spec.block_size for spec in mamba_specs}
+        assert len(mamba_state_block_sizes) <= 1, (
+            "mamba align scheduling requires a single state block size, "
+            f"got {sorted(mamba_state_block_sizes)}"
+        )
+        self.mamba_state_block_size = (
+            next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
+        )
+        # Sparse admission only retains replay/shared-prefix and periodic
+        # boundaries. Materializing discarded states must not split the whole
+        # model's prefill into one-state-block forwards. Mixed alignments still
+        # use dense admission in MambaManager, so keep their dense scheduling.
+        coordinator = self.kv_cache_manager.coordinator
+        self.mamba_state_retention_interval = (
+            self.cache_config.prefix_cache_retention_interval
+            if self.need_mamba_block_aligned_split
+            and all(spec.mamba_cache_mode == "align" for spec in mamba_specs)
+            and getattr(coordinator, "lcm_block_size", self.mamba_state_block_size)
+            == self.mamba_state_block_size
+            else None
+        )
+        # Full-chunk recurrent states need dense boundaries under contention
+        # to preserve concurrent decode throughput. A lone request still uses
+        # sparse replay boundaries: forcing dense admission there changes its
+        # prefix reuse and regresses speculative acceptance on warm repeats.
+        self.mamba_dense_boundaries_on_contention = (
+            self.mamba_state_retention_interval is not None
+            and self.mamba_state_block_size is not None
+            and self.mamba_state_block_size >= self.max_num_scheduled_tokens
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -393,6 +449,33 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _balanced_prefill_chunk(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """Cap a prefill chunk so the prompt's remaining chunks are equal.
+
+        With VLLM_BALANCED_PREFILL_CHUNKS=1, a prompt needing n chunks of at
+        most `num_new_tokens` is split into n near-equal chunks instead of
+        n - 1 full ones and a short tail. On models whose prefill step has a
+        fixed floor (e.g. streaming host-resident experts over PCIe every
+        step), the short tail step otherwise costs a full step.
+        """
+        if not self.balanced_prefill_chunks or num_new_tokens <= 0:
+            return num_new_tokens
+        remaining = (
+            max(request.num_prompt_tokens, request.num_tokens - 1) - num_computed_tokens
+        )
+        if remaining <= num_new_tokens:
+            return num_new_tokens
+        unit = (
+            self.mamba_state_block_size or self.cache_config.block_size
+            if self.need_mamba_block_aligned_split
+            else self.cache_config.block_size
+        )
+        chunks = cdiv(remaining, num_new_tokens)
+        balanced = cdiv(cdiv(remaining, chunks), unit) * unit
+        return min(num_new_tokens, balanced)
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -400,47 +483,99 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        num_computed_tokens = (
+        start = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        # Perform block-aligned splitting at prefill phase, including:
-        # * non-resumed requests: num_computed_tokens < num_prompt_tokens + 0
-        # * resumed requests: num_computed_tokens < (
-        #                       num_prompt_tokens + num_output_tokens
-        #                     )
-        # NOTE: Use `request.num_tokens - 1` to bypass normal decoding.
-        if num_computed_tokens < max(request.num_prompt_tokens, request.num_tokens - 1):
-            # To enable block-aligned caching of the Mamba state, `num_new_tokens`
-            # must be a multiple of `block_size`.
-            # As an exception, if `num_new_tokens` is less than `block_size`, the
-            # state is simply not cached, requiring no special handling.
-            # Additionally, when Eagle mode is enabled, FullAttn prunes the last
-            # matching block. To prevent this from causing a Mamba cache miss, the
-            # last chunk must be not smaller than `block_size`.
-            block_size = self.cache_config.block_size
-            last_cache_position = request.num_tokens - request.num_tokens % block_size
-            # eagle prune
-            if self.use_eagle:
-                last_cache_position = max(last_cache_position - block_size, 0)
-            num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
-            if num_computed_tokens_after_sched < last_cache_position:
-                # align to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
-            elif (
-                num_computed_tokens
-                < last_cache_position
-                < num_computed_tokens_after_sched
-            ):
-                # force to cache the last chunk
-                num_new_tokens = last_cache_position - num_computed_tokens
-            else:
-                # prefill the last few tokens
-                pass
-        return num_new_tokens
+        # `request.num_tokens - 1` extends prefill handling to resumed requests
+        # replaying output tokens while leaving ordinary decode untouched.
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start >= prefill_end:
+            return num_new_tokens
+
+        block_size = (
+            self.mamba_state_block_size
+            if self.mamba_state_block_size is not None
+            else self.cache_config.block_size
+        )
+        # Prefix lookup is capped at n - 1. Flooring from n would register an
+        # unreachable state whenever the request length is block aligned.
+        last_token = request.num_tokens - 1
+        last_cache_position = last_token - last_token % block_size
+        if self.use_eagle:
+            last_cache_position = max(last_cache_position - block_size, 0)
+
+        end = start + num_new_tokens
+        # The rest of the prompt fits this step and no tail checkpoint is
+        # wanted: do not split it at the last cacheable (replay) boundary.
+        skip_tail = end >= prefill_end and not getattr(
+            self.cache_config, "mamba_tail_checkpoint", True
+        )
+        if skip_tail:
+            last_cache_position = 0
+        if end < prefill_end:
+            aligned_end = end // block_size * block_size
+            # Only take the aligned end when it advances past `start`. Otherwise
+            # this returns 0, the caller treats that as "cannot schedule", and
+            # the request is skipped on every step while it holds its KV blocks
+            # and encoder-cache entries. The condition recurs whenever the chunk
+            # available this step is shorter than one state block -- e.g. when
+            # the encoder-cache gate caps it just before an image placeholder --
+            # so the request starves indefinitely. Scheduling the shorter,
+            # unaligned chunk only skips this block's Mamba state checkpoint, and
+            # it cannot straddle two state blocks because `aligned_end <= start`
+            # implies `end < next_block_boundary`.
+            if aligned_end > start:
+                end = aligned_end
+
+        # The align allocator only materializes the state at the chunk end.
+        # Stop at every *retained* boundary so none is admitted with a null
+        # state, while batching across the discarded interior states.
+        retention_interval = getattr(self, "mamba_state_retention_interval", None)
+        if getattr(self, "mamba_dense_boundaries_on_contention", False) and (
+            len(self.running) + len(self.waiting) > 1
+        ):
+            retention_interval = None
+        if retention_interval is None:
+            retained_boundaries = [(start // block_size + 1) * block_size]
+        else:
+            retained_boundaries = (
+                []
+                if skip_tail
+                else list(
+                    self.kv_cache_manager.coordinator.get_replay_boundaries(
+                        request, block_size
+                    )
+                )
+            )
+            if retention_interval:
+                retained_boundaries.append(
+                    (start // retention_interval + 1) * retention_interval
+                )
+        end = min(
+            (
+                stop
+                for stop in (
+                    *retained_boundaries,
+                    last_cache_position,
+                    getattr(request, "shared_prefix_boundary", 0)
+                    // block_size
+                    * block_size,
+                    *(
+                        self.kv_cache_manager.partial_prefix_stops(request, start, end)
+                        if getattr(self.kv_cache_manager, "partial_cache", None)
+                        else ()
+                    ),
+                )
+                if start < stop < end
+            ),
+            default=end,
+        )
+        return max(end - start, 0)
 
     def schedule(self) -> SchedulerOutput:
+        self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -464,6 +599,58 @@ class Scheduler(SchedulerInterface):
             # Do not schedule any requests when paused.
             token_budget = 0
 
+        # Preserve decode capacity even if a running partial prefill precedes a
+        # resident in FCFS order. Replay after preemption counts as prefill too.
+        prefill_remaining = {
+            r.request_id: max(
+                0, max(r.num_prompt_tokens, r.num_tokens - 1) - r.num_computed_tokens
+            )
+            for r in self.running
+        }
+        resident_tokens = {
+            r.request_id: max(
+                0,
+                r.num_tokens_with_spec
+                + r.num_output_placeholders
+                - r.num_computed_tokens,
+            )
+            for r in self.running
+            if prefill_remaining[r.request_id] == 0
+            and r.num_output_tokens > 0
+            and self.current_step >= r.next_decode_eligible_step
+        }
+        resident_tokens = {rid: n for rid, n in resident_tokens.items() if n > 0}
+        control_mixed_prefill = (
+            self.mixed_prefill_enabled
+            and bool(resident_tokens)
+            and self.scheduler_config.mixed_prefill_step_latency_ms > 0
+            and self.scheduler_config.enable_chunked_prefill
+            and not self.scheduler_config.disable_chunked_mm_input
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not self.is_encoder_decoder
+        )
+
+        def limit_prefill(req_id: str, tokens: int) -> int:
+            if not control_mixed_prefill or prefill_remaining.get(req_id, 0) <= 0:
+                return tokens
+            used = sum(
+                min(n, prefill_remaining.get(rid, 0))
+                for rid, n in num_scheduled_tokens.items()
+            )
+            reserve = sum(
+                n
+                for rid, n in resident_tokens.items()
+                if rid not in num_scheduled_tokens
+            )
+            return max(
+                0,
+                min(
+                    tokens,
+                    self.mixed_prefill_budget.tokens - used,
+                    token_budget - reserve,
+                ),
+            )
+
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -476,10 +663,33 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # `long_prefill_token_threshold` exists to stop a long prefill from
+        # starving other requests of the token budget. When it is the only
+        # request there is nobody to starve, so let it use the whole budget.
+        num_eligible_reqs = (
+            len(self.running) + len(self.waiting) + len(self.skipped_waiting)
+        )
+        long_prefill_token_threshold = (
+            self.scheduler_config.long_prefill_token_threshold
+            if num_eligible_reqs > 1
+            else 0
+        )
+        if long_prefill_token_threshold > 0 and self.adaptive_long_prefill_threshold:
+            # Floor the cap at a fair share of the token budget so it never
+            # cuts a request below max_num_scheduled_tokens / num requests.
+            long_prefill_token_threshold = max(
+                long_prefill_token_threshold,
+                self.max_num_scheduled_tokens // num_eligible_reqs,
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if self.current_step < request.next_decode_eligible_step:
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -516,7 +726,7 @@ class Scheduler(SchedulerInterface):
                     ddtree_payload_for_tree_schedule
                 )
                 remaining_output_tokens = self._remaining_output_tokens(request)
-                threshold = self.scheduler_config.long_prefill_token_threshold
+                threshold = long_prefill_token_threshold
                 max_len_tokens = self.max_model_len - 1 - request.num_computed_tokens
                 _ddtree_debug_log(
                     "schedule candidate req=%s base_new=%d tree_new=%d "
@@ -549,9 +759,14 @@ class Scheduler(SchedulerInterface):
                         request.request_id,
                         num_new_tokens,
                     )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if 0 < long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = self._balanced_prefill_chunk(
+                request, request.num_computed_tokens, num_new_tokens
+            )
+
+            num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -819,6 +1034,8 @@ class Scheduler(SchedulerInterface):
                                 request, num_new_local_computed_tokens
                             )
                         )
+                        if request.skip_reading_prefix_cache:
+                            ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -870,9 +1087,8 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    if 0 < long_prefill_token_threshold < num_new_tokens:
+                        num_new_tokens = long_prefill_token_threshold
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -886,6 +1102,17 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+                    num_new_tokens = self._balanced_prefill_chunk(
+                        request, num_computed_tokens, num_new_tokens
+                    )
+                    prefill_remaining[request.request_id] = max(
+                        0,
+                        max(request.num_prompt_tokens, request.num_tokens - 1)
+                        - num_computed_tokens,
+                    )
+                    num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
+                    if num_new_tokens == 0:
+                        break
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -1112,6 +1339,26 @@ class Scheduler(SchedulerInterface):
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            mixed_prefill_tokens=(
+                sum(
+                    min(n, prefill_remaining.get(rid, 0))
+                    for rid, n in num_scheduled_tokens.items()
+                )
+                if control_mixed_prefill
+                else 0
+            ),
+            mixed_decode_tokens=(
+                sum(
+                    n
+                    for rid, n in num_scheduled_tokens.items()
+                    if rid in resident_tokens
+                )
+                if control_mixed_prefill
+                else 0
+            ),
+            mixed_prefill_budget=(
+                self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
+            ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
@@ -1124,6 +1371,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            kv_block_copies=self.kv_cache_manager.take_block_copies() or None,
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),
@@ -1304,7 +1552,13 @@ class Scheduler(SchedulerInterface):
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            # Only the V1 runner reads this history: it drops a request that skipped a
+            # step from its persistent batch and rebuilds the outputs from it. The V2
+            # runner keeps every request's tokens on the GPU and gets a resumed
+            # request as a new one, so under PP (a request is scheduled every
+            # pp_size-th step) the copy and its serialization would cost the whole
+            # context length per decode step: about 4 ms at 287k tokens.
+            if not scheduled_in_prev_step and not self.use_v2_model_runner:
                 all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
@@ -1516,6 +1770,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self.mixed_prefill_budget.update(model_runner_output.mixed_prefill_timing)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

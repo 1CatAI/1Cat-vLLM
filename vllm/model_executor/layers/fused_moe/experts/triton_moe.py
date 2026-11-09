@@ -17,7 +17,7 @@ from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     _prepare_expert_assignment,
-    invoke_fused_moe_triton_kernel,
+    dispatch_fused_moe_kernel,
     invoke_fused_moe_wna16_triton_kernel,
     try_get_optimal_moe_config,
 )
@@ -261,13 +261,14 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         lora_context = self._lora_context
 
         def _base_w13_fn():
-            invoke_fused_moe_triton_kernel(
+            dispatch_fused_moe_kernel(
                 hidden_states,
                 w1,
                 intermediate_cache1,
                 a1q_scale if a1q_scale is not None else self.a1_scale,
                 self.w1_scale,
-                None,  # topk_weights
+                None,  # B_zp
+                topk_weights,
                 sorted_token_ids,
                 expert_ids,
                 num_tokens_post_padded,
@@ -379,12 +380,13 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # the w13 pair: base GEMM on default stream, LoRA delta on aux,
         # join via .add_() into intermediate_cache3.
         def _base_w2_fn():
-            invoke_fused_moe_triton_kernel(
+            dispatch_fused_moe_kernel(
                 qintermediate_cache2,
                 w2,
                 intermediate_cache3,
                 a2q_scale,
                 self.w2_scale,
+                None,  # B_zp
                 topk_weights,
                 sorted_token_ids,
                 expert_ids,

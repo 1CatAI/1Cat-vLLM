@@ -1,0 +1,7643 @@
+{
+  "category": "awq",
+  "cases": [
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/float16/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e4m3/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/none/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/none/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/none/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/none/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/none/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/none/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "flash_next_mtp4_nvfp4/fp8_e5m2/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "not_applicable",
+        "format": "nvfp4"
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/none/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/none/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/none/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/none/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/none/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/none/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/none/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/none/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/none/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/none/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/none/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/none/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/float16/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/none/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/none/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/none/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/none/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/none/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/none/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/none/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/none/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/none/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/none/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/none/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/none/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e4m3/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/none/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/none/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/none/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/none/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/none/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/none/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/mtp/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/mtp/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/mtp/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/mtp/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/mtp/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/mtp/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/dflash/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/dflash/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/dflash/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/dflash/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/dflash/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp2/dflash/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/none/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/none/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/none/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/none/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/none/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/none/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/mtp/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/mtp/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/mtp/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/mtp/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/mtp/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/mtp/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/dflash/c1/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/dflash/c1/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/dflash/c4/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/dflash/c4/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/dflash/c8/b4096",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "35b_a3b_awq/fp8_e5m2/tp4/dflash/c8/b8192",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    }
+  ],
+  "edge_cases": [
+    {
+      "config": "group64",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 64,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 64,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 64,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 64,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 64,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 64,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "group128_prefill",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 128,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_sm70_dequantize_out",
+            "group": 128
+          },
+          {
+            "op": "torch.mm",
+            "m": 4096
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "unqualified_role",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 128,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "native_missing",
+      "route": {
+        "route": "error",
+        "calls": []
+      }
+    },
+    {
+      "config": "workspace_missing",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 128,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "turbo_off",
+      "route": {
+        "route": "legacy_fallback",
+        "calls": []
+      }
+    },
+    {
+      "config": "prefill_off",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 128,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 128,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "fused_tp2",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": true
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": true
+          }
+        ]
+      }
+    },
+    {
+      "config": "fused_tp4",
+      "route": {
+        "route": "turbomind",
+        "calls": [
+          {
+            "op": "awq_sm70_prepare",
+            "group": 32,
+            "gated": true
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 1,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 4096,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          },
+          {
+            "op": "awq_gemm_sm70_out",
+            "m": 8192,
+            "group": 32,
+            "k_ld": 2560,
+            "q_ld": 2560,
+            "gated": false
+          }
+        ]
+      }
+    },
+    {
+      "config": "non_sm70",
+      "route": {
+        "route": "legacy_fallback",
+        "calls": []
+      }
+    }
+  ]
+}

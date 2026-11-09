@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <cmath>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -13,8 +15,21 @@ namespace {
 
 constexpr int kThreads = 256;
 
-template <bool UNIT_SCALE>
-__global__ void fp8_e5m2_paged_kv_to_fp16_kernel(
+template <int KV_DTYPE>
+__device__ __forceinline__ __half2 load_bridge_half2(const void* cache,
+                                                     int64_t offset) {
+  if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2) {
+    return flash_v100::load_fp8_e5m2_half2_unscaled(cache, offset);
+  } else {
+    const uint16_t pair = reinterpret_cast<const uint16_t*>(cache)[offset >> 1];
+    return __float22half2_rn(make_float2(
+        flash_v100::fp8_e4m3fn_to_float(static_cast<uint8_t>(pair)),
+        flash_v100::fp8_e4m3fn_to_float(static_cast<uint8_t>(pair >> 8))));
+  }
+}
+
+template <int KV_DTYPE, bool UNIT_SCALE>
+__global__ void fp8_paged_kv_to_fp16_kernel(
     const void* __restrict__ key_cache, const void* __restrict__ value_cache,
     const int* __restrict__ block_table, const int* __restrict__ seq_lens,
     __half* __restrict__ key_out, __half* __restrict__ value_out,
@@ -73,10 +88,8 @@ __global__ void fp8_e5m2_paged_kv_to_fp16_kernel(
         static_cast<int64_t>(input_block_offset) * value_token_stride +
         static_cast<int64_t>(head_idx) * value_head_stride + element_idx;
 
-    key_pair =
-        flash_v100::load_fp8_e5m2_half2_unscaled(key_cache, key_input_offset);
-    value_pair = flash_v100::load_fp8_e5m2_half2_unscaled(value_cache,
-                                                          value_input_offset);
+    key_pair = load_bridge_half2<KV_DTYPE>(key_cache, key_input_offset);
+    value_pair = load_bridge_half2<KV_DTYPE>(value_cache, value_input_offset);
     if constexpr (!UNIT_SCALE) {
       const float2 key_values = __half22float2(key_pair);
       const float2 value_values = __half22float2(value_pair);
@@ -106,7 +119,8 @@ __global__ void fp8_e5m2_paged_kv_to_fp16_kernel(
 
 }  // namespace
 
-void flash_attention_fp8_e5m2_paged_kv_to_fp16(
+template <int KV_DTYPE>
+void flash_attention_fp8_paged_kv_to_fp16(
     const at::Tensor& key_cache, const at::Tensor& value_cache,
     const at::Tensor& block_table, const at::Tensor& seq_lens,
     at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
@@ -118,7 +132,7 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
               "FP8 KV bridge metadata must be CUDA tensors");
   TORCH_CHECK(key_cache.scalar_type() == at::kByte &&
                   value_cache.scalar_type() == at::kByte,
-              "FP8 E5M2 input caches must be stored as uint8");
+              "FP8 input caches must be stored as uint8");
   TORCH_CHECK(key_out.scalar_type() == at::kHalf &&
                   value_out.scalar_type() == at::kHalf,
               "FP8 KV bridge output caches must be fp16");
@@ -143,8 +157,33 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
   TORCH_CHECK(block_table.dim() == 2 && seq_lens.dim() == 1 &&
                   block_table.size(0) == seq_lens.size(0),
               "FP8 KV bridge metadata shape mismatch");
-  TORCH_CHECK(key_scale > 0.f && value_scale > 0.f,
-              "FP8 KV bridge scales must be positive");
+  TORCH_CHECK(std::isfinite(key_scale) && std::isfinite(value_scale) &&
+                  key_scale > 0.f && value_scale > 0.f,
+              "FP8 KV bridge scales must be finite and positive");
+  TORCH_CHECK(block_table.is_contiguous() && seq_lens.is_contiguous(),
+              "FP8 KV bridge metadata must be contiguous");
+  for (const auto* tensor : {&value_cache, &block_table, &seq_lens,
+                             static_cast<const at::Tensor*>(&key_out),
+                             static_cast<const at::Tensor*>(&value_out)}) {
+    TORCH_CHECK(tensor->device() == key_cache.device(),
+                "FP8 KV bridge tensors must share a device");
+  }
+  for (const auto* tensor :
+       {&key_cache, &value_cache, static_cast<const at::Tensor*>(&key_out),
+        static_cast<const at::Tensor*>(&value_out)}) {
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor->data_ptr()) %
+                        (2 * tensor->element_size()) ==
+                    0,
+                "FP8 KV bridge requires pair-aligned storage");
+    for (int i = 0; i < 3; ++i) {
+      TORCH_CHECK(tensor->stride(i) % 2 == 0,
+                  "FP8 KV bridge requires pair-aligned strides");
+    }
+  }
+  TORCH_CHECK(key_cache.size(1) > 0 && key_cache.size(2) > 0 &&
+                  key_cache.size(3) > 0 && key_out.size(1) > 0 &&
+                  block_table.size(1) > 0,
+              "FP8 KV bridge dimensions must be non-empty");
 
   const int batch_size = block_table.size(0);
   TORCH_CHECK(batch_size > 0, "FP8 KV bridge batch must be non-empty");
@@ -165,18 +204,19 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
 
 #define LAUNCH_FP8_BRIDGE(UNIT_SCALE)                                          \
-  fp8_e5m2_paged_kv_to_fp16_kernel<UNIT_SCALE><<<grid, kThreads, 0, stream>>>( \
-      key_cache.data_ptr(), value_cache.data_ptr(),                            \
-      block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),                   \
-      reinterpret_cast<__half*>(key_out.data_ptr()),                           \
-      reinterpret_cast<__half*>(value_out.data_ptr()), batch_size,             \
-      block_table.size(1), key_cache.size(1), output_blocks_per_seq,           \
-      key_out.size(1), key_cache.size(2), key_cache.size(3),                   \
-      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),           \
-      value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),     \
-      key_out.stride(0), key_out.stride(1), key_out.stride(2),                 \
-      value_out.stride(0), value_out.stride(1), value_out.stride(2),           \
-      key_scale, value_scale)
+  fp8_paged_kv_to_fp16_kernel<KV_DTYPE, UNIT_SCALE>                            \
+      <<<grid, kThreads, 0, stream>>>(                                         \
+          key_cache.data_ptr(), value_cache.data_ptr(),                        \
+          block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),               \
+          reinterpret_cast<__half*>(key_out.data_ptr()),                       \
+          reinterpret_cast<__half*>(value_out.data_ptr()), batch_size,         \
+          block_table.size(1), key_cache.size(1), output_blocks_per_seq,       \
+          key_out.size(1), key_cache.size(2), key_cache.size(3),               \
+          key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),       \
+          value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+          key_out.stride(0), key_out.stride(1), key_out.stride(2),             \
+          value_out.stride(0), value_out.stride(1), value_out.stride(2),       \
+          key_scale, value_scale)
 
   if (key_scale == 1.f && value_scale == 1.f) {
     LAUNCH_FP8_BRIDGE(true);
@@ -186,4 +226,24 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
 #undef LAUNCH_FP8_BRIDGE
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void flash_attention_fp8_e5m2_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
+    const float value_scale) {
+  flash_attention_fp8_paged_kv_to_fp16<flash_v100::KV_CACHE_DTYPE_FP8_E5M2>(
+      key_cache, value_cache, block_table, seq_lens, key_out, value_out,
+      key_scale, value_scale);
+}
+
+void flash_attention_fp8_e4m3_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
+    const float value_scale) {
+  flash_attention_fp8_paged_kv_to_fp16<flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
+      key_cache, value_cache, block_table, seq_lens, key_out, value_out,
+      key_scale, value_scale);
 }

@@ -20,12 +20,16 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import (
+    ResponsesRequest,
+)
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
+from vllm.tool_parsers.qwen_xml_tool_grammar import adjust_qwen_xml_tool_request
 from vllm.tool_parsers.utils import find_tool_properties
 
 logger = init_logger(__name__)
@@ -100,6 +104,9 @@ class StreamingXMLToolCallParser:
 
         self.streaming_buffer += xml_chunk
 
+        # A chunk may close one call and open another. Closing tags in that
+        # chunk must never make the fallback close the newly opened call.
+        initial_call_id = self.current_call_id
         found_elements = self._process_complete_xml_elements()
 
         if found_elements:
@@ -111,6 +118,8 @@ class StreamingXMLToolCallParser:
                 # but didn't generate '}', then complete it
                 if (
                     self.current_call_id is not None
+                    and self.current_call_id == initial_call_id
+                    and self.current_function_open
                     and self.function_end_token in xml_chunk
                 ):
                     # - Added '}' (non-empty parameter ending)
@@ -140,6 +149,7 @@ class StreamingXMLToolCallParser:
                 # but didn't generate final empty delta, then complete it
                 if (
                     self.current_call_id is not None
+                    and self.current_call_id == initial_call_id
                     and self.tool_call_end_token in xml_chunk
                 ):
                     has_toolcall_close = any(
@@ -186,9 +196,13 @@ class StreamingXMLToolCallParser:
             # Only execute when still on the same call as when entered,
             # to prevent accidentally closing new calls
             # in multi <tool_call> scenarios
-            if self.current_call_id is not None and (
-                self.function_end_token in xml_chunk
-                or self.tool_call_end_token in xml_chunk
+            if (
+                self.current_call_id is not None
+                and self.current_call_id == initial_call_id
+                and (
+                    self.function_end_token in xml_chunk
+                    or self.tool_call_end_token in xml_chunk
+                )
             ):
                 # Close potentially unclosed element
                 if self.current_param_name:
@@ -300,7 +314,22 @@ class StreamingXMLToolCallParser:
                 found_any = True
 
             except Exception as e:
-                logger.warning("Error when parsing XML elements: %s", e)
+                # Expat retains an unmatched parameter in its XML stack even
+                # when our value handler has recovered at the next parameter.
+                # Recover only the closing element being processed, so a close
+                # earlier in a burst cannot accidentally finish its next call.
+                closing = element.strip()
+                if self.current_call_id is not None and closing in (
+                    self.function_end_token,
+                    self.tool_call_end_token,
+                ):
+                    if closing == self.tool_call_end_token:
+                        self._end_element("tool_call")
+                    elif self.current_function_open:
+                        self._end_element("function")
+                    found_any = True
+                else:
+                    logger.warning("Error when parsing XML elements: %s", e)
 
             # Update processed position
             self.last_processed_pos = end_pos
@@ -1160,6 +1189,14 @@ class Qwen3XMLToolParser(ToolParser):
         logger.info(
             "vLLM Successfully import tool parser %s !", self.__class__.__name__
         )
+
+    def adjust_request(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        if adjust_qwen_xml_tool_request(request, logger):
+            return request
+        return super().adjust_request(request)
 
     def extract_tool_calls(
         self,

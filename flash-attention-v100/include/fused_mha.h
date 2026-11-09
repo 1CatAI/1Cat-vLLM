@@ -57,6 +57,37 @@ at::Tensor flash_attention_grouped_verify_paged(
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
     const bool one_pass);
 
+int64_t flash_attention_grouped_verify_max_query_tokens();
+
+int64_t flash_attention_grouped_verify_request_major_abi_version();
+
+at::Tensor flash_attention_grouped_e4m3_fp32_paged(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, const at::Tensor& block_table,
+    const at::Tensor& row_lengths, at::Tensor& partial, at::Tensor& lse,
+    float scale, float k_scale, float v_scale);
+
+int64_t flash_attention_grouped_e4m3_fp32_precision_version();
+
+int64_t flash_attention_tp2_e4m3_scalar_fast_version();
+int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count();
+
+int64_t flash_attention_grouped_sparse_page4_abi_version();
+
+at::Tensor flash_attention_grouped_sparse_page4(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
+    const float softmax_scale, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale);
+
+at::Tensor flash_attention_grouped_sparse_page4_plan(
+    const at::Tensor& logical_indices, const at::Tensor& block_table,
+    const at::Tensor& token_to_req, const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths, at::Tensor& output_blocks,
+    at::Tensor& output_masks, at::Tensor& output_seq_lens, const int page_size,
+    const int physical_page_stride, const int num_cache_blocks);
+
 at::Tensor flash_attention_decode_paged_wmma(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
@@ -126,6 +157,12 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
     at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
     const float value_scale);
 
+void flash_attention_fp8_e4m3_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
+    const float value_scale);
+
 std::vector<at::Tensor> flash_attention_backward(
     const at::Tensor& dout, const at::Tensor& q, const at::Tensor& k,
     const at::Tensor& v, const at::Tensor& out, const at::Tensor& softmax_lse,
@@ -135,5 +172,10 @@ std::vector<at::Tensor> flash_attention_backward(
     int window_size_left, int window_size_right, const float softcap,
     const bool deterministic, std::optional<at::Generator> gen_,
     std::optional<at::Tensor>& rng_state);
+
+at::Tensor flash_attention_dflash2_paged_bmhd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    std::optional<at::Tensor>& output, const at::Tensor& table,
+    const at::Tensor& lengths, const float scale);
 
 #endif

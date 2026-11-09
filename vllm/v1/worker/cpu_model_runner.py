@@ -107,9 +107,9 @@ class CPUModelRunner(GPUModelRunner):
         if self.lora_config:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
 
-        if hasattr(self, "drafter"):
+        if (drafter := getattr(self, "drafter", None)) is not None:
             logger.info_once("Loading drafter model...")
-            self.drafter.load_model(self.model)
+            drafter.load_model(self.model)
 
         self._setup_eagle3_aux_hidden_state_outputs()
 

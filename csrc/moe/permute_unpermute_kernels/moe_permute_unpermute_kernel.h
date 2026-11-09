@@ -64,6 +64,12 @@ void expandInputRowsKernelLauncher(
     int64_t const* num_valid_tokens_ptr, int64_t const cols, int const k,
     int num_local_experts, cudaStream_t stream);
 
+void buildMoePermuteMetadataLauncher(
+    int const* expanded_dest_row_to_expanded_source_row,
+    int* expanded_source_row_to_expanded_dest_row, int* permuted_idx,
+    int* input_row_indices, int64_t num_expanded_rows,
+    int64_t const* num_valid_tokens_ptr, int topk, cudaStream_t stream);
+
 template <class T, class OutputType>
 void finalizeMoeRoutingKernelLauncher(
     T const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,

@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
-_SCORE_STRIDE = tl.constexpr(1 << 32)
+_SCORE_STRIDE = tl.constexpr(1 << 32) if HAS_TRITON else 1 << 32
 
 
 @triton.jit
@@ -132,6 +132,7 @@ def _fuse_draft_kernel(
     draft_block,
     k: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    PROBABILISTIC: tl.constexpr,
 ):
     req = tl.program_id(0)
     tl.store(take_flags_ptr + req, 0)
@@ -163,6 +164,13 @@ def _fuse_draft_kernel(
     tail = offsets >= draft_block
     take_tail = (match_len >= nmin_tail) & (take_head | (agreement >= draft_block))
     from_lookup = tl.where(tail, take_tail, take_head) & (offsets < valid) & mask
+    if PROBABILISTIC:
+        # A weak lookup is selected by the first agree_min random proposals.
+        # They already equal the lookup tokens, but must retain their original
+        # q scores. Replacing those scores with point masses conditions on the
+        # draws being corrected and biases rejection sampling. Only subsequent
+        # positions may use a point mass conditional on that sampled prefix.
+        from_lookup &= tail | (match_len >= nstrong) | (offsets >= agree_min)
     tl.store(
         draft_tokens_ptr + req * draft_stride + offsets,
         looked_up,
@@ -296,6 +304,7 @@ def fuse_draft(
     nmin_tail: int = 4,
     long_min: int = 6,
     take_flags: torch.Tensor | None = None,
+    probabilistic: bool = False,
 ) -> None:
     """Fuse lookup continuations into a model-drafted prefix in place."""
     if take_flags is None:
@@ -322,5 +331,6 @@ def fuse_draft(
         draft_block,
         k=num_draft_tokens,
         BLOCK_K=triton.next_power_of_2(num_draft_tokens),
+        PROBABILISTIC=probabilistic,
         num_warps=1,
     )

@@ -4,6 +4,7 @@ requires = [
     "cmake>=3.26.1",
     "ninja",
     "packaging>=24.2",
+    "patchelf>=0.19.1.0",
     "setuptools>=77.0.3,<81.0.0",
     "setuptools-scm>=8.0",
     "setuptools-rust>=1.9.0",
@@ -50,14 +51,16 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 # no extra settings needed, presence enables setuptools-scm
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["vllm*", "flash_qla*"]
+where = [".", "flash-attention-v100"]
+include = ["vllm*", "flash_qla*", "flash_attn_v100*"]
 
 [tool.ruff.lint.per-file-ignores]
 "flash_qla/**" = ["ALL"]
 "vllm/third_party/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
+# DS-V4.1 bring-up scripts (run by hand on the 4x V100 host).
+"benchmarks/deepseek_v41/**" = ["E501", "E402", "E741", "B023", "UP031", "SIM115"]
 
 [tool.ruff.lint]
 select = [

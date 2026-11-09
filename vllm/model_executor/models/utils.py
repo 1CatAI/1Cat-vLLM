@@ -812,7 +812,9 @@ def get_draft_quant_config(
         The draft model's config if available, None otherwise.
     """
     draft_model_config = vllm_config.speculative_config.draft_model_config
-    draft_load_config = vllm_config.load_config
+    draft_load_config = (
+        vllm_config.speculative_config.draft_load_config or vllm_config.load_config
+    )
 
     return (
         VllmConfig.get_quantization_config(draft_model_config, draft_load_config)

@@ -3,6 +3,7 @@
 
 import io
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +13,7 @@ from transformers import Qwen3Config
 from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -23,6 +25,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -36,6 +39,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal.inputs import NestedTensors
+from vllm.platforms import current_platform
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
@@ -43,6 +47,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
 
+from .dflash_sm70 import dflash_layered_rms_norm_sm70
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
@@ -57,6 +62,16 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+
+
+def _dflash_context_projection_dtype(projection: nn.Module) -> torch.dtype | None:
+    weight = getattr(projection, "weight", None)
+    if weight is not None and weight.is_floating_point():
+        return weight.dtype
+    # Packed weights have no floating weight parameter. Their quantization
+    # method declares the projection operand dtype independently of storage.
+    dtype = getattr(getattr(projection, "quant_method", None), "params_dtype", None)
+    return dtype if dtype in (torch.float16, torch.bfloat16, torch.float32) else None
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -77,26 +92,6 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     return not all(
         _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
     )
-
-
-def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
-    """The target's RoPE layout, from its first attention layer.
-
-    A DFlash head must rotate Q/K the way the target it was distilled against
-    does, and a mismatch is silent — acceptance collapses but nothing errors and
-    the output stays correct. Draft checkpoints do not carry this, so take it
-    from the target. None if the target uses no RoPE.
-    """
-    language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    for module in language_model.modules():
-        style = getattr(module, "is_neox_style", None)
-        if isinstance(style, bool):
-            return style
-    return None
 
 
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
@@ -240,6 +235,11 @@ class DFlashQwen3Attention(nn.Module):
             is_neox_style=is_neox_style,
             rope_parameters=rope_parameters,
         )
+        self.is_neox_style = bool(is_neox_style)
+        logger.info_once(
+            "DFlash draft RoPE layout resolved from its own config: neox=%s.",
+            self.is_neox_style,
+        )
 
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
@@ -263,6 +263,9 @@ class DFlashQwen3Attention(nn.Module):
         # The in-tree FlashAttention-V100 backend uses this marker to select
         # its DFlash-compatible non-causal paged-prefill fallback.
         self.attn.is_dflash_draft_attn = True
+        self.attn.dflash_expected_causal = causal
+        self.attn.dflash_expected_sliding_window = sliding_window
+        self.attn.dflash_rope_is_neox_style = self.is_neox_style
         self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -279,18 +282,33 @@ class DFlashQwen3Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Per-head RMSNorm
-        q_shape, k_shape = q.shape, k.shape
-        q = self.q_norm(
-            q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
-        ).view(q_shape)
-        k = self.k_norm(
-            k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
-        ).view(k_shape)
+        fused_prep = getattr(self, "_sm70_dflash2_qk_rope", False)
+        if fused_prep:
+            q = torch.empty_like(q)
+            k = torch.empty_like(k)
+            torch.ops.vllm.sm70_dflash2_qk_norm_rope_cache(
+                qkv,
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                self.attn.layer_name,
+            )
+        else:
+            # Per-head RMSNorm
+            q_shape, k_shape = q.shape, k.shape
+            q = self.q_norm(
+                q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
+            ).view(q_shape)
+            k = self.k_norm(
+                k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
+            ).view(k_shape)
 
-        q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = self.attn(q, k, v)
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, kv_cache_updated=fused_prep)
         output_input_scale = getattr(self, "output_input_scale", 1.0)
         if output_input_scale != 1.0:
             attn_output = attn_output / output_input_scale
@@ -328,11 +346,10 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # non-causal) from the draft config.
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
-        # RoPE layout, copied off the target at load time by the draft loader
-        # (see `dflash_target_rope_is_neox_style`). Checkpoints do not carry it:
-        # a head distilled from an interleaved-RoPE target must rotate the way
-        # that target does, or every drafted Q/K is wrong and acceptance
-        # collapses with no error raised.
+        # RoPE layout. The rotation applies to the draft's own Q/K, so this is
+        # fixed by how the head was distilled, not by the target. A mismatch is
+        # silent and collapses acceptance, so an interleaved-trained checkpoint
+        # must declare it; released DFlash checkpoints otherwise use neox.
         is_neox_style = getattr(config, "is_neox_style", True)
 
         self.self_attn = self.attention_cls(
@@ -385,6 +402,17 @@ class DFlashQwen3DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+
+def _has_dense_qkv_weight(attn: nn.Module) -> bool:
+    """True when ``attn.qkv_proj.weight`` is the plain ``[N, K]`` matrix.
+
+    Quantized checkpoints keep packed codes under the same attribute name, so
+    slicing rows out of it silently yields a differently shaped tensor.
+    """
+    return isinstance(
+        getattr(attn.qkv_proj, "quant_method", None), UnquantizedLinearMethod
+    )
 
 
 @support_torch_compile
@@ -504,9 +532,20 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+        # KV projection weights: [num_layers * 2 * kv_size, hidden_size].
+        # Only a plain nn.Linear keeps that matrix in `.weight`; a quantized
+        # draft checkpoint stores packed codes there instead (NVFP4 packs two
+        # values per byte, so the tensor is [N, K // 2]), and the dense rows
+        # are reachable only through the quantization method. That method is
+        # not usable yet -- this builder runs at the end of load_weights,
+        # before process_weights_after_loading -- so defer the fusion to the
+        # first projection instead. See _fuse_dense_kv_weight.
+        self._context_kv_attn_layers = layers_attn
+        if all(_has_dense_qkv_weight(a) for a in layers_attn):
+            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+            self._fused_kv_weight: torch.Tensor | None = torch.cat(kv_weights, dim=0)
+        else:
+            self._fused_kv_weight = None
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
             self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
@@ -518,6 +557,23 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
+        if (
+            capture_runtime_trace().dflash.value("context_kv")
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            row_diffs = (
+                self._k_norm_weights.float()
+                .sub(self._k_norm_weights[0].float())
+                .abs()
+                .amax(dim=-1)
+                .tolist()
+            )
+            logger.warning(
+                "DFlash loaded context K-norm weight diagnostics: shape=%s "
+                "max_diff_from_layer0=%s",
+                tuple(self._k_norm_weights.shape),
+                row_diffs,
+            )
         # The grouped call below relies on the stable-ABI RMSNorm extension
         # selecting one weight row per outer (layer) index. Older binaries
         # silently accepted the 2-D tensor but applied row zero to every
@@ -525,6 +581,7 @@ class DFlashQwen3Model(nn.Module):
         # target-only output quality. Verify the loaded binary once before
         # trusting its grouped result.
         self._batched_k_norm_runtime_verified: bool | None = None
+        self._sm70_context_k_debugged = False
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -569,6 +626,25 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    def _fuse_dense_kv_weight(self, dtype: torch.dtype, device: torch.device) -> None:
+        """Build the fused context K/V matrix for a quantized draft head.
+
+        Feeding an identity matrix through the layer's own quantization
+        method returns the dense transposed weight, whatever the packing is,
+        so this needs no knowledge of NVFP4/FP8/marlin layouts. Runs once, on
+        the first context projection, when process_weights_after_loading has
+        completed. The per-step decode path keeps using the quantized
+        weights; only this prefill-time fusion is materialized dense.
+        """
+        rows = []
+        for attn in self._context_kv_attn_layers:
+            qkv = attn.qkv_proj
+            eye = torch.eye(qkv.input_size_per_partition, dtype=dtype, device=device)
+            weight_t = qkv.quant_method.apply(qkv, eye, None)
+            rows.append(weight_t.t()[attn.q_size :].contiguous())
+            del eye, weight_t
+        self._fused_kv_weight = torch.cat(rows, dim=0)
+
     def _project_context_kv(
         self,
         context_states: torch.Tensor,
@@ -577,6 +653,8 @@ class DFlashQwen3Model(nn.Module):
         num_kv_heads: int,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._fused_kv_weight is None:
+            self._fuse_dense_kv_weight(context_states.dtype, context_states.device)
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = self._normalize_context_states(context_states)
         all_kv_flat = F.linear(
@@ -639,6 +717,35 @@ class DFlashQwen3Model(nn.Module):
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
         # The weight is selected per layer by the outermost (layer) index.
+        if (
+            all_k.is_cuda
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+        ):
+            logger.info_once(
+                "Using the fused per-layer DFlash context K RMSNorm fast path on SM70."
+            )
+            grouped = dflash_layered_rms_norm_sm70(
+                all_k, self._k_norm_weights, self._rms_norm_eps
+            )
+            if (
+                capture_runtime_trace().dflash.value("context_kv")
+                and not self._sm70_context_k_debugged
+                and get_tensor_model_parallel_rank() == 0
+                and bool(torch.count_nonzero(all_k).item())
+            ):
+                reference = self._normalize_context_k_per_layer(all_k)
+                diff = grouped.float().sub(reference.float()).abs()
+                logger.warning(
+                    "DFlash fused SM70 context K-norm diagnostics: "
+                    "input_shape=%s max_diff=%.9g mean_diff=%.9g",
+                    tuple(all_k.shape),
+                    float(diff.max().item()),
+                    float(diff.mean().item()),
+                )
+                self._sm70_context_k_debugged = True
+            return grouped
+
         runtime_verified = getattr(self, "_batched_k_norm_runtime_verified", None)
         if runtime_verified is None:
             # This one-time comparison is normally consumed by model profiling
@@ -674,7 +781,9 @@ class DFlashQwen3Model(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ) = None,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -688,6 +797,15 @@ class DFlashQwen3Model(nn.Module):
         When context_slot_mapping is None (e.g. during dummy_run) only
         the computation runs, and no K/V is written to cache.
         """
+        all_k, all_v = self.compute_context_kv(context_states, context_positions)
+        self.store_context_kv(all_k, all_v, context_slot_mapping)
+
+    def compute_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project context without modifying the KV cache."""
         if not hasattr(self, "_num_attn_layers"):
             logger.warning_once(
                 "DFlash buffer initialization was skipped. If dummy weights are not "
@@ -721,23 +839,35 @@ class DFlashQwen3Model(nn.Module):
             self._rope_is_neox,
         )
 
+        all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        return all_k_final, all_v
+
+    def store_context_kv(
+        self,
+        all_k: torch.Tensor,
+        all_v: torch.Tensor,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ),
+    ) -> None:
+        """Write only the accepted, resident context slots."""
         if context_slot_mapping is None:
             return
-
-        # --- Per-layer cache insert ---
-        all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        for i in range(L):
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
-            )
+        for i in range(self._num_attn_layers):
+            attn = self._attn_layers[i]
+            if isinstance(context_slot_mapping, dict):
+                slot_mapping = context_slot_mapping[attn.layer_name]
+            else:
+                slot_mapping = (
+                    context_slot_mapping[i] if per_layer else context_slot_mapping
+                )
             if slot_mapping is None:
                 continue  # dummy run: skip cache ops
-            attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,
-                all_k_final[i],
+                all_k[i],
                 all_v[i],
                 kv_cache,
                 slot_mapping,
@@ -832,6 +962,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
+        self._sampling_policy = vllm_config.speculative_config.sampling_policy
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
@@ -927,12 +1058,43 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ) = None,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    def get_aux_hidden_state_dtype(self) -> torch.dtype | None:
+        if (
+            not self._sampling_policy.compact_aux_hidden
+            or not self.model.use_aux_hidden_state
+        ):
+            return None
+        return _dflash_context_projection_dtype(self.model.fc)
+
+    def combine_aux_hidden_states(
+        self, aux_hidden_states: list[torch.Tensor]
+    ) -> torch.Tensor:
+        projection_dtype = self.get_aux_hidden_state_dtype()
+        if projection_dtype is not None:
+            # The projection already casts its concatenated input to this dtype.
+            # Copy/cast directly into the final buffer to avoid keeping a full
+            # FP32 concatenation alongside the FP16 projection input. The
+            # projection's arithmetic stays unchanged.
+            shape = (
+                *aux_hidden_states[0].shape[:-1],
+                sum(hidden.shape[-1] for hidden in aux_hidden_states),
+            )
+            combined = torch.empty(
+                shape, dtype=projection_dtype, device=aux_hidden_states[0].device
+            )
+            torch.cat(aux_hidden_states, dim=-1, out=combined)
+        else:
+            combined = torch.cat(aux_hidden_states, dim=-1)
+        return self.combine_hidden_states(combined)
 
     def combine_hidden_states(
         self,
@@ -954,9 +1116,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         # AWQ target paths can surface fp32 auxiliary states even when the
         # draft projection is initialized in fp16. Match the FC weight dtype
         # before dispatching the linear kernel.
-        fc_weight = getattr(self.model.fc, "weight", None)
-        if fc_weight is not None and hidden_states.dtype != fc_weight.dtype:
-            hidden_states = hidden_states.to(dtype=fc_weight.dtype)
+        projection_dtype = _dflash_context_projection_dtype(self.model.fc)
+        if projection_dtype is not None and hidden_states.dtype != projection_dtype:
+            hidden_states = hidden_states.to(dtype=projection_dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
@@ -1006,6 +1168,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_substrs=skip_substrs,
         )
         loader.load_weights(model_weights.items())
+        # Missing draft weights are supplied by load_dflash_model's target
+        # sharing step. Drop their uninitialized placeholders before the
+        # generic post-loader prepares quantized/packed LM-head copies.
+        # A full TP1 vocabulary otherwise adds several GiB of transient state.
+        if not getattr(self, "has_own_embed_tokens", False):
+            del self.model.embed_tokens
+        if not getattr(self, "has_own_lm_head", False):
+            del self.lm_head
         self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
@@ -1022,11 +1192,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             return None
 
         MASK_EMBEDDING_FILENAME = "mask_embedding.pt"
-        data = get_hf_file_bytes(
-            MASK_EMBEDDING_FILENAME,
-            self.draft_model_config.model,
-            self.draft_model_config.revision,
-        )
+        source = Path(getattr(self, "_gguf_model_path", self.draft_model_config.model))
+        if source.is_file() or source.is_dir():
+            directory = source.parent if source.is_file() else source
+            override = directory / MASK_EMBEDDING_FILENAME
+            data = override.read_bytes() if override.is_file() else None
+        else:
+            data = get_hf_file_bytes(
+                MASK_EMBEDDING_FILENAME,
+                self.draft_model_config.model,
+                self.draft_model_config.revision,
+            )
         if data is None:
             return None
 

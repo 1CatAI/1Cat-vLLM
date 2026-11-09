@@ -1373,6 +1373,14 @@ def marlin_int4_fp8_preprocess(
     return torch.ops._C.marlin_int4_fp8_preprocess(qweight, qzeros_or_none, inplace)
 
 
+def prepare_marlin_workspace_policy(device: torch.device) -> None:
+    """Initialize the selected native Marlin provider with its workspace."""
+    if sm70_marlin_available():
+        from vllm._sm70.marlin import bind_marlin_workspace
+
+        bind_marlin_workspace(device)
+
+
 def marlin_gemm(
     a: torch.Tensor,
     c: torch.Tensor | None,
@@ -2981,15 +2989,31 @@ def _custom_ar_op(name: str):
     return getattr(torch.ops._C_custom_ar, name)
 
 
+def _custom_ar_owner_namespace():
+    # The opaque communicator belongs to the DSO that initialized it. A new
+    # optional op must not fall through to another DSO with a different ABI.
+    sidecar = torch.ops._C_custom_ar_flashnext
+    return sidecar if hasattr(sidecar, "init_custom_ar") else torch.ops._C_custom_ar
+
+
 def init_custom_ar(
     ipc_tensors: list[torch.Tensor],
     rank_data: torch.Tensor,
     rank: int,
     fully_connected: bool,
 ) -> int:
-    return _custom_ar_op("init_custom_ar")(
-        ipc_tensors, rank_data, rank, fully_connected
-    )
+    owner = _custom_ar_owner_namespace()
+    if hasattr(owner, "init_custom_ar_configured"):
+        # Preserve the historical Python defaults without publishing them to
+        # the process environment. This compatibility entry is initialization.
+        from vllm.config.collective import CollectiveNativeConfig
+
+        policy = CollectiveNativeConfig()
+        policy.resolve()
+        return owner.init_custom_ar_configured(
+            ipc_tensors, rank_data, rank, fully_connected, list(policy.values)
+        )
+    return owner.init_custom_ar(ipc_tensors, rank_data, rank, fully_connected)
 
 
 def all_reduce(
@@ -3085,6 +3109,133 @@ def all_reduce_sum2(
     _custom_ar_op("all_reduce_sum2")(fa, inp_a, inp_b, out)
 
 
+def supports_sm70_qwen38_hc_batch() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_batch")
+
+
+def supports_sm70_qwen38_hc_local() -> bool:
+    owner = _custom_ar_owner_namespace()
+    return all(
+        hasattr(owner, name)
+        for name in ("sm70_qwen38_hc_down_local", "sm70_qwen38_hc_up_local")
+    )
+
+
+def sm70_qwen38_hc_down_local(input, packed, partials, output, rank) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_down_local(
+        input, packed, partials, output, rank
+    )
+
+
+def sm70_qwen38_hc_up_local(lora, packed, branches, output, rank) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_up_local(
+        lora, packed, branches, output, rank
+    )
+
+
+def supports_sm70_qwen38_hc_replicated() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_replicated")
+
+
+def sm70_qwen38_hc_replicated(x, down, up, partials, lora, output, injection) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_replicated(
+        x, down, up, partials, lora, output, injection
+    )
+
+
+def sm70_qwen38_hc_batch(
+    fa: int,
+    inp: torch.Tensor,
+    packed_down: torch.Tensor,
+    packed_up: torch.Tensor,
+    partials: torch.Tensor,
+    lora: torch.Tensor,
+    local_output: torch.Tensor,
+    output: torch.Tensor,
+    injection: torch.Tensor,
+    round_down_partials: bool = False,
+    cooperative: bool = False,
+    full_unroll: bool = False,
+    fused_chain: bool = False,
+    cta_split_warps: int = 0,
+) -> None:
+    op = _custom_ar_owner_namespace().sm70_qwen38_hc_batch
+    # Retain the ordinary route with extensions predating CTA split support.
+    supports_split = any(
+        "cta_split_warps" in str(schema) for schema in op._schemas.values()
+    )
+    extra = (cta_split_warps,) if supports_split else ()
+    op(
+        fa,
+        inp,
+        packed_down,
+        packed_up,
+        partials,
+        lora,
+        local_output,
+        output,
+        injection,
+        round_down_partials,
+        cooperative,
+        full_unroll,
+        fused_chain,
+        *extra,
+    )
+
+
+def sm70_qwen38_hc_down_allgather(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_down_allgather(fa, inp, out)
+
+
+def sm70_qwen38_hc_gate_mix(
+    fa: int,
+    local_gate: torch.Tensor,
+    branches: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_gate_mix(fa, local_gate, branches, out)
+
+
+def supports_sm70_qwen38_hc_output_allgather() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_output_allgather")
+
+
+def supports_sm70_qwen38_hc_shard() -> bool:
+    owner = _custom_ar_owner_namespace()
+    return all(
+        hasattr(owner, name)
+        for name in ("sm70_qwen38_hc_down_allgather", "sm70_qwen38_hc_gate_mix")
+    )
+
+
+def sm70_qwen38_hc_output_allgather(
+    fa: int,
+    local_block: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_output_allgather(fa, local_block, out)
+
+
+def supports_sm70_qwen38_hc_up_mix_allgather() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_up_mix_allgather")
+
+
+def sm70_qwen38_hc_up_mix_allgather(
+    fa: int,
+    lora: torch.Tensor,
+    weight: torch.Tensor,
+    branches: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_up_mix_allgather(
+        fa, lora, weight, branches, out
+    )
+
+
 def top1_argmax(
     fa: int,
     input_pair: torch.Tensor,
@@ -3169,12 +3320,26 @@ def sm70_tp4_push_allreduce_buffer_size() -> int:
     return _custom_ar_op("sm70_tp4_push_allreduce_buffer_size")()
 
 
+def sm70_tp8_hierarchical_push_allreduce_buffer_size() -> int:
+    return (
+        _custom_ar_owner_namespace().sm70_tp8_hierarchical_push_allreduce_buffer_size()
+    )
+
+
 def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
     return _custom_ar_op("register_buffer")(fa, ipc_tensors)
 
 
 def register_sm70_tp4_push_allreduce_buffer(fa: int, ipc_tensors: list[int]) -> None:
     _custom_ar_op("register_sm70_tp4_push_allreduce_buffer")(fa, ipc_tensors)
+
+
+def register_sm70_tp8_hierarchical_push_allreduce_buffer(
+    fa: int, ipc_tensors: list[int]
+) -> None:
+    _custom_ar_owner_namespace().register_sm70_tp8_hierarchical_push_allreduce_buffer(
+        fa, ipc_tensors
+    )
 
 
 def get_graph_buffer_ipc_meta(fa: int) -> tuple[list[int], list[int]]:
@@ -4143,3 +4308,19 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
         )
+
+
+if hasattr(torch.ops._C, "sm70_ring_atomic_allreduce_out"):
+
+    @register_fake("_C::sm70_ring_atomic_allreduce_out")
+    def _sm70_ring_allreduce_fake(
+        output,
+        input,
+        addresses,
+        counters,
+        rank_order,
+        rank,
+        capacity,
+        block_packets=False,
+    ) -> None:
+        return None

@@ -12,6 +12,7 @@ from pydantic import Field, TypeAdapter, field_validator
 
 import vllm.envs as envs
 from vllm.compilation.passes.inductor_pass import CallableInductorPass, InductorPass
+from vllm.config.execution_policy import GraphPolicy
 from vllm.config.utils import (
     Range,
     config,
@@ -435,6 +436,9 @@ class CompilationConfig:
         certain small batchsizes, where inductor is good at optimizing.
     """
 
+    runtime: GraphPolicy = Field(default_factory=GraphPolicy)
+    """Per-engine execution decisions and initialization provenance."""
+
     # Top-level Compilation control
     mode: CompilationMode = None  # type: ignore[assignment]
     """The compilation approach used for torch.compile-based compilation of the
@@ -759,6 +763,7 @@ class CompilationConfig:
         "vllm::mamba_mixer2",
         "vllm::mamba_mixer",
         "vllm::short_conv",
+        "vllm::qwen4_exp_compute_ple_ngram_ids",
         "vllm::qwen4_exp_ple_short_conv",
         "vllm::qwen4_exp_qsa_with_output",
         "vllm::linear_attention",
@@ -810,6 +815,7 @@ class CompilationConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
+        factors["runtime"] = self.runtime.compute_hash()
 
         factors["pass_config"] = self.pass_config.compute_hash()
         factors["dynamic_shapes_config"] = self.dynamic_shapes_config.compute_hash()

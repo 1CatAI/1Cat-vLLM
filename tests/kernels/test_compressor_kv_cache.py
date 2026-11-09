@@ -22,6 +22,7 @@ from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
 )
+from vllm.models.deepseek_v4.common.ops.cache_utils import needs_software_fp8
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
@@ -31,8 +32,20 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states_to_ring,
     stage_partial_states_from_ring,
 )
+from vllm.platforms import current_platform
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Cache kernel tests require CUDA or ROCm"
+)
+
+# indexer_k_quant_and_cache converts through quant_utils.cuh, whose bf16 -> fp8
+# conversion is assert(false) below sm_80; release builds drop the assert and
+# the op writes no codes. Pre-Ampere deployments run fp16.
+_INDEXER_K_DTYPE = (
+    torch.bfloat16 if current_platform.has_device_capability(80) else torch.float16
+)
 
 
 def _ue8m0_reference(x: torch.Tensor, block_size: int, fp8_max: float):
@@ -292,7 +305,7 @@ def test_indexer_quant_cache_roundtrip(num_tokens: int, block_size: int):
     device = "cuda"
 
     # Random K (simulates compressor output for indexer)
-    k = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k = torch.randn(num_tokens, HEAD_DIM, dtype=_INDEXER_K_DTYPE, device=device)
 
     # ── Quant + insert ──────────────────────────────────────────────────
     kv_cache = torch.zeros(
@@ -357,7 +370,7 @@ def test_indexer_gather_accepts_upper_bound_output():
     sentinel = 123
     device = "cuda"
 
-    k = torch.randn(valid_tokens, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(valid_tokens, head_dim, dtype=_INDEXER_K_DTYPE, device=device)
     kv_cache = torch.zeros(
         num_blocks, block_size, cache_stride, dtype=torch.uint8, device=device
     )
@@ -542,6 +555,8 @@ def _reference_kv_compress_norm_rope(
 @pytest.mark.parametrize("use_fp4", [False, True])
 def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: bool):
     """Fused K compress+norm+rope+quant+insert for the indexer KV cache."""
+    if use_fp4 and not current_platform.has_device_capability(100):
+        pytest.skip("the MXFP4 indexer cache packs with cvt.e2m1x2, sm_100+")
     HEAD_DIM = 128
     ROPE_DIM = 64
     BLOCK_SIZE = 16
@@ -630,6 +645,8 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         TOKEN_STRIDE=TOKEN_STRIDE,
         SCALE_DIM=SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        # Same value compress_norm_rope_store_triton passes.
+        USE_SOFTWARE_FP8=needs_software_fp8(),
         USE_PRIVATE_STATE=False,
         USE_DENSE_PRIVATE_STATE=False,
         RING_SIZE=1,

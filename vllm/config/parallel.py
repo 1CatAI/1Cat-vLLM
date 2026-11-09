@@ -13,10 +13,11 @@ from torch.distributed import ProcessGroup, ReduceOp, Store
 from typing_extensions import Self
 
 import vllm.envs as envs
+from vllm.config.execution_policy import CommunicationPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.network_utils import get_open_ports_list
+from vllm.utils.network_utils import get_open_ports_list, get_open_zmq_ipc_path
 
 if TYPE_CHECKING:
     from ray.runtime_env import RuntimeEnv
@@ -108,6 +109,9 @@ class EPLBConfig:
 @config
 class ParallelConfig:
     """Configuration for the distributed execution."""
+
+    communication: CommunicationPolicy = Field(default_factory=CommunicationPolicy)
+    """Per-engine execution decisions and initialization provenance."""
 
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel groups."""
@@ -318,6 +322,9 @@ class ParallelConfig:
     """Port of the coordination TCPStore. Can be set by the API server; workers
     connect as clients to exchange self-picked group ports at runtime."""
 
+    _ple_offload_ipc_path: str = ""
+    """Node-local ZMQ IPC address for the PLE offload worker."""
+
     decode_context_parallel_size: int = 1
     """Number of decode context parallel groups, because the world size does
     not change by dcp, it simply reuse the GPUs of TP group, and tp_size
@@ -330,12 +337,15 @@ class ParallelConfig:
     and will be deprecated when PCP is fully supported.
 
     """
-    dcp_comm_backend: DCPCommBackend = "ag_rs"
+    dcp_comm_backend: DCPCommBackend | None = None
     """Communication backend for Decode Context Parallel (DCP).
-    - "ag_rs": AllGather + ReduceScatter (default, existing behavior)
+    - "ag_rs": AllGather + ReduceScatter (existing behavior)
     - "a2a": All-to-All exchange of partial outputs + LSE, then
       combine with Triton kernel. Reduces NCCL calls from 3 to 2
       per layer for MLA models.
+
+    `None` selects the model default, which is "ag_rs" unless the model
+    overrides it via [`set_dcp_defaults`][vllm.config.ParallelConfig.set_dcp_defaults].
     """
 
     cp_kv_cache_interleave_size: int = 1
@@ -428,6 +438,9 @@ class ParallelConfig:
                 f"but found: {self._api_process_rank}"
             )
 
+        if envs.VLLM_PLE_CPU_OFFLOAD:
+            self.ensure_ple_offload_ipc_path()
+
         if self.all2all_backend in ["pplx", "naive"]:
             logger.warning(
                 "The '%s' all2all backend has been removed. "
@@ -494,6 +507,20 @@ class ParallelConfig:
             )
 
         return self
+
+    def ensure_ple_offload_ipc_path(self) -> None:
+        """Initialize the shared PLE endpoint after late config defaults."""
+        if not self._ple_offload_ipc_path:
+            self._ple_offload_ipc_path = get_open_zmq_ipc_path()
+
+    def set_dcp_defaults(self, comm_backend: DCPCommBackend = "ag_rs") -> None:
+        """Fill in the DCP options the user left unset.
+
+        Models can set their preferred DCP settings by calling this from their
+        `verify_and_update_config` hook; an explicit user setting always wins.
+        """
+        if self.dcp_comm_backend is None:
+            self.dcp_comm_backend = comm_backend
 
     @property
     def world_size_across_dp(self) -> int:
@@ -754,6 +781,7 @@ class ParallelConfig:
             "worker_extension_cls",
             "_api_process_count",
             "_api_process_rank",
+            "_ple_offload_ipc_path",
             # NUMA binding is per-rank host-side memory locality; it does
             # not affect collective-communication semantics. When numa_bind
             # is enabled with auto-detection, each DP rank stores its own
@@ -767,9 +795,18 @@ class ParallelConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
+        factors["communication"] = self.communication.compute_hash()
         return hash_factors(factors)
 
     def __post_init__(self) -> None:
+        from vllm.config.sm70_runtime import resolve_legacy_fields
+
+        resolve_legacy_fields(
+            self.communication,
+            {
+                "pp_layer_partition": "VLLM_PP_LAYER_PARTITION",
+            },
+        )
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size

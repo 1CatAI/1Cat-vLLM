@@ -15,6 +15,7 @@ import torch.fx as fx
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
+from vllm.config.execution_policy import graph_policy
 from vllm.config.utils import Range
 from vllm.env_override import _apply_constrain_to_fx_strides_patch
 from vllm.logger import init_logger
@@ -162,7 +163,7 @@ def _get_vllm_functorch_config() -> dict[str, Any]:
     Used by both set_functorch_config() and get_inductor_factors() to ensure
     the compile-time config and cache key are always consistent."""
     cfg: dict[str, Any] = {}
-    if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+    if not bool(graph_policy().mega_aot):
         cfg["bundled_autograd_cache"] = False
     return cfg
 
@@ -302,7 +303,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         supports_aot = is_torch_equal_or_newer("2.10.0")
 
-        if not supports_aot and envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+        if not supports_aot and bool(graph_policy().mega_aot):
             logger.error(
                 "CRITICAL: VLLM_USE_MEGA_AOT_ARTIFACT "
                 "is enabled but PyTorch version does not support 'aot' "
@@ -320,7 +321,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
         if is_torch_equal_or_newer("2.13.0.dev"):
             compile_kwargs["donate_graph_module"] = True  # type: ignore[assignment]
 
-        use_aot: bool = supports_aot and envs.VLLM_USE_MEGA_AOT_ARTIFACT
+        use_aot: bool = supports_aot and bool(graph_policy().mega_aot)
         # only add 'aot' parameter if both supported and enabled...
         # this will set bundled_autograd_cache
         # https://github.com/pytorch/pytorch/blob/9bbc5b2905c260adf41bc866a732f9c121a2828a/torch/_inductor/standalone_compile.py#L359 # noqa

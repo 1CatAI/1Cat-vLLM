@@ -150,3 +150,16 @@ def test_vllm_openai_image_embeds_metadata_contract() -> None:
         'ai.vllm.image.tag="${VLLM_IMAGE_TAG}"',
     ):
         assert expected in dockerfile
+
+
+def test_csrc_build_copies_sm70_h3_source_trees() -> None:
+    dockerfile = (REPO_ROOT / "docker" / "Dockerfile").read_text()
+    csrc_build = dockerfile.split("FROM base AS csrc-build", 1)[1].split(
+        "FROM base AS extensions-build", 1
+    )[0]
+
+    for expected in (
+        "COPY flashinfer-sm70 flashinfer-sm70/",
+        "COPY flash-attention-v100 flash-attention-v100/",
+    ):
+        assert expected in csrc_build

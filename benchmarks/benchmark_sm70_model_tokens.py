@@ -23,7 +23,16 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 FLASH_V100_ROOT = Path(
     os.environ.get("SM70_FLASH_V100_ROOT", SOURCE_ROOT / "flash-attention-v100")
 )
-for source_path in (FLASH_V100_ROOT, SOURCE_ROOT):
+loaded_vllm = sys.modules.get("vllm")
+installed_vllm = (
+    "site-packages" in Path(getattr(loaded_vllm, "__file__", "") or "").parts
+)
+source_paths = []
+if not installed_vllm or "SM70_FLASH_V100_ROOT" in os.environ:
+    source_paths.append(FLASH_V100_ROOT)
+if not installed_vllm:
+    source_paths.append(SOURCE_ROOT)
+for source_path in source_paths:
     source_path_str = str(source_path)
     if source_path_str not in sys.path:
         sys.path.insert(0, source_path_str)
@@ -603,8 +612,8 @@ def _sm70_turbomind_policy(
         "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG",
         True,
     )
-    qwen36_mtp_moe_tuned_config = _env_bool(
-        "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG",
+    mtp_moe_tuned_config = _env_bool(
+        "VLLM_SM70_MTP_MOE_TUNED_CONFIG",
         True,
     )
     awq_warmup = _env_bool("VLLM_SM70_AWQ_WARMUP", True)
@@ -688,7 +697,13 @@ def _sm70_turbomind_policy(
         "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG": os.environ.get(
             "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG"
         ),
-        "qwen36_mtp_moe_tuned_config_effective": qwen36_mtp_moe_tuned_config,
+        "VLLM_SM70_MTP_MOE_TUNED_CONFIG": os.environ.get(
+            "VLLM_SM70_MTP_MOE_TUNED_CONFIG"
+        ),
+        "mtp_moe_tuned_config_effective": mtp_moe_tuned_config,
+        # Backward-compatible output alias. The old Qwen3.6-only environment
+        # variable is no longer consulted by the runtime.
+        "qwen36_mtp_moe_tuned_config_effective": mtp_moe_tuned_config,
         "VLLM_SM70_AWQ_WARMUP": os.environ.get("VLLM_SM70_AWQ_WARMUP"),
         "awq_warmup_effective": awq_warmup,
         "VLLM_SM70_AWQ_WARMUP_MAX_M": os.environ.get("VLLM_SM70_AWQ_WARMUP_MAX_M"),
@@ -1167,10 +1182,7 @@ def _sm70_graph_policy() -> dict[str, Any]:
         "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN",
         True,
     )
-    flash_0dot3_benchmark_combo = _env_bool(
-        "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL",
-        False,
-    )
+    flash_0dot3_benchmark_combo = False  # The retired alias never affected runtime.
     flash_0dot3_decode_only_capture = _env_bool(
         "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE",
         False,
@@ -1205,9 +1217,6 @@ def _sm70_graph_policy() -> dict[str, Any]:
         ),
         "sm70_flash_v100_0dot3_eager_profile_effective": (
             flash_0dot3_compile and flash_0dot3_eager_profile
-        ),
-        "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL": os.environ.get(
-            "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL"
         ),
         "sm70_flash_v100_0dot3_benchmark_combo_kernel_requested": (
             flash_0dot3_benchmark_combo

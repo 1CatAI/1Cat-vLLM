@@ -56,6 +56,10 @@ class StreamingUpdate:
         )
 
 
+# Chunk size of the chunked recurrent (GDN/Mamba) prefill kernels.
+PREFIX_CACHE_BOUNDARY_ALIGNMENT = 64
+
+
 class Request:
     def __init__(
         self,
@@ -141,6 +145,10 @@ class Request:
         self.num_output_placeholders = 0
         self.async_tokens_to_discard = 0
 
+        # V2 PP async decode must wait for the sampled-token broadcast slot
+        # from the prior pipeline pass before scheduling this request again.
+        self.next_decode_eligible_step = 0
+
         # Tokens of steps whose output is not yet processed (async scheduling
         # and PP run ahead of the GPU); `num_computed_tokens` counts them
         # optimistically.
@@ -149,6 +157,23 @@ class Request:
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
+        # Prompt positions inside a block where a partial prefix-cache entry
+        # should be kept (e.g. the end of the last chat message).
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        # Boundaries are rounded down to whole recurrent-kernel chunks, so a
+        # request resumed there chunks its prefill exactly like a cold one.
+        align = PREFIX_CACHE_BOUNDARY_ALIGNMENT
+        self.prefix_cache_boundaries: tuple[int, ...] = tuple(
+            sorted(
+                {
+                    int(b) // align * align
+                    for b in extra_args.get("prefix_cache_boundaries", ())
+                    if align <= int(b) < len(prompt_token_ids or ())
+                }
+            )
+        )
+        # Partial prefix-cache entry selected by the last cache lookup.
+        self.partial_prefix_entry: Any = None
 
         # Multi-modal related
         self.mm_features = mm_features or []
@@ -163,6 +188,8 @@ class Request:
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
+        # Detected cross-request junction to retain for subsequent sparse reuse.
+        self.shared_prefix_boundary = 0
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted

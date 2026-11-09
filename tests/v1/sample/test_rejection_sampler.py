@@ -10,8 +10,13 @@ import torch.nn.functional as F
 import vllm.v1.sample.rejection_sampler as rejection_sampler_module
 from tests.v1.sample.utils import create_allowed_token_ids
 from vllm.platforms import current_platform
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessors
+from vllm.v1.sample.logits_processor.builtin import (
+    MinPLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
+from vllm.v1.sample.logits_processor.interface import AddedRequest
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
@@ -376,6 +381,7 @@ def test_token_matching_path_is_used_for_safe_mtp_stochastic_sampling(
     """
 
     monkeypatch.setenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "1")
+    rejection_sampler = RejectionSampler(rejection_sampler.sampler)
     expected = torch.tensor([[11, 12, 99]], dtype=torch.int32, device=DEVICE_TYPE)
     calls = {"expand": 0, "token_match": 0}
 
@@ -497,14 +503,20 @@ def test_combined_bonus_fast_path_matches_legacy_sampling(monkeypatch):
         top_k=torch.tensor([10], dtype=torch.int32, device=device),
         top_p=torch.tensor([0.95], dtype=torch.float32, device=device),
     )
-    rejection_sampler = RejectionSampler(Sampler())
-
+    # Both paths must draw from the same torch generator to be comparable
+    # token by token. Where FlashInfer runs (sm75 and newer) the regular
+    # sampler would draw the legacy bonus token from FlashInfer's own one.
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
     if DEVICE_TYPE == "cuda":
         rng_state = torch.cuda.get_rng_state(device)
     else:
         rng_state = torch.random.get_rng_state()
 
     monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "0")
+    rejection_sampler = RejectionSampler(Sampler())
+    legacy_combined = Mock(wraps=rejection_sampler._forward_combined_bonus)
+    monkeypatch.setattr(rejection_sampler, "_forward_combined_bonus", legacy_combined)
+    monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1")
     legacy = rejection_sampler(
         spec_decode_metadata,
         draft_probs=draft_probs,
@@ -517,7 +529,12 @@ def test_combined_bonus_fast_path_matches_legacy_sampling(monkeypatch):
     else:
         torch.random.set_rng_state(rng_state)
 
+    legacy_combined.assert_not_called()
     monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1")
+    rejection_sampler = RejectionSampler(Sampler())
+    new_combined = Mock(wraps=rejection_sampler._forward_combined_bonus)
+    monkeypatch.setattr(rejection_sampler, "_forward_combined_bonus", new_combined)
+    monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "0")
     combined = rejection_sampler(
         spec_decode_metadata,
         draft_probs=draft_probs,
@@ -525,6 +542,7 @@ def test_combined_bonus_fast_path_matches_legacy_sampling(monkeypatch):
         sampling_metadata=sampling_metadata,
     ).sampled_token_ids
 
+    new_combined.assert_called_once()
     assert torch.equal(combined, legacy)
 
 
@@ -917,6 +935,75 @@ def test_top_k(rejection_sampler, top_k):
     )
 
 
+def _min_p_processor(min_p_per_request: list[float]) -> MinPLogitsProcessor:
+    vllm_config = Mock()
+    vllm_config.scheduler_config.max_num_seqs = len(min_p_per_request)
+    processor = MinPLogitsProcessor(vllm_config, DEVICE_TYPE, is_pin_memory=False)
+    added: list[AddedRequest] = [
+        (index, SamplingParams(min_p=min_p), None, [])
+        for index, min_p in enumerate(min_p_per_request)
+    ]
+    processor.update_state(
+        BatchUpdate(
+            batch_size=len(min_p_per_request), removed=[], added=added, moved=[]
+        )
+    )
+    return processor
+
+
+def test_min_p_filters_draft_positions_like_the_regular_sampler():
+    """Every draft position of a request gets the cut the regular sampler
+    applies to a single position: temperature first, then min_p."""
+    torch.manual_seed(0)
+    vocab_size = 50
+    min_p_per_request = [0.0, 0.3, 0.05]
+    cu_num_tokens = torch.tensor([3, 4, 8], dtype=torch.int32, device=DEVICE_TYPE)
+    request_of_token = [0, 0, 0, 1, 2, 2, 2, 2]
+    temperature = torch.tensor([1.0, 0.7, 1.6], device=DEVICE_TYPE)
+    logits = 3 * torch.randn((8, vocab_size), device=DEVICE_TYPE)
+
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False, temperature=temperature
+    )
+    sampling_metadata.logitsprocs = LogitsProcessors(
+        [_min_p_processor(min_p_per_request)]
+    )
+    probs = F.softmax(logits / temperature[request_of_token, None], dim=-1)
+    min_p = torch.tensor(min_p_per_request, device=DEVICE_TYPE)[request_of_token]
+    expected_dropped = probs < min_p[:, None] * probs.amax(dim=-1, keepdim=True)
+
+    constrained = rejection_sampler_module.apply_sampling_constraints(
+        logits.clone(), cu_num_tokens, sampling_metadata
+    )
+
+    assert torch.equal(constrained == float("-inf"), expected_dropped)
+    assert not expected_dropped[:3].any()  # min_p = 0 drops nothing
+    assert expected_dropped[3:].any()
+
+
+def test_min_p_keeps_the_combined_bonus_fast_path():
+    processors = LogitsProcessors([_min_p_processor([0.2])])
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False, temperature=torch.ones(1, device=DEVICE_TYPE)
+    )
+    sampling_metadata.logitsprocs = processors
+
+    assert rejection_sampler_module._combined_bonus_sampling_enabled(
+        sampling_metadata, needs_output_logprobs=False
+    )
+    # Token matching hands per-token logits to the per-request processor.
+    assert not rejection_sampler_module._token_matching_processor_safe(
+        processors.argmax_invariant[0]
+    )
+
+
+def test_speculative_decoding_accepts_min_p_and_rejects_logit_bias():
+    speculative_config = Mock()
+    SamplingParams(min_p=0.1)._validate_spec_decode(speculative_config)
+    with pytest.raises(ValueError, match="logit_bias"):
+        SamplingParams(logit_bias={1: 2.0})._validate_spec_decode(speculative_config)
+
+
 @pytest.mark.parametrize("top_p", [0.5, 0.9, 0.99])
 def test_top_p(rejection_sampler, top_p):
     """Test rejection sampling with top-p sampling"""
@@ -1155,6 +1242,139 @@ def test_sample_recovered_tokens(
         device=DEVICE_TYPE,
     )
     assert torch.equal(recovered_token_ids, ref_recovered_token_ids)
+
+
+@pytest.mark.parametrize("no_draft_probs", [True, False])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        100,  # below BLOCK_SIZE: single partial tile with many padding entries
+        8193,  # BLOCK_SIZE + 1: only 1 valid entry in the last tile
+        10000,  # non-aligned, moderate tail
+        151936,  # real-world Qwen3 vocab size from the CVE report
+    ],
+)
+def test_sample_recovered_tokens_vocab_boundary(vocab_size: int, no_draft_probs: bool):
+    """Regression test for GHSA-8wr5-jm2h-8r4f.
+
+    When vocab_size is not a multiple of BLOCK_SIZE (8192), the last Triton
+    tile extends beyond the vocabulary.  If all valid entries in that tail tile
+    have zero target probability, the out-of-range masked positions (score 0)
+    could win the tl.max tie-break, producing recovered_id >= vocab_size.
+    This test forces that scenario and asserts every recovered token is valid.
+    """
+    BLOCK_SIZE = 8192
+    batch_size = 2
+    max_spec_len = 3
+    num_tokens = batch_size * max_spec_len
+
+    last_tile_start = (vocab_size // BLOCK_SIZE) * BLOCK_SIZE
+
+    target_probs = torch.rand(
+        num_tokens, vocab_size, dtype=torch.float32, device=DEVICE_TYPE
+    )
+    if last_tile_start > 0:
+        # Zero out valid entries in the last partial tile so the only
+        # non-zero scores come from earlier, fully-covered tiles.
+        target_probs[:, last_tile_start:] = 0.0
+    else:
+        # vocab_size < BLOCK_SIZE: single tile. Concentrate all mass on
+        # entry 0 so the NO_DRAFT_PROBS path (which zeroes the draft
+        # token entry) can drive all valid scores to zero.
+        target_probs = torch.zeros_like(target_probs)
+        target_probs[:, 0] = 1.0
+    # Re-normalize so it's a valid distribution.
+    target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
+
+    draft_probs = torch.rand(
+        num_tokens, vocab_size, dtype=torch.float32, device=DEVICE_TYPE
+    )
+    draft_probs = torch.nn.functional.softmax(draft_probs, dim=-1)
+
+    if last_tile_start == 0:
+        # Force draft token to 0 so the NO_DRAFT_PROBS path zeroes the
+        # only non-zero entry, leaving all valid scores at zero.
+        draft_token_ids = torch.zeros(
+            num_tokens, 1, dtype=torch.int32, device=DEVICE_TYPE
+        )
+    else:
+        draft_token_ids = torch.randint(
+            0, vocab_size, (num_tokens, 1), dtype=torch.int32, device=DEVICE_TYPE
+        )
+
+    temperature = torch.ones(batch_size, dtype=torch.float32, device=DEVICE_TYPE)
+    generators = {
+        i: torch.Generator(device=DEVICE_TYPE).manual_seed(42 + i)
+        for i in range(batch_size)
+    }
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False, temperature=temperature, generators=generators
+    )
+
+    spec_decode_metadata = create_spec_decode_metadata(
+        draft_token_ids.reshape(batch_size, max_spec_len).tolist(),
+        torch.rand(num_tokens, vocab_size, device=DEVICE_TYPE),
+    )
+
+    recovered = sample_recovered_tokens(
+        max_spec_len,
+        spec_decode_metadata.num_draft_tokens,
+        spec_decode_metadata.cu_num_draft_tokens,
+        draft_token_ids.squeeze(-1),
+        None if no_draft_probs else draft_probs,
+        target_probs,
+        sampling_metadata,
+        device=DEVICE_TYPE,
+    )
+
+    assert (recovered >= 0).all(), (
+        f"Recovered token IDs contain negative values: "
+        f"{recovered[recovered < 0].tolist()}"
+    )
+    assert (recovered < vocab_size).all(), (
+        f"Recovered token IDs >= vocab_size ({vocab_size}): "
+        f"{recovered[recovered >= vocab_size].tolist()}"
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [1000, 129280, 151936])
+@pytest.mark.parametrize("no_draft_probs", [True, False])
+def test_sample_recovered_tokens_stay_in_vocab_for_nan_rows(
+    vocab_size: int, no_draft_probs: bool
+):
+    """A non-finite target row must not turn into a token id past the
+    vocabulary: the next step would feed it to the embedding lookup."""
+    batch_size, max_spec_len = 2, 3
+    num_tokens = batch_size * max_spec_len
+    target_probs = F.softmax(
+        torch.rand(num_tokens, vocab_size, device=DEVICE_TYPE), dim=-1
+    )
+    target_probs[1::2] = float("nan")
+    draft_probs = F.softmax(
+        torch.rand(num_tokens, vocab_size, device=DEVICE_TYPE), dim=-1
+    )
+    draft_token_ids = torch.multinomial(draft_probs, num_samples=1).to(torch.int32)
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.ones(batch_size, dtype=torch.float32, device=DEVICE_TYPE),
+    )
+    spec_decode_metadata = create_spec_decode_metadata(
+        draft_token_ids.reshape(batch_size, max_spec_len).tolist(), target_probs
+    )
+
+    recovered_token_ids = sample_recovered_tokens(
+        max_spec_len,
+        spec_decode_metadata.num_draft_tokens,
+        spec_decode_metadata.cu_num_draft_tokens,
+        draft_token_ids,
+        None if no_draft_probs else draft_probs,
+        target_probs,
+        sampling_metadata,
+        device=DEVICE_TYPE,
+    )
+    assert ((recovered_token_ids >= 0) & (recovered_token_ids < vocab_size)).all(), (
+        recovered_token_ids.tolist()
+    )
 
 
 ########################### Tests for Synthetic Rejection Sampling #########

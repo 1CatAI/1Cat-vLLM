@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Test whether spec decoding handles the max model length properly."""
 
+import copy
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
+from transformers import PretrainedConfig
 
 from tests.utils import get_attn_backend_list_based_on_platform
 from vllm import LLM, SamplingParams
@@ -98,3 +103,167 @@ def test_mtp_speculative_config_max_model_len(spec_max_model_len: int):
         max_model_len=spec_max_model_len,
     )
     assert spec_config.draft_model_config.max_model_len == spec_max_model_len
+
+
+def _native_mtp_yarn_config(
+    *,
+    max_model_len: int = 1_000_000,
+    rope_parameters: dict[str, Any] | None = None,
+) -> tuple[Any, PretrainedConfig]:
+    if rope_parameters is None:
+        rope_parameters = {
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 262_144,
+        }
+    target_hf_config = PretrainedConfig(max_position_embeddings=262_144)
+    # Keep deliberately invalid fixtures out of Transformers' constructor
+    # validation so these cases exercise vLLM's own inheritance checks.
+    target_hf_config.rope_parameters = copy.deepcopy(rope_parameters)
+    draft_hf_config = PretrainedConfig(max_position_embeddings=262_144)
+    target_model_config = SimpleNamespace(
+        model="test/native-mtp",
+        max_model_len=1_000_000,
+        hf_config=target_hf_config,
+    )
+    config = SimpleNamespace(
+        method="mtp",
+        model=target_model_config.model,
+        max_model_len=max_model_len,
+        target_model_config=target_model_config,
+        draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
+    )
+    return config, draft_hf_config
+
+
+def test_native_mtp_inherits_validated_target_yarn() -> None:
+    config, draft_hf_config = _native_mtp_yarn_config()
+    target_rope = config.target_model_config.hf_config.rope_parameters
+
+    SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+    assert draft_hf_config.rope_parameters == target_rope
+    assert draft_hf_config.rope_parameters is not target_rope
+    target_rope["factor"] = 2.0
+    assert draft_hf_config.rope_parameters["factor"] == 4.0
+
+
+@pytest.mark.parametrize(
+    ("rope_parameters", "match"),
+    [
+        ({}, "explicit target YaRN"),
+        (
+            {
+                "rope_type": "dynamic",
+                "factor": 4.0,
+                "original_max_position_embeddings": 262_144,
+            },
+            "explicit target YaRN",
+        ),
+        (
+            {
+                "rope_type": "yarn",
+                "factor": "invalid",
+                "original_max_position_embeddings": 262_144,
+            },
+            "requires numeric",
+        ),
+        (
+            {
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 131_072,
+            },
+            "to match the drafter",
+        ),
+    ],
+)
+def test_native_mtp_rejects_unvalidated_rope(
+    rope_parameters: dict[str, Any],
+    match: str,
+) -> None:
+    config, _ = _native_mtp_yarn_config(rope_parameters=rope_parameters)
+
+    with pytest.raises(ValueError, match=match):
+        SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+
+def test_native_mtp_rejects_length_above_validated_yarn_limit() -> None:
+    config, _ = _native_mtp_yarn_config(max_model_len=1_048_577)
+    config.target_model_config.max_model_len = 1_048_577
+
+    with pytest.raises(ValueError, match="validated target YaRN limit=1048576"):
+        SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+
+def test_native_mtp_does_not_modify_unextended_drafter() -> None:
+    config, draft_hf_config = _native_mtp_yarn_config(max_model_len=262_144)
+    original = copy.deepcopy(draft_hf_config.to_dict())
+
+    SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+    assert draft_hf_config.to_dict() == original
+
+
+@pytest.mark.parametrize("factor", [0.0, 1.0, float("nan"), float("inf"), 1e308])
+def test_native_mtp_rejects_invalid_or_overflowing_yarn_factor(factor: float) -> None:
+    config, _ = _native_mtp_yarn_config()
+    config.target_model_config.hf_config.rope_parameters["factor"] = factor
+    with pytest.raises(ValueError):
+        SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+
+def test_native_mtp_respects_target_limit_below_yarn_limit() -> None:
+    config, _ = _native_mtp_yarn_config(max_model_len=800_001)
+    config.target_model_config.max_model_len = 800_000
+    with pytest.raises(ValueError, match="validated target YaRN limit=800000"):
+        SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+
+@pytest.mark.parametrize("key", ["factor", "original_max_position_embeddings"])
+def test_native_mtp_rejects_missing_yarn_parameters(key: str) -> None:
+    config, _ = _native_mtp_yarn_config()
+    config.target_model_config.hf_config.rope_parameters.pop(key)
+    with pytest.raises(ValueError, match="requires numeric"):
+        SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+
+@pytest.mark.parametrize("rope_type", ["linear", "yarn"])
+def test_native_mtp_preserves_existing_matching_scaled_context(rope_type: str) -> None:
+    from vllm.config.model import _get_and_verify_max_len
+
+    config, draft_hf_config = _native_mtp_yarn_config()
+    rope = {
+        "rope_type": rope_type,
+        "factor": 4.0,
+        "original_max_position_embeddings": 262_144,
+    }
+    config.target_model_config.hf_config.rope_parameters = copy.deepcopy(rope)
+    draft_hf_config.rope_parameters = copy.deepcopy(rope)
+    original_rope = draft_hf_config.rope_parameters
+
+    def derive_limit(requested: int) -> int:
+        return _get_and_verify_max_len(
+            hf_config=draft_hf_config,
+            model_arch_config=SimpleNamespace(
+                derived_max_model_len_and_key=(262_144, "max_position_embeddings")
+            ),
+            tokenizer_config=None,
+            max_model_len=requested,
+            disable_sliding_window=False,
+            sliding_window=None,
+        )
+
+    config.draft_model_config.get_and_verify_max_len = derive_limit
+    assert derive_limit(-1) == 1_048_576
+    SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+    assert draft_hf_config.rope_parameters is original_rope
+
+
+@pytest.mark.parametrize("field,value", [("method", "eagle"), ("model", "other/draft")])
+def test_native_mtp_leaves_unrelated_drafters_unchanged(field: str, value: str) -> None:
+    config, draft_hf_config = _native_mtp_yarn_config()
+    setattr(config, field, value)
+    original = copy.deepcopy(draft_hf_config.to_dict())
+    SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+    assert draft_hf_config.to_dict() == original

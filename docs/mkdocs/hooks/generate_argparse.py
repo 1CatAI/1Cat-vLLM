@@ -64,8 +64,12 @@ with open(ROOT_DIR / "requirements/test/cuda.txt") as f:
 importlib.metadata.version = lambda name: VERSIONS.get(name) or "0.0.0"
 
 
-# Make torch.nn.Parameter safe to inherit from
-mock_if_no_torch("torch.nn", MagicMock(Parameter=object))
+# Real Python bases keep documentation-only imports compatible with ABCs.
+class MockModule:
+    pass
+
+
+mock_if_no_torch("torch.nn", MagicMock(Parameter=object, Module=MockModule))
 
 
 # Mock torch.library.infer_schema for vllm.ir.ops.IrOpInplaceOverload.__init__
@@ -121,7 +125,13 @@ def auto_mock(module_name: str, attr: str, max_mocks: int = 100):
         except ModuleNotFoundError as e:
             assert e.name is not None
             logger.info("Mocking %s for argparse doc generation", e.name)
-            sys.modules[e.name] = PydanticMagicMock(name=e.name)
+            mock = PydanticMagicMock(name=e.name)
+            if e.name == "torch":
+                # `from torch import nn` and `from torch.nn import Module`
+                # must see the same documentation stub.
+                mock.nn = sys.modules["torch.nn"]
+                mock.library = sys.modules["torch.library"]
+            sys.modules[e.name] = mock
         except Exception:
             logger.exception("Failed to import %s.%s", module_name, attr)
             raise

@@ -4,9 +4,9 @@
 
 This is a deliberately narrow verifier microbenchmark.  It loads the TP-local
 gate/up and down projection shards from one native NVFP4 layer, prepares both
-the current TurboMind layout and the QPN2 fragment layout, and measures an M=8
-CUDA-graph replay.  Weight loading and preparation are outside the timed
-region.
+the current TurboMind layout and the QPN2 fragment layout, and measures a
+CUDA-graph replay at verifier batch shapes through M=64. Weight loading and
+preparation are outside the timed region.
 
 QPN2 is compiled from an explicitly supplied source file so this benchmark can
 evaluate a pinned external implementation before it is admitted to the vLLM
@@ -44,6 +44,9 @@ class Projection:
 
 QPN2_CONFIGS = {
     # (K, N): (split K, independent accumulator chains)
+    (1536, 5120): (8, 2),
+    (5120, 3584): (16, 2),
+    (5120, 4128): (16, 2),
     (5120, 8704): (8, 2),
     (4352, 5120): (16, 2),
 }
@@ -64,6 +67,9 @@ def _load_projection_shards(
     tp_size: int,
 ) -> tuple[Projection, Projection]:
     path = model / "model.safetensors"
+    config = json.loads((model / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    num_hidden_layers = int(text_config["num_hidden_layers"])
     prefix = f"model.language_model.layers.{layer_index}.mlp"
     intermediate_size = 17408
     hidden_size = 5120
@@ -111,7 +117,7 @@ def _load_projection_shards(
             1.0 / torch.cat((gate_global, up_global)).max().float()
         ),
         gated_silu=True,
-        calls_per_round=56,
+        calls_per_round=num_hidden_layers,
     )
     down = Projection(
         name="down_proj",
@@ -119,9 +125,38 @@ def _load_projection_shards(
         scales=down_scales.contiguous(),
         inverse_global_scale=float(1.0 / down_global.max().float()),
         gated_silu=False,
-        calls_per_round=56,
+        calls_per_round=num_hidden_layers,
     )
     return gate_up, down
+
+
+def _synthetic_projections(model: Path) -> tuple[Projection, ...]:
+    """Build deterministic tensors for target shapes absent from local weights."""
+    config = json.loads((model / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    layer_types = text_config["layer_types"]
+    num_attention_layers = layer_types.count("full_attention")
+    num_linear_attention_layers = layer_types.count("linear_attention")
+    shapes = (
+        ("attention_out_proj", 1536, 5120, len(layer_types)),
+        ("attention_qkv_proj", 5120, 3584, num_attention_layers),
+        ("gdn_in_proj_qkvz", 5120, 4128, num_linear_attention_layers),
+    )
+    projections = []
+    for name, k, n, calls_per_round in shapes:
+        packed = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+        scales = (torch.rand((n, k // 16)) * 0.5 + 0.25).to(torch.float8_e4m3fn)
+        projections.append(
+            Projection(
+                name=name,
+                packed=packed,
+                scales=scales,
+                inverse_global_scale=0.01,
+                gated_silu=False,
+                calls_per_round=calls_per_round,
+            )
+        )
+    return tuple(projections)
 
 
 def _unpack_nibbles(weight_packed: torch.Tensor) -> torch.Tensor:
@@ -262,16 +297,18 @@ def _run_projection(
     projection: Projection,
     extension: Any | None,
     production: bool,
+    production_source_candidate: bool,
     m: int,
     device: torch.device,
     warmup: int,
     iterations: int,
     trials: int,
+    split_k_override: int | None,
+    accumulator_chains_override: int | None,
 ) -> dict[str, object]:
     from vllm import _sm70_ops as sm70_ops
 
     packed = projection.packed.to(device)
-    scale_codes = projection.scales.view(torch.uint8).to(device)
     qweight = _unpack_nibbles(projection.packed).to(device)
     effective_scales = (
         projection.scales.t()
@@ -283,6 +320,10 @@ def _run_projection(
     )
     k, n = qweight.shape
     split_k, accumulator_chains = QPN2_CONFIGS[(k, n)]
+    if split_k_override is not None:
+        split_k = split_k_override
+    if accumulator_chains_override is not None:
+        accumulator_chains = accumulator_chains_override
     x = torch.randn((m, k), dtype=torch.float16, device=device) * 0.1
 
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
@@ -306,6 +347,7 @@ def _run_projection(
         return tm_final
 
     qpn_final = torch.empty((m, final_n), dtype=torch.float16, device=device)
+    run_qpn2_chunked = None
     if production:
         qpn_codes, qpn_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
             packed, projection.scales.to(device)
@@ -334,9 +376,55 @@ def _run_projection(
                 )
             return qpn_final
 
+    elif production_source_candidate:
+        qpn_codes, qpn_scales = torch.ops._qpn2_candidate.prepare(
+            packed, projection.scales.to(device)
+        )
+
+        def run_candidate(
+            candidate_out: torch.Tensor, candidate_input: torch.Tensor
+        ) -> torch.Tensor:
+            if projection.gated_silu:
+                torch.ops._qpn2_candidate.gated(
+                    candidate_out,
+                    candidate_input,
+                    qpn_codes,
+                    qpn_scales,
+                    projection.inverse_global_scale,
+                    split_k,
+                    accumulator_chains,
+                )
+            else:
+                torch.ops._qpn2_candidate.gemm(
+                    candidate_out,
+                    candidate_input,
+                    qpn_codes,
+                    qpn_scales,
+                    projection.inverse_global_scale,
+                    split_k,
+                    accumulator_chains,
+                )
+            return candidate_out
+
+        def run_qpn2() -> torch.Tensor:
+            return run_candidate(qpn_final, x)
+
+        if m > 8:
+            qpn_chunked = torch.empty_like(qpn_final)
+
+            def run_qpn2_chunked() -> torch.Tensor:
+                for row in range(0, m, 8):
+                    rows = min(8, m - row)
+                    run_candidate(
+                        qpn_chunked.narrow(0, row, rows),
+                        x.narrow(0, row, rows),
+                    )
+                return qpn_chunked
+
     else:
         if extension is None:
             raise AssertionError("external QPN2 extension was not loaded")
+        scale_codes = projection.scales.view(torch.uint8).to(device)
         qpn_codes, qpn_scales = _qpn2_prepack(packed, scale_codes)
 
         def run_qpn2() -> torch.Tensor:
@@ -358,11 +446,26 @@ def _run_projection(
     qpn_graph, qpn_output = _capture(run_qpn2)
     tm_timing = _time_graph(tm_graph, warmup, iterations, trials)
     qpn_timing = _time_graph(qpn_graph, warmup, iterations, trials)
+    chunked_timing = None
+    qpn_chunked_output = None
+    if run_qpn2_chunked is not None:
+        chunked_graph, qpn_chunked_output = _capture(run_qpn2_chunked)
+        chunked_timing = _time_graph(chunked_graph, warmup, iterations, trials)
     tm_graph.replay()
     qpn_graph.replay()
     torch.accelerator.synchronize()
     reference = _fp32_reference(projection, x, device)
+    batch_invariance = None
+    if qpn_chunked_output is not None:
+        run_qpn2_chunked()
+        torch.accelerator.synchronize()
+        batch_invariance = _quality(qpn_output, qpn_chunked_output)
     saved_us = float(tm_timing["median_us"]) - float(qpn_timing["median_us"])
+    native_saved_us = (
+        float(chunked_timing["median_us"]) - float(qpn_timing["median_us"])
+        if chunked_timing is not None
+        else None
+    )
     return {
         "name": projection.name,
         "m": m,
@@ -376,11 +479,23 @@ def _run_projection(
         },
         "turbomind": tm_timing,
         "qpn2": qpn_timing,
+        "qpn2_chunked_m8": chunked_timing,
         "speedup": float(tm_timing["median_us"]) / float(qpn_timing["median_us"]),
         "saved_ms_per_round": saved_us * projection.calls_per_round / 1000.0,
+        "native_vs_chunked_speedup": (
+            float(chunked_timing["median_us"]) / float(qpn_timing["median_us"])
+            if chunked_timing is not None
+            else None
+        ),
+        "native_saved_ms_per_round": (
+            native_saved_us * projection.calls_per_round / 1000.0
+            if native_saved_us is not None
+            else None
+        ),
         "quality_vs_turbomind": _quality(qpn_output, tm_output),
         "turbomind_quality_vs_fp32": _quality(tm_output, reference),
         "qpn2_quality_vs_fp32": _quality(qpn_output, reference),
+        "qpn2_batch_invariance": batch_invariance,
     }
 
 
@@ -397,7 +512,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--split-k-override", type=int, choices=(8, 16, 32))
+    parser.add_argument("--accumulator-chains-override", type=int, choices=(1, 2))
+    parser.add_argument(
+        "--synthetic-shapes",
+        action="store_true",
+        help="Race deterministic tensors for non-MLP Qwen3.8 projection shapes.",
+    )
     parser.add_argument("--qpn2-source", type=Path)
+    parser.add_argument(
+        "--production-source-candidate",
+        type=Path,
+        help="Compile this repository's QPN2 source under a private namespace.",
+    )
     parser.add_argument(
         "--production-library",
         type=Path,
@@ -409,6 +536,9 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _load_production_library(path: Path) -> None:
+    stable_path = path.with_name("_C_stable_libtorch.abi3.so")
+    if stable_path.exists():
+        torch.ops.load_library(stable_path)
     spec = importlib.util.spec_from_file_location("vllm._C", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load production library: {path}")
@@ -425,15 +555,30 @@ def main() -> int:
         0,
     ):
         raise RuntimeError("benchmark requires an exact SM70 CUDA device")
-    if not 1 <= args.m <= 8:
-        raise ValueError("QPN2 benchmark supports M in [1, 8]")
-    production = args.production_library is not None
-    if production:
+    if not 1 <= args.m <= 64:
+        raise ValueError("QPN2 benchmark supports M in [1, 64]")
+    if args.production_library is not None:
         _load_production_library(args.production_library)
-        extension = None
-    else:
-        if args.qpn2_source is None:
-            raise ValueError("--qpn2-source is required without --production-library")
+    if args.qpn2_source is not None and args.production_source_candidate is not None:
+        raise ValueError("QPN2 source modes are mutually exclusive")
+    production_source_candidate = args.production_source_candidate is not None
+    extension = None
+    if production_source_candidate:
+        load(
+            name=args.extension_name,
+            sources=[str(args.production_source_candidate)],
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "-lineinfo",
+                "-gencode=arch=compute_70,code=sm_70",
+                "-DVLLM_NVFP4_QPN2_STANDALONE",
+                "-DVLLM_NVFP4_QPN2_BENCHMARK_CANDIDATE",
+            ],
+            verbose=False,
+            is_python_module=False,
+        )
+    elif args.qpn2_source is not None:
         extension = load(
             name=args.extension_name,
             sources=[str(args.qpn2_source)],
@@ -445,20 +590,31 @@ def main() -> int:
             ],
             verbose=False,
         )
+    elif args.production_library is None:
+        raise ValueError(
+            "one of --qpn2-source, --production-source-candidate, or "
+            "--production-library is required"
+        )
+    production = not production_source_candidate and args.qpn2_source is None
     torch.manual_seed(20260824)
-    projections = _load_projection_shards(
-        args.model, args.layer, args.tp_rank, args.tp_size
+    projections = (
+        _synthetic_projections(args.model)
+        if args.synthetic_shapes
+        else _load_projection_shards(args.model, args.layer, args.tp_rank, args.tp_size)
     )
     rows = [
         _run_projection(
             projection,
             extension,
             production,
+            production_source_candidate,
             args.m,
             device,
             args.warmup,
             args.iterations,
             args.trials,
+            args.split_k_override,
+            args.accumulator_chains_override,
         )
         for projection in projections
     ]
@@ -471,9 +627,20 @@ def main() -> int:
         "layer": args.layer,
         "tp_rank": args.tp_rank,
         "tp_size": args.tp_size,
+        "synthetic_shapes": args.synthetic_shapes,
         "qpn2_source": str(args.qpn2_source) if args.qpn2_source else None,
         "qpn2_source_sha256": (
             _sha256_file(args.qpn2_source) if args.qpn2_source else None
+        ),
+        "production_source_candidate": (
+            str(args.production_source_candidate)
+            if args.production_source_candidate
+            else None
+        ),
+        "production_source_candidate_sha256": (
+            _sha256_file(args.production_source_candidate)
+            if args.production_source_candidate
+            else None
         ),
         "production_library": (
             str(args.production_library) if args.production_library else None
@@ -484,6 +651,8 @@ def main() -> int:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "trials": args.trials,
+        "split_k_override": args.split_k_override,
+        "accumulator_chains_override": args.accumulator_chains_override,
         "rows": rows,
         "projected_total_saved_ms_per_round": sum(
             float(row["saved_ms_per_round"]) for row in rows

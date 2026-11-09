@@ -217,8 +217,11 @@ def _construct_cached_request_state(req_id_suffix: int):
     )
 
 
-def _make_async_history_input_batch(max_num_reqs: int = 2) -> InputBatch:
+def _make_async_history_input_batch(
+    max_num_reqs: int = 2, runtime_policy=None
+) -> InputBatch:
     return InputBatch(
+        runtime_policy=runtime_policy,
         max_num_reqs=max_num_reqs,
         max_model_len=32,
         max_num_batched_tokens=32,
@@ -258,8 +261,15 @@ class _FakeAsyncCopyReadyEvent:
         self.synchronized = True
 
 
-def test_update_async_output_token_ids_repairs_cpu_history_and_moves_spec():
-    input_batch = _make_async_history_input_batch(max_num_reqs=1)
+@pytest.mark.parametrize("legacy", [False, True])
+def test_update_async_output_token_ids_repairs_cpu_history_and_moves_spec(
+    monkeypatch, legacy
+):
+    from vllm.config.sm70_runtime import Sm70RuntimeConfig
+
+    policy = Sm70RuntimeConfig(legacy_output_token_repair=legacy)
+    input_batch = _make_async_history_input_batch(max_num_reqs=1, runtime_policy=policy)
+    monkeypatch.setenv("VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR", "invalid-after-init")
     req = _make_async_history_request("r0", [10, 11], [20, -1, -1, -1])
     input_batch.add_request(req)
     input_batch.update_req_spec_token_ids(req, {"r0": [91, 92]})
@@ -276,6 +286,10 @@ def test_update_async_output_token_ids_repairs_cpu_history_and_moves_spec():
     input_batch.update_async_output_token_ids()
 
     assert copy_ready_event.synchronized
+    if legacy:
+        assert req.output_token_ids == [20, 30, 31, -1]
+        assert input_batch.sampling_metadata.output_token_ids[0] == [20, 30, 31, -1]
+        return
     assert req.output_token_ids == [20, 30, 31]
     assert input_batch.sampling_metadata.output_token_ids[0] == [20, 30, 31]
     assert int(input_batch.num_tokens_no_spec[0]) == 5

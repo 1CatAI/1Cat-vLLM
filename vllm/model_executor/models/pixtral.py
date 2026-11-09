@@ -16,9 +16,7 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 from transformers.models.pixtral.modeling_pixtral import (
-    PixtralRotaryEmbedding,
     apply_rotary_pos_emb,
-    position_ids_in_meshgrid,
 )
 
 from vllm.config import VllmConfig
@@ -35,6 +33,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding.pixtral import (
+    PixtralRotaryEmbedding,
+    position_ids_in_meshgrid,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargsItems

@@ -1,0 +1,399 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Base class for PLE layers that support cross-process CPU offload.
+
+Synchronization between the offload process and the GPU main stream is
+handled by :class:`CpuGpuSemaphore`, which uses CUDA's
+``cuStreamWaitValue32`` / ``cuStreamWriteValue32`` stream memory operations.
+
+CUDA IPC decode-step timeline
+----------------------------
+Offload process (CPU)                  GPU main stream (forward)
+-----------------------------          ------------------------------
+forward_impl() on CPU                  ... other GPU ops ...
+pinned -> GPU async H2D (copy_stream)   WaitValue32(flag==1)  <- in Graph
+WriteValue32(flag=1, copy_stream)       return _gpu_output_buffer[:n]
+                                       ... model consumes output ...
+                                       WriteValue32(flag=0)  <- after forward
+Mapped transport instead writes a small shared CPU result, publishes a host
+release flag, and performs H2D on the consumer stream after WaitValue32. It
+never maps the complete embedding table.
+"""
+
+import functools
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, cast
+
+import torch
+from torch import nn
+
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.config.execution_policy import ple_policy
+from vllm.utils.import_utils import LazyLoader
+from vllm.utils.torch_utils import direct_register_custom_op
+
+if TYPE_CHECKING:
+    from cuda.bindings import driver as cuda_driver
+else:
+    cuda_driver = LazyLoader("cuda_driver", globals(), "cuda.bindings.driver")
+
+# Module-level flag set to True inside the offload subprocess.
+# Because the offload process and GPU worker processes are separate OS
+# processes (spawned via multiprocessing), each has its own memory space.
+# A plain module-level bool is sufficient -- no thread-local storage needed.
+_offload_worker_flag = False
+
+
+def ple_offload_enabled(config=None) -> bool:
+    """Use the engine's resolved cascade, retaining legacy explicit offload."""
+    if ple_policy(config).cpu:
+        return True
+    if config is None:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+    kernel = getattr(config, "kernel_config", None)
+    return bool(getattr(kernel, "ple_disk_cascade_active", False))
+
+
+def is_offload_process() -> bool:
+    """Return True inside the dedicated PLE CPU-offload subprocess."""
+    return _offload_worker_flag
+
+
+def mark_as_offload_worker() -> None:
+    """Mark the current process as the dedicated PLE offload worker."""
+    global _offload_worker_flag
+    _offload_worker_flag = True
+
+
+def _cuda_check(result: Any, operation: str) -> Any:
+    """Check the ``(CUresult, ...)`` tuple returned by cuda-python calls."""
+    error = result[0] if isinstance(result, tuple) else result
+    if error.value != 0:
+        raise RuntimeError(f"{operation} failed: {error}")
+    return result
+
+
+class CpuGpuSemaphore:
+    """Cross-process semaphore backed by a mapped or device int32 flag.
+
+    CUDA transport shares a GPU flag through CUDA IPC. Mapped transport shares
+    a registered CPU flag and keeps its CUDA alias in the consumer process.
+    CPU release publication and GPU stream-memory waits order result writes;
+    the consumer resets only after the model has finished reading the result.
+    """
+
+    RESET_VALUE = 0
+    DONE_VALUE = 1
+
+    def __init__(self, device: torch.device, host_region=None) -> None:
+        self._host_region = host_region
+        self._flag_tensor = (
+            host_region.cuda_flag
+            if host_region is not None
+            else torch.zeros(1, dtype=torch.int32, device=device)
+        )
+
+    @classmethod
+    def from_ipc_tensor(cls, flag_tensor: torch.Tensor) -> "CpuGpuSemaphore":
+        """Construct a semaphore from a CUDA tensor received through IPC."""
+        semaphore = cls.__new__(cls)
+        semaphore._flag_tensor = flag_tensor
+        semaphore._host_region = None
+        return semaphore
+
+    @property
+    def flag_tensor(self) -> torch.Tensor:
+        """Return the CUDA tensor used to share the semaphore through IPC."""
+        return self._flag_tensor
+
+    @property
+    def shared_flag_tensor(self) -> torch.Tensor:
+        """Serialize actual CPU storage for a mapped flag, never a CUDA alias."""
+        if self._host_region is not None:
+            return self._host_region.flag
+        return self._flag_tensor
+
+    def reset(self, stream: torch.cuda.Stream | None = None) -> None:
+        """Enqueue ``WriteValue32(flag=0)`` on ``stream``."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        _cuda_check(
+            cuda_driver.cuStreamWriteValue32(
+                cuda_driver.CUstream(stream.cuda_stream),
+                cuda_driver.CUdeviceptr(self._flag_tensor.data_ptr()),
+                self.RESET_VALUE,
+                0,
+            ),
+            "CpuGpuSemaphore.reset",
+        )
+
+    def signal(self, stream: torch.cuda.Stream | None = None) -> None:
+        """Enqueue ``WriteValue32(flag=1)`` on ``stream``."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        _cuda_check(
+            cuda_driver.cuStreamWriteValue32(
+                cuda_driver.CUstream(stream.cuda_stream),
+                cuda_driver.CUdeviceptr(self._flag_tensor.data_ptr()),
+                self.DONE_VALUE,
+                0,
+            ),
+            "CpuGpuSemaphore.signal",
+        )
+
+    def wait_reset(self, stream: torch.cuda.Stream | None = None) -> None:
+        """Enqueue ``WaitValue32(flag==0)`` on ``stream``."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        _cuda_check(
+            cuda_driver.cuStreamWaitValue32(
+                cuda_driver.CUstream(stream.cuda_stream),
+                cuda_driver.CUdeviceptr(self._flag_tensor.data_ptr()),
+                self.RESET_VALUE,
+                cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+            ),
+            "CpuGpuSemaphore.wait_reset",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Custom op: vllm::ple_offload_wait
+# ---------------------------------------------------------------------------
+# Wraps cuStreamWaitValue32 as a torch custom op so that
+# torch.compile(fullgraph=True) treats the CUDA Driver call as an opaque node.
+# The hidden_states argument creates a dynamo data-dependency edge that prevents
+# the wait from being reordered before preceding GPU work.
+# ---------------------------------------------------------------------------
+
+
+def _ple_offload_wait_impl(
+    sem_flag_tensor: torch.Tensor,
+    gpu_output_buffer: torch.Tensor,
+    hidden_states: torch.Tensor,
+    cpu_output_buffer: torch.Tensor | None = None,
+    num_tokens: int = 0,
+) -> None:
+    """Wait for the CPU result without releasing its output buffer."""
+    stream = torch.cuda.current_stream()
+    cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
+    dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())
+    _cuda_check(
+        cuda_driver.cuStreamWaitValue32(
+            cuda_stream,
+            dev_ptr,
+            CpuGpuSemaphore.DONE_VALUE,
+            cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+        ),
+        "cuStreamWaitValue32(done)",
+    )
+    if cpu_output_buffer is not None:
+        if (
+            not 0
+            <= num_tokens
+            <= min(cpu_output_buffer.shape[0], gpu_output_buffer.shape[0])
+        ):
+            raise ValueError("PLE copy exceeds result buffer capacity")
+        _cuda_check(
+            cuda_driver.cuMemcpyHtoDAsync(
+                cuda_driver.CUdeviceptr(gpu_output_buffer.data_ptr()),
+                cpu_output_buffer.data_ptr(),
+                num_tokens
+                * gpu_output_buffer.shape[1]
+                * gpu_output_buffer.element_size(),
+                cuda_stream,
+            ),
+            "cuMemcpyHtoDAsync(PLE consumer result)",
+        )
+
+
+def _ple_offload_wait_fake(
+    sem_flag_tensor: torch.Tensor,
+    gpu_output_buffer: torch.Tensor,
+    hidden_states: torch.Tensor,
+    cpu_output_buffer: torch.Tensor | None = None,
+    num_tokens: int = 0,
+) -> None:
+    """Represent the side-effect-only wait during dynamo tracing."""
+    pass
+
+
+direct_register_custom_op(
+    op_name="ple_offload_wait",
+    op_func=_ple_offload_wait_impl,
+    mutates_args=["gpu_output_buffer"],
+    fake_impl=_ple_offload_wait_fake,
+)
+
+
+class PleOffloadLayer(nn.Module, ABC):
+    """Base class for embedding-like PLE layers that can run on CPU.
+
+    Subclasses implement :meth:`forward_impl`, which contains the regular
+    on-device computation. In a GPU worker with PLE offload enabled, subclass
+    constructors are skipped so their large weights are never allocated. The
+    CPU process constructs a complete copy and owns those weights instead.
+    """
+
+    _is_cpu_offloaded = False
+    # Whether the forward gathers this instance's own rows and merges the
+    # worker's rows into them. Decided once by the guarded constructor while the
+    # engine config is current; the forward runs outside it, where
+    # offload_keeps_local_tables() can no longer tell.
+    _keeps_local_tables = False
+    _gpu_output_buffer: torch.Tensor
+    _sem: CpuGpuSemaphore
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Skip subclass initialization in cross-process GPU-worker mode."""
+        super().__init_subclass__(**kwargs)
+        original_init_obj = cls.__dict__.get("__init__")
+        if original_init_obj is None or not callable(original_init_obj):
+            return
+        original_init = cast(Callable[..., None], original_init_obj)
+
+        @functools.wraps(original_init)
+        def guarded_init(
+            self: "PleOffloadLayer", *args: object, **kwargs: object
+        ) -> None:
+            keeps_local_tables = self.offload_keeps_local_tables()
+            if (
+                ple_offload_enabled()
+                and not ple_policy().hybrid
+                and not keeps_local_tables
+                and not is_offload_process()
+            ):
+                nn.Module.__init__(self)
+                return
+            original_init(self, *args, **kwargs)
+            self._keeps_local_tables = keeps_local_tables
+
+        cls.__init__ = guarded_init  # type: ignore[method-assign, assignment]
+
+    @classmethod
+    def offload_keeps_local_tables(cls) -> bool:
+        """Whether GPU workers keep their own table next to the offload worker.
+
+        Under the default contract the GPU-side layer is a placeholder that
+        only waits for the worker's result. A tiered layer keeps its resident
+        rows and merges the worker's rows into its own gather, so its
+        constructor and its weight loading run in the GPU workers as well.
+        """
+        return False
+
+    @classmethod
+    def get_target_device(cls) -> torch.device:
+        """Return CPU for the offload process and the active GPU otherwise."""
+        keeps_gpu_tables = ple_policy().hybrid or cls.offload_keeps_local_tables()
+        if ple_offload_enabled() and not (
+            keeps_gpu_tables and not is_offload_process()
+        ):
+            return torch.device("cpu")
+        return torch.device("cuda", torch.accelerator.current_device_index())
+
+    @abstractmethod
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Execute the actual embedding computation on the owning device."""
+        raise NotImplementedError
+
+    def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
+        """Return the dtype used by cross-process output buffers."""
+        return default_dtype
+
+    def get_offload_output_dim(self, default_dim: int) -> int:
+        """Return the transport width, which may differ from decoded width."""
+        return default_dim
+
+    def offload_result_layout(self) -> dict[str, Any] | None:
+        """Describe an encoded result to the separately spawned CPU owner."""
+        return None
+
+    def bind_offload_result_layout(self, layout: dict[str, Any] | None) -> None:
+        """Validate the consumers' result geometry against loaded CPU rows."""
+        if layout is not None:
+            raise ValueError("This PLE layer does not support encoded result layouts")
+
+    def setup_cross_process_offload(
+        self,
+        gpu_output_buffer: torch.Tensor,
+        semaphore: CpuGpuSemaphore,
+    ) -> None:
+        """Configure the GPU-worker placeholder with its IPC resources."""
+        self._is_cpu_offloaded = True
+        self._gpu_output_buffer = gpu_output_buffer
+        self._sem = semaphore
+
+    def remote_placement(self) -> object | None:
+        """Describe the rows the offload worker serves for this GPU layer.
+
+        Sent once with the registration and handed to the worker-side layer
+        through :meth:`bind_remote_placements`. ``None`` keeps the default
+        contract in which the worker owns the complete table.
+        """
+        return None
+
+    def bind_remote_placements(self, placements: list[object]) -> None:
+        """Receive one :meth:`remote_placement` per tensor-parallel rank."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not serve tiered PLE placements"
+        )
+
+    def needs_weight_prefault(self) -> bool:
+        """Whether this worker serves any table rows after registration."""
+        return True
+
+    def wait_offloaded_output(
+        self, hidden_states: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        """Wait for the worker's result and return its first ``num_tokens`` rows."""
+        cpu_output = getattr(self, "_cpu_output_buffer", None)
+        if cpu_output is None:
+            torch.ops.vllm.ple_offload_wait(
+                self._sem.flag_tensor, self._gpu_output_buffer, hidden_states
+            )
+        else:
+            torch.ops.vllm.ple_offload_wait(
+                self._sem.flag_tensor,
+                self._gpu_output_buffer,
+                hidden_states,
+                cpu_output,
+                num_tokens,
+            )
+        return self._gpu_output_buffer[:num_tokens]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Wait for an offloaded result or delegate to ``forward_impl``."""
+        if self._is_cpu_offloaded:
+            pinned = getattr(self, "_pinned_decode", False)
+            if (ple_policy().hybrid or pinned) and use_sm70_decode_graph_semantics():
+                return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
+            if pinned:
+                return self.wait_offloaded_output(hidden_states, input_ids.shape[0])
+            if self._keeps_local_tables:
+                # The layer gathers its resident rows itself and merges the
+                # worker's rows through wait_offloaded_output.
+                return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
+            return self.wait_offloaded_output(hidden_states, input_ids.shape[0])
+        return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
+
+    def release_offloaded_output(
+        self,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Mark the cross-process output buffer reusable on ``stream``."""
+        if self._is_cpu_offloaded:
+            self._sem.reset(stream)

@@ -3,16 +3,20 @@
 
 """DeepSeek V4 C4 indexer fallback using FP16 HMMA on SM70."""
 
-import os
-
 import torch
 
+from vllm.config import CUDAGraphMode
+from vllm.config.sm70_sparse import sparse_policy
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 _INDEX_HEAD_DIM = 128
 _INDEX_CACHE_BYTES = _INDEX_HEAD_DIM + 4
@@ -21,7 +25,6 @@ _INDEX_CACHE_BYTES = _INDEX_HEAD_DIM + 4
 # [rows, max_seq_len, 128] fp16 and running a dense bmm. Set to 0 to get the
 # old gather+bmm path back for an A/B. Only affects decode; prefill scores a
 # contiguous chunk whose width is the real chunk length already.
-_FUSED_DECODE_LOGITS = os.getenv("VLLM_SM70_INDEXER_FUSED_LOGITS", "1") == "1"
 
 # Score with the model's actual indexer function,
 #     I[t, s] = sum_h weights[t, h] * relu(q[t, h] . k[s]),
@@ -33,7 +36,6 @@ _FUSED_DECODE_LOGITS = os.getenv("VLLM_SM70_INDEXER_FUSED_LOGITS", "1") == "1"
 # applies it inside its logits kernel). Dropping it costs 64x fewer flops and
 # ranks the wrong keys, which only shows up once top-k is actually selective.
 # Set 0 to restore the factored form for an A/B.
-_RELU_LOGITS = os.getenv("VLLM_SM70_INDEXER_RELU", "1") == "1"
 
 # Key-axis splits are chosen so the launch is roughly this many blocks, which
 # keeps all 80 SMs busy at long context without paying for thousands of
@@ -49,11 +51,9 @@ _RELU_BLOCK_M = 32
 # Route prefill scoring through cuBLAS instead of the Triton MMA. Set 0 for an
 # A/B against the Triton kernel above (which stays as the reference shape and
 # is what the decode path still uses, since decode gathers from a paged cache).
-_PREFILL_CUBLAS = os.getenv("VLLM_SM70_INDEXER_PREFILL_CUBLAS", "1") == "1"
 # Cap (MiB) on the [tokens*heads, key_tile] fp16 score tile. At the default
 # 2048-token prefill chunk and 64 heads this is 128 KiB per key, so the tile
 # is what keeps a long-context chunk from asking for gigabytes in one go.
-_PREFILL_TILE_MB = int(os.getenv("VLLM_SM70_INDEXER_PREFILL_TILE_MB", "192"))
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
 
@@ -63,11 +63,9 @@ _EPILOGUE_BLOCK_H = 8
 # FP32 output is deliberate: an FP16 score intermediate produced rare top-k
 # set changes at 16K/64K compressed tokens. Short and generic shapes retain the
 # fused paged kernel, whose launch overhead is lower there.
-_DECODE_CUBLAS = os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS", "0") == "1"
-_DECODE_CUBLAS_MIN_KEYS = int(
-    os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS", "1024")
-)
-_DECODE_CUBLAS_MAX_ROWS = 8
+# Measured on V100: with 6 verifier rows and a 16384-key graph bucket the cuBLAS
+# route costs a flat 0.13 ms, the paged kernel 0.04-0.68 ms as the live length
+# goes from 256 to 16384 keys, same top-512 set.
 
 
 @triton.jit
@@ -591,6 +589,7 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
     GEMM whose output is reduced over heads afterwards. Keys are tiled so that
     intermediate stays bounded; it is the largest allocation in the indexer.
     """
+    policy = sparse_policy()
     num_q, num_heads, head_dim = q.shape
     num_k = k_quant.shape[0]
     out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
@@ -610,7 +609,7 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
         q2 = q2.contiguous()
 
     rows = num_q * num_heads
-    budget = max(1, _PREFILL_TILE_MB * 2**20 // max(1, rows * 2))
+    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 2))
     k_tile = max(_RELU_BLOCK_N, min(num_k, budget // _RELU_BLOCK_N * _RELU_BLOCK_N))
 
     for start in range(0, num_k, k_tile):
@@ -645,15 +644,16 @@ def sm70_indexer_prefill_logits(
     weights: torch.Tensor,
 ) -> torch.Tensor:
     """Compute all prefill index scores; caller supplies causal row bounds."""
+    policy = sparse_policy()
     assert k_quant.dtype == torch.float8_e4m3fn
     assert k_quant.ndim == 2 and k_quant.shape[1] == _INDEX_HEAD_DIM
     k_scales = k_scale_storage.view(torch.float32).reshape(-1)
     assert k_scales.shape[0] == k_quant.shape[0]
 
-    if _RELU_LOGITS and _PREFILL_CUBLAS:
+    if policy.value("indexer_relu") and policy.value("indexer_prefill_cublas"):
         return _prefill_logits_cublas(q, k_quant, k_scales, weights)
 
-    if _RELU_LOGITS:
+    if policy.value("indexer_relu"):
         num_q, num_heads, _ = q.shape
         num_k = k_quant.shape[0]
         out = torch.empty((num_q, num_k), dtype=torch.float32, device=q.device)
@@ -695,6 +695,20 @@ def sm70_indexer_prefill_logits(
     return torch.mm(weighted_q, k_fp16.t(), out_dtype=torch.float32)
 
 
+def _decode_score_tile_keys(max_seq_len: int, rows: int, num_heads: int) -> int:
+    """Keys per FP32 score tile of the cuBLAS decode route, 0 if none fits.
+
+    The gathered keys stay whole; the [rows * heads, keys] scores, by far the
+    largest buffer, are tiled so the gather plus one tile fit the indexer
+    workspace budget. A key bound whose scores fit keeps a single tile.
+    """
+    budget = sparse_policy().value("indexer_prefill_tile_mb") * 2**20
+    tile = (budget - max_seq_len * _INDEX_HEAD_DIM * 2) // (rows * num_heads * 4)
+    if tile >= max_seq_len:
+        return max_seq_len
+    return max(0, tile // _EPILOGUE_BLOCK_K * _EPILOGUE_BLOCK_K)
+
+
 def _decode_logits_cublas(
     q: torch.Tensor,
     cache: torch.Tensor,
@@ -702,15 +716,56 @@ def _decode_logits_cublas(
     flat_lens: torch.Tensor,
     block_table: torch.Tensor,
     max_seq_len: int,
+    table_rows_per_request: int,
 ) -> torch.Tensor:
-    """Score a one-request decode by sharing one paged gather across rows."""
+    """Score each request's verifier rows over one shared paged gather.
+
+    `block_table` holds `table_rows_per_request` identical rows per request
+    (the flattened speculative decode) or one (the native layout); `q`,
+    `weights` and `flat_lens` hold the request's rows back to back. The FP32
+    scores are computed in key tiles of `_decode_score_tile_keys`.
+    """
     total_rows, num_heads, head_dim = q.shape
+    num_requests = block_table.shape[0] // table_rows_per_request
+    rows = total_rows // num_requests
+    tile_keys = _decode_score_tile_keys(max_seq_len, rows, num_heads)
     workspace = current_workspace_manager()
     gathered_k, k_scales, scores = workspace.get_simultaneous(
         ((max_seq_len, head_dim), torch.float16),
         ((max_seq_len,), torch.float32),
-        ((total_rows * num_heads, max_seq_len), torch.float32),
+        ((rows * num_heads, tile_keys), torch.float32),
     )
+    out = torch.empty((total_rows, max_seq_len), dtype=torch.float32, device=q.device)
+    for request in range(num_requests):
+        first = request * rows
+        _score_request_cublas(
+            q[first : first + rows],
+            cache,
+            weights[first : first + rows],
+            flat_lens[first : first + rows],
+            block_table[request * table_rows_per_request],
+            max_seq_len,
+            gathered_k,
+            k_scales,
+            scores,
+            out[first : first + rows],
+        )
+    return out
+
+
+def _score_request_cublas(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    weights: torch.Tensor,
+    flat_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seq_len: int,
+    gathered_k: torch.Tensor,
+    k_scales: torch.Tensor,
+    scores: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    total_rows, num_heads, head_dim = q.shape
     block_n = 16
     _gather_paged_index_k_unscaled_kernel[(triton.cdiv(max_seq_len, block_n),)](
         cache,
@@ -724,37 +779,154 @@ def _decode_logits_cublas(
         max_seq_len,
         total_rows,
         head_dim=head_dim,
-        MAX_ROWS=_DECODE_CUBLAS_MAX_ROWS,
+        MAX_ROWS=triton.next_power_of_2(total_rows),
         BLOCK_N=block_n,
         num_warps=4,
     )
 
     q2 = q.reshape(total_rows * num_heads, head_dim)
-    torch.mm(
-        q2,
-        gathered_k.t(),
-        out=scores,
-        out_dtype=torch.float32,
+    tile_keys = scores.shape[1]
+    for start in range(0, max_seq_len, tile_keys):
+        width = min(tile_keys, max_seq_len - start)
+        # A contiguous [rows * heads, width] view keeps the rows of the last,
+        # narrower tile back to back, as the epilogue's strides expect.
+        tile_scores = scores.view(-1)[: q2.shape[0] * width].view(q2.shape[0], width)
+        torch.mm(
+            q2,
+            gathered_k[start : start + width].t(),
+            out=tile_scores,
+            out_dtype=torch.float32,
+        )
+        _relu_weight_headsum_kernel[
+            (total_rows, triton.cdiv(width, _EPILOGUE_BLOCK_K))
+        ](
+            tile_scores,
+            weights,
+            k_scales[start : start + width],
+            out[:, start : start + width],
+            tile_scores.stride(0) * num_heads,
+            tile_scores.stride(0),
+            weights.stride(0),
+            out.stride(0),
+            width,
+            num_heads=num_heads,
+            BLOCK_K=_EPILOGUE_BLOCK_K,
+            BLOCK_H=_EPILOGUE_BLOCK_H,
+            num_warps=4,
+        )
+
+
+def _decode_cublas_blocker(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    weights: torch.Tensor,
+    flat_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seq_len: int,
+    native_rows: bool,
+    table_rows_per_request: int,
+) -> str | None:
+    """The first requirement of `_decode_logits_cublas` this call misses."""
+    policy = sparse_policy()
+    if is_forward_context_available():
+        context = get_forward_context()
+        descriptor = context.batch_descriptor
+        if context.cudagraph_runtime_mode == CUDAGraphMode.FULL and (
+            descriptor is None or descriptor.attention_context_bucket is None
+        ):
+            # cuBLAS processes the whole static key bound. A full graph without
+            # a context bucket is bound by the model's maximum length, where the
+            # paged kernel, which skips inactive keys on replay, is cheaper.
+            # Context-bucket graphs and eager/piecewise calls bound it closely.
+            return "a context-bucket or live key bound rather than the full length"
+    total_rows = q.shape[0]
+
+    def num_requests() -> int:
+        return block_table.shape[0] // table_rows_per_request
+
+    def rows_per_request() -> int:
+        return total_rows // num_requests()
+
+    requirements = (
+        (
+            "a CUDA pre-Ampere device",
+            lambda: current_platform.is_cuda()
+            and current_platform.is_device_capability_family(70),
+        ),
+        (
+            f"a key bound of at least {policy.value('indexer_decode_min_keys')}",
+            lambda: max_seq_len >= policy.value("indexer_decode_min_keys"),
+        ),
+        (
+            "whole requests in the block table",
+            lambda: table_rows_per_request > 0
+            and block_table.ndim == 2
+            and block_table.shape[0] > 0
+            and block_table.shape[0] % table_rows_per_request == 0
+            and total_rows % (block_table.shape[0] // table_rows_per_request) == 0,
+        ),
+        (
+            "query rows that share one gather per request",
+            lambda: (native_rows or total_rows == 1 or table_rows_per_request > 1)
+            and rows_per_request() > 0,
+        ),
+        (
+            f"float16 q [rows, heads % {_EPILOGUE_BLOCK_H} == 0, {_INDEX_HEAD_DIM}]",
+            lambda: q.ndim == 3
+            and q.dtype == torch.float16
+            and q.shape[2] == _INDEX_HEAD_DIM
+            and q.shape[1] > 0
+            and q.shape[1] % _EPILOGUE_BLOCK_H == 0,
+        ),
+        (
+            "float32 weights [rows, heads]",
+            lambda: weights.ndim == 2
+            and weights.shape == q.shape[:2]
+            and weights.dtype == torch.float32,
+        ),
+        (
+            "the shared key gather and one FP32 score tile within the indexer "
+            "workspace budget",
+            lambda: _decode_score_tile_keys(max_seq_len, rows_per_request(), q.shape[1])
+            > 0,
+        ),
+        (
+            f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
+            "contiguous blocks",
+            lambda: cache.ndim == 3
+            and cache.dtype == torch.uint8
+            and cache.shape[1] > 0
+            and cache.shape[2] == _INDEX_CACHE_BYTES
+            and cache.stride(1) == _INDEX_CACHE_BYTES
+            and cache.stride(2) == 1,
+        ),
+        (
+            "an int32 block table that covers the key bound",
+            lambda: block_table.ndim == 2
+            and block_table.dtype == torch.int32
+            and triton.cdiv(max_seq_len, cache.shape[1]) <= block_table.shape[1],
+        ),
+        ("int32 row lengths", lambda: flat_lens.dtype == torch.int32),
+        (
+            "all tensors on one device",
+            lambda: q.device
+            == cache.device
+            == weights.device
+            == flat_lens.device
+            == block_table.device,
+        ),
+        (
+            "contiguous q, weights, row lengths and block table",
+            lambda: q.is_contiguous()
+            and weights.is_contiguous()
+            and flat_lens.is_contiguous()
+            and block_table.is_contiguous(),
+        ),
     )
-    out = torch.empty((total_rows, max_seq_len), dtype=torch.float32, device=q.device)
-    _relu_weight_headsum_kernel[
-        (total_rows, triton.cdiv(max_seq_len, _EPILOGUE_BLOCK_K))
-    ](
-        scores,
-        weights,
-        k_scales,
-        out,
-        scores.stride(0) * num_heads,
-        scores.stride(0),
-        weights.stride(0),
-        out.stride(0),
-        max_seq_len,
-        num_heads=num_heads,
-        BLOCK_K=_EPILOGUE_BLOCK_K,
-        BLOCK_H=_EPILOGUE_BLOCK_H,
-        num_warps=4,
-    )
-    return out
+    for name, met in requirements:
+        if not met():
+            return name
+    return None
 
 
 def sm70_indexer_decode_logits(
@@ -764,15 +936,26 @@ def sm70_indexer_decode_logits(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     max_seq_len: int,
+    table_rows_per_request: int = 1,
+    *,
+    indexer_decode_cublas: bool,
 ) -> torch.Tensor:
-    """Gather paged FP8 index keys and compute batched decode scores."""
+    """Gather paged FP8 index keys and compute batched decode scores.
+
+    `table_rows_per_request` is how many consecutive `block_table` rows belong
+    to one request: 1 in the native layout, the verifier length when a uniform
+    speculative decode was flattened to one row per token.
+    `indexer_decode_cublas` is the engine's `KernelConfig.sm70_sparse` setting;
+    callers pass it because the forward pass runs outside the config context."""
+    policy = sparse_policy()
     assert cache.dtype == torch.uint8 and cache.ndim == 3
     assert cache.shape[-1] >= _INDEX_CACHE_BYTES
     # The relu path scores per head, so it needs q as [rows, heads, dim]; the
     # factored path collapses the head axis up front.
-    weighted_q = q if _RELU_LOGITS else _combine_index_queries(q, weights)
+    weighted_q = (
+        q if policy.value("indexer_relu") else _combine_index_queries(q, weights)
+    )
 
-    single_request = block_table.shape[0] == 1
     native_rows = seq_lens.ndim == 2
     if native_rows:
         next_n = seq_lens.shape[1]
@@ -785,57 +968,43 @@ def sm70_indexer_decode_logits(
     total_rows = weighted_q.shape[0]
 
     if (
-        _RELU_LOGITS
-        and _DECODE_CUBLAS
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
-        and max_seq_len >= _DECODE_CUBLAS_MIN_KEYS
-        and single_request
-        and (native_rows or total_rows == 1)
-        and 0 < total_rows <= _DECODE_CUBLAS_MAX_ROWS
-        and q.ndim == 3
-        and q.dtype == torch.float16
-        and q.shape[2] == _INDEX_HEAD_DIM
-        and q.shape[1] > 0
-        and q.shape[1] % _EPILOGUE_BLOCK_H == 0
-        and weights.ndim == 2
-        and weights.shape == q.shape[:2]
-        and weights.dtype == torch.float32
-        and cache.ndim == 3
-        and cache.dtype == torch.uint8
-        and cache.shape[1] > 0
-        and cache.shape[2] == _INDEX_CACHE_BYTES
-        and cache.stride(1) == _INDEX_CACHE_BYTES
-        and cache.stride(2) == 1
-        and block_table.ndim == 2
-        and block_table.dtype == torch.int32
-        and flat_lens.dtype == torch.int32
-        and triton.cdiv(max_seq_len, cache.shape[1]) <= block_table.shape[1]
-        and q.device
-        == cache.device
-        == weights.device
-        == flat_lens.device
-        == block_table.device
-        and q.is_contiguous()
-        and weights.is_contiguous()
-        and cache.is_contiguous()
-        and flat_lens.is_contiguous()
-        and block_table.is_contiguous()
+        policy.value("indexer_relu")
+        and policy.value("indexer_decode_cublas_enabled")
+        and indexer_decode_cublas
     ):
-        return _decode_logits_cublas(
+        blocker = _decode_cublas_blocker(
             q,
             cache,
             weights,
             flat_lens,
             block_table,
             max_seq_len,
+            native_rows,
+            table_rows_per_request,
+        )
+        if blocker is None:
+            logger.info_once("SM70 indexer decode: cuBLAS route on %s.", q.device)
+            return _decode_logits_cublas(
+                q,
+                cache,
+                weights,
+                flat_lens,
+                block_table,
+                max_seq_len,
+                table_rows_per_request,
+            )
+        logger.info_once(
+            "SM70 indexer decode: paged Triton kernel on %s, the cuBLAS route "
+            "needs %s.",
+            q.device,
+            blocker,
         )
 
     if native_rows:
         block_table = block_table.repeat_interleave(next_n, dim=0)
     assert block_table.shape[0] == weighted_q.shape[0]
 
-    if _RELU_LOGITS:
+    if policy.value("indexer_relu"):
         out = torch.empty(
             (total_rows, max_seq_len), dtype=torch.float32, device=q.device
         )
@@ -865,7 +1034,7 @@ def sm70_indexer_decode_logits(
         # seq_lens (see the note on the factored path below).
         return out
 
-    if _FUSED_DECODE_LOGITS:
+    if policy.value("indexer_fused_logits"):
         out = torch.empty(
             (total_rows, max_seq_len), dtype=torch.float32, device=q.device
         )

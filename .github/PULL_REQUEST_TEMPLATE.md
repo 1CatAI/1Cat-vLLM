@@ -5,6 +5,30 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 
 ## Test Plan
 
+## Path coverage
+
+For documentation-only changes, write **N/A — documentation/offline tooling only**
+and list the applicable CPU/documentation checks. GPU tests are not required.
+See the [1Cat development guide](https://github.com/1CatAI/1Cat-vLLM/blob/main/docs/contributing/1cat-development.md).
+
+| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |
+| --- | --- | --- | --- | --- | --- |
+| | | | | | |
+
+## Acceleration and benchmark contract (required for performance changes)
+
+- Default enabled or opt-in:
+- Required CLI options and environment switches:
+- KV cache dtype used for the benchmark:
+- Wheel SHA or source commit:
+- PYTHONPATH, source overlays, or external native libraries used (write "none" if absent):
+- User-entry route-hit, speed, and output-quality evidence:
+- Existing kernel/backend registry and capability-rejection reasons:
+- Per-engine configuration and deprecated-variable compatibility:
+- New/changed environment metadata and generated reference check:
+- Route snapshot command and intentional changed rows (write "none" for refactors):
+- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after:
+
 ## Test Result
 
 ---

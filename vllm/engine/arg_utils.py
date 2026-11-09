@@ -71,6 +71,7 @@ from vllm.config.cache import (
     PrefixCachingHashAlgo,
 )
 from vllm.config.device import Device
+from vllm.config.execution_policy import flash_v100_policy, graph_policy
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
 from vllm.config.lora import MaxLoRARanks
 from vllm.config.mamba import MambaBackendEnum
@@ -97,6 +98,7 @@ from vllm.config.vllm import (
     OptimizationLevel,
     PerformanceMode,
     _sm70_mtp_cudagraph_capture_sizes,
+    _sm70_speculative_cudagraph_capture_sizes,
 )
 from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
@@ -141,11 +143,11 @@ def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     requested_dtype: str,
     resolved_dtype: str,
 ) -> str:
-    """Preserve the historical 1Cat V100 meaning of the ``fp8`` alias."""
+    """Use E4M3 storage for the SM70 Flash-V100 ``fp8`` alias."""
     if (
         requested_dtype != "fp8"
         or resolved_dtype != "fp8"
-        or not envs.VLLM_SM70_FLASH_ATTN_V100
+        or not flash_v100_policy().enabled
         or not current_platform.is_cuda()
     ):
         return resolved_dtype
@@ -156,12 +158,11 @@ def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     if capability is None or (capability.major, capability.minor) != (7, 0):
         return resolved_dtype
     logger.warning_once(
-        "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e5m2 "
-        "for compatibility with the optimized 1Cat V100 KV-cache path. "
-        "Use explicit fp8_e4m3 to request E4M3 KV storage. Model weight "
+        "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e4m3. "
+        "Use explicit fp8_e5m2 to request legacy E5M2 KV storage. Model weight "
         "quantization is configured independently."
     )
-    return "fp8_e5m2"
+    return "fp8_e4m3"
 
 
 # object is used to allow for special typing forms
@@ -497,7 +498,7 @@ class EngineArgs:
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
-    dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
+    dcp_comm_backend: DCPCommBackend | None = ParallelConfig.dcp_comm_backend
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
     data_parallel_size: int = ParallelConfig.data_parallel_size
@@ -535,6 +536,11 @@ class EngineArgs:
     )
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
+    prefix_cache_retention_interval: int | None = (
+        CacheConfig.prefix_cache_retention_interval
+    )
+    mamba_tail_checkpoint: bool = CacheConfig.mamba_tail_checkpoint
+    partial_prefix_cache: bool = CacheConfig.partial_prefix_cache
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -553,6 +559,11 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+    mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
+    mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+    long_prefill_token_threshold_adaptive: bool = (
+        SchedulerConfig.long_prefill_token_threshold_adaptive
+    )
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -593,6 +604,7 @@ class EngineArgs:
     )
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
+    mm_encoder_batch_size: int = MultiModalConfig.mm_encoder_batch_size
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
     )
@@ -1175,6 +1187,16 @@ class EngineArgs:
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
         )
         cache_group.add_argument(
+            "--prefix-cache-retention-interval",
+            **cache_kwargs["prefix_cache_retention_interval"],
+        )
+        cache_group.add_argument(
+            "--mamba-tail-checkpoint", **cache_kwargs["mamba_tail_checkpoint"]
+        )
+        cache_group.add_argument(
+            "--partial-prefix-cache", **cache_kwargs["partial_prefix_cache"]
+        )
+        cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
         )
         cache_group.add_argument(
@@ -1269,6 +1291,9 @@ class EngineArgs:
         )
         multimodal_group.add_argument(
             "--mm-encoder-tp-mode", **multimodal_kwargs["mm_encoder_tp_mode"]
+        )
+        multimodal_group.add_argument(
+            "--mm-encoder-batch-size", **multimodal_kwargs["mm_encoder_batch_size"]
         )
         multimodal_group.add_argument(
             "--mm-encoder-attn-backend",
@@ -1420,7 +1445,19 @@ class EngineArgs:
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
+        scheduler_group.add_argument(
+            "--long-prefill-token-threshold-adaptive",
+            **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
+        scheduler_group.add_argument(
+            "--mixed-prefill-step-latency-ms",
+            **scheduler_kwargs["mixed_prefill_step_latency_ms"],
+        )
+        scheduler_group.add_argument(
+            "--mixed-prefill-min-tokens",
+            **scheduler_kwargs["mixed_prefill_min_tokens"],
+        )
         # are no longer supported.
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
@@ -1641,6 +1678,7 @@ class EngineArgs:
             mm_shm_cache_max_object_size_mb=self.mm_shm_cache_max_object_size_mb,
             mm_encoder_only=self.mm_encoder_only,
             mm_encoder_tp_mode=self.mm_encoder_tp_mode,
+            mm_encoder_batch_size=self.mm_encoder_batch_size,
             mm_encoder_attn_backend=self.mm_encoder_attn_backend,
             mm_encoder_attn_dtype=self.mm_encoder_attn_dtype,
             mm_encoder_fp8_scale_path=self.mm_encoder_fp8_scale_path,
@@ -1746,11 +1784,15 @@ class EngineArgs:
         usage_context: UsageContext | None,
         model_config: ModelConfig,
     ) -> None:
-        """Apply the 1Cat SM70 MTP baseline knobs that affect decode speed."""
-        if (
+        """Apply the 1Cat SM70 speculative serving defaults."""
+        mtp_defaults_disabled = (
             envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
             or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
-        ):
+        )
+        explicit_dflash = isinstance(self.speculative_config, dict) and (
+            self.speculative_config.get("method") == "dflash"
+        )
+        if mtp_defaults_disabled and not explicit_dflash:
             return
         if not current_platform.is_cuda_alike():
             return
@@ -1758,7 +1800,7 @@ class EngineArgs:
             cap = current_platform.get_device_capability()
         except Exception:
             return
-        if cap is None or cap.major != 7:
+        if cap is None or (cap.major, cap.minor) != (7, 0):
             return
 
         text_config = model_config.hf_text_config
@@ -1827,9 +1869,18 @@ class EngineArgs:
                 f"speculative_config.draft_sample_method={draft_sample_method}"
             )
 
-        if spec_method != "mtp":
+        if "attention_backend" not in self.speculative_config:
+            self.speculative_config["attention_backend"] = "FLASH_ATTN_V100"
+            profile_updates.append(
+                "speculative_config.attention_backend=FLASH_ATTN_V100"
+            )
+
+        if spec_method == "dflash":
+            # MRV2 owns a separate K+1 draft query batch, so DFlash does not
+            # require B1 or a reduced prefill chunk. Preserve the server's
+            # normal capacity defaults and every explicit user override.
             if profile_updates:
-                logger.info(
+                logger.info_once(
                     "Applied SM70 speculative defaults: %s",
                     ", ".join(profile_updates),
                 )
@@ -1838,16 +1889,6 @@ class EngineArgs:
         if "use_local_argmax_reduction" not in self.speculative_config:
             self.speculative_config["use_local_argmax_reduction"] = True
             profile_updates.append("speculative_config.use_local_argmax_reduction=True")
-
-        if "attention_backend" not in self.speculative_config:
-            self.speculative_config["attention_backend"] = "FLASH_ATTN_V100"
-            profile_updates.append(
-                "speculative_config.attention_backend=FLASH_ATTN_V100"
-            )
-
-        if self.max_num_seqs is None:
-            self.max_num_seqs = 4 if self.tensor_parallel_size >= 4 else 1
-            profile_updates.append(f"max_num_seqs={self.max_num_seqs}")
 
         if has_native_mtp and self.compilation_config.fast_moe_cold_start is None:
             # Native MTP layers are encoded explicitly by MoERunner and do not
@@ -1878,40 +1919,41 @@ class EngineArgs:
                     num_speculative_tokens, ddtree_budget
                 )
             decode_query_len = num_speculative_state_tokens + 1
-            max_num_seqs = max(int(self.max_num_seqs or 1), 1)
-            if envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
+            if self.max_num_seqs is None:
+                # Scheduler defaults are resolved later in VllmConfig. Leave
+                # graph sizing to that stage instead of turning a graph policy
+                # into a service-capacity limit.
+                profile_updates.append("mtp_cudagraph_shapes=deferred_to_scheduler")
+            elif graph_policy().split_draft_graphs and spec_method == "mtp":
                 cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
-                    max_num_seqs,
+                    self.max_num_seqs,
                     decode_query_len,
                 )
                 profile_updates.append(
                     f"mtp_split_verifier_cudagraph_shapes={cudagraph_capture_sizes}"
                 )
             else:
-                cudagraph_capture_sizes = (
-                    [1, 2, 4, 8, 9, 18]
-                    if self.tensor_parallel_size >= 4
-                    else [1, 2, 4, 8, 9]
-                )
-                cudagraph_capture_sizes = sorted(
-                    set(cudagraph_capture_sizes)
-                    | {
-                        decode_query_len * num_reqs
-                        for num_reqs in range(1, max_num_seqs + 1)
-                    }
+                cudagraph_capture_sizes = _sm70_speculative_cudagraph_capture_sizes(
+                    self.max_num_seqs,
+                    decode_query_len,
                 )
                 profile_updates.append(
-                    "mtp_verifier_cudagraph_shapes="
-                    f"{decode_query_len}x1..{max_num_seqs}"
+                    f"mtp_cudagraph_shapes={cudagraph_capture_sizes}"
                 )
-            self.compilation_config.cudagraph_capture_sizes = cudagraph_capture_sizes
-            self.compilation_config.max_cudagraph_capture_size = max(
-                cudagraph_capture_sizes
-            )
-            profile_updates.append(
-                "cudagraph_capture_sizes="
-                f"{self.compilation_config.cudagraph_capture_sizes}"
-            )
+            if self.max_num_seqs is not None:
+                self.compilation_config.cudagraph_capture_sizes = (
+                    cudagraph_capture_sizes
+                )
+                max_tokens = self.max_num_batched_tokens
+                self.compilation_config.max_cudagraph_capture_size = max(
+                    size
+                    for size in cudagraph_capture_sizes
+                    if max_tokens is None or size <= max_tokens
+                )
+                profile_updates.append(
+                    "cudagraph_capture_sizes="
+                    f"{self.compilation_config.cudagraph_capture_sizes}"
+                )
 
         if profile_updates:
             logger.info_once(
@@ -1994,6 +2036,9 @@ class EngineArgs:
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
+            prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            mamba_tail_checkpoint=self.mamba_tail_checkpoint,
+            partial_prefix_cache=self.partial_prefix_cache,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
@@ -2003,6 +2048,10 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+        )
+
+        cache_config.cache_dtype_from_checkpoint = (
+            self.kv_cache_dtype == "auto" and resolved_cache_dtype != "auto"
         )
 
         if resolved_cache_dtype.startswith("turboquant_"):
@@ -2272,6 +2321,11 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
+            mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+            long_prefill_token_threshold_adaptive=(
+                self.long_prefill_token_threshold_adaptive
+            ),
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
@@ -2480,6 +2534,17 @@ class EngineArgs:
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
+        )
+
+        # Checked here, once before any worker starts, and not in
+        # VllmConfig.__post_init__: model construction rebuilds the config in
+        # every worker while the first stage may already pin its tables.
+        from vllm.models.qwen4_exp.common.ple import check_ple_host_share
+
+        check_ple_host_share(
+            model_config.hf_text_config,
+            parallel_config.tensor_parallel_size,
+            policy=config.offload_config.ple,
         )
 
         return config

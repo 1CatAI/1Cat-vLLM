@@ -9,7 +9,35 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 )
 from vllm.model_executor.models.qwen3_5 import (
     _sm70_materialize_qwen35_gdn_splits,
+    _sm70_qwen35_gdn_split_kernel,
 )
+
+
+def test_qwen35_gdn_split_new_lengths_reuse_the_compiled_kernel():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the Qwen3.5 GDN split kernel")
+
+    qkv_size, z_size, ba_size = 2560, 1536, 12
+    qkvz = torch.randn((1403, qkv_size + z_size), dtype=torch.float16, device="cuda")
+    ba = torch.randn((1403, 2 * ba_size), dtype=torch.float16, device="cuda")
+
+    def compiled():
+        return sum(
+            len(kernels)
+            for kernels, *_ in _sm70_qwen35_gdn_split_kernel.device_caches.values()
+        )
+
+    _sm70_materialize_qwen35_gdn_splits(qkvz[:5], ba[:5], qkv_size, z_size, ba_size)
+    before = compiled()
+    for rows in (7, 16, 758, 1403):
+        z, b, a = _sm70_materialize_qwen35_gdn_splits(
+            qkvz[:rows], ba[:rows], qkv_size, z_size, ba_size
+        )
+        torch.accelerator.synchronize()
+        assert torch.equal(z, qkvz[:rows, qkv_size:])
+        assert torch.equal(b, ba[:rows, :ba_size])
+        assert torch.equal(a, ba[:rows, ba_size:])
+    assert compiled() == before
 
 
 @pytest.mark.parametrize("num_rows", [1, 8, 32])
@@ -79,6 +107,50 @@ def test_qwen35_gdn_split_graph_replay_reads_current_projection_values():
     assert torch.equal(actual_z, mixed_qkvz[:, qkv_size:].contiguous())
     assert torch.equal(actual_b, mixed_ba[:, :ba_size].contiguous())
     assert torch.equal(actual_a, mixed_ba[:, ba_size:].contiguous())
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_qwen35_combined_split_preserves_tails_across_graph_replay(compiled):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the Qwen3.5 GDN split kernel")
+
+    # Real TP4 NVFP4 geometry: 4120 logical columns in a 4128-column row.
+    # Both input arguments alias this allocation, and b/a start at an offset.
+    storage = torch.empty((8, 4128), dtype=torch.float16, device="cuda")
+    projection = storage[:, :4120]
+
+    def split(values):
+        return _sm70_materialize_qwen35_gdn_splits(
+            values, values[:, 4096:4120], 2560, 1536, 12
+        )
+
+    if compiled:
+        split = torch.compile(split, fullgraph=True)
+    storage.normal_()
+    split(projection)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = split(projection)
+        # The consumer may overwrite QKV in the same graph. Tail outputs must
+        # be independent snapshots, including the two small gating vectors.
+        projection[:, :2560].zero_()
+
+    for seed in (41, 42, 43):
+        torch.manual_seed(seed)
+        storage.normal_()
+        expected = [
+            projection[:, start:end].clone()
+            for start, end in ((2560, 4096), (4096, 4108), (4108, 4120))
+        ]
+        padding = storage[:, 4120:].clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        for result, reference in zip(actual, expected):
+            assert result.is_contiguous()
+            assert torch.equal(result.view(torch.uint8), reference.view(torch.uint8))
+        assert torch.count_nonzero(projection[:, :2560]) == 0
+        assert torch.equal(storage[:, 4120:], padding)
 
 
 @pytest.mark.parametrize("num_rows", [1, 8])

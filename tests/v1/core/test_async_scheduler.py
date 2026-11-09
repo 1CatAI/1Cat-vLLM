@@ -80,6 +80,7 @@ def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
     scheduler.num_spec_tokens = num_speculative_tokens
     scheduler._spec_token_placeholders = (-1,) * num_speculative_tokens
     scheduler._drafter_max_model_len = 32
+    scheduler.use_v2_model_runner = False
     request = SimpleNamespace(
         is_prefill_chunk=False,
         use_structured_output=False,
@@ -101,6 +102,58 @@ def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
 
     assert request.num_output_placeholders == 5
     assert len(request.spec_token_ids) == expected_num_spec_tokens
+
+
+def test_v2_pp_spec_decode_respects_pipeline_cadence(monkeypatch):
+    # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
+    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+    )
+    scheduler.use_v2_model_runner = True
+    scheduler.num_spec_tokens = 7
+    scheduler._spec_token_placeholders = (-1,) * scheduler.num_spec_tokens
+    (request,) = create_requests(num_requests=1, num_tokens=8)
+    scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    assert prefill_output.num_scheduled_tokens[request.request_id] == 8
+    assert request.next_decode_eligible_step == 3
+
+    pipeline_fill_output = scheduler.schedule()
+    assert request.request_id not in pipeline_fill_output.num_scheduled_tokens
+
+    decode_output = scheduler.schedule()
+    assert decode_output.num_scheduled_tokens[request.request_id] == 8
+    assert len(decode_output.scheduled_spec_decode_tokens[request.request_id]) == 7
+
+
+@pytest.mark.parametrize(
+    ("use_v2_model_runner", "history_is_sent"), [(True, False), (False, True)]
+)
+def test_cached_request_history_is_only_sent_to_the_runner_that_reads_it(
+    use_v2_model_runner: bool, history_is_sent: bool
+):
+    scheduler = create_scheduler(async_scheduling=True)
+    scheduler.use_v2_model_runner = use_v2_model_runner
+    (request,) = create_requests(num_requests=1, num_tokens=1000)
+    scheduler.add_request(request)
+    scheduler.schedule()  # prefill: the request is now running
+
+    # A step that does not schedule the request (the PP cadence leaves such steps in
+    # between): the next decode step finds it missing from the previous step.
+    scheduler.prev_step_scheduled_req_ids.clear()
+    cached = scheduler._make_cached_request_data(
+        [request],
+        [],
+        {request.request_id: 1},
+        {},
+        {request.request_id: scheduler.kv_cache_manager.empty_kv_cache_blocks},
+    )
+
+    assert cached.req_ids == [request.request_id]
+    assert (request.request_id in cached.all_token_ids) is history_is_sent
 
 
 def test_abort():

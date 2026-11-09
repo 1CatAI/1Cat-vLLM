@@ -16,8 +16,6 @@ Per-head per-position slot layout:
   For turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
 """
 
-import functools
-import json
 import math
 import os
 from dataclasses import dataclass
@@ -28,6 +26,7 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.diagnostics import diagnostics_for
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
@@ -49,13 +48,14 @@ from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
-from vllm.v1.attention.backends.flash_attn_v100 import (
+from vllm.v1.attention.backends.flash_v100 import (
     flash_v100_dense_prefill,
     flash_v100_dense_prefill_available,
     flash_v100_turboquant_decode,
     flash_v100_turboquant_decode_available,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.ops.sm70_workspaces import workspace_cache
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
@@ -74,13 +74,8 @@ _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
-_logged_flash_v100_prefill = False
-_logged_flash_v100_tq_decode = False
-_flash_v100_prefill_compare_count = 0
-_flash_v100_decode_compare_count = 0
-_flash_v100_prefill_dump_count = 0
-_flash_v100_decode_dump_count = 0
-_tq_continuation_workspace_reserved_bytes = 0
+# Independent compatibility storage; configured engines borrow their own cache.
+_standalone_turboquant_cache: dict = {}
 
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -88,6 +83,28 @@ _tq_continuation_workspace_reserved_bytes = 0
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+
+
+def _continuation_sdpa(query, key, value, cached_len, scale):
+    """Bound SDPA query working memory without requantizing the current chunk."""
+    q_len, num_heads, _ = query.shape
+    k_t = key.transpose(0, 1).unsqueeze(0)
+    v_t = value.transpose(0, 1).unsqueeze(0)
+    k_pos = torch.arange(key.shape[0], device=query.device).unsqueeze(0)
+    output = torch.empty_like(query)
+    for start in range(0, q_len, _CONTINUATION_DECODE_THRESHOLD):
+        end = min(start + _CONTINUATION_DECODE_THRESHOLD, q_len)
+        q_pos = torch.arange(start, end, device=query.device).unsqueeze(1) + cached_len
+        out = F.scaled_dot_product_attention(
+            query[start:end].transpose(0, 1).unsqueeze(0),
+            k_t,
+            v_t,
+            attn_mask=k_pos <= q_pos,
+            scale=scale,
+            enable_gqa=(key.shape[1] < num_heads),
+        )
+        output[start:end] = out[0].transpose(0, 1)
+    return output
 
 
 def _flash_attn_varlen_supported_on_device() -> bool:
@@ -99,29 +116,7 @@ def _flash_attn_varlen_supported_on_device() -> bool:
     return True
 
 
-def _env_int(name: str, default: int = 0) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Ignoring invalid integer env %s=%r", name, raw)
-        return default
-
-
-def _env_float(name: str, default: float = 0.0) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning("Ignoring invalid float env %s=%r", name, raw)
-        return default
-
-
-def _record_compare_result(record: dict[str, Any]) -> None:
+def _record_compare_result(record: dict[str, Any], channel, log_path) -> None:
     logger.info(
         "TURBOQUANT %s compare %s: max_diff=%s mean_diff=%s shape=%s meta=%s",
         record["stage"],
@@ -131,14 +126,14 @@ def _record_compare_result(record: dict[str, Any]) -> None:
         record["shape"],
         record["meta"],
     )
-    log_path = os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH")
     if log_path:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, sort_keys=True) + "\n")
+        channel.append_json_path(log_path, record)
 
 
 def _compare_tensors(
     *,
+    channel,
+    log_path,
     stage: str,
     route: str,
     candidate: torch.Tensor,
@@ -157,7 +152,7 @@ def _compare_tensors(
         "pid": os.getpid(),
         "meta": meta,
     }
-    _record_compare_result(record)
+    _record_compare_result(record, channel, log_path)
     return record
 
 
@@ -171,12 +166,16 @@ def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
     return _build_hadamard_cached(d, str(torch.device(device_str)))
 
 
-@functools.cache
 def _build_hadamard_cached(d: int, device_str: str) -> torch.Tensor:
+    cache = workspace_cache("turboquant", _standalone_turboquant_cache)
+    key = ("hadamard", d, device_str)
+    if key in cache:
+        return cache[key]
     H = torch.tensor([[1.0]])
     while H.shape[0] < d:
         H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
-    return (H / math.sqrt(d)).to(torch.device(device_str))
+    cache[key] = (H / math.sqrt(d)).to(torch.device(device_str))
+    return cache[key]
 
 
 class TurboQuantAttentionBackend(AttentionBackend):
@@ -298,9 +297,15 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> TurboQuantMetadata:
         attn_metadata = self.build(0, common_attn_metadata)
-        # Set seq_lens to 1 so CUDA graph capture is fast
-        # (real seq_lens are filled at replay time).
-        attn_metadata.seq_lens.fill_(1)
+        # Present a continuation/decode-shaped batch (seq_len > q_len) so
+        # the captured branch matches replay-time verify/decode. Filling
+        # seq_lens with 1 makes max_query_len == max_seq_len and routes
+        # capture to the first-chunk flash path (no KV-cache history),
+        # which then replays for verify steps and corrupts attention.
+        attn_metadata.seq_lens.fill_(attn_metadata.max_query_len + 1)
+        attn_metadata.max_seq_len = attn_metadata.max_query_len + 1
+        if attn_metadata.seq_lens_cpu is not None:
+            attn_metadata.seq_lens_cpu.fill_(attn_metadata.max_query_len + 1)
         return attn_metadata
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
@@ -391,34 +396,51 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         )
         if current_platform.is_cuda() and self.fa_version is None:
             self.use_flash_attn_prefill = False
+        vllm_config = get_current_vllm_config()
+        self.runtime_policy = vllm_config.attention_config.flash_v100.turboquant
+        self.compare_policy = vllm_config.observability_config.runtime_trace.turboquant
+        diagnostics = diagnostics_for(vllm_config)
+        assert diagnostics is not None
+        self.diagnostics = diagnostics
+        self._runtime_cache = workspace_cache(
+            "turboquant", _standalone_turboquant_cache
+        )
+        self._workspace_manager = (
+            current_workspace_manager() if is_workspace_manager_initialized() else None
+        )
         self.use_flash_v100_dense_prefill = (
-            os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_PREFILL", "1") != "0"
-            and flash_v100_dense_prefill_available()
+            self.runtime_policy.flash_prefill and flash_v100_dense_prefill_available()
         )
         self.use_flash_v100_tq_decode = (
             not self.tq_config.key_fp8
-            and os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE", "1") != "0"
+            and self.runtime_policy.flash_decode
             and flash_v100_turboquant_decode_available()
         )
 
         # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
         # and benchmarks show no regression vs dynamic in eager mode).
-        vllm_config = get_current_vllm_config()
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
-        self._continuation_workspace_tokens = _env_int(
-            "VLLM_SM70_TURBOQUANT_CONTINUATION_WORKSPACE_TOKENS", 0
-        )
+        workspace_tokens = self.runtime_policy.continuation_workspace_tokens
+        assert workspace_tokens is not None
+        self._continuation_workspace_tokens = workspace_tokens
         if self._continuation_workspace_tokens <= 0:
             self._continuation_workspace_tokens = int(
                 vllm_config.model_config.max_model_len
             )
 
+    def _workspace(self):
+        if self._workspace_manager is None:
+            self._workspace_manager = current_workspace_manager()
+        return self._workspace_manager
+
     def _reserve_continuation_prefill_workspace(self) -> None:
-        if not is_workspace_manager_initialized():
-            return
-        if os.getenv("VLLM_SM70_TURBOQUANT_RESERVE_WORKSPACE", "1") == "0":
+        if self._workspace_manager is None:
+            if not is_workspace_manager_initialized():
+                return
+            self._workspace_manager = current_workspace_manager()
+        if not self.runtime_policy.reserve_workspace:
             return
 
         max_cached_len = self._continuation_workspace_tokens
@@ -428,15 +450,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         buf_shape = (1, self.num_kv_heads, max_cached_len, self.head_size)
         required_bytes = 2 * math.prod(buf_shape) * torch.float16.itemsize
 
-        global _tq_continuation_workspace_reserved_bytes
-        if required_bytes <= _tq_continuation_workspace_reserved_bytes:
+        reservation_key = ("reserved_bytes", self._workspace_manager)
+        if required_bytes <= self._runtime_cache.get(reservation_key, 0):
             return
 
-        current_workspace_manager().get_simultaneous(
+        self._workspace().get_simultaneous(
             (buf_shape, torch.float16),
             (buf_shape, torch.float16),
         )
-        _tq_continuation_workspace_reserved_bytes = required_bytes
+        self._runtime_cache[reservation_key] = required_bytes
         logger.info(
             "TURBOQUANT reserved %.2f MiB continuation-prefill workspace "
             "(tokens=%d, kv_heads=%d, head_dim=%d).",
@@ -516,14 +538,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         query_start_loc: torch.Tensor,
         num_actual_tokens: int,
     ) -> torch.Tensor:
-        global _logged_flash_v100_prefill
-        if not _logged_flash_v100_prefill:
+        if self.diagnostics.channels["turboquant_prefill"].take("route_log", 1):
             logger.info(
                 "TURBOQUANT prefill using Flash-V100 dense raw-QKV path "
                 "(kv_cache_dtype=%s).",
                 self.kv_cache_dtype,
             )
-            _logged_flash_v100_prefill = True
         out = torch.empty_like(q)
         return flash_v100_dense_prefill(
             query=q,
@@ -547,11 +567,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         max_input_len: int,
         meta: dict[str, Any],
     ) -> None:
-        global _flash_v100_prefill_compare_count
-        limit = _env_int("VLLM_SM70_TURBOQUANT_COMPARE_FLASH_V100_PREFILL", 0)
-        if limit <= 0 or _flash_v100_prefill_compare_count >= limit:
+        channel = self.diagnostics.channels["turboquant_prefill"]
+        if not channel.take("compare", self.compare_policy.prefill_limit or 0):
             return
-        _flash_v100_prefill_compare_count += 1
+        compare_index = channel.saves["compare"]
         triton_out = self._triton_prefill_attention(
             q=q,
             k=k,
@@ -561,13 +580,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_input_len=max_input_len,
         )
         record = _compare_tensors(
+            channel=channel,
+            log_path=self.compare_policy.log_path,
             stage="prefill",
             route="flash_v100_dense_vs_triton_context",
             candidate=flash_out,
             reference=triton_out,
             meta={
                 **meta,
-                "compare_index": _flash_v100_prefill_compare_count,
+                "compare_index": compare_index,
                 "max_input_len": max_input_len,
             },
         )
@@ -595,24 +616,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         b_seq_len: torch.Tensor,
         max_input_len: int,
     ) -> None:
-        dump_dir = os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR")
-        if not dump_dir:
+        channel = self.diagnostics.channels["turboquant_prefill"]
+        if not channel.policy.directory:
             return
-        limit = _env_int("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_LIMIT", 1)
-        if limit <= 0:
+        if record["max_diff"] < self.compare_policy.dump_threshold:
             return
-        threshold = _env_float("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_THRESHOLD", 0.0)
-        if record["max_diff"] < threshold:
+        if not channel.take("dump", channel.policy.max_dumps or 0):
             return
 
-        global _flash_v100_prefill_dump_count
-        if _flash_v100_prefill_dump_count >= limit:
-            return
-        _flash_v100_prefill_dump_count += 1
-
-        os.makedirs(dump_dir, exist_ok=True)
-        path = os.path.join(
-            dump_dir,
+        path = channel.output_path(
             (
                 f"prefill_compare_pid{os.getpid()}_"
                 f"idx{record['meta']['compare_index']}_"
@@ -655,22 +667,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         PiT: torch.Tensor | None,
     ) -> None:
-        dump_dir = os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR")
-        if not dump_dir:
+        channel = self.diagnostics.channels["turboquant_decode"]
+        if not channel.policy.directory:
             return
-        limit = _env_int("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_LIMIT", 1)
-        if limit <= 0:
+        if record["max_diff"] < self.compare_policy.dump_threshold:
             return
-        threshold = _env_float("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_THRESHOLD", 0.0)
-        if record["max_diff"] < threshold:
+        if not channel.take("dump", channel.policy.max_dumps or 0):
             return
 
-        global _flash_v100_decode_dump_count
-        if _flash_v100_decode_dump_count >= limit:
-            return
-        _flash_v100_decode_dump_count += 1
-
-        os.makedirs(dump_dir, exist_ok=True)
         batch_size = int(query.shape[0])
         block_size = int(kv_cache.shape[1])
         max_seq_len = int(attn_metadata.seq_lens[:batch_size].max().item())
@@ -680,8 +684,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         kv_blocks = kv_cache.index_select(
             0, unique_blocks_cpu.to(device=kv_cache.device)
         ).detach()
-        path = os.path.join(
-            dump_dir,
+        path = channel.output_path(
             (
                 f"decode_compare_pid{os.getpid()}_"
                 f"idx{record['meta']['compare_index']}_"
@@ -729,11 +732,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         PiT: torch.Tensor | None,
     ) -> None:
-        global _flash_v100_decode_compare_count
-        limit = _env_int("VLLM_SM70_TURBOQUANT_COMPARE_FLASH_V100_DECODE", 0)
-        if limit <= 0 or _flash_v100_decode_compare_count >= limit:
+        channel = self.diagnostics.channels["turboquant_decode"]
+        if not channel.take("compare", self.compare_policy.decode_limit or 0):
             return
-        _flash_v100_decode_compare_count += 1
+        compare_index = channel.saves["compare"]
         triton_out = triton_turboquant_decode_attention(
             query=query,
             kv_cache=kv_cache,
@@ -751,12 +753,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_num_kv_splits=self.max_num_kv_splits,
         )
         record = _compare_tensors(
+            channel=channel,
+            log_path=self.compare_policy.log_path,
             stage="decode",
             route="flash_v100_tq_packed_vs_triton_tq_packed",
             candidate=flash_out,
             reference=triton_out,
             meta={
-                "compare_index": _flash_v100_decode_compare_count,
+                "compare_index": compare_index,
                 "batch": int(query.shape[0]),
                 "num_heads": int(query.shape[1]),
                 "head_dim": int(query.shape[2]),
@@ -1177,8 +1181,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 if q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request
                     # with incremental seq_lens for causal masking.
-                    # Slice from pre-built arange (no kernel launch)
-                    synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
+                    # Graph-safe: derive per-row seq_lens from the GPU-resident
+                    # seq_lens tensor (refreshed before each CUDA graph replay)
+                    # plus a freshly built arange. A python slice of
+                    # _arange_cache would bake a stale pointer at capture.
+                    synth_seq_lens = (
+                        attn_metadata.seq_lens[i : i + 1]
+                        - q_len
+                        + 1
+                        + torch.arange(
+                            q_len,
+                            device=query.device,
+                            dtype=attn_metadata.seq_lens.dtype,
+                        )
+                    )
                     synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
                     out = triton_turboquant_decode_attention(
                         query=q_seq,
@@ -1249,7 +1265,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Use WorkspaceManager for dequant buffers.
         # Shared across all layers — saves 60× memory at long context.
         # Required for CUDA Graph capture (per-layer growth incompatible with CG).
-        k_buf, v_buf = current_workspace_manager().get_simultaneous(
+        k_buf, v_buf = self._workspace().get_simultaneous(
             (buf_shape, torch.float16),
             (buf_shape, torch.float16),
         )
@@ -1338,24 +1354,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
             )
         else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
-            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
-            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
-            out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=mask,
-                scale=self.scale,
-                enable_gqa=(Hk < Hq),
-            )  # (1, Hq, q_len, D)
-            return out[0].transpose(0, 1)  # (q_len, Hq, D)
+            return _continuation_sdpa(query, k_full, v_full, cached_len, self.scale)
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
@@ -1378,18 +1377,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         S = self.max_num_kv_splits
         Hq = self.num_heads
         mid_o_buf = output_buf = lse_buf = None
-        if is_workspace_manager_initialized():
+        if self._workspace_manager is not None or is_workspace_manager_initialized():
             # output_buf in query dtype — matches the in-kernel fp16 cast in stage2.
-            mid_o_buf, output_buf, lse_buf = (
-                current_workspace_manager().get_simultaneous(
-                    ((B, Hq, S, D + 1), torch.float32),
-                    ((B, Hq, D), query.dtype),
-                    ((B, Hq), torch.float32),
-                )
+            mid_o_buf, output_buf, lse_buf = self._workspace().get_simultaneous(
+                ((B, Hq, S, D + 1), torch.float32),
+                ((B, Hq, D), query.dtype),
+                ((B, Hq), torch.float32),
             )
 
         if self.use_flash_v100_tq_decode:
-            global _logged_flash_v100_tq_decode
             if output_buf is None:
                 output_buf = torch.empty(
                     B, Hq, D, dtype=query.dtype, device=query.device
@@ -1398,7 +1394,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             if PiT is None:
                 PiT = Pi.T.contiguous()
             q_rot = (q_float @ PiT).contiguous()
-            if not _logged_flash_v100_tq_decode:
+            if self.diagnostics.channels["turboquant_decode"].take("route_log", 1):
                 logger.info(
                     "TURBOQUANT decode using Flash-V100 packed-cache path "
                     "(kv_cache_dtype=%s, mse_bits=%d, value_bits=%d).",
@@ -1406,7 +1402,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     self.tq_config.key_mse_bits,
                     self.tq_config.effective_value_quant_bits,
                 )
-                _logged_flash_v100_tq_decode = True
             result = flash_v100_turboquant_decode(
                 q_rot=q_rot,
                 kv_cache=kv_cache,

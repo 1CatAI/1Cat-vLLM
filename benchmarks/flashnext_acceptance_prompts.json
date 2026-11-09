@@ -1,0 +1,34 @@
+[
+  {
+    "id": "zh_story",
+    "prompt": "写一个完整的中文科幻短篇：一位修理工在废弃空间站里发现一段来自未来自己的留言。包含环境、对话、一次合理的误导和一个闭合的结局。请充分展开，至少1500字，不要概述或列提纲。"
+  },
+  {
+    "id": "en_story",
+    "prompt": "Write a complete, richly detailed short story about a lighthouse keeper who receives letters dated ten years in the future. Include dialogue, a credible mystery, and a satisfying ending. Develop the scenes fully; aim for at least 1200 words rather than an outline."
+  },
+  {
+    "id": "zh_science",
+    "prompt": "向高中生详细解释为什么飞机可以飞起来：从气流、压强、动量、迎角、失速讲到常见误解，并用生活中的实验说明。请给出一篇连贯的长文，至少1200字，区分模型假设与现实情况。"
+  },
+  {
+    "id": "en_science",
+    "prompt": "Explain how a relational database executes a SQL query from parsing through planning, indexes, joins, transactions, and returning rows. Use one concrete running example, discuss tradeoffs and common misconceptions, and provide a thorough tutorial of at least 1200 words."
+  },
+  {
+    "id": "python_cache",
+    "prompt": "Implement a production-oriented Python LRU cache with a fixed capacity, expiration times, injectable clock, and thread-safe get/put operations. Explain the design, include a complete implementation, and show meaningful tests for eviction, expiration and concurrent access. Do not omit code with placeholders."
+  },
+  {
+    "id": "python_graph",
+    "prompt": "Write a Python implementation of Dijkstra shortest paths for an adjacency-list graph with nonnegative weights. Return distances and reconstruct paths, handle disconnected vertices, and validate malformed input. Include a detailed correctness argument, complexity analysis, worked example, and tests. Provide complete executable code."
+  },
+  {
+    "id": "zh_reasoning",
+    "prompt": "一家小型社区图书馆只有两名工作人员，要在周末举办儿童阅读、老人电脑课和读书会。请设计一个详细可执行的两天计划，明确资源约束、时段安排、预约规则、突发情况及公平性，并逐步解释每个取舍。请充分展开至少1200字。"
+  },
+  {
+    "id": "en_reasoning",
+    "prompt": "Design a robust process for a small team migrating a legacy data service without losing records. Discuss invariants, dual writes, backfill, validation, rollback, observability and failure cases. Give a detailed phased plan with worked examples and explicit tradeoffs, not just a checklist; aim for at least 1200 words."
+  }
+]

@@ -45,12 +45,18 @@ CHECK_IMPORTS = {
             "tests/tokenizers_/test_hf.py",
             "tests/utils_/test_hashing.py",
             "tests/compile/test_aot_compile.py",
+            # Round-trip trusted, test-owned worker configuration.
+            "tests/v1/worker/test_step_profiler.py",
+            "tests/compile/test_aot_triton_side_table.py",
             "benchmarks/kernels/graph_machete_bench.py",
             "benchmarks/kernels/benchmark_lora.py",
             "benchmarks/kernels/benchmark_machete.py",
             "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
             "benchmarks/cutlass_benchmarks/w8a8_benchmarks.py",
             "benchmarks/cutlass_benchmarks/sparse_benchmarks.py",
+            # Pickling round trips are the subject of these tests.
+            "tests/tokenizers_/test_gguf_bpe_encode.py",
+            "tests/config/test_gguf_prefill_prepare.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",
@@ -85,6 +91,9 @@ CHECK_IMPORTS = {
             # AOT inspection needs compiler/backend modules that the vLLM
             # runtime shim deliberately does not export.
             "benchmarks/kernels/deepseek_v4_sm70_aot_check.py",
+            # Standalone source-built kernel screen: run before installing a
+            # vLLM runtime, including CPU-only layout tests and compilation.
+            "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",
         },
     ),
 }

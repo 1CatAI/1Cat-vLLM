@@ -30,8 +30,9 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         return device_capability.major == 10
 
     _INSTALL_HINT = (
-        "tokenspeed_mla package is not installed. "
-        "Install it with: `uv pip install tokenspeed-mla`"
+        "tokenspeed_mla is an optional package and is not installed. "
+        "Its apache-tvm-ffi requirement must be compatible with the installed "
+        "TileLang version."
     )
 
     @classmethod

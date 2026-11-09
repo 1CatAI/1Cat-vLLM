@@ -5,7 +5,7 @@
 
 import torch
 
-import vllm.envs as envs
+from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -39,6 +39,39 @@ def _sm70_dsv4_fp16_gemv_kernel(
         weight = tl.load(weight_ptr + row * K + block_start + offsets).to(tl.float32)
         acc += tl.sum(x * weight, axis=0)
     tl.store(out_ptr + row, acc)
+
+
+@triton.jit
+def _sm70_dsv4_fused_fp16_aux_gemv_kernel(
+    x_ptr,
+    weight_ptr,
+    compressor_out_ptr,
+    indexer_compressor_out_ptr,
+    indexer_weights_out_ptr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    COMPRESSOR_N: tl.constexpr,
+    INDEXER_COMPRESSOR_N: tl.constexpr,
+):
+    """Compute the three C4 auxiliary GEMVs in one exact-FP16 launch."""
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    acc = 0.0
+    for block_start in tl.static_range(0, K, BLOCK_K):
+        x = tl.load(x_ptr + block_start + offsets).to(tl.float32)
+        weight = tl.load(weight_ptr + row * K + block_start + offsets).to(tl.float32)
+        acc += tl.sum(x * weight, axis=0)
+    tl.store(compressor_out_ptr + row, acc, mask=row < COMPRESSOR_N)
+    tl.store(
+        indexer_compressor_out_ptr + row - COMPRESSOR_N,
+        acc,
+        mask=(row >= COMPRESSOR_N) & (row < COMPRESSOR_N + INDEXER_COMPRESSOR_N),
+    )
+    tl.store(
+        indexer_weights_out_ptr + row - COMPRESSOR_N - INDEXER_COMPRESSOR_N,
+        acc,
+        mask=row >= COMPRESSOR_N + INDEXER_COMPRESSOR_N,
+    )
 
 
 @triton.jit
@@ -232,7 +265,7 @@ def _has_sm70_dsv4_fp13_weight_contract(weight: torch.Tensor) -> bool:
 
 
 def prepare_sm70_dsv4_fp13_gemv(layer: torch.nn.Module) -> torch.Tensor | None:
-    if not envs.VLLM_SM70_DSV4_FP13_GEMV or not getattr(
+    if not bool(layer_policy().dsv4_fp13_gemv) or not getattr(
         layer, "_sm70_dsv4_fp13_gemv", False
     ):
         return None
@@ -262,6 +295,118 @@ def prepare_sm70_dsv4_fp13_gemv(layer: torch.nn.Module) -> torch.Tensor | None:
     else:
         layer.register_buffer(_FP13_BUFFER, packed, persistent=False)
     return packed
+
+
+def has_sm70_dsv4_fused_fp16_aux_weight_contract(
+    weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> bool:
+    """Require three dense FP16 projections sharing a block-aligned input."""
+    if len(weights) != 3 or any(weight.ndim != 2 for weight in weights):
+        return False
+    k = weights[0].shape[1]
+    device = weights[0].device
+    return (
+        k > 0
+        and k % _BLOCK_K == 0
+        and all(
+            weight.dtype == torch.float16
+            and weight.shape[0] > 0
+            and weight.shape[1] == k
+            and weight.device == device
+            and weight.is_contiguous()
+            for weight in weights
+        )
+    )
+
+
+def sm70_fused_fp16_aux_reason(
+    weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor], *, enabled: bool
+) -> str | None:
+    """Select only a fusion of the already-selected exact GEMV route."""
+    if not enabled:
+        return "disabled_by_kernel_config"
+    if bool(layer_policy().dsv4_fp13_gemv):
+        return "existing_fp13_route_preserved"
+    if not bool(layer_policy().dsv4_fp16_gemv):
+        return "existing_exact_gemv_route_not_selected"
+    if not has_sm70_dsv4_fused_fp16_aux_weight_contract(weights):
+        return "requires_three_dense_fp16_projections_with_common_aligned_input"
+    if not weights[0].is_cuda or not current_platform.is_cuda():
+        return "requires_cuda_weights"
+    capability = current_platform.get_device_capability(weights[0].device.index or 0)
+    if capability is None or capability.to_int() != 70:
+        return "requires_sm70"
+    # Do not replace the cuBLAS or approximate path with a different reduction.
+    x = weights[0].new_empty((1, weights[0].shape[1]))
+    if not all(
+        can_use_sm70_dsv4_fp16_gemv(x, weight, dtype)
+        for weight, dtype in zip(weights, (torch.float32, torch.float32, torch.float16))
+    ):
+        return "individual_exact_gemv_not_admitted"
+    return None
+
+
+@torch.no_grad()
+def prepare_sm70_dsv4_fused_fp16_aux_weight(
+    weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor], *, enabled: bool = True
+) -> torch.Tensor | None:
+    if sm70_fused_fp16_aux_reason(weights, enabled=enabled) is not None:
+        return None
+    return torch.cat(weights, dim=0).contiguous()
+
+
+def can_use_sm70_dsv4_fused_fp16_aux_gemv(
+    x: torch.Tensor,
+    fused_weight: torch.Tensor | None,
+    rows: tuple[int, int, int],
+) -> bool:
+    return (
+        not bool(layer_policy().dsv4_fp13_gemv)
+        and bool(layer_policy().dsv4_fp16_gemv)
+        and fused_weight is not None
+        and x.is_cuda
+        and current_platform.is_cuda()
+        and (capability := current_platform.get_device_capability(x.device.index or 0))
+        is not None
+        and capability.to_int() == 70
+        and x.dtype == torch.float16
+        and x.ndim == 2
+        and x.shape[0] == 1
+        and x.shape[1] > 0
+        and x.shape[1] % _BLOCK_K == 0
+        and x.is_contiguous()
+        and len(rows) == 3
+        and all(n > 0 for n in rows)
+        and fused_weight.device == x.device
+        and fused_weight.dtype == torch.float16
+        and fused_weight.shape == (sum(rows), x.shape[1])
+        and fused_weight.is_contiguous()
+    )
+
+
+def maybe_sm70_dsv4_fused_fp16_aux_gemv(
+    x: torch.Tensor,
+    fused_weight: torch.Tensor | None,
+    rows: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    if not can_use_sm70_dsv4_fused_fp16_aux_gemv(x, fused_weight, rows):
+        return None
+    assert fused_weight is not None
+    outputs = tuple(
+        torch.empty((1, n), device=x.device, dtype=dtype)
+        for n, dtype in zip(rows, (torch.float32, torch.float32, torch.float16))
+    )
+    _sm70_dsv4_fused_fp16_aux_gemv_kernel[(sum(rows),)](
+        x,
+        fused_weight,
+        *outputs,
+        K=x.shape[1],
+        BLOCK_K=_BLOCK_K,
+        COMPRESSOR_N=rows[0],
+        INDEXER_COMPRESSOR_N=rows[1],
+        num_warps=_NUM_WARPS,
+    )
+    return outputs
 
 
 def _has_sm70_dsv4_gemv_contract(
@@ -294,7 +439,7 @@ def can_use_sm70_dsv4_fp16_gemv(
     weight: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> bool:
-    enabled = envs.VLLM_SM70_DSV4_FP16_GEMV or envs.VLLM_SM70_DSV4_FP13_GEMV
+    enabled = bool(layer_policy().dsv4_fp16_gemv) or bool(layer_policy().dsv4_fp13_gemv)
     return enabled and _has_sm70_dsv4_gemv_contract(x, weight, output_dtype)
 
 
@@ -305,7 +450,7 @@ def can_use_sm70_dsv4_fp13_gemv(
     output_dtype: torch.dtype,
 ) -> bool:
     return (
-        envs.VLLM_SM70_DSV4_FP13_GEMV
+        bool(layer_policy().dsv4_fp13_gemv)
         and _has_sm70_dsv4_gemv_contract(x, weight, output_dtype)
         and packed_weight is not None
         and packed_weight.dtype == torch.int32

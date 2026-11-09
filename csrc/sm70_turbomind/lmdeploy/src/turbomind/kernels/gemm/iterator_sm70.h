@@ -66,6 +66,13 @@ struct GmemIteratorSm70 {
 
   bool g_mask{true};
 
+  // AWQ may keep its persistent per-group statistics as the packed byte
+  // sequence {scale_lo, scale_hi, zero}. The aligned source pointer's low bit
+  // marks the compact format. Shared memory still contains the regular uint32
+  // {half scale, half bias} value consumed by the existing transform. Keeping
+  // the expansion here avoids a persistent or per-layer workspace.
+  bool compact_awq_stats_{false};
+
   SmemAccessor<T, SmemLayout> smem_data_;
 
   static constexpr int2 kMK0 = cs2mk<kOrder>(SmemLayout::C0, SmemLayout::S0);
@@ -93,8 +100,15 @@ struct GmemIteratorSm70 {
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane_id = threadIdx.x % WARP_SIZE;
 
-    const Pointer data{(T*)mat.ptr.ptr};
+    const uintptr_t tagged_ptr = reinterpret_cast<uintptr_t>(mat.ptr.ptr);
     const int ld = mat.ptr.stride;
+    if constexpr (std::is_same_v<T, uint32_t>) {
+      compact_awq_stats_ = (tagged_ptr & uintptr_t{1}) != 0;
+    }
+    const uintptr_t data_ptr =
+        compact_awq_stats_ ? tagged_ptr & ~uintptr_t{1} : tagged_ptr;
+    const Pointer data{reinterpret_cast<T*>(data_ptr)};
+    const int source_bits = compact_awq_stats_ ? 24 : bitsof<T>;
 
     const int2 offsets = Map::get_offset(warp_id, lane_id);
 
@@ -129,13 +143,14 @@ struct GmemIteratorSm70 {
 
     const int src_offset = is_indexed ? offsets.x : offsets.x + offsets.y * ld;
 
-    src_offset_ = src_offset * bitsof<T> / bitsof<char>;
+    src_offset_ = src_offset * source_bits / bitsof<char>;
 
-    src_step_c_ = bitsof<T> * Map::kDeltaC / bitsof<char>;
-    src_step_s_ = bitsof<T> * Map::kDeltaS * ld / bitsof<char>;
+    src_step_c_ = source_bits * Map::kDeltaC / bitsof<char>;
+    src_step_s_ = source_bits * Map::kDeltaS * ld / bitsof<char>;
 
     src_step_k_ =
-        bitsof<T> * cs2mk<kOrder>(Map::kDimC, Map::kDimS * ld).y / bitsof<char>;
+        source_bits * cs2mk<kOrder>(Map::kDimC, Map::kDimS * ld).y /
+        bitsof<char>;
 
     // initialize for the first tile
     if constexpr (is_indexed) {
@@ -143,13 +158,27 @@ struct GmemIteratorSm70 {
       for (int s = 0; s < ITER_S; ++s) {
         const int ss = cta_cs.y + offset_s_ + s * Map::kDeltaS;
         const int idx = (mat.idxs && pred_(s, 0)) ? __ldg(mat.idxs + ss) : ss;
-        const auto tmp = data + cs2idx({cta_cs.x, idx}, ld);
-        src_data_vec_[s] = reinterpret_cast<const char*>((T*)tmp) + src_offset_;
+        const int logical_offset = cs2idx({cta_cs.x, idx}, ld);
+        if (compact_awq_stats_) {
+          src_data_vec_[s] = reinterpret_cast<const char*>(data_ptr) +
+                             logical_offset * 3 + src_offset_;
+        } else {
+          const auto tmp = data + logical_offset;
+          src_data_vec_[s] =
+              reinterpret_cast<const char*>((T*)tmp) + src_offset_;
+        }
       }
     } else {
-      auto src_data = data + cs2idx(to_cs(pack(offset)), ld);
-      src_data_ = reinterpret_cast<const char*>((T*)src_data) + src_offset_;
+      const int logical_offset = cs2idx(to_cs(pack(offset)), ld);
+      if (compact_awq_stats_) {
+        src_data_ = reinterpret_cast<const char*>(data_ptr) +
+                    logical_offset * 3 + src_offset_;
+      } else {
+        auto src_data = data + logical_offset;
+        src_data_ = reinterpret_cast<const char*>((T*)src_data) + src_offset_;
+      }
     }
+
   }
 
   __device__ constexpr int _src_step_k() const { return src_step_k_; }
@@ -240,6 +269,25 @@ struct GmemIteratorSm70 {
   __device__ void Copy2(AccessType& frag, const char* __restrict__ src,
                         bool mask) {
     if (mask) {
+      if constexpr (std::is_same_v<T, uint32_t>) {
+        if (compact_awq_stats_) {
+          PRAGMA_UNROLL
+          for (int i = 0; i < Map::kAccessC; ++i) {
+            const auto* bytes =
+                reinterpret_cast<const uint8_t*>(src + i * 3);
+            const uint16_t scale_bits =
+                static_cast<uint16_t>(__ldg(bytes)) |
+                (static_cast<uint16_t>(__ldg(bytes + 1)) << 8);
+            const uint8_t zero_u8 = __ldg(bytes + 2);
+            const half scale = __ushort_as_half(scale_bits);
+            const half zero = __int2half_rn(static_cast<int>(zero_u8));
+            const half bias = __hmul(__hneg(zero), scale);
+            frag[i] = static_cast<uint32_t>(scale_bits) |
+                      (static_cast<uint32_t>(__half_as_ushort(bias)) << 16);
+          }
+          return;
+        }
+      }
       if constexpr (Policy_::kEvictPolicy != EvictPolicy::kEvictNormal) {
         _Ld(frag, (const T*)src);
       } else {

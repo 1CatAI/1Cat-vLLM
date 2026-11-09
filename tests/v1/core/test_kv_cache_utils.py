@@ -1831,16 +1831,23 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # different hidden size that cannot be aligned by using different block size
+    # Non-integral page sizes use physical padding, preserving logical blocks.
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": new_sliding_window_spec(head_size=96),
     }
 
-    with pytest.raises(NotImplementedError):
-        get_kv_cache_configs(
-            vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
-        )[0]
+    padded_config = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
+    )[0]
+    assert {
+        group.kv_cache_spec.page_size_bytes for group in padded_config.kv_cache_groups
+    } == {kv_cache_specs_hybrid["layer_2"].page_size_bytes}
+    assert all(
+        group.kv_cache_spec.block_size
+        == kv_cache_specs_hybrid[group.layer_names[0]].block_size
+        for group in padded_config.kv_cache_groups
+    )
 
     # Test num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = 16
@@ -2020,6 +2027,10 @@ def test_deepseek_v4_tuple_width_minimizes_physical_pool_pages():
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
+        # VllmConfig.max_in_flight_tokens with one concurrent batch; the
+        # sliding-window spec reads it for the recycling-aware admission
+        # bound this PR adds.
+        max_in_flight_tokens=8192,
     )
 
     assert (
@@ -2338,7 +2349,9 @@ def test_auto_fit_max_model_len_with_hybrid():
     _kv_cache_configs = get_kv_cache_configs(
         vllm_config, [kv_cache_specs], [available_memory]
     )
-    assert vllm_config.model_config.max_model_len == 1024
+    # The shared pool also reserves one null block. After the Mamba running
+    # state and speculative blocks, only 63 full-attention blocks remain.
+    assert vllm_config.model_config.max_model_len == 1008
 
 
 def test_auto_fit_max_model_len_not_triggered():
@@ -2500,3 +2513,95 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+def test_free_kv_cache_block_queue_prepend_n():
+    queue = FreeKVCacheBlockQueue([])
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+
+    queue.prepend_n([])
+    assert queue.num_free_blocks == 0
+    assert queue.fake_free_list_head.next_free_block is queue.fake_free_list_tail
+
+    # Prepend into an empty queue: fake_head->b0->b1->fake_tail
+    queue.prepend_n(blocks[0:2])
+    assert queue.get_all_free_blocks() == blocks[0:2]
+    assert blocks[0].prev_free_block is queue.fake_free_list_head
+    assert blocks[1].next_free_block is queue.fake_free_list_tail
+
+    # Appended blocks go behind, prepended ones in front.
+    queue.append_n(blocks[4:6])
+    queue.prepend_n(blocks[2:4])
+    assert queue.num_free_blocks == 6
+    assert queue.get_all_free_blocks() == [
+        blocks[2],
+        blocks[3],
+        blocks[0],
+        blocks[1],
+        blocks[4],
+        blocks[5],
+    ]
+    assert queue.popleft() is blocks[2]
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_flash_v100_hybrid_draft_pages_preserve_state_capacity(tp):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    page = 4 * 2**20 // tp
+    full = new_kv_cache_spec(
+        block_size=2048, num_kv_heads=4 // tp, head_size=256, dtype=torch.uint8
+    )
+    mamba = new_mamba_spec(
+        block_size=8192,
+        shapes=((10, 10240 // tp), (48 // tp, 128, 128)),
+        dtypes=(torch.float16, torch.float32),
+        num_speculative_blocks=7,
+        mamba_cache_mode="align",
+        page_size_padded=page,
+    )
+    draft = new_sliding_window_spec(
+        block_size=2048,
+        num_kv_heads=8 // tp,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=2048,
+    )
+    specs = {f"full.{i}": full for i in range(16)}
+    specs.update({f"mamba.{i}": mamba for i in range(48)})
+    specs.update({f"draft.{i}": draft for i in range(5)})
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=65536),
+        attention_config=SimpleNamespace(backend=AttentionBackendEnum.FLASH_ATTN_V100),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, prefill_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align", user_specified_mamba_block_size=True
+        ),
+        max_in_flight_tokens=16384,
+    )
+    compact = kv_cache_utils.unify_kv_cache_spec_page_size(specs, config)
+    assert specs["draft.0"].block_size == 2048  # Don't mutate worker specs.
+    assert compact["draft.0"].block_size == 1024
+    assert compact["draft.0"].dtype == torch.float16
+    assert compact["draft.0"].sliding_window == 2048
+    assert compact["mamba.0"] == mamba
+    assert compact["full.0"] == full
+    assert {s.page_size_bytes for s in compact.values()} == {page}
+    groups = kv_cache_utils.get_kv_cache_groups(config, specs)
+    required = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+    assert required == 137 * 32 * 2**20 // tp  # 4.28125 GiB / TP.
+
+    # Other backends retain their existing block-size contract.
+    config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
+    original = kv_cache_utils.unify_kv_cache_spec_page_size(specs, config)
+    assert original["draft.0"] == draft
+    assert original["mamba.0"].page_size_bytes == 2 * page
+
+    config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN_V100
+    config.speculative_config = SimpleNamespace(
+        attention_backend=AttentionBackendEnum.TRITON_ATTN
+    )
+    assert kv_cache_utils.unify_kv_cache_spec_page_size(specs, config) == original

@@ -60,6 +60,10 @@ class CachePolicy(ABC):
     def touch(self, keys: Iterable[OffloadKey]) -> None:
         """Mark blocks as recently used."""
 
+    def demote(self, keys: Iterable[OffloadKey]) -> None:
+        """Make the given keys the next eviction candidates (default: no-op)."""
+        return
+
     @abstractmethod
     def evict(
         self, n: int, protected: set[OffloadKey]

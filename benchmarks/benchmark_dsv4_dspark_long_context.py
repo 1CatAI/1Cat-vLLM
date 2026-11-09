@@ -81,8 +81,9 @@ def _build_messages(unit_count: int, marker: str) -> list[dict[str, str]]:
         {
             "role": "system",
             "content": (
-                "Follow the final user instruction exactly. Long repeated context "
-                "must not cause repetition, garbling, or loss of the suffix."
+                f"This request is isolated by {marker}. Follow the final user "
+                "instruction exactly. Long repeated context must not cause "
+                "repetition, garbling, or loss of the suffix."
             ),
         },
         {"role": "user", "content": filler + instruction},
@@ -155,6 +156,8 @@ def _metrics_snapshot(host: str, port: int, timeout: int) -> dict[str, Any]:
         "rounds": _metric_total(text, "vllm:spec_decode_num_drafts_total"),
         "proposed": _metric_total(text, "vllm:spec_decode_num_draft_tokens_total"),
         "accepted": _metric_total(text, "vllm:spec_decode_num_accepted_tokens_total"),
+        "prompt_tokens": _metric_total(text, "vllm:prompt_tokens_total"),
+        "prefill_seconds": _metric_total(text, "vllm:request_prefill_time_seconds_sum"),
         "positions": positions,
     }
 
@@ -399,6 +402,8 @@ def _run_case(
     rounds = after["rounds"] - before["rounds"]
     proposed = after["proposed"] - before["proposed"]
     accepted = after["accepted"] - before["accepted"]
+    computed_prompt_tokens = after["prompt_tokens"] - before["prompt_tokens"]
+    prefill_seconds = after["prefill_seconds"] - before["prefill_seconds"]
     accepted_per_position = [
         after["positions"].get(position, 0.0) - before["positions"].get(position, 0.0)
         for position in range(num_speculative_tokens)
@@ -446,6 +451,15 @@ def _run_case(
                     value / rounds if rounds else None
                     for value in accepted_per_position
                 ],
+            },
+            "prefill_metrics": {
+                "computed_prompt_tokens": computed_prompt_tokens,
+                "prefill_seconds": prefill_seconds,
+                "tokens_per_second": (
+                    computed_prompt_tokens / prefill_seconds
+                    if prefill_seconds > 0
+                    else None
+                ),
             },
             "verifier_profile": verifier_profile,
         }

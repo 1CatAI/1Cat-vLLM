@@ -114,7 +114,12 @@ def mhc_post_torch(
         residual.to(torch.float32),
     )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
-    return (mixed_residual + post_term).to(residual.dtype)
+    out = mixed_residual + post_term
+    if residual.dtype == torch.float16:
+        # Saturate the float16 store, see FP16_MAX in tilelang_kernels.py.
+        fp16_max = torch.finfo(torch.float16).max
+        out = out.clamp_(-fp16_max, fp16_max)
+    return out.to(residual.dtype)
 
 
 def mhc_fused_post_pre_torch(

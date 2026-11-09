@@ -29,7 +29,13 @@ the patch mechanically. Development is tracked in public Draft PR #355.
   overlapping matches are legal.
 - The lookup proposal is fused with the neural proposal. Filled probabilistic
   rows become point masses in the existing sparse draft-logit cache, including
-  complete erase metadata for the following step.
+  complete erase metadata for the following step. When a weak match relies on
+  `VLLM_DFLASH2_LOOKUP_AGREE > 0`, the agreeing neural prefix retains its
+  original proposal scores. Only subsequent positions become point masses:
+  conditioning the prefix's own correction on its sampled tokens biases the
+  target distribution. Strong history-only matches and the default agreement
+  threshold of zero retain the existing behavior. See the
+  [numerical audit](sm70_dflash2_fastpath_numerics.md) for the counterexample.
 - Structured-output and prefill batches retain q8 and do not use lookup.
 - The host controller enters q16 only after two consecutive strong copy
   signals. B1 may coast for three steps; batches larger than one never keep

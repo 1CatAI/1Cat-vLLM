@@ -10,6 +10,8 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
+from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -762,6 +764,9 @@ def sparse_attn_indexer_kpool(
                 seq_lens,
                 decode_metadata.block_table,
                 attn_metadata_narrowed.max_seq_len,
+                indexer_decode_cublas=get_forward_context()
+                .no_compile_layers[k_cache_prefix]
+                .sm70_sparse.indexer_decode_cublas,
             )
         else:
             logits = fp8_fp4_paged_mqa_logits(
@@ -844,6 +849,23 @@ def sparse_attn_indexer_kpool(
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
             out = expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+            if (
+                capture_runtime_trace().dflash.coord_exact_one
+                and not diagnostic_history("kpool_coord_trace").get("seen", False)
+                and 1 < out.shape[0] <= 8
+                and positions is not None
+                and int(positions[0].item()) >= target_trace_min_position()
+            ):
+                logger.warning(
+                    "DFLASH_KPOOL_COORD_TRACE positions=%s dec_seq=%s "
+                    "decode_seq_lens=%s pool_topk_prefix=%s out_prefix=%s",
+                    positions[:num_decode_tokens].detach().cpu().tolist(),
+                    dec_seq.detach().cpu().tolist(),
+                    decode_metadata.seq_lens.detach().cpu().tolist(),
+                    pool_topk[:, :8].detach().cpu().tolist(),
+                    out[:, :24].detach().cpu().tolist(),
+                )
+                diagnostic_history("kpool_coord_trace")["seen"] = True
         else:
             out = topk_dst
 

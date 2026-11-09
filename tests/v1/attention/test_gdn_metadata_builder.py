@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
     prepare_dflash2_gdn_group_metadata,
+    select_gdn_state_block_ids,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -107,6 +108,7 @@ def test_mamba_hybrid_passes_seq_lens_cpu_upper_bound(monkeypatch):
     )
     state = object.__new__(MambaHybridModelState)
     state.max_model_len = 4096
+    state._spec_replay = None  # speculative GDN states stored per position
     seq_lens_cpu_upper_bound = torch.tensor([130], dtype=torch.int32)
     input_batch = SimpleNamespace(
         num_reqs=1,
@@ -121,6 +123,7 @@ def test_mamba_hybrid_passes_seq_lens_cpu_upper_bound(monkeypatch):
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         dcp_local_seq_lens=None,
         prefix_anchor_lens=None,
+        is_dummy_batch=False,
     )
     state.prepare_attn(
         input_batch,
@@ -265,6 +268,7 @@ def _create_gdn_builder(
     mamba_cache_mode: str = "none",
     max_cudagraph_capture_size: int = 4,
     device: torch.device = DEVICE,
+    speculative_method: str = "ngram",
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(model_name=model_name, block_size=BLOCK_SIZE)
@@ -284,6 +288,10 @@ def _create_gdn_builder(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
         )
+        # MTP construction normally needs the target/draft model configs. The
+        # metadata-only fixture has no draft model, but the builder only needs
+        # its method and width.
+        vllm_config.speculative_config.method = speculative_method
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
@@ -296,6 +304,20 @@ def _create_gdn_builder(
         vllm_config=vllm_config,
         device=device,
     )
+
+
+def _create_grouped_gdn_builders(model_name, count, **kwargs):
+    """Cache groups of one engine share one configuration/resource owner."""
+    first = _create_gdn_builder(model_name, **kwargs)
+    return [first] + [
+        GDNAttentionMetadataBuilder(
+            kv_cache_spec=first.kv_cache_spec,
+            layer_names=[f"layer.{index}"],
+            vllm_config=first.vllm_config,
+            device=kwargs.get("device", DEVICE),
+        )
+        for index in range(1, count)
+    ]
 
 
 def _clear_envs_cache() -> None:
@@ -311,9 +333,14 @@ def _build(
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
     use_common_metadata: bool = False,
+    is_prefilling: list[bool] | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if is_prefilling is not None:
+        common = common.replace(
+            is_prefilling=torch.tensor(is_prefilling, dtype=torch.bool, device=DEVICE)
+        )
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
         num_decode_draft_tokens_cpu = torch.tensor(
@@ -409,6 +436,97 @@ def test_gdn_build_classification(
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+
+
+@pytest.mark.parametrize("use_full_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    (
+        "num_speculative_tokens",
+        "query_len",
+        "seq_len",
+        "is_prefilling",
+        "expected_prefills",
+        "expected_initial_state",
+    ),
+    [
+        pytest.param(7, 1, 1, True, 1, [False], id="fresh-singleton"),
+        pytest.param(7, 1, 17, True, 1, [True], id="cached-singleton-extension"),
+        pytest.param(7, 1, 17, False, 0, None, id="regular-decode"),
+        pytest.param(7, 2, 2, True, 1, [False], id="two-token-prefill"),
+        pytest.param(7, 17, 17, True, 1, [False], id="longer-prefill"),
+        pytest.param(7, 1, 1, None, 0, None, id="legacy-metadata"),
+        pytest.param(0, 1, 1, True, 0, None, id="non-speculative-unchanged"),
+    ],
+)
+def test_singleton_prefill_state_initialization(
+    local_gdn_model: str,
+    use_full_cuda_graph: bool,
+    num_speculative_tokens: int,
+    query_len: int,
+    seq_len: int,
+    is_prefilling: bool | None,
+    expected_prefills: int,
+    expected_initial_state: list[bool] | None,
+):
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=num_speculative_tokens,
+        use_full_cuda_graph=use_full_cuda_graph,
+        max_cudagraph_capture_size=8,
+    )
+    meta = _build(
+        builder,
+        BatchSpec(seq_lens=[seq_len], query_lens=[query_len]),
+        num_decode_draft_tokens=[-1] if num_speculative_tokens else None,
+        is_prefilling=None if is_prefilling is None else [is_prefilling],
+    )
+
+    assert meta.num_spec_decodes == 0
+    assert meta.num_prefills == expected_prefills
+    assert meta.num_decodes == 1 - expected_prefills
+    assert meta.num_prefill_tokens == query_len * expected_prefills
+    if expected_initial_state is None:
+        assert meta.has_initial_state is None
+    else:
+        assert meta.has_initial_state is not None
+        assert meta.has_initial_state.tolist() == expected_initial_state
+
+
+@pytest.mark.parametrize("poison", [10.0, float("nan")], ids=["recycled", "nan"])
+def test_singleton_prefill_masks_recycled_conv_state(local_gdn_model: str, poison):
+    from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
+        causal_conv1d_torch,
+    )
+
+    builder = _create_gdn_builder(local_gdn_model, num_speculative_tokens=7)
+    meta = _build(
+        builder,
+        BatchSpec(seq_lens=[1], query_lens=[1]),
+        num_decode_draft_tokens=[-1],
+        is_prefilling=[True],
+    )
+    assert meta.num_prefills == 1
+    assert meta.has_initial_state is not None
+    assert meta.non_spec_query_start_loc is not None
+    assert meta.non_spec_state_indices_tensor is not None
+    states = torch.full((1, 1, 3), poison, dtype=torch.float32, device=DEVICE)
+    output = causal_conv1d_torch(
+        x=torch.ones((1, 1), dtype=torch.float32, device=DEVICE),
+        weight=torch.ones((1, 4), dtype=torch.float32, device=DEVICE),
+        bias=None,
+        conv_states=states,
+        query_start_loc=meta.non_spec_query_start_loc,
+        cache_indices=torch.zeros_like(meta.non_spec_state_indices_tensor),
+        has_initial_state=meta.has_initial_state,
+        activation=None,
+    )
+    torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
+    torch.testing.assert_close(
+        states,
+        torch.tensor([[[0.0, 0.0, 1.0]]], device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -583,6 +701,64 @@ def test_common_gdn_metadata_matches_full_graph_padding(local_gdn_model):
     _assert_gdn_metadata_equal(actual, expected)
 
 
+@pytest.mark.parametrize("num_spec", [1, 2, 3, 4])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_mtp_shared_gdn_metadata_matches_legacy(local_gdn_model, num_spec, mixed):
+    """Shared native-MTP batch metadata matches per-group builds at any depth."""
+    if mixed:
+        seq_lens = [17, 32, 17]
+        query_lens = [num_spec + 1, 1, num_spec + 1]
+        drafts = [num_spec, -1, num_spec]
+        graph_tokens = 16
+    else:
+        seq_lens, query_lens, drafts, graph_tokens = [17], [num_spec + 1], [num_spec], 8
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=num_spec,
+            use_full_cuda_graph=True,
+            mamba_cache_mode="align",
+            max_cudagraph_capture_size=16,
+            speculative_method="mtp",
+        )
+        for _ in range(2)
+    ]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=seq_lens, query_lens=query_lens), BLOCK_SIZE, DEVICE
+    ).replace(
+        block_table_tensor=torch.arange(
+            len(seq_lens) * 6, dtype=torch.int32, device=DEVICE
+        ).reshape(len(seq_lens), 6),
+        num_actual_tokens=graph_tokens,
+    )
+    draft_cpu = torch.tensor(drafts, dtype=torch.int32)
+    accepted = torch.ones(len(drafts), dtype=torch.int32, device=DEVICE)
+    expected = builders[0].build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=draft_cpu,
+    )
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=draft_cpu,
+        query_start_loc=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        num_spec_state_tokens=num_spec,
+        legacy_mixed_decode_routing=(
+            qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+        ),
+    )
+    assert common_metadata is not None
+    actual = builders[1].build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=draft_cpu,
+        common_gdn_metadata=common_metadata,
+    )
+    _assert_gdn_metadata_equal(actual, expected)
+
+
 def test_prepared_dflash2_metadata_belongs_to_exact_builder(local_gdn_model):
     builder = _create_gdn_builder(
         local_gdn_model,
@@ -660,8 +836,8 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the fused GDN metadata kernel")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (7, 0):
-        pytest.skip("the fused GDN metadata kernel is SM70-only")
+    if torch.cuda.get_device_capability(device)[0] != 7:
+        pytest.skip("the fused GDN metadata kernel is SM7x-only")
 
     # The accepted DFlash2 verifier keeps the legacy spec-core operator off.
     # Fused metadata must therefore own its graph-stable buffers independently.
@@ -670,16 +846,14 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
     qwen_gdn.envs.disable_envs_cache()
 
-    builders = [
-        _create_gdn_builder(
-            local_gdn_model,
-            num_speculative_tokens=7,
-            use_full_cuda_graph=True,
-            max_cudagraph_capture_size=16,
-            device=device,
-        )
-        for _ in range(2)
-    ]
+    builders = _create_grouped_gdn_builders(
+        local_gdn_model,
+        2,
+        num_speculative_tokens=7,
+        use_full_cuda_graph=True,
+        max_cudagraph_capture_size=16,
+        device=device,
+    )
     width = builders[0].num_spec_state_tokens + 1
     assert width == 8
     query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
@@ -811,25 +985,23 @@ def test_dflash2_fused_gdn_group_metadata_align_replay(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the fused GDN metadata kernel")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (7, 0):
-        pytest.skip("the fused GDN metadata kernel is SM70-only")
+    if torch.cuda.get_device_capability(device)[0] != 7:
+        pytest.skip("the fused GDN metadata kernel is SM7x-only")
 
     monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
     monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "1")
     monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
     qwen_gdn.envs.disable_envs_cache()
 
-    builders = [
-        _create_gdn_builder(
-            local_gdn_model,
-            num_speculative_tokens=7,
-            use_full_cuda_graph=True,
-            mamba_cache_mode="align",
-            max_cudagraph_capture_size=16,
-            device=device,
-        )
-        for _ in range(2)
-    ]
+    builders = _create_grouped_gdn_builders(
+        local_gdn_model,
+        2,
+        num_speculative_tokens=7,
+        use_full_cuda_graph=True,
+        mamba_cache_mode="align",
+        max_cudagraph_capture_size=16,
+        device=device,
+    )
     width = builders[0].num_spec_state_tokens + 1
     query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
     common_metadata = compute_common_gdn_attn_metadata(
@@ -946,6 +1118,117 @@ def test_dflash2_fused_gdn_group_metadata_align_replay(
         )
 
 
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+@pytest.mark.parametrize(
+    ("num_spec", "query_len"),
+    [(num_spec, q) for num_spec in (1, 2, 3, 4) for q in range(2, num_spec + 2)],
+)
+def test_mtp_fused_gdn_group_metadata_matches_legacy_replay(
+    monkeypatch, local_gdn_model, cache_mode, num_spec, query_len
+):
+    """Fused native-MTP state rows match per-group builds at any depth."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the fused GDN metadata kernel")
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device)[0] != 7:
+        pytest.skip("the fused GDN metadata kernel is SM7x-only")
+
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0")
+    monkeypatch.delenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", raising=False)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
+    qwen_gdn.envs.disable_envs_cache()
+
+    def make_builder():
+        return _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=num_spec,
+            use_full_cuda_graph=True,
+            mamba_cache_mode=cache_mode,
+            max_cudagraph_capture_size=32,
+            device=device,
+            speculative_method="mtp",
+        )
+
+    legacy_builders = [make_builder() for _ in range(3)]
+    first_fused = make_builder()
+    fused_builders = [first_fused] + [
+        GDNAttentionMetadataBuilder(
+            kv_cache_spec=first_fused.kv_cache_spec,
+            layer_names=[f"layer.{i}"],
+            vllm_config=first_fused.vllm_config,
+            device=device,
+        )
+        for i in range(1, 3)
+    ]
+    assert all(b._ddtree_fast_common_buffers is not None for b in fused_builders)
+    seq_lens = torch.tensor([16, 17, 63], dtype=torch.int32, device=device)
+    query_start_loc = torch.arange(
+        0, 4 * query_len, query_len, dtype=torch.int32, device=device
+    )
+    query_start_loc_cpu = query_start_loc.cpu()
+    draft_cpu = torch.full((3,), query_len - 1, dtype=torch.int32)
+    accepted = torch.tensor(
+        [1, min(3, query_len), query_len], dtype=torch.int32, device=device
+    )
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=draft_cpu,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        num_spec_state_tokens=num_spec,
+        legacy_mixed_decode_routing=False,
+    )
+    assert common_metadata is not None
+    tables = tuple(
+        torch.arange(3 * 8, dtype=torch.int32, device=device).reshape(3, 8)
+        + group_id * 100
+        for group_id in range(3)
+    )
+    descriptor = None
+    for new_seq_lens, new_accepted in (
+        ([16, 17, 63], [1, min(3, query_len), query_len]),
+        ([31, 32, 48], [query_len, 1, min(4, query_len)]),
+    ):
+        seq_lens.copy_(torch.tensor(new_seq_lens, dtype=torch.int32, device=device))
+        accepted.copy_(torch.tensor(new_accepted, dtype=torch.int32, device=device))
+        expected = []
+        for builder, table in zip(legacy_builders, tables, strict=True):
+            common = create_common_attn_metadata(
+                BatchSpec(seq_lens=new_seq_lens, query_lens=[query_len] * 3),
+                BLOCK_SIZE,
+                device,
+            ).replace(block_table_tensor=table, num_actual_tokens=16)
+            expected.append(
+                builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                    num_accepted_tokens=accepted,
+                    num_decode_draft_tokens_cpu=draft_cpu,
+                )
+            )
+        result = prepare_dflash2_gdn_group_metadata(
+            builders_by_group=list(enumerate(fused_builders)),
+            block_tables=tables,
+            common_gdn_metadata=common_metadata,
+            num_accepted_tokens=accepted,
+            num_actual_tokens=16,
+            descriptor=descriptor,
+            seq_lens=seq_lens if cache_mode == "align" else None,
+            enable_mtp4=True,
+        )
+        assert result is not None
+        actual_by_builder, new_descriptor = result
+        if descriptor is not None:
+            assert new_descriptor is descriptor
+        descriptor = new_descriptor
+        for builder, expected_metadata in zip(fused_builders, expected, strict=True):
+            _assert_gdn_metadata_equal(
+                actual_by_builder[id(builder)], expected_metadata
+            )
+        for table in tables:
+            table.add_(1000)
+
+
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):
     builder = _create_gdn_builder(
         local_gdn_model,
@@ -960,6 +1243,62 @@ def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model
 
     assert meta.num_decodes == 1
     assert meta.num_spec_decodes == 0
+
+
+@pytest.mark.parametrize("query_len", range(1, 9))
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+def test_dflash_tail_capture_matches_runtime_metadata(
+    local_gdn_model, query_len, cache_mode
+):
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=7,
+            use_full_cuda_graph=True,
+            mamba_cache_mode=cache_mode,
+            max_cudagraph_capture_size=8,
+        )
+        for _ in range(2)
+    ]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[262143], query_lens=[query_len]), BLOCK_SIZE, DEVICE
+    ).replace(
+        block_table_tensor=torch.arange(
+            10, 10 + 262144 // BLOCK_SIZE + 8, dtype=torch.int32
+        ).reshape(1, -1)
+    )
+    drafts = torch.tensor([-1 if query_len == 1 else query_len - 1])
+    runtime_kwargs = dict(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=torch.tensor([query_len], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=drafts,
+        common_gdn_metadata=compute_common_gdn_attn_metadata(
+            num_decode_draft_tokens_cpu=drafts,
+            query_start_loc=common.query_start_loc,
+            query_start_loc_cpu=common.query_start_loc_cpu,
+            num_spec_state_tokens=7,
+            legacy_mixed_decode_routing=False,
+        ),
+    )
+    runtime = builders[0].build(**runtime_kwargs)
+    captured = builders[1].build_for_cudagraph_capture(common)
+    # Capture deliberately poisons state indices. Runtime preparation must
+    # refresh the same storage referenced by the captured graph.
+    tensor = (
+        captured.non_spec_state_indices_tensor
+        if query_len == 1
+        else captured.spec_state_indices_tensor
+    )
+    pointer = tensor.data_ptr()
+    refreshed = builders[1].build(**runtime_kwargs)
+    refreshed_tensor = (
+        refreshed.non_spec_state_indices_tensor
+        if query_len == 1
+        else refreshed.spec_state_indices_tensor
+    )
+    assert refreshed_tensor.data_ptr() == pointer
+    _assert_gdn_metadata_equal(captured, runtime)
 
 
 def test_full_cuda_graph_capture_keeps_spec_state_selector(local_gdn_model):
@@ -1191,6 +1530,56 @@ def test_align_cache_mixed_non_spec_uses_legacy_current_state_slot0(
     assert meta.non_spec_state_indices_tensor.tolist() == [30]
 
 
+@pytest.mark.parametrize(
+    "mask_values",
+    [[True], [True] * 5, [True, False, True], [False], [False] * 3],
+)
+@pytest.mark.parametrize("device_name", ["cpu", "cuda:0"])
+def test_active_align_state_selection_matches_masked_copy(
+    mask_values: list[bool], device_name: str
+) -> None:
+    if device_name.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    device = torch.device(device_name)
+    count = len(mask_values)
+    mask_cpu = torch.tensor(mask_values, dtype=torch.bool)
+    mask = mask_cpu.to(device)
+    block = torch.arange(count * 8, device=device, dtype=torch.int32).reshape(count, 8)
+    accepted = torch.arange(1, count + 1, device=device, dtype=torch.int32)
+    selectors = accepted.flip(0).contiguous()
+    result = build_gdn_spec_decode_state_contract(
+        block_table_tensor=block,
+        seq_lens=torch.full((count,), 32, device=device, dtype=torch.int32),
+        block_size=16,
+        num_spec=4,
+        spec_sequence_masks_cpu=mask_cpu,
+        num_accepted_tokens=accepted,
+        current_state_block_ids=None,
+        is_mamba_cache_all=False,
+        spec_state_slot_selectors=selectors,
+    )
+    expected = (
+        block[mask, :5],
+        select_gdn_state_block_ids(block[~mask], accepted[~mask], 4),
+        accepted[mask],
+        selectors[mask],
+    )
+    actual = (
+        result.spec_state_indices_tensor,
+        result.non_spec_state_indices_tensor,
+        result.num_accepted_tokens,
+        result.spec_state_slot_selectors,
+    )
+    for observed, reference in zip(actual, expected, strict=True):
+        assert observed is not None
+        assert torch.equal(observed, reference)
+        assert observed.is_contiguous() == reference.is_contiguous()
+    assert result.spec_state_indices_tensor is not None
+    assert result.spec_state_indices_tensor.data_ptr() != block.data_ptr()
+    assert result.num_accepted_tokens is not None
+    assert result.num_accepted_tokens.data_ptr() != accepted.data_ptr()
+
+
 def test_align_active_mtp_rollover_contract_near_block_boundary(
     local_gdn_model,
 ):
@@ -1326,12 +1715,13 @@ def test_spec_core_placeholder_registry_includes_state_slot_selector(
 ):
     monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "1")
 
-    _create_gdn_builder(
+    builder = _create_gdn_builder(
         local_gdn_model,
         num_speculative_tokens=4,
         use_full_cuda_graph=True,
     )
-    tensors = get_registered_gdn_spec_metadata_tensors("layer.0", DEVICE)
+    with set_forward_context(None, builder.vllm_config):
+        tensors = get_registered_gdn_spec_metadata_tensors("layer.0", DEVICE)
 
     assert len(tensors) == 9
     assert tensors[7].numel() > 0
@@ -1429,8 +1819,11 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
             self.conv1d.weight = torch.empty((8, 1, 1), device=DEVICE)
             self.conv1d.bias = torch.empty(8, device=DEVICE)
             self.activation = "silu"
+            self.gdn_policy = builder.gdn_policy
             self.A_log = torch.empty(1)
             self.dt_bias = torch.empty(1)
+            self._spec_replay = False
+            self._replay_stride = 1
 
         def rearrange_mixed_qkv(
             self,
@@ -1442,6 +1835,10 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
 
         def _forward_core(self, **kwargs) -> None:
             raise AssertionError("pure spec_commit should not use metadata fallback")
+
+        def _can_use_sm70_gdn_preprocess(self, *args) -> bool:
+            # This case covers the existing convolution/gating path.
+            return False
 
     def fake_conv_update(
         x,
@@ -1481,7 +1878,9 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
         out = torch.full((1, mixed_qkv.shape[0], 1, 1), 7.0, device=DEVICE)
         return out, None
 
-    monkeypatch.setattr(qwen_gdn, "causal_conv1d_update", fake_conv_update)
+    from vllm.model_executor.layers.fla.ops import gdn_stages
+
+    monkeypatch.setattr(gdn_stages, "causal_conv1d_update", fake_conv_update)
     monkeypatch.setattr(qwen_gdn, "fused_gdn_gating", fake_gating)
     monkeypatch.setattr(
         qwen_gdn,
@@ -1671,6 +2070,7 @@ def test_sm70_qwen_gdn_003_spec_core_route_has_priority(
     )
 
     class FakeSelf:
+        gdn_policy = spec_builder.gdn_policy
         auto_sm70_qwen_gdn_003_spec_core = True
         auto_sm70_qwen_gdn_spec_core = True
         auto_sm70_qwen_gdn_full_forward = True
@@ -1780,6 +2180,7 @@ def test_sm70_qwen_gdn_spec_commit_route_is_compile_stable(
     )
 
     class FakeSelf:
+        gdn_policy = regular_builder.gdn_policy
         auto_sm70_qwen_gdn_003_spec_core = False
         auto_sm70_qwen_gdn_spec_core = True
         auto_sm70_qwen_gdn_full_forward = False

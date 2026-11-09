@@ -7,6 +7,7 @@ from vllm.utils.torch_utils import (
     common_broadcastable_dtype,
     current_stream,
     is_lossless_cast,
+    set_high_precision_cuda_matmul_defaults,
 )
 
 
@@ -114,3 +115,60 @@ def test_current_stream_multithread():
     )
 
     _test_stream_thread(main_dedicated_stream)
+
+
+@pytest.mark.parametrize(
+    "initial_split_k,override", [(False, None), (True, None), (True, False)]
+)
+def test_high_precision_cuda_matmul_defaults(monkeypatch, initial_split_k, override):
+    # Configure the real backend policy without initializing a CUDA device.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    matmul = torch.backends.cuda.matmul
+    names = (
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+    )
+    saved: dict[str, bool | tuple[bool, bool]] = {}
+    for name in names:
+        old = getattr(matmul, name)
+        if hasattr(matmul, f"{name}_split_k"):
+            old = (old, getattr(matmul, f"{name}_split_k"))
+        saved[name] = old
+    old_accumulation = getattr(matmul, "allow_fp16_accumulation", None)
+    try:
+        for name in names:
+            value: bool | tuple[bool, bool] = True
+            if hasattr(matmul, f"{name}_split_k"):
+                value = (initial_split_k, initial_split_k)
+            setattr(matmul, name, value)
+        if old_accumulation is not None:
+            matmul.allow_fp16_accumulation = True
+        if override is None:
+            set_high_precision_cuda_matmul_defaults()
+        else:
+            set_high_precision_cuda_matmul_defaults(allow_split_k=override)
+        for name in names:
+            assert getattr(matmul, name) is False
+            if hasattr(matmul, f"{name}_split_k"):
+                expected = initial_split_k if override is None else override
+                assert getattr(matmul, f"{name}_split_k") is expected
+        if old_accumulation is not None:
+            assert matmul.allow_fp16_accumulation is False
+    finally:
+        for name, setting in saved.items():
+            setattr(matmul, name, setting)
+        if old_accumulation is not None:
+            matmul.allow_fp16_accumulation = old_accumulation
+
+
+def test_high_precision_cuda_matmul_defaults_without_cuda(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.utils import torch_utils
+
+    cuda = Mock()
+    cuda.is_available.return_value = False
+    torch_stub = Mock(cuda=cuda)
+    monkeypatch.setattr(torch_utils, "torch", torch_stub)
+    set_high_precision_cuda_matmul_defaults()
+    assert not torch_stub.backends.mock_calls

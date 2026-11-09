@@ -7,6 +7,9 @@
 
 namespace turbomind::gemm {
 
+// One-to-one replacement, outside the ordinary tuning/import registry.
+Kernel* Sm70Nvfp4PrescaledCounterpart(const Kernel& control);
+
 class Registry {
 public:
     explicit Registry(std::shared_ptr<cudaDeviceProp> device_prop);

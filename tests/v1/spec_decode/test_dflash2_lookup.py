@@ -164,6 +164,150 @@ def test_lookup_controller_flag_requires_lookup_and_full_q8_emission() -> None:
     assert output.tolist() == [1, 0, 0]
 
 
+@pytest.mark.parametrize("probabilistic", [False, True])
+@pytest.mark.parametrize("match_length", [4, 6])
+def test_agreement_prefix_retains_its_proposal_distribution(
+    probabilistic: bool, match_length: int
+) -> None:
+    """Only positions after a random lookup decision may become point masses."""
+    k, draft_block, agree_min = 15, 7, 3
+    lookup = torch.arange(k, device="cuda", dtype=torch.int64).view(1, k)
+    draft = lookup.clone()
+    draft[:, agree_min:] += 100
+    use = torch.zeros_like(draft, dtype=torch.int32)
+    hits = torch.zeros((), device="cuda", dtype=torch.int64)
+    fuse_draft(
+        draft,
+        lookup,
+        torch.tensor([match_length], device="cuda", dtype=torch.int32),
+        torch.tensor([k], device="cuda", dtype=torch.int32),
+        use,
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        hits,
+        1,
+        k,
+        draft_block=draft_block,
+        nmin=4,
+        nstrong=6,
+        agree_min=agree_min,
+        probabilistic=probabilistic,
+    )
+    # The repair changes q bookkeeping, not the proposed token sequence.
+    assert torch.equal(draft, lookup)
+    assert torch.all(use[:, agree_min:] == 1)
+    expected_prefix_use = int(not probabilistic or match_length >= 6)
+    assert torch.all(use[:, :agree_min] == expected_prefix_use)
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_agreement_lookup_rejection_preserves_target_distribution(sparse: bool) -> None:
+    """The old point-mass rewrite turned p(A)=0.8 into p(A)=0.7."""
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+        dflash2_sparse_topk_rejection_sample,
+        rejection_sample,
+    )
+
+    num_reqs, steps, vocab_size = 100_000, 2, 32
+    idx = torch.arange(num_reqs, device="cuda", dtype=torch.int32)
+    seeds = idx.to(torch.int64)
+    temperature = torch.ones(num_reqs, device="cuda")
+    positions = torch.arange(steps + 1, device="cuda").repeat(num_reqs) + 100
+    dense_q = torch.full((num_reqs, steps, vocab_size), -float("inf"), device="cuda")
+    dense_q[:, :, :2] = 0.0
+    draft = torch.zeros((num_reqs, steps), device="cuda", dtype=torch.int64)
+    draft[:, 0] = gumbel_sample(
+        dense_q[:, 0],
+        idx,
+        temperature,
+        seeds,
+        positions.view(num_reqs, -1)[:, 0].contiguous(),
+        apply_temperature=False,
+        is_drafting=True,
+    )
+    cached_ids = torch.arange(2, device="cuda").repeat(num_reqs, steps, 1)
+    cached_scores = torch.zeros_like(cached_ids, dtype=torch.float32)
+    use = torch.zeros_like(draft, dtype=torch.int32)
+    fuse_draft(
+        draft,
+        torch.zeros_like(draft),
+        torch.full_like(idx, 4),
+        torch.full_like(idx, steps),
+        use,
+        idx,
+        torch.zeros((), device="cuda", dtype=torch.int64),
+        num_reqs,
+        steps,
+        draft_block=1,
+        nmin=4,
+        nstrong=6,
+        agree_min=1,
+        probabilistic=True,
+    )
+    _point_mass_draft_logits_kernel[(num_reqs * steps,)](
+        dense_q,
+        cached_ids,
+        cached_scores,
+        draft,
+        draft.stride(0),
+        use,
+        idx,
+        1,
+        cached_ids.stride(0),
+        cached_ids.stride(1),
+        dense_q.stride(0),
+        dense_q.stride(1),
+        num_steps=steps,
+        top_k=2,
+        BLOCK_K=2,
+        CACHE_SCORES=True,
+        num_warps=1,
+    )
+    sampled_input = torch.zeros((num_reqs, steps + 1), device="cuda", dtype=torch.int64)
+    sampled_input[:, 1:] = draft
+    cu = torch.arange(num_reqs + 1, device="cuda", dtype=torch.int32) * (steps + 1)
+    target_values = torch.tensor([0.8, 0.2], device="cuda").log()
+    target_values = target_values.repeat(num_reqs * (steps + 1), 1)
+    target_ids = torch.arange(2, device="cuda").expand_as(target_values).contiguous()
+    if sparse:
+        sampled, _ = dflash2_sparse_topk_rejection_sample(
+            target_ids,
+            target_values,
+            cached_ids,
+            cached_scores,
+            sampled_input.flatten(),
+            cu,
+            positions,
+            idx,
+            temperature,
+            torch.ones_like(temperature),
+            seeds,
+            steps,
+        )
+    else:
+        target_dense = torch.full(
+            (num_reqs * (steps + 1), vocab_size), -float("inf"), device="cuda"
+        )
+        target_dense[:, :2] = target_values
+        sampled, _ = rejection_sample(
+            target_dense,
+            dense_q,
+            sampled_input.flatten(),
+            cu,
+            positions,
+            idx,
+            idx.repeat_interleave(steps + 1),
+            torch.arange(steps + 1, device="cuda", dtype=torch.int32).repeat(num_reqs),
+            temperature,
+            seeds,
+            steps,
+        )
+    observed = (sampled[:, 0] == 0).float().mean().item()
+    # Eight standard deviations; the old approximately 0.10 bias is far larger.
+    tolerance = 8 * (0.8 * 0.2 / num_reqs) ** 0.5
+    assert abs(observed - 0.8) < tolerance, observed
+
+
 def test_point_mass_rewrite_preserves_sparse_cache_invariant() -> None:
     device = torch.device("cuda")
     num_steps, top_k, vocab_size = 15, 16, 64

@@ -33,7 +33,6 @@ import torch
 from torch import nn
 from transformers import Qwen2Config
 
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -112,8 +111,6 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def _try_sm70_awq_mlp_engine(self, x):
-        if not envs.VLLM_SM70_AWQ_MLP_ENGINE:
-            return None
         if not getattr(self.gate_up_proj, "_awq_sm70_gated_silu", False):
             return None
         fused_act = getattr(self.gate_up_proj, "forward_fused_silu_and_mul", None)

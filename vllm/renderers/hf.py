@@ -275,6 +275,10 @@ def resolve_chat_template(
         # so that downstream kwargs detection can parse template variables.
         return tokenizer.get_chat_template(chat_template, tools=tools)
 
+    # Standalone GGUF embeds its own template and has no HF processor to query.
+    if getattr(tokenizer, "_vllm_gguf_metadata", False):
+        return tokenizer.get_chat_template(chat_template, tools=tools)
+
     # 2nd priority: AutoProcessor chat template, unless tool calling is enabled
     if tools is None:
         chat_template = _try_get_processor_chat_template(
@@ -448,6 +452,135 @@ def _detect_content_format(
         return default
     else:
         return "openai"
+
+
+@lru_cache(maxsize=32)
+def _detect_developer_role_support(chat_template: str) -> bool:
+    """Require a role declaration and verify that it renders the instruction.
+
+    A quoted word in a comment or an explicit rejection branch is not support.
+    Probe only synthetic text; no request data or tokenizer/network work is
+    involved, and the result is cached per template.
+    """
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    ast = _try_extract_ast(chat_template)
+    if ast is None:
+        return False
+    declared = any(
+        node.value == "developer"
+        for comparison in ast.find_all(jinja2.nodes.Compare)
+        for node in comparison.find_all(jinja2.nodes.Const)
+    )
+    if not declared:
+        return False
+    marker = "vllmDeveloperRoleProbe92847"
+    for structured in (False, True):
+        content = [{"type": "text", "text": marker}] if structured else marker
+        for with_system in (False, True):
+            messages = [{"role": "developer", "content": content}]
+            if with_system:
+                messages.insert(0, {"role": "system", "content": "System probe"})
+            messages.append({"role": "user", "content": "User probe"})
+            try:
+                rendered = _compile_jinja_template(chat_template).render(
+                    messages=messages,
+                    tools=[],
+                    bos_token="",
+                    eos_token="",
+                    add_generation_prompt=False,
+                )
+            except (jinja2.TemplateError, TypeError, ValueError, IndexError):
+                continue
+            if marker in rendered:
+                return True
+    return False
+
+
+def _convert_developer_to_system(
+    conversation: list[ConversationMessage],
+) -> list[ConversationMessage]:
+    converted: list[ConversationMessage] = []
+    for msg in conversation:
+        if msg["role"] == "developer":
+            new_msg = dict(msg)
+            new_msg["role"] = "system"
+            new_msg.pop("tools", None)
+            converted.append(new_msg)  # type: ignore[arg-type]
+        else:
+            converted.append(msg)
+    return converted
+
+
+def _consolidate_system_messages(
+    conversation: list[ConversationMessage],
+) -> list[ConversationMessage]:
+    """Merge all system messages into one at position 0.
+
+    Some chat templates (e.g. Qwen 3.6) require the system message to be the
+    very first message.  After developer-to-system conversion, system messages
+    may appear at non-first positions; this merges them into a single message.
+    """
+    system_messages: list[ConversationMessage] = []
+    non_system: list[ConversationMessage] = []
+    needs_consolidation = False
+    for i, msg in enumerate(conversation):
+        if msg["role"] == "system":
+            if i > 0 or system_messages:
+                needs_consolidation = True
+            system_messages.append(msg)
+        else:
+            non_system.append(msg)
+
+    if not needs_consolidation:
+        return conversation
+
+    contents = [msg.get("content") for msg in system_messages]
+    merged = dict(system_messages[0])
+    for msg in system_messages[1:]:
+        for key, value in msg.items():
+            if key not in ("role", "content"):
+                if key in merged and merged[key] != value:
+                    raise ValueError(
+                        "Cannot consolidate system messages with conflicting metadata"
+                    )
+                merged[key] = value
+    if any(isinstance(content, list) for content in contents):
+        parts: list[dict[str, Any]] = []
+        for content in contents:
+            if not content:
+                continue
+            if parts:
+                parts.append({"type": "text", "text": "\n\n"})
+            if isinstance(content, list):
+                parts.extend(
+                    {"type": "text", "text": part}
+                    if isinstance(part, str)
+                    else copy.deepcopy(part)
+                    for part in content
+                )
+            elif content:
+                parts.append({"type": "text", "text": content})
+        merged["content"] = parts
+    else:
+        merged["content"] = "\n\n".join(
+            content for content in contents if isinstance(content, str) and content
+        )
+    return [cast("ConversationMessage", merged), *non_system]
+
+
+def _normalize_developer_messages(
+    conversation: list[ConversationMessage], chat_template: str | None
+) -> list[ConversationMessage]:
+    if not any(msg["role"] == "developer" for msg in conversation):
+        return conversation
+    if chat_template is None or _detect_developer_role_support(chat_template):
+        return conversation
+    logger.info_once(
+        "Chat template does not support the 'developer' message role. "
+        "Converting developer messages to 'system' role."
+    )
+    return _consolidate_system_messages(_convert_developer_to_system(conversation))
 
 
 def _resolve_chat_template_content_format(
@@ -653,7 +786,7 @@ def safe_apply_chat_template(
             "allowed, so you must provide a chat template if the tokenizer "
             "does not define one."
         )
-
+    conversation = _normalize_developer_messages(conversation, chat_template)
     resolved_kwargs = resolve_chat_template_kwargs(
         tokenizer=tokenizer,
         chat_template=chat_template,
@@ -814,6 +947,26 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 self.tokenizer, config.model_config.renderer_num_workers + 1
             )
 
+    def _prepare_developer_messages(
+        self, messages: list[ChatCompletionMessageParam], params: ChatParams
+    ) -> list[ChatCompletionMessageParam]:
+        if not any(msg["role"] == "developer" for msg in messages):
+            return messages
+        template = resolve_chat_template(
+            self.get_tokenizer(),
+            params.chat_template,
+            tools=params.chat_template_kwargs.get("tools"),
+            model_config=self.model_config,
+        )
+        # Normalize before multimodal parsing so moved placeholders and the
+        # tracker/UUID data retain the same order in sync and async rendering.
+        return cast(
+            "list[ChatCompletionMessageParam]",
+            _normalize_developer_messages(
+                cast("list[ConversationMessage]", messages), template
+            ),
+        )
+
     def render_messages(
         self,
         messages: list[ChatCompletionMessageParam],
@@ -828,6 +981,7 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 _ensure_prompt_embeds_placeholder_token(tokenizer)
             )
 
+        messages = self._prepare_developer_messages(messages, params)
         conversation, mm_data, mm_uuids = parse_chat_messages(
             messages,
             model_config,
@@ -935,6 +1089,7 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 _ensure_prompt_embeds_placeholder_token(tokenizer)
             )
 
+        messages = self._prepare_developer_messages(messages, params)
         conversation, mm_data, mm_uuids = await parse_chat_messages_async(
             messages,
             model_config,

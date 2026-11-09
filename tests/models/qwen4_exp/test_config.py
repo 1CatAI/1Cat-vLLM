@@ -43,7 +43,9 @@ def test_sm70_v2_route_accepts_prefix_caching(
             multimodal_config=SimpleNamespace(language_model_only=True),
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=True),
-        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, ubatch_size=1, decode_context_parallel_size=1
+        ),
         speculative_config=None,
         use_v2_model_runner=True,
     )
@@ -53,7 +55,8 @@ def test_sm70_v2_route_accepts_prefix_caching(
     assert "mrope_interleaved" not in vllm_config.model_config.hf_config.rope_parameters
 
 
-def test_initial_sm70_route_rejects_multimodal_tower(
+@pytest.mark.skip_global_cleanup
+def test_sm70_route_accepts_multimodal_tower_and_preserves_mrope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -75,12 +78,15 @@ def test_initial_sm70_route_rejects_multimodal_tower(
             multimodal_config=multimodal_config,
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
-        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, ubatch_size=1, decode_context_parallel_size=1
+        ),
         speculative_config=None,
     )
 
-    with pytest.raises(NotImplementedError, match="--language-model-only"):
-        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+    Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+    assert text_config.rope_parameters == {"mrope_section": [11, 11, 10]}
 
 
 @pytest.mark.parametrize(
@@ -102,6 +108,24 @@ def test_qwen4_exp_defaults_to_v2_even_when_quantized_moe(
     assert VllmConfig._is_default_v2_model_runner_model(vllm_config)
 
 
+def test_qwen4_exp_rejects_explicit_v1_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.config.vllm.envs.VLLM_USE_V2_MODEL_RUNNER",
+        False,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=None,
+        model_config=SimpleNamespace(
+            architectures=["Qwen4ExpForCausalLM"],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires Model Runner V2"):
+        VllmConfig.use_v2_model_runner.fget(vllm_config)
+
+
 def test_initial_sm70_v2_route_accepts_native_mtp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -120,7 +144,9 @@ def test_initial_sm70_v2_route_accepts_native_mtp(
             multimodal_config=None,
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
-        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, ubatch_size=1, decode_context_parallel_size=1
+        ),
         speculative_config=SimpleNamespace(method="mtp"),
     )
 
@@ -145,7 +171,9 @@ def test_initial_sm70_v2_route_rejects_unvalidated_speculator(
             multimodal_config=None,
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
-        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, ubatch_size=1, decode_context_parallel_size=1
+        ),
         speculative_config=SimpleNamespace(method="dflash"),
     )
 
@@ -171,6 +199,11 @@ def test_qwen4_exp_v2_model_state_uses_committed_ngram_context() -> None:
     model_state.ngram_context = torch.empty((4, 3), dtype=torch.int32)
     model_state.ngram_context_offsets = torch.arange(-3, 0, dtype=torch.int64)
     model_state.ple_query_start_loc = torch.empty(5, dtype=torch.int32)
+    # Admission state read by prepare_inputs since #988; keep the torch path.
+    model_state._ple_kernel_config = SimpleNamespace(
+        ple_input_prepare=False, ple_input_preparations={}
+    )
+    model_state._ple_input_hardware = False
 
     input_batch = SimpleNamespace(
         num_reqs=2,
@@ -294,3 +327,28 @@ def test_qwen4_exp_qsa_uses_private_mrope_signature(
     assert calls == [
         (torch.Size([3, 2, 2]), torch.Size([3, 2, 2]), [1, 0, 0], 4, 2, True)
     ]
+
+
+@pytest.mark.parametrize("language_model_only", [True, False])
+def test_sm70_decode_lane_covers_vision_wrapper(language_model_only: bool) -> None:
+    from vllm.model_executor.models.runtime_defaults import (
+        _is_sm70_qwen38_decode_compile_contract,
+    )
+
+    model_config = SimpleNamespace(
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        multimodal_config=SimpleNamespace(language_model_only=language_model_only),
+        dtype=torch.float16,
+    )
+    assert _is_sm70_qwen38_decode_compile_contract(
+        model_config, None, SimpleNamespace()
+    )
+    model_config.dtype = torch.bfloat16
+    assert not _is_sm70_qwen38_decode_compile_contract(
+        model_config, None, SimpleNamespace()
+    )
+    model_config.dtype = torch.float16
+    model_config.multimodal_config = None
+    assert not _is_sm70_qwen38_decode_compile_contract(
+        model_config, None, SimpleNamespace()
+    )

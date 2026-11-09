@@ -59,6 +59,7 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.config import ParallelConfig
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -172,6 +173,33 @@ def sm70_tp2_all_reduce_gemma_rms_norm(
 
 
 def sm70_tp2_all_reduce_gemma_rms_norm_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight, epsilon, group_name
+    return torch.empty_like(tensor), torch.empty_like(residual, dtype=torch.float32)
+
+
+def sm70_tp4_all_reduce_gemma_rms_norm(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._sm70_tp4_all_reduce_gemma_rms_norm_out_place(
+        tensor, residual, weight, epsilon
+    )
+
+
+def sm70_tp4_all_reduce_gemma_rms_norm_fake(
     tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -399,6 +427,12 @@ direct_register_custom_op(
 )
 
 direct_register_custom_op(
+    op_name="sm70_tp4_all_reduce_gemma_rms_norm",
+    op_func=sm70_tp4_all_reduce_gemma_rms_norm,
+    fake_impl=sm70_tp4_all_reduce_gemma_rms_norm_fake,
+)
+
+direct_register_custom_op(
     op_name="sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather",
     op_func=sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather,
     fake_impl=sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather_fake,
@@ -476,6 +510,8 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
+        from vllm.config.execution_policy import communication_policy
+
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
@@ -486,13 +522,27 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
-        from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
+        from vllm.distributed.utils import (
+            get_cpu_distributed_timeout_or_none,
+            get_distributed_timeout_or_none,
+        )
 
         timeout = get_cpu_distributed_timeout_or_none()
+        # --distributed-timeout-seconds reaches init_process_group (the world
+        # group) and the gloo CPU groups, but the NCCL subgroups were created
+        # without it, so TP and PP silently kept PyTorch's 600 s default. On a
+        # cold boot under pipeline parallelism the first stage compiles Triton
+        # kernels for minutes while the next stage sits in its receive; the
+        # watchdog then kills the waiting rank and the boot dies at a timeout
+        # instead of an error. The subgroups follow the configured value;
+        # unset keeps PyTorch's default.
+        self._device_group_timeout = get_distributed_timeout_or_none()
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+                ranks,
+                backend=torch_distributed_backend,
+                timeout=self._device_group_timeout,
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
@@ -510,6 +560,8 @@ class GroupCoordinator:
         assert self_cpu_group is not None
         assert self_device_group is not None
 
+        self.group_ranks = group_ranks
+        self.torch_distributed_backend = torch_distributed_backend
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
 
@@ -542,7 +594,7 @@ class GroupCoordinator:
         self.mq_broadcaster: MessageQueue | None = None
         if use_message_queue_broadcaster and self.world_size > 1:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS
+                self.cpu_group, 1 << 22, communication_policy().mq_max_chunks
             )
 
         # TODO(#35915): Remove is_tpu() check once tpu_inference
@@ -557,15 +609,31 @@ class GroupCoordinator:
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
 
+    def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
+        """Create a distinct device communicator with identical membership."""
+        sibling: ProcessGroup | None = None
+        for ranks in self.group_ranks:
+            group = torch.distributed.new_group(
+                ranks,
+                backend=self.torch_distributed_backend,
+                timeout=self._device_group_timeout,
+                group_desc=group_desc,
+            )
+            if self.rank in ranks:
+                sibling = group
+        assert sibling is not None
+        return sibling
+
     def create_mq_broadcaster(
         self, writer_rank=0, external_writer_handle=None, blocking=True
     ):
+        from vllm.config.execution_policy import communication_policy
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
         return MessageQueue.create_from_process_group(
             self.cpu_group,
             1 << 22,
-            envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS,
+            communication_policy().mq_max_chunks,
             writer_rank=writer_rank,
             external_writer_handle=external_writer_handle,
             blocking=blocking,
@@ -574,12 +642,13 @@ class GroupCoordinator:
     def create_single_reader_mq_broadcasters(
         self, reader_rank_in_group=0, blocking=False
     ):
+        from vllm.config.execution_policy import communication_policy
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
         return MessageQueue.create_from_process_group_single_reader(
             self.cpu_group,
             1 << 22,
-            envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS,
+            communication_policy().mq_max_chunks,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
         )
@@ -722,6 +791,24 @@ class GroupCoordinator:
         fused_op = getattr(
             self.device_communicator,
             "sm70_tp2_all_reduce_gemma_rms_norm",
+            None,
+        )
+        if fused_op is None:
+            raise RuntimeError("Device communicator lacks SM70 fused AR RMSNorm")
+        return fused_op(input_, residual, weight, epsilon)
+
+    def _sm70_tp4_all_reduce_gemma_rms_norm_out_place(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        fused_op = getattr(
+            self.device_communicator,
+            "sm70_tp4_all_reduce_gemma_rms_norm",
             None,
         )
         if fused_op is None:
@@ -1663,7 +1750,7 @@ def get_pcp_group() -> GroupCoordinator:
 
 
 @contextmanager
-def graph_capture(device: torch.device):
+def graph_capture(device: torch.device, context: GraphCaptureContext | None = None):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that some
@@ -1677,7 +1764,8 @@ def graph_capture(device: torch.device):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    context = GraphCaptureContext(torch.cuda.Stream(device=device))
+    if context is None:
+        context = GraphCaptureContext(torch.cuda.Stream(device=device))
     with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
         yield context
 
@@ -1861,6 +1949,16 @@ def init_distributed_environment(
             )
         else:
             _INNER_DP_WORLD = _WORLD
+
+
+def _ep_device_communicator_required(parallel_config: "ParallelConfig") -> bool:
+    """TP-only MoE uses TP collectives and only EP membership metadata."""
+    return bool(
+        parallel_config.enable_expert_parallel
+        or parallel_config.data_parallel_size > 1
+        or parallel_config.prefill_context_parallel_size > 1
+        or parallel_config.enable_eplb
+    )
 
 
 def initialize_model_parallel(
@@ -2064,8 +2162,21 @@ def initialize_model_parallel(
             )
         else:
             _EP = init_model_parallel_group(
-                group_ranks, get_world_group().local_rank, backend, group_name="ep"
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_device_communicator=_ep_device_communicator_required(
+                    parallel_config
+                ),
+                group_name="ep",
             )
+
+        if not _EP.use_device_communicator:
+            config.kernel_config.collective_kernel_selections[_EP.unique_name] = {
+                "enabled": False,
+                "reason": "tp_only_moe_uses_tp_collectives",
+                "scope": "group_device_communicator",
+            }
 
         # Create EPLB group with the same ranks as EP if EPLB is enabled.
         # This is a separate process group to isolate EPLB communications
@@ -2440,6 +2551,26 @@ def is_global_first_rank() -> bool:
     except Exception:
         # If anything goes wrong, assume this is the first rank
         return True
+
+
+def is_last_pp_first_tp_rank() -> bool:
+    """
+    Check if the current process is the first tensor-parallel rank of the
+    last pipeline-parallel stage.
+
+    Sampling and speculative decoding only run on the last PP stage, so
+    per-step reports about them have to be emitted from that stage; the
+    global first rank (see `is_global_first_rank`) is never on it when
+    PP > 1.
+
+    Returns:
+        bool: True on the first TP rank of the last PP stage. Returns True
+              if the model-parallel groups are not initialized
+              (single process).
+    """
+    if _PP is None or _TP is None:
+        return True
+    return _PP.is_last_rank and _TP.rank_in_group == 0
 
 
 def is_local_first_rank() -> bool:

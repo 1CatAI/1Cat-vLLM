@@ -705,6 +705,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 routing_tables=layer._expert_routing_tables(),
                 layer=layer,
             )
+            if self.mxfp4_backend == Mxfp4MoeBackend.SM70_SKINNY:
+                # The skinny experts re-permute weights and scales in place.
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
         w13 = layer.w13_weight
@@ -716,6 +719,45 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
+
+        if self.mxfp4_backend == Mxfp4MoeBackend.SM70_SKINNY:
+            from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+                rebase_e8m0_for_fp16,
+            )
+
+            try:
+                rebase_e8m0_for_fp16(w13_scale.data, dry_run=True)
+                rebase_e8m0_for_fp16(w2_scale.data, dry_run=True)
+            except ValueError as exc:
+                if self.moe.moe_backend != "auto":
+                    raise
+                from dataclasses import replace
+
+                from vllm.model_executor.layers.quantization import sm70_turbomind
+
+                fallback: FusedMoEMethodBase
+                if sm70_turbomind.is_exact_sm70_cuda_platform():
+                    from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
+                        Mxfp4SM70MoEMethod,
+                    )
+
+                    fallback = Mxfp4SM70MoEMethod(self.moe)
+                else:
+                    fallback = Mxfp4MoEMethod(replace(self.moe, moe_backend="marlin"))
+                reason = f"MXFP4 scale range: {exc}"
+                logger.info_once("Skinny MoE fallback: %s", reason)
+                get_current_vllm_config().kernel_config.moe_kernel_selections[
+                    f"Mxfp4SkinnySm70Experts:{self.moe.hidden_dim}:"
+                    f"{self.moe.intermediate_size_per_partition}"
+                ] = {
+                    "enabled": False,
+                    "reason": reason,
+                    "scope": "loaded_scale_capability",
+                }
+                fallback.process_weights_after_loading(layer)
+                layer._replace_quant_method(fallback)
+                layer.base_quant_method = fallback
+                return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 
@@ -806,14 +848,23 @@ def make_deepseek_v4_mxfp4_moe_method(
 ) -> FusedMoEMethodBase:
     """Construct the DeepSeek-V4 MXFP4 MoE implementation for this device.
 
-    Volta cannot use the upstream CUDA MXFP4 implementations.  It must take
-    the native TurboMind path or fail explicitly: silently falling through to
-    Marlin or an emulation backend would change the deployment contract and
-    duplicate full expert weights.
+    Volta cannot use the upstream CUDA MXFP4 implementations.  It takes the
+    native TurboMind path, or the skinny QPN kernels when
+    ``--moe-backend sm70_skinny`` asks for them, or fails explicitly:
+    silently falling through to Marlin or an emulation backend would change
+    the deployment contract and duplicate full expert weights.
     """
+    # An explicit --moe-backend sm70_skinny serves every SM70/SM75 stage with
+    # the skinny QPN kernels through the backend oracle.
+    from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+        skinny_backend_admitted,
+    )
     from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 
-    if sm70_tm.is_exact_sm70_cuda_platform():
+    use_skinny = moe.moe_backend == "sm70_skinny" or (
+        moe.moe_backend == "auto" and skinny_backend_admitted(moe, mxfp4=True)
+    )
+    if not use_skinny and sm70_tm.is_exact_sm70_cuda_platform():
         if not sm70_tm.should_use_mxfp4_moe_turbomind():
             raise NotImplementedError(
                 "DeepSeek-V4 MXFP4 MoE on SM70 requires the native TurboMind "

@@ -16,6 +16,20 @@ vLLM provides 4 optimization levels (`-O0`, `-O1`, `-O2`, `-O3`) that allow user
 
 For more information, see the [optimization level documentation](../design/optimization_levels.md).
 
+### SM70 Flash-V100 Compilation Defaults
+
+The SM70 Flash-V100 compile-graph and no-compile decode-graph policies only fill
+`compilation_config.mode` and `compilation_config.cudagraph_mode` when the field is
+unset (`None`). Explicit values, including `NONE`, `STOCK_TORCH_COMPILE`, and
+`PIECEWISE`, take precedence over these policy defaults independently.
+With both fields unset, the automatic baseline still selects `VLLM_COMPILE` and
+`FULL_AND_PIECEWISE`; explicitly opting into
+`VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1` selects `NONE` and
+`FULL_DECODE_ONLY` instead.
+The usual `enforce_eager`, compile-disable switches, and configuration
+compatibility checks still apply; preserving a field at the policy stage does
+not make an incompatible compilation/CUDA-graph combination valid.
+
 ## Preemption
 
 Due to the autoregressive nature of transformer architecture, there are times when KV cache space is insufficient to handle all batched requests.

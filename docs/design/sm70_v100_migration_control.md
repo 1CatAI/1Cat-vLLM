@@ -2,6 +2,974 @@
 
 Date: 2026-05-30
 
+## Full-mesh HCX local schedule, 2026-10-09
+
+The Flash-Next TP4 HCX schedule defers up-weight prefetch until combine
+completes, overlaps independent peer loads and stream norm reductions, and
+assigns gate-mix to one warp per row. Persistent counters remove the completion
+arrival/reset phase; acquire/release publication replaces thread-wide barrier
+fences. The arithmetic order is unchanged. Source `71fce5ca51` in the normal
+installed wheel measures 23.753 to 19.013 µs per complete M5 boundary;
+M1 is 18.680 to 14.424 µs and M8 30.525 to 25.927 µs.
+These are boundary measurements with actual weights and synthetic activations,
+not model round latency. Installed-artifact and model results are tracked in
+[the local schedule report](flashnext_hcx_local_schedule.md).
+Both the first fresh-process pair and the subsequent shared-cache comparison
+fail the teacher-distribution gate. The new schedule is explicitly opt-in;
+the Python and native defaults retain the reference schedule. Model promotion
+remains pending repeatable fresh-process validation. The completed same-process
+original/recaptured-reference/candidate/original-again comparisons all pass:
+64/64 logits, eight natural continuations and their acceptance counters are
+identical, with KL zero. A same-artifact fresh-process A/A comparison itself
+has top-1 agreement 63/64 and different natural outputs, so the earlier A/B
+differences do not isolate a native scheduling effect. The underlying startup
+variation remains unresolved. Two symmetric C1 timing blocks give -0.024 and
+-0.771 ms; keep these exploratory and quote the reproducible boundary gain.
+
+Those model results apply to the first-round wheel. V6 source `71fce5ca51`
+passes 73 raw-bit comparisons per rank for every M1–8 shape, including six
+counter-wrap and interleaved-route checks. A separate M5 process measures
+23.737 to 19.004 µs. The V4 model diagnostic was stopped during loading
+at the user's request to prioritize larger kernel scheduling changes; no
+V4–V6 model result is claimed. M5's achieved reduction is about 20%, below the
+requested 30–50% target. Keep the default false and defer full-model work.
+Interleaved up ownership retains norm inputs in the producing CTA and screens
+at 19.804 µs, but is research-only. Raw LoRA-to-register paths, compact
+receiver/consumer pipelines and direct batched polling all regress; do not
+repeat them without a materially different schedule.
+
+The structural reassessment records every warp's phase timing. Norm/partial
+handoffs, grid joins and LoRA staging remain material; up MMA is a small span.
+These are instrumented phase spans, not an additive model latency ledger.
+Three concrete rewrites fail the paired complete-boundary screen against V6:
+joint norm/down exchange with coalesced compact receivers is 21.881 versus
+19.062 µs; one full-K down column per CTA is 24.716 versus 19.005 µs; twenty
+Tensor Core K partitions are 23.093 versus 19.025 µs. Changed-sum-order screens
+are deterministic with maximum relative L2 error 7.07e-5, but are research-only
+and have no model quality gate. Record these failures before trying another
+layout. A real-weight output-projection-plus-HC screen measures 28.481 µs
+for production projection plus V6 and 26.464 µs for fused local scheduling.
+The 2.017-µs saving is measured over the complete chain. This remains a
+research DSO, supports Q4_K/Q6_K with already normalized input, and is not
+part of the installed result or a model speedup. Do not omit producer work
+from the comparison or budget the previous assumed 3.8 µs per fusion.
+
+Source `b0d7af22b5` subsequently adds the local schedule to normal fused
+Q4_K/Q6_K dispatch for already-normalized inputs; gated normalization and
+two-hop paths retain their legacy schedules. Its source-complete `_C` is
+installed in a fresh V7 runtime. The matched M5 production-projection-plus-HC
+chain is 28.505 µs separate, 30.205 µs with the legacy fused schedule, and
+26.395 µs with fused local scheduling: a 2.110-µs (7.4%) complete-chain gain.
+M1 is 23.031 to 20.712 µs; M8 is 35.447 to 32.628 µs. All M1–8 shapes pass
+35 raw-bit eager/graph cases per fused mode per rank, plus 12 counter and
+four fallback comparisons. Poisoned partial outputs rule out stale separate
+producer results. A separate CUDA trace observes both Q4_K/Q6_K selected
+kernel specializations on all four ranks. The unfused M5 regression remains
+18.993 µs, and both unfused SASS variants match V6. This validates native
+operators, not the model layout adapter, quality or latency. Keep the local
+schedule default false and model tests deferred. Identities and raw evidence
+are in [the local schedule report](flashnext_hcx_local_schedule.md).
+
+The 2026-10-10 follow-up targets half the **current** approximately 19-µs
+boundary, or at most approximately 9.5 µs. Five new research screens do not
+reach it. A 94-boundary synthetic recurrent chain, including full block
+delivery every step and full residual delivery at exit, measures 19.350 µs
+per boundary for V6 versus 19.028 for residual carry. Carry saves only
+0.739 µs against the same K-shard arithmetic with materialization every call.
+Its largest changed-chain relative L2 error is 0.001397; this is not a model
+quality gate. Overlapped central norm reduction, earlier mix-input loads,
+per-producer first-join readiness, compact all-row-refresh LoRA packets and
+receiver-only second-join arrivals all regress against their paired V6
+controls. Their raw-bit checks pass. Keep these failures recorded in
+[the local schedule report](flashnext_hcx_local_schedule.md) before reusing
+their layouts. No structural partition candidate is promoted and full-model
+work remains deferred.
+
+Further screens reject full-K Tensor Core column ownership (24.756 / 29.448 µs
+prefetched / streamed versus 19.080 installed), per-M compact LoRA buffers
+(20.289 versus 18.818), and vectorized LoRA staging (22.615 / 20.827 versus
+18.609). Sharing input across four down columns improves the column prototype
+to 21.258 µs from 24.726, but still loses to its 19.016-µs native control.
+Two/eight-column follow-ups take 21.437/22.243 µs against four-column 21.252
+and native 19.094 µs; stop treating wider input reuse as a presumed win.
+The numerical gates pass; changed-tree candidates are not model-qualified.
+An intentionally incorrect-output V6 ablation bypassing weight reads,
+both grid joins and peer waits still measures 13.206 µs against a 19.037-µs
+copied control. It retains arithmetic, intermediate staging and communication
+writes. It is not a usable implementation, an additive cost ledger or a
+rigorous lower bound. The half-current target remains unmet.
+
+The historical approximately 3-ms HC number is 2.9623 ms of profiled target
+HCX service on the earlier two-hop machine, alongside a separate unprofiled
+17.3988-ms model round. It is not the current full-mesh microbenchmark sum.
+At 94 boundaries, 19.004 µs gives a 1.786-ms isolated estimate; less than
+1 ms requires an average below 10.64 µs before draft/remaining HC. Neither
+an under-1-ms HC result nor a new model speedup has been demonstrated.
+
+Do not repeat the K-shard implementations as presumed wins: a centralized
+receiver takes 77–82 µs; distributed receivers take 44–48 µs versus a 23.7-µs
+control, including delivery of the complete residual state. Last-arrival norm
+reduction, grouped partial layouts and a smaller barrier arrival set also
+failed to produce an additional gain. The CTA-local norm cache helps slightly
+alone but loses when combined with the retained schedule, so it is omitted.
+
+## Pre-release packaging and video cancellation fixes, 2026-09-29
+
+The release audit against main `357d07bcb0ee` reproduced three P2 issues:
+precompiled reuse omitted the SM70 sparse-attention extension, full-CPython-ABI
+extensions could be labelled `cp38-abi3`, and cancelling queued video jobs
+retained uploaded references. Reuse now includes the sparse-attention library;
+wheel tags account for both extension declarations and precompiled package
+data; queued cancellation cleans request-owned inputs before returning.
+
+The focused packaging, Docker metadata, H3 host-memory and API suites pass
+67 tests, with two GPU tests skipped. All applicable pre-commit hooks pass.
+A tiny C-extension fixture also passes source wheel build, extraction,
+repackaging, installation and import in a fresh process: both wheels use
+`cp312-cp312`, retain the native file and reject CPython 3.11 compatibility.
+This is packaging evidence, not a full CUDA wheel or model qualification.
+Raw before/after logs and fixture hashes are retained in the
+`release-audit-20260928` evidence directory as `p2-*` artifacts. No inference
+kernel, benchmark threshold or performance claim changes in this patch.
+
+## DFlash2 concurrent long decode follow-up, 2026-09-27
+
+Against main `1e90d17f` (PR #697), the new default candidate reaches the
+requested C4/C8 32K/256 pure-decode target: 377.689 -> 436.004 tok/s (+15.44%)
+and 612.982 -> 709.714 (+15.78%). C1/C2 are 161.621/252.465 (+1.56%/+6.90%).
+These are three retained ordinary-service wave medians with one warm wave
+excluded, TP4 V100, FP16 execution, E4M3 KV, DFlash2 q7, matching seeds and
+prefix-cache admission. The metric counts actual returned tokens in the
+all-C-alive window with no new prefills; it is not rolling output throughput.
+Every 256-token array and accepted/drafted/prefix counter matches the frozen
+baseline. Long retrieval and natural stops both pass 8/8.
+
+The changes repair coordinated warmup of secondary compressed FP8 layouts,
+prefetch full-M32 FP4/FP8 weights and long-attention K panels, share merge
+weights, reduce sampling fallback/synchronization and tune medium TP4
+reductions. No new persistent weight copy, model-name/target-quantization
+admission or user acceleration switch is added.
+
+A startup-dependent C2 acceptance loss is causally isolated to the draft
+context projection's M16 FP16 GEMM: changing just its reduction plan toggles
+31.305%/22.104% acceptance and the exact previously observed token paths.
+An A/B/A restore reproduces the baseline. The stable selector now covers its
+default M1–16 tuning range, preserves the original single-request tree and
+pins the qualified concurrent tree before any imported/autotuned cache.
+Do not repeat the disproven M8/M16 vocabulary-projection or sampling-guard
+root-cause hypotheses. A literal extension of the M8 tree is also rejected.
+
+Normal source-built artifacts, all raw waves, causal controls, rejected
+candidates and checks are retained under `sm70-long-decode15-20260927`.
+The final core SHA256 is
+`49b92da93e596ef8e3c2ec4b07907c5e2663c131413ce7f3dafdc8e4f68bb7b4`.
+No fresh PRO or 35B-A3B AWQ/FP8 speed qualification is claimed; C2's 15%
+speed target and the separate older rolling-workload gates are not closed.
+See [implementation, contract and results](sm70_dflash2_long_decode_followup_20260927.md).
+
+## Shared batch defaults and incremental integration, 2026-09-26
+
+The requested integration scope is the current measured C2/C4/C8 improvement,
+with the larger performance targets retained as follow-up work. This supersedes
+the earlier keep-Draft disposition below; it does not turn failed aspirational
+targets or relative output-quality parity into passing acceptance results.
+
+PR #691 now applies the existing batch-layout and M64 warmup/tuning defaults
+to participating SM70 devices before model-specific defaults. Common admission
+does not inspect model architecture/name, quantization label, speculative method
+or width, TP size or maximum service concurrency. The layout helper no longer
+requires DFlash q7 and at least eight sequences. Native dtype/layout/alignment
+checks and operator availability remain local to each format, preserving safe
+fallbacks. Explicit environment overrides still win. Model-specific verifier
+and GDN policies are not broadened by this common GEMM change.
+
+The default-policy/override and batch replay selection covers 37 focused tests.
+An additional 57 warmup, FP4 layout and channel-FP8 tests pass. Four old QPN2
+test doubles initially lacked the new prescale argument; their contracts now
+check both ordinary and prescaled preparation and dispatch. Native sources and
+the normal `72e750ee` extension are unchanged from the previous 105-test audit.
+The fresh ordinary service `merge-defaults` gives three-run C2 rolling decode
+266.85 -> 289.26 tok/s (+8.40%) and first-two-prompt no-prefill windows
+369.04 -> 408.07 (+10.58%), with identical 63.31% window acceptance. This
+supersedes the earlier +29.71% window pair whose acceptance also increased.
+Current C4/C8 no-prefill gains remain +23.62%/+11.37%, with the distinct
+prompt coverage retained. Four worker maps confirm automatic 1/64/64/64
+settings and the normal source artifact; memory remains 9.57 GiB model plus
+11.45 GiB available KV per rank at the existing service configuration.
+All owned measurement services are stopped. Exact results are recorded in
+`merge-defaults-consolidated.json` and
+[the batch reuse report](sm70_quantized_batch_reuse.md).
+
+## GEMM savings realized in serving, 2026-09-26
+
+The current Draft PR #691 contains default logits reuse on compact-sampling
+fallback and corrects prescaled FP4 gate/up warmup to match the actual FP16
+output plus separate activation. No extra user switch or persistent weight
+layout is added. In a same-process ordered-admission comparison, logits reuse
+preserves all 48 token arrays, 2714 request rounds and 51.047479% acceptance,
+while improving decode by 1.91%. A direct-dense alternative adds only 0.22%
+and is not shipped. Ordinary admission changes some generated paths even
+with fixed tuned plans; startup variation alone does not explain acceptance.
+
+Three ordinary-service repetitions, same original unordered 2K/256 workload,
+give C1/16, C4/32 and C8/48 rolling medians 245.19/330.77/388.00 tok/s,
+versus 243.15/297.30/365.98 (+0.84%/+11.26%/+6.02%). C8 full-48,
+all-eight-alive no-prefill windows improve 621.91 -> 692.62 tok/s (+11.37%),
+with acceptance 50.51% -> 49.54% (-0.98 points). C4 first-four-prompt
+windows improve 477.65 -> 590.49 (+23.62%), acceptance unchanged. These
+two window protocols have different prompt coverage; use their paired
+references, not a cross-concurrency scaling inference. No diagnostic hooks,
+worker extension, imported LUT or profiler is used for ordinary speed.
+
+Final matched q8 diagnostics give C8 forward 36.882 -> 33.919 ms, sampling
+6.426 -> 5.757 ms and complete round 51.182 -> 47.491 ms. Actual target
+GEMM is 21.382 -> 18.604 ms (-12.99%), below the earlier microbenchmark
+estimate of -20.02%; actual savings broadly reach forward. C4 forward is
+30.276 -> 23.972 ms and whole round 42.162 -> 35.038 ms. GEMM is only
+41.78% of the original C8 round, so a 20% GEMM time reduction alone implies
+about 9.12% higher round rate at fixed accepted tokens, not 20%. The final
+instrumented timings are diagnostic, separate from ordinary speed above.
+
+Normal source-built extension SHA256 is
+`72e750ee54acc7ca61aadfa8b3e1664974f79305c7b059025310d95f3963e412`.
+The measured `d08ae144` and final rebuild have identical instructions in all
+4048 GPU kernels; the final artifact passes 105 focused tests, including GPU
+batch, captured-tail, replay and sampling-cutoff checks. No private sidecar
+or preload is required. Natural-EOS quality remains 14 correct natural
+completions and 15 natural stops of 16 on both versions: the strict
+16-natural-stop gate still fails. The 4K prefix and 32K C2 route smokes pass
+without claiming long-context speed. The C8 GEMM -20% and decode +20%
+goals remain unmet; retain Draft status and do not merge. No new PRO or
+35B-A3B AWQ/FP8 model-speed qualification is claimed.
+
+Evidence in `sm70-gemm-expand-20260926`: `fulfillment-service-comparison.json`,
+`fulfillment-final-trace-comparison.json`, `sampling-paired-comparison.json`,
+`fulfillment-final-build-manifest.json` and `fulfillment-final-gpu-tests.log`.
+See [full implementation and evidence](sm70_quantized_batch_reuse.md).
+
+## Earlier C8 acceptance retest, 2026-09-26
+
+The current unmerged batch candidate uses normal extension
+`d08ae1443aa24f91bddfbc4c80ba2c6dd1122a4368d6b3db4a944cfe537fef68`,
+retaining the legacy FP8 reference pool and correcting prescaled FP4 warmup.
+52 batch/replay GPU tests pass. Real-weight C8 GEMM is 17.026 ms versus
+21.289 ms (-20.02%). Three default-service 2K/256 C8/48 repetitions, without
+LUT imports, worker extensions or profiling, give median acceptance 51.06%
+versus main's 50.51%, recovering the previous candidate's 46.36%. Per-request
+verification rounds summed over 48 requests fall 2920 -> 2709 (main 2732).
+Individual latest acceptance is 48.07/51.06/51.57%; startup/order variability
+is not yet eliminated.
+
+Pure full-eight-alive decode is 654.76 versus 621.91 tok/s (+5.28%).
+Rolling C8 is 375.24 versus 365.98 (+2.53%) with 55.67% versus 54.92%
+acceptance. C1 remains 243.60 versus 243.15 tok/s and 56.77% versus 57.04%
+acceptance. The C8 20% service-speed target still fails; do not merge on
+the GEMM estimate alone. Earlier family-LUT diagnostics changed uncached
+tail dispatch by disabling tuning; they cannot prove a production-family
+cause. An independent restart gave C8 acceptance 50.829% and 2722 summed
+request verification rounds; C1 acceptance remained 56.766%. Its idle
+route-export extension and single timing result are recorded separately
+from the three primary performance runs. Actual routes were saved and the
+owned service stopped. Existing matched C1/C8 complete-q8 event traces on
+the previous fb606 artifact show forward +19.595 ms, sampling +5.512 ms,
+draft +3.301 ms and total +27.933 ms; these are not a new d08 trace. See
+[implementation and full evidence](sm70_quantized_batch_reuse.md).
+
+## Default batch GEMM reuse and C2 memory, 2026-09-26
+
+The owned FP4/FP8 batch-reuse candidate recovers M17..32 row sharing and
+extends M9..16 using existing compressed weights. The C2 duplicate-layout
+research cost of approximately 1.87 GiB per rank is eliminated. Normal-artifact
+real-weight Graph estimates reduce C2/C4 GEMM latency by 25.4%/34.5%; FP8-only
+reductions are 23.9%/30.9%. C1 native kernels are unchanged. The 84 focused GPU
+checks pass. Initial M64 tile experiments remain withdrawn pending reevaluation.
+
+C1 serving initially lost acceptance despite unchanged native kernels. An
+artifact A/B audit found 4,023 shared GPU instruction streams identical.
+Controlled LUT imports isolated the varying draft context FC split-K: importing
+only FP16 plans restored every diagnostic token and verification count, whereas
+importing only FP8 plans did not. This startup variability confounds earlier
+acceptance comparisons. A cuBLAS projection candidate was faster locally and
+removed 62.5 MiB per-rank packed weights, but failed the C1 service guard:
+236.50 tok/s and 54.86% acceptance versus 243.15 and 57.04%. It was withdrawn.
+Disabling generic FP16 autotuning alone also failed (227.05 / 52.07%). Fixed
+split-12 failed too (223.08 / 50.94%). The legacy split-10 tactic passed its
+first diagnostic C1 guard (242.89 / 56.77%). The narrow existing TP4 context-FC
+shape now selects it in source; incompatible cached plans cannot override it.
+All 92 focused GPU tests pass, including first-captured tails and changed
+inputs after a conflicting cached plan. The normal extension is
+`75303f12d50f02ebfb1f4f7616e009125851a207041ecda4df9e3ede9ec39d00`.
+Uninstrumented service validation finished without diagnostic flags or LUTs.
+C4 no-new-prefill decode improved 477.65 -> 577.46 tok/s (+20.90%) with identical
+65.16% acceptance; rolling C4 improved 297.30 -> 321.13 (+8.02%). C8 did not
+improve: full-48 windows 621.91 -> 618.40 (-0.56%) and rolling 365.98 -> 363.81
+(-0.59%). Rolling C8 acceptance lost 2.20 points, failing the two-point limit.
+Quality remained 14 correct natural completions and 15 natural stops of 16.
+The FP8-only M64 candidate is being reevaluated with the context-FC fix;
+no acceptance threshold has been waived and Draft PR #691 remains unqualified.
+See [implementation and evidence](sm70_quantized_batch_reuse.md).
+Do not repeat rejected prepared-weight, register-cap-only or M16-slicing
+experiments. No fresh PRO or 35B-A3B AWQ/FP8 model-speed claim is made.
+
+## TP4 DFlash2 batch GEMM supply experiment, 2026-09-24
+
+For Qwen3.8-27B-NVFP4 at C8/q8, the channel-FP8 TurboMind output
+projection still has low SM70 occupancy. A reversible load-time 256x shift of
+its existing FP16 scale removes the E4M3 exponent-bias multiply inside the
+packed-weight transform without expanding the weights. Only M=33..64 and
+fully packed K1536/N5120 or K5120/N4096,3584 projections are eligible;
+M<=32 remains on the QPN8 fast path, and non-reversible scales fall back.
+`VLLM_SM70_FP8_BATCH_PRESCALED=1` opts in. It is off by default.
+
+On real TP4 weights, the M64 output-projection CUDA Graph operator time falls
+from 73.66 to 31.76 us, with identical fixed-input output. With the same
+M16/N256/K32 split-3 tile forced in both transforms, the main GEMM alone
+falls from 41.22 to 34.50 us; registers/thread remain 146/148 and achieved
+occupancy 17.40/17.48%. Tensor-pipe activity is about 29% and DRAM throughput
+25–28% of sustained peak, so neither compute nor HBM is saturated on this
+sample. Narrow N128 tiles reduce registers to 110–128 but increase operator
+time to 40.9–41.7 us; they were discarded. An FP4 K16 tile candidate also
+failed the complete-service gate and was discarded.
+
+The uninstrumented same-source ON/OFF C8 pure-decode median is
+516.77/489.59 tok/s across three independent eight-request waves (+5.6%).
+For 48 rolling requests, ON/OFF decode capacity is 338.16/343.12 tok/s and
+complete output throughput is 270.77/283.93 tok/s. The rolling result does
+not support default-on. One matched C1/C4 run gives virtually identical
+ON/OFF results, as expected from the unchanged QPN8 route. Seven focused
+SM70 CUDA Graph/replay checks pass. The saved single-wave PRO C8 pure decode
+is 820.84 tok/s; no fresh PRO comparison or 35B-A3B AWQ/FP8 speed gate was
+available for this experiment. The opt-in candidate is retained for further
+mixed-prefill and GEMM scheduling work, not promoted as an overall C8 speed
+win.
+
+## PRO 6000 C1/C4/C8 prefix-cache and verifier comparison, 2026-09-24
+
+The resumed PRO 6000 machine retained its original C8 target-forward profiler
+trace. We reran matched 2,048-input/256-output DFlash2 q7 probabilistic
+requests, with 1,792 shared prompt tokens, temperature 0.7, top-p 0.8,
+top-k 20, and prefix caching explicitly enabled on both services. V100 uses
+TP4/FP16/E4M3 KV/Flash-V100; PRO uses TP1/BF16/FlashInfer. The checkpoint
+and dataset hashes match across hosts. The research V100 source and extensions
+still need the clean-package and output-quality acceptance gates described
+below. Request-level decode capacity excludes each request's TTFT but includes
+new-request prefill pauses:
+
+| In flight / total | V100 decode tok/s | PRO decode tok/s | V100 / PRO | V100 / PRO draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| C1 / 16 | 229.71 | 210.42 | 1.092 | 55.38% / 55.84% |
+| C4 / 32 | 265.56 | 519.82 | 0.511 | 59.54% / 53.80% |
+| C8 / 48 | 277.81 | 711.77 | 0.390 | 56.17% / 50.83% |
+
+Median per-request mean ITL (ms) is V100 4.248/14.286/29.028 and PRO
+4.618/7.504/10.866 at C1/C4/C8. From C1 to C8, V100 ITL inflates 6.83x
+and PRO 2.35x; aggregate V100 decode capacity rises only 21% versus PRO's
+238%. V100 is slightly faster at C1. The ITL is the median of each request's
+mean inter-token latency, not a median over individual token gaps.
+
+All three 2K runs had zero prefix-cache hits despite the shared 1,792-token prefix.
+The hybrid cache aligns an attention page to 1,648 tokens; DFlash/EAGLE
+recomputes the last matched page, leaving no reusable complete page at 2K.
+A separate 4K-input/3,504-shared-prefix C8 single-wave probe confirmed
+nonzero hits on both systems; its pure decode window was 253.78 versus
+626.53 tok/s with 32.82% versus 33.82% acceptance. That prompt changed the
+acceptance profile, so it is only a cache-path diagnostic, not a substitute
+for the matched 2K production baseline. Cache hit counters differed between
+the systems and should not be treated as an equal cache-hit ratio.
+
+An instrumented 2K single wave filters only complete eight-row-per-request
+verifier steps. CUDA-event medians (ms) are:
+
+| Full-q8 stage | V100 / PRO C1 | V100 / PRO C4 | V100 / PRO C8 |
+| --- | ---: | ---: | ---: |
+| Target forward | 13.317 / 21.101 | 32.741 / 24.010 | 56.995 / 28.029 |
+| Sampling before draft | 2.763 / 1.142 | 5.359 / 1.271 | 7.552 / 1.346 |
+| Draft | 4.601 / 4.038 | 9.928 / 4.219 | 14.543 / 4.595 |
+| Full GPU step | 20.739 / 26.302 | 48.227 / 29.495 | 79.288 / 33.949 |
+
+V100 forward grows 24.254 ms from C4 to C8, versus 4.019 ms on PRO; it
+accounts for about 78% of V100's 31.061-ms full-step increase.
+Across C1 to C8, V100 forward grows 43.678 ms (4.28x) versus PRO's 6.928
+ms (1.33x), whereas full GPU steps grow 58.549 versus 7.647 ms. The PRO C8
+target-forward trace contains 62 full steps. Within its target annotation,
+mean kernel busy time is 24.69 ms: FP4 CUTLASS GEMM 8.00, FP8 CUTLASS GEMM
+7.72, CUDA GDN 5.83, target attention 0.81 and FP4 activation quantization
+0.44 ms. These kernel-busy categories do not sum to the independently measured
+CUDA-event forward wall time. The pinned vLLM 0.29.0 implementation pre-packs
+NVFP4 weights/scales at load and uses compressed-weight CUTLASS FP4 GEMM;
+scaled FP8 GEMM similarly consumes FP8 weights without a separate full-weight
+FP16 materialization every step. PRO still performs scale/activation work.
+
+V100 already executes TurboMind batched W4A16 GEMM. Its compressed-weight
+channel-FP8 QPN8 route admits at most M32; C8/q8 is M64 and falls through
+to repeated full-weight FP16 dequantization and GEMM. NVFP4 QPN2 also changes
+at M32 to the TurboMind batch route. The PRO SM120 native FP4/FP8 Tensor Core
+and TP1 path are structurally different from V100 SM70 FP16 Tensor Core plus
+TP4 reductions. A new same-shape Nsight Systems CUDA Graph node trace captures
+six interior full C8/q8 steps on all four V100 ranks without new prefill. On
+rank 0 the mean per-step kernel busy time is 77.675 ms, comprising 16.250 ms
+TurboMind NVFP4 gate/down GEMM, **12.238 ms repeated full-weight channel-FP8
+dequantization**, 4.816 ms GDN update, 4.959 ms TP reduction, 3.436 ms
+target grouped attention, 2.259 ms FP4 scale restoration, and 6.701 ms
+draft paged attention. The remaining 27.015 ms includes FP16 GEMM, sampling
+and other target/draft kernels; categories are kernel busy time rather than a
+closed target-forward wall decomposition. The previous C16 trace's 12.291-ms
+QPN8 dequantization is a separate shape. Its similarity to C8 is expected
+because full-weight reconstruction is dominated by weight size once M>32.
+
+A second six-step, no-prefill C4/q8 graph-node trace on rank 0 records
+47.324 ms total kernel busy time per step. Its NVFP4 QPN2 compressed-weight
+gate/down GEMMs are 8.427/4.082 ms; channel-FP8 QPN8 compressed-weight GEMM
+is 9.993 ms; GDN update, TP reduction, grouped target attention and draft
+paged attention are 3.469, 3.196, 1.951 and 3.618 ms. C4 has **no
+full-weight dequantization**. At C8 the NVFP4 path changes to TurboMind
+W4A16 and its gate/down GEMM body rises from C4's 12.509 to 16.250 ms,
+plus 2.259 ms scale restoration. GDN, TP reduction and target attention rise
+to 4.816, 4.959 and 3.436 ms. The FP8 route changes at M64 from packed
+QPN8 GEMM to full-weight dequantization plus FP16 GEMM; the directly measured
+12.238-ms dequantization is only part of its C8 cost. The FP16 GEMMs are not
+isolated from the "other" trace category, so C4 packed GEMM versus C8
+dequantization alone is not a closed route comparison. Two matching Nsight
+captures locate the C4-to-C8 route transition without assigning all of the
+target-forward growth to one kernel.
+
+A corrected C1/q8 graph-node trace uses the same six interior full steps,
+rank 0 and no-prefill filter. Its kernel busy time is 19.265 ms/step: NVFP4
+QPN2 gate/down 2.852/1.674 ms, packed channel-FP8 QPN8 GEMM 3.956 ms, GDN
+update 0.963 ms, TP reduction 1.263 ms, target grouped attention 0.633 ms,
+draft paged attention 0.853 ms and other kernels 7.071 ms. Between C1/M8 and
+C4/M32, the two compressed-weight GEMM families rise by 7.983 and 6.037 ms,
+respectively. Their combined 14.020-ms kernel-busy increase is the largest
+identified part of the 19.424-ms target-forward CUDA-event increase. GDN,
+TP reduction and target attention rise by 2.506, 1.933 and 1.318 ms. These
+different timing scopes cannot be subtracted into a closed forward breakdown.
+The C1-to-C4 slowdown therefore starts inside batch-scaling packed GEMM and
+TP/GDN work; the repeated full-weight FP8 materialization appears only after
+the M32-to-M64 route change. PRO's C1-to-C8 target forward rises only 6.928
+ms, but only its saved C8 trace has per-kernel attribution. Its compressed
+CUTLASS GEMMs, SM120 native low-precision Tensor Cores and TP1/no all-reduce
+explain the direction of the smaller growth; assigning an exact C1-to-C8
+PRO kernel delta would require a matching C1 trace. The next V100 candidate
+should address M8–M64 batched FP4/FP8 GEMM and avoid per-step full-weight
+materialization across quantizations, then retest C1/C4/C8 output quality and
+unprofiled decode capacity. A source-route hypothesis is not an achieved
+speedup or clean-build baseline.
+
+## DFlash2 27B concurrent decode investigation, 2026-09-23
+
+The matched 2,048-input/256-output rolling workload uses the same target and
+draft checkpoints, prompt set, q7 probabilistic sampler (temperature 0.7,
+top-p 0.8, top-k 20), 262,144 service capacity, 8,192-token scheduler budget,
+and 16 sequence slots on both machines. The V100 service uses four
+V100-SXM2-32GB GPUs, FP16 execution, E4M3 KV, TurboMind and Flash-V100;
+RTX PRO 6000 uses one GPU, native BF16 and FlashInfer. These are deployment
+comparisons, not a same-architecture kernel comparison. Both runs have zero
+prefix-cache hits. The V100 source tree matches main `d49e32b358`, but its
+native extensions predate the merge; it is a research baseline until rebuilt
+from the owned source. The DFlash2 q1 tail CUDA Graph option is disabled because
+the current full-capture startup stalls with it enabled. Other CUDA Graphs run.
+
+| Requests in flight / total | V100 decode capacity | PRO 6000 decode capacity | V100 full-q8 target verify / forward / draft |
+| --- | ---: | ---: | ---: |
+| C1 / 16 | 194.0 tok/s | 177.8 tok/s | 16.108 / 13.174 / 4.231 ms |
+| C4 / 32 | 204.1 tok/s | 452.3 tok/s | 45.096 / 39.699 / 9.767 ms |
+| C8 / 48 | 221.1 tok/s | 660.5 tok/s | 78.318 / 70.834 / 14.973 ms |
+| C16 / 64 | 255.5 tok/s | 1039.1 tok/s | 122.094 / 110.214 / 25.462 ms |
+
+Decode capacity excludes each request's TTFT but includes prefill stalls from
+new rolling requests. The verifier/forward/draft columns are CUDA-event medians
+for complete q8 steps in a separate instrumented run; they are not additive
+end-to-end latency. V100 draft acceptance is 40.9% at C16 versus 42.7% on PRO
+6000, too close to explain the fourfold capacity gap.
+
+A short CUDA Graph node trace captured eight complete C16 q8 steps on all four
+V100 ranks after two settling steps, without a new prefill in the capture.
+Six interior steps on the critical rank average about 148 ms wall and 144 ms
+summed kernel service. Graph-node IDs separate approximately 108 ms target
+forward from 22.6 ms draft; uncaptured graph nodes, sampling, and other kernels
+account for about 13.4 ms service. The target graph's main per-step kernel
+families are paged attention 29.1 ms, TurboMind NVFP4 GEMM 26.5 ms, FP16
+GEMM/CUTLASS 15.0 ms, FP8 QPN8 weight dequantization 12.4 ms, fused GDN update
+9.8 ms, and TP reduction 8.8 ms. The draft graph spends about 14.2 ms in
+paged attention. Category sums describe service, not a closed wall-clock
+decomposition, and graph-node tracing adds overhead.
+
+The C16 E4M3 DFlash2 target log rejects batched grouped verification at
+`reqs=16, q=(128,6,256)`. The exact E4M3 FP32 grouped entry requires one
+request; the older request-major grouped entry admits E5M2 only because its
+partial values are FP16. DFlash2 E4M3 then runs per-query paged decode for its
+16 full-attention layers, matching the 29.1-ms trace bucket. This is a proven
+route gap, but eliminating that whole bucket alone cannot close the C16 gap.
+The existing E4M3 XQA batch operator was admitted in a task-private probe;
+its C16 decode capacity was 264.0 tok/s (+3.3%) and acceptance fell from
+40.9% to 39.5%, so it is not the selected change.
+
+The source candidate extends the FP32 grouped verifier to independent
+request-major q8 batches of 2–16 requests, using the existing B1 numerical
+path and native precision ABI version 6. In a matched, uninstrumented 2K/256
+run, C8 decode capacity rose from 221.1 to 244.2 tok/s (+10.4%), and C16
+from 255.5 to 278.8 tok/s (+9.1%); the PRO 6000 references remain 660.5
+and 1039.1 tok/s. The candidate's C8/C16 acceptance was 41.5%/38.9%, versus
+41.6%/40.9% on the old V100 route. After rebuilding the final Flash-V100
+source (SHA256 `f23e6f7d2f1aa3724874e6444b5804a6bdee8570c9747f00a756fe369a757acd`),
+a second matched C16 run reached 288.7 tok/s (+13.0%), with acceptance 42.9%
+and 3.972 output tokens per draft round versus 38.9% and 3.689 in the first
+candidate run. Acceptance variation contributes to the spread; do not assign
+the full difference between candidate runs to kernel speed. Prefix hits were
+zero and the final logs show grouped q8/128-row capture on all four ranks.
+In a separate same-dataset C8 single wave, the candidate's overlap window
+with no new prefill reached 347.2 tok/s versus 820.8 tok/s on PRO 6000;
+this pure decode comparison remains 2.36x apart. The old corrected V100
+service did not run this exact single-wave dataset, so this number is not a
+matched candidate-versus-main speedup claim.
+These are research results using a native Flash-V100 extension built from this
+branch, with other unchanged vLLM native extensions from a source-equivalent
+main build. They are not yet clean-wheel performance or a full output-quality
+gate. The 65 focused CUDA and dispatch tests pass after the final rebuild.
+
+CUDA-event medians for complete q8 steps after the change are C8 target
+verifier/forward/sample/draft/full step 65.198/57.230/7.747/14.288/79.469 ms
+(64 samples), and C16 94.107/81.632/12.459/24.152/118.262 ms (54 samples).
+Against the matched old V100 phase run, the C16 target forward falls by
+28.582 ms and full GPU step by 29.327 ms. At C8, PRO 6000's verifier/forward/
+sample/draft/full step is 29.49/28.06/1.43/4.64/34.14 ms under its slightly
+wider forward timing boundary. The candidate still spends roughly 29 ms more
+in target forward, 6 ms more in sampling and 10 ms more in draft at C8. This
+is a phase-level direction, not a closed identical-kernel decomposition.
+
+At B16/q8/2K, the grouped attention operator takes about 0.38 ms per full
+attention layer versus 1.93 ms for the old row operator. At B16/q8/32K, the
+new grouped operator takes about 3.6 ms per layer and is only about 2–3%
+faster than sixteen independent grouped calls, though it is much faster than
+the row operator. The first 32K probe exposed a request-stride bug in the
+FP32 max/sum workspace: the stride omitted its second float and overlapped
+request data once more than 40 splits were live. The bug is fixed. Focused
+CUDA tests now compare B2/B4/B8/B16 q8 with independent requests under graph
+replay, and B2 at both 32K and 262,144 tokens; a B16 32K operator screen is
+also bitwise equal to independent requests. These tests do not replace
+end-to-end long-context quality validation.
+
+The remaining C16 gap is not an attention-only problem. QPN8 weight
+dequantization repeats about 12.4 ms per target step; making all eligible
+weights resident FP16 would require approximately 4.36 GiB per TP rank and
+would consume KV/long-context capacity. Widening NVFP4 GEMM autotuning to
+M128 reduced one representative gated projection from 334 to 295 microseconds
+but left a second projection unchanged; it also requires explicit prewarming
+before CUDA Graph capture. Neither isolated result is an end-to-end gain.
+An experimental grouped split cap improved one-layer 2K/32K timings but
+changed FP16 outputs by about 1e-5 relative and was reverted; it is absent
+from the candidate source and final native extension. Full vLLM/Triton rebuild
+was stopped after it began fetching unrelated dependencies; only the changed
+Flash-V100 extension was rebuilt. The clean package/quality gate remains open.
+For a quantization-independent GDN schedule screen, BV8 beat BV32 by
+1.25–1.73x on C4/C8/C16 q1/q8 synthetic layers and matched FP16 outputs
+bitwise. A whole-model C16 trial with the existing `VLLM_SM70_FLA_BV=8`
+override reached 290.2 tok/s decode capacity and 238.6 tok/s output versus
+288.7/235.6 without the override; acceptance also changed from 42.9% to
+41.4%. This small, sampling-sensitive system gain does not justify changing
+the shared recurrent schedule yet. A general PyTorch top-k/top-p fallback
+matched the Triton mask but took 18.8 ms versus 2.1 ms at 128x248,320, so
+it is not an alternative sampling speed path. Nsight Compute counters were
+unavailable under the host's `ERR_NVGPUCTRPERM` policy; Nsight Systems and
+CUDA events remain the evidence source.
+Continue with a shared batch-shape GEMM/GDN/TP path and preserve the memory
+budget; do not promote a single-kernel projection as a PRO 6000 win.
+
+The PRO 6000 service is now stopped. The retained service log identifies
+vLLM v0.29.0, native BF16, FlashInfer CUTLASS NVFP4, CUTLASS scaled-FP8
+linear, CUDA GDN decode, FlashInfer XQA and TP1. The pinned upstream
+`v0.29.0` implementation pre-swizzles FP4 weight scales at load and uses
+`scaled_fp4_quant` followed by a GEMM that consumes compressed FP4 weights;
+its FP8 linear similarly uses activation quantization and
+`cutlass_scaled_mm`. There is no local copy of the PRO per-kernel profiler
+trace, so these are source-backed route facts, not measured PRO category times.
+
+The V100 trace confirms that its C16 target already runs TurboMind **batch**
+GEMM: over eight q8 steps per rank, 448 gate/up `gemm_kernel` calls average
+276.2 microseconds and 448 down calls 195.1 microseconds, or about 26.4 ms
+per step for the 56 NVFP4 MLP layers. Compact-scale restore costs about
+2.3 ms per step. FP8 QPN8 full-weight dequant costs about 12.4 ms per step;
+QPN8 native handles at most 32 rows, while C16/q8 sends 128 rows. This
+explains why applying a single-request fast-path result to C16 was invalid.
+V100 and PRO perform conceptually similar projections, but SM70 executes
+packed W4A16/FP16 Tensor Core work while SM120 uses native FP4/FP8 Tensor
+Cores. TP4 further requires inter-rank reductions that PRO TP1 avoids.
+
+Small independent CUDA Graph screens reject naively slicing M128 into
+repeated packed kernels: FP8 K1536/N5120 falls from 91.5 to 152.7 us when
+using eight M16 tiles, and NVFP4 K5120/N8704 gate from 306.3 to 613.4 us
+with four M32 tiles. Repeated weight reads exceed the saved reconstruction.
+The existing TurboMind shape tuner can be prewarmed at M64/M128 by setting
+`VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M=128` together with
+`VLLM_SM70_AWQ_WARMUP_MAX_M=128`; merely raising the former inside a captured
+graph will use the default spec. Synthetic M128 gate/down timings change
+328.4/222.9 to 300.6/156.8 us, but output hashes change. A full 64-request
+C16 run on the same 2K/256 dataset gives 292.17 tok/s decode capacity,
+237.25 tok/s output and 41.96% acceptance, versus the previous candidate's
+288.7/235.6 tok/s and 42.9%. The gain is under 2% with acceptance drift,
+so the shared default stays unchanged. The original 13.97-GiB/rank KV cache
+budget is unchanged by tuning. Task-private evidence is in the retained
+`verification/` artifact directory
+(`screen_packed_m128.json`, `screen_turbomind_m128_{default,tuned}.jsonl`,
+`v100-turbomind-m128-c16.json` and its service log). The corrected grouped
+path was subsequently captured with Nsight Systems
+`--cuda-graph-trace=node` across four ranks and eight complete C16/q8 steps.
+An earlier default `graph` capture omitted model graph nodes and is not used
+for forward attribution. On rank 0, kernel busy time per full q8 step changed
+as follows (old paged / corrected grouped, ms): target attention
+29.047 / 5.750; FP4 TurboMind gate/down 26.390 / 25.480; QPN8 full-weight
+dequant 12.415 / 12.291; GDN update 9.803 / 9.701; TP reduce
+9.846 / 9.548; FP4 scale restore 2.329 / 2.274; draft paged attention
+14.216 / 13.449. All kernel service falls 144.047 -> 117.586 ms per step.
+The target attention reduction explains most of the prior improvement, while
+the FP4 batch GEMM, QPN8 dequant, recurrent update and TP costs remain. These
+category times are not a closed target forward wall decomposition and do not
+measure corresponding PRO kernel times. Original four-rank reports and SQL
+comparison are task-private under `verification/trace-c16-grouped-nodes/`.
+
+The same 2K/256, C16/64-request unprofiled endpoint contract rejects
+shortening DFlash2's speculative depth as a broad concurrency fix. With the
+same grouped-attention source, q7/q3/q1 (8/4/2 target rows per request)
+produce 288.69/247.46/237.27 tok/s request-level decode capacity,
+235.57/206.12/200.21 tok/s complete output throughput, and
+3.972/2.858/1.797 emitted tokens per draft round. q3/q1 verifier matrix
+rows are M64/M32 rather than q7's M128, but the additional rounds outweigh
+their cheaper steps. The q3/q1 services selected their E4M3 grouped FP32
+attention route and had zero prefix-cache hits. These results compare V100
+configuration choices; the retained PRO 6000 q7 reference is unchanged.
+Original summaries and service route logs are task-private under
+`verification/v100-q{3,1}-*`.
+
+## Graph scratch, score workspace and active peak, 2026-09-23
+
+[Implementation and paired evidence](sm70_memory_arena.md). The new SM70
+defaults share decode row buffers per stream and rounded partition capacity,
+use 8K rather than 16K prefill score blocks, and retain DFlash auxiliary
+snapshots in the loaded projection dtype. FP16 attention operands and FP32
+accumulation remain. No TP, batch=1, or model-quantization gate was added.
+
+At TP2, non-KV active allocation drops 17.117 -> 15.146 GiB/card, and the
+temporary request increment drops 2.110 -> 1.674 GiB. At TP4, non-KV active
+allocation drops 10.225 -> 8.794 GiB/card, and the increment drops
+2.183 -> 1.343 GiB. Same-resident TP2 C4 throughput rises 0.44%; TP4 256K
+TTFT/TPOT rise 0.58%/1.44%, and same-resident C8 throughput rises 1.84%.
+The increased KV pool permits more resident requests at offered C32; aggregate
+throughput rises, while individual TPOT rises 7.68% at TP2 and 20.56% at TP4.
+Do not describe these saturated latencies as within the 3% matched-speed gate.
+
+TP2 MBPP32 scores 24/32 in both arms with no truncation; two item verdicts
+swap. TP4 32K-prefix MBPP4 scores 4/4 in both arms without truncation.
+The TP1 32GB DFlash2/8K/C32/GUM0.9 admission still fails by 1.939 GiB;
+no 16GB-card feasibility or full-FP32 75T/35B performance claim follows.
+
+## Memory reuse defaults, 2026-09-22
+
+[Candidate implementation and validation contract](sm70_memory_defaults.md).
+Based on merged PR666/main949728e891, this scope removes duplicate weight/scale
+storage and native score workspaces without narrowing TP or concurrency gates.
+Shared codes and compact scales default on, with capability fallback and explicit
+rollback. Reusable scale scratch removes the capture-size<=32 restriction;
+Q8000/Q8192 and the tail share scores; SM70 V2 reserves graph memory before KV.
+See the linked report for the exact native capability and stream contracts.
+
+Matched TP4/27B NVFP4/DFlash2/7/E4M3/FP16-draft/185W/CUDA-Graph validation
+reduces model loading from10.07 to6.47 GiB/rank, with KV budget10.57 to12.68 GiB.
+Cold256000/256 prefill changes2069.8 to2061.5 tok/s (-0.40%); fixed-seed C32
+aggregate output throughput averages+0.91%. More resident requests increase
+per-request TPOT; do not hide it behind aggregate throughput. All C1-C32 bench
+requests and32K/128K/exact262144-boundary retrieval requests complete.
+
+MBPP32 remains25/32 main versus24/32 candidate; the candidate has no truncated
+answers, while main has one. The discordant item144 is also main-only correct
+in a serial sampled check. A separate complete C1/temperature-zero diagnostic
+produces15756 tokens and identical complete response text, passing in both modes.
+A same-native-build shared-off control reproduces that text; eight forced
+prefixes also have identical top20 logprob maps with shared storage on/off. Preserve both
+outcomes; the greedy diagnostic is not a replacement quality score or proof
+of global equivalence.504 real-projection cases match every FP16 output bit,
+including compact restoration and changed-input graph replay;40 GPU and19 CPU
+regressions pass. No effective-weight or attention accumulation precision was
+reduced to obtain the memory saving.
+
+TP2 on2x32GB passes32K retrieval with12.17 GiB model loading per rank. TP1 on32GB
+still fails KV admission with DFlash2/chunk8192/C32/utilization0.85. No physical
+16GB GPU was tested. The full-FP32 75T and35B migration targets remain open.
+Keep the interrupted audit and rejected experiments recorded in the report;
+do not repeat broad sampled sweeps solely to obtain a favorable score.
+
+## Local head/projection layouts across TP1/TP2/TP4, 2026-09-21
+
+Draft PR666, base `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`; see the
+[implementation and speed evidence](sm70_tp_shape_coverage.md) and
+[paired quality audit](sm70_tp_quality_audit.md). Default dispatch follows local
+head/matrix layout rather than TP1/TP2/TP4 allowlists. Promotion is paused
+for the quality investigation below. QK and PV accumulate in
+FP32, measuring70-71T;75T remains open. Do not attribute the older FP16-QK
+75T result to full FP32.
+
+The paired96-item audit completes without truncation: OFF/ON scores are
+GSM8K30/30, MATH50032/32 and MBPP26/25. The small difference does not establish
+statistical equivalence. Three deterministic discordant-case diagnostics also
+retain all failures. Both modes shared an exact-capacity DFlash failure;
+commit316e04a1ec materializes accepted Mamba state before a single-token tail.
+The original262128-input request now returns the correct16-token answer and
+naturally stops exactly at262144 total tokens. Eleven GPU state/graph checks pass.
+
+The follow-up isolates early greedy token differences to the projection
+accelerators: attention-only trajectories match the OFF control on all three
+short diagnostic probes. QPN2 prematurely rounds the global weight scale to
+FP16;12 checked real tensors have13-59% differing group scales. The repair
+matches the ordinary W4A16 effective weights and avoids rebias overflow.
+Twenty-four exact GPU cases pass; same-input FP64 audits put repaired QPN2
+and TurboMind at virtually identical error. The repaired32-item MBPP run
+scores23/32, versus25/32 for the fresh matched OFF control. All64 outputs
+finish naturally. This is not quality acceptance. Do not build another wheel;
+the user requested source/kernel diagnosis and repair instead.
+
+Earlier full-FP32 TP4 DFlash results include cold256K prefill about2511tok/s and
+C1-C32 client completion, with13 resident sequences. No-DFlash TP1/TP2 pass
+cold64K/256K and C1-C32; TP2 reaches32 resident sequences. TP1 27B+DFlash2 still
+exceeds chunk8192 profiling memory, and TP2 DFlash/256K needs the unpromoted
+shared-weight layout. These limits are not erased by removing TP gates.
+The missing matched35B-A3B AWQ/FP8 evidence remains a migration requirement;
+this PR does not claim that migration is complete. Rejected tuning and invalid
+measurements remain in the design note; do not repeat them without a new cause.
+
+## Mamba state grid decoupled from the KV block size, 2026-09-17
+
+[Design note](sm70_mamba_state_grid_decoupling.md). The long-prefill chunk is
+`min(max_num_scheduled_tokens, mamba_state_block_size)`, and the 75T Q8000
+dense route only dispatches for a chunk in [8000, 8192], so the recurrent-state
+grid -- not the token budget -- decided whether the fast prefill path was
+reachable at all. Page-size unification scaled that grid together with the block
+size, which tied the fast path to a 4096 block.
+
+- An explicit `--mamba-block-size` is now honoured in align mode and is no
+  longer multiplied by the page-unification ratio. Both edits are inert without
+  the flag, so existing deployments are unchanged: `--block-size 4096` still
+  yields grid 8192, chunk 8192 and an 858,310-token pool exactly as before.
+- `--block-size 2048 --mamba-block-size 8192` gives chunk 8192 with the 75T
+  route and a 1,058,133-token pool, 23-29% more than the 4096 block, at equal
+  prefill (3336 versus a 3295-3426 tok/s band on a unique-salt 100K prompt).
+- The grid must be a multiple of the block size. `--block-size 1648` against
+  grid 8192 measured the largest pool (1,112,091) and the fastest prefill
+  (3551 tok/s) but dropped prefix caching to 0 hits over 812,040 queries,
+  because no prefix length is then simultaneously block-aligned (KV blocks) and
+  grid-aligned (recurrent state). The alignment assertion is retained for that
+  reason.
+- Prefix-cache reuse is quantised by the grid, not the block: at grid 8192 a
+  byte-identical prompt below 8192 tokens gets no reuse at all. Since
+  `chunk <= grid`, the reuse quantisation, the chunk size and the grid are one
+  and the same knob, so a smaller block buys KV capacity only -- not finer
+  reuse. This is inherent to align-mode hybrid scheduling.
+- Adopted default for this model: `scripts/serve_qwen38_27b_nvfp4_v100.sh`.
+
+## DFlash2 TP4 capacity tails, 2026-09-11
+
+[The capacity-tail worklog](sm70_dflash2_tail_graphs_20260911.md) tracks PR596.
+Ordinary q8 DFlash2 did not enter the inherited lookup-only tail capture
+branch. Explicit target B1 q1-q7 graphs and manifest-bounded grouped/scalar
+attention now recover that path while retaining default-off behavior.
+Three independent starts, 96 requests and 48 exact pairs give 37.403 to
+31.335 ms at 261888/256 seed2, including q1/q6/q7 tail cost. Pure decode
+improves 154.899 to 184.953 tokens/s; 1K and 128K differences are under
+0.01 ms. A late short-prefill guard and its separate service check are
+tracked in the worklog; original repeated measurements remain identified.
+
+Do not repeat a capture-placeholder/live-state comparison as a GDN bug:
+PAD_SLOT_ID is intentional and runtime preparation refreshes the captured
+storage. Do not skip draft solely on proposals=0 or discard q1 time from
+the endpoint metric. No arithmetic, capacity guard or scheduler change is
+included. The complete-round 22-ms and attention 7-ms goals remain open.
+
+## DFlash2 TP2 accepted endpoint, 2026-09-10
+
+The user closed TP2 optimization at **31.884546/29.279787 ms** complete rounds
+for release1k/MBPP28, retiring the earlier approximately 25-ms goal. The
+[TP2 worklog](sm70_dflash2_tp2_verifier.md) retains the frozen contract,
+development history, rejected candidates and source/library provenance.
+TP4 remains a separate campaign.
+
+Three independent unprofiled startups each run one warmup and five paired
+requests per fixture. All fifteen pairs preserve token IDs, acceptance and
+natural EOS. Accepted drafts per round are 2.010638/3.569231; emitted tokens
+per round are 3.010638/4.569231. A separate same-startup diagnostic preserves
+hidden states, full FP32 vocabulary logits and valid acceptance records.
+These short-context measurements are not 256K performance evidence.
+
+PR566 integrates the exact revision-2 scalar E4M3 decoder/PV schedule, the
+independently gated TP2 q8 BV2 GDN schedule and the matched QPN2 builder.
+Main already contains the FP32-beta and row-stride repairs from PR556;
+integration keeps those repairs and the TP4 fallback. The observed K64 split,
+effective FP16 scale rounding, FP32 state/logits and E4M3 KV are unchanged.
+The complete measured combination also uses the retained single-layout
+QPN2/context worker harness; merging the kernel components does not enable
+that whole combination by default. New TP2 switches remain opt-in.
+
+The later combined-projection copy experiment is withdrawn from this PR's
+source. Its local copy and live byte-oracle gates pass, but its model A/B
+harness fails before generation due to a ctypes graph-binding conflict.
+It contributes no accepted whole-round improvement. Changed draft GEMM
+arithmetic is also excluded: better local FP64 error still changes proposal
+distributions. Historical failed numerical, memory-budget, route-coverage,
+sanitizer-timeout and slower-kernel results remain recorded in the worklog.
+
+## DFlash2 residual weight memory recovery, 2026-09-08
+
+Follow-up in the [shared NVFP4 report](sm70_dflash2_shared_nvfp4.md) removes
+unused FP16 LM-head packing when FP32 logits consume the original parameter.
+Allocation stacks identify the extra 606.25 MiB/rank matrix as draft-head
+packing retained in the native cache after target-head sharing; avoiding
+the unused preparation removes that allocation too. QPN8 screening remains
+enabled, and explicit packed Tensor Core top1 retains its layout.
+
+`VLLM_SM70_NVFP4_QPN2_SHARED_SCALES=1` optionally retains only QPN2 E4M3
+scales and restores temporary FP16 scales for TurboMind fallback. It requires
+the shared-code path, rebuilt native operators, DFlash2 TP4 q7 without DBO,
+and capture sizes <=32 so graphs do not retain each fallback's temporary
+scales. The largest temporary is 5.3125 MiB. The switch defaults off.
+
+43 CPU checks, 224 real-shard scale/output checks and six LM-head cases pass,
+including changed-input graph replay. Decode scale-cost ratios are within
+0.1% of one; head ratios are 0.9969–1.0010. M135 fallback projections cost
+5.87% more, adding 3.13 ms across the isolated projection sequence; this is
+not TTFT. Preserve the rejected initial lane-map and harness setup evidence.
+
+Production candidate completes at 18:59 CST: loading 6.286138 GiB/rank,
+25.144552 GiB/TP4, down 7.671183 GiB from shared codes alone. Both unused
+head matrices and persistent TM scales are absent on all four ranks. KV is
+still automatic E4M3 at utilization0.8, maxlen256K/chunk4096/maxseq4/q7;
+budget17.70 GiB/rank, 1,661,426 logical tokens, idleNVML26,036 MiB/rank.
+MBPP28 repeats match all754 tokens of the archived shared-code cohort;
+MBPP0 matches all1093. Median decode225.66 tok/s, round19.068 ms,
+TTFT107.95 ms. Historical same-output values were221.40/19.435/112.37;
+no observed focused slowdown, but no contemporaneous speedup claim.
+
+The current paired control was terminated during compilation and has no
+endpoint result. Keep it separate. Earlier other-cohort parity differences
+are not resolved by the latest archived-cohort match. Concurrency and
+long-context admission remain outstanding; PR561 stays Draft.
+
+Evening quality follow-up at source2d683cc135: the two completed candidate
+final answers pass original assertions and EvalPlus base/plus tests (2/2
+each). Two attempts to run a current 32-task plus four-concurrent A/B are
+interrupted before candidate execution. Latest parent receives SIGINT;
+child receives SIGTERM during cleanup, without a logged OOM/CUDA failure.
+The controls themselves return270 versus634 tokens on MBPP28 (first
+difference at zero-based token8), with six identical repeats within each
+process. Different-output medians233.57/253.62 tok/s do not prove an
+optimization speed delta. Preserve this restart-variation evidence and
+the interrupted1957/2018 cohorts. No new32-task/concurrency pass is claimed;
+resume with an uninterrupted GPU reservation and verify control stability.
+
+## DFlash2 shared NVFP4 codes, 2026-09-08
+
+The [shared QPN2/TurboMind weight path](sm70_dflash2_shared_nvfp4.md) removes
+the extra QPN2 codes while retaining both scale formats and opaque dynamic-M
+dispatch. All 280 real TP4-shard operator cases match output bits, including
+gated output, padding and CUDA Graph replay with changed inputs. The removed
+target codes total approximately 2.836 GiB per rank for QUASAR 27B.
+
+Keep `VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT` opt-in. Shared row-first scheduling,
+8-row CTAs and selective caching for K=1536/N=5120 output weights yield
+weighted M8/M16/M32 ratios of 1.0013/0.9869/0.9591 in the repeated-operator
+ABBA benchmark. All 336 final cases on 24 real shards pass bitwise,
+including partial rows. A six-tensor working set yields ratios
+1.0259/0.9915/0.9019; M8 retains a cost and these isolated projection ratios
+do not establish model throughput. Reject the slower
+vector-load/shuffle and global unroll 1/2/8 experiments.
+
+Production validation must retain automatic KV at utilization 0.8, TP4,
+256K context, E4M3 KV, chunk 4096, maxseq 4 and the existing DFlash2 q7 graph,
+FP32-logit and sampling settings. The fixed 2 GiB/8K/E5M2 diagnostic is excluded
+from production conclusions. With matching revision-four Flash-V100, the
+production control completes: 11.08 GiB loading/rank, 12.68 GiB KV budget,
+1,190,275 KV tokens and 277.52 tokens/s median single-request pure decode.
+The shared production retry completes: loading 8.20 GiB/rank, KV 15.76 GiB,
+1,479,578 logical tokens (+24.31%) and idle NVML 26,030 MiB/rank versus 26,114.
+However, MBPP28 differs at token 16 and completes 754 versus 260 tokens; MBPP0
+completes 1093 versus 2105. Both arms finish naturally, but deterministic parity
+fails. Shared 221.40 tok/s cannot establish a matched-output speed comparison.
+Inputs, launch arguments and recorded binaries match. Comparing the actual
+installed `_C` operators exposes M16/M32 differences on all six projections;
+M1/M8/135/1024 match. The 336 earlier checks used same-build source controls.
+All 18 installed-dispatch comparisons at M9/16/32 equal TurboMind bitwise.
+The optional sidecar overlay now permits both model arms to use legacy/shared
+QPN2 from the same declared source, instead of trusting a Python route log.
+The 17:55/17:57 CST source-aligned pair reproduces the loading and KV capacity
+values above, with 26,040 versus 26,030 MiB idle worker usage and 0.26 GiB
+graph capture increments in both arms. Both have zero active requests/KV use.
+However, parity still fails: MBPP28 first differs at token 155, returning
+998 versus 297 tokens; MBPP0 differs at token 287, returning 887 versus 760.
+Within-arm speed repeats are stable and all outputs finish naturally. The
+native version gap does not fully explain model parity. Raw medians of
+222.82 versus 236.75 tok/s and 19.286 versus 19.234 ms/round are different
+output workloads, not an accepted model speedup. Preserve this cohort in
+`source-aligned-summary.json` separately from the older mixed-native pair.
+Next compare actual activations at the first-divergence prefix; do not repeat
+unchanged endpoint timing or change production KV/context/sampling settings.
+Keep the feature default-off and PR Draft; do not repeat the old-extension,
+fixed-KV harness failures or passed 336 checks as a substitute for localization.
+
+## DFlash2 E4M3 FP32 default policy, 2026-09-08
+
+[The precision-default change](sm70_dflash2_fp32_defaults.md) is based on
+`56f534e672657a6c7599afd6c0dcb2e2c211b2e3`. It removes E4M3 admission to the
+legacy FP16-partial verifier, admits DFlash2 pages 1728/3456 to repaired FP32
+attention, resolves the SM70 `fp8` alias to E4M3, and enables FP32 logits in
+the existing Qwen3.8 DFlash2 default configuration. Explicit E5M2 remains
+available. No MTP enablement is part of this change.
+
+The legacy half-partial microbenchmark is retained for the speed/precision
+comparison; its higher speed is not a reason to restore it to E4M3 serving.
+Only measured model results may establish acceptance or throughput effects.
+
+## v37 prefill integration: model-parity hold, 2026-09-07
+
+Draft [PR548](https://github.com/1CatAI/1Cat-vLLM/pull/548) integrates the
+FP32 v37 prefill route and exact E4M3 bridge, independently of grouped/MTP
+PR524. See [the integration audit](sm70_flash_v37_prefill.md) for admission,
+rollback and the explicit E4M3 wave-decode launch recipe. Global KV encoding
+and decode kernels are unchanged; every model run has MTP disabled.
+
+The port preserves bitwise operator output and latency, including17
+real-derived dynamic-shape comparisons. CPU141-pass/1-skip, GPU33-pass,
+CMake build and memory-safety checks are recorded. In the controlled TP4
+comparison,256000-input decode is43.136 versus43.109tok/s and prefill is
+106.985 versus107.000s. This is not a NVFP4-weight50.38tok/s baseline.
+
+Do not merge yet: with non-FA2 native binaries held identical, five of six
+natural-EOS outputs match exactly, but the256K summary differs from token109
+(157 versus158 tokens). Both answers remain coherent and retrieval-correct;
+the cause of the identity failure is not established. An earlier
+multi-library comparison also differed on a72-input-token reasoning prompt,
+which cannot enter v37. Preserve both failed comparisons. Do not repeat
+kernel-only checks as a substitute for localizing model-level variation,
+or use forced post-EOS continuations as quality evidence.
+
+## QUASAR E4M3 KV and FP32 logits, 2026-09-06
+
+The [precision follow-up](sm70_quasar_e4m3_fp32_logits.md) adds explicit
+FP32 candidate/dense logits and E4M3 grouped q8 verification. The measured
+problem-row distribution TV drops from 0.021532 to 3.6694e-7, all 24 checked
+nucleus supports match the FP32 reference, and maximum real KV conversion
+relative L2 drops from 0.059324 to 0.029024. Paired E4M3 conversion preserves
+the scalar route bitwise across 1K–256K kernel probes. Keep the opt-in
+precision contract and the answer-quality limitations visible; do not
+equate these operator improvements with recovery of unquantized-model quality.
+
+## QUASAR + DFlash2 operator audit, 2026-09-06
+
+See [the operator audit](sm70_quasar_dflash2_operator_audit.md) for the frozen
+`755baae1d075ee04fa9096b23fc0225b23589a86` baseline, per-operator error
+tables, sampling-boundary fixes, and rejected diagnostic evidence. C1
+captures and the original concatenated GDN QKV oracle are invalid for
+production numerical conclusions. C2 residuals and q8 state updates are
+exact under their staged contracts. E5M2 conversion and LM-head rounding
+remain distinct precision concerns. Keep this change in Draft: final
+complete-round costs are 20.781/19.941 ms versus 18.037/17.588 ms, and the
+three-case Plus smoke is 0/3 versus the old DFlash 1/3.
+
 ## Objective
 
 Target tree:
@@ -129,6 +1097,108 @@ Goal:
   and
   [long-context result](https://github.com/yangzhuxinyzx/1Cat-vLLM-private/pull/23#issuecomment-5437096030)
   comments.
+
+### Grouped Page4 QSA follow-up, 2026-08-28
+
+- Public PR #378 landed the Page4 precursor. The exact grouped follow-up is
+  Draft PR #387 on
+  `codex/v100-qwen38-grouped-page4-prefill-20260828-144759`, rebuilt from
+  public `main@03c04da68e`. The frozen endpoint route remains
+  TP4/V2/ModelOpt NVFP4/FP16 activations and KV/no MTP, with 8192-token chunked
+  prefill. The retained BN16 endpoint baseline is
+  `4532.07/4446.64/4108.16 tok/s` at 32K/64K/131K; do not compare short route
+  probes or TTFT-inclusive numbers against it.
+- The retained 8192-token Nsight Systems capture makes selected QSA the first
+  optimization target: `55.151 ms` per layer/rank and `36.42%` of kernel time.
+  GEMM is about `35.8%`, TP collectives about `12.8%`, and the main GDN kernel
+  `3.11%`. Nsight Compute counters remain unavailable to this user with
+  `ERR_NVGPUCTRPERM`; do not repeat the counter attempt or change host policy
+  for this campaign.
+- Upstream audits found no drop-in SM70 kernel. FlashInfer PRs
+  [#4474](https://github.com/flashinfer-ai/flashinfer/pull/4474) and
+  [#4689](https://github.com/flashinfer-ai/flashinfer/pull/4689) provide the
+  useful BSR/KV256 and weight-stationary scheduling ideas, but target SM75+
+  and assume one semantic query block shares one sparse row. SGLang PR
+  [#36497](https://github.com/sgl-project/sglang/pull/36497) and vLLM PR
+  [#53896](https://github.com/vllm-project/vllm/pull/53896) retain a direct
+  per-row Triton QSA prefill kernel. Qwen TP4 has six query heads, D256, and
+  different top-k sets per row, so exact cross-query masks are required.
+- The retained production-layout Page4 partition sweep admits P1024 without
+  changing the 192-thread/two-CTA-per-SM resource contract. P256/P512/P1024
+  measure `30.742/29.361/28.769 ms`; P1024 is `6.4%` faster than P256 with
+  maximum absolute error `0.000244140625` and relative L2 about `3.95e-4`.
+  This is the fallback for large rows that cannot use grouped planning.
+- The grouped candidate assigns one CTA to eight adjacent query rows and six
+  heads, reusing each unioned FP16 K/V Page4 block. A 32-bit mask carries four
+  token bits for each of eight queries, preserving different top-k sets and
+  causal tails exactly. Real retained selection diagnostics are `81.92%`
+  adjacent-row overlap and `54.88%` at gap four; the admission microbenchmark
+  uses a 1163-page union matching both values, rather than assuming one common
+  set across all eight rows.
+- The GPU planner uses a per-group 8192-entry shared-memory hash table. It
+  resolves physical pages for every request independently, unions all rows,
+  and groups output by the seven possible active WMMA row-tile masks. Category
+  boundaries are padded to eight Page4 blocks so a 32-token kernel tile never
+  mixes categories. A deterministic block-wide prefix orders entries by hash
+  slot; four replays produce bitwise-identical tables and outputs. The earlier
+  shared-atomic ordering is rejected despite a slightly lower median because
+  it varied by one FP16 ULP across replays.
+- After the latest-main repair and QSA cache-table canonicalization, grouped
+  planning also consumes per-row query positions and per-request live sequence
+  lengths. It truncates early prompt rows, validates partial tails, request and
+  logical-page bounds, and rejects stale physical pages before hashing. A
+  4096-row hybrid Page16/Page4 test spans 1/2/3/4-token early rows, the
+  2048/2049/2050/2051 boundaries, mature rows, and a nonmonotonic physical page
+  table; it matches Triton at relative L2 `2.434e-4` and cosine `1.0`. An all
+  invalid/padded-group test produces bitwise-equal zero output instead of
+  leaving the caller's output buffer untouched.
+- The final isolated route, including Python dispatch, GPU planning, padding,
+  and grouped attention, measures `16.132 ms` median (`15.588 ms` minimum)
+  versus Triton `55.940 ms`, a `3.468x` speedup. Maximum absolute error is
+  `0.0001220703125`, relative L2 `3.535e-4`, and cosine
+  `0.9999998807907104`. The standalone planner is about `0.32 ms`; its exact
+  group-0 block/mask dictionary matches the reference. Focused Python tests
+  are `10 passed`, and the SM70 extension builds successfully with zero local
+  memory for the grouped kernel. Focused latest-source coverage is `19 passed,
+  16 warnings`.
+- The TP4 endpoint gate route-hits grouped Page4 on full 8192-row chunks and on
+  the 8120-row 131K tail. Pure-prefill throughput is `5998.65`, `5777.43`, and
+  `5450.92 tok/s` at 32K/64K/131K, versus the matching retained
+  `4532.07/4446.64/4108.16` baseline: `1.3236x/1.2993x/1.3269x`. An exact 8K
+  case measures `6394.74 tok/s`. Arithmetic, Chinese, and all long-context
+  token hashes are bitwise identical to the baseline, including both repeats
+  at 32K and 64K. The recovery endpoint run overlapped host/disk activity from
+  an unrelated GPU4-7 model load beginning at `15:23:39`, so treat these as
+  conservative endpoint values rather than a clean-host ceiling.
+- The clean double-locked 8192-token Nsight capture reports `5094.991 ms` of
+  aggregate kernel service over four ranks. Grouped attention is
+  `9.632 ms` per QSA layer/rank and its planner is `0.362 ms`, or `9.994 ms`
+  together: `5.518x` faster and `81.88%` lower than the old `55.151 ms` QSA
+  path. QSA plus planning is now `9.42%` of aggregate service instead of
+  `36.42%`. Per-GPU kernel-union duty is `98.27-98.61%` over a `1293.2 ms`
+  capture span; only `18.0-22.4 ms` is between kernels. The representative
+  NVML sample is `99-100%` GPU busy at `1530 MHz` and `268-314 W`. These are
+  scheduling-duty and power observations, not achieved Tensor-Core or HBM
+  counters; NCU remains unavailable under `ERR_NVGPUCTRPERM`.
+- The post-QSA first hotspot is the routed NVFP4 MoE chain. Its two grouped
+  GEMMs consume `25.12%`; materializing the top-10 input permutation consumes
+  `5.61%`; deterministic unpermute/finalize consumes `2.46%`. These three
+  stages alone are `33.19%`, before routing, sorting, and activation. The
+  NVFP4 kernel uses 128 threads, 122 registers/thread, and 16.4 KiB shared
+  memory, giving a four-CTA/SM, 16-warp/SM (`25%`) static occupancy ceiling.
+  Useful W13/W2 rates are only about `28.8-31.9 TFLOP/s`. HC combine-norm and
+  gate-mix are `6.44%/3.85%`, NCCL all-reduce is `8.45%`, and the main GDN
+  kernel is `4.43%`. GDN is separately grid/resource limited (48 CTAs for 80
+  SMs, 253 registers/thread, 91 KiB dynamic shared memory), but its absolute
+  opportunity is smaller than routed MoE.
+- Do not spend another full-model startup rechecking the same grouped-QSA
+  route. The next bounded experiment is an indexed-A NVFP4 W13 operator gate:
+  retain the existing deterministic expert sort and inverse map, but avoid
+  materializing 8192 rows into 81920 top-10 rows and let TurboMind's existing
+  indexed SM70 A iterator read the original token-major activation. Admit it
+  only if the complete sort/map/W13 chain wins and remains bitwise or within
+  the existing FP16 accumulation tolerance; a noncontiguous indexed read that
+  merely moves the copy cost into GEMM is rejected before any endpoint run.
 
 ## Active MRV2 DFlash2 campaign, 2026-08-20
 
@@ -42936,8 +44006,9 @@ Interpretation:
   M1-M16 plus M33/M257
   and explicitly covers legacy M1/M2/M9/M10 naive/aligned signatures; a fresh
   48-request run then produced no inference-time `fused_moe_kernel` JIT.
-  Unmatched shapes retain the old `(9,33,257)` warmup set, and the tuned route
-  requires `VLLM_SM70_MTP_MOE_TUNED_CONFIG=1`.
+  Unmatched shapes retain the old `(9,33,257)` warmup set. The audited
+  exact-shape tuned route is now enabled by default and can be rolled back
+  with `VLLM_SM70_MTP_MOE_TUNED_CONFIG=0`.
 - Full-model evidence rejects the isolated M1 result. A physical-GPU4-7 C1
   candidate/control/candidate sandwich measured endpoint-mean summed pure
   decode `112.233` versus control `115.451 tok/s` (`-2.79%`) and endpoint-mean
@@ -44172,3 +45243,4456 @@ Interpretation:
   `docs/design/sm70_dflash2_quality_audit.md`. Do not cite acceptance length as
   intelligence: it explains throughput, while official executable scores and
   natural termination are the quality gates.
+
+## 2026-08-28 GLM-5.3 NVFP4 selector audit
+
+- The exact TP4/B1 grouped W13 shape is eight routed slots with local
+  `N=1024`, `K=4096`, and group size 16. A same-GPU random-data screen on one
+  V100 measures the default split-8 median at `51.200 us` and the measured
+  split-12 route at `48.128 us`, a 6.0% stage-latency reduction.
+- The two FP16 outputs differ in 37 of 8192 elements with maximum absolute
+  difference 0.125, relative L2 `1.642e-5`, and cosine `0.99999917`. This is a
+  small accumulation-order difference rather than task-quality regression
+  evidence, so the faster dynamic W13 selector remains enabled.
+- The exact TP4/B1 W2 shape is eight routed slots with local `N=4096`, `K=512`,
+  and group size 16. Across five random seeds, the measured split-1 policy is
+  only 2.8%-3.5% faster than default split-2 in the materialized grouped-MoE
+  screen. It changes 52-70 of 32768 FP16 outputs per seed with maximum absolute
+  difference 0.0625, relative L2 `1.34e-5`-`2.01e-5`, and cosine
+  `0.9999972`-`0.9999981`. With no task-quality regression evidence, the
+  dynamic W2 selector also remains enabled.
+  `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=0` remains the common
+  stable-accumulation rollback for both shapes.
+- The grouped-MoE benchmark now supports random inputs, output hashes, tensor
+  dumps, and the real eight-slot GLM shape. Seed 17 reproduces output hash
+  `47836839b542fb73494caa64adc14cd660e38c535c4a5e67e16d3a763196dac7`
+  across repeated runs. The W2 audit evidence is rooted at
+  `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827/`
+  `nvfp4_selector_main_20260828/`. A separate FP16 Dense/Indexer candidate
+  screen remains benchmark-only and does not alter production dispatch.
+
+## 2026-08-28 Qwen3.8 QSA page4 XQA prefill audit
+
+- The SM70-only route converts each selected four-token QSA block into a
+  virtual Flash-V100 page, sorts physical microblocks for cache locality, and
+  keeps a marked causal tail last. It is restricted to FP16 Hq6/Hkv1/D256,
+  the 2051-token QSA selection layout, compatible contiguous or interleaved
+  KV strides, and at least 4096 query rows. The route remains default-on and
+  retains `VLLM_SM70_QSA_XQA_PAGE4=0` as an operational escape hatch.
+- A production-shaped interleaved-KV V100 A/B at 4096 rows measures the
+  established Triton route at `27.8303 ms` and page4 XQA, including table
+  construction and sort, at `8.84736 ms` (`3.1456x`). Across 6,291,456 FP16
+  outputs, maximum absolute difference is `6.104e-5`, relative L2 is
+  `2.845e-4`, cosine is `0.99999994`, and all outputs are finite.
+- A separate nonmonotonic contiguous-page A/B passes with maximum absolute
+  difference `3.815e-6`, relative L2 `3.645e-4`, and cosine `1.0`. Causal
+  tails of one, two, and three tokens each remain below relative L2 `3.64e-4`
+  with cosine at least `0.99999988`. The 4095-row boundary takes the Triton
+  fallback and is bitwise identical with or without the newly forwarded
+  metadata.
+- The hybrid 784-token scheduler / 16-token kernel geometry is also exercised
+  with a nonmonotonic 128-entry virtual page table after the physical-page
+  correction. Page4 XQA passes at maximum absolute difference `3.815e-6`,
+  relative L2 `3.631e-4`, and cosine `0.99999994`; its CUDA Graph replay is
+  bitwise equal to eager output.
+- Prewarmed CUDA Graph capture succeeds on V100; two replays are bitwise
+  identical to eager page4 XQA with output hash
+  `9b4c76f8420d6e349dc7d552c72d6f0a861332e7e8e8f62459a1c48f0faf278f`.
+  The table kernel now clamps padded or stale query positions to the live
+  request length and admits a partial tail only when the expanded QSA indices
+  contain that exact token, preventing an invalid synthetic tail page.
+- Raising the shared page-ID capacity from 8 to 32 does not reduce the
+  declared two-block V100 occupancy: the page4 padded kernel uses 45,568
+  bytes per CTA (`91,136 < 98,304` bytes for two CTAs), and the pipeline
+  variant uses 47,616 bytes (`95,232 < 98,304`). Existing FP16 page-16 and
+  page-784 XQA-to-scalar smokes pass at relative L2 `3.03e-5` and `4.10e-5`,
+  respectively.
+
+## 2026-08-28 exact shared-gate prescaled M=1 audit
+
+- The earlier rejected PP2/TP4 shared-gate candidate forced a dedicated
+  prescaled tactic and changed the control split/reduction tree. The repaired
+  selector instead inherits the ordinary per-rank measured kernel family,
+  CTA, split-K, and swizzle for only `M=1`, `N=1024`, `K=4096`; other M=1
+  roles retain their existing selectors. If a reused or imported cache holds
+  a different family, the selector restores the audited ordinary
+  `8x128x64`, split-K-7, swizzle-0 launch before selecting its prescaled pair;
+  it fails closed only when that compiled kernel pair is unavailable.
+- The locked SM70 artifact for source
+  `3897ac3d45667e4746dd7c87d18280173b607db6` uses the same
+  `8x128x64`, split-K-7, swizzle-0 launch in both arms. On the real layer-0
+  TP4-rank-0 shared gate/up weight, 64 changing inputs are bitwise equal both
+  before and after the external clamp-SwiGLU; both CUDA Graphs are stable.
+  Same-GPU A/B/B/A timing moves `62.229` to `20.793 us/layer` (`2.99x`).
+- A focused rebuild after the latest-main cache repair has extension SHA256
+  `7006136ef008f49663dad71f212aec3f2dc8adf369fc4f5c26800ae5f2eef05a`.
+  A fresh exclusive-V100 run selected the same ordinary and prescaled family,
+  split-K-7, and swizzle-3 in both arms. All 64 raw and activated patterns are
+  bitwise equal, CUDA Graph replay is stable, and A/B/B/A timing moves
+  `62.594` to `20.728 us/layer` (`3.02x`). Evidence is under
+  `/data/models/v100-pr347-cache-fallback-operator-screen-20260828-r1/`.
+- The subsequent source narrowing changes only the guard from every M=1
+  descriptor to the exact measured `M1/N1024/K4096` descriptor, so the tested
+  body is unchanged. Exhaustive simulation over every E4M3 byte and all
+  checkpoint UE8M0 scale codes also finds zero dequantized FP16 differences
+  for the reversible exponent shift.
+- This exact tensor/runtime route defaults on without checkpoint or model
+  identity checks. A missing operator, an incompatible runtime topology, or
+  non-reversible scales retain the ordinary TurboMind transform; explicit
+  incompatible opt-in fails closed. `VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE=0`
+  is the rollback.
+
+## 2026-08-28 GLM-5.3 exact KDA FP16 GEMV candidate
+
+- Development starts from public main
+  `03c04da68e72bf26271de4986364a72141a7601f` in isolated worktree
+  `v100-glm53-cublas-match-gemv-20260828-145134`, branch
+  `codex/v100-glm53-cublas-match-gemv-20260828-145134`. The target contract is
+  GLM-5.3-Flash-NVFP4, FP16 unquantized KDA weights, TP4/PP2 on eight V100s,
+  B1 decode, no MTP, FP8 E4M3 KV cache, and CUDA Graphs.
+- An exact-recipe sweep reconstructs the V100 cuBLAS `gemv2T` arithmetic for
+  the TP4 KDA projection `[M=1,N=6416,K=4096]`: 16 lanes per output, eight
+  512-element chunks, 32 ascending FP32 FMAs per `(chunk,lane)`, then chunk
+  `0..7` and lane `0..15` FP32 additions. The only matching Triton recipe is
+  vector width 1, 32 tiles per chunk, and a left-to-right lane fold. It is
+  bitwise equal to cuBLAS across five random seeds but slower, so it remains
+  an arithmetic oracle rather than the production route.
+- The CUDA candidate assigns one 128-thread CTA to each output row. All eight
+  chunks run in parallel, consume 512 bytes of shared memory, and join in the
+  reconstructed cuBLAS order. Across five post-cleanup runs it is bitwise
+  equal with zero maximum error and measures `65.485-65.509 us`; paired
+  cuBLAS measures `77.532-77.657 us`. This is a `15.55%-15.68%` latency
+  reduction and `802.6-802.9 GB/s` effective traffic bandwidth. The sidecar
+  contains only an `sm_70` cubin and has SHA256
+  `21924e7e93634eebce03199d264be5ec2bba08441d4f02f5881979bb6548b404`.
+- The focused native test passes all six cases. Five random seeds require
+  eager and CUDA Graph output to be bitwise equal to `torch.nn.functional.linear`.
+  A checkpoint audit additionally fuses the real layer-0 BF16 q/k/v/b/f_a/g_a
+  weights after the runtime FP16 cast for all four TP ranks. Sixteen changing
+  hidden states plus a CUDA Graph replay per rank, 68 comparisons in total,
+  are all bitwise equal with zero maximum error.
+- Retained evidence is under
+  `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827/`
+  `cublas_match_kda_20260828/`, including `cuda_final_seed0.json` through
+  `cuda_final_seed4.json` and
+  `checkpoint_layer0_tp4_exact_audit.json`. Nsight Compute hardware counters
+  are unavailable on this host with `ERR_NVGPUCTRPERM`; bytes divided by
+  synchronized CUDA Graph time provide only the stated bandwidth lower bound.
+- Rejected one-pass row-grouped CUDA variants reached only about `78.7 us`,
+  and the global split-partial workspace route was about `130 us`. Neither is
+  retained in production. The accepted kernel theoretically removes about
+  `0.403 ms/token` over 34 KDA calls; this is a projection, not an end-to-end
+  result. The following stability and quality audit records the compiled `_C`
+  route hit, real-model output gates, and same-contract unprofiled TP4/PP2
+  result required for production admission.
+
+## 2026-08-28 GLM-5.3 TP4/PP2 stability and output-quality audit
+
+- The production audit uses source
+  `5de4e1c063747af776b9f834d4ea36b053549a84`, Torch `2.10.0+cu128`, CUDA
+  `12.8`, and eight 32-GiB V100-SXM2 GPUs. The `_C` binary is SM70-only and
+  has SHA256
+  `65b424044f4237557226025078a80b9e949c62a9946843ea2652a099299bd627`.
+  Public main contains the same exact KDA route and default-on rollback gate
+  through merged repair PR #396. Subsequent main changes are exact Qwen3.8 or
+  Quark routes; there are no later GLM model or KDA source changes.
+- The frozen speed contract is GLM-5.3-Flash-NVFP4, `modelopt_fp4` routed-MoE
+  weights, FP16 non-expert weights, FP8 E4M3 KV cache, TP4/PP2 with layer
+  partition `24,21`, B1, no MTP, `max_model_len=4096`, 1,024 input tokens,
+  256 greedy output tokens with EOS ignored, and `FULL_DECODE_ONLY` CUDA Graph
+  capture at B1. Runtime logs hit GLM sparse MLA, exact KDA GEMV, fused KDA
+  f/g, native/Triton mHC, TurboMind NVFP4 MoE, custom TP4 all-reduce, and the
+  full decode graph.
+- Three prefix-cache-reset, unprofiled repeats measure steady decode at
+  `53.013085`, `53.018516`, and `53.017527 token/s`, mean
+  `53.016376 token/s`. Mean TPOT is `18.862097 ms`; the full range is only
+  `0.005431 token/s` (`0.01024%`). All three 256-token outputs have hash
+  `a28466cfa75e5850b532fabf18ead71af6a044ab69f17763327cea7522540343`.
+  This is the accepted stable baseline; neither `62` nor `75 token/s` is a
+  measured result for this contract.
+- The same repeats measure 1,024-token prefill at `3.845156`, `3.851318`, and
+  `3.850663 s`, mean `3.849045 s` or `266.039984 token/s`. Mean first-token
+  latency is `3.851276 s`. This is a 1K-prefill result, not a projection for
+  longer contexts. Single quality-worker cross-checks are only
+  `240.7-241.4 token/s` because they use separate one-shot worker startups;
+  they are not substituted for the stable three-repeat baseline.
+- At `gpu_memory_utilization=0.90`, the limiting worker reports `2.94 GiB`
+  available for KV, `255,122` aggregate GPU KV-cache tokens, and `62.29x`
+  maximum concurrency at 4,096 tokens. A separate `max_model_len=8192` audit
+  reports `326,769` tokens and `39.89x`; hybrid-cache block geometry changes
+  with maximum length, so those token capacities must not be compared as a
+  simple byte ratio.
+- Official quality sampling follows the checkpoint generation config:
+  temperature `1.0`, top-p `0.95`, top-k `-1`, EOS enabled, and fixed seed
+  `20260828`. Eight external prompts cover arithmetic, executable Python,
+  medication safety, strict JSON, translation, logic, kernel-validation
+  concepts, and code-only stable deduplication. With the template's default
+  Max reasoning and budgets extended from 1,024 through 4,096 tokens, six
+  tasks naturally stop and pass task-level review. The algorithm and
+  code-only tasks consume all 4,096 tokens without closing `</think>` or
+  producing a visible answer, so default Max reasoning is `6/8`, not a full
+  quality pass.
+- GLM's chat template ignores `enable_thinking`; both true and false render
+  `Reasoning Effort: Max` with identical prompt hashes. The actual control is
+  the model-specific `reasoning_effort`. Re-running the two failed tasks with
+  `reasoning_effort=low` makes both stop naturally at 514 and 62 tokens. Both
+  code blocks parse; the longest-run implementation passes six external
+  execution cases and the stable-unique implementation passes four. The
+  longest-run response contains one incorrect tie assertion in its explanation
+  and immediately corrects it; the implementation and final assertion are
+  correct, but this remains a minor model-text issue rather than a kernel
+  failure.
+- Kernel-causal gates remain clean: the exact KDA on/off A/B produced identical
+  full token sequences, the real checkpoint audit was bitwise exact for all
+  68 comparisons, each three-run greedy determinism set is exact, and repeated
+  quality runs retain stable speed hashes. There is no observed acceleration
+  or FP8-KV corruption in these short-context tests. This does not justify an
+  unconditional default-Max quality claim: production should pass
+  `reasoning_effort=low` for concise code/structured requests and reserve Max
+  for workloads with a sufficiently large reasoning budget.
+- Retained speed evidence is
+  `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827/`
+  `postmain_5de4e1c063_exact_kda_fp8kv_tp4pp2_i1024_o256_r3_20260828.json`.
+  Quality evidence is in the sibling `quality_official_*q1024`,
+  `quality_official_*q2048_remaining7`,
+  `quality_official_*q4096_remaining4`, and `quality_reasoning_low_*code2`
+  JSON artifacts. The fixed prompt set has SHA256
+  `cb8f877ca930299393816d06fb1584c2227f2c3971206fd622955a032c451d0d`.
+
+## 2026-08-28 GLM-5.3 DFlash2 TP4/PP2 bring-up
+
+- Development is isolated in worktree
+  `v100-glm53-dflash2-20260828-125830`, branch
+  `codex/v100-glm53-dflash2-20260828-125830`, from public-main base
+  `62ad1e02693f4c857f3b7547cef1860ee54e8053`; Draft PR #404 is the owned
+  review boundary. The target contract is
+  `LibertAIDAI/GLM-5.3-Flash-NVFP4`, official
+  `incoai/GLM-5.3-Flash-DFlash2`, TP4/PP2 on eight V100s, seven draft tokens,
+  greedy lossless validation, target E4M3 KV, draft FP16 KV, and CUDA Graphs.
+- The GLM target now exposes completed mHC-contracted auxiliary hidden states
+  at boundaries `6,15,25,34,43`, transports PP0 captures to PP1, and shares a
+  replicated target embedding with the final-stage-local DFlash draft. The
+  capture mapping matches the SGLang GLM DFlash adapter and its follow-up mHC
+  residual correction. The draft uses an independent SWA KV group and its own
+  final-stage parallel config rather than inheriting target MLA/PP metadata.
+- The first TP4/PP2 route attempt reached proposal generation but hung after
+  verification. NCCL diagnostics reduced this to a PP token broadcast count
+  mismatch: the last stage sent the first prefill result as `[B,1]` while the
+  receiving stage always posted `[B,8]`. PP broadcast now pads the sender to
+  the fixed `num_speculative_steps + 1` width; focused PP tests cover both
+  single-token and multi-token sends. Do not classify this wait as target
+  compute or TP/PP service time in a latency table.
+- After the PP fix, DFlash candidates and selector outputs were finite and in
+  range, but target verification returned vocabulary sentinel `154880` with
+  zero acceptance. Layer probes found the first real-request corruption in
+  layer 41 KDA: projection, gate, and short-conv outputs were finite; only
+  `fused_recurrent_kda` produced two nonfinite FP16 elements on TP0. The
+  following FP16 `o_proj` and TP all-reduce spread that one-token corruption
+  to every rank. Packed E4M3 sparse MLA, DFlash capture, selector, and PP
+  transport are therefore ruled out as the first source.
+- A production-shape V100 microbenchmark (`T8/H16/K128/V128`) proves the
+  caller-provided output buffer is bitwise identical to kernel allocation, so
+  aliasing is also ruled out. Scaling the FP32 recurrent state to `5e5`
+  makes the old FP16 staging produce three nonfinite values with the largest
+  finite value at `63680`; FP32 staging remains finite at `78023.71`, and the
+  existing fused RMSNorm+sigmoid gate writes a fully finite FP16 result.
+- The retained SM70 GLM route therefore keeps recurrent output in FP32 only
+  through the immediately following fused gate-norm, which writes FP16 for
+  `o_proj`. It adds no kernel launch and no clamp or per-token fallback. The
+  paired microbenchmark moves recurrent+norm from `120.279` to `121.188 us`
+  at T1 and `115.090` to `119.721 us` at T8. The T8 cost is about
+  `0.157 ms` across all 34 KDA layers per verifier round. The mixed-dtype norm
+  suite passes 25 tests; the SM70 KDA suite passes 10, including forced FP16
+  overflow and bitwise-stable CUDA Graph replay.
+- Subsequent correctness work removed two independent acceptance blockers.
+  The draft now keeps its trained NeoX RoPE instead of inheriting the NoPE
+  target/indexer layout, and the compressed MRV2 indexer cache is exposed as
+  real 64-token virtual pages rather than indexing 64-token metadata into
+  576-token physical blocks. A post-fix request accepts all seven proposed
+  tokens without an out-of-bounds cache access.
+- A target-only versus DFlash layer trace then found the first material quality
+  drift at sparse-attention layer 3. B1 decode used packed-E4M3 dequantization
+  plus FP16 Tensor Core GEMMs; M2-M8 verification used a numerically different
+  online-softmax kernel. Commit `494770be21` adds a small-batch hybrid route:
+  gather, QK, and softmax remain batched, while each PV uses the exact B1
+  Tensor Core GEMM reduction. The 2048-index-width V100 gate is bitwise equal
+  to eight B1 calls in eager and CUDA Graph replay. Strided-batched PV is
+  rejected because it changes the reduction order.
+- The retained exact-contract eager audit is
+  `.artifacts/glm53_dflash2_route_smoke/`
+  `gsm8k60_hybrid_fp8_gemm_release_eager_tp4pp2_20260901.json`. Across 60
+  sequential GSM8K questions it records `59/60` accuracy, zero invalid answers,
+  token-weighted acceptance length `5.5305228`, and no regression from the
+  independent target-only wrong-question set. The previous DFlash audit was
+  `58/60`; dataset index 16 improves to answer 230, while index 12 remains the
+  same target-only error. Per-position acceptance is
+  `0.9123/0.8148/0.7275/0.6320/0.5548/0.4766/0.4125`.
+- Eager steady decode averages `35.144 tok/s` (P50 `35.328`, P90 `39.655`),
+  versus `36.426 tok/s` before the exact PV correction and `14.597 tok/s`
+  target-only. The 3.5% quality cost retains a 2.41x target-only speedup.
+  Logical KV capacity is 10,406 tokens, 110 fewer than the prior DFlash audit.
+  The focused closure is 26 SM70 sparse/KDA GPU tests plus 170 CPU-side
+  DFlash, PP, and benchmark tests, with 21 environment-dependent skips; ruff,
+  format, compileall, and diff checks pass.
+- The final production graph audit is
+  `.artifacts/glm53_dflash2_route_smoke/`
+  `gsm8k60_hybrid_graph_fast_nopush_tp4pp2_20260901.json`. CUDA Graph and all
+  DFlash compute/metadata fast paths are enabled; only TP4 push all-reduce is
+  disabled. It records `59/60` accuracy, zero invalid answers, `60/60` natural
+  stops, and no target-only-correct regression. Token-weighted acceptance is
+  `5.6119455`; request mean/P50/P90 are `5.69076/5.78544/6.40038`.
+- The accepted graph averages `112.406 tok/s` steady decode (P50 `114.162`, P90
+  `126.322`, P99 `133.706`) and `77.496 tok/s` aggregate output throughput.
+  This closes the no-MTP TP4/PP2 75-token/s production goal. The separate
+  1024-input/256-output three-repeat checkpoint averages `154.57 tok/s`, with
+  identical outputs and full eight-token acceptance on its repeated
+  low-entropy prompt.
+- The matched all-fast graph with `VLLM_SM70_TP4_PUSH_ALLREDUCE=1` is rejected:
+  accuracy falls to `58/60`, case 20 becomes a new low-margin divergence and
+  reaches the 1024-token cap. Case 20 passes three repeated graph runs both with
+  all DFlash fast paths plus ordinary custom all-reduce (`108.934 tok/s`) and
+  with the conservative graph route (`103.530 tok/s`). The material quality
+  difference is therefore isolated to push all-reduce, not CUDA Graph or the
+  DFlash compute path.
+- For SM70 GLM5 DFlash2 TP4, config now auto-sets the push variable to `0` when
+  absent. Explicit `1` is preserved only for diagnostics and emits a warning;
+  Qwen and non-DFlash routes retain their existing global default. The
+  deterministic quality and graph speed gates are complete. The release-card
+  128-request stochastic `5.78` gate remains open and is reported separately.
+
+## 2026-08-28 Qwen3.8 NVFP4 indexed-A prefill audit
+
+- Public Draft PR #390 is stacked on grouped-QSA PR #387. The retained clean
+  #387 trace showed that the copied routed-MoE input alone cost about
+  `1.488 ms/layer/rank`, while the NVFP4 W13 and W2 grouped GEMMs remained the
+  largest combined post-QSA service category. This follow-up changes only the
+  exact Qwen3.8 TP4 `E512/K10`, `K2560/N320` W13 prefill route; decode, W2,
+  routing order, expert offsets, activation, and weighted unpermute are
+  unchanged.
+- The metadata-only permute keeps the same CUB stable expert sort, inverse map,
+  permuted map, and expert offsets. A 256-thread kernel derives the original
+  token row for each sorted route instead of launching one 256-thread CTA per
+  route to copy 2,560 FP16 values. TurboMind consumes those rows through its
+  existing SM70 `MatrixLayout.idxs` iterator. The materialized
+  `[tokens * 10, 2560]` allocation is omitted for the admitted route.
+- One locked V100 operator screen, using production dimensions and physically
+  distinct repeated real layer-0 packed weights, passes exact metadata and
+  output checks at 128, 512, 2,048, and 8,192 input tokens. At 8,192 tokens:
+    - sort plus materialization moves from `1.578496 ms` to metadata-only
+      `0.095232 ms` (`16.58x`);
+    - contiguous W13 moves from `4.409344 ms` to indexed W13 `4.184064 ms`;
+    - the complete sort/metadata plus W13 chain moves from `6.026752 ms` to
+      `4.235264 ms` (`1.423x`, `1.791488 ms/layer/rank` saved);
+    - expert offsets, inverse maps, permuted maps, sorted rows, and sorted
+      expert IDs are elementwise equal; indexed rows reproduce the expanded
+      input bitwise and W13 output is bitwise equal.
+- Incremental SM70 builds of `_C` and `_moe_C` pass and both new schemas import
+  in the production Python 3.12/Torch 2.10/CUDA 12.8 environment. The focused
+  admission suite passes `15 passed, 5 skipped`; ruff and repository
+  clang-format hooks pass.
+- A single model startup then completes the same TP4 V2, no-MTP, 8,192-token
+  chunk, QSA-page4 endpoint matrix used by #387. Runtime logs hit both
+  `SM70 Qwen3.8 NVFP4 indexed-A W13 prefill route enabled` and grouped QSA.
+  Pure-prefill results are:
+    - 32K: `5.4625646 -> 5.0357304 s`,
+      `5,998.65 -> 6,507.10 token/s` (`+8.47%`);
+    - 64K: `11.3434579 -> 10.5000728 s`,
+      `5,777.43 -> 6,241.48 token/s` (`+8.03%`);
+    - 131K: `24.0326333 -> 22.3112715 s`,
+      `5,450.92 -> 5,871.47 token/s` (`+7.71%`);
+    - 8K: `1.2810527 -> 1.1751880 s`,
+      `6,394.74 -> 6,970.80 token/s` (`+9.01%`).
+- Arithmetic text/hash, Chinese text/hash, and every retained long-context
+  token hash exactly match #387. The route therefore defaults on from 128
+  tokens under the exact contract. `VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL=0`
+  is the rollback. An implicitly enabled route falls back when paired with an
+  older extension; explicit `=1` fails closed if either new operator is
+  missing.
+- This clears 6K at 32K and 64K. The 131K result is still about 2.19% below
+  6K. Using the retained trace plus the measured indexed W13 time, W13 and W2
+  are still projected near 26% of 8K per-rank service, so the next bounded
+  screen remains the NVFP4 grouped-GEMM scheduler/register-pressure path, not
+  another model startup or a return to QSA launch tuning.
+
+## 2026-08-28 Qwen3.8 NVFP4 grouped-GEMM prefill audit
+
+- Public Draft PR #393 is stacked on indexed-A PR #390. The retained route is
+  restricted to the exact Qwen3.8 TP4 prefill descriptors and leaves decode
+  on the original packed weights. W13 partitions its existing packed N320
+  storage without copies: the N256 head uses the SM70 M32xN128xK32 streaming-B
+  tactic and the N64 tail uses M32xN64xK32. W2 keeps M32xN128xK32 and changes
+  only its cache-B policy. The W13 epilogue writes exact FP16 clamp-SwiGLU
+  values directly, removing the separate activation launch.
+- The partition is zero-copy. For every expert, the N256 head is the first
+  81,920 packed int32 words and the N64 tail the last 20,480 words. Their scale
+  tensors are column views with the original N320 leading dimension, so the
+  route adds no duplicate expert weights and no roughly 10-GiB/rank capacity
+  penalty. Missing operators in an older extension retain the unsplit route
+  unless the feature was explicitly forced.
+- One locked V100 operator screen uses physically repeated real layer-0 expert
+  weights, 8,192 tokens, top-K 10, and 512 local expert slots. The original
+  indexed W13 plus activation plus W2 chain measures `6.684 ms/layer/rank`.
+  The default production selector measures `6.12096 ms/layer/rank`: W13 is
+  `3.97773 ms`, W2 is `2.27123 ms`, and intermediate and final hashes are
+  exactly
+  `6d96da1848ed7ac92111df786a04afd54ef743f2e768dbc1ebca9ac9ffa2eae4`
+  and
+  `ceb78a76571ff57ea5eec6cba7b5c3b796d2af96e4225b8b2b4618a3fe592a1f`.
+  The measured saving is about `0.563 ms/layer/rank` per 8K chunk.
+- Bounded screens rejected the following paths and they must not be retried
+  without a new kernel design: full-W13 N64 tiles (`6.098 ms` for W13 alone),
+  M16 tactics, larger W2 M64/M128 tactics, and a padded dequantize-to-FP16
+  `bmm` route (`3.684 + 2.223 ms` before paying for about 1.26 GiB of
+  dequantized writes). A direct W2 atomic weighted reduction is also rejected
+  because multi-token accumulation is nondeterministic. Cache-B helps W2 by
+  about `0.08 ms`; applying the same policy to W13 does not help.
+- The first exact-256K startup exposed two PLE CPU-offload graph-boundary bugs
+  before any benchmark request ran. GPU placeholders now retain the checkpoint
+  scale in the model dtype, preventing a BF16 graph input on the FP16 V100
+  route. Quantized PLE IPC results are transported in the same one-byte-per-
+  element footprint as raw `uint8`, then decoded by an opaque SM70 Triton
+  E4M3FN-byte kernel. This keeps the 20-MiB-per-8K-chunk transfer size and
+  prevents TorchInductor from generating unsupported native-FP8 loads on
+  compute capability 7.0. The focused PLE suite passes 18 tests, and a Dynamo
+  export contains the opaque byte-dequant op with no float8 graph nodes.
+- A locked V100 gate covers all 256 E4M3FN byte patterns. Eager and
+  `torch.compile(fullgraph=True)` results exactly match the PyTorch FP8
+  reference for finite values and agree on NaN patterns. Dequantizing one
+  production `8192x2560` raw-byte
+  buffer takes `0.127 ms` median (`0.114 ms` minimum) and produces hash
+  `c15a97bc70b4d7de66d4cff36b989e34413b5fe966ccafe18f422ece8c897728`.
+  The ten PLE checkpoint files occupy 47.684 GiB on host storage/RAM; no PLE
+  embedding table is replicated onto any GPU.
+- One subsequent startup completed the full TP4 V2, no-MTP, FP16-KV,
+  PLE-CPU-offload, 8,192-token-chunk matrix through the model's exact
+  262,144-token limit. Every request reports `is_corrupted=false`; arithmetic
+  and Chinese outputs are respectively `42<|im_end|>` and
+  `在标准大气压下，水的沸点是100摄氏度。<|im_end|>`. Pure prefill is:
+    - 8K: `1.160956 s`, `7,056.26 token/s`;
+    - 32K: `4.962370 s`, `6,603.30 token/s`;
+    - 64K: `10.357441 s`, `6,327.43 token/s`;
+    - 131K: `22.101014 s`, `5,927.33 token/s`;
+    - input 262,143 plus output 1: `49.945010 s`,
+      `5,248.63 token/s`.
+- Against #390 at the four shared lengths, throughput improves
+  1.23%/1.48%/1.38%/0.95%. The exact-256K output is token `This`, hash
+  `274dfec6e079fb08d6b5771537c54d3f0bd36c64c3d8ed0a4e6d2f201b489274`.
+  KV capacity is 487,405 tokens/rank (1.86x maximum 256K concurrency), with
+  5.98 GiB reported free for KV allocation after model profiling. During the
+  steady 256K request, allocation is 32,409-32,471 MiB/rank; three ranks sample
+  100% GPU utilization for all 48 interior seconds and rank zero averages
+  99.81%, at 261-267 W average power. This rules out CPU/PLE starvation as the
+  long-context limiter. The next trace must be taken at 256K and separate the
+  context-growing QSA indexer/attention work from the now-fixed MoE projection
+  cost; 128K-only traces are no longer sufficient acceptance evidence.
+
+## 2026-08-29 DFlash2 18-ms source-default and prefill closure
+
+- The first NVFP4 QPN2-prefill integration exposed `M >= 1024` in Python.
+  AOT decode captured the wrong branch, grew the graph pool from 0.13 to
+  0.28 GiB, and regressed a complete DFlash2 round from about 17.4 to
+  41.98 ms. Sidecar-only and persistent-workspace variants are rejected.
+- One opaque C++ dispatcher now selects established QPN2/TurboMind for small M
+  and the QPN2-packed bounded prefill kernel for large M. The latter owns an
+  ephemeral FP16 workspace inside the operator. M8/M16 normal/gated and
+  explicit/ephemeral workspace comparisons are bitwise equal.
+- The exact quality-audited NVFP4 DFlash2 TP4/B1 q7/top16, E5M2-KV, q4096
+  contract now source-defaults the accepted verifier/GDN fast paths and QPN8
+  dense-order rerank. Explicit overrides remain authoritative. Candidate-order
+  stays off because its candidate-set tie cutoff is not quality-equivalent.
+- A four-V100 restart with the corresponding booleans absent from the launch
+  file logged automatic admission, opaque prefill, `dense_order=True`, and a
+  0.13-GiB graph pool. Three 512-token single-request runs measured
+  `17.4035/17.3569/17.3697 ms` per complete round (mean `17.3767 ms`). Cold
+  32K prefill was `4039.49 tok/s`; post-prefill decode remained
+  `17.3640 ms/round`.
+- Evidence:
+  `docs/design/sm70_dflash2_nvfp4_prefill_promotion.md` and
+  `/data/minimax-h3/task-cache/v100-dflash2-release-audit-20260829/remote-18ms-restart/source-default-validation.json`.
+
+## 2026-08-29 Qwen3.8 Flash-Next no-MTP checkpoint-native decode
+
+- Draft PR #415 carries the isolated source work. This contract is
+  `/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4`, TP4 on GPU0-3, V2,
+  ModelOpt FP4, FP16 activation/KV, Flash-V100, full CUDA Graph, aligned Mamba
+  prefix caching, max length 262,144, input 8,192, output 512, five cache-reset
+  greedy repetitions, and no MTP. Online QPN8 and top1-only LM-head lanes are
+  explicitly off. It is not the input-1,024/output-256 E4M3/QPN8 acceptance
+  recorded on 2026-08-24.
+- The matched control is 65.872/65.882/65.856/65.855/65.853 tok/s:
+  **65.864 tok/s** mean and **15.183 ms** mean TPOT. A four-rank graph-node
+  trace localizes 7.502 ms/rank/token and 812 launches/rank/token to dense
+  GEMV/GEMM and compressor work, led by two cuBLAS GEMV families at 3.656 and
+  2.254 ms/rank/token.
+- The retained default-off exact-topology route replaces audited
+  checkpoint-FP16 batch-one projections with SM70 row GEMV, fuses the exact
+  HyperConnection projection/mix, reduces QSA lexicographic top-k from eight
+  composite-key radix passes to four score-pivot passes plus exact
+  increasing-index tie compaction, and computes GDN QKVZ+b/a with direct
+  qkv/z/b/a outputs in one launch. It prepares 288 projections, 96 HC modules,
+  and 36 GDN inputs. Unsupported contracts retain the prior path.
+- The full matched candidate records
+  80.367/80.451/80.463/81.560/80.822 tok/s: **80.732 tok/s** mean,
+  **12.387 ms** mean TPOT, and 0.442 tok/s population standard deviation.
+  This is +22.57% throughput and -18.41% TPOT from control; all five token
+  arrays are identical. Warm 8K prefill median is 2,766.4 ms versus 2,777.6 ms
+  for control.
+- Frozen natural-output GSM8K indices 8-23 at xhigh,
+  temperature/top-p/top-k `1.0/0.95/20`, seed 20260828, and max output 4,096
+  score **15/16 raw and 15/16 strict**. All 16 stop naturally, all thinking
+  sections close, and there are no caps or structural failures. The historical
+  same-prompt MTP4 result is 15/16 raw and 14/16 strict; both miss item 12 with
+  prediction 12 versus answer 13. Repository repetition/character health
+  checks pass 16/16 with zero replacement characters and maximum same-token
+  run 3.
+- Focused static closure currently includes 25/25 QSA and new route policy tests,
+  Ruff check/format, shell syntax, and `git diff --check`. The exact QSA
+  sidecar previously passed its three GPU exactness, prefill-batch, and CUDA
+  Graph replay tests. Unused fused-W13 and shared-expert prototypes were
+  removed rather than stacked onto the accepted result.
+- Retained and rejected routes, full contracts, operator evidence, trace
+  tables, quality details, and artifact paths are recorded in
+  `docs/design/sm70_qwen38_nvfp4_decode.md`.
+
+## 2026-08-29 DFlash2 grouped-verifier binary capability guard
+
+- A production NVFP4 DFlash2 TP4 service failed on a 51,088-token cached
+  request whose final chunk scheduled 16 target tokens. The Python source
+  admitted q16 grouped verification, but the deployed Flash-V100 extension
+  still enforced the legacy q8 limit. Its `TORCH_CHECK` killed EngineCore and
+  left the systemd unit falsely active with four orphaned TP workers.
+- Draft PR #422 makes the native extension report its maximum grouped-verifier
+  query length. Source overlays paired with an older binary conservatively
+  infer q8; rebuilt extensions report q16. Unsupported q16 work uses the exact
+  independent paged-decode fallback, while the normal seven-draft-plus-bonus
+  q8 verifier remains on the 18-ms grouped fast path.
+- Five focused policy tests pass, including q8/q16 admission with a simulated
+  current extension and q16 fallback with a legacy extension. The deployed
+  legacy binary reports max-q 8 through the compatibility interface.
+- The four-V100 deployment reproduced the incident boundary with exactly
+  49,084 prompt tokens: twelve 4,089-token chunks plus a final q16 chunk. It
+  completed in 13.288 seconds without an engine error. Repeating the same
+  prefix completed in 1.715 seconds, confirming prefix-cache health. A tool
+  smoke returned a valid `get_weather` call with `{"city":"北京"}`.
+- The historical single-request web-generation prompt produced 512 tokens at
+  206.06 token/s streaming decode. Metrics recorded 142 speculative rounds,
+  369 accepted draft tokens, 3.599 emitted tokens per round, and 17.463 ms per
+  engine round. The service remained healthy with no post-restart traceback or
+  grouped-verifier shape failure.
+
+## 2026-08-28 Qwen3.8 NVFP4 prefill output-quality audit
+
+- Public Draft PR #393 source `472e06f4461ff8cf9fe37063dc954eb0dfa1d301`
+  passed a matched TP4 V2 candidate/control audit on four V100-SXM2-32GB GPUs.
+  Model, source, weights, FP16 KV, no-MTP state, PLE CPU offload, chunk size,
+  prompts, seeds, sampling parameters, CUDA Graph state, MoE routes, and cuBLAS
+  QSA indexer were identical. The only environment differences were
+  `VLLM_SM70_QSA_GROUPED_PAGE4=1/0` and
+  `VLLM_SM70_QSA_XQA_PAGE4=1/0`. Candidate logs hit the grouped Flash-V100
+  page4 route at both 8,192-row chunks and the 8,128-row 256K tail; control
+  logs retained the selected-attention fallback and contain no page4 hit.
+- The quality set contains three official-sampling corruption/repetition
+  probes at temperature 1, top-p 0.95, top-k 20, and `ignore_eos=false`; an
+  exact 32,768-token four-needle prompt with facts crossing the 8,192,
+  16,384, and 24,576 chunk boundaries; and a 262,080-token prompt whose
+  generation budget reaches the exact 262,144-token model limit. The latter
+  places facts at token 4,096, across 131,072, across 253,952, and at 261,760.
+  Greedy 32K runs are repeated twice with top-5 logprobs, and the same 32K
+  prompt also runs with official sampling. Short official probes are text-
+  health smokes: all reach their 512-token cap inside coherent reasoning and
+  are not presented as natural-termination task scores.
+- Candidate and control both report `completed=true`, metrics available for
+  every request, zero corrupted requests, zero text-health failures, and
+  complete code recall. Across seven records and 1,704 generated tokens,
+  every prompt hash, output token ID, output hash, finish reason, and decoded
+  text is exactly equal between routes. Both 32K repeats, the 32K official-
+  sampling request, and the exact-limit request return
+  `ALPHA=R7K2-ZEPHYR; BETA=M4Q9-ORCHID; GAMMA=T8V3-LANTERN;`
+  `DELTA=C6P1-HARBOR` and terminate normally. The 32K repeat hashes are also
+  exact within each route.
+- The 126 greedy long-context generation steps have identical top-1 tokens in
+  candidate and control. Maximum chosen-token logprob difference is
+  `0.0024374` at 32K and `0.0010699` at 262,080 tokens; the minimum observed
+  top-1 margin is still `5.0156` nats for candidate and `4.8125` for control.
+  Mean top-5 token overlap is 4.64-4.76 of five. A low-probability common
+  top-5 tail value differs by as much as `2.2810` nats at 262,080 tokens, but
+  same-route 32K repeats already show tail drift up to `1.2031` for candidate
+  and `0.7422` for control, while control's same-route chosen-logprob drift
+  (`0.0031536`) exceeds the matched route difference. This tail variation did
+  not alter a top-1 token, sampled output, recall result, or corruption gate.
+- The end-to-end result is consistent with the page4 operator audit: maximum
+  FP16 difference `6.104e-5`, relative L2 `2.845e-4`, cosine `0.99999994`,
+  finite outputs, correct causal tails, and bitwise-stable CUDA Graph replay.
+  The attempted full-vocabulary dump produced no evidence file because the
+  active V2 runner uses the MRv2 sampler while the existing diagnostic hook
+  is in the legacy V1 sampler. Do not claim full-vocabulary logit equality
+  from this run; adding an MRv2-only diagnostic hook or a bounded
+  `logprobs=-1` one-token probe is the correct future test if that evidence is
+  required.
+- Matched warm 32K prefill improves from `4,744.62` to `6,493.38 token/s`
+  (`1.3686x`); the 32K official-sampling request improves from `4,762.95` to
+  `6,526.09 token/s` (`1.3702x`); and 262,080-token prefill improves from
+  `4,131.06` to `5,185.43 token/s` (`1.2552x`). The performance gain therefore
+  accompanies exact observed output parity rather than a changed prompt or
+  sampling contract. PR #393 passes this prefill quality gate; the two page4
+  environment variables remain its immediate rollback.
+
+## 2026-08-31 1.5.0 DFlash2 release usability audit
+
+- Integration base is public `onecat/main@187b932dbd11940f0bcf52fb3675dd47fd69f313`.
+  The audit does not change a CUDA kernel, sampler, rejection rule, or target
+  distribution. It closes configuration and documentation gaps around the
+  already accepted Qwen3.8 NVFP4 DFlash2 TP4/B1 profile.
+- Explicit SM70 DFlash now defaults its draft backend to `FLASH_ATTN_V100`.
+  `--performance-mode interactivity` selects the scored B1/q4096 capacity
+  values only when neither value was supplied. Balanced/concurrent services
+  and every explicit override retain their requested capacity.
+- Selector-based DFlash2 now derives seven draft tokens from the official
+  checkpoint's block size eight when the user omits the field. Config SHA256
+  `873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980`
+  at revision `dedf8df68adfb1afeaf7b7480c0a0243108177b4` resolves to block
+  size eight and selector top-K 16 in a source-only configuration load.
+- The practical-default admission now checks for an actual NVFP4 format,
+  including `nvfp4-pack-quantized` inside a mixed-precision compressed-tensors
+  config group. A same-shape non-NVFP4 compressed checkpoint no longer receives
+  the NVFP4-only default set. Legacy MTP-disable variables no longer suppress
+  explicit DFlash defaults, and SM75 no longer receives SM70 backends.
+- CPU gates pass: SM70 EngineArgs defaults `13 passed`, DFlash2 targeted suite
+  `84 passed, 12 CUDA-only skipped`, Qwen3 coder tool parser `104 passed`, and
+  changed-file pre-commit passes. Initial source-only pytest collection tried
+  to import the absent worktree `_C`; rerunning with host platform detection
+  disabled exercised the Python contracts without borrowing a stale binary.
+- No new throughput claim is made. The runtime values remain the accepted
+  `17.3767 ms` mean complete round and `4,039.49 token/s` cold 32K prefill from
+  the matched four-V100 source-default proof. A built 1.5.0 wheel still needs
+  install/import, grouped-verifier max-q, API tool/schema, and TP4 route smokes
+  before tagging.
+
+## 2026-08-31 1.5.0 wheel RPATH release gate
+
+- The first post-merge 1.5.0 RC wheel built successfully from
+  `onecat/main@87c615a02ffcba08cc00a0e48ad1363a23cb29d6`, but the build
+  environment did not contain `patchelf`. Packaging only warned and retained
+  the build host's absolute Conda RPATH in both bundled Flash-V100 extensions.
+  `readelf -d` reported
+  `/home/ymzx/miniconda3/envs/1cat-vllm-1.3.0/lib`; that artifact is rejected
+  even though it can import on the build host.
+- The build dependency contract now installs `patchelf`, and wheel assembly
+  fails closed if it is absent or cannot remove an RPATH. This converts a
+  silent portability hazard into a build-time error and applies to source and
+  precompiled-extension wheel assembly.
+- The first incremental rebuild also exposed a pre-existing FetchContent
+  failure: CMake reran the SM70 FA2 patch command against its already-patched
+  source checkout. The patch step now resets and cleans only the downloaded,
+  pinned dependency and its CUTLASS submodule before reapplying the four
+  repository patches. Explicit `VLLM_FLASH_ATTN_SRC_DIR` development trees
+  remain outside this reset path.
+- The rejected diagnostic wheel is
+  `/data/minimax-h3/task-cache/v100-release150-wheel-20260831/dist/`
+  `1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl`, SHA256
+  `e09fd22f4030560a54ad59a783d82ee054e52ea6da014c5c755ee5e8a51a8fb1`.
+  Do not publish it. A rebuilt wheel must show no absolute RPATH before its
+  clean-environment and four-V100 runtime gates count.
+- The first RPATH-clean replacement, SHA256
+  `112888af049c66fecdc96aa1cee12ca16ede54aee62819dd8018762069352995`,
+  has no `RPATH` or `RUNPATH` in any of its ten native libraries and installs
+  in an isolated Python 3.12 environment. It is nevertheless also rejected:
+  its dependency metadata selects FastAPI `0.141.1` together with
+  `prometheus-fastapi-instrumentator` `7.1.0`. A real Uvicorn request then
+  fails with HTTP 500 because the metrics middleware reads `.path` from
+  FastAPI's `_IncludedRouter`.
+- The metrics dependency now requires `prometheus-fastapi-instrumentator`
+  `>=8.1.0,<9.0.0`. Upstream fixed `_IncludedRouter` handling in `8.0.1`, and
+  `8.1.0` also repairs nested-route resolution. A final wheel must resolve the
+  new dependency contract, pass `pip check`, and repeat the live plain-chat,
+  tool-call, and JSON-schema API gates before publication.
+
+### Final wheel proof
+
+- The final wheel was built from exact head
+  `c660086aa1aa264058b1fe54c1cd9f0620bb978d` and is stored at
+  `/data/minimax-h3/task-cache/v100-release150-wheel-20260831/dist-final/`
+  `1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl`. Its size is `147,963,867`
+  bytes and SHA256 is
+  `9dbb1118d670f081563b202127e77af41f9261d9ec7f7a829ec1357f53037d71`.
+  It is a validated release candidate, not a published/tagged artifact.
+- The wheel contains ten expected native libraries. All ten have zero
+  `RPATH`/`RUNPATH`, no `/home/ymzx` string, and no unresolved dependency when
+  checked with the normal Torch/CUDA runtime library set. Wheel metadata is
+  version `1.5.0` and requires
+  `prometheus-fastapi-instrumentator>=8.1.0,<9.0.0`.
+- A source-independent Python 3.12 environment force-installed the final wheel
+  and passed `pip check` with FastAPI `0.141.1`, Starlette `1.6.0`, and
+  instrumentator `8.1.0`. On a V100-SXM2 it imported the core and SM70
+  extensions, FlashQLA, grouped-verifier q16 capability, QPN2 prepare/decode/
+  prefill dispatch, SM70 LM-head top20, and the Qwen3 Coder tool parser.
+- The wheel then started a real TP4/B1 server on four V100s with the README
+  profile. Startup logs resolved q7/probabilistic DFlash2, target and draft
+  Flash-V100, FP8 E5M2 target KV, prefix cache plus Mamba align, q4096,
+  QPN2-packed prefill, exact grouped verification, and the quality-audited
+  DFlash2 defaults without explicit fast-path environment variables.
+- `/v1/models` and `/metrics` both returned HTTP 200. Plain chat returned
+  `42`; non-streaming `get_weather` and streaming `read_file` calls returned
+  the correct function names and JSON arguments; JSON-schema output returned
+  exactly `{"name":"小林","age":27}`. The schema case passed with thinking
+  enabled at a 512-token budget and with per-request thinking disabled at a
+  128-token budget. A 128-token thinking budget ended in reasoning before the
+  final JSON, confirming normal shared-budget semantics rather than DFlash2
+  token corruption; the public README now calls out this request contract.
+- Two identical 10,017-token prefix requests returned the same `收到` output.
+  Wall time fell from `2.642 s` cold to `0.164 s` cached, and the server
+  reported a `47.3%` aggregate prefix-cache hit rate while hitting the
+  Flash-V100 prefix/chunked prefill and FP8-KV routes. Shutdown released GPUs
+  4-7 back to `5 MiB` each.
+- A completely cold Triton cache still JIT-compiled three small kernels on the
+  first inference (`_sm70_qwen35_gdn_split_kernel`,
+  `_prepare_dflash_inputs_kernel`, and `layer_norm_fwd_kernel`). The request
+  remained correct and completed in `0.547 s`; this is a bounded cold-start
+  warmup follow-up, not a steady-state or publication correctness blocker.
+
+## 2026-09-01 GLM-5.3 Flash DFlash2 official closure
+
+- Draft PR #404 closes the GLM-5.3-Flash-NVFP4 DFlash2 release-card gate on
+  eight V100-SXM2-32GB GPUs with TP4/PP2, no MTP, E4M3 target KV, q7
+  probabilistic draft sampling, and CUDA Graph. Integration base is
+  `onecat/main@9e860996550c692d42b6f7ca57ced1bffbd8dfe5`; the owned branch is
+  `codex/v100-glm53-dflash2-20260828-125830`.
+- The remaining quality failure was cross-request PP state contamination, not
+  target or draft arithmetic. Immediate PP sampled-token receives could arrive
+  after a request slot was freed and then update the next request assigned to
+  that slot. Dataset item 16 reproduced the failure only after 16 preceding
+  requests: the isolated answer was 230, while the contaminated sequence
+  produced 170 and reached the output limit.
+- The fix adapts upstream vLLM #42187 to DFlash2: scheduler PP cadence, a
+  PP-depth deferred receive ring, a sibling NCCL communicator and side stream,
+  per-slot generation counters, optimistic position updates, and deferred
+  sampled/rejected updates. Sampled q8 and next-step draft q7 tokens share one
+  15-int64 packet. Triton scatters valid draft/state rows, skips negative
+  sentinels, and handles native int32 request indices without an indexing
+  fallback.
+- The retained deterministic artifact is
+  `gsm8k60_deterministic_graph_pp24_21_slotring_dtypefix_tp4pp2_20260901.json`.
+  It records `59/60` accuracy, zero invalid answers, 60 natural stops, and exact
+  extracted-answer parity with the target-only deterministic audit. Item 16 is
+  again 230. Token-weighted acceptance length is `5.615924`, aggregate output
+  throughput is `75.9518 tok/s`, and mean steady decode is `109.1768 tok/s`.
+- The official retained artifact is
+  `gsm8k128_official_graph_slotring_auto_tp4pp2_20260901.json`. The benchmark
+  clears manual acceptance-path overrides; the runtime then logs the production
+  defaults `PP=24,21`, proposal temperature scale `0.8`, and proposal top-p
+  `0.95`. The `zlab-shuffle42`, temperature-1.0/top-p-0.95, Max-reasoning run
+  records `122/128` accuracy, zero invalid answers, and 128 natural stops.
+- Mean completion tokens per verification step are `5.810047` (release gate
+  `5.78`) and token-weighted acceptance length is `5.585307` (implementation
+  gate `4.85`). Aggregate output throughput is `77.8477 tok/s`; mean steady
+  decode is `112.1869 tok/s` with P50/P90/P99
+  `111.3379/127.3029/138.8517`. Mean TPOT is `9.0196 ms`, mean prefill is
+  `89.4121 tok/s`, and FP8 KV capacity is 18,064 logical tokens.
+- The `25,20` alternative is not retained: its deterministic run has a length
+  stop and its official accuracy is `120/128`, below the accepted route.
+  Explicit mHC boundary materialization remains rejected at `58/60`; item 16
+  changes to 170. Both remain diagnostic-only.
+- The selector retains the exact calibrated/nucleus-truncated q logits used for
+  each draft draw, so standard p/q rejection corrects against the actual
+  proposal. After merging current `onecat/main`, the complete DFlash2 suite,
+  including the multi-position statistical test, passes `143` tests; PP
+  scheduler/model-runner regression files pass another `25` tests. Ruff
+  check/format, Python compilation, and `git diff --check` pass on the
+  pre-publication worktree.
+- The post-merge source is `3129de7dcd5ccc3463158dca652a5dc4657bd5d5`.
+  Its retained 17-request sequential integration artifact is
+  `gsm8k17_deterministic_graph_pp24_21_slotring_postmerge_3129de7_tp4pp2_20260901.json`:
+  `16/17`, only the target-baseline item 12 miss, 17 natural stops, and item 16
+  at 230 with the same accepted token hash. Token-weighted acceptance length is
+  `5.481799`. Its `73.8594 tok/s` aggregate includes first-request JIT over a
+  small 17-request set and is a merge smoke, not a replacement for the formal
+  128-request `77.8477 tok/s` performance result.
+
+## 2026-08-31 API failure and in-process cleanup gate
+
+- Draft PR #432 is based on `onecat/main@9e860996550c692d42b6f7ca57ced1bffbd8dfe5`;
+  tested head is `011adcf8ce`. It changes no DFlash2 proposal, selector,
+  rejection, sampling, verifier, or attention arithmetic.
+- Historical assistant tool calls now preserve object arguments, decode valid
+  JSON objects, and coerce malformed, null, or non-object arguments to an empty
+  object. This prevents one truncated tool call from making every later turn
+  in the conversation fail during template rendering.
+- Async multimodal items are stored as deferred factories, so per-prompt limit
+  validation happens before a coroutine exists. Resolution gathers with
+  `return_exceptions=True`, drains sibling fetches, then re-raises the first
+  failure. The two-image-over-limit API probe returned the expected HTTP 400
+  and produced no `coroutine ... was never awaited` warning, including after
+  server shutdown.
+- MRV2 shutdown now drops the target and draft CUDA Graph managers, detaches
+  target and draft layer KV/state views, removes Dynamo bytecode hooks, releases
+  `model_state` and `speculator`, and clears process-global Flash-V100, FP8, and
+  NVFP4 workspace owners. The multimodal language-model lookup cache is weak
+  keyed so it no longer pins models for the interpreter lifetime.
+- Focused Python gates pass `15 passed`; changed-file Ruff formatting/checks
+  and `git diff --check` pass. The broader pre-existing multimodal suite was
+  stopped while downloading its external model/assets and is not counted.
+- Remote TP4 proof used four V100-SXM2-32GB GPUs, Qwen3.8-27B NVFP4 target,
+  FP8 E5M2 target KV, FP16 draft KV, q7 probabilistic DFlash2, 256K maximum
+  context, q4096 chunked prefill, prefix cache plus Mamba align, Flash-V100,
+  and target/draft CUDA Graphs. Startup hit exact grouped verification and the
+  quality-audited fast-path defaults.
+- A malformed historical tool call returned HTTP 200 and continued with `OK`;
+  forced `get_weather` returned valid Guangzhou arguments; JSON Schema returned
+  exactly `{"name":"Alice","age":30}`. A no-thinking coding smoke naturally
+  stopped with valid typed binary-search code and three assertions. Its 176
+  completion tokens took `0.889 s` wall time (about 198 completion token/s),
+  which is a route smoke rather than a new performance baseline.
+- Graceful termination removed the API, engine, and all four worker processes;
+  GPU 0-3 memory fell from `26,259 MiB` to `9 MiB` each. No recent `/dev/shm`
+  file, port listener, or unawaited-coroutine warning remained. Python's
+  multiprocessing resource tracker still reported semaphore/shared-memory
+  cleanup warnings while removing them; this is retained as a logging cleanup
+  follow-up, not evidence of a surviving process, file, or GPU allocation.
+- Retained remote log and request/response artifacts are under
+  `/home/ymzx/1cat-vllm-deploy/logs/`
+  `nvfp4-dflash2-pr432-011adcf8ce-256k.log` and
+  `/home/ymzx/1cat-vllm-deploy/test-artifacts/pr432-011adcf8ce/`.
+
+## 2026-09-01 DFlash2 default-capacity 17 ms root cause
+
+- A matched four-V100 audit held the model, TP4, q8 verifier, E5M2 target KV,
+  256K maximum length, prefix cache, Mamba align, tool/reasoning parsers, and
+  graph policy fixed. Changing only `max_num_seqs` from the source default 256
+  to 1 moved the steady complete round from about `18.52 ms` to
+  `17.39 ms`. Changing graph capture sizes, available KV memory, and dense
+  draft-logit allocation order did not recover the gap.
+- The CUDA Graph descriptor and attention metadata are not capacity-expanded.
+  For the single live q8 request both configurations capture `num_reqs=1` and
+  `num_tokens=8`; Mamba/GDN state indices and Flash-V100 metadata are sliced to
+  that descriptor. Node traces placed the difference inside the target q8
+  graph, while the DFlash graph remained unchanged.
+- The causal branch was a model-load predicate in the NVFP4 scheme. The
+  DFlash2 QPN2 contract required `scheduler_config.max_num_seqs == 1`, so a
+  default-capacity server retained TurboMind for every compatible target MLP
+  even when the live verifier width was eight. The old default-capacity log
+  had no QPN2 route hit; the B1 log reported `QPN2 M<=8 route enabled`.
+- Scheduler capacity is not an operator capability. The opaque C++ dispatcher
+  already selects the byte-preserving QPN2 layout only for live `M<=8` and
+  falls back to the retained TurboMind layout for larger dynamic M. The model-
+  load contract now keeps TP4, q7/top16, PP1, no-DBO, dtype, tensor-shape, and
+  operator-availability checks, but no longer reads `max_num_seqs`. Explicit
+  `VLLM_SM70_NVFP4_QPN2=0` and prefill rollback controls remain authoritative.
+- With source-default capacity 256, the repaired launch now reports both QPN2
+  decode and QPN2-packed prefill routes. After one first-request warmup at
+  `18.972 ms`, two independent steady requests measure `17.391 ms` and
+  `17.394 ms`; the historical B1 controls were `17.396 ms` and `17.386 ms`.
+  This recovers about `1.13 ms` without constraining service concurrency.
+- The probabilistic dense draft-logit fallback is about `1.66 GiB` per rank at
+  capacity 256. It was previously allocated before the model-loading memory
+  profile, allowing KV sizing to overcommit that already-resident memory. Its
+  allocation is now deferred until draft weights load, while the compact
+  rejection cache and dense compatibility semantics are unchanged. This is a
+  startup/OOM accounting fix, not a speed claim: its isolated latency result
+  remained about `18.52 ms` before the QPN2 admission repair.
+- The focused NVFP4 QPN2 module reports `5 passed`. A live forced-tool request
+  returns `get_weather` with `{"city":"北京"}`, and a JSON-schema request
+  returns exactly `{"name":"小明","age":18}`. The change introduces no new
+  arithmetic path: it makes default capacity select the same previously
+  quality-audited, checkpoint-code-preserving B1 operator path. Test services
+  were stopped after collection and all four V100s returned to idle memory.
+
+## 2026-09-02 GLM-5.3 DFlash2 TP8 verifier under 30 ms
+
+- Draft PR #454 is stacked on GLM DFlash2 Draft PR #404. The owned branch is
+  `codex/v100-glm53-dflash2-verifier30-20260901-165322`; the quality and
+  performance source is `561b7007f12e78ed626041ae58fa1d51cc8486f9` and the
+  loaded SM70 extension SHA256 is
+  `e0e88d7629c81a808f4bebb17045757d4af5b99fd2c9db0f558ac7d6d7de4a15`.
+- The frozen contract is GLM-5.3-Flash-NVFP4, FP16 target execution, E4M3 FP8
+  target KV, DFlash2 q7 probabilistic sampling, TP8/PP1, eight V100-SXM2-32GB
+  GPUs, one live request, CUDA Graph, and no MTP. This is the PP-free verifier
+  lower bound; it does not replace the accepted TP4/PP2 service topology.
+- The matched verifier series moved from `33.2440 ms/round` to `32.7333 ms`
+  with exact cuBLASLt KDA projections, then `30.1857 ms` with fused GDN
+  metadata, and finally `29.91297 ms` with the native q8 mHC post+dot kernel.
+  The source-default three-seed rerun records `29.88682 ms/round` across 74
+  rounds and `172.2715 tok/s` weighted pure decode.
+- The final sampler step assigns eight warps only to the exact SM70 GLM5
+  target shape: batch 8, vocabulary 154,880, top-k disabled, and top-p
+  enabled. The existing default-on environment switch remains its immediate
+  rollback. A candidate/control/candidate sandwich records `29.847545`,
+  `30.210515`, and `30.049566 ms/round`; the two-candidate mean is
+  `29.948555 ms/round`, `0.261959 ms` or 0.87% below the four-warp control.
+  Individual runs can still land slightly above 30 ms, so this is a mean
+  steady-shape closure rather than an every-run upper bound.
+- A matched seed-zero graph-node trace has the same 128 output tokens, token
+  hash, and 23 verification steps on both schedules. `_topk_topp_kernel`
+  falls from `303.237 us` to `207.963 us` per rank/round, a `95.273 us`
+  (31.4%) reduction. One candidate trace step has 4.8 ms of rank-start skew;
+  traced interval means are therefore diagnostic composition evidence, not
+  the accepted endpoint latency.
+- The accepted mHC kernel uses CUDA `half`, round-to-nearest FP16 stores, and
+  source-order `value += comb * residual` / `dot += weight * mapped`
+  accumulation. Its six outputs are bitwise equal to the retained FP32 staged
+  implementation. The earlier explicit-`fmaf` version was faster but changed
+  seven of 131,072 FP16 residual elements by one ULP and changed the token
+  hash, so it remains rejected.
+- The official no-request-seed 128-question GSM8K audit with proposal
+  calibration `0.9/0.95` records `124/128` accuracy, zero invalid answers, and
+  128 natural stops. Mean completion tokens per verification step are
+  `5.787283`, passing the `5.78` release gate; token-weighted acceptance is
+  `5.573722`, passing the `4.85` implementation gate.
+- The post-sampler-change repeat again records `124/128`, zero invalid
+  answers, and 128 natural stops. Mean completion tokens per verification step
+  are `5.784293`; token-weighted acceptance is `5.561909`. Both gates pass,
+  and acceptance min/P50/P90/P99/max are unchanged from the earlier audit.
+  Weighted pure decode is `180.008 tok/s`; mean per-request steady decode is
+  `190.320 tok/s`, aggregate output throughput is `106.575 tok/s`, and mean
+  TPOT is `5.4041 ms`. Across all 38,236 completion tokens, total decode time
+  divided by all 6,873 verification steps is `30.8020 ms/round`; the longer
+  contexts and request transitions make this a different contract from the
+  short steady-shape 29.95 ms sandwich.
+- A paired fixed-seed 128-question audit records `122/128`, zero invalid
+  answers, 128 natural stops, `5.753127` mean completion tokens per verifier
+  step, and `5.602134` token-weighted acceptance. The more aggressive
+  `0.8/0.95` candidate is rejected because it produced one length stop and one
+  invalid answer on the same fixed seed.
+- The official run averages `187.4022 tok/s` steady decode and `101.2123 tok/s`
+  aggregate output throughput. Mean/P50/P90/P99 TPOT is
+  `5.4907/5.2661/6.2850/9.3154 ms`. Each rank reports 1.7 GiB available for KV
+  and 34,071 logical KV tokens at 0.90 memory utilization. During steady
+  generation all eight GPUs report 100% GPU utilization and about 38-39%
+  memory-controller utilization.
+- The narrow runtime selector applies the qualified flags only to SM70,
+  ModelOpt NVFP4 GLM5, FP16, probabilistic q7 DFlash2, TP8/PP1, no-DBO
+  contracts. It preserves every explicit override, keeps sparse target
+  rejection and the rejected MoE QPN W13 route disabled, and chooses regular
+  `torch.compile`; AOT compile measured `30.98 ms/round` with an exact output
+  prefix and is rejected for missing the 30 ms latency gate.
+- A historical upstream single-pass top-p kernel is also rejected: it is
+  faster but changes 703 mask elements on a random GLM-shaped exactness test.
+  Non-default top-p tile sizes likewise change the mask. An eight-warp
+  rejection block-stat candidate changed the accepted-token chain despite
+  matching isolated intermediate buffers and was removed. Compact target
+  rejection does not apply because the official target contract has top-k
+  disabled; forcing top-k 20 would change the target distribution.
+- Raw endpoint and quality artifacts are under
+  `.artifacts/glm53_dflash2_verifier30/`, notably
+  `q8_tp8pp1_multiseed012_topponly8_source_default_prop09_candidate_20260902.json`,
+  `q8_tp8pp1_multiseed012_topponly4_rollback_prop09_control_20260902.json`,
+  `q8_tp8pp1_topponly8_final_round_nodes.json`,
+  `q8_tp8pp1_gsm8k128_topponly8_source_default_prop09_top095_official_quality_20260902.json`,
+  and
+  `q8_tp8pp1_gsm8k128_source_default_aot0_prop09_top095_seed20260902_quality_20260902.json`.
+
+## 2026-09-02 GLM-5.3 TP8 fused KDA f_b/g_b closure
+
+- The native SM70 KDA f_b/g_b operator now admits the exact TP8
+  `B=1..8, N=1024, K=128` shape while retaining the existing TP4 `N=2048`
+  specialization. Its CUDA Graph replay is stable, and the focused V100
+  operator plus environment-gate suite reports 11 passed cases.
+- A 128-token-warm, ten-seed low-overhead A/B records `29.6850 ms/round` with
+  fusion and `29.9173 ms/round` without it, saving `0.2323 ms` or 0.78%.
+  Removing the first three requests still saves `0.1834 ms`. Earlier short-
+  warmup outliers are rejected as lazy-module startup measurements.
+- Same-seed node traces preserve the token hash and 23 verification steps.
+  Per rank/round they replace 68 CUTLASS `32x32x64 TN` projection launches with
+  34 native launches. The TP GPU-sum delta is `78.562 - 33.705 = 44.857 ms`
+  over 24 rounds and eight ranks, or `0.2336 ms/rank/round`, independently
+  explaining the endpoint result.
+- The official 128-question, 4096-token audit records `123/128` accuracy,
+  zero invalid answers, 128 natural stops, `5.827398` mean completion tokens
+  per verification step, and `5.585305` token-weighted acceptance. Both release
+  gates pass. Weighted pure decode is `187.716 tok/s`; the full long-output
+  audit averages `29.6639 ms` across 6,805 verification steps.
+- `VLLM_SM70_GLM53_TP8_FUSED_FG_B=1` is added only to the existing audited
+  SM70 GLM-5.3 NVFP4 DFlash2 TP8/PP1 default set. Its global default remains
+  off, explicit `0` remains the immediate rollback, and TP4/PP2 plus unrelated
+  model, quantization, topology, dtype, and draft routes are unchanged.
+- New raw evidence is under `.artifacts/glm53_dflash2_verifier30/`:
+  `q8_tp8pp1_10seed_topponly8_fusedfg1024_candidate3_warm128_20260902.json`,
+  `q8_tp8pp1_10seed_topponly8_fusedfg1024_control2_warm128_20260902.json`,
+  `q8_tp8pp1_fusedfg1024_topponly8_round_nodes.json`, and
+  `q8_tp8pp1_gsm8k128_topponly8_fusedfg1024_source_default_prop09_top095_official_quality_20260902.json`.
+
+## 2026-09-03 mixed-NVFP4 DFlash2 concurrency endpoint probe
+
+- Draft PR #476 at `51541062b8` was exercised with the local mixed-NVFP4 27B
+  target, BF16 LM head, q7 probabilistic DFlash2, TP4, Flash-V100, FlashQLA,
+  FP8 E5M2 target KV, FP16 draft KV, FULL_AND_PIECEWISE graphs, and sixteen
+  fixed SPEED-Bench 1K-by-512 requests per concurrency row.
+- After batch-specific sampling warmup, aggregate output throughput was
+  B1 `187.77`, B2 `175.26`, B4 `247.13`, and B8 `362.53` token/s. Relative to
+  B1 this is `0.933x/1.316x/1.931x`, or `46.7%/32.9%/24.1%` ideal scaling
+  efficiency at B2/B4/B8. B2 is a 6.7% regression and must not be promoted
+  without a matched grouped-verifier-off endpoint arm.
+- The cold B2 row was only `139.26` token/s because the first formal batch
+  JIT-compiled its sampling kernel and reached 11.46-second p99 TTFT. Retain it
+  as cold-shape evidence only. A one-output-token warmup is insufficient;
+  concurrency harnesses must warm the steady sampling path for each batch.
+- Prefix-cache queries matched the prewarmed prompt lengths but recorded zero
+  hits, and the source overlay lacked optional exact D256 prefill operators.
+  The table is therefore an endpoint scaling measurement, not a pure-decode,
+  prefill, or final TTFT baseline.
+- Target and DFlash graph audits hit FULL B2/q8, B4/q8, and B8/q8 descriptors
+  on all four ranks. QPN2 M<=32, FlashQLA decode, FP8 E5M2 KV, compact
+  rejection, and request-major grouped verification were present in worker
+  logs. Every official row completed 16/16 full-length outputs without an
+  error or empty response. Greedy B1/B8 was byte-identical on 2/8 prompts and
+  otherwise diverged into coherent text, so this closes text health but not
+  semantic-quality equivalence.
+- The fully QUASAR checkpoint remains unavailable. Do not use this mixed-target
+  probe to close the final QUASAR acceptance gate. Raw artifacts are retained
+  under the PR worktree's `.artifacts/runtime/endpoint-b1-b2-b4-b8-v2` and
+  `.artifacts/runtime/endpoint-b2-b4-b8-v3` directories. GPU 0-3 returned to
+  4 MiB per rank after graceful shutdown.
+
+## 2026-09-04 mixed-NVFP4 DFlash2 concurrency optimization follow-up
+
+- The acceptance targets are B2/B4/B8 scaling efficiencies of 80%/70%/60%
+  relative to the `187.77 token/s` B1 row, or absolute throughput gates of
+  `300.43/525.76/901.30 token/s`.
+- Default-off channel-FP8 QPN8 routes now cover exact M16 plus native dense
+  M32. The M32 kernel time-multiplexes the original split-12/16 warp ranges,
+  retains their FP32 reduction order, uses 28/36 KiB shared memory, and reads
+  each packed weight tile once for all 32 rows. M=17/18/24/31/32 is bitwise
+  equal to concatenated M8 calls for every production dense projection split.
+- Formal mixed-checkpoint endpoint results are B2 `253.95 token/s` (67.6%)
+  with exact M16, B4 `309.06 token/s` (41.2%) with chunked M32, and B4
+  `322.68 token/s` (43.0%) with native dense M32. Every row completed 16/16
+  full outputs. The B2/B4 acceptance statistics remain healthy at
+  `47.62%/4.33` and `51.68%/4.62` for rate/mean length.
+- Proposal temperature scale 0.85 was rejected: B2 was `258.38 token/s`, but
+  B4 fell to `313.46 token/s` versus native-M32 default proposal. A native M64
+  route was also rejected and removed: despite bitwise operator outputs and a
+  warm-cache microbenchmark win, B8 regressed to `283.94 token/s`, 21.7% below
+  the steady `362.53 token/s` baseline.
+- Retained source controls are `VLLM_SM70_FP8_QPN8_M16`,
+  `VLLM_SM70_FP8_QPN8_M32_CHUNKED`, and
+  `VLLM_SM70_FP8_QPN8_M32_NATIVE`, all default off. The benchmark now records
+  batch-invariance equality and supports real channel-scale checkpoint data.
+- The throughput gates are not closed. Further row tiling is stopped. The next
+  high-yield branch must split draft versus target cost without CUPTI, then
+  test request/stream partitioning inside the same TP4 instance; two Nsight
+  attempts crashed in `cuptiActivityFlushAll` during multiprocess shutdown and
+  produced no report.
+- MRV2's default-off phase profiler incorrectly admitted only `method=mtp`, so
+  the DFlash2 service emitted no phase records. Its gate now also admits
+  `dflash` and `dspark`, matching the legacy runner. Targeted tests pass.
+- The resulting synchronized B2/B4 diagnostic is not a throughput result, but
+  its stable full-batch CUDA-event medians localize the work: B2 is target
+  forward `37.64 ms`, target sample/state `1.29 ms`, draft `7.50 ms`, and total
+  GPU `46.65 ms`; B4 is `47.41/1.54/9.05/58.10 ms`, respectively. Target
+  forward consumes about 81% of both intervals and causes nearly all
+  B2-to-B4 growth. Selector/rejection micro-tuning is therefore not the next
+  primary optimization.
+- A q3 B8 screen reduced the target shape from M64 to M32 but reached only
+  `249.14 token/s`, 31.3% below the q7 steady B8 result. Draft acceptance was
+  `72.85%`, yet the shorter proposal emitted only `3.19` tokens per round
+  versus q7's `4.49`; q3 is rejected as a scaling workaround.
+- A default-off TP4 push all-reduce extension is bitwise equal to current
+  custom-order output over 128 consecutive graph collectives and four input
+  patterns. M16 improves `18.45 -> 11.03 us` per collective and M32
+  `26.78 -> 18.36 us`; M64 regresses and is not admitted. The control is
+  `VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY`.
+- Combined QPN8 plus push-AR endpoint results are B2 `258.04 token/s` (68.7%)
+  and B4 `317.11 token/s` (42.2%). B2 improves 1.6% over exact M16. B4's raw
+  value is below the prior `322.68 token/s`, but its mean acceptance length is
+  also lower (`4.39` versus `4.62`); acceptance-normalized round rate improves
+  about 3.4%. Both rows completed 16/16 full outputs without errors. Keep the
+  switch default-off because the absolute B4 endpoint gate did not improve.
+- A third Nsight run used stop-only capture termination, completed the B4
+  workload, and still crashed in `cuptiActivityFlushAll` without a report.
+  Do not retry this multiprocess CUPTI path until the external runtime changes.
+- The TP4/B8 synchronized MRV2 phase probe now has 43 stable full-batch q7/M64
+  rounds. Median target forward is `54.103 ms`, target sample plus state
+  `2.024 ms`, draft `12.041 ms`, and total GPU `68.290 ms`. Target forward is
+  79.2% of the interval, so selector work is not the primary B8 bottleneck.
+  The profiler-synchronized endpoint throughput is deliberately excluded.
+- A default-off `VLLM_SM70_NVFP4_QPN2_M16_NATIVE` route reuses each packed
+  NVFP4 weight tile across the two verifier row groups. On real layer-55 TP4
+  shards, gate/up improves `72.30 -> 66.76 us` and down projection
+  `38.06 -> 31.31 us`, saving a projected `0.786 ms` per target round versus
+  concatenated M8 calls. M9/M15/M16 gate/up and down outputs are bitwise equal
+  to that existing order with maximum difference zero.
+- Two same-contract single-instance TP4/B2 endpoint runs with retained QPN8,
+  push all-reduce, and native QPN2 M16 measured `271.46` and
+  `270.20 token/s`. The final source-matched result is `270.20 token/s`, or
+  72.0% scaling efficiency versus fixed B1 `187.77 token/s`. It completed
+  16/16 requests and 8,192/8,192 output tokens without errors, empty text, or
+  replacement characters; acceptance was `45.30%` with mean length `4.17`.
+- NVFP4 QPN2 M32 was removed because the exact candidate regressed down
+  projection to `140.94 us` versus approximately `71.59 us`. q5 B8 was also
+  rejected at `335.71 token/s`, 7.4% below q7, and a single-accumulator QPN8
+  candidate was removed because its acceptance-normalized B2 rate regressed
+  about 0.6% while changing reduction order.
+- The absolute gates remain open: B2 is about 10.1% below `300.43 token/s`,
+  while retained B4/B8 are `322.68/362.53 token/s` versus
+  `525.76/901.30`. Do not change tensor parallelism or use replica topology for
+  this acceptance task. Generic DBO targets DP+EP/DeepEP and is unsupported by
+  ModelRunnerV2, so the next branch is a TP4/DP1 MRV2-local verifier
+  microbatch/request-partitioning prototype.
+
+## 2026-09-03 Qwen3.8 unified prefill/decode compilation
+
+- The matched TP4/no-MTP evidence separated the regression from PLE residency.
+  The current source with the prefill graph policy measured `7026 tok/s` on the
+  repeated 8192-token prompt, while the combined decode graph service measured
+  about `5480 tok/s` after PLE major faults fell to two and PLE CPU time was
+  about 70 ms. The remaining roughly 330 ms was therefore inside the GPU graph.
+- The combined service compiled one dynamic backbone range `(1, 8193)`. Its FX
+  graph contained the M=1 FP16 GEMV, fused HC, fused GDN input, sum2 all-reduce,
+  graph-safe GDN slicing, and native Gemma RMS paths even for M=8192. The 7k
+  graph instead retained ordinary prefill linear/HC/GDN/RMS operations. This is
+  a phase-specialization bug, not evidence that two services or two weight
+  copies are required.
+- The candidate keeps one engine, one parameter set, and one KV/state cache. It
+  traces the existing dynamic prefill backbone first, then creates a non-owning
+  shared-parameter compiler limited to the FULL decode capture range. A capture
+  context selects decode-only graph semantics only while tracing FULL graphs;
+  normal prefill and PIECEWISE capture retain the established prefill graph.
+- Admission is limited to the exact Qwen4Exp 48-layer, H2560, E512/K10, HC4,
+  QSA TP4, FP16, PP1, no-MTP contract with at least one Qwen3.8 decode operator
+  enabled. `VLLM_SM70_QWEN38_DUAL_COMPILE=0` is the explicit rollback.
+- CPU-only gates pass: the phase context produces independent Dynamo branches,
+  the shared-weight proxy compiles without registering or copying target
+  parameters, focused config/route tests report `20 passed`, Ruff passes, and
+  GPUs 4-7 remain at zero allocated MiB. Real-model quality/performance evidence
+  is pending one combined candidate startup; no result is claimed yet.
+- The first routed real-model capture proved that the large backbone remains an
+  independent `(1, 8193)` graph (44.73 s compile), then stopped before any
+  request because the late-created decode wrapper was outside vLLM's model-load
+  config context. Commit `d6d72cd30b` scopes its construction with the derived
+  decode config; a focused lifecycle probe confirms that the wrapper observes
+  that config and limits its token range to `[1, 2]`. This failed capture is not
+  a performance or quality result and systemd was stopped before retry.
+- The corrected combined candidate produced two cache families on every rank:
+  `(1, 8193)` contains no Qwen3.8 M=1 GEMV/fused-HC/fused-GDN operators, while
+  `(1, 2)` contains the decode-only operators and captured successfully. Its
+  no-MTP steady decode is `85.80 tok/s`, but matched warm 8192-token prefill is
+  only `5525-5532 tok/s`, so this candidate is not the final 7k service.
+- AST call-count comparison against the accepted 7k graph leaves one material
+  runtime difference: the accepted graph calls CPU PLE gather plus FP8 byte
+  dequantization, whereas the combined candidate calls random UVA reads from
+  the pinned shard. Even the exact natural calibration hash regressed from
+  `6986` to `5522 tok/s`. The next candidate therefore preserves direct UVA for
+  decode, but deduplicates large-prefill row IDs on CPU, gathers from the same
+  pinned TP shard into a 20-MiB staging buffer, and performs one contiguous H2D
+  transfer before the existing byte-exact dequantization kernel. A 131072-row
+  CPU microbenchmark with 32703 unique local rows settles at `28.7-28.9 ms`;
+  the current random UVA path accounts for roughly 0.3 s at this shape.
+- The synchronous local staging candidate disproved the final sentence above:
+  matched warm prefill was only `5355-5399 tok/s`, while decode remained
+  `85.72 tok/s`. Its measured gather was `60-76 ms`; it could not reproduce
+  the accepted offload graph because GPU N-gram calculation and CPU gathering
+  still began at the PLE layer instead of being submitted before model forward.
+  That candidate was stopped and the local-staging code was removed.
+- The replacement hybrid uses the already validated offload connector for
+  prefill and the already validated rank-local pinned shard for decode. Both
+  storage views coexist in one model process topology: file-backed mmap pages
+  are loaded only by the asynchronous CPU worker, while each TP rank retains
+  its checkpoint-native pinned shard. The compile-phase context makes the large
+  graph wait for the async result and the small graph call local UVA; V2 FULL
+  replay suppresses unnecessary CPU requests. This route still needs one
+  combined real-model quality/performance gate before acceptance.
+- The first hybrid startup was killed by `systemd-oomd` after reaching
+  `108.7 GiB` unit memory: the existing executor spawned the mmap worker before
+  loading four local pinned shards, so both checkpoint scans overlapped. The
+  failure occurred before compile or requests and all GPUs were released. In
+  hybrid mode only, executor startup now loads the main model first and spawns
+  the file-backed worker afterward; non-hybrid offload ordering is unchanged.
+- Delaying process creation exposed that model loading attaches local weight
+  loader closures to the live configuration object graph, which `spawn` cannot
+  pickle. Hybrid startup now snapshots the small clean offload configuration
+  before model loading and consumes that snapshot after loading; the failed
+  attempt ended before mmap loading or compilation and produced no benchmark.
+- The corrected hybrid service started with zero systemd restarts. The large
+  graph contains `ple_offload_wait` and no Qwen3.8 M=1 operators; the small
+  graph contains the rank-local pinned PLE gather and decode-only FP16 GEMV,
+  fused HC, and fused GDN operators. No engine, weights, KV cache, or state
+  cache is duplicated.
+- An initial combined run measured only `5433` and `5495 tok/s` on the exact
+  8192-token hash `8aab945ad780...`, despite PLE mmap gather falling to
+  `31.3 ms`. The graph was structurally equivalent to the accepted disk graph;
+  the remaining regression was the launcher's explicit
+  `VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=0`. Restoring the default original
+  FlashQLA-SM70 TileLang GDN prefill route recovered `6878` and `6984 tok/s`
+  warm, within `0.6%` of the historical `7026 tok/s` result.
+- The same final no-MTP TP4 service measured `513 / 5.9602 = 86.07 tok/s`
+  pure decode. A full-context request accepted `262143` prompt tokens plus one
+  generated token and reported `51.8063 s` prefill, or `5060 tok/s`; prefix
+  caching remained disabled. Deterministic quality probes returned `5017` for
+  `173 * 29`, `1517` for `41 * 37`, and an accurate Chinese two-sentence lunar
+  phase explanation. Thinking is enabled and exposed through
+  `message.reasoning` by the selected Qwen3 parser.
+- The final API advertises maximum model length `262144`, remains served by
+  1cattunnel, and its authenticated public `/v1/models` probe returned HTTP
+  200. The service retained the 47.684-GiB file-backed PLE mapping with about
+  1.3 GiB worker RSS; startup's cgroup peak includes reclaimable/shared file
+  mappings and did not trigger `systemd-oomd` after sequencing was repaired.
+
+## 2026-09-04 Qwen3.8 exact no-MTP decode continuation
+
+- The current TP4/V2/no-MTP baseline uses Qwen3.8-Flash-Next-NVFP4 on four
+  V100-SXM2-32GB GPUs, FP16 activation/KV, Flash-V100, full CUDA Graphs,
+  hybrid mmap-prefill plus pinned-decode PLE, 8,192 input tokens, and 513
+  generated tokens. The accepted result is `85.136 token/s`, or
+  `11.746 ms/token`; its output token IDs exactly match the preceding control
+  (`7385dac...`). The active target remains `100 token/s` without changing
+  arithmetic precision or enabling MTP.
+- A graph-node trace at source `234d6bea91` measures `12.559 ms/token` with
+  tracing overhead. The leading additive categories are row GEMV
+  `1.439 ms`, GDN input `1.059 ms`, W13 `0.656 ms`, HC local down
+  `0.564 ms`, LM head `0.552 ms`, router `0.525 ms`, HC local up
+  `0.492 ms`, W2 `0.480 ms`, QSA split-K `0.440 ms`, and HC combine/norm
+  `0.402 ms`. Shared-expert auxiliary GEMVs overlap routed MoE and are not
+  added to the critical path a second time.
+- The production sidecar now includes the existing exact direct-W2 reduction
+  operator that the prior deployed binary lacked. Its production-shape graph
+  screen is bitwise equal and moves the W2 plus weighted-reduce chain from
+  `0.5062` to `0.4082 ms/token`, a projected `0.0980 ms/token` saving. This
+  projection is intentionally held for a combined model startup.
+- Two narrow SM70 PLE M=1 kernels remove generic tensor plumbing without
+  changing data types or rounding boundaries. The exact ngram-2/3 ID kernel
+  passes 256/256 random and EOS-boundary comparisons and moves
+  `0.08169` to `0.00435 ms/token`. The depthwise dilated-convolution/state
+  kernel is bitwise for normal, no-initial-state, and graph-padding cases and
+  moves `0.04084` to `0.00543 ms/token` while retaining native `F.silu`.
+- Fusing SiLU into Triton was rejected because the approximation changed two
+  FP16 values by up to `1.22e-4`; the admitted path keeps the original native
+  SiLU rounding. Cooperative HC combine/down, sum2/combine fusion, a
+  deterministic replacement router, SGLang's atomic persistent-HC design,
+  and fine-grained down-project/push pipelining were also rejected as slower,
+  nondeterministic, or deadlocking. They must not be retried without a new
+  schedule or arithmetic proof.
+- The direct-W2 and PLE screens project about `0.211 ms/token` combined. No
+  full-model speed result is claimed yet: these changes are deliberately
+  batched with further exact hot-path work so model loading is not repeated
+  for a sub-millisecond projection.
+- The official Qwen3.8 PLE gate and merged key/value projection were screened
+  separately on V100 before porting. The gate saved only `0.0022 ms` at the
+  production M=1 shape and changed thousands of FP16 elements. Merging the two
+  projections saved only `0.0031-0.0034 ms` and changed 11 of 12,800 FP16
+  outputs. Both are rejected for the no-precision-loss lane.
+- The checkpoint-native interleaved W13 layout places each gate/up pair in one
+  N32 CTA. The admitted decode epilogue retains the existing FP32 split-16
+  accumulation, rounds each projection to FP16 at the same boundary, then
+  evaluates the existing `expf` SiLU and FP16 multiply using warp shuffles.
+  Across 48 production-shaped layers, three CUDA Graph runs are bitwise equal
+  and save `0.0656-0.0720 ms/token` (`0.6045-0.6106` to
+  `0.5386-0.5388 ms/token`). Both variants use 60 registers/thread and 2 KiB
+  shared memory. Older extensions without the new op fall back to the prior
+  exact two-kernel route.
+- Direct-W2, exact PLE, and fused W13/SwiGLU now project about
+  `0.277-0.283 ms/token` combined. This remains a projection rather than an
+  end-to-end claim; retain it for the next material combined model startup.
+- A shared-expert gate screen localizes the old M=1 path to separate scalar
+  projection/reduction, sigmoid, and 2,560-element output-multiply kernels.
+  The prior `sm70_f16_gate_mul_out` candidate is rejected for this lane
+  because it rounds products to FP16 and omits the eager FP16 linear boundary;
+  on 48 real layer-0-shaped cases it changed 13,947 output elements by up to
+  `0.001953125` despite improving `0.4278 -> 0.1231 ms/token`.
+- The accepted shared-gate candidate retains FP32 FMA, explicitly rounds the
+  scalar linear output and sigmoid result to FP16 at the original boundaries,
+  and performs the final FP16 output multiplication in one CTA. Across all 48
+  real checkpoint gate weights and 512 changing inputs, the rounded gate and
+  all 2,560 output elements are bitwise equal (`0` mismatches). The production
+  sidecar/facade route measures `0.4261 -> 0.1253 ms/token`, saving
+  `0.3009 ms/token` for the isolated 48-layer chain without changing weight,
+  activation, accumulation, or output precision. Because shared experts can
+  overlap routed MoE, this is not counted one-for-one as endpoint TPOT until a
+  combined full-model run measures the reduced contention.
+- An exact HC-up projection/push experiment reproduced Triton's two-warp
+  K-split and XOR reduction tree, eliminating all 22 mismatches from the older
+  prototype on every TP4 rank. Expanding the fused collective from 32 to 80
+  CTAs nevertheless regressed the 96-HC chain from `1.7440` to
+  `2.3930 ms/token`; P2P polling and CTA overhead dominate the saved launch.
+  The 80-CTA fusion is rejected and must not replace the current split path.
+- vLLM PR 55309's QSA output-gate fusion was adapted to this tree's split-K,
+  E4M3-scale, and SM70 XQA branches. The generic split-merge and direct-write
+  paths preserve the compiled model's FP16/BF16 attention-output boundary,
+  then evaluate sigmoid and multiplication in FP32 before the final store.
+  The TP4 decode/split-64 and large-batch/split-1 tests are bitwise equal to
+  the previous separate compiled gate. A 12-QSA-layer CUDA Graph screen at
+  8K context improves `0.35888 -> 0.34250 ms/token`, saving
+  `0.01639 ms/token` (`1.048x`) with zero differing elements.
+- The same upstream PR's PLE outer-residual patch is not directly portable as
+  an additional decode optimization here. This tree already compiles the two
+  PLE residual additions into one three-input FP32 pointwise kernel. Its exact
+  M=1 short-convolution deliberately retains native `F.silu`: the earlier
+  Triton SiLU fusion changed FP16 results. Moving the add across the custom-op
+  boundary without also replacing native SiLU would not remove a launch, so
+  no PLE residual source change is admitted from this PR.
+
+## Exact HC three-direction screen, 2026-09-05
+
+- Owner: `codex/v100-qwen38-nomtp-token-trace-20260903-173451`, public Draft
+  PR [#481](https://github.com/1CatAI/1Cat-vLLM/pull/481). Pre-change source
+  `30f81105621e9f39e6b3bf9d816f77d63acd8307`; current integration merge base
+  `fbcef6e2f959e95bbe4ca807931abfa2393546e7`. Work stays in the owned worktree;
+  no direct push to `main` and no change to another task's running API.
+- Frozen operator contract: RadixArk/Qwen3.8-Flash-Next-NVFP4, all 48 layers'
+  attention and MLP HC pairs (96 distinct weights), TP4 V100-SXM2-32GB, M=1,
+  checkpoint FP16 weights/inputs/outputs, FP32 arithmetic, no MTP. These are
+  HC Mix-only CUDA Graph cycles, not full HC, prefill, or endpoint TPOT.
+- Implemented and screened all three research directions: hidden-coordinate
+  ownership, producer-only down publication, and exact logical-lane down
+  splitting with fused reduction/communication. All 96 pairs x 16 changing
+  inputs x four ranks are bitwise for block and injection outputs.
+- Only hidden ownership is retained. It gathers 640 final FP16 values per
+  rank instead of 2,560 gates, with no additional resident weight copy. Two
+  stable paired screens show `1.745654 -> 1.702919` and
+  `1.743988 -> 1.703158 ms` per 96 Mix calls, saving `0.041-0.043 ms` (about
+  2.3-2.4%). Three paired groups use 150 replays each after 1,000 warmups;
+  the second screen's range is below 0.2% for each retained variant.
+- Rejected: direct per-row publication (`2.229951 ms`), its coalesced revision
+  (`2.037357 ms`), and exact one/two/four-part down with the improved
+  half2-load/one-warp gather tail (`1.842709/1.850873/1.864315 ms`). These are
+  slower than the `1.743988-ms` matched control despite preserving precision.
+  The coalesced publication and tail revision were targeted responses to the
+  first screen, not new full-model startups. Do not rescan them unchanged.
+- Hidden two-row/four-warp, four-row/eight-warp, and four-row/sixteen-warp
+  schedules are also bitwise but slower at `1.738779/1.741660/1.719310 ms`.
+  Select two hidden rows and eight warps; do not conflate row tiling with a
+  change to the K-reduction tree.
+- A separate publication prototype single-GPU four-peer emulation passed
+  18 real-weight cases including generation 65535/65536 and signed 32-bit
+  wrap. This is arithmetic/protocol evidence only, not proof of distributed
+  speed or grounds to retain a slower publisher.
+- Source integration retains the existing HC opt-in, exact shape gate, and
+  older-extension fallback. A new capability check follows the communicator's
+  owning DSO, preventing an old sidecar from borrowing a new base-wheel op.
+  The four ownership/capability cases pass; the complete focused CPU dispatch
+  suite is `13 passed`.
+- Reproducible production gate:
+  `benchmarks/kernels/benchmark_sm70_hc_tp4.py --model MODEL --out RESULT`,
+  launched with four torchrun ranks and the source-matched extension. It uses
+  the registered HC custom op, compares forced old dispatch with new dispatch,
+  and checks concurrent sum2 on an auxiliary stream. Detailed launch examples
+  and measurement limitations are in
+  [the decode guide](sm70_qwen38_nvfp4_decode.md#hidden-coordinate-hc-sharding-2026-09-05).
+- Local raw evidence: `.artifacts/hc_hidden_shard/stages_result.json`,
+  `coalesced_result.json`, `single.log`, `dispatch_test.log`, and
+  `build_production.log`. The initial `result.json` had large idle-clock jitter
+  and is not accepted timing evidence. Warmup was added before the stable
+  screens. No full-model load has been performed for this HC screen.
+- The first production validation attempt was stopped by its owner before
+  timing when another task began a TP4 model run on GPUs 0-3. Its partial log
+  is `production_run.log`, not a failed numerical gate or performance result.
+  The guarded runner now checks both locks and actual device memory before
+  launch. Subsequent exit-75 lock waits are not model/GPU test attempts.
+- Final production gate at source `aaf63696b6`: all 96 real weight pairs x 16
+  changing inputs x four ranks pass bitwise, including 512 graph replays with
+  the actual sum2 route on an auxiliary stream. HC block, injection, and sum2
+  each have zero differing FP16 bits on every rank. The independent GPU
+  hidden-shard test is `1 passed, 18 deselected`; CPU dispatch remains
+  `13 passed`.
+- Three production paired samples are control
+  `1.738315/1.739291/1.738595 ms` and hidden
+  `1.689020/1.690590/1.690003 ms`. Medians are
+  `1.738595 -> 1.690003 ms`, saving **0.048592 ms (2.79%)** per 96 Mix calls;
+  ranges are below 0.1%. Runtime is Torch `2.10.0+cu128`, CUDA `12.8`, with
+  the SM70 sidecar compiled by NVCC `12.0.140`. Binary SHA256:
+  `a1fa27c23aea3ee2a7030017ee404c9d2bcb1f3c03889461a070c1f4daded4dd`.
+  Results/logs: `.artifacts/hc_hidden_shard/production_result.json` and
+  `production_final.log`. Result SHA256:
+  `6bf2c047430e586bf1814fbf8ae0fd09a335d4c59decc8d6fff4c5ca6aa37750`.
+- All task-owned GPU tests and lock holders exited after validation. Other
+  tasks' model workers/API were not stopped. No full-model startup or endpoint
+  was launched for this small HC increment. The next combined full-model
+  quality/performance gate remains pending; do not claim 100 tok/s or promote
+  an endpoint from the isolated 0.049-ms saving.
+
+## Full HC <= 1.5 ms target, 2026-09-05
+
+- The user explicitly set the next target to full HyperConnection latency
+  below `1.5 ms/token`, with no precision reduction. Preserve checkpoint FP16
+  weights/activations, FP32 accumulation, and the established rounding/order
+  contract. A Mix-only result does not satisfy this target. Final acceptance
+  requires matched full-model trace attribution and output quality, not just
+  an isolated graph score.
+- The old `2.658-ms` trace bucket was grouped by HC kernel names. It excluded
+  the final mixer's ordinary down/up projections (classified as dense work).
+  The new semantic HC microbenchmark includes these as well: 96 layer Mix
+  pairs, 95 combine/norm calls, two grouped input norms, the PLE boundary's
+  separate combine, and the final projection/SiLU/gate-mix path. Attention,
+  MoE, and PLE computation are excluded; attention/MoE outputs are fixed
+  external inputs. This is not a full-model run or an endpoint TPOT metric.
+- Frozen source `50f9fbe3749ecd673fee1aef361afd8db98e914a`, same Torch
+  `2.10.0+cu128`, CUDA runtime `12.8`, TP4 V100-SXM2-32GB, and source-matched
+  HC sidecar as the preceding screen. Public integration advanced to
+  `9ed8697ac0` during this work; the candidate kernel source was not changed
+  to mix unrelated integration changes into the comparison.
+- Complete HC microbenchmark medians are gate-sharded `2.277335 ms` and
+  current hidden-sharded `2.106689 ms`. Hidden samples are
+  `2.103712/2.106914/2.106689 ms`. All intermediate state, normalized state,
+  block input, injection, and final-mixer output tensors are bitwise across
+  all four ranks and 16 changing input cases. This cannot be reported as
+  `2.658 -> 2.107 ms` improvement: source scope, tracing, and workload differ.
+- Independent component graph medians are down `0.486018 ms`, down gather
+  `0.305125 ms`, hidden up/mix `0.505760 ms`, output gather `0.212166 ms`,
+  95 combine/norm calls `0.311712 ms`, and final mixer including its norm
+  `0.032160 ms`. Do not add these to close the complete graph: dependencies,
+  cache state, and the final norm overlap between component scopes differ.
+- `benchmarks/kernels/benchmark_sm70_hc_full_chain.py` provides the portable
+  complete-HC registered-op gate. It initializes cuBLAS before capture and
+  checks exclusive GPU process ownership around timing groups. The initial
+  artifact harness missed cuBLAS warmup and failed at handle creation during
+  capture; this was corrected once before the accepted baseline. No model
+  startup was involved.
+- Exact physical down expansion (128/256 threads with original 40-term FMA
+  chains and XOR tail tree) passes the full four-rank bitwise gate. Another
+  task entered the GPUs during timing; its large timing variance is not
+  accepted performance evidence. Neither CUDA down variant is admitted.
+  Ownership checks now also run during timing, not just before launch.
+- A materially different combine/norm + down prototype preserves Triton's
+  original two-axis norm reduction and uses four producer CTAs with
+  release/acquire readiness, instead of the old changed-order cooperative
+  reduction/global grid barrier. Cooperative launch bounds the residency
+  requirement. It passes the full bitwise gate but loses: matched hidden
+  `2.105330 ms`, fused without prefetch `2.134842 ms`, fused with four-chunk
+  prefetch `2.125169 ms`. Do not admit these variants.
+- One targeted follow-up prefetches all 40 immutable weight chunks before
+  consuming normalized input. A tensor-gather implementation was rejected at
+  compile/resource inspection (32 KiB dynamic shared memory, 255 registers,
+  480-byte stack frame, large generated code) without a GPU timing trial.
+  The static-register revision compiles with 125 registers, 64 bytes dynamic
+  shared memory and no stack/local spill. Its full-chain gate passes bitwise,
+  but matched medians are `2.109467 -> 2.159213 ms` (regression). Stop this
+  combine/norm + down fusion direction; do not repeat the failed variants.
+- A separate exact FP16 layout prototype packs four successive down chunks
+  into each 16-byte vector read and interleaves up's four branch rows by
+  hidden coordinate. Arithmetic order is unchanged; decode-only packed
+  shards cost `316538880 bytes` (`301.875 MiB`) extra per rank if both are
+  retained. The packed down compiles with 31 registers, 16 bytes shared
+  memory, no stack/local spill. All full-chain variants pass bitwise. Matched
+  medians are hidden `2.114089 ms`, packed down `2.174867 ms`, packed up
+  `2.100613 ms`, both `2.159398 ms`. Down/both are rejected; up's isolated
+  `0.013476-ms` saving is too small to justify admission on this evidence
+  alone. No production weight-loader or kernel route has changed for it.
+- The portable registered-op benchmark also passes 16 changing inputs on all
+  four ranks. Medians are gate `2.277540 ms`, hidden `2.111058 ms`; hidden
+  samples are `2.109891/2.111399/2.111058 ms`. It agrees with the artifact
+  harness, and remains an isolated complete-HC measurement, not endpoint TPOT.
+- Local evidence lives under `.artifacts/hc_full_chain/`:
+  `baseline.json`, `baseline_warm.log`, `down_schedules.json` (contended
+  timing, quality only), `fused_norm_down.json`, `fused40.json`, `packed.json`,
+  `public_baseline.json`, compiler logs and resource artifacts. The guarded
+  queue completed all three pending jobs and released its GPUs. Other
+  API/model tasks were not terminated. No full-model startup was involved.
+  The `1.5 ms` goal remains active and unachieved. Next screen targets hidden
+  up/local-mix/output-gather fusion with private per-CTA communication epochs,
+  distinct from the previously rejected branch-sharded/global-counter fusion.
+- The new hidden-sharded 80-CTA CUDA up/mix/output-gather prototype uses exact
+  FP16-value-plus-generation packets and independent two-slot CTA epochs;
+  no global completion counter or sentinel-value substitution. Its full-chain
+  16-input/four-rank gate passes bitwise. Matched medians are control
+  `2.105945 ms`, CUDA up/mix with separate gather `2.265607 ms`, fused gather
+  `2.180970 ms`. Fusion saves `0.084637 ms` relative to the CUDA split version,
+  but the projection schedule loses more: the net result is slower and is
+  rejected. Evidence: `up_gather.json`, source snapshot `up_gather80.cu`.
+  A bounded 160/320-CTA follow-up tests whether more projection parallelism can
+  retain the communication saving; each tile has its own private peer buffer
+  and generation counters. This is not a new production route.
+- The bounded scalar-load follow-up is also not admitted: control
+  `2.108150 ms`; 160-CTA local/fused `2.161794/2.103446 ms`; 320-CTA
+  local/fused `2.139696/2.183004 ms`. The best saving is only `0.004704 ms`.
+  All four ranks pass the 16-input bitwise gate and a second comparison after
+  generation `146593` (two 16-bit wraps). Evidence: `up_gather_tiled.json`.
+- SASS inspection identifies scalar U16 weight loads and shared-lora staging
+  in the CUDA prototype. A separate LDG128 revision removes staging while
+  preserving all arithmetic/rounding. It passes the initial four-rank
+  16-input gate, but another task enters during timing; the benchmark rejects
+  the sample and exits. This is a contention-aborted result, not a numerical
+  failure or a speed claim (`up_gather_vector.log`). A bounded follow-up also
+  distributes the four branch sigmoids over four times as many active lanes
+  at the existing gate-materialization barrier, without an extra barrier or
+  changed FP16 boundary. Its 80/160-CTA full-chain gate is pending.
+- The repeated contention is localized to a separate GPU reservation held
+  across another suite's model restarts. The guarded runner now honors that
+  existing flock as well as this task's GPU locks, without truncating the
+  other lease file. Do not enter the reserved suite's between-model gaps,
+  interrupt it, or accept contended timing. The vector/parallel-gate kernel
+  compiles without spills; its queued GPU screen remains pending.
+- The vector-load/parallel-gate screen subsequently completed under the
+  shared reservation. It produces the first material complete-chain win in
+  this follow-up: control `2.108826 ms`, 160-CTA local-only `2.068084 ms`,
+  160-CTA fused `1.999374 ms`. The full-chain saving is **`0.109452 ms`
+  (`5.19%`)**; fused samples are `1.999995/1.999374/1.998002 ms`. The 80-CTA
+  fused version is `2.082618 ms` and is not selected. There is no packed-weight
+  copy. All intermediate/final outputs pass bitwise on four ranks over 16
+  changing input cases and again after generation `146593` (two tag wraps).
+  Evidence: `up_gather_vector.json` and `up_gather_vector_final.log`; source
+  SHA256 `10d65cb0b979a51b3e6cf712dd3c535d93f66e4b418909adeec1616077c4def5`.
+- This is still an artifact prototype, not a registered production-path or
+  whole-model result. Next: port the selected 160-CTA kernel/private channel
+  with extension-capability fallback, then validate production dispatch and
+  actual auxiliary-stream sum2 coexistence. Batch the full-model trace and
+  output-quality gate with further material changes. Do not claim the old
+  full-model HC bucket moved `2.658 -> 1.999 ms`, or that the `1.5-ms` target
+  was achieved. All task-owned GPU tests/queues exited; other tasks continue.
+
+## 2026-09-03 GLM-5.3 DFlash2 TP4/PP2 256K cache and verifier audit
+
+- Draft PR #456 is stacked on verifier PR #454. The frozen contract is eight
+  V100-SXM2-32GB GPUs, TP4/PP2 with layer partition `24,21`, GLM-5.3-Flash
+  NVFP4 target execution in FP16, E4M3 target KV, official probabilistic q7
+  DFlash2, one live request, CUDA Graph, and AOT compile. No INT8 dense or KDA
+  path is admitted.
+- GLM's target Mamba state forces a 2,304-token MLA manager block. Charging
+  each DFlash sliding-window layer at that block size wasted about 1.6 GiB on
+  every PP1 rank. The cache planner now reblocks the draft attention to the
+  largest aligned divisor whose real page fits an MLA tensor slot: 1,152
+  tokens and 1,198,080 padded bytes for this model. Draft pages share the
+  unused MLA slot for the same globally exclusive block ID; no cache value,
+  scale, dtype, attention window, or block-owner lifetime changes.
+- At `gpu_memory_utilization=0.93`, every run reports 333,796 logical KV
+  tokens, or 1.27 concurrent 262,144-token requests. PP0 has 2.20 GiB
+  available and needs 1.05 GiB; PP1 has 1.14-1.16 GiB available and needs
+  0.89 GiB. The pool block is 7,644,672 bytes on PP0 and 6,370,560 bytes on
+  PP1. Model loading is 24.95 GiB/rank on PP0 and 25.85 GiB/rank on PP1,
+  where the approximately 0.90-GiB difference is the resident drafter.
+- The exact boundary run uses 262,136 prompt tokens plus eight output tokens
+  at `max_model_len=262144`. It finishes normally with no cache corruption.
+  Prefill takes 1,160.21 seconds and boundary decode is 1.825 token/s because
+  the real 256K sparse-attention work is included; this is a capacity proof,
+  not the short-context verifier speed result.
+- Three 128-question audits at the 256K service configuration record
+  `122/128`, `119/128`, and `123/128` accuracy. The fixed-seed runs have zero
+  invalid answers and 128 natural stops. The official unseeded run records
+  one length stop, `0.78125%` invalid answers, and `5.81257` mean completion
+  tokens per verification step, above the 5.78 release threshold. Pooled
+  acceptance is 5.46934-5.53801 on the fixed-seed routes, above the 4.85
+  implementation threshold.
+- Robust full-round cost is 43.440, 43.709, and 44.160 ms when each complete
+  128-request audit sums decode time and divides by all verification rounds.
+  Mean steady accepted-token throughput is 130.589-132.127 token/s. Two
+  deterministic dataset-0 AOT1 runs have identical 207-token output arrays
+  and measure 42.643 and 42.836 ms/round. Single unrelated stochastic
+  requests ranged more widely and are not used as a stable speed claim.
+- Temporary V2 CUDA-event probes localize a representative 42.486-ms round:
+  PP0 target forward 19.281 ms, PP1 target forward 16.109 ms, target logits
+  plus rejection sampling 1.282 ms, request-state update 0.034 ms, DFlash
+  proposal 3.456 ms, PP broadcast GPU work 0.124 ms, and about 2.200 ms of
+  remaining CPU scheduler/PP handoff. The two sequential target stages alone
+  are 35.390 ms. Resident NCCL wait kernels are dependency waits and are not
+  added again as communication service.
+- The retained exact KDA candidate lets every row lane directly load the
+  cached input half2 and removes the row-0 warp shuffle while preserving the
+  FP32 FMA and reduction order. The q8 microbenchmark is bitwise equal and
+  moves 126.222 to 114.924 microseconds (`+9.8%` effective bandwidth). Rows-8
+  CTA and forced 32-register launch-bound variants regress to 132.407 and
+  131.568 microseconds and were removed. The full-model output remains exact;
+  endpoint movement is below run-to-run noise, so only the operator result is
+  claimed.
+- Shared-expert side-stream execution remains enabled. A retained serialized
+  trace is about 1.23 ms/round slower. TP4 shared+routed `all_reduce_sum2` was
+  also left off: unmatched route smokes did not establish a benefit and were
+  not promoted. The quality-rejected TP4 push collective remains off.
+- The latest SGLang PP work does not provide a mergeable latency escape hatch.
+  GLM-5 speculative decoding plus PP issue #23162 is a closed RFC with no
+  linked implementation and keeps target PP stages serial. Parallel-spec
+  roadmap #27462 lists DFlash's hidden-state data plane and the PP handshake
+  as future/unvalidated work. Cross-round enumeration is not quality-neutral
+  for this hidden-state-conditioned drafter without that data plane.
+- Strict TP4/PP2 does not meet the requested 32-ms full-round ceiling. It
+  would require at least 10.5 ms, about 24.7%, below the stable 42.5-ms short
+  round, while the sequential target forwards already exceed 32 ms before
+  sampling and drafting. The same packed-cache code gives TP8/PP1 309,806 KV
+  tokens (1.18x 256K) and a 31.093-ms q8 round, but that is an explicitly
+  different topology and must not be reported as TP4/PP2.
+- Nsight Compute hardware-counter collection remains unavailable with
+  `ERR_NVGPUCTRPERM`. The host also rejects application-clock changes for the
+  current user; V100 application clocks remain 877/1290 MHz rather than the
+  supported 877/1530-MHz maximum. Neither unavailable counter values nor a
+  locked-clock speed projection is used as measured evidence.
+
+## Registered HC up/mix/gather port, 2026-09-05
+
+- Previous goal turn made progress: the complete-HC prototype improved by
+  `0.109452 ms`, with bitwise evidence. The current goal remains full HC below
+  `1.5 ms/token` on matched whole-model trace, no MTP or precision reduction.
+- Port only the selected 160-CTA/vector-load/parallel-gate kernel. Preserve
+  original FP32 FMA/reduction order and FP16 boundaries. Append a 21,120-byte
+  private packet/counter region to the existing communicator allocation;
+  legacy HC and auxiliary MoE layouts are unchanged. Start from zero counters
+  and publish generation one first. No extra weight copy or public switch.
+- Add `sm70_qwen38_hc_up_mix_allgather` to production binding, owner-DSO
+  facade, communicator, and model dispatch. Keep split-hidden and gate-sharded
+  fallbacks for older owner DSOs. Never borrow the new op from another DSO,
+  which may have allocated a different buffer extent.
+- Extend the complete-HC benchmark with `--fused-up`, forced control dispatch,
+  16 changing-input checks, 512 replays with actual sum2 on an auxiliary
+  stream, and a post-timing bitwise check after generation wrap. The legacy
+  Mix-only benchmark also explicitly disables the new route in its controls.
+- CPU dispatch/owner/fallback suite: **20 passed**. Ruff on affected Python
+  files and changed-line clang-format pass. Source-matched sidecar compiles;
+  dynamic `RankData` indexing initially introduced a 64-byte stack frame.
+  Constant parameter indices remove it before GPU testing: selected kernel
+  uses 31 registers, 192 bytes shared memory, zero stack or spill traffic.
+- Evidence is under `.artifacts/hc_up_fused_production/`: `cpu_tests.log`,
+  `build_final.log`, source-only sidecar builder, guarded `run_when_idle.sh`.
+  Registered GPU gate is pending at this update; no whole model was started.
+  Public integration was fetched at `2b89b77e3882423d1c93e01faf8c1db43f6650f4`;
+  keep the candidate's existing integration base `fbcef6e2f9` frozen for this
+  paired screen rather than mixing unrelated model-route updates into it.
+- Registered gate completed at `0303b82d1ec8fd9549d75018995939bbee63846e`:
+  full semantic HC split `2.109529 ms` -> fused **`1.994807 ms`**, saving
+  **`0.114722 ms` (`5.44%`)**. Split samples are
+  `2.109556/2.109529/2.109242`; fused `1.994807/1.993735/1.996370 ms`.
+  All four ranks have zero HC/intermediate/final and sum2 bit mismatches over
+  16 changing input cases, 512 auxiliary sum2 replays, and post-timing checks
+  after generation wrap. `result.json` SHA256:
+  `b9524acfe04ea92ca3836a404ae590284dc6ea0b8ee4ddfd3a3488e9653a9996`.
+  Production binary SHA256:
+  `5b1ee678bebf6a8fcdb008d5832cfd8ca3d6978558291ec9fe54ec2b9f6cf1bf`.
+  All test processes exited; no full-model startup. This is a production-op
+  microbenchmark, not a whole-model trace or endpoint acceptance.
+- Next bounded screen is an exact down/gather packet fusion, under
+  `.artifacts/hc_down_packet/`. It is materially different from the old
+  rejected 80-CTA/16-byte-sentinel fusion: 81 resident cooperative CTAs (no
+  serialized injection row), 4-byte half-plus-generation packets, no sentinel
+  clearing, half2 projection loads, and a private channel. The original
+  40-term FMA chains and cross-warp reduction remain unchanged. Both split and
+  fused variants compile with 31 registers/16 bytes shared/zero stack or
+  spills. Compare complete HC with the newly registered up fusion held fixed,
+  including actual auxiliary sum2 and post-wrap checks. GPU gate pending.
+
+## 2026-09-06 QUASAR E4M3 / FP32 DFlash2 latency recovery
+
+- Continue owned Draft PR #517 from precision-control `6ec27bec9c`; integration
+  base remains `755baae1d0`. Keep E4M3 target KV, FP32 candidate logits, and
+  ambiguous-cutoff reference sampling.
+- Capture q8 context computation and accepted-slot writes; stage independent
+  context work before sampling; refresh the non-causal paged graph's persistent
+  metadata directly. Remove four identity gather/stride-copy launches.
+- Same-process control/pipeline/control medians: release1k 20.035 → 18.925 ms;
+  MBPP28 19.642 → 18.467 ms. Full token sequences and acceptance counts match.
+  The historical 18.037 / 17.588 ms peaks are still about 0.9 ms faster.
+- Independent production confirmation at `f22ac115d0`: 18.892 / 18.435 ms,
+  144.015 / 286.721 pure decode tok/s; 303 / 260 tokens and 111 / 49 rounds.
+  Both speed hashes match the preceding precision control; round cost drops
+  6.24% / 6.64%. No profiler, development mode, or diagnostic worker extension.
+- Real weights: all 64 changing-context cases and all 16 metadata cases match
+  eager reference bitwise, including accepted lengths 1–8 and the 256K boundary.
+  Three long code responses (3559 / 1400 / 1856 tokens) match completely; MBPP
+  Base 3/3, Plus 1/3 in both diagnostic arms; structured JSON 42 passes.
+  Production outputs 4939 / 5904 / 633 tokens match the preceding precision
+  configuration completely, with Base 3/3, Plus 0/3 and JSON 42. The diagnostic
+  service's different trajectories remain unexplained; no quality-score gain.
+- Focused GPU tests 32 passed; metadata/policy tests 15 passed; Ruff/mypy pass.
+- Profiling environment: use Nsight Systems 2025.3.1 for V100. 2026.4 does not
+  support Volta. Start the profiler in every TP worker; a rank-zero-only CUDA
+  trace must not be reported as TP4 GPU evidence. Final trace has all four ranks.
+- NUMA pinning gave only ~0.03–0.04 ms; original affinity restored. Do not repeat
+  that experiment or disable sampling guards to manufacture a peak result.
+- Full contract, exact tests, acceptance limits, and artifact bundle are in
+  [the recovery report](sm70_quasar_dflash2_quality_speed_recovery.md). Raw bundle:
+  `v100-quasar-quality-speed-recovery-20260906`.
+
+## 2026-09-06 QUASAR TP2/TP4 quality and QAT execution audit
+
+- Continue owned Draft PR #517 from `6f07be1cce`, integration `755baae1d0`.
+  Repairs at `fcb6dada58`: align TurboMind NVFP4 physical output to 32 columns
+  and independently honor explicit FP32 dense LM-head output on TP2.
+- TP2 GDN N=8240 was 16-aligned but corrupt. Eight real shards show relative
+  L2 32.68%–51.25%; padding to 8256 restores 0.0249%–0.0323%. TP4's 4128
+  physical width is unchanged. Do not describe this as ordinary rounding.
+- All 64 target layers / 256 fused projections tested on identical C2 inputs.
+  Same-family TP changes affect row projections through local FP16 rounding;
+  native captured TP2/TP4 collectives match FP32 sum then FP16 on the six
+  real-partial cases per rank. QPN2 is still a TP4 production route.
+- Fresh E4M3 services, two fixed-prefix tapes, 129 positions each: TP2/TP4
+  greedy IDs all match, maximum sampling TV 1.029% / 2.208%; 21 differing
+  target Gumbel draws across 16,512 paired seed/position tests. Final hidden
+  relative L2 is 0.958% / 0.978%. This is not full speculative sampling or
+  a free-generation score, and includes the production kernel-family change.
+- The TP2 head-only repair removes both changed nucleus supports and reduces
+  differing Gumbel draws from 10 to 0 against the same-hidden FP32 oracle.
+- QAT declares W4A4; SM70 currently executes W4A16. Same-input activation
+  quantization changes projection outputs up to 12.24% relative L2; replacing
+  only the final down projection yields up to 5.042% sampling TV. No BF16
+  teacher or end-to-end W4A4 quality comparison; do not claim either is better.
+- Tests: 19 native/adapter, 6 head admission, 6 logical shard tests passed.
+  Matrix CLI and actual target-prefix/production Gumbel probes completed.
+- Diagnostic request switching used a global file and could race in-flight
+  rounds after the API cap. Bind diagnostics to request IDs; exclude extra
+  rounds and validate exact input positions. TP4 MBPP3 used a separate startup.
+  The revised hook has no fresh multi-request endpoint validation yet.
+- No new speed claim. Full evidence, reproducible matrix command and remaining
+  gates: [TP quality audit](sm70_quasar_tp2_tp4_quality.md). Bundle:
+  `v100-quasar-tp2-tp4-quality-audit-20260906`. Owned GPU services/leases stopped.
+
+## 2026-09-06 DFlash2 proposal and context fast-path numerical audit
+
+- Continue Draft PR #517 from `41a9018e9f`, integration `755baae1d0`.
+  Optional probabilistic lookup with a positive agreement threshold rewrote
+  the deciding random prefix's q as point masses. A production-kernel
+  counterexample changes target P(A)=0.8 to 0.70027 over 100000 seeds.
+  Preserve that prefix's original q and only replace subsequent positions:
+  repaired P(A)=0.80072. Default q8 and agreement threshold0 are unaffected.
+- Twelve lookup GPU regressions pass, including sparse and dense statistical
+  correction. The fusion kernel adds no launch; paired graph median cost
+  increases at most 0.006 us on B1/B4. This is not whole-round latency.
+- Ten fresh E4M3/FP32 request snapshots: 70 conditional selector rows have
+  unchanged greedy top-1, but FP32 selector arithmetic gives maximum proposal
+  TV 0.0954%. Token-keyed draws change 3/17920 at official temperature1 and
+  10/17920 at diagnostic temperature0.6. These are draft-token changes, not
+  final target-token errors. Do not claim a selector precision upgrade
+  improves final quality without measuring acceptance and target correction.
+- Fused selector graph vs sequential dense Gumbel: all 8960 positions match;
+  realized/sparse/dense q caches are exact. Cache overwrite under reordered,
+  intersecting supports and permuted request slots passes 288 checks.
+- Fresh context FC outputs reproduce the live TP4 path bitwise. Same-kernel
+  counterfactual TP2/TP4 output partition error reaches 9.21e-6 relative L2;
+  TP4-vs-cuBLAS FC drift is 1.77e-5 and becomes 1.06e-4 after BF16 norm.
+- Context pipeline/KV/metadata graphs on vs off: ten complete real boundaries
+  match bitwise through candidate scores, q caches and accept/reject counts.
+  Both full outputs match the prior 260-token MBPP28 control (49 rounds).
+  Synchronized capture timing is excluded; retain historical 18.435/18.892 ms
+  medians and the unmet 17.6–18 ms objective.
+- Exclude `_warmup_*` captures by request ID; first two dumps are startup
+  warmups. Use `context-fc-fresh-v2.json`. Raw bundle:
+  `v100-dflash2-fastpath-numerics-20260906`. Full reproduction and scope limits:
+  [fast-path numerical audit](sm70_dflash2_fastpath_numerics.md).
+
+## 2026-09-06 DFlash2 verifier route costs and quality attribution
+
+- Continue owned Draft PR #517 from `53be620005`, integration `755baae1d0`.
+  GPU 0–3 are occupied by another task; this audit leases GPU 4–7. Do not label
+  changed hardware-set measurements as recovery of the earlier speed peak.
+- QPN8 support/FP32 rerank: 535 real rows (465 target, 70 draft), no local top21
+  or required global top-k misses, no target top-p support changes; maximum
+  target TV 1.2456e-6. Local q8 head cost is 573–575 us vs 993–1011 us dense
+  FP32, excluding TP communication.
+- Sparse rejection: 60 independent real q8 rounds, emitted counts 1–8, exactly
+  equal to dense rejection and the captured output. Local graph cost 15.242 us
+  vs 43.530 us dense rejection alone; the latter excludes separate top-p.
+- Real admitted norm cases: 144 Gemma and 24 GDN reproduce live fused outputs
+  exactly, but can differ from staged FP32/FP64 references. Standalone fused
+  vs eager costs: Gemma 3.620/26.846 us; GDN 2.231/25.428 us. Do not extrapolate
+  the eager reference timing to the compiled full-model fallback.
+- Full-model fixed-prefix norm-switch comparisons show up to 4.55% TV with
+  unchanged greedy top-1. However, the same optimized configuration restarted
+  also differs by up to 4.33%. Layer 0/rank 2 GDN core already differs before
+  the first affected Gemma fusion. Attribution to either norm is not closed;
+  repeatability of prefill state and the forced-prefix diagnostic comes first.
+- Repair two diagnostics only: GDN projection dump violates its non-aliasing
+  schema; alignment rank detection can duplicate every TP replica. Three GPU
+  schema/AOT/graph tests and seven distributed-rank/fallback tests pass.
+  Deduplicate the original 240 alignment files into 60 independent rounds.
+  Use `norm-real-cost-v2.json` to exclude first-layer FP16 residuals that do
+  not enter the fused Gemma gate.
+- Uninstrumented GPU 4–7 production closure: medians 19.505/19.092 ms per round,
+  154.434/234.829 decode tokens/s, 248/270 output tokens, 82/60 rounds. Each
+  request's three measured repetitions match and stop naturally. The token
+  trajectories differ from the historical GPU 0–3 run; 17.6–18 ms and broad
+  cross-startup output parity remain open. Native hashes are unchanged.
+- Route-by-route ledger, controls and failed-diagnostic exclusions:
+  [verifier route audit](sm70_dflash2_verifier_route_audit.md). Raw bundle:
+  `v100-dflash2-verifier-route-audit-20260906`. Runtime arithmetic and precision
+  defaults are unchanged; keep the existing Draft PR pending the remaining
+  state, QAT teacher and performance gates.
+
+### Prefill repair history recheck
+
+At main `95205a2d9952813aa7469f63ff65b8f2813c027a`, the Flash-V100
+paged-prefill race/alignment fixes #202/#226 are already integrated and
+present in the source used for the retained 4.33% TV run and rebuilt native
+library. QSA allocation repair #494 and its validation #525 are in main but
+do not execute in
+the QUASAR 27B GDN/full-attention model. Draft #524 has a failed model token
+gate. No applicable validated pending prefill repair was found or merged.
+The [PR history recheck](sm70_dflash2_verifier_route_audit.md) records the
+scope and ancestry checks, prefill divergence, top-p boundary amplification,
+and the remaining conv/SSM state-replay requirement. CPU capture analysis
+passed; no fresh GPU run or performance claim accompanies this recheck.
+
+- The exact down packet screen completed and is rejected. Same-source
+  complete-HC control `1.989379 ms`, CUDA down plus separate gather
+  `2.072549 ms`, fused down/gather `2.218926 ms`. All intermediate/final
+  outputs and auxiliary sum2 are bitwise, including generation `195841`, but
+  both projection scheduling and distributed polling regress latency. Do
+  not repeat this 81-CTA packet variant unchanged. Evidence:
+  `.artifacts/hc_down_packet/result.json`; no production down route changed.
+
+## Decode-only HC norm weight prefetch, 2026-09-05
+
+- Previous goal turn made progress by registering and validating the up
+  fusion. Its final bounded down queue expired with exit75 before obtaining
+  GPUs, not after a failed GPU test. The same waiting job was resumed only
+  after its terminal status was verified; the down screen then completed.
+- The existing norm source documents that early weight reads help decode but
+  regress larger batches. A decode-only screen keeps the exact two-axis sum,
+  FP16 combine boundary, FP32 RMS/affine operations and their order; only the
+  weight load moves before combine/reduction. Offline SM70 compilation has
+  40 registers for late load and 66 for early, zero stack/local spills, and
+  64 bytes dynamic shared memory. This is not a repeat of failed norm/down
+  fusion or its down-weight-prefetch variants.
+- Complete-HC prototype control `1.982710 ms` -> early norm load
+  `1.942050 ms`, saving `0.040660 ms` (2.05%). Early samples
+  `1.942009/1.942050/1.942132 ms`. Four ranks x16 changing inputs and all
+  post-timing intermediate/final FP16 bits match. The already registered up
+  fusion is fixed on both sides; no new communication path is introduced.
+  Evidence: `.artifacts/hc_norm_prefetch/result.json` and `run.log`.
+- Port the load scheduling only for SM70, FP16, N=1, HC=4, H=2560. Other
+  shapes/dtypes/architectures and prefill retain deferred loads. Targeted CPU
+  dispatch tests **5 passed**, Ruff passed. The registered-kernel A/B with
+  explicit late/early control is pending; no whole-model claim from this
+  microbenchmark. Next also refresh the whole-model trace after the admitted
+  HC changes, with natural-output checks before profiling and one model load.
+- Registered norm kernel A/B at `8f74e4b88b3e2ec63c14d6be69c833e5a569822a`
+  passes all four-rank initial/post-timing FP16 checks. Explicit late-load
+  control `1.982525 ms`, early-load `1.944255 ms`, saving `0.038270 ms`
+  (1.93%); early samples `1.942992/1.944972/1.944255 ms`. The up fusion remains
+  fixed on both sides. Evidence: `.artifacts/hc_norm_prefetch/registered_result.json`.
+- A complete model/trace attempt loaded and captured the actual fused HC
+  route, then failed before generation: the quality harness passed the chat
+  tokenizer's Mapping result as token IDs. This is a harness failure, not a
+  model-output quality result. Engine shutdown released all task GPUs; the
+  failure is retained under `.artifacts/hc_trace_20260905/`. Do not count it
+  as a successful trace or hide the model startup from the attempt record.
+- Fix/preflight before retry: explicitly request `return_dict=False`, normalize
+  Mapping outputs, and validate nonempty integer IDs and vocabulary bounds on
+  CPU before creating the LLM. Both quality prompts pass (71/82 tokens). The
+  installed Nsight CLI and matching QdstrmImporter live under different library
+  roots; invoking the importer directly successfully converts the retained old
+  qdstrm entirely on CPU. No new profiler version or tracing criterion is used.
+- Reuse the skill parser's exact rank/ordinal windows with the old trace's
+  actual NVTX label `execute_context_0(0)_generation_1(1)`. A second SQL pass
+  selects the final mixer's same-stream work after its last HC norm, excluding
+  auxiliary-stream kernels and deduplicating named HC work. The old core bucket
+  is reproduced as `2.658072 ms` rank-average service; additional named HC and
+  final-mixer work brings the semantic total to `2.701252 ms` (rank-max mean
+  `2.726784 ms`). No steady-window final-mixer attribution failures. These
+  service statistics are not an additive whole-model wall-clock TPOT table.
+- A corrected retry is queued in `.artifacts/hc_trace_20260905_retry1/`, using
+  the same 8K/513 untraced and 8K/32 traced cases, current source-matched HC/W2
+  sidecars, and two short natural-EOS/thinking-enabled official-sampling checks
+  before the performance cases. These short checks are not the required final
+  256K quality gate. GPU locks are released before CPU-only report import;
+  an in-scope failure stops the job rather than automatically restarting it.
+
+## Completed HC full-model trace refresh, 2026-09-05
+
+- Corrected retry completed at frozen source `e76a9c8ca3` without further
+  model restarts. Two natural-EOS, thinking-enabled checks pass under official
+  sampling (temperature 1, top-p 0.95, top-k 20, seed 0): arithmetic 118 output
+  tokens and record-copy 110. These short checks do not establish full output
+  quality or the final 256K input boundary. The configured max context is
+  262144, but the timed prompt is 8192 tokens.
+- Same loaded engine: TP4 physical V100-SXM2-32GB GPUs 0-3, PP1, V2, no MTP,
+  no prefix cache, FP16 activations/KV, checkpoint-native NVFP4 experts,
+  online QPN8 disabled, q8192, shared-weight dual CUDA graphs, hybrid PLE.
+  Torch 2.10.0+cu128, CUDA runtime 12.8, Nsight Systems 2022.4.2.50.
+  Untraced 8K/513 case: pure decode **93.433729 tok/s**, **10.702773 ms/token**,
+  prefill 1.162319 s, TTFT 1.165618 s. One measured repeat after one warmup;
+  not a repeated endpoint stability claim. Traced 8K/32 request TPOT is
+  11.511879 ms; do not substitute it for the untraced speed.
+- Retained artifacts: `.artifacts/hc_trace_20260905_retry1/` contains the
+  exact contract/command, quality/result JSON, GPU sampler, raw qdstrm,
+  converted report/SQLite and `per_token.{json,md,csv}`. Manual same-version
+  QdstrmImporter conversion works; GPU reservation was released before this
+  CPU-only conversion. Owned engine/workers/PLE processes and sampler exited;
+  GPUs measured 144/10/10/10 MiB immediately after shutdown. No API is left
+  resident by this task.
+- Same parser rank/ordinal windows and NVTX label as the old trace: 31 x four
+  ranks, 29 middle steps. Kernel-name HC bucket **2.658072 -> 2.165077 ms**;
+  complete semantic HC **2.701252 -> 2.208302 ms** (18.25% reduction).
+  New full-HC p50 2.188509 ms, per-token rank-max mean 2.237414 ms. Preserve
+  the rank-skew/communication outlier; do not drop it to improve the mean.
+  No middle-window final-mixer attribution failures. CPU replay-window
+  boundaries produce small fractional launch-count averages; these are not
+  rounded into exact counts. Values are GPU service sums, not additive wall
+  critical-path TPOT. Full-HC **1.5 ms is not achieved**; remaining gap is
+  0.708302 ms (32.1% of the current measured HC time).
+- Current HC rank-average service: fused up/mix/gather 0.693805 ms; local down
+  0.559589; down gather 0.539501; combine/norm 0.367759; final gate 0.004423;
+  additional semantic work 0.043225. The trace confirms the actual fused
+  route. Endpoint improvement also includes earlier admitted W13/W2 and
+  other changes; do not attribute its entire delta solely to HC or norm.
+- Evidence SHA256: result
+  `83a381288a4fb1edc2966c323be567ace02c754fcc754a67778f73247d5df06a`;
+  quality `b4cb34908ca44eeac449104d2f87da77bcedd3345380876a574e5bbee32c0b33`;
+  nsys-rep `121c8bff98bce955ce13bb13501bcfc1021dffc31a214144191d1fcc7348673d`.
+- PR #481 was externally merged at `205acfb4da`, main merge `755baae1d0`.
+  Norm prefetch was pushed after that PR's merge point and needs a new Draft
+  PR. Continue in owned branch `codex/v100-qwen38-hc-15ms-20260905-1702`, same
+  artifact-preserving worktree. Merge main only AFTER the frozen trace ended
+  (`4b6c2daa1fe5a0a6b8ca14212b92c79736e22bb5`); this trace is not a speed claim
+  for the integrated source.
+- Next bounded hypothesis: fused-up H8/512-thread scheduling provides eight
+  row pairs and two serial groups, unlike the rejected H8/256-thread schedule
+  with four serial groups. Keep the same FMA/reduction/rounding and packet
+  protocol; screen against admitted H4/256 on full HC with actual auxiliary
+  sum2 and post-tag-wrap checks. It is unimplemented/unmeasured at this update.
+  Existing logical-lane down split, producer publication, 81-CTA down fusion,
+  and norm/down variants remain rejected; do not repeat unchanged.
+- Post-integration targeted norm dispatch/communicator-owner CPU checks pass
+  **35 tests**. Continuation Draft PR:
+  [#506](https://github.com/1CatAI/1Cat-vLLM/pull/506).
+- H8/512 screen completed at `2c2ec3f38d`: production complete HC
+  **1.948767 ms**, private H4/256 control 1.970251 ms, private H8/512
+  **1.953417 ms**. H8 improves private geometry by 0.016835 ms, but the tested
+  candidate does not beat production (0.004649 ms slower); no production port
+  or endpoint promotion. This does not prove that every source-integrated H8
+  implementation would lose, but it is not sufficient evidence to admit one.
+  Both fused kernels use 30 registers, zero stack/spills; H4 has 192 shared
+  bytes and H8 384. All four ranks x16 changing inputs, 512 actual auxiliary
+  sum2 replays, and post-timing checks are bitwise; generations 146593/195841
+  cross the 16-bit tag boundary. Evidence `.artifacts/hc_up_h8_threads/`, result
+  SHA256 `2b233da24cf9bba28d867fcdb364e6e8dafd873bf467755358bf169fa83f8ea4`.
+  Test exited normally; GPUs0-3 measured 141/7/7/7 MiB. No own queue/model/API
+  remains. Do not repeat this private-pointer H8/512 candidate unchanged.
+
+## HC down counter refresh and packed scatter, 2026-09-05
+
+- Previous goal turn made progress: refreshed full-model HC 2.208302 ms and
+  untraced decode 93.433729 tok/s, and rejected H8/512 private scheduling.
+  Full HC <=1.5 ms remains unachieved. No full-model startup in this turn.
+- Earlier NCU evidence (488 GB/s, 24.23% occupancy) profiled the old 324-row
+  replicated down projection, not today's 81-live-row TP shard. Profile only
+  `_qwen38_hc_down_local_shard_kernel`, grid88/block128, one real layer-0
+  weight on GPU0. Nsight Compute2022.4.1, clock-control none, cache-control all,
+  full counter set, one launch after warmup. New cold-replay diagnostic:
+  7.74 us, 216.88 GB/s, DRAM28.09%, SM5.85%, achieved occupancy6.51%, 40
+  registers, 0.08 eligible warps/scheduler, no-eligible91.84%; long-scoreboard
+  7.7 cycles/issue (63.9%). This is not wall HC timing and the clocks were
+  not locked. Evidence `.artifacts/hc_down_ncu_20260905/`: profile/run scripts,
+  retained NCU report and exported metrics. Privileged profiler exited normally.
+- Reuse the existing full-model SQLite, with no GPU rerun. Align all down
+  gathers by collective ordinal across ranks (2976 =31x96 each), verify
+  participant overlap, retain 29 middle whole-graph groups. Mean service
+  5.620995 us/call comprises 0.732571 us before the latest participant starts
+  and 4.888424 us after; last arrival to last completion5.188404 us. Retain
+  the step18 rank-skew outlier. These diagnostic boundaries differ from the
+  accepted CPU replay windows and do not replace the whole-HC report.
+- SASS confirms the old gather scatters contiguous low-rank rows through
+  scalar U16 stores and per-element routing branches. Change ONLY output
+  placement: aligned first80 values/rank use packed16-byte stores, the final
+  pack scatters one injection and three padding values. Keep the original
+  scalar output fallback for an unaligned weak-contiguous view. No changes
+  to arithmetic, sentinel handling, peer ordering, epoch, IPC layout, up or
+  norm. New gather44-46 registers versus old38; both zero stack/spills.
+- Build a single owner DSO containing production vector scatter and the
+  literal old scalar control, then run a paired full-HC benchmark. Pre-commit
+  source SHA4ef36a70d2 plus communication-file SHA256
+  `fea0d06d29cbcdcc3093a32ccd27aeac92e36e23342e5079063df58ba1b9bf64`.
+  Full HC **1.971644 ->1.899800 ms**, saving **0.071844 ms (3.64%)**;
+  vector samples1.899800/1.899861/1.899677. All four ranks pass raw-bit
+  aligned/unaligned comparisons and guards, 16 full-chain changing inputs,
+  512 actual auxiliary sum2 replays and post-timing bitwise checks. Keep this
+  candidate in DraftPR506; do not subtract its isolated gain directly from
+  the previous model trace or claim the 1.5-ms target.
+- Evidence `.artifacts/hc_down_vector_scatter/`: source-derived sidecar/control,
+  build script/log, paired benchmark/guarded runner, result and SASS. Result
+  SHA256 `f533515ef855ab0de4a1f39c71b5d43f96a7520705b38420288b76b8c94e3963`;
+  binary `fb5ee424a70c7532791d38918530d01f85ee99719a37b931c3c95762d3c0d023`.
+  Main was fetched and unchanged at755baae1d0 before publication.
+- Add the model-free public oracle
+  `benchmarks/kernels/verify_sm70_hc_down_scatter.py`: byte-gather reference,
+  all eight FP16 output alignments, reserved-NaN canonicalization in low-rank,
+  injection and padding positions, outside-buffer guards and CUDA Graph replay.
+  Ruff passes. Its focused GPU execution is queued behind the existing GPU
+  reservation; an earlier probe exited75 without starting a CUDA process.
+  This pending oracle is not yet reported as passed.
+- A separate explicit down register-lookahead screen (8/40 steps) was checked
+  OFFLINE ONLY. Compiler scheduling reduced both to32-register rolling-load
+  code, including a warp-ordering attempt, so the intended lookahead was not
+  established. Do not run these as purported prefetch variants or repeat the
+  previously rejected ordinary CUDA128 down. No GPU startup for this screen.
+
+### 2026-09-06: default-off E4M3 grouped FP32 small-query integration
+
+- Base: `755baae1d075ee04fa9096b23fc0225b23589a86` (`onecat/main`).
+  Owned branch: `codex/v100-e4m3-fp32-integration-20260906-050258`.
+- [Design, contract and evidence](sm70_e4m3_grouped_fp32.md): dense single-request
+  q2–8/GQA6/D256, FP32 partial state, explicit device query lengths and graph
+  padding. `VLLM_FLASH_V100_E4M3_GROUPED_FP32` defaults off and checks native
+  capability. E5M2, sparse page4, prefill and B1 defaults are unchanged.
+- Fresh integration extension builds; 39 GPU regression tests pass, 12 new
+  tests pass memcheck with zero errors, and 138 routing-policy tests pass.
+  Private 24-group real-input replay remains below captured scalar L2, but
+  is not bitwise equivalent to the private prototype. No current-main model
+  speed or long-output quality acceptance is claimed.
+- Artifacts: owned worktree `.artifacts/e4m3-fp32/`; source and binary hashes
+  are in the linked report. Private captures and paper drafts stay out of Git.
+  No service was restarted, and all validation GPU processes exited.
+- Keep experimental/default-off pending current-main model gates and human
+  review. Do not count this as completing all E5M2 specializations; the slower
+  native paged SplitKV port remains excluded. PR #517 addresses a different
+  DFlash2 q8/logits/context-pipeline scope and is not replaced by this work.
+
+## 2026-09-06 E4M3 model promotion blocked by a repeated token difference
+
+- See [the grouped FP32 admission update](sm70_e4m3_grouped_fp32.md).
+  Original PR artifact `953924a...959f0`, Qwen3.8-27B-FP8, TP4/MTP4,
+  8K greedy natural-document input, 256 output tokens: dynamic-tuning
+  control--candidate--control was inconclusive because the controls diverged.
+- Under diagnostic-only fixed GEMM dispatch, six control runs agree, but
+  three candidate runs first differ at output token 102. Three same-KV
+  PyTorch FP64 small-Q counterfactual runs reproduce the control's 256 tokens.
+  Finite operator output and lower aggregate L2 do not authorize promotion.
+- Keep the new grouped entry disabled and the FP8 alias unchanged. Do not
+  claim a production speedup from the tune-off diagnostic or its changed
+  output sequence. Long-context acceptance remains pending; fix the local
+  counterexample before repeating broad tests.
+- The E4M3 prefill bridge native/Python conversion entry is added separately
+  as a prerequisite. It has exhaustive encoding/scale/page/graph coverage,
+  but the backend still does not select it. CUDA 12.8 build `c1ce414...b2003`
+  has 70 regression passes, 138 policy passes, and 42 memcheck cases with zero errors;
+  its model gate is not granted. No production service or default changed.
+
+## 2026-09-06 E4M3 precision repair publication remains experimental
+
+- Follow-up commit `52dcdc4d52` compensates QK summation and probability
+  residuals, keeps PV Tensor Core accumulation tile-local, carries online state
+  in FP32, and rejects stale extensions without the precision capability.
+  The scaled residual is paired with an exact inverse scale on E4M3-derived V.
+- The tested CUDA 12.8 binary `87ffc1fd...b325cd` passes 89 GPU checks and
+  62 memcheck cases with zero errors. Two negative controls reproduce the
+  previous biased-PV and residual-underflow errors before final FP16 rounding.
+  Actual-input replay reduces FP16 element disagreements from 2092 to 1872
+  across 200 inputs; four q5/page848 100-ABBA endpoint speed ratios are
+  1.0007/1.0000/1.0007/1.0007. These are not token counts or model speed.
+- The same-process 128K FP64-reference/candidate/FP64-reference bracket
+  completes, but the candidate first diverges at token 77 while both
+  references match all 256 tokens. Four TP ranks hit the native path; all
+  captured layer outputs are finite. Keep the failure in the linked report.
+  Near-ties do not waive the deterministic admission gate.
+- Publish this repair in existing Draft PR #524, not as a default promotion.
+  Merge current main `95205a2d99` into the owned branch without force-pushing;
+  preserve main's independent sparse-page4 allocation-invariance fix.
+  Fresh integration DSO `76aa9a19...e97b42` builds and passes 89 kernel plus
+  138 policy checks; all 200 retained small-Q outputs match archived R6
+  bitwise. Main's planner suite has 30 passes and 8 setup failures (missing
+  `vllm._C`, before numerical assertions); do not report the full suite as
+  passed. These checks are separate from the archived model/sanitizer
+  evidence. Human review and model admission remain outstanding.
+- Later private FP32 long-prefill v18/v37 are not silently included here.
+  Their separate clean-source integration, build dependency cleanup, runtime
+  routing, and whole-model acceptance remain unfinished. Original stable
+  60/61T prefill is already in main and is not replaced by this small-Q PR.
+
+## 2026-09-06 DFlash2 quality repair mainline integration
+
+The user explicitly requested that the existing output-quality repair
+PR #517 be integrated into main after the remaining limits were reported. Its
+validated scope includes sampling cutoff boundaries, TP2 NVFP4 alignment,
+lookup proposal probabilities, independent FP32 logits, E4M3 q8 support,
+context/metadata graph options, and diagnostic ownership/rank fixes.
+
+Synchronizing main at `95205a2d9952813aa7469f63ff65b8f2813c027a` preserves
+the independent QSA ordering, HC/router, AWQ and PP work. The only merge
+conflict is this append-only ledger; both histories are retained. Native
+Flash-V100 integration is rebuilt for SM70 and the scoped regressions are
+recorded with final status, exact head and artifact hashes on PR #517.
+
+FP32 logits and the new context graph/pipeline switches remain opt-in; E4M3
+requires an explicit KV setting and a rebuilt native library. This admission
+does not certify QAT-versus-BF16 quality, solve the 4.33% fixed-prefix
+repeatability issue, or establish recovery to 17.6–18 ms. Historical Draft
+notes describe the investigation at their recorded revisions. The remaining
+state/prefix and performance goals continue after implementation integration.
+
+## 2026-09-06 exact M1 projection and W13 follow-up (#510)
+
+Stacked on #507/bbdf0af5c9; integration remains public/main755baae1d0.
+The latest measured endpoint remains98.965175 tok/s, not100. This follow-up
+has launched no full model. Details and artifacts are in
+`docs/design/sm70_qwen38_projection_w13_followup.md`.
+
+- Fix the same-shape GDN/QSA role-policy overwrite while preserving legacy
+  two-argument calls and all FP16/FP32 arithmetic.48 real output projections
+  save0.008681ms;64 input-changing graph checks and16 production-op graph
+  checks are bitwise. CPU29 pass/3 GPU-only deselections plus1 export pass.
+- W13 fixed geometry saves only0.000714ms/48 calls; register reduction alone
+  did not remove the small-grid/load-dependency bottleneck. Do not repeat as
+  a proposed large speedup. Counter baseline:352GB/s,30.55% occupancy,
+  66.95% no-eligible cycles,46.6% long-scoreboard share.
+- Next-group weight/scale prefetch is exact over64 changing graph replays
+  but saves only0.007588ms/48 calls. No production launcher enables it.
+- Same16-partial-group distribution across2/4 CTAs is a benchmark-only
+  candidate awaiting idle GPU time. Merge/workspace cost must be included;
+  do not confuse it with changing numerical split-K grouping.
+- Ordinary output GEMV already uses64-bit vectorized loads in its PTX.
+  Do not repeat speculative scalar-to-vector rewrites without new evidence.
+
+## 2026-09-07 E4M3 FP32 integration alignment repair
+
+- Synchronize PR524 with main `099d9841f5` in commit `4d889d0c1d` and retain
+  both native capability registrations. Keep the explicit-row FP32 entry on
+  its 8-byte load contract; do not inherit main's dense-q8 16-byte paired
+  load for admitted 8-but-not-16-byte KV strides.
+- Fresh DSO `b65ee698...9132b3`: 98 kernel, 142 policy, 38 planner checks
+  pass. The planner runs with pinned archived core dependencies, not a newly
+  rebuilt core. All three new padded-stride graph cases pass memcheck with
+  zero errors. All 200 real-input outputs match the previous R6 bitwise;
+  four 100-ABBA q5 speed ratios remain within 0.26% of one.
+- The alignment issue is fixed in this tested source. The refreshed 128K
+  same-process model bracket is still running; the prior token-77 failure
+  remains a separate blocker. Do not promote the route, change defaults, or
+  transfer operator passes to model admission. See the linked E4M3 report.
+
+## 2026-09-07 E4M3 revision-3 state precision repair
+
+- Main7 revision 2 completed its refreshed 128K bracket: candidate and both
+  stable references match all 256 tokens, with native route hits on all four
+  TP ranks. This does not establish why the prior cohort differed at token
+  77; keep the old failure and the source/binary boundaries in the report.
+- Revision 3 (`beb172ebd0`) retains max/sum and unnormalized FP32 PV until
+  the final combine. Version-gate the changed workspace so old extensions
+  cannot consume the new layout. FP16-midpoint tests expose a round-up error
+  in the old normalized/LSE path at 128K/256K; the new state returns the
+  correct ties-to-even value without introducing production FP64.
+- Fresh DSO `8880b040...a9d49`: 102 kernel, 142 policy, 38 planner, and 69
+  memcheck passes with zero memory errors. All 200 real-input outputs match
+  the screened prototype. Their FP16 disagreements fall from 1872 to 1640,
+  but 45/200 groups worsen; do not claim uniform per-input L2 improvement.
+  Four 100-ABBA q5 speed ratios are within 0.08% of one.
+- The frozen-driver model run passes the 128K 256-token bracket, then fails
+  261888+256 at one-based token 126: both FP64-attention references choose
+  `speed`, candidate chooses `benchmark`. References are stable, four TP
+  ranks hit the route, and all captured attention outputs are finite. A
+  reference top-two tie is not a waiver. Result SHA256 is
+  `a94d356ce29273fba3a202428ea77c737e7f51bd5152be1885d3ed46b6fb700e`.
+- The length-boundary broadcast wait eventually recovers; all eight model
+  requests complete. A q5-only summarizer assertion failed on valid late q3
+  rows; its width-aware replacement preserves strict token/finite checks.
+  Retain both the original summary failure and the earlier aborted startup
+  with a changed driver hash. Neither is mislabeled as a model pass.
+- A new counterfactual tests main's existing FP32 LM-head flag identically
+  in reference and candidate; the failing cohort used FP16 logits and SSM
+  state. The same-shape synthetic head screen improves arithmetic precision
+  with unchanged operator latency, but does not establish the cause of token
+  126 or approve model speed/quality. Avoid rerunning the same failed FP16
+  cohort without a new hypothesis. Keep the route default-off and PR524 Draft.
+
+## 2026-09-07 E4M3 Q alignment and FP32-head counterfactual
+
+- The FP32-head-only counterfactual fails at 128K token 191 (`validation`
+  versus the stable references' `scrutiny`). Both sides really emit FP32
+  logits; all recorded attention outputs are finite. The prescribed gate
+  stops before 256K. Raw result SHA256:
+  `9571a0b77a2dfa161b8e8f0aa90097e3e6f9115b89c5eab06f295394113b043c`.
+  Do not keep rerunning FP16 SSM plus FP32 head as a claimed repair.
+- The diagnostic explicitly fixed SSM state to FP16. Current main's GDN
+  `auto` default is FP32. Test that single configuration change on both
+  reference and candidate while retaining FP32 logits, and record actual
+  cache dtype/page shape. Neither earlier FP16-SSM failure is erased.
+- Q views with half-element offsets 1/4/7 are contiguous but have base-byte
+  remainders 2/8/14 modulo 16. The new entry's host code now clones only
+  unaligned Q after its device guard, before the uint4 feed. Normal aligned
+  inputs, kernel arithmetic and workspace ABI are unchanged; no blind
+  fallback into another vector loader is used. This is not attributed to
+  the model's token counterexamples.
+- DSO `c33a8444...b56aaf`: 105 kernel passes, six targeted alignment memcheck
+  passes with zero errors, and all 200 aligned real inputs match the previous
+  revision-3 DSO bitwise. Four q5 100-ABBA speed ratios are
+  1.01834/1.00065/1.00036/1.00000. Model admission and human review remain
+  outstanding; keep PR524 Draft and production defaults unchanged.
+
+## 2026-09-07 final FP32-SSM counterfactual remains unadmitted
+
+- Guarded-Q source `0c34be5d60` / DSO `c33a8444...b56aaf`, actual FP32 SSM
+  (48 GDN layers on all four ranks), FP16 conv, FP32 logits, page1616:
+  128K reference/native/reference matches all 256 tokens, but 261888+256
+  first differs at token 26 (`-level` vs `-`). Both references are stable.
+  Raw result SHA256:
+  `452a5a1845cae49b8aa26470a2fffacc4e8009a715ebb7625ec3b0e990c3a722`.
+- All captured attention outputs are finite and near the final FP16 rounding
+  floor. This does not waive the deterministic gate. Both prose outputs are
+  coherent; do not portray the local counterexample as universal semantic
+  degradation or claim that an earlier/later divergence ranks configurations.
+- The FP32-SSM configuration does not solve all failures. Do not repeat this
+  unchanged long cohort; next capture/replay the first-divergence prefix to
+  separate local arithmetic error from downstream/MTP-state propagation.
+- Two private dtype-recording setup failures preceded the successful run:
+  a Dynamo graph-break hook and a subclass filter mistake. Both occurred
+  before accepted generation; keep their logs separate from numerical gates.
+- The boundary wait coincides with on-demand compilation of this worktree's
+  strided FlashQLA GDN module, followed by recovery. That dependency uses
+  CUDA 12.0.140, with DSO SHA256
+  `89337e7055cc8ba8f9bd972341f43010ce23a5a7cb991a84eb48e60bc5bbfaf9`.
+  Prebuild/warm it before production timing. Do not label this diagnostic
+  elapsed time as a prefill/decode benchmark or mix its build provenance
+  with the CUDA-12.8 Flash-V100 extension.
+- Model admission and human review remain outstanding. PR524 stays Draft;
+  no auto-merge, production default change, or private long-prefill promotion.
+
+## 2026-09-14 E4M3 FP8-KV route parity
+
+- Base `a6f5e8347b` (`onecat/main`), owned branch
+  `codex/v100-fp8kv-fp16-route-parity-20260914-122513`.
+- Route E4M3 GQA6/D256 prefill through the shared FP16 workspace and default
+  Q8000/Q8192 FP32-accumulated attention kernel. Route uniform decode, batches
+  above 16, and resident small-query rows in mixed chunked-prefill batches
+  through E4M3 XQA. These paths are default on with explicit rollback flags.
+- Fix the page-800 wave loader, which previously addressed at most two logical
+  pages inside p896/p1664 partitions. The corrected B1 page-800 256K graph run
+  is bitwise equal to scalar and 6.82x faster. B32 page-800 256K is 6.60x faster
+  with `4.77e-7` maximum absolute difference. Page-1568 B1 256K is 6.92x
+  faster with `2.38e-7` maximum absolute difference.
+- Preserve E4M3 XQA softmax/PV state and partition outputs in FP32 until the
+  final FP16 output boundary. E5M2 retains its existing numerical contract.
+- All full-model validation for this line uses normal CUDA graphs; do not pass
+  `--enforce-eager`. Record first-request uncached prefill independently from
+  prefix-cache hits.
+- The TP4 Qwen3.8-27B NVFP4/compressed-tensors full-model gate uses FP16
+  execution, E4M3 KV, Q8192 chunks, maximum length 262144, one live request,
+  prefix caching off, no speculation, and `FULL_AND_PIECEWISE` CUDA graphs.
+  The 16K quality precheck returns `海蓝石榴；木星` at 4149.15 prompt
+  tok/s. The uncached 256000-token request returns
+  `校验词是「海蓝石榴」，太阳系最大的行星是木星。` with a 102.7519-second TTFT,
+  **2491.44 prompt tok/s**. Both retrieval and knowledge checks pass, and
+  `cached_tokens=0`. Its 15 decode intervals are a short quality observation,
+  not a throughput baseline. A separate graph-only 256000-input/256-output run
+  measures 255 intervals in 5.3902 seconds: **47.308 tok/s** and **21.138 ms
+  TPOT**, with a 102.9135-second TTFT and 2487.53 prompt tok/s.
+- Every rank records 480 Q8192 FP32-accumulated long-prefill calls and 496 E4M3
+  bridge calls during the 256K request. The final route summary records 48
+  dynamic page-800 E4M3 XQA decode calls per rank. The final source-built
+  operator reaches 77.0142/75.9654 TFLOP/s at KV128K/KV256K with finite output.
+- CUDA 12.8 SM70 source build and local import pass. Final SHA256 values are
+  core `2557f6b7...fa4c4`, stable libtorch `622af596...d162`, FA2/79T
+  `aa657e16...5add`, and Flash-V100 `66df783d...70b3`. Runtime process maps
+  contain the attention DSOs from this owned worktree and no other checkout.
+- Remove the pre-existing B16 ceiling from no-MTP full CUDA-graph capture and
+  default-capture B1/B2/B4/B8/B16/B32 when `max_num_seqs` permits. A standard
+  non-eager `vllm bench serve` matrix at exact 2048 input and 256 output tokens
+  completes C2/C4/C8/C16/C32 with zero failures. C32 records 21.7727-second
+  median TTFT, 32.521/32.824-ms median/P90 ITL, 983.986 derived pure-decode
+  tok/s, 272.868 full-request output tok/s, and 30.008-second median request
+  wall. All 62 requests generate 256 tokens; a separate 32-request natural
+  answer burst passes retrieval and knowledge checks for every response.
+- The matching page-800/256K CUDA-graph operator matrix covers
+  B2/B4/B8/B16/B32. All outputs are finite, maximum absolute difference from
+  scalar E4M3 is at most `4.77e-7`, and XQA speedups are
+  3.64x/6.12x/6.35x/6.46x/6.59x. Native attention admission has no batch or
+  total-KV-length ceiling; services above B32 continue through piecewise CUDA
+  graphs with the same accelerated attention route.
+
+## 2026-09-21 TP quality localization: normalization and mixed sampling
+
+- Continue owned PR666 on `codex/v100-tp-generalize-20260921-021932`, base
+  `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`. Native QPN2 scale repair remains
+  `_C` SHA256 `81db4a88972dc0fdf0c4a59cdb2128e7b9e875770ea0d510b0d398b599222ccd`.
+  This round changes Python source only; no wheel rebuild or eager serving.
+- Fixed-token/fixed-q8 captures distinguish target arithmetic from changed
+  DFlash proposals. Real-activation FP64 checks cover all 256 target projections
+  at sampled output columns. Neither repaired QPN2 nor ordinary TurboMind shows
+  a large local numerical error. Actual-hidden LM-head checks find no missing
+  exact top-21 candidates in 900 vocabulary-shard rows. Do not repeat those
+  broad probes without a new counterexample.
+- The earliest prefill drift is layer-0 input RMSNorm: seven FP16 values differ
+  across runs/ranks, before projection or GDN. Enable the existing fixed
+  reduction in the DFlash2 default profile. With that setting, all captured
+  prefill projections, GDN intermediates and final hidden states match exactly
+  across the QPN2 ON/OFF pair. Decode arithmetic still differs; zero top-1 flips
+  in 225 fixed positions is not a natural-output quality pass.
+- Repair a separate compact-sampling guard that applied the first request's
+  temperature/top-p to every request. Expand parameters by packed logit counts
+  and request-state mapping; retain general concurrent dispatch. The original
+  caller fails the heterogeneous-batch regression. This does not explain the
+  earlier homogeneous-parameter MBPP score gap.
+- See `sm70_tp_quality_audit.md` for retained r20-r25 evidence. Uninstrumented
+  r26/r27 MBPP32 completes at ON24/32 versus OFF25/32, all64naturalEOS;
+  item144is the only OFF-only correct case. Both answers contain the correct
+  nth-decagonal formula but assign different behavior to the required function
+  name. Keep this difference and the quality gate open; do not hide it with
+  prompt changes or a favorable rerun. Full C1 greedy144 is a separate diagnostic.
+- Complete greedy144 reverses the direction: ON passes after13413tokens,
+  OFF fails after14878; both stop naturally with identical C1/temperature-zero
+  requests. This is not a replacement for the C4sampled24/25 result. Avoid
+  repeating score sweeps without a concrete new numerical counterexample.
+- vLLM bench C1/C4 full-request output TPS is ON176.3946/189.2527 versus
+  OFF119.6903/160.0622 at2048input/256output. Both cold262128+16boundary checks
+  pass with naturalEOS; ON/OFF TTFT132.3341/174.3433s. Do not infer long-context
+  decode speed from that16-token answer. The75T full-FP32 target and35B-A3B
+  AWQ/FP8 migration baselines are not resolved by this change.
+
+## 2026-09-22 Studio startup: channel-FP8 QPN8 cached workspace addresses
+
+- Integration base `949728e891aaeb43285e6730aa8b7abc8b986acc`; runtime baseline
+  `f5dbb369a78ad94f0876ccc502c7953d8dc41688`, Torch 2.10.0+cu128, CUDA 12.8,
+  four V100 32 GB, TP4, FP16 execution, E5M2 KV, Flash-V100, FULL_AND_PIECEWISE
+  graphs, 262144 context, 8192 batched tokens, four sequences, memory fraction
+  0.8, prefix caching and DFlash2 seven-token probabilistic speculation.
+- Unsloth Qwen3.8-27B-NVFP4 startup took 253.67 seconds with the vLLM compile
+  cache disabled; weights took about eight seconds and compilation 117 seconds.
+  A persistent Inductor cache alone is not proof of AOT artifact reuse. Studio's
+  imported interpreter also lacked Ninja on PATH and referenced a deleted CUDA
+  toolkit directory; preparing native extensions belongs to installation.
+- The first cache-enabled Unsloth run completed, but its long greedy code
+  response differed from the cache-disabled control. Repeating the control
+  reproduced its original answer. A subsequent actual AOT reload failed in
+  `_C.fp8_qpn8_dispatch_sm70_out`: the compiled graph contained the previous
+  process's integer scratch pointer, which was not a registered CUDA address.
+  Keep these failed paths; a cache-write-only test cannot qualify this route.
+- Resolve the compressed-tensors channel-FP8 QPN8 shared workspace inside an
+  opaque operator. The cached graph contains tensor inputs and dispatch
+  parameters, never the workspace address. Both ordinary and fused gated-SiLU
+  projections use the resolver; the native math kernels remain unchanged.
+- Add an export/save/reload regression that replaces the workspace allocation
+  and verifies the new address is used, plus the fresh-process startup matrix
+  in `benchmarks/benchmark_startup_cache.py`. Related global cache-policy work
+  remains in PR621; the Qwen4Exp PLE address fix is PR622. This change addresses
+  the separate mixed NVFP4/channel-FP8 checkpoint path.
+- With the workspace fix, the Unsloth cache-disabled run takes 172.00 seconds
+  and exactly reproduces all three original responses (math, Chinese prose,
+  and a 1654-token Python LRU implementation). The cache-fill run takes 171.53
+  seconds; first reload takes 122.33 seconds with a Torch 2.10 artifact-load
+  fallback; the next fresh process takes 84.74 seconds with all 12 AOT loads
+  (three graphs on four ranks), no load fallback, and 8.30 seconds reported
+  compilation work. First native-extension build time is excluded from these
+  process-to-health measurements. Host activity on the other GPU set varied;
+  these are individual startup observations, not an averaged timing study.
+- Cache-fill and both reloads produce exactly the same three responses. The
+  long code answer differs between cache-disabled and cache-enabled execution
+  (1654 versus 1764 tokens); both versions' generated unittest suites pass
+  (seven and eight tests respectively). Keep the strict off/on token-parity
+  gate marked failed: this is not evidence that PR621 can enable every model
+  globally without separate quality qualification. A source-identical
+  cache-disabled warm control before the fix took 157.96 seconds.
+- The QAT checkpoint, tested separately on the other V100 quartet with the
+  same serving limits, takes 253.18 seconds to fill its cache, 120.86 seconds
+  on the fallback reload, then 79.25 seconds with all 12 AOT loads. Its three
+  responses match across those cache-enabled launches; this is not a QAT
+  cache-off/on parity comparison.
+- A separate corrected-runtime canary starts in 86.27 seconds with 12 AOT
+  loads and passes eight executable Python-function checks under the model's
+  normal non-thinking sampling (temperature 0.7, top-p 0.8, top-k 20), parsed
+  tool calling, and retrieval from 261994 prompt tokens with nine output tokens
+  and natural EOS. The long request takes 162.88 seconds end-to-end; it is a
+  context-boundary quality gate, not a startup or decode-speed measurement.
+  These functional checks qualify the tested checkpoint/configuration, not
+  all FP8 layouts or models, and do not replace the failed off/on text-parity
+  observation above.
+- Studio deployment verification measures 88.26 seconds from the management
+  load request to completion, including 86.13 seconds from engine launch to
+  readiness. It loads all 12 AOT artifacts without fallback and passes a chat
+  request through Studio's authenticated public-API proxy. Existing model,
+  topology, context, batch limits, and speculative settings are preserved.
+
+## 2026-09-22 Studio startup follow-up: first-reload metadata and source hashes
+
+- Preserve the actual first artifacts before forcing their first reload. The
+  initial GPU0–3 run takes 261.74 seconds to fill an empty cache, then fails in
+  `FxGraphHashDetails -> kernel_side_table.get_kernel` on its first forced
+  reload. The Torch 2.10 bundled-AOT backport does not serialize the FX graph
+  owned by `VllmSerializableFunction` on the non-mega path.
+- Save only the Triton kernels and constant arguments referenced by that graph.
+  On reload, allocate current side-table indices and rewrite the loaded graph;
+  never overwrite another graph's entries. Preserve Dynamo-generated fixed
+  Autotuner configs, including explicit warp/stage counts. Importing only their
+  underlying JIT function would lose these execution settings. Unsupported
+  dynamic wrappers fail saving instead of silently changing their behavior.
+  Old artifacts with Triton nodes and no table require one regeneration;
+  artifacts without those nodes remain readable. The mega-AOT path is unchanged.
+- The initial backend key also differed from the reloaded key solely because
+  Dynamo included the synthetic filename `<frozen os>` and AOT `SourceInfo`
+  omitted it. Adding that literal to the restored file set exactly reproduces
+  the original hash. Exclude frozen/generated filenames from backend source
+  hashing, retaining real-file invalidation. This avoids recompiling the
+  Inductor artifacts even after the missing-table error is repaired.
+- The first implementation rejected generated fixed Autotuner wrappers as
+  non-importable. Retain this failed path: only the candidate-selector artifact
+  was saved; forcing reload then failed with FileNotFoundError. The corrected
+  implementation preserves the effective config and passes seven CPU cases:
+  empty/populated tables, ordinary/wrapped kernels, repeat serialization, legacy
+  artifacts, and source-content invalidation. Applicable pre-commit hooks pass.
+- Numerical diagnosis remains separate: the GPU0–3 logprob probe has 1387 tokens
+  with caching off and 1310 during the failed-save candidate fill. These requests
+  include logprobs and are not an exact replacement for the prior no-logprobs
+  production contract. The backbone FX text and all 128 normalized generated
+  Triton kernel sources match, but autotuning selected different launch configs
+  for 14 backbone, 13 draft, and one selector kernel. Eight changed backbone
+  configs alter reduction tiling, including 64 versus 256 element reductions.
+  This is a concrete lead, not a proven end-to-end explanation or a closed
+  cache-off/on quality gate; do not enable caching globally on that basis.
+- Raw artifacts, full traces, commands and effective-config differences are in
+  `/data/minimax-h3/task-cache/studio-startup-20260922/followup`. GPU0–3 was later
+  acquired by another task; the final same-contract validation uses production's
+  GPU4–7, preserving TP4, FP16, E5M2 KV, Flash-V100, full/piecewise graphs,
+  262144 context, 8192 batched tokens, four sequences, memory fraction 0.8,
+  prefix caching and DFlash2 seven-token probabilistic speculation. The first
+  corrected fill takes 256.71 seconds and reproduces the original cache-enabled
+  1764-token LRU response exactly. Native extension build time is excluded.
+- The corrected first forced reload takes 84.734 seconds, with all 12 AOT loads,
+  zero load failures and zero graph recompiles. However, the complete LRU answer
+  differs from its cold counterpart (both 1764 tokens, first difference in a
+  test-case comment/assertion). The strict cold/warm parity gate fails; the
+  later functional/tool checks were not reached. The deployment controller
+  restored the original qualified runtime; its engine starts in 84.165 seconds.
+  Do not promote this candidate or report its quality gate as passed.
+- The preserved first artifacts and post-reload cache differ in 23 effective
+  autotune configs, including one reduction changing R0_BLOCK from 64 to 256.
+  CPU-only inspection of bundled standalone artifacts finds 592 autotune
+  records, 136 keys and 17 keys with conflicting saved configurations. The
+  AOT setup shares the Inductor directory across TP ranks, while restoring each
+  standalone artifact writes its saved autotune entries to that directory.
+  This suggested a shared-cache collision; the next experiment tests that
+  hypothesis without changing sampling or native kernels.
+
+- Rejected rank-isolation experiment: per-rank Inductor directories take
+  263.679 seconds to fill and 90.750 seconds on the first forced reload, still
+  with 12 AOT loads and zero graph recompiles. Cold output exactly matches the
+  original cache-disabled 1654-token response, but warm output has 1387 tokens
+  and fails parity. There are still 18 effective config changes; 22 bundled
+  tuning keys conflict, including multiple subgraphs within a single rank.
+  The inspected reduction's saved and reconstructed config hashes match, so
+  a hash mismatch is not established as the cause. Rank isolation alone does
+  not solve the issue and is excluded from the implementation. Its patch and
+  all failed responses remain under `followup/rank-isolated/` for reproduction.
+- This second controller also restores the original qualified runtime (90.177
+  seconds engine-to-ready); no candidate is promoted. The first-reload loading
+  repair is verified, but the strict numerical/output parity investigation
+  remains open. Do not erase failed gates or repeatedly interrupt production
+  without a smaller reproducer for the remaining per-subgraph tuning drift.
+
+## 2026-09-24 DFlash2 concurrent batch-layout candidate
+
+- Owned branch `codex/v100-dflash2-concurrent-decode-20260923-075451`, base
+  `d49e32b358`. Keep the 27B TP4, q7, 2K/256, prefix-enabled, E4M3-KV and
+  262144-context contract fixed. Previous unprofiled rolling decode is
+  229.706/265.558/277.808 tok/s at C1/C4/C8 on V100, versus saved PRO
+  210.416/519.818/711.773. Neither run has the new per-step pure-decode
+  recorder, so do not label those values pure decode. The batch-layout
+  candidate is opt-in with `VLLM_SM70_BATCH_GEMM_LAYOUTS=1` until the
+  cross-model and two-host admission gates pass.
+- PRO C1/C4 raw rank-0 Torch traces are copied from the rented host with
+  SHA256 `5dabd5180997a92bde16ad4cb86b3170ae8e5ea0350c85de972d3c5ff98a2e74`
+  and `99a8faf4a5a88b4026cbf8efca20c7cdb6de79baeccb8bf47e478394866e4500`.
+  They are retained under task-private `verification/pro-trace-c1c4/`; the
+  original C8 trace remains on the host. New SSH attempts to port 36176 close
+  before authentication, so fresh two-host admission is pending.
+- Real checkpoint TP4 channel-FP8 GEMM screening at M8/M32/M64 compares the
+  present QPN8 path with a second load-time TurboMind W8A16 compressed layout.
+  At M64, measured savings are about 31 us per output projection, 66 us per
+  GDN input projection and 47 us per attention QKV projection. Weighted by
+  64/48/16 target layers this projects 5.85 ms per complete target forward.
+  At M8, QPN8 is faster. The candidate preserves QPN8 through M32 and chooses
+  TurboMind only for M33–M64. It does not restore a complete FP16 weight on
+  those verifier batches. Dynamic-dispatch/CUDA-graph tests pass 5/5 on the
+  clean extension, including fused gate/up; M8/M32 outputs are bitwise equal
+  to QPN8 and M64 differs by at most 0.007813 absolute in the tested tensors.
+  An earlier M32 TurboMind variant reduced the GPU step by roughly 1 ms but
+  lost 3.8 percentage points of draft acceptance on matched rolling C4,
+  reducing pure decode 409.59→387.63 tok/s. It was rejected.
+- NVFP4 shares the concurrent-layout policy. Retaining the already prepared
+  FP16 TurboMind scale layout for M>32 avoids the former per-step E4M3 scale
+  restoration. Real layer-0 TP4 gate/up and down M64 outputs are bitwise equal
+  to the compact-scale fallback; graph medians improve 205.96→183.26 us and
+  100.45→87.72 us. Weighted across 64 layers this projects about 2.27 ms.
+  M32 gate/up TurboMind interleaving and prior QPN2 split/tile candidates do
+  not show a material gain and are not promoted.
+- Clean source-built native and Flash-V100 extensions are deployed in the
+  owned worktree. Their hashes are retained in task-private
+  `verification/clean-artifact-current.json`; the final `_C.abi3.so` is
+  `fd6ab2274a43e851fac4557921cf41f0e21e26afde60f6230faa7318b2fcd677`.
+  The first packaging attempt stopped for missing `patchelf`; the corrected
+  clean `setup.py build_ext` compiled all native and bundled Flash extensions
+  successfully. The optional Rust frontend was skipped because `rustc` is
+  unavailable, and a complete wheel was not produced. `readelf` finds no
+  RPATH/RUNPATH in the deployed extensions; the source tree imports the clean
+  native and Flash-V100 copies. Candidate logs confirm both layouts,
+  1,009,312 KV tokens at
+  memory fraction 0.8 (3.85 complete 262144-token requests), a 4K prefix
+  hit count of 26368/32768, and a 32768-input/32-output service request.
+- A task-only scheduler recorder counts actual emitted tokens over complete
+  8-request active steps with no new prefill, including q1–q8 acceptance.
+  With the same C1→C4→C8 order and 2K/256 dataset, the first batch-layout
+  candidate versus clean control had C8 pure decode 464.56→544.41 tok/s and
+  median step 79.67→65.86 ms. Rolling C8 decode improved 277.27→297.93
+  tok/s with matched acceptance 52.32%/52.26%. C4 pure decode regressed
+  409.59→387.63 tok/s due to the rejected M32 FP8 switch. C1 pure decode was
+  236.56→241.64 tok/s, with four representative seeded 256-token outputs
+  byte-identical between layouts. All raw rows and benchmark JSON are under
+  task-private `verification/pure-{off,on}.*.jsonl` and
+  `verification/v100-batch-layout-pure-{off,on}-*.json`; their filtered summary
+  is `verification/pure-decode-matched-on-off-summary.json`. The recorder is
+  diagnostic; uninstrumented service results remain the speed admission gate.
+  The final M64-only dispatch has passed the focused 5/5 GPU tests. Its first
+  uninstrumented C1/C4/C8 service run, in that order, reaches
+  231.788/255.976/295.735 rolling decode tok/s with
+  55.38/54.95/53.86% acceptance. The M≤32 QPN8 path remains in place;
+  C1/C4 have no demonstrated speed gain, and C8 remains far below the saved
+  PRO 711.773 tok/s. These are single runs, not the three-run admission gate.
+  Raw JSON is task-private `verification/v100-batch-layout-m64only-*.json`.
+- Rank-0 Nsight CUDA Graph node traces on six interior, no-prefill C8/q8
+  steps show 82.45→69.20 ms median step spacing and 77.68→65.40 ms mean
+  GPU kernel service with the M64-only dispatch. Per-step FP8 full-weight
+  dequant (12.24 ms), post-dequant GEMM (10.50 ms), and FP4 scale restore
+  (2.26 ms) disappear; FP8 compressed GEMM costs 16.11 ms, FP4 compressed
+  GEMM 15.79 ms. The remaining GDN, draft attention, target grouped
+  attention, TP communication, sampling, and other kernels cost
+  5.42/6.56/3.33/5.75/4.09/8.09 ms respectively. These are GPU kernel
+  sums, not the endpoint pure-decode metric. The reusable classification
+  script and per-step JSON are task-private
+  `verification/summarize_c8_nsys_compare.py` and
+  `verification/trace-c8-m64only/comparison.json`.
+- The saved PRO rank-0 C1/C4 Torch traces have a 7.03→7.79 ms FP4 CUTLASS
+  GEMM and 7.04→7.62 ms FP8 CUTLASS GEMM from C1 to C4, while GDN grows
+  0.96→2.25 ms. The V100 C8 compressed GEMM total alone is 31.91 ms versus
+  the saved PRO C8 15.73 ms, so further work must prioritize arithmetic
+  throughput as well as launch and attention costs. PRO SSH currently closes
+  before authentication; fresh two-host admission and output-quality gates
+  remain open.
+- A real-shard M64 TurboMind FP8 tuning screen changed only `out_proj` in one
+  run (100.11→58.85 us), while `in_proj_qkvz` and `qkv_proj` stayed near
+  115 us. It is below the 5-ms weighted-forward promotion threshold and is
+  not enabled. An exploratory resident-FP16 screen reached 48.01/72.94/
+  70.02 us on the three FP8 projection shapes, but would add about 1.7 GiB
+  per GPU versus the second compressed layout and would leave the stipulated
+  direct-compressed-weight execution route. It is not part of this candidate.
+  The screening logs are task-private `verification/screen_fp8_tm_m64_tuning.log`
+  and `verification/screen_fp8_resident_m64.log`.
+- After copying the clean built extensions into the owned source tree, the
+  focused SM70 dispatch/CUDA Graph suite passes 5/5. Three sequential
+  uninstrumented candidate runs of the same C1/16, C4/32, C8/48 2K/256
+  dataset have median rolling decode 236.630/257.106/303.188 tok/s, median
+  acceptance 56.48/55.58/54.48%, and median per-request mean ITL
+  4.106/15.563/26.337 ms. All nine runs report zero prefix-cache hits,
+  consistent with the hybrid-cache block alignment for the 1792-token shared
+  prefix. Candidate C8 is about 9.1% above the historical 277.808 tok/s V100
+  run but still 57.4% below saved PRO 711.773 tok/s; C1/C4 remain near or
+  below their historical baselines. The C8 acceptance median is 1.69
+  percentage points below historical V100, within the plan's 2-point limit,
+  compared with a matched new-binary OFF control below. Raw outputs are
+  task-private `verification/v100-clean-m64on-repeat{1,2,3}/`.
+- Three sequential OFF-control runs on the same clean binary and request
+  sequence have C1/C4/C8 median rolling decode
+  237.523/263.183/279.502 tok/s and median acceptance
+  56.77/56.70/56.18%. With batch layouts enabled, C8 improves 8.48% and
+  loses 1.70 percentage points of acceptance; C1 is 0.38% slower and C4 is
+  2.31% slower. All nine OFF runs also report zero prefix-cache hits.
+  Per-request mean ITL medians are 4.102/15.200/27.182 ms OFF versus
+  4.106/15.563/26.337 ms ON. Raw OFF JSON is task-private
+  `verification/v100-clean-m64off-repeat{1,2,3}/`. This retains the M64 C8
+  candidate for quality review but does not satisfy the PRO superiority target
+  or C4 recovery. A seeded C8 eight-request wave has only 3/8 exact output texts
+  between ON/OFF; the other five diverge under probabilistic sampling, so
+  the existing task-quality gate remains necessary before promotion.
+- A final matched task-only scheduler record, on the same clean binary, counts
+  emitted tokens across all C-active, no-new-prefill decode steps (q1–q8).
+  ON/OFF pure decode is C1 212.305/227.053, C4 397.956/415.296, and C8
+  558.144/462.666 tok/s. Median step spacing is C1 20.643/20.664, C4
+  48.207/48.057, and C8 65.717/79.768 ms. The C8 gain is 20.64% in this
+  instrumented measure; the C1/C4 rate differences track sampling acceptance
+  changes while their step times remain essentially equal. This recorder is
+  diagnostic and perturbs timing; the three-run, uninstrumented comparison
+  above remains the endpoint speed evidence. Rows and exact benchmark windows
+  are task-private `verification/pure-m64{on,off}-final.*.jsonl` and
+  `verification/v100-pure-m64{on,off}-final-once/`; their summary is
+  `verification/pure-decode-m64-final-on-off-summary.json`.
+- In the three-run uninstrumented OFF/ON comparison, median TTFT is
+  C1 0.5469/0.5467 s, C4 0.6933/0.6927 s, and C8 0.7951/1.2290 s;
+  median of per-run ITL P90 is C1 5.179/5.201 ms, C4 20.793/22.112 ms,
+  and C8 38.002/37.451 ms. The C8 TTFT median is unstable across runs
+  (ON 0.770/1.231/1.229 s, OFF 1.062/0.795/0.793 s), so the change is
+  retained as a measured latency cost, not attributed to the GEMM kernel.
+- A paired xhigh GSM8K test on dataset indices 8–23 uses the same model,
+  TP4, q7 probabilistic draft, E4M3 KV, Flash-V100, 262144 model length,
+  aligned prefix cache, 8 active requests, and fixed temperature/top-p/top-k
+  0.7/0.8/20 with request seed 20260923. The quality harness now accepts
+  this checkpoint's `xhigh` chat-template value. OFF and ON both score 15/16,
+  have no invalid answers, and stop naturally on all 16 questions. Aggregate
+  draft acceptance is 53.814% OFF versus 52.587% ON (-1.227 percentage
+  points); mean acceptance length is 4.767 versus 4.681. Only 1/16 token
+  sequences are identical, but all final numerical answers match. The
+  benchmark's absolute 4.85 mean-length threshold fails for the OFF control
+  too on this short subset, so this pair establishes relative quality only.
+  Raw results and comparison are task-private
+  `verification/gsm8k16-m64{off,on}-clean.json` and
+  `verification/gsm8k16-m64-clean-on-off-summary.json`.
+- The candidate remains opt-in. The C1/C4/C8 rolling 5%-ahead-PRO goal is
+  not met: the saved PRO points are 210.416/519.818/711.773 tok/s versus
+  this V100 candidate's 236.630/257.106/303.188. The PRO SSH entry at
+  port 36176 still closes before authentication, so the required fresh
+  three-run PRO and PRO pure-decode records cannot be collected. Local 35B-A3B
+  AWQ/FP8 weights are absent; a focused policy test confirms that non-DFlash
+  paths do not activate the new layouts, but this is not a model speed or
+  quality regression test. Keep the control OFF by default and defer the
+  target-dependent Draft PR until both the speed and cross-model gates pass.
+- The remaining C8/q8 GPU service is 65.40 ms, of which compressed FP4+FP8
+  GEMM is 31.91 ms. The non-GEMM 33.49 ms already exceeds 33.949/1.05 =
+  32.33 ms, the saved PRO q8 step budget for 5% superiority under equal
+  emitted tokens. This is a diagnostic inference, not an endpoint bound:
+  acceptance and rolling prefill also affect tok/s. It shows that a future
+  faster compressed GEMM alone cannot close the whole q8 step. The largest
+  remaining categories are draft paged attention 6.56 ms, TP collectives
+  5.75 ms, sampling 4.09 ms, and other kernels 8.09 ms. Existing SM70 TP4
+  push all-reduce screens in this control document regressed at M64, so no
+  unqualified communication switch is stacked on this candidate.
+
+## 2026-09-25 DFlash batch attention and packed GDN follow-up
+
+- Continue the existing owned branch and Draft PR #688, based on
+  `onecat/main` at `d49e32b3587d4d34ffccb0ffd376e63974b06c88`; do not open
+  a duplicate PR. The detailed contract, results and limits are recorded in
+  [SM70 DFlash batch attention and verifier-state scheduling](sm70_dflash2_batch_attention_gdn.md).
+  This entry supersedes the older candidate's timing figures above, not its
+  outstanding PRO and 35B-A3B acceptance gates.
+- The latest same-contract trace localizes a real missing batch path:
+  draft projections were batched, but paged attention ran one request at a
+  time. Uniform noncausal draft queries now use the existing native kernel's
+  batch grid, with live GPU page tables and lengths during graph replay.
+  No native rebuild, additional environment flag or quantization-specific
+  fast path is added. Native extension SHA256 remains
+  `2884a59db00563d686a5dd7bbfbad57edb424b7d43b22a79bb468f299b56cef5`.
+- TP4 full-q8 GDN uses the numerically identical BV8 schedule for C4/C8,
+  preserving every FP32 state snapshot and accepted-state selector. The
+  existing FlashQLA DDTree API with linear parents does not outperform it
+  across C1/C4/C8, so that alternative is not promoted. This comparison does
+  not rule out a new specialized FlashQLA verifier.
+- The same CUDA-event observer gives rank-0 target-forward C1/C4/C8
+  14.055/31.253/37.648 → 14.065/30.365/36.863 ms, draft
+  4.296/9.322/13.490 → 4.270/6.760/7.309 ms, and whole-step
+  20.000/45.861/57.810 → 20.371/42.255/50.744 ms. These are full concurrent
+  batches, not per-request serialized costs. Candidate per-step rank maxima,
+  then medians, are 20.556/42.360/51.105 ms. Timing instrumentation is for
+  attribution and is not endpoint speed admission.
+- Six interior Nsight steps per batch and rank confirm five draft attention
+  launches at all batch sizes, with grids (1,1,8)/(1,1,32)/(1,1,64).
+  Previously C4/C8 issued 20/40 separate small launches. Rank-0 draft
+  attention service changes 0.862/3.255/6.451 → 0.859/0.876/0.910 ms;
+  GDN C4/C8 changes 3.689/5.345 → 2.661/4.474 ms. Target GEMM remains
+  8.506/20.278/21.429 ms at C1/C4/C8. The C1→C4 increase still dominates
+  target-forward growth; GEMM occupies 66.8%/58.1% of C4/C8 target service.
+- Three matched, uninstrumented endpoint runs at C1/16, C4/32 and C8/48,
+  same 2K/256 dataset and sampling, give rolling client decode-capacity
+  medians 243.633/293.667/343.050 → 246.891/298.459/356.606 tok/s.
+  C4/C8 gains are 1.63%/3.95%. This metric includes replacement-prefill
+  pauses and is not a GPU emitted-token counter. Prefix hits are zero.
+  Acceptance medians change 56.60/56.70/56.22% → 57.49/56.54/55.18%;
+  individual runs vary. A single common-client-window estimate gives
+  C4 418.12→494.03 and C8 746.67→784.79 tok/s, but retokenizes streamed text
+  and must not be reported as the exact three-run pure-decode gate.
+- All 44 focused GPU tests pass: attention graph replay with changing live
+  lengths/pages, FP16/E4M3 KV, page16/1648, 2K–262K logical positions;
+  and TP2/TP4 packed GDN with heterogeneous selectors, all snapshots and
+  repeated replays. Targeted pre-commit passes with the bundled Flash-V100
+  package on MYPYPATH. Paired GSM8K16 xhigh natural-EOS quality runs both
+  score 15/16 with the same wrong question; acceptance 51.29→51.58%.
+  The control has one length-capped output, candidate none. This is relative
+  quality evidence, not general output-quality proof.
+- Do not repeat the rejected real-weight GEMM screens unchanged. FP8 M32
+  four-phase split-K regresses; reduced unrolling cuts registers 138→127
+  but saves only about 5.36 us on one shape. FP4 multirow 16/32-row reuse
+  preserves bits but regresses M32 gate/up from 145 to 157–161 us and does
+  not help down. Research extensions are not loaded into the service.
+- Raw endpoint results, trace, compiler logs, rejected screens and source
+  hashes use task-private key `verification/batch-followup-20260925/`.
+  No new PRO measurement or 35B-A3B AWQ/FP8 model-speed gate was run.
+  The 5%-ahead-PRO goal remains open; this update does not claim completion.
+
+## 2026-09-25 Default enablement and integration of PR #688
+
+- Following the user's explicit request to enable the measured paths and
+  merge, the existing SM70 Qwen3.8 DFlash2 configuration now sets batch GEMM
+  layouts on and AWQ warmup/FP8 tuning/NVFP4 tuning limits to M64. Every
+  explicit environment override is preserved. This supersedes the older
+  default-off batch-layout decision; it does not declare the PRO speed goal
+  achieved. The configuration contract is independent of target quantization
+  and KV dtype; local operators retain their own capability and shape gates.
+- Joint draft paged attention and TP4 C4/C8 packed GDN scheduling select
+  automatically within their routes. The packed GDN entry, combined split,
+  draft context pipeline/KV graph and quantized LM-head prerequisites now
+  join the same automatic configuration, preserving explicit overrides.
+  C1/C4 compressed GEMM keeps the existing small-M routes, while
+  the alternate FP8 prescaled layout remains default-off. No additional
+  native source change or rebuild is needed for this configuration update.
+- The focused verifier-contract/default tests cover the batch settings and
+  packed-verifier/draft prerequisites' overrides and TP/quantization-independent
+  admission. Existing paired endpoint/quality and 44 GPU regression evidence
+  remain recorded above. The previous CI failure was an import-group
+  classification difference for the new benchmark's optional native package;
+  moving that import into the benchmark operation makes local and CI lint
+  resolution agree. Targeted pre-commit passes.
+- Fresh default-configuration service logs, smoke requests, CI and merge
+  records are retained under task-private
+  `verification/batch-followup-20260925/merge-defaults/`.
+
+## 2026-09-24 Qwen3.8 Flash-Next NVFP4 MTP4 full-round cost
+
+- The acceptance contract is the **complete** TP4/V2 MTP4 verification round,
+  not the target-only forward: 8,192 fixed input tokens, 513 greedy output
+  tokens, disk-backed PLE without prefault, FP16 activations/KV, full/piecewise
+  CUDA Graph, four V100-SXM2-32GB GPUs. The retained control is
+  13.13857 s / 307 rounds = 42.797 ms/round, with 1.671 accepted tokens per
+  round. The low-overhead trace attributes 33.35 ms to PLE-input submission
+  through verifier-result sampling and 10.92 ms to sampling, draft, and
+  next-round preparation. The post-PLE target graph alone is 24.66 ms, so a
+  20-ms **complete** round cannot come from a PLE-only tweak.
+- Direct NVFP4 MTP5 expert and 25-KiB TP push together reached
+  5.16974 s / 131 rounds = 39.464 ms/round on disk PLE, but the deterministic
+  fixed output first diverged at token index 8. Two of three natural prompts
+  also diverged. The higher acceptance is from a changed output stream, not a
+  qualified speedup. Do not enable this pair by default or reuse its
+  99-tok/s emitted rate as a quality-preserving result.
+- Draft PR [#684](https://github.com/1CatAI/1Cat-vLLM/pull/684) instead
+  accelerates only the byte-exact short disk-PLE gather. The steady complete
+  round first fell to 11.85655 s / 307 = 38.621 ms (9.8% below the control)
+  with sorted-scatter. Direct copying from retained mmap addresses then cut the
+  matched repeat to 11.38005 s / 307 = 37.069 ms (13.4% below the original
+  control). Both fixed requests and all three natural-prompt outputs match
+  token-for-token with unchanged draft counts. Twelve targeted CPU tests pass.
+  Larger prefill gathers retain their deduplicated, parallel route; the direct
+  copy does not allocate a second table. The complete 20-ms goal remains open.
+- An exact Triton screen of the M=5, 50-route MoE sort/expand matched all
+  output bytes and routing metadata and reduced that isolated operator from
+  25.6 to 13.3 microseconds. Across 48 target layers it projects only about
+  0.6 ms/round, so no extra full-model startup is warranted for this candidate
+  while the 20-ms gap remains. Prior direct-W13 split-K 1/4/5/8/10/16/20/32
+  screens were all non-bitwise relative to the generic path; do not repeat them
+  as an output-parity fix.
+- The 4.87-ms draft-completion to next-PLE-input interval has only about
+  0.43 ms of visible rank-0 GPU kernels and is largely host/launch/coordination.
+  A single 12-step scheduled Torch CPU/GPU profile was deliberately diagnostic
+  only: it slowed a 129-token request to 11.11 seconds of decode, so its times
+  are not endpoint speed figures. Python-stack attribution nonetheless found
+  three GDN metadata-builder calls per step. Over those 12 steps,
+  `build_gdn_spec_decode_state_contract` performed 180 `aten::index` and 180
+  `aten::nonzero` calls, all under target `execute_model`; its nested CPU span
+  accounted for about 7.38 ms/step in the perturbed trace. The existing pure
+  DDTree state path avoids those dynamic boolean indices, but ordinary MTP4
+  does not select it. An isolated single-request, all-spec fixed-slice GDN
+  candidate matched its masked-index tensors in CPU/GPU unit tests and reduced
+  one standalone call from 0.189 to 0.027 ms. The necessary full-model gate
+  **failed**: with the same direct-copy PLE route, fixed output first diverged
+  at token 25 and verification grew from 307 to 441 rounds; natural prompts
+  0 and 2 diverged at tokens 36 and 208. It is not in PR #684 and must not be
+  counted as a speedup. The isolated candidate was reverted after the run;
+  unit-level tensor equality did not establish whole-graph state equivalence.
+- A GPU-only SM70 M=5 FP16 projection screen tested a five-row Triton GEMV
+  with FP32 accumulation against the existing PyTorch linear graph, without
+  loading the model. At K=2560/N=4096 its best graph median was 44.0 vs
+  49.2 microseconds, but 130 of 20,480 FP16 outputs differed (max 0.125).
+  K=10240/N=336 and K=1536/N=2560 were slower (best 39.9 vs 19.5 and 23.6
+  vs 21.5 microseconds) and also non-bitwise. The direct M=5 GEMV is therefore
+  not a quality-preserving or sufficiently large target-graph optimization;
+  do not start a whole model for this candidate.
+- A representative steady node-trace round has 427 CUTLASS FP16 `Kernel2`
+  launches taking 7.699 ms of perturbed kernel service; MoE expert GEMM is
+  another 3.696 ms. These are diagnostic GPU service times, not additive
+  untraced wall time. A GPU-only PyTorch BLAS-preference screen found cuBLASLt
+  faster than cuBLAS only at M=5/K=2560/N=4096 (45.1 vs 49.2 microseconds),
+  but 5,619 outputs differed; at K=10240/N=336 and K=1536/N=2560 cuBLASLt
+  was slower and non-bitwise. Neither a BLAS toggle nor the direct GEMV passes
+  the exact-output gate. Reaching 20 ms/round requires substantial target-graph
+  and draft/preparation changes, not further PLE-only tuning. At the retained
+  1.671 accepted tokens/round, 20 ms/round is only 83.6 emitted tokens/s; to
+  exceed the approximately 98-token/s no-MTP baseline at unchanged acceptance
+  requires below 17.1 ms/round.
+- The latest direct-copy low-overhead Nsight graph capture at source
+  `48be98393d` matches all 513 fixed output tokens and 307 verifier rounds.
+  Its **decode-only** metric is 12.505251 s / 307 = 40.734 ms/round under
+  tracing, versus the same-code untraced repeat of 37.069 ms/round. Across
+  306 closed PLE-to-PLE intervals, 40.669 ms mean divides without overlap
+  into PLE input-to-four-rank-result readiness **4.437 ms**, post-PLE target
+  **25.112 ms**, verifier sampling/draft **6.169 ms**, and next-round
+  preparation **4.951 ms**. The 4.437-ms PLE-related window includes IPC,
+  fanout, and overlapping pre-PLE GPU work, not just mmap lookup. Five rounds
+  have request-to-first-result waits over 10 ms, so the complete-round p99 is
+  56.223 ms; the trace cannot alone attribute those stalls to disk faults or
+  worker scheduling. The 13.482920-s traced request wall includes prefill and
+  must not be divided by 307 as a decode metric. Full local report and raw
+  SQLite are in `.artifacts/mtp_disk_memmove_graph_report.md` and
+  `.artifacts/mtp_disk_memmove_graph_trace.sqlite`.
+
+## 2026-09-24 Qwen3.8 MTP4 draft-combine to next-PLE reduction
+
+- Follow-up to PR #684 uses the same 8,192-token fixed prompt, 513 greedy
+  output tokens, TP4 on V100-SXM2-32GB, MTP4, disk-backed PLE without prefault,
+  FP16 activation/KV, and CUDA Graph settings above. The target is the **closed
+  draft-combine to next PLE-input interval**, not an estimate from Python
+  profiler inclusive spans. Its GPU-combine-to-host-PLE boundary can include
+  queueing/handoff and must not be labeled wholly as CPU execution. No model
+  precision or sampling setting changed.
+- The PLE worker now computes at most 16 offloaded n-gram IDs with scalar
+  signed-int64-wrap arithmetic instead of many tiny CPU Torch operations, and
+  enqueues a byte-exact pinned H2D copy directly on each rank's existing copy
+  stream before its completion semaphore. The 5-by-16-ID CPU microbenchmark
+  fell from 0.379 to 0.035 ms median; four-rank fanout enqueue from 0.126
+  to 0.033 ms median. The short-ID path has randomized EOS, padding, and
+  multi-request equality tests; larger gathers keep their prior route.
+- The GPU runner submits PLE as soon as token/query/context inputs are ready,
+  overlapping CPU lookup with attention and Mamba metadata preparation. The
+  ordinary MTP4 GDN contract does **not** receive `current_state_block_ids`,
+  so optimizing that other branch would miss this workload. The active branch
+  now converts authoritative CPU speculative-row masks into GPU `index_select`
+  indices instead of GPU boolean indexing and its dynamic-shape synchronization.
+  For an all-speculative batch it clones the selected block/count/selector
+  tensors and creates an empty non-spec result, retaining the independent,
+  contiguous copy semantics. CPU/GPU pure-spec, mixed, and pure non-spec tests
+  match the masked-index reference; the standalone pure-spec contract fell from
+  about 0.11 to 0.055 ms per call. The previously rejected fixed-slice/no-copy
+  candidate remains rejected because it failed the whole-model quality gate.
+- One same-setting low-overhead graph capture per accepted stage reports 306
+  closed rounds: original combine-to-next-PLE mean **4.951 ms**, after PLE
+  submission and active-branch `index_select` **3.503 ms**, and after the
+  independent-copy pure-spec fast path **3.248 ms** (1.703 ms / 34.4% below
+  original). The final captured complete-round mean is 36.865 ms versus
+  original 40.669 ms; captures perturb throughput, so compare their stage
+  boundaries, not their wall time to an untraced run. Final untraced fixed
+  repeat decode is **10.82794 s / 307 = 35.270 ms/round** versus the original
+  11.38005 s / 307 = 37.069 ms/round. Two fixed and three natural-prompt
+  outputs match their pre-change token IDs and verifier-round counts exactly.
+  The three affected test files passed 188 tests before the final pure-spec
+  addition; its expanded pure/mixed/non-spec matrix then passed ten cases.
+  Local raw evidence: `.artifacts/mtp_disk_pure_clone_probe.json` and
+  `.artifacts/mtp_disk_pure_clone_graph_trace.sqlite`; the earlier-stage
+  comparison is `.artifacts/mtp_disk_early_ple_probe.json` and
+  `.artifacts/mtp_disk_early_ple_graph_trace.sqlite`.
+- The remaining 3.248-ms stage is still worth profiling, but the final trace
+  already spends 25.120 ms from four-rank PLE readiness to verifier gather and
+  6.172 ms in verifier sampling/draft. Thus eliminating this preparation stage
+  entirely would still leave over 31 ms/round under the current target graph
+  and acceptance rate. The 20-ms complete-round objective is not achieved by
+  this change; next decisions should prioritize target-graph/draft cost rather
+  than repeatedly loading the model for sub-0.1-ms host candidates.
+
+## 2026-09-24 Qwen3.8 MTP4 shared and fused GDN metadata follow-up
+
+- The preceding 3.248-ms draft-combine-to-next-PLE trace showed 102 CUDA
+  runtime calls in one representative rank-0 interval, including 57 kernel
+  launches and 39 asynchronous copies. Three GDN builders independently
+  classified the same request batch. MTP4 on SM70 now computes their common
+  classification, query offsets, and token indices once. This default path is
+  controlled by `VLLM_SM70_MTP4_SHARED_GDN_METADATA=1`; setting it to `0`
+  restores the old per-builder path. No model arithmetic or precision changed.
+- A further opt-in, `VLLM_SM70_MTP4_FUSED_GDN_METADATA=1`, reuses the grouped
+  pointer-table kernel to populate all GDN cache groups and shared graph
+  buffers in one launch for pure speculative FULL-graph batches. The MTP4
+  align-mode state column is selected from sequence length and Mamba block
+  size, matching `mamba_get_block_table_tensor`; DFlash2 retains its separate
+  post-precopy start-index contract. Mixed/prefill or unsupported batches
+  fall back. The fusion flag defaults to `0` pending the verifier-trajectory
+  audit below.
+- At the three-group, MTP4 width-5 V100 micro shape, pure-single-request
+  metadata submission was 1.757 ms legacy, 1.434 ms shared, and 0.120 ms
+  fused (full GPU completion: 1.776, 1.454, 0.136 ms respectively).
+  Three-request pure-spec behaved similarly. Mixed three-request metadata
+  submission was 2.515 ms legacy versus 1.562 ms shared; fusion is not used
+  for mixed batches. Twelve targeted tests cover shared pure/mixed metadata,
+  fused MTP4 query lengths 2-5 in both `none` and `align` modes, changing
+  sequence lengths/accepted counts, and existing DFlash2 fused behavior. All
+  compared scalar and tensor metadata fields match the original builders.
+- Three single-start TP4 V100 full-model runs used identical 8,192-token
+  fixed input, 513 greedy output tokens, MTP4, FP16 activation/KV, disk PLE
+  without prefault, and the same graph configuration. On the same committed
+  source, the unchanged GDN path and shared-only path each used **306**
+  verification rounds and generated identical tokens for both fixed prompts
+  and all three natural prompts. The second fixed request's pure decode fell
+  from **10.756 to 10.032 s** (47.60 to 51.04 emitted tok/s, +7.2%); the first
+  repeat showed the same direction. This is a matched endpoint measurement,
+  not a per-kernel attribution. The earlier pre-commit record used 307 rounds,
+  so it is not substituted for this same-source control.
+- The opt-in fused run also produced identical output tokens, but required
+  **308** fixed-prompt verification rounds versus the same-source control's
+  306. Its low-overhead trace reduced the target interval from the preceding
+  3.248-ms reference to **0.896 ms** mean (p50 0.857 ms) across 307 closed
+  rounds; the captured complete-round mean was 34.529 ms. Because the draft
+  acceptance trajectory differs, this is a promising speed experiment, **not
+  the default quality-approved route**. Do not infer arithmetic parity from
+  matching final tokens alone or compare whole-round means as exact A/B
+  throughput. Next work should isolate graph-buffer aliasing/metadata reuse
+  effects before enabling the fusion default. Raw local evidence is in
+  `.artifacts/mtp4_fused_gdn_probe.json`,
+  `.artifacts/mtp4_fused_gdn_graph_trace.sqlite`,
+  `.artifacts/mtp4_shared_only_probe.json`, and
+  `.artifacts/mtp4_current_source_old_gdn_probe.json`. All GPU test processes
+  exited.
+
+## 2026-09-26 Flash-Next MTP4 combined acceleration defaults
+
+- The user explicitly requested merging PR #684 and enabling its accelerated
+  paths together with the already-merged PR #398. This supersedes the earlier
+  default-off deployment decision. It does not turn the historical output or
+  acceptance differences into an exact-output performance result.
+- Integration base is `fcf59f8e9ae50c186333e98e5cf6aae705f320de` on
+  `onecat/main`; PR #684 starts at `98b81ea69c09ae494e22bc7f22f2f7219065023a`.
+  The integration preserves both sides of the append-only worklog conflict.
+  Native M5 direct experts, the 25-KiB push collective, shared MTP4 GDN
+  classification, and fused pure-speculative GDN writes now default on.
+  Explicit zero overrides and all existing capability/shape gates remain.
+- Both native push dispatch sites now agree with the Python default; changing
+  only `envs.py` would leave the real collective disabled when the variable
+  is absent. Rebuild the normal package extension for the new default.
+- The earlier PR CI failures were a missing `list[int]` annotation and CUDA
+  device-count/device-context calls in its new four-GPU PLE test. Those calls
+  now use `torch.accelerator`.
+- Fresh qualification uses TP4 V100-SXM2-32GB, Torch 2.10.0+cu128 and CUDA
+  12.8.93, FP16 activations/KV, max length 32768, batch limit 8192, one request,
+  GPU memory utilization 0.95, prefix caching, V2 runner and
+  FULL_AND_PIECEWISE CUDA Graphs. RAM PLE and disk mmap PLE are measured
+  separately. Fixed speed requests use 8192 input/513 output tokens,
+  temperature 0/seed 0/forced length; natural quality uses temperature 1.0,
+  top-p 0.95/top-k 20 and natural EOS. HumanEval 0-7 uses deterministic
+  code generation and executable assertions.
+- Build, focused tests, matched endpoint runs and trace qualification are
+  retained in this task's `.artifacts/`; results will be recorded after the
+  freshly built artifact completes these gates. No new speed result is
+  claimed by this integration commit.
+
+## 2026-09-26 Accepted MTP4 common-path baseline and trace
+
+- The owner accepted **27.3963 ms per complete MTP round** as the development
+  baseline. This is decode time / speculative rounds, including target,
+  draft and host work. Freeze this result; do not repeat no-MTP baseline or
+  broad quality sweeps. Development uses the owned source/in-place build;
+  no further wheel packaging is requested.
+- Exact MTP4 now shares the existing FP16 GEMV/GDN/HC admission and defaults,
+  hybrid pinned-UVA PLE and dual compilation. The drafter shares parameters
+  through a decode compiler view and uses the existing split graph manager.
+  The first combined trace exposed missing M=1 draft graphs; the corrected
+  run captures target `(5, 10)` and draft `(1)` and proves GEMV/HC execution.
+- Measured source is `6b8cc4eaa7bed73b56176549ab6dbcce940b5887` plus saved
+  patch `35f8cb9ac6ebea7ce4cf58562c503c376596ba0991532dfa8193376b348a5636`.
+  TP4 V100, FP16 activation/KV, FP32 SSM, 32768 capacity, 8192 chunk,
+  C=1, memory 0.95, prefix cache on, MTP4; all PLE rows occupy pinned host RAM
+  (11.92 GiB/rank). Acceleration switches are unset and resolve on by default.
+- The 8192/513 fixed fixture takes 9.177750 s decode / 335 rounds =
+  27.3963 ms/round, acceptance length 1.5284 and 55.79 emitted tok/s.
+  This forced-length fixture continues after EOS and is a cost reference.
+  Natural EOS cases emit 284/329/421 tokens at 135.23/148.36/86.94 tok/s;
+  all answers are healthy and exactly match the preceding common-stack run,
+  with identical acceptance counters. Scoped coverage: 46 passed, one skipped;
+  five generated-LIS assertions pass. Earlier HumanEval 8/8 is not a new run.
+- The corresponding 8192/129 node trace has 84 closed cycles/rank. Rank 0:
+  metadata/pre-graph 0.9242 ms, target graph 29.3167 ms, gather gap 0.0199 ms,
+  sampling/state/handoff 0.9540 ms, four drafts/combine 5.2779 ms, next-round
+  preparation 0.0459 ms, total 36.5387 ms. Capture-disabled endpoint timing
+  and profiled stage timing remain separate; do not rescale these stages.
+- Dense matrix operations lead GPU service (12.83 ms round rank-max),
+  followed by TP communication including waits (4.83 ms), elementwise/copy
+  (4.48 ms) and direct experts (3.02 ms). Pinned PLE is only 0.116 ms.
+  Next: map hot M=5 GEMMs to shapes/call sites and extend/fuse the existing
+  shared operators where justified, without another standalone fast path.
+- Earlier 73-75 tok/s no-MTP used CPU-worker PLE and does not reproduce the
+  historical 97.7-97.9 tok/s hybrid baseline. One 262144-capacity attempt
+  failed before generation (3.24 GiB required KV vs 1.25 GiB available).
+  Retain that failure and do not repeat it under the narrowed scope.
+- Full contract, baseline manifest, raw artifacts and analysis are linked in
+  [the accepted profile](sm70_flash_next_mtp4_default_profile.md). All owned
+  model/profiler workers exited; preserve the worktree and evidence.
+
+## 2026-09-26 DFlash2 batch latency follow-up
+
+- Owned branch `codex/v100-decode-round-20260926-111504` starts from
+  `e889919e2192fa36b25c922366526fa3fe62edbc`. The current implementation and
+  acceptance ledger are in
+  [the batch latency report](sm70_dflash2_batch_latency_20260926.md).
+- Expand the existing context/metadata graph capability by captured query shape,
+  retain exact dense sampling only for ambiguous requests, and share partition
+  exponential weights in the common grouped-attention combine kernel. No new
+  weight-quantization or model-name dispatch is introduced.
+- Focused CPU results: 32 passed/19 skipped and 192 passed/21 skipped. GPU:
+  25 mixed sampler cases (FP32/FP64 RNG, including the real 248320 vocabulary),
+  five deferred context cases and 91
+  grouped-attention cases pass. Automatic-policy checks add 48 CPU passes.
+  Endpoint acceptance has not passed; this is not a new PRO performance win
+  or a completed 35B regression gate.
+- Reject grouped-scale lifetime and two-CTA GEMM prototypes: reducing registers
+  to 128 without spills did not produce a meaningful weighted speed benefit.
+  Retain the negative results so later work does not repeat occupancy-only tuning.
+- Other sessions' GPU tests were allowed to finish. A clean control service then
+  started on GPUs 4–7. Its 16-question natural-output check matches the previously
+  recorded 14 correct/15 natural stops; the strict all-natural-stop gate is open.
+- The initial single-run C8 endpoint screen lost 3.52 acceptance percentage
+  points and is retained as a failed screen. Real-input auditing then finds
+  bitwise context and sampling parity on 64 steps/rank. Same-process C8/48
+  Python ablation gives +5.09% rolling and +5.38% pure decode, with identical
+  full-48 pure acceptance counters. These are diagnostic findings only.
+- The fresh ordinary default services complete three repeats of every cell.
+  C1/C2/C4/C8 rolling medians are 241.739/265.057/326.295/385.783 ->
+  242.487/295.439/327.664/385.374 tok/s. Full-48 pure C8 is
+  680.644 -> 676.332 tok/s (-0.63%). Rolling C8 acceptance falls 2.497
+  percentage points, failing the requested gate. C2's +11.46% speed comes
+  with +6.585 acceptance points, so it is not an isolated compute improvement.
+  This campaign does not qualify its single-process +5% as production
+  performance. The natural-EOS pair remains 14 correct/15 natural stops on
+  the same cases. 4K cache-hit and 32K C2 route smokes complete on both.
+- The all-step ledger closes to client request decode duration within 0.14%.
+  In warmed runs, complete C8/q8 occupies 31–33% of that duration and mixed
+  prefill occupies 58–62%. Applying an old q8-only speedup to all rolling time
+  overstates the expected endpoint gain. Do not promote the diagnostic ledger's
+  raw endpoint delta: admission/acceptance differs, and the first pass includes
+  cold sampler/JIT stalls. Default-route logs confirm no manual acceleration
+  flags are necessary. Details and limits are in the batch latency report.
+
+## 2026-09-27 DFlash2 long-context q8 batches
+
+- Extend the existing built-in compensated E4M3 attention from B1 to
+  request-major q8 B2–B16. Correct request offsets for row lengths and FP32
+  max/sum panels, query native batch capacity, capture compatible batch graphs,
+  and inspect all live CPU length hints. Single-request tails retain their
+  route. No new enable switch, model-name or weight-quantization gate is added.
+- Share compatible graph workspaces within a device/stream/bound contract and
+  retain older allocations when growing. The graph pool falls from the initial
+  candidate's 1.13 GiB to 0.99 GiB (control 0.88 GiB). Unsupported head geometry
+  or KV dtype does not capture extra batch graphs; 35B-A3B TP4's local GQA=4
+  remains on the existing route. This is not a new 35B AWQ/FP8 speed result.
+- Normal FA2 extension rebuilt from owned source. The initial focused suite has
+  41 passes; after main b034648012 integration, the relevant graph/operator and
+  quantized-draft regressions have 50 passes. The expanded CPU admission matrix
+  has 49 passes (overlapping suites). Changed-input, padding, zero-length rows,
+  old-graph replay after workspace growth and FP64 oracle checks pass through
+  262144 context. Batch results equal independent-request execution bitwise.
+- TP4 V100, Qwen3.8-27B-NVFP4, FP16 execution/E4M3 KV, DFlash2 q7, 262144 service
+  limit, memory 0.8, prefix caching, same 32K/256 tokenized fixture and sampling.
+  Three warm client all-live decode medians C1/C4/C8 are
+  159.300/326.832/492.025 -> 159.324/429.134/624.863 tok/s
+  (+0.02%/+31.30%/+27.00%). No later arrivals; TTFT is separate. Aggregate
+  acceptance is 33.395/38.961/47.904 -> 33.395/41.889/53.968%. Both control and
+  final natural-EOS retrieval score 8/8 correct and 8/8 normal stops. C4/C8
+  acceptance varies between waves: do not assign all endpoint gain to compute.
+- Actual C4/C8 graph selection is logged on all four TP workers. KV budget
+  before graph capture is 11.45 GiB control versus 11.00 GiB candidates; this
+  separate difference remains unisolated. Do not claim unchanged total KV
+  capacity, C8 at 256K, a PRO win or completion of the prior rolling gate.
+- Source, hashes, both intermediate/final service pairs, failed first startup,
+  measurements and limits are in
+  [the long-batch report](sm70_dflash2_long_batch_20260927.md). On 2026-09-27,
+  the project owner requested merging PR #697 after disclosure of the earlier
+  rolling-acceptance failure and KV-budget difference. Both remain follow-up
+  items; merging does not mark them as passed. Capability-based defaults need
+  no additional enable switches. Public API and gateway were stopped at the
+  user's request; local benchmark services are shut down.
+
+## 2026-09-27 DFlash2 C4/C6/C8 target continuation (PR #708)
+
+The next targets remain **unmet**: C4 +10%, C6 +15%, C8 +20% over the
+conservative frozen PR #706/GDN-only baselines. The retained default
+candidate adds full and masked M48 compressed-weight tiles, an exact
+eight-lane attention softmax layout and canonical-order 384–512-KiB TP4
+reduction. Ordinary 32K/256 all-live pure decode is
+447.421/666.955/730.373 tok/s, or +2.46%/+13.31%/+1.69%; required rates are
+480.345/676.925/861.921. All 76 token arrays and speculative counters match,
+and long retrieval/natural stops remain 8/8. No new enable switch or weight
+copy is required. Source and expanded GPU checks are in PR #708.
+
+Do not repeat the rejected deeper prefetch, extra M64 tile, forced-register
+cap, paired-half scale or L2-prefetch candidates without new evidence.
+Relaxing split-K partitions improved the M64 GEMM estimate by only 4.1%
+and changed output bits; it was reverted, with no acceptance claim. Fresh
+M32/M64 NCU counters, failed correctness checks, exact build hashes and
+all endpoint qualifications are in the
+[M48 implementation and profiling report](sm70_dflash2_m48_scaling_20260927.md).
+M64 representative kernels do not saturate DRAM; low resident-warp counts,
+instruction/data dependencies and long-attention work remain relevant.
+The report distinguishes these diagnostic counters from endpoint speed.
+
+Main advanced to `db292f9a49` (PR #703) during this frozen comparison and
+was integrated in `bec7cb784c`. The integrated normal extensions build and
+269 GPU/graph regression checks pass. The figures above retain their
+frozen performance baselines; shared 35B-A3B AWQ/FP8 endpoint gates remain
+open. The owner requested merging this verified increment on 2026-09-27;
+the unmet C4/C6/C8 targets remain follow-up work. The integration audit
+and artifact hashes are recorded in the implementation report.
+
+Post-integration ordinary serving on idle GPUs 0–3 preserves all 19 token
+arrays and speculative counters across one C1/C4/C6/C8 wave, with 8/8
+long-retrieval answers and natural stops. This is correctness evidence,
+not a replacement speed baseline. Startup KV capacity is 11.00 GiB versus
+the prior 11.45 GiB; the existing capacity qualification remains open.
+The tested private service is stopped and public serving remains off.
+
+## 2026-09-27 DFlash2 M48 coverage and scaling audit
+
+- Main after PR #706 remeasured at 32K/256, TP4, E4M3 KV, prefix caching and
+  ordered admission. C1/C4/C6/C8 all-live decode medians are
+  162.364/436.677/578.872/704.171 tok/s. C6 is M48 with no graph padding to M64;
+  its GEMM already uses the SM70 batch path. See the
+  [M48 trace and coverage report](sm70_dflash2_m48_scaling_20260927.md).
+- Full-q8 whole GPU rounds are 20.825/33.274/47.913/50.695 ms. At 32K,
+  attention is the largest C1→C4 increment. GEMM is the largest C4→C6
+  increment; M48's GEMM cost is almost the same as M64's. The M64 full-tile
+  iterator must not be admitted at M48 without implementing safe tail loads.
+- Close the separate GDN omission: replace the C4/C8 whitelist by the measured
+  SM70 q8 operator range N4–N32, with identical recurrence and FP32 state
+  snapshots. No quantization/model-name gate, new runtime flag or native
+  artifact is added. Preserve BV32 above N32: the B64 BV8 screen regressed
+  1.06%. The expanded exact-state/replay suite passes 80 GPU tests.
+- C6's GDN screen saves 17.46% per layer; ordinary serving improves
+  578.872→588.630 tok/s (+1.69%). All 76 fixture requests have exact matching
+  token IDs and speculative counters; natural retrieval remains 8/8 correct
+  and 8/8 stops. Do not attribute the unchanged full-C8 route's endpoint
+  median fluctuation to this patch.
+- Retain the startup KV-budget difference (11.45 versus 11.00 GiB) separately:
+  both actual graph pools are 0.99 GiB, but total capacity equality is not
+  established. The baseline C6 480-KiB one-stage versus C8 640-KiB two-stage
+  reduction discontinuity is addressed by the later Draft #708 candidate
+  above; the capacity qualification remains separate.
+
+## 2026-09-27 MTP4 batch GDN input qualification
+
+- Keep the accepted 27.3963-ms complete-round reference. The target verifier
+  is M5/M10 batch decode; M1 GEMV remains the single-token/draft route.
+- Reuse PR #692's packed GDN input operator at `bcf0efa914`, on integration
+  base `b034648012`. This scope imports no other no-MTP candidates from that
+  PR. The existing shared split-copy fallback is already present on main.
+- `VLLM_SM70_QWEN38_GDN_INPUT_BATCH` remains opt-in while M5/M10 real-weight
+  bit parity, engine token/acceptance parity, memory and complete-round timing
+  are qualified. Do not infer MTP performance from the previous M2/4/8/16
+  component benchmark or repeat the rejected generic FP16 GEMM substitution.
+- Build and measurements use the owned source tree and CUDA 12.8, with no
+  wheel packaging. Record results and commands in the
+  [MTP4 batch GDN report](sm70_flash_next_mtp4_batch_gdn.md).
+- The batch candidate passes the component and full-model gates: 114 targeted
+  tests pass; all 36 real target GDN weight pairs across four TP slices are
+  FP16-bit exact; fixed and natural endpoint token IDs and MTP acceptance
+  statistics are identical. On the matched 8192/513 fixture, complete-round
+  median falls from 27.309572 ms (control) to 26.495768 ms (candidate), a
+  0.813804-ms (2.980%) saving. Natural EOS rounds also improve by
+  0.550--0.606 ms.
+- Keep the new environment variable default-off for now. Retaining packed
+  QKVZ/BA buffers adds 725.625 MiB per rank and reduces the engine's KV cache
+  from 153,910 to 122,631 tokens (maximum concurrency 4.70x to 3.74x). The
+  next optimization is to preserve the batch-decode speed without duplicating
+  the original weight storage; only then revisit a default-on change.
+- The trace confirms this is a batch Tensor Core path, not GEMV: the critical
+  target graph is 28.389041 to 26.740710 ms, dense service drops 9.735184 to
+  7.667470 ms, and 36 `gdn_input_batch_kernel` launches account for
+  1.306008 ms/round. Nsight Compute counters remain unavailable because the
+  driver returns `ERR_NVGPUCTRPERM`; do not claim measured occupancy or HBM
+  utilization.
+
+## 2026-09-27 MTP4 grouped experts and gated norm
+
+- The complete unprofiled MTP4 round must be below 20 ms, retaining the frozen
+  Flash-Next TP4/8K/513/MTP4 workload. Target-only verifier times do not qualify.
+- Extend existing grouped batch experts to M5, preserving W13 split4 and all
+  FP16 boundaries; reuse PR #692's grouped W2/ordered reduction at `2c5b584468`.
+  Add the common N128 native gated RMSNorm fusion, including sigmoid, with
+  ATen's exact vector4 mean and pointwise arithmetic. Both new flags are
+  opt-in: `VLLM_SM70_NVFP4_MOE_GROUPED_MTP5` and
+  `VLLM_SM70_RMSNORM_GATED_EXACT`.
+- Source-built component gates pass: four TP expert weight slices, changing
+  routes/inputs, 36 real norm weights, CUDA Graph poison/canary checks and all
+  FP16 gate payloads. See the [batch decode report](sm70_flash_next_mtp4_batch_gdn.md)
+  for commands, native hashes and the corrected test-fixture failure.
+- Same-build, same-GPUs0--3 full-model pair: with packed GDN enabled in both,
+  complete-round median **26.696061 -> 23.849974 ms**, saving **2.846087 ms
+  (10.6611%)**. Fixed repeats and all three natural EOS outputs retain every
+  token and acceptance count. KV capacity remains 122,631 tokens. The
+  less-than-20-ms target is still **3.849974 ms away**.
+- After ordinary timing, separate CUDA-event profiling gives critical-rank
+  target forward 18.208780 ms, verifier GPU 18.963904, drafts 5.038821 and total
+  wall 24.155889. The 18.96-ms verifier is not the complete-round result.
+- Do not repeat rejected screens: original-layout HC down regresses; packed
+  HC gives about 0.47 ms projected over 96 pairs but needs roughly 1.20 GiB/rank
+  and regresses M10 down; shared-gate vector8 dot changes FP16 logits. A fused
+  packed output projection is exact at M5 but costs 22--28 us versus 16--17 us;
+  its M10 arithmetic differs and is rejected without a model run.
+- Full reports and negative evidence remain in this task's `.artifacts/`.
+  No wheel is built; no private research extension is used in model runs.
+- Implementation is published as Draft PR #703 at `45248dc8d4`; main
+  `1e90d17f2c` is merged at `2e4369373a`. Normal source rebuild succeeds and
+  post-merge CPU regressions give 108 passes/8 GPU skips. These do not replace
+  the accepted endpoint pair's original source and extension identity.
+- Draft follow-up closes the old node-trace rank0 wall at 5.271298 ms, with
+  4.790127 ms kernel union and 0.481171 ms gaps. Full local vocabulary heads
+  use 1.883523 ms, MoE projection service 0.822872 ms; the M1 W13 grid has 30
+  CTAs and the compiled SM70 Triton path uses FP32 FMA rather than MMA.
+  Historical tuned tiles and local argmax are already on. Screen projection
+  geometry before another engine run; retain full-vocabulary sampling.
+- Reject `mtp_stack_trace` for kernel attribution: it contains no kernel
+  activity table. The follow-up explicitly flushes all TP workers before
+  shutdown. Do not substitute its profiled wall for the unprofiled baseline.
+- `mtp_stack_trace_flush` recovers four-rank kernel records and 84 closed
+  rounds. Capture shutdown exits 143 and prevents the later phase request;
+  retain the valid intervals plus this failure. Rank0 profiled cycle is
+  29.679408 ms, target graph 22.614401 and draft (excluding combine)
+  5.262167 ms. Target gaps include 3.661182 ms inside graph-launch API;
+  neither profiled time nor subtracted gaps are a new endpoint claim.
+- The draft screen preserves every FP16 bit and admits an original-layout
+  native projection schedule: M1 W13 105.395 -> 61.395 us, M1 W2
+  24.960 -> 13.024 us; captured first-draft M5 routes improve W13
+  170.989 -> 88.070 us and W2 95.258 -> 52.294 us. Native integration is
+  opt-in (`VLLM_SM70_MTP_MOE_FP16_EXACT`); normal-build GPU/model gates are
+  pending. Keep full vocabulary and target batch decode.
+- Reject original-layout GDN: exact M5 36-layer chain regresses from
+  1.104200 to 1.444454 ms even with read-only loads; M10 also regresses.
+  Do not spend another full-model run on this variant.
+- Normal-build draft tests pass 14 cases; the real-weight benchmark covers
+  all four TP slices and 16 M1/M5/W13/W2 cases at six scales with zero bit
+  differences. Native `_C` SHA256 is
+  `647649e8d5ee1ef6ab0952e8e29b8967967ca647a27bd86d55af62e58ca65179`.
+- The first engine candidate missed the native route because modular
+  `TritonExperts` bypassed the common dispatcher. Retain the stopped attempt
+  (exit -15), route both projections through the common entry, and require
+  the native route log in the corrected candidate. Two additional GPU tests
+  verify this modular entry, both operator hits and graph output bit parity.
+  The same-GPU control completes at **23.950179 ms**; its corrected candidate
+  remains pending. Do not relabel the older 23.849974-ms pair.
+- The refreshed Nsight report warns of unsupported driver CUDA 13.0 and
+  possibly incomplete CUDA/NVTX records on all four workers. Empty intervals
+  mean no recorded kernel; they do not prove removable GPU idle time.
+- Reject original-layout HC shared staging: exact M5 13.664 ->
+  18.052--21.776 us and M10 14.424 -> 20.924--23.592 us. Asking the identical
+  kernel to prefer L1 also gives no gain (M5 12.696 -> 12.716 us). Retain
+  `hc_up_original_shared` and `hc_up_cache`; skip full-model runs for both.
+- Draft-MoE full-model gate completes on GPU4--7 at source `6bcffbb796`,
+  same native extension and engine settings in both arms. Only the new draft
+  flag changes. Fixed 8192/513 round median is **23.874188 -> 23.657858 ms**,
+  saving **0.216330 ms (0.9061%)**. The <20-ms objective is still unmet by
+  3.657858 ms. Do not subtract this delta from a different historical pair.
+- Both fixed repeats and all three natural EOS cases preserve every token,
+  finish reason and acceptance count. Natural outputs stop at 284/329/421
+  tokens and pass the code/arithmetic/explanation health checks. Natural
+  round timings do not improve (24.957797/24.920565/24.962826 ->
+  25.067507/25.013588/24.962961 ms). Keep the new draft flag opt-in; no
+  universal throughput gain or default-on qualification is claimed.
+- Separate per-rank CUDA-event draft means fall from 5.011584--5.034362 to
+  4.879756--4.902546 ms. This is less than the isolated projection saving.
+  A new node trace is needed to inspect actual scheduling; event-profiled
+  or heavily traced request timing is not a replacement endpoint result.
+- Retain the pre-weight-load GPU4--7 resource-conflict failure. The
+  successful retry reused its completed same-GPU control and waited for
+  foreign jobs to exit, without changing the .95 memory contract. Normal
+  model memory remains 23.61 GiB, with 122,631 KV tokens.
+- The real-weight full-vocabulary head screen finds no exact cuBLASLt gain.
+  Reject other full-head algorithms for FP16-logit differences. Raw fused
+  top1 additionally rounds products to FP16 via `__hmul2`, violating this
+  arithmetic contract; six matching selected tokens do not admit it.
+- Reject the Nsight 2025.3.2.474 model capture: it completes generation and
+  profiler RPCs but emits no report. A tiny reproduction identifies CUPTI
+  13.1 `CUPTI_ERROR_INVALID_DEVICE` and zero CUDA events. The same smoke with
+  isolated 2025.3.1.90/CUPTI 12.9 captures exactly 40/40 graph kernels. A
+  driver-version warning remains, so preserve diagnostics and distinguish
+  unrecorded intervals from idle. This is the gate for one model recapture.
+  Model runtime/build remain unchanged; do not install Nsight 2025.4+ for
+  Volta, which those versions no longer support.
+
+### Current-build draft trace and long-tail screen, 2026-09-27
+
+- `mtp_draft_exact_trace2531` exits 0 and preserves the 129-token request and
+  85/43 draft/accepted counts. Four ranks and 84 closed intervals pass the
+  marker checks: 2,060 target and 298 draft kernels each; every round uses
+  exactly 1 M5 W13 + 3 M1 W13 + 4 W2 native projections. Keep compatibility
+  diagnostics. The 29.391136-ms profiled cycle is not the 23.657858-ms ordinary
+  endpoint. Target graph-launch overlap explains a large part of its extra
+  unrecorded span, without establishing all such spans as idle.
+- Current traced rank0 draft wall is 5.027947 ms: full heads 1.881527, MoE
+  0.613238, other dense 0.629245, sampling/state 0.544494, communication/waits
+  0.405687, attention 0.343567, HC 0.199544, overlap 0.067603, unrecorded
+  0.343043. Target dense service is 7.565656 ms, including 3.022150 ms HC
+  down/up; HC postops add 1.055227 ms service. Service is nonadditive.
+- Native M1 W13 has 62--73-us medians but 171/1,008 traced calls exceed
+  250 us. Do not equate isolated 59--64-us timing with all model calls.
+  Changed-route screens, 64-MiB cache flush, Nsight on/off and 24-GiB strided
+  address pressure do not reproduce those tails (direct64 maxima <=101 us).
+  Preserve `draft_moe_{context,tlb}_screen*`; do not re-run these hypotheses
+  or install a new schedule from a cold-only component win.
+- The discriminating next observation is CUDA-event timing within the
+  resident draft graph without CUPTI, actual routes and rank arrival times.
+  Root cause remains unresolved. Prioritize target batch dense/HC fusion
+  for the remaining several milliseconds; the <20-ms goal is still unmet.
+- The task-local graph-event observer passes a three-replay changed-route,
+  counter and bit-parity smoke. Its first resident attempt fails before
+  weight loading when a foreign service races startup (20.43 GiB free versus
+  the unchanged 30.15-GiB request). Preserve the failed log and pending
+  observer; there is no resident no-CUPTI result yet. Both GPU groups are
+  occupied at this checkpoint. No model/code change or quality regression
+  is inferred from this resource failure.
+- The bounded retry subsequently completes on idle GPU4--7; all tokens,
+  acceptance and cross-rank route IDs agree. The resident runner replays
+  **one captured M1 graph three times**. Its end-of-proposal event value
+  therefore covers only the last M1 step, not three independent kernels.
+  On 84 aligned rounds/rank, last-step event means are 75.447/65.938/66.280/
+  75.106 us; all maxima <=82.944 us. The node trace has 39/336 last-step
+  calls >250 us, versus zero in this instrumented no-CUPTI observation.
+  Record measurement sensitivity, not a proven ordinary scheduling bug.
+  An existing stream-synchronize API overlaps both fast and slow traced
+  calls and is not a causal explanation. Preserve the observer source/hash
+  and comparison artifacts. Any follow-up must collect after each graph
+  replay before overwrite; do not repeat the end-of-proposal-only observer.
+- Next exact component decisions: extend the existing FP16 router packed32
+  key to its admitted M<=16 batch route. Original FP32 normalization and all
+  three outputs remain bitwise; 48-call M5/M10 savings are approximately
+  0.05 ms. Reuse the existing mixed-QKV fused recurrence for pure small-M
+  MTP, behind `VLLM_SM70_FUSED_SIGMOID_MIXED_QKV`; 36-layer M5 copy-chain
+  1.097771 -> 0.615125 ms, M10 1.256832 -> 0.784512 ms, all output/FP32
+  state bits exact in ten changing graph checks. These are component gates,
+  not a new complete-round result. CPU guards: 18 pass, ten GPU integration
+  checks and full-model admission pending at this checkpoint.
+- Reject original-layout HC split-stage schedules: exact but M5
+  17.024 -> 18.702 us, M10 16.098 -> 20.422 us. Do not model-test those
+  variants. CuBLAS uses 480 single-warp CTAs versus this prototype's 220;
+  a masked-quad 420/840-CTA hypothesis and reuse of PR #704's up/mix kernel
+  under original MTP precision are separately pending component screens.
+  PR #504 sharding changes replicated GEMM association and is not an exact
+  shortcut. Preserve artifacts and follow-up decisions in
+  `docs/design/sm70_flash_next_mtp4_batch_gdn.md`. The qualified endpoint
+  remains 23.657858 ms; <20 ms is still unmet.
+- Loader source `8a99ccb4ea` passes changed-file pre-commit/mypy. The combined
+  15-minute GPU wait expires before CUDA starts; ten new integration tests
+  and the two HC follow-ups remain unrun, not failed numerical gates.
+  All eight cards have foreign owners. No owned waiter/worker remains;
+  resume the retained `run_mtp_pending_gates.py` without repeating successful
+  router/mixed-loader components or the rejected HC split-stage schedules.
+- CPU-only MTP recurrence follow-up: the existing trace has 48 CTAs for 80
+  SMs. BV16 with unchanged four warps/stages3 compiles to the same K/state
+  and Q/K-normalization layouts as BV32, doubles M5 CTAs to 96 and uses
+  80 versus 117 registers in the isolated pair (zero spills). The actual
+  trace's 119-register binary remains separately identified. No measured
+  occupancy, bitwise equivalence or speedup follows from compilation alone.
+  `gdn_mtp_value_tile.py` is the fourth pending component job; no runtime
+  schedule/default changed. Preserve this distinct hypothesis and do not
+  repeat the rejected global BV8/recurrent-schedule overrides.
+- The next 600-second lease wait also expires before CUDA starts
+  (`mtp_pending_gates_retry1.log`). Both foreign TP4 groups remain active;
+  the four prepared jobs and model admission are unrun. No owned worker or
+  pending wait process remains. Latest qualified complete round stays
+  23.657858 ms, with <20 ms still unmet.
+- Capture qualification correction: the 29.391136-ms node trace is not an
+  admitted absolute decomposition of the ordinary 23.657858-ms round. Its
+  request's own decode metrics give 29.350420 ms (0.139% closure difference),
+  but use 129 rather than 513 output tokens and lack matched capture-off
+  controls. The separate phase observer's enclosing request is 26.885772 ms,
+  +13.64%; its target/round event fences preclude calling it an unperturbed
+  breakdown. The phase observer was disabled in the node trace.
+- A correlation-ID audit finds target graph host launch 4.116641 ms for
+  2,060 nodes, versus draft 0.232171/0.163631 ms for 81/65 nodes. This is a
+  capture-overhead lead, not evidence that all unrecorded gaps are idle or
+  removable. Retain the existing Nsight-2025.3.2 invalid-device/no-events
+  failure. New clean/graph/node calibration scripts fix 8192/513, warm the
+  actual shape, compare identical resident-engine before/during/after
+  requests, avoid CUDA-event fences and require token/acceptance equality
+  plus a 3% perturbation/drift gate. The first launch was rejected before
+  CUDA by a foreign GPU4--7 lease; no new speed/trace result or owned waiter
+  exists. See the detailed capture audit in the MTP batch qualification doc.
+- Completed capture calibration on source `e7df523a3c`, normal native SHA256
+  `647649e8d5ee1ef6ab0952e8e29b8967967ca647a27bd86d55af62e58ca65179`,
+  physical GPUs4--7, same warmed 8192/513 MTP4 fixture, pinned host PLE,
+  four acceleration flags on and mixed-QKV off. Clean rounds are
+  23.686521/23.704239/23.700977 ms (mean 23.697246). Nsight whole-graph
+  off/on/off is 25.176410/25.350714/25.460508 ms: inactive injection is
+  already +6.841% against clean, so the arm is rejected and node collection
+  is skipped. Three ranks also each lack one target-graph record. Retain
+  the graph audit; do not repeat this failed arm as an absolute timing path.
+- Deferred CUDA-event observation preserves asynchronous execution and reads
+  timing only after the request. Same-engine off/on/off is
+  23.602294/23.799931/23.691980 ms, +0.646% capture perturbation and 0.380%
+  control drift; every output ID, finish reason and acceptance statistic
+  matches. There are 336 target starts / 6,720 unique events on each rank,
+  closing 335 intervals. Correct the parser's original start-count versus
+  request-draft-counter mistake without rerunning GPU work; its failure is
+  retained. Independent raw-event/identity/quality checks pass.
+- The calibrated rank0 cycle is **23.783247 ms**, within 0.071% of the
+  enclosing request: target forward 17.781912, sampling/state handoff
+  0.780647, four drafts 4.627054, next-round preparation 0.593635 ms.
+  Draft replay envelopes are 1.329739/1.081356/1.058597/1.051968 ms, with
+  0.105394 ms outside their graphs. All four rank-local cycle means agree
+  within 0.000171 ms. Per-ordinal slowest complete-rank intervals average
+  23.813001 ms; never sum independent category maxima. These are replay/
+  phase envelopes including waits, not per-kernel service or utilization.
+- Raw events, closed intervals, Chrome/Perfetto trace and reviewed PNG/SVG
+  are under `mtp_capture_calibration_deferred_20260927*` and
+  `calibrated_mtp_trace_view/` in the owned artifact directory. Target
+  forward is about 75% of the cycle; split HC/GDN/experts/attention within
+  it next under the same admission gate. The old kernel-level Nsight
+  breakdown and SM/HBM counters remain unqualified. <20 ms is still unmet.
+  No foreign service was stopped, no wheel was built, and all owned
+  measurement/waiter processes have exited.
+- User-requested forward planning estimate reclassifies the two retained
+  node traces using 97 HC boundaries and 2,060 kernels per rank/round.
+  Same-module overlap is unioned; HC includes its projections, while the
+  extra PLE GEMM is removed from HC up. Estimated budgets are HC 4.293,
+  MoE 4.307, GDN 3.774, QSA 2.908, PLE/preparation 0.607 and TP/waits
+  0.909 ms. These inherit old kernel timing and are not current internal
+  measurements. The 0.934-ms balancing residual is not measured idle.
+  Preserve `mtp_forward_module_estimate_20260927.{json,md}` and its parser.
+- HC audit confirms current M5 projections are replicated on TP4; the
+  admitted exact HC shard/gather path only accepts M1. Batch output-sharding
+  is a new candidate, subject to unchanged reduction/materialization and
+  communication-cost checks. Do not port PR #504 as an exact speedup.
+- On idle, leased GPU4, source `63ad3e255b` and the unchanged normal `_C`,
+  only the two previously pending HC components run. More-CTA original-layout
+  down remains exact but slower: M5 17.022->18.510 and 16.324->18.116 us;
+  M10 also regresses. Reject without a model run. PR #704's selected
+  register up/mix under original MTP precision is exact on eight checkpoint
+  pairs/seven scales and improves M5 14.516->10.738 us, M10
+  15.422->11.946 us. The 96-module extrapolation is 0.363 ms at M5, not a
+  measured endpoint saving. Packed-up duplication would cost 0.586 GiB/rank.
+  Resolve source integration, memory and model quality/speed before promotion.
+  Retain `hc_evidence_20260927_contract.json`, JIT hashes and raw reports in
+  the owned artifact directory. Both research processes exit 0; GPU4 is
+  released. No model reload, wheel, runtime/default change or foreign stop.
+  The GDN gates/current internal trace remain pending; <20 ms is still unmet.
+- MTP HC batch integration reuses pinned PR704's arithmetic with the original
+  MTP FP16 split-partial rounding and FP32 reduction order. Cooperative HC,
+  exact router projection and mixed-QKV integration qualify **22.094242 ms**
+  per ordinary complete round on GPU4--7, versus the independent 23.697246-ms
+  clean baseline. Fixed/natural token IDs, EOS and acceptance are unchanged.
+  Same-engine deferred trace overhead is +0.205%; its 22.127934-ms closed
+  cycle splits into target 16.183720, sampling/state 0.766432, four drafts
+  4.607666 and preparation 0.570115 ms. Source `3b7365925f` and full contracts
+  are in the detailed MTP batch report. <20 ms remains unmet; no wheel.
+- Do not repeat rejected BV16 GDN, grouped-W13 unroll40/N16, HC half-tile,
+  per-tile gather, N8 down, or M1 norm-reduction-at-M5 experiments. The new
+  Triton QSA scorer is removed: actual page204 causes register spilling and
+  a ~5x component regression despite exact outputs. `tl.dot` here lowers to
+  scalar FP32 FMA, not Tensor Core MMA. Native exact scorer screens are
+  neutral at M5. Keep original scoring.
+- Exact HC full unroll and QSA short-row compaction pass component/native
+  gates, but their combined source `732e184173` measures 22.325730-ms ordinary
+  rounds, failing to exceed the prior best. Its trace overhead is +0.476%;
+  all fixed/natural quality counters match and sampled GPU clocks do not
+  throttle. Both HC schedules now remain selectable for same-process A/B/A.
+  The partial router-key sort is bit-exact and saves about 0.06 ms per target
+  component chain; its model gate is pending. The resident harness avoids
+  reloading weights for each schedule and retains inspectable graph metadata.
+  Preserve all `mtp_hc_*candidate_20260927*` contracts/events and component
+  rejections; do not promote extrapolated savings or repeat completed gates.
+
+- Resident HC/QSA/router A/B/A now qualifies a modest 22.156515->22.005602-ms
+  combined improvement, preserving fixed/natural output IDs and acceptance.
+  The 194-event internal observer is rejected (+23.753% perturbation);
+  selecting the actual bucket32768 graph and checking unique invocation
+  counts are mandatory. Empty cloning itself stays close to the control.
+  Globaltimer kernel-node research passes a tiny graph gate; no current
+  internal absolute attribution is admitted yet.
+- New default-off shared-expert M5/M10 Tensor Core/SiLU and sigmoid/multiply
+  fusions pass 49 checkpoint modules x four TP slices x seven scales and
+  36 native/fallback tests, preserving FP16 boundaries and scalar projection.
+  Source build adds 76.5625 MiB/rank packing. Full-model admission is pending.
+  The one-warp GDN screen is exact but saves only about 0.056 ms per M5
+  component chain; avoid a new model load solely for it. Keep all rejection
+  and source identities in the detailed MTP report. The <20-ms goal is unmet.
+
+- Shared-expert fusion completes fixed and natural quality gates with exact
+  IDs/EOS/acceptance. Ordinary mean is 21.722330 ms (21.662596/21.782064),
+  outer events add 0.306%. A later research timestamp-template capture fails
+  outside inference mode; reject that diagnostic attempt and keep the earlier
+  completed performance/quality segment. Fresh ordinary confirmation and
+  admitted internal trace are still pending; <20 ms remains unmet.
+
+- Source-built single-request MTP4 PLE rollback/conv/SiLU/state fusion passes
+  ten native/public tests and all fixed/natural model token/EOS/acceptance
+  gates. With shared-expert fusion, ordinary complete rounds average
+  **21.507750 ms**; final same-engine ordinary confirmations average
+  **21.427792 ms**. Outer trace perturbation is only +0.1405% and closes at
+  21.542208 ms: target 15.534391, sampling/state 0.780901, four drafts
+  4.574895, preparation 0.652021. Full contract/hashes are in the MTP report.
+  The dense globaltimer observer still perturbs by +6.85%; the two-marker
+  attempt contains multi-second stalls. Both internal captures are rejected,
+  with no outlier deletion or rescaling. The resident engine exits normally.
+  New W2 expert-pair warp packing is under component screening; do not repeat
+  the rejected W13 N16 screen. The <20-ms complete-round goal remains unmet.
+
+- Post-PLE component screens reject W2 expert-pair N16, W13 shuffled
+  epilogue/quad-split, HC producer-ready flags and HC 2/4-warp CTAs: all
+  preserve bits but regress. Detailed magnitudes/artifact names are in the
+  MTP report; do not repeat these scheduling ideas. GDN BV16 divergence is
+  traced to LLVM's first-product/FMA contraction for the final four V rows;
+  explicitly pinning the original BV32 arithmetic restores all output/state
+  bits, but exact BV8/BV16 saves only ~0.05 ms per 36-layer component chain.
+  Keep it as research rather than rerunning a full model for that small gain.
+
+### 2026-09-27 PR #703 audit and authorized main integration
+
+- The user explicitly requested audit and merge. Merge latest `onecat/main`
+  `ef6909830cbb7b40a24413bfe74ab49a4f7e1b90` (#706) into the owned published
+  MTP branch without rebasing; integration commit is `b772a0e962`.
+- Fix one numerical-contract bug in `4d4cb68dac`: batch GDN must fall back
+  when the caller requests FP16 accumulation. M5/M10 GPU regressions and
+  the focused 185-test integration suite pass; changed-file pre-commit and
+  normal native rebuild pass. Optional Rust frontend remains unavailable.
+- Fresh source-built TP4 GPU4–7 all-acceleration gate preserves all fixed and
+  natural IDs/EOS/acceptance. Complete ordinary rounds are 21.421255 /
+  21.401212 ms, mean **21.411234 ms**; pure decode 71.347743 / 71.414562
+  tokens/s. Deferred observer adds +0.468769%; rank0 cycle is 21.515078 ms.
+- Native SHA256 is
+  `790ca7b49e83c2289c98b167ca070146d10643f63dab653ee6a54e95f56a175f`;
+  no preload/private kernel dependency. Raw artifacts use
+  `pr703_merge_all_accel_20260927*` in the existing owned MTP worktree.
+  Full commands, audit and dependency hashes are in the final section of
+  `sm70_flash_next_mtp4_batch_gdn.md`.
+- Admit PR #703 for the authorized main merge. Retain opt-in defaults,
+  original precision and batch decode. <20 ms and reliable internal HC
+  attribution remain unmet follow-ups. All owned GPU workers are stopped;
+  no foreign service was interrupted and no wheel was built.
+
+## 2026-10-02 release acceleration admission audit
+
+Release baseline remains `d30469863287471a7082842500ae73299a697e0d`.
+Using its installed 1.5.1 wheel, Torch2.10.0+cu128, four V100-SXM2-32GB devices,
+and the proposed Draft #748 E4M3/TP4/8192-budget/2048-block/seven-draft recipe, ordinary
+`EngineArgs.create_engine_config()` selected all eight required configured
+capabilities with no launch-time performance environment variables. Native
+QPN2/shared-layout/prefill operator checks had no missing operators; QPN2 decode
+and bounded prefill defaults resolved inside the quantization layer even though
+their global env getters default to false. No weights were loaded, no worker
+started, and no new output-quality or throughput result is claimed.
+
+Nine configuration cases cover the release recipe, E5M2, a 4096-token budget,
+TP2, eight sequences, 16-token blocks, target-only, five drafts and eager mode.
+These identify E4M3, prefill-budget, scalar-page, speculative-width and graph
+fallback reasons. TP and service capacity do not globally disable compatible
+batch GEMM or verifier operators. Flash-Next MoE decode belongs to another model
+contract; the 27B release status must not count it as a missing required path.
+
+Draft #748 publishes the recipe's expected path list for status consumers.
+Studio Draft #6 pairs already verified release drafts with new presets and
+offers explicit updates for existing presets. A revision label alone does not
+admit modified draft files, and inherited external FlashQLA DSO paths are
+filtered. No acceleration defaults or native arithmetic changed. Preserve the
+compile-cache quality guard: #675 demonstrated first-reload mechanics but its
+recorded complete output parity failed. Final rebuilt-wheel GPU qualification,
+three-start quality/speed gates and 35B-A3B AWQ/FP8 speed gates remain open.
+
+## 2026-10-02 Release default-cache requirement and E4M3 reload diagnosis
+
+The release owner now explicitly requires compilation caching on by default.
+This supersedes the previous release policy of retaining automatic cache-off
+as the final behavior. Existing PR #621 removes both main's env getter default
+and VllmConfig's forced opt-out; do not duplicate that change. Its patch applies
+to main d30469863287471a7082842500ae73299a697e0d. Six getter cases preserve
+explicit opt-out and default to cache-on; 16 AOT/side-table/startup-cache CPU
+regressions pass. This does not qualify cached numerical behavior.
+
+User-path evidence is retained at
+`/data/minimax-h3/task-cache/release151-qualification-20260930/compile-cache-20261002`.
+It uses the independent installed main 1.5.1 wheel with SHA256
+`b3cd873677f17cc779dbf3bb7ffcc03d64d243378df331b9a3ab38e97c32a2f7`,
+Torch 2.10.0+cu128, four authorized V100 GPUs 0-3, the QUASAR NVFP4 target
+and pinned DFlash2 draft, E4M3 KV, TP4/FP16, q7 probabilistic draft sampling,
+262144 context, 8192 budget, four sequences, memory 0.80, block2048,
+mamba8192 and FULL_AND_PIECEWISE graphs. Production launcher and bundled
+native libraries are used, with no source overlay or external kernel DSO.
+The isolated cache-directory variables are test hygiene. Explicit
+VLLM_DISABLE_COMPILE_CACHE=0 simulates #621 on the unmodified main wheel;
+the final no-variable default-on wheel remains unbuilt/unqualified.
+
+- Empty-cache startup: 237.164 seconds. The complete deterministic LRU answer
+  has 2181 tokens, normal stop, and all 11 generated unit tests pass.
+- First cached startup: 76.778 seconds, 12 AOT loads, zero load failures and
+  no graph recompilation. Its LRU answer has 2106 tokens. First token difference
+  is at zero-based position 1370; a generated test incorrectly expects
+  LRUCache(0.5) to raise ValueError. One of its 13 tests fails. This is a failed
+  quality gate, not an accepted startup improvement.
+- A same-contract cache-off control starts in 182.033 seconds with zero AOT
+  loads. Its entire 2181-token answer and response fingerprint match the cold
+  reference. The control retains populated lower-level caches and does not
+  isolate a particular compiler/kernel defect, but narrows this reproduction
+  to AOT reload behavior rather than ordinary restart alone.
+- Second cached startup: 73.268 seconds. Complete-output parity again fails;
+  this is not a three-start quality pass.
+- The separate binary-search request hit its 1024-token limit during the cold
+  run. Preserve that failure; it is excluded from the complete-output parity
+  probe rather than relabeled as a pass. The LRU cold response was retained
+  before the controller stopped and is reused as the full-output reference.
+
+The release diagnostic now uses the compiler's effective cache predicate,
+also reporting eager/NONE mode and Torch/config force_disable_caches. A false
+environment opt-out alone must not report caching available when another
+control disables it. 24 profile/API/stream CPU cases pass, including four
+effective-disable cases; five worker cleanup regressions also pass. Caching
+remains a startup diagnostic, outside the
+decode-acceleration count. The default-on requirement and existing #621
+dependency are documented in the release profile.
+
+Do not repeat the rejected #675 rank isolation or #682 subgraph/autotune
+isolation experiments. #710 separately resolves process-local linear workspace
+addresses and must be reviewed before universal cache-on qualification, but
+its changed routes are not established as the cause of this V100 reproduction.
+Unchanged tuning records alone do not close the CUDA-graph/AOT output gate.
+
+An alternative retains compilation caching and FULL_AND_PIECEWISE CUDA graphs
+but reconstructs the FX graph normally (VLLM_USE_AOT_COMPILE=0), reusing compiled
+subgraphs from disk. With a separate empty cache, startup times are 221.114,
+92.317 and 92.842 seconds. Each complete 2181-token response matches the original
+cold reference exactly, including the token IDs and generated code. Each warm
+launch reports three compiled-graph cache loads, zero graph compilations and
+zero AOT loads. This closes this single-request cold/warm reproduction, not the
+full B6 or cross-model gate. It is an explicit-switch diagnostic on the installed
+main wheel, not final default-wheel/B0 qualification.
+
+A separate owned cache-policy change, Draft
+[#753](https://github.com/1CatAI/1Cat-vLLM/pull/753), uses this strategy when
+compilation caching is enabled for the tested compressed-tensors NVFP4,
+TP4/E4M3 DFlash2 verifier contract. It preserves explicit AOT selection and
+warns about the failed AOT-reload quality gate. Other model contracts keep their
+existing defaults. It depends on #621 for cache-on without user variables and
+does not duplicate #621's removal of cache opt-outs. A final combined wheel and
+broader quality/performance checks remain required.
+Its head is 6de965641d10ca9a5bb74b68034aee7030ec09dd; 25 policy/cache CPU cases
+and scoped hooks pass. Source configuration with #621 has no initial performance
+variables, cache-on/AOT-off and FULL_AND_PIECEWISE graphs. Native symbols come
+from the matching baseline wheel for that configuration-only diagnostic; this
+mixed source setup is not used for the installed-wheel GPU measurements.
+
+Studio now exposes startup compilation-cache status separately from the
+required decode-capability count, instead of dropping that row when counting
+expected routes. Its full backend suite passes (512 passed, 17 skipped), frontend
+typecheck and build pass, and the existing build chunk-size warning is retained.
+Keep all candidate PRs Draft and preserve existing release failures; do not
+merge, tag or publish from this qualification task.
+
+### 2026-10-02: SM70 linear policy migration on main
+
+The maintainer approved integrating SM70 paths into existing linear/MoE
+selectors, attention validators and model configuration policies, rather than
+adding a parallel acceleration registry. The acceleration cleanup has separate
+authorization to merge verified PRs into main; it does not alter the release
+qualification task above or release/1.5.1.
+
+The first owned scope is compressed-tensors NVFP4 QPN2/QPN4/TurboMind, based
+on main e21372d7547f96949dbfc5ccd1c1073d05ba1e55. Kernel preparation and
+execution move into the existing NVFP4 framework. Five QPN2 compatibility
+aliases resolve once in KernelConfig; model quality restrictions remain in
+models/config.py. Native numerical sources, precision, tuning values and
+default admitted routes are retained. See [the implementation design](sm70_linear_kernel_integration.md).
+
+The independent original quantization adapter and migrated adapter agree on
+324 category configurations and 18 boundary cases. This is CPU loading and
+native-entry dispatch evidence, not an all-category GPU routing claim.
+Flash-Next ModelOpt and 35B AWQ are explicitly outside this CT category.
+
+Comparable static-inventory metrics remain 494 registered SM70-related names,
+619 total names, 125 unregistered SM70-related direct-read names (177 across
+all VLLM names), and 110 hardcoded-comparison candidates (51 in config/vllm.py).
+The matching inventory scope is Python vllm/**/*.py and csrc C/CUDA, with name
+filter SM70|FLASH_V100|FLASHQLA; dynamic keys and companion packages are
+excluded. Comparison candidates are a lexical audit counter, not a semantic
+count of quality restrictions. No model parameter locks are removed here.
+The five migrated names remain registered throughout their compatibility
+release, so their count does not decrease yet.
+
+GPU validation is a matched ordinary installed-wheel release-profile 27B,
+TP4, GPU0–3, FP16, E4M3, 32K input, C1/C4 run with separate prefill and pure
+decode metrics. An initial baseline startup lost free memory to a concurrent
+owner and also exposed an editable Flash-V100 packaging omission; neither
+is candidate performance evidence. Preserve that failed startup, use normal
+complete wheels for both arms, and wait for free GPUs rather than stopping
+other services. The native-library hashes match between the two rebuilt
+Python wheels and have no private RPATHs.
+
+The ordinary installed-wheel comparison completed on 4x V100-SXM2-32GB,
+Torch 2.10.0+cu128/CUDA 12.8, Flash-V100, FULL_AND_PIECEWISE graphs and
+compiled-subgraph caching without AOT reload. Both arms use the same profile,
+32,768 input tokens, 256-token output budget and per-request seed 4201+j,
+temperature 1, top-p 0.95 and top-k 20. Development APIs are enabled solely
+to reset prefix cache and pause admission. No preload or private library/source
+path is set. Discard the first C1 request and first C4 cohort as warmup.
+
+| Client pure-decode metric | Original adapter | Kernel framework | Change |
+| --- | --- | --- | --- |
+| C1 median tokens/s, three measured requests | 133.277 | 140.224 | +5.21% |
+| C4 median aggregate tokens/s, two measured cohorts | 267.494 | 266.306 | -0.44% |
+
+C1 excludes the first emitted chunk and prefill. C4 counts returned tokens
+only during the interval in which all four requests are decoding. TTFT is
+retained separately. The small C4 difference is within the repeated-cohort
+variation; the C1 increase is not claimed as a new optimization. These are
+emitted-token service measurements, not synchronized kernel timings.
+
+The fixed C1 outputs diverge at token 86 while repeats within each arm match.
+The code and arithmetic health answers match exactly and naturally stop;
+the longer explanation reaches the 1024-token limit in both arms and is
+inconclusive as a complete-answer gate. Preserve this difference rather than
+claiming bitwise full-model parity. Its exact numerical origin is not localized;
+native arithmetic, precision and captured category dispatch plans are retained.
+
+A deterministic target-temperature-zero paired gate adds 12 sanitized MBPP
+tasks in C4 cohorts (IDs 2,3,4,6,7,8,9,11,12,14,16,17), three approximately
+32K needle cases at 10/50/90% depth, and six Chinese QA cases. Both arms score
+MBPP 11/12, needle 3/3 and Chinese QA 5/6, with no new case failure. All 21
+requests naturally stop; 20/21 token sequences match, and the differing MBPP
+task 4 passes its original assertions in both arms. Existing failures are
+MBPP task 16's lowercase/underscore check and the machine-rate question
+(both answer 18 instead of 36). This is a paired subset gate, not a full model
+quality qualification or evidence for widening other contracts. Dataset SHA256:
+ca95deaa9a01ef0a6f439f88bcf0dd3db3563d22f22aad6cae04ebb9a8d8c8e9.
+
+The GPU source pair is original e21372d7547f96949dbfc5ccd1c1073d05ba1e55
+and migration bc8b673812deebcad4cbc791e44c7d1ffd11d86e. Production Python
+files in the candidate wheel match that commit, and its 15 bundled native
+libraries match the control. Subsequent synchronization with main changes
+upstream graph-override/NCCL policies; its CPU merge gate passes 34 profile/API/
+cache tests and 41 category/selector/guard tests. The category's independent
+324+18 dispatch snapshot still has zero changes. The 25 visible-device mock
+tests pass on their CUDA-platform harness; three of them are incompatible
+with forcibly replacing that platform by CpuPlatform, which is not a routing
+regression. A CI/local Ruff import-classification difference caused by extracted
+companion build files is fixed with an explicit import-block boundary.
+
+The historical QWEN38 +29%/+18% batch result is pre-repair and not quality
+qualified; do not repeat it as accepted current performance. #703 has stronger
+same-contract quality evidence and is the next default-promotion candidate
+to screen, with resident-weight memory and KV capacity checked explicitly.
+
+### AWQ dense kernel framework migration (2026-10-03)
+
+The AWQ adapter now selects `TurboMindAwqLinearKernel` through the existing
+mixed-precision registry. Preparation, exact-dense workspace and execution
+move to the kernel with unchanged native calls. Dense policy resolves in
+`KernelConfig.sm70_awq`; three legacy switches remain compatible. AWQ MoE,
+FP8/QPN8, attention and verifier policies remain separate scopes.
+
+The independent legacy/candidate CPU snapshot covers 324 configurations and
+10 boundaries with zero default route changes. Twenty real AWQ eager cases
+(K/N representative of dense projections, groups 32/64/128 and M=1/4/8/4096/
+8192) plus three graph replays at each M=8 case match bitwise. No native
+arithmetic or accumulation precision is changed.
+
+Matched ordinary-wheel 27B release-profile32K validation used V1000-3,
+TP4, E4M3, DFlash7, page2048, budget8192, maximum4 sequences and FULL/
+PIECEWISE graphs. Initial C1 pure-decode median was 133.30 ->131.38 tokens/s,
+with identical returned tokens and TTFT 8.921 ->8.933s. The first two C4
+sampling pairs showed opposite changes (263.35 ->244.52 and, with ordered
+admission, 247.93 ->254.65); neither was a stable trajectory comparison.
+Deterministic target sampling still diverged at long context before the hash
+fix, and measured259.61 ->234.86. Preserve these failed controls.
+
+A new, unused AWQ subconfig had salted NVFP4's graph fingerprint. Resolve and
+hash AWQ only when it is used; an independent pre-migration hash fixture now
+protects that boundary. With the original fingerprint restored, all12 C4
+request token sequences match the deterministic control. Pure-decode C4 is
+259.61 ->254.68 tokens/s (-1.90%, inside the baseline's two-repeat spread of
+252.64..266.59). This is refactor validation, not a speedup claim. The change
+in long-context trajectory associated with the unused fingerprint is measured;
+its exact compiler/warmup numerical mechanism is not localized.
+
+Paired natural-stop quality checks have identical tokens in all21 requests:
+MBPP subset11/12, 32K needle3/3 and Chinese QA5/6 in both arms, with no new
+failure. The existing lowercase/underscore and machine-rate failures are
+retained. Dataset SHA256 remains the #764 sanitized-MBPP manifest.
+
+Measured source pair starts at b5f36b66434531cf888f463696f9769fb3520c69;
+normal wheels carry identical hashes for12 bundled vllm native libraries.
+Artifacts are retained in the task's sm70-awq-routing-20261002 audit directory,
+including failed starts, samplings, fixed-order controls, hash ablation,
+full returned tokens and checkpoint/input/output digests. These tests do not
+establish a new35B speed baseline or qualify new AWQ projection roles. AWQ
+exact-dense role expansion and the fused epilogue's TP boundary await a real
+AWQ quality pair; the available27B NVFP4 model cannot qualify those changes.
+
+## 2026-09-26 MTP4 trace and historical-verifier timing reconciliation
+
+- Retain the accepted 27.3963-ms full-round baseline. Same 8192/129 request,
+  one engine, capture off/on/off: **27.1598 / 35.4506 / 28.0762 ms/round**.
+  All 129 output tokens, 85 rounds and 43 accepted drafts match the original
+  trace. Node capture adds 7.3743-8.2908 ms against the two off arms; do not
+  assume all of the older unmatched 9.1424-ms difference is precisely attributed.
+- Existing V2 phase timer, separate process without Nsight: target verifier
+  wall **21.9472-22.2415 ms** across rank means at 8K. TP0 forward/sample/state
+  event intervals are 21.1253/0.7477/0.0164 ms. Same historical 152-token
+  HumanEval/0 input gives 21.5247-21.8349-ms target wall and exactly the old
+  62 output tokens/acceptance counters. Old #398 23.409 ms includes sampling
+  and state, and differs in batch/memory settings; it is not a node-service sum.
+- Original target-only graph: 23.6025-ms kernel sum minus 2.2471-ms overlap
+  plus 7.9613-ms no-kernel time equals 29.3167-ms wall. Dense target service is
+  9.3119 ms; the older 12.8330-ms table describes the entire round. Direct
+  M5 experts/push remain active. Ordinary M5 dense replacements were already
+  screened at only 0.1902-ms projected savings; preserve those rejected paths.
+- Measurement source `3ed85627c8` matches the frozen baseline runtime except
+  for the typing-only overload. This documentation update is not a GPU
+  qualification of later main changes. No source kernel/default change or wheel.
+- Retain both harness failures: initial configuration serialization after
+  warmup, and callable-RPC rejection after the successful off/on/off segment.
+  The separate named-worker phase probe completes with exit 0. No insecure
+  serialization override, repeated node capture or broad quality rerun.
+- Full scope, per-rank values and limitations:
+  [MTP4 timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md).
+
+### AWQ final main-synced validation (2026-10-03)
+
+Against main `f350e2ebe7`, the source-complete installed-wheel comparison passed
+on four V100 32 GB GPUs with Torch 2.10.0+cu128 and CUDA 12.8. The 27B NVFP4
+DFlash2 release profile retained TP4, FP16 activations, E4M3 KV, page2048,
+8192-token budget, four sequences, seven speculative tokens, and its existing
+attention/graph modes. The latency workload used 32K input and a 256-token
+output limit, temperature1, top-p0.95, top-k20, seed4201+j.
+
+After excluding the first warmup sample, pure C1 decode was130.63→132.47 tokens/s
+and C4 was258.93→264.89 tokens/s; C1 TTFT was8.937→8.939 seconds. No slowdown
+was observed and no acceleration gain is claimed for this structural change.
+C1 matched all four token sequences. C4 matched three of twelve sequences with
+probabilistic drafting and concurrent admission; these latency requests are not
+reported as a deterministic numerical oracle.
+
+All21 deterministic paired quality sequences were identical and ended
+naturally: MBPP11/12,32K needle3/3,ChineseQA5/6 in both arms, with no new failures.
+The final installed-wheel AWQ oracle also passed: all 20 shape/group cases and
+CUDA Graph replays were bitwise identical. The earlier result is retained with
+its original source boundary.
+
+CI passed after adding explicit types to two imported ROCm router buffers.
+That annotation-only change preserves executable bytecode and constants. No
+AWQ qualification limit, native numerical code, or calculation precision changes.
+
+### Serialized FP8 kernel integration gate (2026-10-03, #794)
+
+Control source `1fa49b3645`, candidate `333217c91a`; normal installed wheels
+contain identical hashes for all 15 native shared objects. The actual historical
+FP8 loader dispatch snapshot matches all 324 standard configurations and 226
+additional FP8 configurations/edges. Eleven Python aliases resolve into
+`KernelConfig.sm70_fp8`; two flags shared with native host dispatch retain their
+legacy interface. Duplicate PP2/TP4 quality predicates have one definition in
+`models/config.py`; no admission boundary is widened.
+
+The numerical oracle covers four FP8 geometries, M1/4/8/4096/8192, TurboMind and
+QPN8: all 40 cases match checkpoint, packed-weight, scale and output hashes.
+Fused gate/up outputs and three CUDA Graph replays at M8 also match bitwise.
+This is an operator oracle, not a 35B model speed baseline.
+
+The 27B NVFP4 DFlash2 release-profile gate uses four V100 32 GB GPUs, Torch
+2.10.0+cu128, CUDA 12.8, TP4, FP16 compute, E4M3 KV, page2048, budget8192,
+C4 capacity, memory utilization0.8, max length262144, 32K input and a 256-token
+output limit. Target sampling remains temperature1/top-p0.95/top-k20 with
+probabilistic drafting. Pure C1 decode is132.08→130.34 tokens/s (-1.32%);
+C4 is252.17→255.23 (+1.21%); C1 TTFT is8.949→8.952s. Individual C1 samples
+span more than the median shift. Retain the raw observations; no speedup claim.
+All21 deterministic quality outputs match tokens and natural EOS, with unchanged
+MBPP11/12, needle3/3 and ChineseQA5/6; the same two baseline failures remain.
+
+The mandatory CPU gate passes54 common tests plus64 scoped tests, and CI passes.
+Two NVFP4 padded-output warmup tests fail under forced CpuPlatform identically
+on the unmodified control; retain that negative result outside this FP8 scope.
+Config environment writes remain20 including one `setdefault`, down from22
+before #790; assignment-only counts are19 and21. All1003 registrations have
+metadata. No environment name is deleted during this compatibility version.
+Actual 35B-A3B AWQ/FP8 checkpoints remain required before widening qualification
+or claiming same-criterion 35B decode parity.
+
+### Loaded SM70 route reporting (2026-10-03)
+
+- Record decisions and actual rejection reasons in the existing linear selectors;
+  do not probe lower-priority kernels just to populate a report. KernelConfig
+  owns the data per engine and excludes it from the compilation hash.
+- Collect worker tables once after initialization. Startup and acceleration HTTP
+  diagnostics read the same table, including final NVFP4/AWQ/FP8 instances,
+  preparation flags and resident packed-buffer bytes. Never claim request hits.
+- Discover SM70 policy configuration fields automatically; unrelated AWQ/FP8
+  models no longer claim the fixed 27B NVFP4 release profile. Legacy non-linear
+  rows remain until their category migrations.
+- This is route-preserving instrumentation. Environment counts, model/TP
+  qualifications and the 20 configuration environment writes do not change.
+
+### SM70 environment surface cleanup (2026-10-03)
+
+- Remove six inactive registrations with no runtime/native consumer; add the
+  unified debug entry and register long attention's stable opt-out. Net change
+  is four fewer registered variables (1003 -> 999), not hundreds deleted.
+- Curate 36 public SM70 controls. Keep internal tuning, compatibility and
+  diagnostic metadata in the developer inventory; this does not remove the
+  remaining implementation switches. Public descriptions explain behavior,
+  defaults and override use, and CI rejects consumer placeholder text there.
+- Move four QSA defaults into `SM70_QSA_TUNING`, preserving all explicit legacy
+  values/parsing with warnings for one full released compatibility version.
+  Consolidate six observer aliases into `VLLM_SM70_DEBUG` channels.
+- NVFP4/AWQ/FP8 historical dispatch matrices have zero route changes. Repair
+  the FP8 snapshot loader so it loads the historical kernel after #794 instead
+  of assuming the helpers still live in fp8.py. The 43 QSA function/kernel ASTs
+  are identical; only the unchanged tuning assignments move into a table.
+- Configuration environment writes remain 20; model/TP locks are unchanged in
+  this pure cleanup. Default promotions and MTP admission belong to the
+  separately validated Flash-Next PR. No GPU speed A/B is needed here.
+
+### DFlash2 verifier policy migration (#807)
+
+Per-engine `SpeculativeConfig.sm70_dflash2` replaces the verifier startup ENV
+write and captures decisions through loaded operators and graph capture.
+Retain model quality qualification and parser compatibility. Standard 324 routes
+remain equal; the explicit TP2 combined-copy local-layout edge is the sole
+intentional change. See [design](sm70_dflash2_policy.md) and the checked expected
+change list. Six GPU bitwise/graph oracle cases passed; combined-copy graph replay was
+6.233 versus 6.824 microseconds median. Do not count this
+as a 35B AWQ/FP8 speed baseline. Environment registrations remain 999; public
+SM70 controls 36→31; unchecked reads 0; startup ENV write sites 20→19.
+
+### Verifier diagnostics through the unified debug entry
+
+Two further aliases map to `VLLM_SM70_DEBUG`: greedy LM-head skip traces use
+`trace`; the eager DFlash2 selector shadow oracle uses the separate `selector`
+channel. Unset unified configuration preserves the old integer parser and
+production defaults. Explicit unified channels, including empty, take
+precedence. These are compatibility aliases for one full released cycle;
+registrations and public control counts do not decrease in this step. Native
+arithmetic, forwarding code and the scored selector remain unchanged.
+
+### Retire DFlash2 candidate-order research override
+
+Remove the failed candidate-order environment registration and both typed
+ordering choices. Keep dense ordering mandatory; its old alias is warning-only
+for one released cycle. Historical quality evidence is recorded in the
+[retirement design](sm70_dflash2_retired_candidate_order.md). Standard 324 routes
+remain equal; one explicit failed-experiment edge intentionally changes.
+Registrations 999→998; public SM70 controls remain 31; unchecked reads 0;
+startup ENV write sites remain 19. Native numerical functions stay unchanged.
+
+### Flash-Next no-MTP: mapped result transport and distribution gates
+
+The decode acceptance contract now permits FP32 reassociation while retaining
+FP16 dense weights/activations and FP32 accumulators/state. Greedy equality is
+only diagnostic. The initial full-vocabulary teacher-forcing limits and task
+checks are recorded in
+[the acceptance design](sm70_qwen38_distribution_acceptance.md).
+
+The mapped transport registers only bounded result/flag buffers; the ngram
+weights remain disk-backed mmap. The normal installed-wheel C1 pair measured
+13.117008 versus 11.082492 ms/token (six separate-arm samples), with 36/36 tasks
+and natural stops in both arms. A 64-position English capture had zero KL/logit
+error. Concurrent timings, complete distribution/noise checks and fresh graph
+budget attribution remain pending; these numbers are not complete admission.
+
+Do not repeat the scalar-projection cooperative GDN segment: it regressed C16
+by about 113%. Keeping native batched projection reduced the loss to about 7%
+but regressed every measured width. Neither variant is admitted. The next
+structural prototype must remove synchronization/phase overhead or include a
+larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
+separate and disabled in these arms.
+
+## 2026-10-08 — architecture A0 Flash-V100 package split: validation pending
+
+Continue `agent/arch-flash-v100-split-20261008` from #1049
+(`cd081f4aec77f18362759985081cb9c384815aee`) in
+`/home/ymzx/arch-ws/refactor`. Source and private Git metadata now both live
+on the root disk; the handed-off worktree's Git directory originally pointed
+at full `/mnt/nvme3`. Retain original metadata and data, and do not install
+anything in the shared runtime.
+
+Static extraction audit found 194 original symbols with unchanged normalized
+AST bodies, but a duplicated prefill log flag, distinct module loggers and
+frozen public re-exports broke shared state/old-path monkeypatches. Restore
+one-owner flag access, the original shared logger and dynamic package exports;
+retain wildcard compatibility. Focused CPU compatibility/cleanup/MLA suite:
+11 passed. Coupling totals stay model 2325 / platform 3964 / env 335.
+
+GPU acceptance is pending, not waived. The handed-off base test process
+exhausted its GPU3 lock wait and never executed tests. The original A/B helper
+could mistake two incomplete logs for matching empty failure sets; use
+`/home/ymzx/arch-ws/tmp/ab_checked.sh` instead, which records exit codes and
+JUnit XML and refuses missing completion summaries. The 54-file base/new
+suite and the route/output/timing gate were queued under the GPU3 lock while
+an unrelated TP4 model owned all GPUs; neither job was stopped. A machine
+reboot then interrupted the queued runners. After reboot, `nvidia-smi` cannot
+connect and `lspci -d 10de:` lists no NVIDIA devices. Current static checks and
+the 11-case CPU suite pass again; GPU access must be restored before rerunning
+the paired gates. The checked runner also requires an available SM70 device
+before pytest and compares every JUnit outcome, so skipped/no-GPU runs cannot
+be counted as acceptance. Tests use the
+user-specified `gguf-round-cost-20261008` runtime with task caches under
+`/home/ymzx/arch-ws/tmp/a0-caches` and `VLLM_NO_USAGE_STATS=1`.
+
+Retain evidence at `/home/ymzx/arch-ws/tmp/a0-handoff.md`,
+`split_checked_ab.log`, `operator_gate.log`, `a0-compatibility.txt` and
+`a0-precommit-restart.log`, `a0-compatibility-restart.txt` and
+`no_gpu_probe.log`. Require executed matching GPU failure sets,
+`VLLM_SM70_DEBUG=routing` route equality, bitwise operator equality and the
+requested decode/long-prefill timing within ±2% before accepted commit/push.
+A2 and the remaining campaign are not complete. #1048 overlaps partial
+metadata extraction and provides a useful route inventory, but its CUDA
+reader changes are outside this full Python backend split.
+
+### Campaign validation override
+
+The user explicitly instructed continuation without V100 on 2026-10-08.
+Proceed with CPU/static validation and stacked Draft PRs; do not represent
+unrun GPU failure-set, route, numerical or timing checks as passed. A0 has
+11 passing CPU regressions, 194 matching normalized extracted symbols and
+passing pre-commit/mypy/layering checks. This override supersedes the GPU
+publication gate above; hardware qualification remains unmeasured.
+
+## 2026-10-08 — architecture A2 declarative counters and shared XQA admission
+
+Stack on A0 #1052 (`d8aa0bef64b7bb410380e79849c478ec7f915142`) in
+`agent/v100-arch-route-table-20261008-081749`, worktree
+`/home/ymzx/arch-ws/v100-arch-route-table-20261008-081749` on the root disk.
+The user's no-V100 validation override applies; no GPU precision or speed
+claim is made.
+
+`routing.RouteSpec` declares stage, codec set, head/GQA, page and chunk
+constraints. All 44 literal counter names resolve through the table. Dynamic
+page/partition and FP8 observer families retain their original strings;
+concrete split-D aliases and the sibling FlashInfer shared counters are covered.
+Do not classify the native Triton tree correction as diagnostic fallback.
+Uniform, mixed-row and small-query XQA now use one admission implementation
+with the original stage-specific hint priority, window and batch rules.
+Operator metadata/ABI/stride guards remain necessary. Fallback accounting and
+logs are separate from the original route summary, including when debug route
+counting is disabled. Unknown route names fail explicitly.
+
+Focused CPU suite: 306 passed, covering the generated structural matrix,
+frozen A0 predicate equivalence at 4096/16384/32768 boundaries, graph/workspace
+hints, disabled E4M3 batch, policy/availability/window/partition cases, mixed
+row metadata/scatter, compatibility/cleanup and FlashInfer. No CUDA operator
+was executed. Original/new CPU policy suite A/B is recorded separately under
+`/home/ymzx/arch-ws/tmp/a2_cpu_*`; do not confuse these CPU mocks with GPU tests.
+
+Coupling totals remain model 2325 / platform 3964 / env 335. One existing
+small-query raw env read moved from impl (27 to 26) to routing (14 to 15);
+`--accept-moves` records this without growing any total. The new component
+README explains structural coverage versus installed operator qualification.
+Retain the frozen legacy JSON as a migration oracle; the initial fixture
+annotation namespace omission was fixed, then a clean independent test run
+passed. Next scope: split impl and move feature metadata behind hooks (A3b).
+
+A2 final CPU policy A/B: 243 cases in both arms, identical complete JUnit
+outcomes (233 passed / 9 failed / 1 skipped). All nine inherited failures are
+`DeviceConfig` device inference in metadata-builder setup without hardware;
+they are not new routing failures. Evidence: `a2_cpu_ab.json`, paired JUnit
+XML and logs. The clean focused matrix/compatibility/backend suite has 306
+passes. Pre-commit and mypy pass on all nine owned paths. The table contains
+56 concrete declarations plus four observer families; 1,560 differential
+legacy decisions cover boundaries, availability/window/partition/graph hints
+and disabled E4M3 batch. GPU measurements remain unrun per the user override.
+
+## 2026-10-08 — architecture A3b-1 implementation method extraction
+
+Stack on A2 #1053 (`c7e4baf3c214ecedb6356fb19cd6c80ec94978ea`) in
+`agent/v100-arch-impl-split-20261008-084930`, root-disk worktree
+`/home/ymzx/arch-ws/v100-arch-impl-split-20261008-084930`.
+
+Extract 40 methods into decode (798 lines), prefill (1680), verify (1031)
+and debug_compare (428); core impl drops from 4930 to 1135 lines. Bind the
+same method names on the original class with unchanged inheritance and
+staticmethod descriptors. Move 30 global one-shot states to one state owner
+and register the owners with the compatibility shim. Preserve the original
+class receiver for the extracted comparison super call; a rebound public
+class export must not change the old `__class__` cell semantics.
+
+All 47 normalized calculation bodies match frozen A2 hashes. Normalization
+accounts only for state qualification/global declarations, typed-self
+annotations, docstring dedent and the explicit original-class super receiver.
+The initial seven hash differences were docstring indentation, not algorithm
+changes. The clean hash comparison has zero differences. New descriptor,
+state rebinding and patched-export/super tests: 3 passed. Existing focused
+matrix/mixed-row/compatibility/cleanup/FlashInfer suite: 306 passed. CPU policy
+candidate: 233 passed / 9 inherited device-inference failures / 1 skipped;
+all 243 JUnit case/status outcomes match the retained A2 parent result exactly
+(`a3_cpu_ab.json`). No GPU test is required by the user's active override;
+GPU numerical equivalence, replay and performance remain unmeasured.
+
+Coupling totals stay model 2325 / platform 3964 / env 335; accept per-file
+moves without any total growth. Pre-commit/mypy on moved implementation files
+passed. Raw logs and the source-normalization helper are under
+`/home/ymzx/arch-ws/tmp/a3_*`. This PR only extracts method responsibilities.
+A3b feature metadata hooks and removing family references from the remaining
+initialization/forward orchestration are still pending and must be a separate
+review scope; do not mark the full A3b or the architecture campaign complete.
+
+## 2026-10-08 — architecture A3b-2 speculative metadata hooks
+
+Stack on A3b-1 #1055 (`fb6b12c5b8013ec43b5c34e0135857f3b0fb74e7`) in
+`agent/v100-arch-spec-hooks-20261008-090436`, root-disk worktree
+`/home/ymzx/arch-ws/v100-arch-spec-hooks-20261008-090436`.
+
+Move 14 feature builder methods into spec/builder, draft, tree and
+verify_metadata; move device/group preparation into spec/smallq_metadata with
+a true module alias at the prior path. Register initialization, common attach
+and capture preparation hooks. Keep generic metadata, prefix-anchored windows,
+decode shape hints and partition buffers in metadata.py (1345 to 471 lines).
+The common file has no DFlash/DDTree names. The inherited compatibility mixin
+keeps every method and the extended positional/keyword build signature;
+extracted super calls continue after the mixin and execute the Triton builder
+once. Internal imports use the new device metadata owner.
+
+All 14 normalized calculation bodies match the parent. Six new CPU tests
+plus three retained implementation tests pass. These check legacy
+module alias/patch identity, tree capture restoration and invalid inputs,
+persistent draft buffer addresses/capacity, base builder and feature hook
+order, and small-query capture lengths/partition hints. Existing focused
+suite: 306 passed. Existing policy suite: 233 passed / 9 inherited device
+inference failures / 1 skipped; all 243 JUnit outcomes match A3b-1 exactly.
+Evidence: a3b_cpu_ab.json, a3b_cpu_new.xml, a3b-tests.log and a3b-spec-tests-final.log
+under /home/ymzx/arch-ws/tmp. Initial mypy errors from typed assignments to an
+external self were fixed by retaining field annotations on the owning mixin.
+
+Coupling totals stay model 2325 / platform 3964 / raw env 335. The two
+small-query env reads move to their feature owner; accept-moves records this
+without total growth. GPU validation remains waived by the explicit user
+instruction. Remaining A3b scope: implementation initialization/forward hooks
+and removal of feature names from the backend core. The campaign is ongoing.
+
+## 2026-10-08 — architecture A3b-3 attention feature boundary
+
+Stack on A3b-2 #1056 (`0a38520587c2552b7150907a8f62acc4371b89ec`) in
+`agent/v100-arch-attention-hooks-20261008-091421`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-attention-hooks-20261008-091421`.
+
+Register typed immutable attention callbacks for scalar-tail initialization,
+verifier ABI/policy, prefill wrapper policy, feature contract validation,
+selector XQA exclusions, unsupported-layer fallback and capture accounting.
+Retain legacy methods/fields in a feature compatibility mixin and all existing
+route labels. impl.py drops 1135 to 1021 lines; impl.py, metadata.py and
+backend.py now contain no DFlash/DDTree references. This completes A3b's method
+and metadata extraction plus core feature hooks; A4 grouped-family admission
+and subsequent phases remain outstanding.
+
+After mechanically expanding hook bodies and validating call argument order,
+all 47 calculation hashes still match the original A2 fixture. Seven new
+feature-boundary CPU cases plus nine retained composition/metadata cases pass.
+They exercise the actual forward entrypoint for rejection/fallback/non-causal
+capture, retain route labels/base-call counts and legacy instance patches, and
+check prefill wrapper attributes with both split policies. Initial new tests
+contained an incorrect mock positional index and omitted query_start_loc;
+these test inputs were repaired. Clean evidence: a3c-hooks-tests-final.log.
+
+Existing focused suite: 306 passed. Existing CPU policy suite: 233 passed /
+9 inherited device-inference failures / 1 skipped; all 243 outcomes match
+A3b-2 exactly (a3c_cpu_ab.json and paired JUnit XML). Mypy and the ratchet pass.
+Coupling totals remain model 2325 / platform 3964 / raw env 335; one existing
+env read moves from impl to spec/attention, without total growth. No GPU
+precision, replay or timing evidence is claimed under the user's active
+no-V100 requirement. Root-disk logs are under /home/ymzx/arch-ws/tmp/a3c_*.
+
+## 2026-10-08 — architecture A4a codec-parameterized grouped admission
+
+Stack on A3b-3 #1057 (`71b5fe54aac37d91bc2521b44aab4c4345bfc514`) in
+`agent/v100-arch-grouped-codecs-20261008-092507`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-grouped-codecs-20261008-092507`.
+
+One grouped_fp32_reason(codec, ...) owns FP16/E4M3 request-row and E4M3
+explicit-group admission, returning rejection strings. Declarative contracts
+own native providers/revisions and format-specific measured shape/layout
+limits; compatibility wrappers preserve old signatures and FP16 reason
+precedence. Backend imports use the shared owner. Move scalar/long family
+modules to codec-neutral grouped paths, retaining true old-module aliases and
+original logger names. Native arithmetic/manifests/workspace/launch code stays
+unchanged: 22 normalized function hashes match the parent. Scalar/long remain
+E4M3-only; this PR does not expand their admitted codecs.
+
+Differential CPU evidence: 2940 shape/device/revision combinations plus 98
+policy/layout cases match frozen legacy predicates, including FP16 rejection
+strings. Preserve the old raw partition-env "0" vs typed-zero distinction and
+E4M3 CPU descriptor admission. Declared group boundaries generate additional
+cases. Old-module alias/patch identity, provider dispatch, missing batch
+revision ImportError and sole workspace cleanup are checked. A first import
+run exposed an omitted common cleanup export; restored it. Ruff split a mixed
+compatibility import and removed two unused exports; explicit self-alias
+reexports now survive formatting and the clean admission tests.
+
+Paired family suite: all 86 outcomes match, 71 passed / 15 failed in both
+branches (a4a_family_ab.json, paired XML/logs). Nine scalar tests leave the real
+long native dependency unresolved, yielding None; six existing runner mocks
+lack the device attribute. Do not repeat these as new native regressions.
+Coupling: model 2325 → 2325, platform 3964 → 3964, raw env 335 → 334, from
+consolidating two identical E4M3 reads into one. GPU numerical/replay/timing
+validation remains waived by the user; no precision or speed claim is made.
+Evidence under /home/ymzx/arch-ws/tmp/a4a_*. Next scope: audit the current E4M3
+decode partition/reduce state before implementing A4b; do not assume the
+original p256 observation still describes the current source.
+
+A4a final CPU checks: 13 new shared-family cases pass (3038 differential
+admission comparisons, declaration-generated boundaries, native source/alias
+and workspace/provider checks). The combined admission/implementation/feature
+suite passed 57 cases before two declaration-generated cases were added; the
+final shared-family file includes and passes those two. Retained backend
+routing/mixed-row/compatibility/cleanup/FlashInfer suite: 306 passed. Existing
+policy suite: 233 passed / 9 inherited DeviceConfig inference failures /
+1 skipped, identical across all 243 parent/new outcomes (a4a_cpu_ab.json).
+No new runtime policy failure was introduced.
+
+## 2026-10-08 — architecture A4b shared decode strategy
+
+Stack on A4a #1059 (`58511ea2bc617ef904a0578b6004a58a1479a203`) in
+`agent/v100-arch-decode-strategy-20261008-095916`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-decode-strategy-20261008-095916`.
+
+Audit found the original fixed-p256 observation is stale as a source description:
+current E4M3 plans p64 and has p64/p256 and p512/p896/p1664 wave dispatch;
+wave selection additionally needs the forwarded context bound. E4M3 XQA
+requires FP32 partials by a native static assertion and runtime dtype check.
+Do not force the FP16 partial dtype or claim the old timing describes current
+route hits without a matched artifact.
+
+KernelConfig.sm70_decode_strategy requests shared by default or retained
+legacy. Capture it at impl initialization. New native shared-strategy revision
+1 advertises existing D256/GQA6/B1 p256/p1024 support with the PARTIAL_T
+standard launch/reducer. The Python wrapper propagates the marker once.
+Older artifacts keep legacy planning with explicit counted/logged fallback;
+disabled/unavailable XQA avoids irrelevant warnings. Shared E4M3 uses the
+FP16 shape hint (page784 p256 envelope, otherwise ordinary context planner),
+while keeping uint8 storage, FP32 partials and existing batch/small-query/
+explicit partition guards. Legacy wave and experimental paths are retained.
+Observers no longer mislabel shared p256 as the adaptive p64/p256 route.
+
+This scope intentionally changes partition boundaries/reduction order for new
+qualified artifacts. No CUDA kernel arithmetic is edited; no bitwise or speed
+claim follows from that. Three implementation calculation hashes (init and
+the two policy consumers) are deliberately excluded from the old invariant;
+the other 44 and all descriptor kinds stay protected. E4M3/FP16 hints match
+across six page shapes; mock native interface calls at 4097/32K/128K/256K
+check actual source planning arguments, storage and FP32 workspace. Config
+hash differences and revision/missing/legacy/disabled cases pass. New strategy
+plus retained composition suite: 21 passed. A fixture root-path error was
+corrected; the clean run passes. Host binding syntax check g++ -std=c++17
+-fsyntax-only passed, using the authorized runtime's Torch/Python includes.
+Full pre-commit/mypy on implementation files passed.
+
+GPU numerical error, timing and real route traces are unmeasured under the
+user's explicit no-V100 instruction. The C++ syntax check does not build or
+qualify a linked FA2 wheel. The installed older artifact remains in legacy
+mode; shared-mode CPU tests use the declared native marker and mocked calls.
+Coupling totals stay model 2325 / platform 3964 / raw env 334. The campaign
+continues with A5, avoiding overlap with #1048's newly extended KV tile/storage
+work. Evidence is under /home/ymzx/arch-ws/tmp/a4b_*.
+
+A4b retained backend/mixed-row/compatibility/cleanup/FlashInfer plus feature
+suites: 323 passed, including four generated codec cases for the new policy
+fallback observer. Existing CPU policy suite: 233 passed / 9 inherited device
+inference failures / 1 skipped, identical across all 243 parent/new outcomes
+(a4b_cpu_ab.json). This validates retained old-ABI decisions, not new-ABI GPU
+output or speed. The clean strategy suite has 21 passes and host binding
+syntax exit 0. No CUDA driver repair or GPU execution was attempted.
+
+## 2026-10-09 Phase B delivery 1: common AWQ/FP8 stages
+
+- Integration base: `fc9a518654d8e2dc5dce32507aaece474930ea17`;
+  owned branch `agent/v100-phase-b-mainflow-20261009-021900`;
+  worktree `/home/ymzx/arch-ws/v100-phase-b-mainflow-20261009-021900`.
+- B0 inventory and disposition: `docs/design/architecture/sm70_phase_b.md`
+  and generated `sm70_phase_b_parameters.md`. Four ordinary decomposed flows
+  (AWQ/FP8 × single/routed) now share two stage executors, the existing route
+  plan, a tensor-only weight codec, and a thin lifecycle base. Monolithic
+  experiments and diagnostic reference arithmetic remain explicitly separate.
+- Legacy policy reads move to per-engine `KernelConfig.sm70_moe` initialization.
+  Native single-token capability and plans are initialized once. Explicit typed
+  config wins; legacy OR/compact/indexed/strict precedence is preserved. Only
+  loaded formats affect graph hashes; diagnostics and provenance do not.
+- Reused #1065's layer-owned workspace view and FP8 buffer extraction, including
+  behavioral allocation, rebinding and fullgraph tracing tests. Source banks,
+  resident addresses, overflow allocation and AOT pointer resolution are kept.
+- CPU: 144 passed, four pre-existing failures unchanged from the baseline
+  (NVFP4 test stub lacks GROUPED_MTP5; two obsolete linear workspace test imports;
+  old AWQ hash golden). The new stage/config/workspace checks pass, including
+  48 frozen single-token call/argument/view sequences. The existing route
+  snapshot command reports 168 configurations and zero baseline differences.
+- GPU host `dx.1catai.com:54633`, GPU1 V100-SXM2-32GB, Torch `2.10.0+cu128`,
+  CUDA `12.8`. H=I=256, E4, top-k2; AWQ g32 and FP8 g128; matching source weights,
+  native bytes and flags. Final ordinary/legacy A/B: 105 eager cases bit-exact,
+  60 capture cases each with three changed-input/route replays bit-exact, and
+  identical observed public native-call order. M=0/1/2/3/32/33/65 covers empty,
+  resident/overflow and 128-slot active-W2 boundaries. Four AWQ diagnostic cases
+  additionally preserve output and reference native-call order.
+- Alternating CUDA-event graph timing medians: median relative change +0.102%;
+  largest increase +5.17% (70.354 to 73.989 microseconds, AWQ indexed request M32).
+  A first dense M1 case measures 83.164 to 39.265 microseconds despite identical
+  public call order; retain this unexplained timing outlier, do not claim a 2x
+  speedup. These are small operator timings, not model decode throughput.
+- Native `_C` SHA256:
+  `2f73362d50ec8c92c7c4ebc1323ee7b1fe56b9775513573b5d1a4ec6737ccbe8`;
+  `_moe_C`: `915e5bd5ad46eeb6ad770cf363ce132259abd18241309d8173c70c9cb80e9a14`.
+  Python-only changes; both runs use the same installed extensions, no preload.
+- Reproducer: `benchmarks/kernels/sm70_moe_stage_parity.py --root <ab-directory>`
+  with baseline source under `base/`, candidate package on PYTHONPATH, and
+  `--diagnostics` for reference-observer cases. Raw evidence on 54633:
+  `/home/ymzx/arch-ws/phase-b-20261009/artifacts/`; local CPU/snapshots/artifacts:
+  `/home/ymzx/arch-ws/tmp/phase-b/`. GPU ownership uses
+  `/tmp/1cat-vllm-v100-gpu1.lock`; no service/port is left running.
+- Owner explicitly authorized operator-only acceptance on 2026-10-09. No 35B
+  AWQ/FP8 model speed, TTFT/prefill, MTP or new-model qualification is claimed.
+  Deliveries 2 (remaining MoE) and 3 (linear/native ownership) follow on main;
+  DDTree and repository-wide C/D remain separate.
+
+## 2026-10-09 Phase B delivery 2: shared FP4 stages
+
+- Base `fe63db651e3cc4055bf4349411d372ad801714aa`; owned branch
+  `agent/v100-phase-b-moe-formats-20261009-025824`, worktree
+  `/home/ymzx/arch-ws/v100-phase-b-moe-formats-20261009-025824`.
+  Delivery 1 (#1124) is merged, remote CI passed; superseded #1065/#1066 closed.
+- Seven NVFP4/MXFP4 production sequences now use one FP4 stage executor and a
+  weight codec. Includes direct M1/batch/MTP, raw/prepared scales, fused W13,
+  fused W2/reduce, grouped/MTP and indexed/split-prefill/GLM stages. Existing
+  shape/model/TP gates, arithmetic, split choices and native names are preserved.
+  FP8's legacy decomposed path also reuses its common routed executor. GGUF and
+  skinny share FP32 slot-major reduction while retaining their other numerical
+  and modular/mixed-format contracts.
+- New per-engine NVFP4/MXFP4 policy captures 27 aliases; AWQ QPN M1 joins its
+  existing policy. Workspace owners retain layer-owned addresses, overflow and
+  raw-scale shared workspace/microbatch rejection. The codec uses non-owning
+  layer views and sees tensor rebinding. No native binary or CUDA kernel edit.
+- Focused FP4 safety net: 223 passed (213 frozen-main full-apply native argument,
+  order and view traces plus configuration/workspace/reduction checks). AWQ/FP8,
+  QPN and lifecycle combination: 313 passed before the final native-conflict
+  guard; NVFP4 integration/GLM gates: 82 passed. Broader baseline/head run:
+  348 passed, 35 skipped, two unchanged baseline failures (ModelOpt min-capability
+  test and a GGUF PLE test stub missing `ple_pinned_decode`). The original NVFP4
+  lifecycle stub was updated to own its resolved config and now passes.
+  Final combined suite after all edits: 359 passed, 5 skipped; all applicable
+  pre-commit hooks passed, including typing, policy and layering checks.
+- Existing MoE snapshots: 168 configurations, zero differences from base. New
+  generated bindings/alias table and stage coverage use the codec declarations.
+  Static Python inventory: 95 to 48 legacy read sites, 217 to 179 direct native
+  call sites. Indirect bindings and migrated aliases are not deleted paths.
+  Layering totals: model 2325, platform 3964, raw environment 275 to 274.
+- GPU contract: authorized host `dx.1catai.com:54633`, V100-SXM2-32GB, Torch
+  2.10.0+cu128 / CUDA 12.8, same native `_C` / `_moe_C` digests as delivery 1.
+  Synthetic packed checkpoints, FP16 inputs, FP32 router weights; separate
+  baseline/candidate preparations compare banks, pointer offsets and strides.
+  Qwen NVFP4 E512/H2560/I160/top-k10/g16 (TP4 geometry), MXFP4
+  E256/H4096/I512/top-k6/g32/clamp7 (TP4 geometry), GLM NVFP4
+  E288/H4096/I256/top-k8/g16 (TP8 geometry). These are local operators, not
+  distributed model runs. GPUs 1/2/3 used for the respective FP4 checks; GPU0
+  used for FP8 E4/H256/I256/top-k2/g128. Each uses its GPU lock and task caches.
+- Final numerical evidence: Qwen NVFP4 84 eager + 180 changed-input/route replays;
+  MXFP4 20 + 51; GLM 5 + 12; grouped NVFP4/MTP 6 + 12; FP8 decomposed 7 + 12.
+  All outputs are bit-exact and observed public native stage order agrees.
+  Total: 122 eager cases, 89 captured cases with three changed-data replays each.
+  GLM and grouped cases assert actual requested operator hits, not flag presence.
+- CUDA-event graph time medians (head relative to base): Qwen NVFP4 -0.158%,
+  MXFP4 -0.033%; largest increases +1.55% and +0.625%. The first GLM dense M1
+  retains a large faster-head outlier despite matching public calls (also seen
+  in delivery 1); no speedup claim is based on it. Prefill, TTFT and 35B model
+  throughput remain unmeasured under the owner's operator-only acceptance.
+- Corrected validation failures before promotion: an extracted workspace method
+  accidentally retained both staticmethod/classmethod decorators; pointer-bank
+  checks initially compared allocation-specific addresses/StridedPtr padding;
+  the GLM fixture initially omitted the grouped-expert prerequisite and the
+  recorder missed the GLM symbol prefix; the older FP8 harness needed to
+  initialize codecs for both now-refactored revisions. Final checks exercise
+  the real supported combinations and compare only defined pointer fields.
+- A native audit found unresolved dual Python/C++ policy consumers in AWQ
+  active/grouped W2, MXFP4 grouped/verifier, NVFP4 grouped/prefill, and common
+  permutation paths. Conflicting typed boolean overrides fail clearly until
+  explicit native policy arguments land; no environment mutation is used.
+  Do not claim full typed-native precedence or whole-AOT hash isolation yet.
+  Delivery 3 must finish these native consumers/cache factors and FP8 diagnostic
+  ownership alongside linear/QPN/binding consolidation. Defaults and existing
+  legacy configurations retain their observed behavior in this delivery.
+- Reproducers: `benchmarks/kernels/sm70_fp4_stage_parity.py --root <ab> --family
+  nvfp4|mxfp4`, with `--model glm53` or `--grouped-only` for dedicated cases;
+  `benchmarks/kernels/sm70_moe_stage_parity.py --root <ab> --decomposed` for FP8.
+  Raw GPU evidence: `/home/ymzx/arch-ws/phase-b2-20261009/artifacts/` on 54633.
+  Local CPU/GPU/log evidence: `/home/ymzx/arch-ws/tmp/phase-b2/`.
+  No model service, port, sidecar, preload or background benchmark remains.
+
+## Phase B delivery 3: linear/native consolidation, operator acceptance, 2026-10-09
+
+- Base `fc2f145aebee0d2e7cbfc2b520c383cb64644e57`; PR #1128, owned branch
+  `agent/v100-phase-b-linear-native-20261009-035407`, worktree
+  `/home/ymzx/arch-ws/v100-phase-b-linear-native-20261009-035407`.
+  Deliveries 1 (#1124) and 2 (#1126) are merged with remote CI passing.
+- Prepared linear providers share input/output handling; QPN implementations
+  share one directory and historical module identities remain compatible.
+  Native loading/linear/MoE/auxiliary bindings are split behind `_sm70_ops.py`;
+  all 134 baseline public function/class definitions remain exported.
+  Weight layouts, CUDA arithmetic, defaults and qualification are unchanged.
+- Explicit native policies cross the packaged `_C`/`_moe_C` ABI as one optional
+  string token. Preparation caches parsed values and the calculation key, and
+  binds argument-preserving MoE calls directly. Instrumented public wrappers
+  remain observable. GEMM holders, tuning and imported tables are partitioned
+  by calculation policy; diagnostic differences share calculation caches.
+- Engine-owned scratch registries preserve capacity growth and AOT address
+  reload, including linear pools and NVFP4 raw-scale expansion. Already-matrix
+  linear inputs/outputs avoid redundant views. MoE reads layer buffers directly;
+  there is no tensor-view cache, stale-address shortcut or new buffer lifetime.
+  Disabled AWQ diagnostics skip callbacks; enabled diagnostics keep their stage
+  positions. Stage log-once skips repeated rank queries after an accepted event.
+- CPU evidence: combined regression 583 passed / 7 skipped; lifecycle/buffer/
+  MXFP4/FP8-prefill supplement 79 passed / 5 skipped; owner/explanation recheck
+  36 passed. String transport/prebinding checks: 128 passed locally and 128
+  against the newly built artifact. Host-view changes: 117 passed; provider
+  checks 52 passed / 96 GPU skips. Final binding/flow/owner check: 370 passed /
+  one local old-ABI skip; AWQ stage recheck 59 passed. On the actual artifact,
+  direct native export/reload and instrumentation checks pass all three cases.
+  Counts overlap and must not be added as unique test coverage.
+- Export/reload covers dynamic M=1/32/33/65, full and token policies, and another
+  engine's workspace/policy. The direct native export test uses a CPU dispatcher
+  implementation solely to validate transport/serialization, not CUDA math.
+  Standalone C++ checks cover UTF-8, empty/unset fields, malformed tokens,
+  nested scopes and thread isolation. All source checks pass; remote CI for
+  `9a1aa8b29` is run `37901353942`. The final PR carries the follow-up CI result.
+- Static route comparison: 168 cases, zero differences from the delivery base.
+  Python/C++ declaration order and calculation/diagnostic fields agree. Expanded
+  source audit: 58 files, 135 parameters, 1042 functions; direct reads 74 to 57,
+  direct native call sites 215 to 179. These counts do not mean paths were
+  deleted. Common numerical executors/codecs have no policy reads. Layering
+  totals remain model 2325, platform 3880, environment 271.
+- Normal source-complete CUDA 12.8/SM70 build on 54633 uses Torch 2.10.0+cu128.
+  Fresh import, ABI=55, four-format fake dispatch and `readelf`/`ldd` checks pass
+  without preload or private kernel libraries. Native hashes (unchanged by the
+  final Python-only host changes):
+  `_C` `70cfdcc88eb7b8f2c86db0b78b93c59852f55c7911a8c8371d89bdcb0c624881`,
+  `_moe_C` `4c671824b05e69741be29c39d70c0285062facc4ed9b90d0efba2536a23c7fe3`.
+- Fresh baseline/candidate artifact A/B: 323 outputs bit-exact, matching native
+  order/error contracts (75 eager outputs, 216 changed-input replays, 32 FP8
+  reference intermediates). Final affected-family follow-up: 143 exact outputs
+  for QPN8, AWQ MoE and FP8 MoE. QPN8 traces observe actual native calls on both
+  sides of M=8. Typed routing policies produce distinct generic/fast CUDA hits;
+  six changed-input/ID replays and four alternating-owner calls remain exact.
+  Rechecking FP4 stages on the new ABI gives NVFP4 84 eager / 180 replays and
+  MXFP4 20 / 51, all exact with matching stage order.
+- Performance contract: GPU0 V100-SXM2-32GB, fixed CPU affinity 6, one CPU thread,
+  same environment and frozen GGUF tuning table. N=K=256 linear projections;
+  ordinary MoE E4/top-k2; M=1/2/8/9/32/33/64/65/128. Five timing samples per
+  case; each sample has 100 graph replays and 30 eager calls. Graph device time
+  is separate from synchronized eager host wall time. Final family medians:
+
+  | Family | Graph change | Eager change | Eager delta |
+  |---|---:|---:|---:|
+  | AWQ linear | -0.519% | -12.05% | -8.47 us |
+  | FP8 linear | -0.659% | -9.96% | -8.18 us |
+  | NVFP4 linear | -0.370% | -12.00% | -7.77 us |
+  | MXFP4 linear | -0.472% | -12.82% | -8.66 us |
+  | GGUF affine | -0.311% | -4.78% | -3.27 us |
+  | QPN8 | -0.058% | +3.11% | +4.03 us |
+  | AWQ MoE | +0.098% | -4.17% | -20.52 us |
+  | FP8 MoE | -0.012% | +2.24% | +10.05 us |
+
+  First five rows use the full artifact run; last three use the final affected
+  follow-up. All final graph cases are within +0.63% on the slower side. Eager
+  QPN8/FP8 MoE retain small host overhead (maximum case +6.35%/+4.14%); this is
+  accepted for structural consolidation and engine-policy isolation, not hidden
+  as a speedup or a claim that every eager case is faster. No model performance
+  conclusion is drawn from these synthetic operators.
+- Retained negative evidence: initial `str[]=[]` schema compiled but failed
+  Torch registration. The optional list ABI fixed import but 55 strings added
+  11–23% eager time; compact-list transport still added overhead. The final
+  optional-string token, direct bindings and common host handling replace those
+  variants. Do not repeat their builds. Cold GGUF M9 selected a different tuning
+  descriptor (max difference 0.0001220703125); importing the baseline table fixes
+  the oracle without relaxing equality or changing production defaults.
+  FP4 fixture policy capture also needed both frozen/current Python stages bound
+  to the same per-case native policy; the corrected checks remain bit-exact.
+  Raw baseline AWQ M0 cannot launch; CPU dispatch coverage is retained and raw
+  TM M0 is excluded from GPU timings. GGUF M0 matches its pre-launch error.
+- Raw evidence on 54633: `/home/ymzx/arch-ws/phase-b3-20261009/artifacts/`.
+  `base-operators.*` / `head-operators.*` are the full artifact run;
+  `final-base.*` / `final-head.*` are the affected-family follow-up;
+  `nvfp4-stage.log`, `mxfp4-stage.log`, `typed-policy-isolation.json`,
+  `native-verification.json` and `direct-stage-export.log` cover other gates.
+  Earlier `vector-policy/`, `compact-list-policy/`, `string-policy/`,
+  `direct-*` and untuned GGUF records retain the rejected/intermediate evidence.
+  Local logs/summaries: `/home/ymzx/arch-ws/tmp/phase-b3/`.
+- This closes the three Phase B delivery scopes under the owner's explicit
+  operator-only acceptance. Model throughput, pure 35B decode and TTFT were not
+  run or claimed. DDTree and broad C/D remain subsequent work. GPU leases and
+  task benchmark processes are released; no model service or port was created.
+
+### 2026-10-10 Phase D5b operator handoff
+
+- Base `e2a52d519`, owned branch `agent/v100-phase-d5b-marlin-20261010-003032`.
+  Native ABI 67 binds six Marlin controls; normal `_C`/`_moe_C` context probes
+  coalesce only proven shared TLS. Old-runner/graph event traces use engine owners.
+- 54633: final 47 GPU tests pass, no models loaded; three AB/BA/AB rounds retain
+  deterministic digests and allocation counts. GPU changes within 0.2%; FP16/QPN8
+  native-boundary host cost falls 5–9 us. New Marlin owner boundary costs 20–26 us
+  vs the old standalone path; no model throughput claim.
+- Negative evidence: random split-K=8 legacy rounding variability and independent
+  FP16 tuning winners cannot be used as bitwise reference pairs. Exact checks now
+  use the matched fixed oracle; existing random split-K tests remain.
+- Source, binary hashes, raw samples and detailed limits:
+  `docs/design/architecture/phase_d5b_operators.json`; raw remote artifacts under
+  `/home/ymzx/arch-ws/phase-d5b-20261010/artifacts`.
+- D6 remains pending; full inventory, retained boundaries and FlashQLA's remaining
+  native column-policy binding are being completed there.
+
+### 2026-10-10 Phase D closure
+
+- D5b merged as #1153 (`22c4d22f4`), after native ABI 67 / event-owner CI and
+  47 GPU cases. D6 is based on that merged main; #1152 is retained.
+- D6 closes the full Python/native/FlashQLA parameter inventory: 757 names,
+  zero unassigned names/consumer scopes/dynamic domains. The same scanner counts
+  914 → 355 legacy source positions, including dynamic readers including retained boundaries; these are
+  not per-token execution counts. The always-run ownership hook checks each
+  boundary instead of excluding directories.
+- Final integrated CPU suite: 162 passed. FlashQLA normal-source build: 24 GPU
+  operator/configuration cases on 54633 GPU 1. Three A/B rounds retain exact
+  output/state digests and allocations across nine cases. No model testing.
+- Retain failed/negative evidence: missing-patchelf first build; five pre-existing
+  broad PLE fixture failures reproduced on clean D5b; Marlin legacy split-K=8
+  random-input nondeterminism; native owner host-boundary overhead. Do not rerun
+  model screens to reinterpret these operator contracts.
+- See [the Phase D closure](architecture/sm70_phase_d.md), its machine-readable
+  counts, exact retained boundaries and operator artifacts. DDTree and full E
+  documentation/workflow work remain outside this delivery.

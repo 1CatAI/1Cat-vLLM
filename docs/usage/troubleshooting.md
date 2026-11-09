@@ -174,6 +174,29 @@ If the script runs successfully, you should see the message `sanity check is suc
 
 If the test script hangs or crashes, usually it means the hardware/drivers are broken in some sense. You should try to contact your system administrator or hardware vendor for further assistance. As a common workaround, you can try to tune some NCCL environment variables, such as `export NCCL_P2P_DISABLE=1` to see if it helps. Please check [their documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html) for more information. Please only use these environment variables as a temporary workaround, as they might affect the performance of the system. The best solution is still to fix the hardware/drivers so that the test script can run successfully.
 
+### SM70 TP2 custom all-reduce startup hangs
+
+Some V100 (SM70) deployments with tensor parallelism set to two have reported
+hangs during custom all-reduce warmup or CUDA graph capture
+([#430](https://github.com/1CatAI/1Cat-vLLM/issues/430),
+[#652](https://github.com/1CatAI/1Cat-vLLM/issues/652)). To compare against the
+NCCL fallback, rerun the same launch command with
+`--disable-custom-all-reduce`. For example:
+
+```bash
+vllm serve <model> --tensor-parallel-size 2 --disable-custom-all-reduce
+```
+
+Keep the same model, quantization, context length, and other launch options
+when comparing results. This flag selects an explicit workaround; custom
+all-reduce defaults are unchanged. A fallback may affect performance, so
+measure the workload before keeping it in a deployment configuration.
+
+If the NCCL test above also hangs or the driver reports Xid errors, check the
+GPU, driver, and interconnect health before attributing the failure to a
+particular all-reduce implementation. The reported TP2 symptoms do not justify
+disabling custom all-reduce on every SM70 configuration.
+
 ## Python multiprocessing
 
 ### `RuntimeError` Exception

@@ -12,13 +12,117 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.utils import KVBlockZeroer, _infer_segment_block_strides
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    _infer_segment_block_strides,
+    _resolve_zeroer_kernel_layout,
+)
 
 CELL_ELS = 8  # int32 elements zeroed per (block, segment)
 CELL_BYTES = CELL_ELS * 4
 N_LAYERS = 3  # -> n_segs = 3 interleaved segments
 N_BLOCKS = 4
+
+
+class _BlockFirstAttentionBackend:
+    @staticmethod
+    def get_kv_cache_block_dim(*args, **kwargs) -> int:
+        return 0
+
+
+@pytest.mark.parametrize(
+    ("spec", "group_kernel_bs", "expected"),
+    [
+        (
+            FullAttentionSpec(
+                block_size=784,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+            ),
+            16,
+            (16, 49),
+        ),
+        (
+            MLAAttentionSpec(
+                block_size=784,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+                compress_ratio=8,
+            ),
+            16,
+            (98, 1),
+        ),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_resolve_zeroer_kernel_layout(
+    spec: FullAttentionSpec,
+    group_kernel_bs: int,
+    expected: tuple[int, int],
+) -> None:
+    assert _resolve_zeroer_kernel_layout(spec, group_kernel_bs) == expected
+
+
+@pytest.mark.skip_global_cleanup
+def test_resolve_zeroer_kernel_layout_rejects_nondivisible_size() -> None:
+    spec = FullAttentionSpec(
+        block_size=784,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="must be divisible"):
+        _resolve_zeroer_kernel_layout(spec, 30)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zero_block_ids_compressed_attention_storage_page() -> None:
+    device = torch.device("cuda")
+    num_blocks = 8
+    spec = MLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.bfloat16,
+        compress_ratio=2,
+    )
+    kv = torch.ones(
+        (num_blocks, spec.storage_block_size, 1, spec.head_size),
+        dtype=spec.dtype,
+        device=device,
+    )
+    layer_name = "qsa.compressed"
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=[layer_name],
+        backend=_BlockFirstAttentionBackend,
+    )
+    static_forward_context = {layer_name: SimpleNamespace(kv_cache=kv)}
+
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[2],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context=static_forward_context,
+    )
+
+    target = 1
+    zeroer.zero_block_ids([target])
+    torch.accelerator.synchronize()
+
+    pages = kv.view(num_blocks, -1)
+    zeroed = {index for index in range(num_blocks) if bool((pages[index] == 0).all())}
+    assert zeroed == {target}
 
 
 @pytest.mark.parametrize(
@@ -214,15 +318,13 @@ def test_zeroer_supports_heterogeneous_page_sizes() -> None:
     small = torch.ones((3, 8), dtype=torch.int32, device=device)
     large = torch.ones((3, 20), dtype=torch.int32, device=device)
     zeroer = KVBlockZeroer(device, pin_memory=False)
-    zeroer._id_cap = 8
-    zeroer._ids_pinned = torch.empty(8, dtype=torch.int64)
-    zeroer._ids_gpu = torch.empty(8, dtype=torch.int64, device=device)
     zeroer._meta = (
         torch.tensor(
             [small.data_ptr(), large.data_ptr()], dtype=torch.uint64, device=device
         ),
         torch.tensor([8, 20], dtype=torch.int64, device=device),
         torch.tensor([8, 20], dtype=torch.int64, device=device),
+        torch.tensor([3, 3], dtype=torch.int64, device=device),
         3,
         8,
         2,
@@ -237,3 +339,208 @@ def test_zeroer_supports_heterogeneous_page_sizes() -> None:
     torch.testing.assert_close(large[0], torch.ones_like(large[0]))
     torch.testing.assert_close(large[1], torch.zeros_like(large[1]))
     torch.testing.assert_close(large[2], torch.ones_like(large[2]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_block_ids_are_not_overwritten_while_copy_is_in_flight() -> None:
+    device = torch.device("cuda")
+    storage = torch.ones((4, 4), dtype=torch.int32, device=device)
+    zeroer = KVBlockZeroer(device, pin_memory=True)
+    zeroer._meta = (
+        torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
+        torch.tensor([4], dtype=torch.int64, device=device),
+        torch.tensor([4], dtype=torch.int64, device=device),
+        torch.tensor([4], dtype=torch.int64, device=device),
+        1,
+        4,
+        1,
+    )
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        # Hold both copies behind pending GPU work. The second CPU submission
+        # must not mutate the pinned source used by the first copy.
+        torch.cuda._sleep(10_000_000)
+        zeroer.zero_block_ids([1])
+        zeroer.zero_block_ids([2])
+    stream.synchronize()
+
+    torch.testing.assert_close(storage[0], torch.ones_like(storage[0]))
+    torch.testing.assert_close(storage[1], torch.zeros_like(storage[1]))
+    torch.testing.assert_close(storage[2], torch.zeros_like(storage[2]))
+    torch.testing.assert_close(storage[3], torch.ones_like(storage[3]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_bounded_state_pool_ignores_block_ids_past_its_pages() -> None:
+    """Block IDs carry no group identity. With a bounded recurrent-state pool
+    (fewer pages than the scheduler's ID range), zeroing a history-range ID
+    must not write past the state tensor into the adjacent allocation."""
+    device = torch.device("cuda")
+    page_el, state_pages = 8, 3
+    # One allocation: a 3-page state tensor followed by a guard region that
+    # stands in for whatever the allocator placed next (e.g. a hot cache).
+    backing = torch.ones((state_pages + 4) * page_el, dtype=torch.int32, device=device)
+    state = backing[: state_pages * page_el].view(state_pages, page_el)
+    guard = backing[state_pages * page_el :]
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.int32,),
+        page_size_padded=page_el * 4,
+    )
+    group = SimpleNamespace(
+        kv_cache_spec=spec, kv_cache_group_id=0, layer_names=["state"], backend=None
+    )
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[16],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context={"state": SimpleNamespace(kv_cache=[state])},
+    )
+
+    # 1 is a state block; 3 and 5 belong to other (history) groups.
+    zeroer.zero_block_ids([1, 3, 5])
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(state[0], torch.ones_like(state[0]))
+    torch.testing.assert_close(state[1], torch.zeros_like(state[1]))
+    torch.testing.assert_close(state[2], torch.ones_like(state[2]))
+    torch.testing.assert_close(guard, torch.ones_like(guard))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_host_backed_layers_are_not_zeroed() -> None:
+    device = torch.device("cuda")
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    names = ["attn.device", "attn.host"]
+    caches = {
+        name: torch.ones(N_BLOCKS, 16, 1, 8, dtype=torch.float16, device=device)
+        for name in names
+    }
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=names,
+        backend=_BlockFirstAttentionBackend,
+    )
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[spec.block_size],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context={
+            name: SimpleNamespace(kv_cache=cache) for name, cache in caches.items()
+        },
+        host_backed_layers={"attn.host"},
+    )
+    zeroer.zero_block_ids([1])
+    torch.accelerator.synchronize()
+
+    zeroed = caches["attn.device"].flatten(1).eq(0).all(1).tolist()
+    assert zeroed == [False, True, False, False]
+    assert bool(caches["attn.host"].eq(1).all())
+
+
+# Small fp16 layout, and the deployed Qwen3.8 DCP2 main KV: 816 local slots,
+# one 256-wide E4M3 head, FlashAttention kernel blocks of 16 (ratio 51).
+_SMALL = (
+    FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=4, dtype=torch.float16),
+    2,
+)
+_DEPLOYED = (
+    FullAttentionSpec(
+        block_size=816, num_kv_heads=1, head_size=256, dtype=torch.float8_e4m3fn
+    ),
+    16,
+)
+
+
+def _packed_members(device: torch.device, num_blocks: int = 4, layout=_SMALL):
+    """Two attention layers packed into one physical page, as attn_utils builds
+    them for DCP-sharded pages: member j is a view offset by j kernel blocks
+    with a block stride that spans both members."""
+    spec, kernel_bs = layout
+    member_count = 2
+    ratio = spec.block_size // kernel_bs
+    block_bytes = spec.page_size_bytes * member_count
+    raw = torch.ones(num_blocks * block_bytes, dtype=torch.int8, device=device)
+    shape = (num_blocks * ratio, 2, kernel_bs, spec.num_kv_heads, spec.head_size)
+    strides = list(torch.empty(shape, device="meta").stride())
+    kernel_block_numel = strides[0]
+    strides[0] = kernel_block_numel * member_count
+    views = {
+        f"layer{j}": torch.as_strided(
+            raw.view(spec.dtype),
+            size=shape,
+            stride=tuple(strides),
+            storage_offset=kernel_block_numel * j,
+        )
+        for j in range(member_count)
+    }
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=list(views),
+        backend=_BlockFirstAttentionBackend,
+    )
+    context = {name: SimpleNamespace(kv_cache=kv) for name, kv in views.items()}
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[kernel_bs],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context=context,
+    )
+    return raw, block_bytes, zeroer
+
+
+@pytest.mark.parametrize("layout", (_SMALL, _DEPLOYED), ids=("small", "deployed"))
+@pytest.mark.skip_global_cleanup
+def test_packed_member_segments_stay_inside_their_page(layout) -> None:
+    """Every (block, segment) zero range must lie inside that block's physical
+    page and the segments must cover it. Zeroing member 1 from its own start
+    used to run one kernel block into the next page (DCP2 packed main KV)."""
+    num_blocks = 3
+    raw, block_bytes, zeroer = _packed_members(torch.device("cpu"), num_blocks, layout)
+    assert zeroer._meta is not None
+    seg_addrs, seg_strides, seg_pages = (t.tolist() for t in zeroer._meta[:3])
+    base = raw.data_ptr()
+    for block in range(num_blocks):
+        page = (base + block * block_bytes, base + (block + 1) * block_bytes)
+        spans = []
+        for addr, stride, size in zip(seg_addrs, seg_strides, seg_pages):
+            start = addr + block * stride * 4
+            end = start + size * 4
+            assert page[0] <= start and end <= page[1], (block, start, end, page)
+            spans.append((start, end))
+        # The segments cover the page exactly (byte intervals, merged).
+        spans.sort()
+        merged = [list(spans[0])]
+        for start, end in spans[1:]:
+            if start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        assert merged == [list(page)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zero_block_ids_packed_members_leave_next_block_alone() -> None:
+    num_blocks = 4
+    raw, block_bytes, zeroer = _packed_members(torch.device("cuda"), num_blocks)
+    zeroer.zero_block_ids([1])
+    torch.accelerator.synchronize()
+    pages = raw.view(num_blocks, block_bytes)
+    assert bool((pages[1] == 0).all())
+    for block in (0, 2, 3):
+        assert bool((pages[block] == 1).all()), block

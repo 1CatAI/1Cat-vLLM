@@ -135,7 +135,7 @@ class TorchCompileWithNoGuardsWrapper:
         _apply_constrain_to_fx_strides_patch()
 
         aot_context = nullcontext()
-        if envs.VLLM_USE_AOT_COMPILE:
+        if self.vllm_config.compilation_config.runtime.aot_compile:
             if hasattr(torch._dynamo.config, "enable_aot_compile"):
                 aot_context = torch._dynamo.config.patch(enable_aot_compile=True)
             else:
@@ -154,7 +154,9 @@ class TorchCompileWithNoGuardsWrapper:
             )
 
         if envs.VLLM_USE_BYTECODE_HOOK and mode != CompilationMode.STOCK_TORCH_COMPILE:
-            torch._dynamo.convert_frame.register_bytecode_hook(self.bytecode_hook)
+            self._bytecode_hook_handle = (
+                torch._dynamo.convert_frame.register_bytecode_hook(self.bytecode_hook)
+            )
             self._compiled_bytecode: CodeType | None = None
 
     def aot_compile(self, *args: Any, **kwargs: Any) -> Any:
@@ -260,6 +262,13 @@ class TorchCompileWithNoGuardsWrapper:
                 f"(please search for the usage of the function `update`):\n{src}"
             )
             raise RuntimeError(msg)
+
+    def cleanup(self) -> None:
+        """Remove the Dynamo bytecode hook registered by this instance."""
+        handle = getattr(self, "_bytecode_hook_handle", None)
+        if handle is not None:
+            handle.remove()
+            self._bytecode_hook_handle = None
 
     @contextmanager
     def _dispatch_to_compiled_code(self) -> Generator[None, None, None]:

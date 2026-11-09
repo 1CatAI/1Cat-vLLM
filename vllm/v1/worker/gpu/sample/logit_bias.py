@@ -88,7 +88,8 @@ class LogitBiasState:
 
         # Min tokens.
         min_tokens = sampling_params.min_tokens
-        min_len = prompt_len + min_tokens
+        # Sampling uses the zero-based position of the last input token.
+        min_len = prompt_len + min_tokens - 1
         self.min_lens.np[req_idx] = min_len
         stop_token_ids = sampling_params.all_stop_token_ids
         if min_tokens > 0 and stop_token_ids:
@@ -189,6 +190,8 @@ def _bias_kernel(
             logits_ptr + token_idx * logits_stride + allowed_token_ids, mask=mask
         )
 
+        tl.debug_barrier()  # save must read original logits before the -inf overwrite
+
         # Set logits to -inf for all tokens.
         for i in range(0, vocab_size, LOGITS_BLOCK_SIZE):
             offset = i + tl.arange(0, LOGITS_BLOCK_SIZE)
@@ -197,6 +200,8 @@ def _bias_kernel(
                 -float("inf"),
                 mask=offset < vocab_size,
             )
+
+        tl.debug_barrier()  # -inf overwrite must finish before restoring saved logits
 
         # Restore logits for allowed token IDs.
         tl.store(

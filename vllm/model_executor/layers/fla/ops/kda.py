@@ -19,6 +19,7 @@ from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .cumsum import chunk_local_cumsum
 from .fused_recurrent import fused_recurrent_gated_delta_rule_fwd_kernel
+from .gdn_chunk_kernels import resolve_kda_kernels
 from .index import prepare_chunk_indices
 from .l2norm import l2norm_fwd
 from .op import exp2, log
@@ -27,6 +28,25 @@ from .utils import FLA_CHUNK_SIZE, is_amd
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+
+
+_recompute_w_u_configs = [
+    triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
+
+_chunk_gla_o_configs = [
+    triton.Config(
+        {"BK": BK, "BV": BV},
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for BK in [32, 64]
+    for BV in [64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
 
 
 def fused_recurrent_kda_fwd(
@@ -71,9 +91,12 @@ def fused_recurrent_kda_fwd(
     if out is None:
         o = torch.empty_like(k)
     else:
-        # Caller-provided output buffer; must be layout-compatible with the
-        # tensor the kernel indexes (contiguous, same shape/dtype as k).
-        assert out.shape == k.shape and out.dtype == k.dtype
+        # The recurrent math accumulates in fp32. SM70 GLM keeps that precision
+        # through its following RMSNorm to avoid an otherwise lossy fp16
+        # round-trip (and possible overflow) between the two kernels.
+        assert out.shape == k.shape
+        assert out.dtype in (k.dtype, torch.float32)
+        assert out.device == k.device
         assert out.is_contiguous()
         o = out
     if inplace_final_state:
@@ -446,6 +469,7 @@ def rms_norm_gated(
     prenorm: bool = False,
     residual_in_fp32: bool = False,
     eps: float = 1e-6,
+    out_dtype: torch.dtype | None = None,
 ):
     x_shape_og = x.shape
     # reshape input data into 2D tensor
@@ -467,6 +491,7 @@ def rms_norm_gated(
         activation=activation,
         eps=eps,
         residual=residual,
+        out_dtype=out_dtype,
         residual_dtype=residual_dtype,
         is_rms_norm=True,
     )
@@ -509,13 +534,16 @@ class FusedRMSNormGated(CustomOp):
         residual: torch.Tensor | None = None,
         prenorm: bool = False,
         residual_in_fp32: bool = False,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """Decomposed PyTorch ops for torch.compile/inductor fusion."""
         # TODO(https://github.com/vllm-project/vllm/issues/36175): implement
         # native residual/prenorm path and unify with RMSNormGated.
         # For now, fall back to the triton kernel.
         if residual is not None or prenorm:
-            return self.forward_cuda(x, g, residual, prenorm, residual_in_fp32)
+            return self.forward_cuda(
+                x, g, residual, prenorm, residual_in_fp32, out_dtype
+            )
         x_float = x.float()
         variance = x_float.pow(2).mean(dim=-1, keepdim=True)
         x_normed = x_float * torch.rsqrt(variance + self.eps)
@@ -526,7 +554,7 @@ class FusedRMSNormGated(CustomOp):
             out = x_normed * g_float * torch.sigmoid(g_float)
         else:  # sigmoid
             out = x_normed * torch.sigmoid(g_float)
-        return out.to(x.dtype)
+        return out.to(out_dtype or x.dtype)
 
     def forward_cuda(
         self,
@@ -535,6 +563,7 @@ class FusedRMSNormGated(CustomOp):
         residual: torch.Tensor | None = None,
         prenorm: bool = False,
         residual_in_fp32: bool = False,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         return rms_norm_gated(
             x,
@@ -546,6 +575,7 @@ class FusedRMSNormGated(CustomOp):
             eps=self.eps,
             prenorm=prenorm,
             residual_in_fp32=residual_in_fp32,
+            out_dtype=out_dtype,
         )
 
 
@@ -848,11 +878,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_recompute_w_u_configs,
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -1008,7 +1034,10 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
+    kernel=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if kernel is None:
+        kernel = resolve_kda_kernels().recompute
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
     BK = 64
@@ -1021,7 +1050,7 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
-    recompute_w_u_fwd_kernel[(NT, B * H)](
+    kernel[(NT, B * H)](
         q=q,
         k=k,
         qg=None,
@@ -1048,13 +1077,7 @@ def recompute_w_u_fwd(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_chunk_gla_o_configs,
     key=["BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -1176,7 +1199,10 @@ def chunk_gla_fwd_o_gk(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
+    kernel=None,
 ):
+    if kernel is None:
+        kernel = resolve_kda_kernels().output
     B, T, H, K, V = *q.shape, v.shape[-1]
     BT = chunk_size
 
@@ -1187,7 +1213,7 @@ def chunk_gla_fwd_o_gk(
     def grid(meta):
         return (cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_gla_fwd_kernel_o[grid](
+    kernel[grid](
         q=q,
         v=v,
         g=g,
@@ -1369,6 +1395,7 @@ def _chunk_kda_fwd_with_cumulative_g(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
+    kernels=None,
 ):
     # `g` must already be chunk-local cumulatively-summed AND scaled by
     # RCP_LN2 (so the downstream exp2-based kernels reproduce exp(g)).
@@ -1376,6 +1403,7 @@ def _chunk_kda_fwd_with_cumulative_g(
     # calling this helper directly unless that invariant is upheld.
     # the intra Aqk is kept in fp32
     # the computation has very marginal effect on the entire throughput
+    kernels = resolve_kda_kernels(kernels)
     A, Aqk = chunk_kda_scaled_dot_kkt_fwd(
         q=q,
         k=k,
@@ -1396,6 +1424,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         gk=g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        kernel=kernels.recompute,
     )
     del A
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
@@ -1408,6 +1437,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
+        kernel=kernels.delta_h,
     )
     del w, u, kg
     o = chunk_gla_fwd_o_gk(
@@ -1421,6 +1451,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        kernel=kernels.output,
     )
     del Aqk, v_new, h
     return o, final_state
@@ -1436,6 +1467,7 @@ def chunk_kda_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
+    kernels=None,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1464,6 +1496,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        kernels=kernels,
     )
 
 
@@ -1481,6 +1514,7 @@ def chunk_kda_with_fused_gate_fwd(
     cu_seqlens: torch.Tensor | None = None,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
+    kernels=None,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1510,6 +1544,7 @@ def chunk_kda_with_fused_gate_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        kernels=kernels,
     )
 
 
@@ -1524,6 +1559,7 @@ def chunk_kda(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    kernels=None,
     **kwargs,
 ):
     if scale is None:
@@ -1543,6 +1579,7 @@ def chunk_kda(
         initial_state=initial_state.contiguous(),
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        kernels=kernels,
     )
     return o, final_state
 
@@ -1562,6 +1599,7 @@ def chunk_kda_with_fused_gate(
     cu_seqlens: torch.Tensor | None = None,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
+    kernels=None,
     **kwargs,
 ):
     """Run chunk KDA from raw gate projection using fused gate+cumsum."""
@@ -1586,6 +1624,7 @@ def chunk_kda_with_fused_gate(
         cu_seqlens=cu_seqlens,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
+        kernels=kernels,
     )
     return o, final_state
 

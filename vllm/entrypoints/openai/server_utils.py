@@ -27,7 +27,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     GenerationError,
 )
 from vllm.entrypoints.utils import create_error_response, sanitize_message
-from vllm.exceptions import VLLMValidationError
+from vllm.exceptions import VLLMNotFoundError, VLLMValidationError
 from vllm.logger import init_logger
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -386,6 +386,21 @@ async def exception_handler(req: Request, exc: Exception):
 
     err = create_error_response(exc)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    app.exception_handler(HTTPException)(http_exception_handler)
+    app.exception_handler(RequestValidationError)(validation_exception_handler)
+    app.exception_handler(EngineGenerateError)(engine_error_handler)
+    app.exception_handler(EngineDeadError)(engine_error_handler)
+    app.exception_handler(GenerationError)(generation_error_handler)
+    # Starlette runs a handler registered for Exception in its
+    # ServerErrorMiddleware, which re-raises after responding: uvicorn then logs
+    # a full traceback for every rejected request. Client errors get their own
+    # registration so they are answered without being re-raised.
+    app.exception_handler(VLLMValidationError)(exception_handler)
+    app.exception_handler(VLLMNotFoundError)(exception_handler)
+    app.exception_handler(Exception)(exception_handler)
 
 
 async def http_exception_handler(req: Request, exc: HTTPException):

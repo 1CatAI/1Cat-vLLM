@@ -374,6 +374,10 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
 
+    def demote(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """Demote in the CPU tier; secondary tiers keep their own policy."""
+        self.primary_tier.demote(keys, req_context)
+
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Mark blocks as done loading from primary tier to GPU.

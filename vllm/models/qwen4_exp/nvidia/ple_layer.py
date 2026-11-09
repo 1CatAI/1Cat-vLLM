@@ -2,22 +2,52 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp position-learning enhancement layers."""
 
+import ctypes
 import math
+import os
+import resource
+import time
+import weakref
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+import vllm.envs as envs
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    VllmConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
+from vllm.config.execution_policy import layer_policy, ple_policy
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.ple.disk_rows import (
+    MappedRowGatherKernel,
+    prepare_mapped_row_gather,
+)
+from vllm.model_executor.kernels.ple.ngram import (
+    SM70_PLE_NGRAM,
+    sm70_ple_ngram_ids,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
+)
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
+    ple_offload_enabled,
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -34,6 +64,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
+    get_masked_input_and_mask,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import (
@@ -58,15 +89,112 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import copy_ple_embedding_shard_
+from ..common.ple import (
+    PLE_SHARD_PREFIX,
+    PLEDiskSegment,
+    PLEPlacement,
+    PLERemotePlacement,
+    auto_ple_host_budget_bytes,
+    available_host_bytes,
+    cap_host_budget_bytes,
+    copy_ple_embedding_shard_,
+    copy_ple_embedding_shard_tiers_,
+    kv_cache_bytes_for_max_model_len,
+    plan_ple_disk_segments,
+    plan_ple_placement,
+    ple_cascade_configured,
+    ple_disk_mask,
+    ple_host_budget_bytes,
+    ple_host_reserve_bytes,
+    ple_vram_reserve_bytes,
+    total_host_bytes,
+)
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
+_MADV_RANDOM = 1
+_MADV_DONTNEED = 4
+# Offload-worker batches up to this size (four MTP4 verify requests = 20) hash
+# n-grams in plain Python instead of many small Torch CPU ops.
+_CPU_SMALL_NGRAM_TOKENS = 64
 
 logger = init_logger(__name__)
+_PLE_DIAGNOSTIC_BUFFERS: dict[str, torch.Tensor] = {}
+
+
+def _ple_diagnostic_snapshot(tensor: torch.Tensor, label: str) -> torch.Tensor:
+    # Return an owned clone: an unannotated custom-op output cannot alias its
+    # input. The retained copy is diagnostic-only, outside speed comparisons.
+    output = tensor.clone()
+    if tensor.shape[0] == 5:
+        if label not in _PLE_DIAGNOSTIC_BUFFERS:
+            _PLE_DIAGNOSTIC_BUFFERS[label] = torch.empty_like(output)
+        _PLE_DIAGNOSTIC_BUFFERS[label].copy_(output)
+    return output
+
+
+direct_register_custom_op(
+    "qwen4_exp_ple_diagnostic_snapshot",
+    _ple_diagnostic_snapshot,
+    fake_impl=lambda tensor, label: torch.empty_like(tensor),
+)
+
+
+def snapshot_ple_diagnostic(
+    tensor: torch.Tensor, label: str, enabled: bool
+) -> torch.Tensor:
+    if enabled and tensor.is_cuda:
+        return torch.ops.vllm.qwen4_exp_ple_diagnostic_snapshot(tensor, label)
+    return tensor
+
+
+def _advise_random_file_access(tensor: torch.Tensor) -> str:
+    """Require a lazy file mapping and disable destructive mmap read-around."""
+    if tensor.device.type != "cpu" or tensor.is_meta:
+        raise RuntimeError("PLE disk shards must be real CPU tensors")
+    address = tensor.data_ptr()
+    mapped_path = None
+    with open("/proc/self/maps") as mappings:
+        for line in mappings:
+            fields = line.rstrip().split(maxsplit=5)
+            start_text, end_text = fields[0].split("-", maxsplit=1)
+            if int(start_text, 16) <= address < int(end_text, 16):
+                # Shared anonymous memory shows up as "/dev/zero (deleted)".
+                if (
+                    len(fields) == 6
+                    and fields[5].startswith("/")
+                    and not fields[5].startswith("/dev/zero")
+                ):
+                    mapped_path = fields[5]
+                break
+    if mapped_path is None:
+        raise RuntimeError(
+            "VLLM_PLE_DISK_OFFLOAD requires lazy file-backed safetensor "
+            "weights; eager or copied tensors are unsupported"
+        )
+
+    _madvise_mapped_tensor(tensor, _MADV_RANDOM)
+    return mapped_path
+
+
+def _madvise_mapped_tensor(tensor: torch.Tensor, advice: int) -> None:
+    """Apply one madvise value to the pages a mapped CPU tensor covers."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    address = tensor.data_ptr()
+    byte_count = tensor.numel() * tensor.element_size()
+    aligned_address = address - address % page_size
+    aligned_end = (address + byte_count + page_size - 1) // page_size * page_size
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.madvise(
+        ctypes.c_void_p(aligned_address),
+        ctypes.c_size_t(aligned_end - aligned_address),
+        advice,
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 @triton.jit
@@ -120,6 +248,158 @@ def _gather_ple_fp8_from_pinned_kernel(
     scale = tl.load(scale_ptr).to(tl.float32)
     values = _e4m3fn_byte_to_float(raw) * scale
     tl.store(output_ptr + row_idx * embedding_dim + offsets, values, mask=mask)
+
+
+@triton.jit
+def _dequantize_ple_fp8_bytes_kernel(
+    input_ptr,
+    scale_ptr,
+    output_ptr,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    """Dequantize raw E4M3FN bytes without exposing FP8 to SM70 Inductor."""
+
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < numel
+    raw = tl.load(input_ptr + offsets, mask=mask, other=0)
+    scale = tl.load(scale_ptr).to(tl.float32)
+    values = _e4m3fn_byte_to_float(raw) * scale
+    tl.store(output_ptr + offsets, values, mask=mask)
+
+
+@triton.jit
+def _qwen38_ple_m1_ngram_ids_kernel(
+    input_ids_ptr,
+    ngram_context_ptr,
+    multipliers_ptr,
+    sizes_ptr,
+    offsets_ptr,
+    output_ptr,
+    EOS_TOKEN_ID: tl.constexpr,
+):
+    """Compute the exact Qwen3.8 M=1 ngram-2/3 IDs in one launch."""
+
+    head = tl.arange(0, 16)
+    current = tl.load(input_ids_ptr).to(tl.int64)
+    older = tl.load(ngram_context_ptr).to(tl.int64)
+    previous = tl.load(ngram_context_ptr + 1).to(tl.int64)
+
+    # ``compute_ngram_ids`` resets history at EOS. The immediately previous
+    # token remains the ngram-2 source (and is itself EOS), while ngram-3 must
+    # not reach across that boundary.
+    older = tl.where(previous == EOS_TOKEN_ID, EOS_TOKEN_ID, older)
+    multiplier0 = tl.load(multipliers_ptr).to(tl.int64)
+    multiplier1 = tl.load(multipliers_ptr + 1).to(tl.int64)
+    multiplier2 = tl.load(multipliers_ptr + 2).to(tl.int64)
+    mixed2 = (current * multiplier0) ^ (previous * multiplier1)
+    mixed3 = mixed2 ^ (older * multiplier2)
+    mixed = tl.where(head < 8, mixed2, mixed3)
+
+    size = tl.load(sizes_ptr + head).to(tl.int64)
+    offset = tl.load(offsets_ptr + head).to(tl.int64)
+    remainder = mixed % size
+    # PTX signed remainder follows the dividend, whereas torch.remainder is
+    # always non-negative for these positive vocabulary sizes.
+    remainder = tl.where(remainder < 0, remainder + size, remainder)
+    tl.store(output_ptr + head, remainder + offset)
+
+
+@triton.jit
+def _qwen38_ple_m1_short_conv_kernel(
+    x_ptr,
+    state_ptr,
+    weight_ptr,
+    output_ptr,
+    state_index_ptr,
+    has_initial_ptr,
+    STATE_STRIDE_0: tl.constexpr,
+    STATE_STRIDE_1: tl.constexpr,
+    STATE_STRIDE_2: tl.constexpr,
+    HAS_INITIAL: tl.constexpr,
+    NULL_STATE_ID: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Fuse exact Qwen3.8 M=1 dilated conv and state-cache update."""
+
+    hidden = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    hidden_mask = hidden < HIDDEN_SIZE
+    state_index = tl.load(state_index_ptr).to(tl.int64)
+    valid = state_index != NULL_STATE_ID
+    safe_state_index = tl.where(valid, state_index, 0)
+    use_initial = valid
+    if HAS_INITIAL:
+        use_initial &= tl.load(has_initial_ptr).to(tl.int1)
+    state_base = safe_state_index * STATE_STRIDE_0 + hidden * STATE_STRIDE_1
+    state_mask = hidden_mask & use_initial
+
+    s0 = tl.load(state_ptr + state_base, mask=state_mask, other=0.0).to(tl.float32)
+    s1 = tl.load(
+        state_ptr + state_base + STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s2 = tl.load(
+        state_ptr + state_base + 2 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s3 = tl.load(
+        state_ptr + state_base + 3 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s4 = tl.load(
+        state_ptr + state_base + 4 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s5 = tl.load(
+        state_ptr + state_base + 5 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s6 = tl.load(
+        state_ptr + state_base + 6 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s7 = tl.load(
+        state_ptr + state_base + 7 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s8 = tl.load(
+        state_ptr + state_base + 8 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x = tl.load(x_ptr + hidden, mask=hidden_mask, other=0.0).to(tl.float32)
+    w0 = tl.load(weight_ptr + hidden * 4).to(tl.float32)
+    w1 = tl.load(weight_ptr + hidden * 4 + 1).to(tl.float32)
+    w2 = tl.load(weight_ptr + hidden * 4 + 2).to(tl.float32)
+    w3 = tl.load(weight_ptr + hidden * 4 + 3).to(tl.float32)
+    conv = s0 * w0
+    conv += s3 * w1
+    conv += s6 * w2
+    conv += x * w3
+    # Preserve the depthwise-conv FP16 output boundary. The caller deliberately
+    # retains native F.silu because its SM70 rounding differs slightly from
+    # Triton's sigmoid approximation.
+    conv = conv.to(tl.float16)
+    tl.store(output_ptr + hidden, tl.where(valid, conv, 0.0), mask=hidden_mask)
+
+    update_mask = hidden_mask & valid
+    tl.store(state_ptr + state_base, s1, mask=update_mask)
+    tl.store(state_ptr + state_base + STATE_STRIDE_2, s2, mask=update_mask)
+    tl.store(state_ptr + state_base + 2 * STATE_STRIDE_2, s3, mask=update_mask)
+    tl.store(state_ptr + state_base + 3 * STATE_STRIDE_2, s4, mask=update_mask)
+    tl.store(state_ptr + state_base + 4 * STATE_STRIDE_2, s5, mask=update_mask)
+    tl.store(state_ptr + state_base + 5 * STATE_STRIDE_2, s6, mask=update_mask)
+    tl.store(state_ptr + state_base + 6 * STATE_STRIDE_2, s7, mask=update_mask)
+    tl.store(state_ptr + state_base + 7 * STATE_STRIDE_2, s8, mask=update_mask)
+    tl.store(state_ptr + state_base + 8 * STATE_STRIDE_2, x, mask=update_mask)
 
 
 def _splitmix64(value: int) -> int:
@@ -268,9 +548,31 @@ def _get_ple_embedding_quant_method(
     *,
     force_fp8_storage: bool = False,
 ) -> QuantizeMethodBase | None:
-    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+    """Select an embedding implementation that preserves checkpoint storage."""
+
+    from vllm.model_executor.layers.quantization.gguf import (
+        GGUFConfig,
+    )
+
+    if isinstance(quant_config, GGUFConfig):
+        from .gguf_embedding import Qwen4ExpPLEGGUFEmbeddingMethod
+
+        return Qwen4ExpPLEGGUFEmbeddingMethod(quant_config)
 
     if force_fp8_storage:
+        return Qwen4ExpPLEFp8EmbeddingMethod()
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        # ModelOpt mixed-precision checkpoints (e.g. nvidia's Flash-Next NVFP4)
+        # declare the FP8 PLE table per layer in quantized_layers instead of
+        # setting ple_embedding_dtype in the model config.
+        if quant_config.is_layer_excluded(prefix):
+            return None
+        if quant_config._resolve_quant_algo(prefix) != "FP8":
+            return None
         return Qwen4ExpPLEFp8EmbeddingMethod()
     if not isinstance(quant_config, Fp8Config):
         return None
@@ -292,20 +594,87 @@ def _get_ple_embedding_quant_method(
 
 
 def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
+    # The dedicated CPU-offload process owns and executes the embedding table
+    # directly. The UVA pinned-host implementation is only for GPU execution.
+    if is_offload_process():
+        return False
+    if ple_cascade_configured():
+        return True
     explicit = getattr(config, "ple_offload_embedding", None)
     if explicit is not None:
         return bool(explicit)
-    capability = current_platform.get_device_capability()
-    return capability is not None and capability.to_int() == 70
+    if not current_platform.is_cuda():
+        return False
+    # Decide on THIS worker's device: on a heterogeneous pipeline the PLE
+    # stage is not necessarily device 0 of the visible list. Every
+    # pre-Ampere card takes the split placement, not only exact Volta: the
+    # generic path dequantizes the whole FP8 table to fp16 inside the
+    # compiled graph (47.7 GiB for Qwen3.8 Flash Next), which none of them
+    # can hold.
+    capability = current_platform.get_device_capability(
+        device_id=torch.accelerator.current_device_index()
+    )
+    return capability is not None and capability.major < 8
+
+
+# cudaHostRegisterPortable | cudaHostRegisterMapped. On a UVA system this is
+# what cudaHostRegisterDefault already means; it is spelled out because the
+# UVA gather depends on the mapping (get_cuda_view_from_cpu_tensor asks
+# cudaHostGetDevicePointer for the device address of registered memory).
+_CUDA_HOST_REGISTER_PORTABLE_MAPPED = 0x01 | 0x02
+
+
+def _unregister_host_ptr(ptr: int) -> None:
+    # Runs only when the table is garbage collected; process exit releases
+    # the registration together with the CUDA context.
+    torch.cuda.cudart().cudaHostUnregister(ptr)
+
+
+def _pin_host_tensor_exact(tensor: torch.Tensor) -> None:
+    """Page-lock a CPU tensor at exactly its own size.
+
+    ``pin_memory=True`` goes through torch's CachingHostAllocator, which
+    rounds every request up to the next power of two before allocating
+    (torch 2.10 ATen/core/CachingHostAllocator.h:251,278), so an 11.92 GiB
+    per-rank PLE share pinned 16 GiB. Registering an ordinary allocation pins
+    ``nbytes`` and nothing more -- the same bypass vLLM's
+    simple_kv_offload/cuda_mem_ops.py:pin_tensor uses for its CPU KV cache.
+    """
+    ptr = tensor.data_ptr()
+    err = torch.cuda.cudart().cudaHostRegister(
+        ptr, tensor.nbytes, _CUDA_HOST_REGISTER_PORTABLE_MAPPED
+    )
+    if err.value != 0:
+        raise RuntimeError(
+            f"cudaHostRegister of the {format_gib(tensor.nbytes)} PLE host "
+            f"share failed: {err}"
+        )
+    if not tensor.is_pinned():
+        # get_cuda_view_from_cpu_tensor would otherwise take its unpinned
+        # branch and cudaHostAlloc a second full copy of the table.
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+        raise RuntimeError("PLE host share is not pinned after cudaHostRegister")
+    finalizer = weakref.finalize(tensor, _unregister_host_ptr, ptr)
+    # ``atexit`` is a documented writable property; typeshed's __slots__
+    # declaration does not list it.
+    finalizer.atexit = False  # type: ignore[misc]
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """TP-sharded FP8 PLE table backed directly by pinned host memory.
+    """TP-sharded FP8 PLE table split between device memory and pinned host.
 
-    The base embedding is constructed on the meta device, so the full shard is
-    never allocated on a GPU. Checkpoint shards copy directly into the pinned
-    CPU parameter. A stable UVA view is created after loading and used only for
-    embedding gathers.
+    The base embedding is constructed on the meta device, so nothing is
+    allocated up front. The real tables are built lazily on the first
+    checkpoint shard (or when the accelerator view is prepared), when every
+    other weight of this pipeline stage is already placed and the automatic
+    budget can measure the real headroom: rows that fit beside the weights,
+    the KV cache of the requested context and a reserve stay in device
+    memory, only the remainder goes to pinned host memory and is gathered
+    through a stable UVA view. ``VLLM_QWEN4EXP_PLE_HOST_GIB`` fixes the host
+    share instead. With the overflow cascade the rows beyond both tiers stay
+    unallocated here and arrive from the PLE offload worker. Gathers always
+    read both halves (an unused half reads row 0), because branching on the
+    ids would need a device-to-host sync on every decode step.
     """
 
     def __init__(
@@ -337,19 +706,34 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         meta_weight = self._parameters.get("weight")
         if not isinstance(meta_weight, torch.Tensor):
             raise RuntimeError("Qwen4Exp PLE meta weight was not initialized")
-        host_weight = ModelWeightParameter(
+        self._meta_weight_shape = tuple(meta_weight.shape)
+        # The gather op resolves this module by name at run time (see
+        # qwen4_exp_ple_pinned_gather): a raw table pointer must never enter a
+        # compiled graph, because a reloaded AOT artifact would carry the
+        # address of a buffer that no longer exists in the new process.
+        self.layer_name = prefix
+        static_forward_context = (
+            get_current_vllm_config().compilation_config.static_forward_context
+        )
+        if prefix in static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        static_forward_context[prefix] = self
+        self._meta_weight_dtype = meta_weight.dtype
+        # Placeholder parameter: keeps the loader contract (a CPU-resident
+        # ``weight`` that must not be moved to the device) without holding
+        # rows; the tables live in ple_device_table / ple_host_storage.
+        placeholder = ModelWeightParameter(
             data=torch.empty(
-                tuple(meta_weight.shape),
+                (0, self.embedding_dim),
                 dtype=meta_weight.dtype,
                 device="cpu",
-                pin_memory=True,
             ),
             input_dim=1,
             output_dim=0,
             weight_loader=self.weight_loader,
         )
-        host_weight._vllm_keep_on_cpu = True
-        self.weight = host_weight
+        placeholder._vllm_keep_on_cpu = True
+        self.weight = placeholder
         self.weight_scale = create_fp8_scale_parameter(
             PerTensorScaleParameter,
             [self.num_embeddings_per_partition],
@@ -361,10 +745,221 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._accelerator_weight_views: dict[int, torch.Tensor] = {}
         self._accelerator_weight_ptrs: dict[int, int] = {}
         self._output_dtype = self.weight_scale.dtype
-        logger.info(
-            "Qwen4Exp PLE shard allocated in pinned host memory: %s",
-            format_gib(self.weight.numel() * self.weight.element_size()),
+        self._device_rows = 0
+        self._host_rows = 0
+        self._disk_rows = 0
+        self._device_table_ptr = 0
+        self.ple_device_table: torch.Tensor | None = None
+        self.ple_host_storage: torch.Tensor | None = None
+        self._checkpoint_shard_loaded = False
+
+    @property
+    def local_rows(self) -> int:
+        """Rows this rank holds itself: the device tier followed by the host tier."""
+        self.materialize_tables()
+        return self._device_rows + self._host_rows
+
+    def _device_spill_bytes(self, device: torch.device, table_bytes: int) -> int:
+        """Bytes of the table that do not fit beside the weights and the KV cache."""
+        vllm_config = get_current_vllm_config()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        kv_bytes = kv_cache_bytes_for_max_model_len(vllm_config)
+        reserve_bytes = ple_vram_reserve_bytes(total_bytes)
+        gmu = vllm_config.cache_config.gpu_memory_utilization
+        spill = auto_ple_host_budget_bytes(
+            table_bytes=table_bytes,
+            device_total_bytes=total_bytes,
+            device_allocated_bytes=total_bytes - free_bytes,
+            gpu_memory_utilization=gmu,
+            kv_cache_bytes=kv_bytes,
+            reserve_bytes=reserve_bytes,
         )
+        logger.info(
+            "Qwen4Exp PLE auto placement: %s usable at gmu=%.2f, %s already "
+            "allocated, %s KV for %d tokens, %s reserve -> %s of the table do "
+            "not fit in device memory",
+            format_gib(int(total_bytes * gmu)),
+            gmu,
+            format_gib(total_bytes - free_bytes),
+            format_gib(kv_bytes),
+            vllm_config.model_config.max_model_len,
+            format_gib(reserve_bytes),
+            format_gib(spill),
+        )
+        return spill
+
+    def _cap_derived_host_budget(self, budget: int) -> int:
+        """Bound a derived host budget by this rank's share of the host memory.
+
+        What no longer spills to the host stays on the device or goes to the
+        disk tier. A configured budget is checked once before the ranks start
+        (check_ple_host_share) and used as given.
+        """
+        host_available = available_host_bytes()
+        host_total = total_host_bytes()
+        if not budget or host_available is None or host_total is None:
+            return budget
+        # The table lives on the first pipeline stage only, so its
+        # tensor-parallel ranks are the ones sharing this host's memory.
+        parallel = get_current_vllm_config().parallel_config
+        ranks = min(parallel.tensor_parallel_size, parallel.local_world_size) * (
+            parallel.data_parallel_size_local
+        )
+        host_reserve = ple_host_reserve_bytes(host_total)
+        capped = cap_host_budget_bytes(
+            budget_bytes=budget,
+            available_bytes=host_available,
+            reserve_bytes=host_reserve,
+            ranks_sharing_host=ranks,
+        )
+        if capped == budget:
+            return budget
+        logger.warning(
+            "Qwen4Exp PLE host budget cut from %s to %s: %s host memory "
+            "available, %s kept in reserve, shared by %d tensor-parallel ranks. "
+            "The rest of the table stays on the device or goes to the disk "
+            "tier; if the requested context no longer fits, the KV allocator "
+            "reports the reachable max_model_len.",
+            format_gib(budget),
+            format_gib(capped),
+            format_gib(host_available),
+            format_gib(host_reserve),
+            ranks,
+        )
+        return capped
+
+    def _plan_placement(self, device: torch.device) -> PLEPlacement:
+        """Place the rows of this rank across the three tiers of the cascade.
+
+        Without the cascade a configured host share leaves the device the rest
+        unmeasured, as before. With the cascade the device tier is measured, so
+        the rows beyond device and host are read from the mapped checkpoint on
+        disk -- instead of overcommitting the device.
+        """
+        row_bytes = getattr(self, "_storage_dim", self.embedding_dim)
+        total_rows = self._meta_weight_shape[0]
+        table_bytes = total_rows * row_bytes
+        runtime = get_current_vllm_config_or_none()
+        if runtime and runtime.kernel_config.ple_disk_only:
+            return plan_ple_placement(
+                total_rows=total_rows,
+                row_bytes=row_bytes,
+                host_budget_bytes=row_bytes,
+                vram_budget_bytes=0,
+                disk_allowed=True,
+            )
+        explicit_host = ple_host_budget_bytes()
+        cascade = ple_cascade_configured()
+        from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+        hybrid = ple_policy().hybrid or pinned_decode_active()
+        spill = None
+        if cascade or (explicit_host is None and not hybrid):
+            spill = self._device_spill_bytes(device, table_bytes)
+        if explicit_host is not None:
+            host_budget = explicit_host
+        elif hybrid:
+            # Cache pages are resolved after model loading. Hybrid placement
+            # keeps the entire table on host and does not need a provisional
+            # device/KV estimate, which can reject not-yet-padded CSA pages.
+            host_budget = self._cap_derived_host_budget(table_bytes)
+            logger.info(
+                "Qwen4Exp hybrid PLE auto placement: %s of the table go to "
+                "host memory before cache layout resolution",
+                format_gib(host_budget),
+            )
+        else:
+            assert spill is not None
+            host_budget = self._cap_derived_host_budget(spill)
+        vram_budget = None
+        if cascade:
+            assert spill is not None
+            # A partial row of the spill still fits beside the rest on the
+            # device, as it does without the cascade.
+            vram_budget = table_bytes - (spill // row_bytes) * row_bytes
+        placement = plan_ple_placement(
+            total_rows=total_rows,
+            row_bytes=row_bytes,
+            host_budget_bytes=host_budget,
+            vram_budget_bytes=vram_budget,
+            disk_allowed=cascade,
+        )
+        if placement.disk_rows and not placement.local_rows:
+            # The gathers of both resident tiers always run and read row 0.
+            raise RuntimeError(
+                "Qwen4Exp PLE cascade needs at least one resident row per rank; "
+                "raise VLLM_QWEN4EXP_PLE_HOST_GIB or free device memory."
+            )
+        return placement
+
+    def materialize_tables(self) -> None:
+        """Allocate the device and host parts of the FP8 table (idempotent)."""
+        if self.ple_device_table is not None:
+            return
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        placement = self._plan_placement(device)
+        device_table = torch.empty(
+            (placement.vram_rows, self.embedding_dim),
+            dtype=self._meta_weight_dtype,
+            device=device,
+        )
+        host_storage = torch.empty(
+            (placement.host_rows, self.embedding_dim),
+            dtype=self._meta_weight_dtype,
+            device="cpu",
+        )
+        if placement.host_rows > 0:
+            _pin_host_tensor_exact(host_storage)
+        # Publish only a complete allocation so a host allocation failure
+        # cannot leave the idempotent path pointing at a half-built table.
+        self.ple_device_table = device_table
+        self.ple_host_storage = host_storage
+        self._device_rows = placement.vram_rows
+        self._host_rows = placement.host_rows
+        self._disk_rows = placement.disk_rows
+        # Cached as a plain int: torch.compile cannot trace data_ptr() inside
+        # the forward, the same reason the host pointer is cached below.
+        self._device_table_ptr = self.ple_device_table.data_ptr()
+        logger.info(
+            "Qwen4Exp PLE table placement: %d of %d rows in device memory "
+            "(%s), %d rows in pinned host memory (%s), %d rows on the disk "
+            "tier (%s)",
+            placement.vram_rows,
+            placement.total_rows,
+            format_gib(placement.vram_rows * self.embedding_dim),
+            placement.host_rows,
+            format_gib(placement.host_rows * self.embedding_dim),
+            placement.disk_rows,
+            format_gib(placement.disk_rows * self.embedding_dim),
+        )
+
+    def load_shard(
+        self,
+        loaded_weight: torch.Tensor,
+        *,
+        checkpoint_start: int,
+        tp_start: int,
+        tp_end: int,
+    ) -> int:
+        """Copy one checkpoint shard into whichever resident tier owns its rows."""
+        self.materialize_tables()
+        assert self.ple_device_table is not None
+        assert self.ple_host_storage is not None
+        # The disk tier's rows stay in the checkpoint; the PLE offload worker
+        # reads them in place.
+        copied = copy_ple_embedding_shard_tiers_(
+            [
+                (self._device_rows, self.ple_device_table),
+                (self._host_rows, self.ple_host_storage),
+                (self._disk_rows, None),
+            ],
+            loaded_weight,
+            checkpoint_start=checkpoint_start,
+            tp_start=tp_start,
+            tp_end=tp_end,
+        )
+        self._checkpoint_shard_loaded = True
+        return copied
 
     def get_accelerator_weight(self, device: torch.device) -> torch.Tensor:
         if device.type != "cuda":
@@ -382,45 +977,153 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 raise RuntimeError(
                     "Qwen4Exp PLE UVA view must be prepared before CUDA graph capture"
                 )
-            with torch.accelerator.device_index(device_index):
-                view = get_accelerator_view_from_cpu_tensor(self.weight)
+            self.materialize_tables()
+            assert self.ple_host_storage is not None
+            if self.ple_host_storage.numel():
+                with torch.accelerator.device_index(device_index):
+                    view = get_accelerator_view_from_cpu_tensor(self.ple_host_storage)
+            else:
+                view = self.ple_host_storage
             self._accelerator_weight_views[device_index] = view
             self._accelerator_weight_ptrs[device_index] = view.data_ptr()
         return view
 
     def prepare_accelerator_weight(self) -> None:
+        self.materialize_tables()
+        if not self._checkpoint_shard_loaded and not self._accelerator_weight_views:
+            # Dummy loading initializes only the zero-row parameter, not these
+            # private tables. Ensure finite profiling data before graph capture.
+            # Real checkpoints load in-place before this post-load callback.
+            assert self.ple_device_table is not None
+            assert self.ple_host_storage is not None
+            self.ple_device_table.view(torch.uint8).zero_()
+            self.ple_host_storage.view(torch.uint8).zero_()
         self.get_accelerator_weight(
             torch.device("cuda", torch.accelerator.current_device_index())
         )
 
-    def embedding_lookup(self, input_: torch.Tensor) -> torch.Tensor:
-        """Gather FP8 UVA rows and emit scaled model-dtype values."""
+    def forward(
+        self, input_: torch.Tensor, remote_rows: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Gather, merging the rows the PLE offload worker delivered.
+
+        Same masking and reduction as ``VocabParallelEmbedding.forward``. The
+        worker's rows are merged by rank-local id, so that has to happen
+        before the tensor-parallel reduce.
+        """
+        if remote_rows is None:
+            return super().forward(input_)
+        input_mask = None
+        masked_input = input_
+        if self.tp_size > 1:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+        output_parallel = self.embedding_lookup(masked_input.long(), remote_rows)
+        if input_mask is not None:
+            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return tensor_model_parallel_all_reduce(output_parallel)
+
+    def embedding_lookup(
+        self, input_: torch.Tensor, remote_rows: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Gather FP8 rows from the device/host split, emit scaled values.
+
+        Both gathers always run: branching on whether any id falls into the
+        host half would need a device-to-host sync on every decode step. The
+        unused gather reads row 0 and coalesces.
+
+        ``remote_rows`` are the raw FP8 bytes the PLE offload worker wrote for
+        this batch, one row per id in ``input_`` order. Ids beyond the resident
+        rows read row 0 locally and take the worker's row in the final merge,
+        dequantized by the same kernel arithmetic as the resident gathers.
+        """
 
         device_index = (
             torch.accelerator.current_device_index()
             if input_.device.index is None
             else input_.device.index
         )
-        weight_ptr = self._accelerator_weight_ptrs.get(device_index)
-        if weight_ptr is None:
+        host_ptr = self._accelerator_weight_ptrs.get(device_index)
+        if host_ptr is None:
             self.get_accelerator_weight(input_.device)
-            weight_ptr = self._accelerator_weight_ptrs[device_index]
+            host_ptr = self._accelerator_weight_ptrs[device_index]
+        if remote_rows is None and self._disk_rows:
+            # Ids on the disk tier would read past the resident tables.
+            raise RuntimeError(
+                "Qwen4Exp PLE rows live on the disk tier, but the lookup got "
+                "no rows from the PLE offload worker"
+            )
+        flat_ids = input_.reshape(-1)
+        on_remote = None
+        if remote_rows is not None:
+            on_remote = flat_ids >= self._device_rows + self._host_rows
+            flat_ids = torch.where(on_remote, flat_ids.new_zeros(()), flat_ids)
         output = torch.empty(
             (*input_.shape, self.embedding_dim),
             dtype=self._output_dtype,
             device=input_.device,
         )
-        torch.ops.vllm.qwen4_exp_ple_pinned_gather(
-            input_.reshape(-1),
-            output.reshape(-1, self.embedding_dim),
-            self.weight_scale,
-            weight_ptr,
-            self.embedding_dim,
-        )
+        out_flat = output.reshape(-1, self.embedding_dim)
+        if self._host_rows == 0 or self._device_rows == 0:
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+                flat_ids,
+                out_flat,
+                self.weight_scale,
+                self.layer_name,
+                self._host_rows != 0,
+                self.embedding_dim,
+            )
+        else:
+            boundary = self._device_rows
+            on_host = flat_ids >= boundary
+            zero = flat_ids.new_zeros(())
+            device_ids = torch.where(on_host, zero, flat_ids)
+            host_ids = torch.where(on_host, flat_ids - boundary, zero)
+            host_out = torch.empty_like(out_flat)
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+                device_ids,
+                out_flat,
+                self.weight_scale,
+                self.layer_name,
+                False,
+                self.embedding_dim,
+            )
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+                host_ids,
+                host_out,
+                self.weight_scale,
+                self.layer_name,
+                True,
+                self.embedding_dim,
+            )
+            out_flat.copy_(torch.where(on_host.unsqueeze(-1), host_out, out_flat))
+        if on_remote is not None:
+            assert remote_rows is not None
+            if (
+                remote_rows.dtype != torch.uint8
+                or not remote_rows.is_contiguous()
+                or remote_rows.numel() != out_flat.numel()
+            ):
+                raise ValueError(
+                    "remote PLE rows must be contiguous raw FP8 bytes, one row "
+                    f"per id: got {remote_rows.dtype} with {remote_rows.numel()} "
+                    f"bytes for {out_flat.numel()} values"
+                )
+            remote_out = torch.empty_like(out_flat)
+            torch.ops.vllm.qwen4_exp_ple_fp8_bytes_dequant(
+                remote_rows, self.weight_scale, remote_out
+            )
+            out_flat.copy_(torch.where(on_remote.unsqueeze(-1), remote_out, out_flat))
         return output
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
+class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -429,10 +1132,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         max_total_tokens: int,
         max_num_reqs: int,
         prefix: str,
+        layer_name: str,
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        self.layer_name = layer_name
         self.embedding_dim = embedding_dim
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
@@ -448,6 +1153,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
         self.head_dim = embedding_dim // self.ngram_heads
         self.eos_token_id = int(config.eos_token_id)
+        self.eos_token_id = int(
+            getattr(config, "gguf_ple_eos_token_id", self.eos_token_id)
+        )
         self.unigram_vocab_size = int(config.vocab_size)
         self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
         if self.split_ngram_parts <= 0:
@@ -477,6 +1185,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             sizes.append(size)
             offsets.append(offset)
             offset += size
+        if (constants := getattr(config, "gguf_ple_constants", None)) is not None:
+            # A GGUF converter preserves the checkpoint's exact integer
+            # constants. Never regenerate them from an assumed random seed.
+            multipliers = constants["layer_multipliers"]
+            sizes = constants["ngram_heads_vocab_sizes"]
+            offsets = constants["ngram_heads_offsets"]
+            self.layer_multipliers.copy_(
+                torch.tensor(
+                    multipliers,
+                    dtype=torch.int64,
+                    device=self.layer_multipliers.device,
+                )
+            )
+            offset = offsets[-1] + sizes[-1]
         self.register_buffer(
             "ngram_heads_vocab_sizes",
             torch.tensor(sizes, dtype=torch.long),
@@ -498,7 +1220,100 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embedding_prefix,
             force_fp8_storage=ple_storage_dtype == "float8_e4m3fn",
         )
-        if _should_use_pinned_host_ple(config):
+        self._cascade = ple_cascade_configured()
+        from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+        self._pinned_decode = pinned_decode_active()
+
+        self._remote_placements: list[PLERemotePlacement] = []
+        self._disk_segments: list[PLEDiskSegment] = []
+        self._disk_offload = bool(ple_policy().disk and is_offload_process())
+        # The cascade worker keeps the checkpoint shards file-backed like the
+        # disk lane: it serves only the rows the ranks do not hold and copies
+        # none of the table into anonymous host memory.
+        self._file_backed_shards = self._disk_offload or (
+            self._cascade and is_offload_process()
+        )
+        self._disk_shards: list[torch.Tensor | None] = []
+        self._disk_shard_arrays: list[np.ndarray] = []
+        self._disk_shard_pointers: list[int] = []
+        self._disk_mapped_paths: set[str] = set()
+        self._disk_row_kernel: MappedRowGatherKernel | None = None
+        runtime = get_current_vllm_config_or_none()
+        # Read the disk-tier policy now: load_weights may run outside the config
+        # context (direct loads, tests), and the admission record goes to the
+        # engine's kernel config when there is one.
+        self._kernel_config = getattr(runtime, "kernel_config", None)
+        self._release_disk_pages = bool(
+            getattr(self._kernel_config, "ple_disk_release_pages", False)
+        )
+        self._disk_row_gather = bool(
+            getattr(self._kernel_config, "ple_disk_row_gather", True)
+        )
+        self._disk_executor: ThreadPoolExecutor | None = None
+        from .gguf_embedding import (
+            Qwen4ExpPackedGGUFEmbedding,
+            Qwen4ExpPLEGGUFEmbeddingMethod,
+        )
+
+        self._packed_gguf = isinstance(quant_method, Qwen4ExpPLEGGUFEmbeddingMethod)
+        if self._packed_gguf:
+            self._file_backed_shards = False
+            self.ngram_embedding = Qwen4ExpPackedGGUFEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype,
+                divisor,
+                embedding_prefix,
+                quant_method,
+            )
+        elif self._file_backed_shards:
+            if quant_method is None:
+                raise NotImplementedError(
+                    "Qwen4Exp PLE file-backed shards require FP8 checkpoint storage"
+                )
+            with torch.device("meta"):
+                self.ngram_embedding = VocabParallelEmbedding(
+                    padded_vocab_size,
+                    self.head_dim,
+                    params_dtype=params_dtype,
+                    padding_size=divisor,
+                    prefix=embedding_prefix,
+                    quant_method=quant_method,
+                )
+            self._disk_shards = [None] * self.split_ngram_parts
+            shard_size = (
+                self.ngram_embedding.org_vocab_size + self.split_ngram_parts - 1
+            ) // self.split_ngram_parts
+            self._disk_shard_size = shard_size
+            self._disk_shard_boundaries = (
+                torch.arange(
+                    1,
+                    self.split_ngram_parts,
+                    dtype=torch.int64,
+                )
+                * shard_size
+            )
+            # The mmap reader is shared, so its thread pool serves the disk
+            # lane and the cascade's disk tier alike.
+            num_threads = envs.VLLM_PLE_DISK_OFFLOAD_NUM_THREADS
+            if num_threads < 0:
+                raise ValueError(
+                    "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS must be non-negative"
+                )
+            if num_threads == 0:
+                num_threads = min(32, os.cpu_count() or 1)
+            self._disk_executor = ThreadPoolExecutor(
+                max_workers=num_threads,
+                thread_name_prefix="ple-mmap",
+            )
+            logger.info(
+                "Qwen4Exp PLE disk mmap enabled "
+                "(shards=%d, mmap workers=%d, access=random).",
+                self.split_ngram_parts,
+                num_threads,
+            )
+        elif _should_use_pinned_host_ple(config):
             if quant_method is None:
                 raise NotImplementedError(
                     "Qwen4Exp pinned-host PLE requires FP8 checkpoint storage"
@@ -535,6 +1350,88 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             persistent=False,
         )
 
+    @classmethod
+    def offload_keeps_local_tables(cls) -> bool:
+        from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+        return ple_cascade_configured() or pinned_decode_active()
+
+    def remote_placement(self) -> PLERemotePlacement | None:
+        """The rows of this rank the cascade worker has to serve."""
+        # Whole-table offload skips the GPU placeholder's constructor.
+        if not getattr(self, "_cascade", False):
+            return None
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, Qwen4ExpPinnedHostEmbedding):
+            raise RuntimeError(
+                "Qwen4Exp PLE cascade requires the split device/host table on "
+                "the compute ranks"
+            )
+        return PLERemotePlacement(
+            tp_start=embedding.shard_indices.org_vocab_start_index,
+            tp_end=embedding.shard_indices.org_vocab_end_index,
+            local_rows=embedding.local_rows,
+        )
+
+    def bind_remote_placements(self, placements: list[object]) -> None:
+        """Take the ranks' row geometry inside the cascade worker."""
+        if not self._cascade or not is_offload_process():
+            raise RuntimeError(
+                "remote PLE placements belong to the cascade offload worker"
+            )
+        bound: list[PLERemotePlacement] = []
+        for tp_rank, placement in enumerate(placements):
+            if not isinstance(placement, PLERemotePlacement):
+                raise TypeError(
+                    f"tensor-parallel rank {tp_rank} sent "
+                    f"{type(placement).__name__} instead of PLERemotePlacement"
+                )
+            bound.append(placement)
+        disk_segments = plan_ple_disk_segments(bound)
+        disk_rows = sum(placement.remote_rows for placement in bound)
+        logger.info(
+            "Qwen4Exp PLE cascade worker: the ranks leave %d rows (%s) to the "
+            "disk tier %s.",
+            disk_rows,
+            format_gib(disk_rows * self.head_dim),
+            disk_segments,
+        )
+        self._disk_segments = disk_segments
+        self._remote_placements = bound
+
+    def needs_weight_prefault(self) -> bool:
+        # Until placements arrive, retain the full CPU-table contract. A bound
+        # empty disk tier only publishes zero rows; resident pinned/device rows
+        # are already owned by the GPU workers and need no second RAM copy.
+        return not self._remote_placements or bool(self._disk_segments)
+
+    def _remote_lookup(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
+        """Fill the worker's output with the rows the ranks left to it.
+
+        One buffer serves every tensor-parallel rank: all segments are
+        disjoint, and each rank merges only the slots of ids in its own
+        segments. The other slots carry whatever the buffer held.
+        """
+        if not self._remote_placements:
+            raise RuntimeError(
+                "PLE cascade worker received a request before the ranks "
+                "registered their placements"
+            )
+        output_rows = output.view(torch.uint8).reshape(-1, self.head_dim)
+        flat_ids = ngram_ids.reshape(-1)
+        if not self._disk_segments:
+            # Every rank holds all of its rows, so the buffer carries none; the
+            # copy and the signal still run so the ranks' waits are exercised.
+            output_rows.zero_()
+            return
+        on_disk = ple_disk_mask(flat_ids, self._disk_segments).numpy()
+        disk_ids = flat_ids.numpy()[on_disk]
+        if disk_ids.size == 0:
+            return
+        # Read from the mapped checkpoint; only the ids that belong to the
+        # disk tier are touched.
+        output_rows.numpy()[on_disk] = self._gather_mapped_rows(disk_ids)
+
     @staticmethod
     def _shift_precompute(
         tokens: torch.Tensor, eos_token_id: int
@@ -570,30 +1467,228 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def _compute_ngram_ids_cpu_small(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
-        input_ids = input_ids.reshape(-1).long()
-        query_start_loc = query_start_loc.long()
-        num_reqs = ngram_context.shape[0]
+        """Avoid many tiny Torch ops for CPU-offloaded speculative steps."""
+        tokens = input_ids.tolist()
+        starts = query_start_loc.tolist()
+        context = ngram_context.tolist()
+        num_tokens = len(tokens)
+        num_reqs = len(starts) - 1
+        max_seq_len = max(1, max(b - a for a, b in zip(starts, starts[1:])))
+        num_valid_tokens = min(starts[-1], num_tokens)
+        eos = self.eos_token_id
+        packed = [[eos] * (max_seq_len + 2) for _ in range(num_reqs)]
+        for req in range(num_reqs):
+            packed[req][:2] = context[req]
+            begin = min(starts[req], num_valid_tokens)
+            end = min(starts[req + 1], num_valid_tokens)
+            packed[req][2 : 2 + end - begin] = tokens[begin:end]
+
+        multipliers = self.layer_multipliers.tolist()
+        sizes = self.ngram_heads_vocab_sizes.tolist()
+        offsets = self.ngram_heads_offsets.tolist()
+        mask = (1 << 64) - 1
+        sign = 1 << 63
+        full = 1 << 64
+        output: list[int] = []
+        req = 0
+        for pos in range(num_tokens):
+            while req + 1 < num_reqs and pos >= starts[req + 1]:
+                req += 1
+            col = min(max(pos - starts[req], 0), max_seq_len - 1)
+            seq = packed[req]
+            current, previous = seq[col + 2], seq[col + 1]
+            # A preceding EOS resets the history used by the trigram head.
+            previous2 = eos if previous == eos else seq[col]
+            mixed2 = ((current * multipliers[0]) & mask) ^ (
+                (previous * multipliers[1]) & mask
+            )
+            mixed3 = mixed2 ^ ((previous2 * multipliers[2]) & mask)
+            if mixed2 >= sign:
+                mixed2 -= full
+            if mixed3 >= sign:
+                mixed3 -= full
+            output.extend(mixed2 % sizes[h] + offsets[h] for h in range(8))
+            output.extend(mixed3 % sizes[h] + offsets[h] for h in range(8, 16))
+        return torch.tensor(output, dtype=torch.long).reshape(num_tokens, 16)
+
+    def draft_prefetch_row_ids(
+        self, tokens: list[int], context: list[int]
+    ) -> np.ndarray:
+        """Table rows of consecutive tokens following two context tokens.
+
+        Used only to warm storage for drafted tokens; it shares the verify
+        path's hashing, so prefetched rows are exactly the rows it will read.
+        """
+        if (
+            not tokens
+            or self.ngram_size != 3
+            or self.heads_per_ngram != 8
+            or self.ngram_heads != 16
+        ):
+            return np.empty(0, dtype=np.int64)
+        rows = self._compute_ngram_ids_cpu_small(
+            torch.tensor(tokens, dtype=torch.int64),
+            torch.tensor([0, len(tokens)], dtype=torch.int64),
+            torch.tensor([context], dtype=torch.int64),
+        )
+        return rows.numpy().reshape(-1)
+
+    def compute_ngram_ids(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute PLE indices for the current, unpadded request layout."""
+        input_ids = input_ids.reshape(-1)
+        num_reqs = query_start_loc.numel() - 1
         num_tokens = input_ids.shape[0]
-        # The scheduler already enforces max_num_batched_tokens and max_num_seqs.
-        # Python comparisons here would specialize these symbolic dimensions and
-        # violate V2's dynamic-shape contract during AOT compilation.
+
+        if num_tokens > self.positions_buffer.numel():
+            raise ValueError(
+                f"PLE received {num_tokens} tokens, but its workspace supports "
+                f"at most {self.positions_buffer.numel()}"
+            )
+        if num_reqs > self.padded_buffer.shape[0]:
+            raise ValueError(
+                f"PLE received {num_reqs} requests, but its workspace supports "
+                f"at most {self.padded_buffer.shape[0]}"
+            )
+        if num_reqs <= 0:
+            raise ValueError("PLE requires at least one request")
+
+        if (
+            not is_offload_process()
+            and input_ids.is_cuda
+            and current_platform.is_device_capability((7, 0))
+            and num_tokens == 1
+            and num_reqs == 1
+            and input_ids.dtype in (torch.int32, torch.int64)
+            and self.ngram_size == 3
+            and self.heads_per_ngram == 8
+            and self.ngram_heads == 16
+            and ngram_context.ndim == 2
+            and ngram_context.shape[0] >= 1
+            and ngram_context.shape[1] == 2
+            and ngram_context.is_cuda
+            and ngram_context.is_contiguous()
+            and self.layer_multipliers.is_cuda
+            and self.ngram_heads_vocab_sizes.is_cuda
+            and self.ngram_heads_offsets.is_cuda
+            and input_ids.device
+            == ngram_context.device
+            == self.layer_multipliers.device
+            == self.ngram_heads_vocab_sizes.device
+            == self.ngram_heads_offsets.device
+        ):
+            output = torch.empty((1, 16), dtype=torch.long, device=input_ids.device)
+            _qwen38_ple_m1_ngram_ids_kernel[(1,)](
+                input_ids,
+                ngram_context,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+                output,
+                EOS_TOKEN_ID=self.eos_token_id,
+                num_warps=1,
+            )
+            logger.info_once("SM70 Qwen3.8 fused M=1 PLE ngram-ID path enabled.")
+            return output
+
+        if (
+            not is_offload_process()
+            and self.ngram_size == 3
+            and self.heads_per_ngram == 8
+        ):
+            reason = SM70_PLE_NGRAM.reason(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+            )
+            if reason is None:
+                logger.info_once("SM70 fused small-batch PLE ngram-ID path enabled.")
+                return sm70_ple_ngram_ids(
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                    self.layer_multipliers,
+                    self.ngram_heads_vocab_sizes,
+                    self.ngram_heads_offsets,
+                    self.eos_token_id,
+                )
+            logger.debug_once("SM70 small-batch PLE ngram-ID fallback: %s", reason)
+
+        if (
+            is_offload_process()
+            and num_tokens <= _CPU_SMALL_NGRAM_TOKENS
+            and self.ngram_size == 3
+            and self.heads_per_ngram == 8
+            and self.ngram_heads == 16
+            and self.layer_multipliers.numel() == 3
+            and self.ngram_heads_vocab_sizes.numel() == 16
+            and self.ngram_heads_offsets.numel() == 16
+            and input_ids.device.type == "cpu"
+            and query_start_loc.device.type == "cpu"
+            and ngram_context.device.type == "cpu"
+            and input_ids.dtype in (torch.int32, torch.int64)
+            and query_start_loc.dtype in (torch.int32, torch.int64)
+            and ngram_context.dtype in (torch.int32, torch.int64)
+            and ngram_context.ndim == 2
+            and ngram_context.shape[0] >= num_reqs
+            and ngram_context.shape[1] == 2
+            and self.layer_multipliers.device.type == "cpu"
+            and self.ngram_heads_vocab_sizes.device.type == "cpu"
+            and self.ngram_heads_offsets.device.type == "cpu"
+        ):
+            return self._compute_ngram_ids_cpu_small(
+                input_ids, query_start_loc, ngram_context
+            )
+
+        input_ids = input_ids.long()
+        query_start_loc = query_start_loc.long()
+
+        if is_offload_process():
+            max_seq_len = max(
+                1,
+                int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
+            )
+            # CUDA-graph batches can include padded token IDs while
+            # query_start_loc describes only real tokens. Do not let those
+            # padded IDs overwrite the final real token after index clamping.
+            num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
+        else:
+            # This method runs behind a splitting custom op on GPU, so request
+            # dimensions are evaluated for every replay instead of being
+            # specialized into a PIECEWISE graph keyed only by token count.
+            max_seq_len = num_tokens
+            num_valid_tokens = num_tokens
 
         positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs]
+        packed = self.padded_buffer[:num_reqs, :max_seq_len]
         packed.fill_(self.eos_token_id)
         request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         request_indices.clamp_(max=num_reqs - 1)
         columns = (positions - query_start_loc[request_indices]).clamp(
             0, packed.shape[1] - 1
         )
-        packed[request_indices, columns] = input_ids
-        ngram_context = ngram_context.to(device=input_ids.device, dtype=torch.long)
+        if is_offload_process():
+            packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
+                input_ids[:num_valid_tokens]
+            )
+        else:
+            packed[request_indices, columns] = input_ids
+        ngram_context = ngram_context[:num_reqs].to(
+            device=input_ids.device, dtype=torch.long
+        )
 
         context = torch.cat([ngram_context, packed], dim=-1)
         positions_2d, position_in_segment = self._shift_precompute(
@@ -624,11 +1719,345 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
-        ngram_ids = torch.cat(id_blocks, dim=-1)
+        return torch.cat(id_blocks, dim=-1)
+
+    def _release_mapped_pages(self, shard: torch.Tensor) -> None:
+        """Unmap the pages of a file-backed shard this process has read.
+
+        Only with kernel_config.ple_disk_release_pages. The pages stay in the page
+        cache, so reading them again is a cheap minor fault, but a mapped page
+        is one the kernel keeps: with them mapped the offload worker held
+        1.9 GiB of the checkpoint after twelve disk-tier requests while the
+        kernel swapped other processes out (2026-09-23). The shards are
+        private file mappings nobody writes, so the file still holds every
+        byte.
+
+        Only file-backed shards may be released: on anonymous memory
+        MADV_DONTNEED discards the contents. Loading records the mapped file
+        of every shard it accepts (_advise_random_file_access refuses others).
+        """
+        if self._release_disk_pages and self._disk_mapped_paths:
+            _madvise_mapped_tensor(shard, _MADV_DONTNEED)
+
+    def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
+        """Read the given PLE rows from the mapped checkpoint shards.
+
+        Short requests copy their rows straight from the retained mappings;
+        longer ones read sorted unique ids per shard, which keeps the mmap
+        reads local, and read the shards in parallel where a thread pool is
+        configured. Shared by the whole-table disk lane and by the cascade's
+        disk tier.
+        """
+        if any(shard is None for shard in self._disk_shards):
+            raise RuntimeError("PLE disk lookup started before every shard was loaded")
+        if self._disk_row_kernel is not None:
+            rows = torch.empty(
+                (flat_ids.size, self.head_dim), dtype=torch.uint8, device="cpu"
+            )
+            self._disk_row_kernel.apply(torch.from_numpy(flat_ids), rows)
+            if self._release_disk_pages:
+                for index in np.unique(flat_ids // self._disk_shard_size):
+                    shard = self._disk_shards[int(index)]
+                    assert shard is not None
+                    self._release_mapped_pages(shard)
+            return rows.numpy()
+        shard_size = self._disk_shard_size
+
+        # Decode moves only a few dozen rows. Per-shard NumPy dispatch and the
+        # thread pool cost more than copying these FP8 rows from their retained
+        # file mappings. Keep the deduplicated, parallel route for prefill.
+        if flat_ids.size <= 128:
+            min_id = int(flat_ids.min())
+            max_id = int(flat_ids.max())
+            if min_id < 0 or max_id >= self.ngram_embedding.org_vocab_size:
+                raise IndexError(
+                    "PLE disk row id out of range: "
+                    f"[{min_id}, {max_id}] for "
+                    f"{self.ngram_embedding.org_vocab_size} rows"
+                )
+            rows = np.empty((flat_ids.size, self.head_dim), dtype=np.uint8)
+            row_bytes = self.head_dim
+            rows_ptr = rows.ctypes.data
+            touched_shards: set[int] = set()
+            for output_row, row_id in enumerate(flat_ids.tolist()):
+                shard_index, local_row = divmod(row_id, shard_size)
+                ctypes.memmove(
+                    rows_ptr + output_row * row_bytes,
+                    self._disk_shard_pointers[shard_index] + local_row * row_bytes,
+                    row_bytes,
+                )
+                touched_shards.add(shard_index)
+            for shard_index in touched_shards:
+                shard = self._disk_shards[shard_index]
+                assert shard is not None
+                self._release_mapped_pages(shard)
+            return rows
+
+        sorted_ids, inverse = np.unique(flat_ids, return_inverse=True)
+        if sorted_ids[0] < 0 or sorted_ids[-1] >= self.ngram_embedding.org_vocab_size:
+            raise IndexError(
+                "PLE disk row id out of range: "
+                f"[{sorted_ids[0]}, {sorted_ids[-1]}] for "
+                f"{self.ngram_embedding.org_vocab_size} rows"
+            )
+        boundaries = self._disk_shard_boundaries.numpy()
+        split_positions = np.searchsorted(sorted_ids, boundaries).tolist()
+        starts = [0, *split_positions]
+        ends = [*split_positions, sorted_ids.size]
+        sorted_output = np.empty((sorted_ids.size, self.head_dim), dtype=np.uint8)
+
+        tasks = [
+            (shard_index, start, end)
+            for shard_index, (start, end) in enumerate(zip(starts, ends, strict=True))
+            if start != end
+        ]
+
+        def gather_shard(task: tuple[int, int, int]) -> None:
+            shard_index, start, end = task
+            shard = self._disk_shards[shard_index]
+            assert shard is not None
+            local_ids = sorted_ids[start:end] - shard_index * shard_size
+            sorted_output[start:end] = self._disk_shard_arrays[shard_index][local_ids]
+            self._release_mapped_pages(shard)
+
+        executor = getattr(self, "_disk_executor", None)
+        if executor is None or len(tasks) == 1:
+            for task in tasks:
+                gather_shard(task)
+        else:
+            for _ in executor.map(gather_shard, tasks):
+                pass
+        return np.take(sorted_output, inverse, axis=0)
+
+    def _disk_embedding_lookup(
+        self,
+        ngram_ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Gather mapped FP8 shard rows in logical-ID order (whole table)."""
+        if output.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise RuntimeError("PLE disk lookup currently requires FP8 output")
+        profile = envs.VLLM_PLE_DISK_OFFLOAD_PROFILE
+        if profile:
+            faults_before = resource.getrusage(resource.RUSAGE_SELF)
+            started = time.perf_counter()
+        flat_ids = ngram_ids.reshape(-1).numpy()
+        if flat_ids.size == 0:
+            return
+        if self._disk_row_kernel is not None:
+            self._disk_row_kernel.apply(ngram_ids, output.view(torch.uint8))
+            if self._release_disk_pages:
+                for index in np.unique(flat_ids // self._disk_shard_size):
+                    shard = self._disk_shards[int(index)]
+                    assert shard is not None
+                    self._release_mapped_pages(shard)
+        else:
+            rows = self._gather_mapped_rows(flat_ids)
+            output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
+        if profile:
+            faults_after = resource.getrusage(resource.RUSAGE_SELF)
+            logger.info(
+                "PLE disk mmap gather: tokens=%d rows=%d wall=%.3f ms "
+                "major_faults=%d minor_faults=%d",
+                ngram_ids.shape[0],
+                flat_ids.size,
+                (time.perf_counter() - started) * 1000.0,
+                faults_after.ru_majflt - faults_before.ru_majflt,
+                faults_after.ru_minflt - faults_before.ru_minflt,
+            )
+
+    def forward_impl(  # type: ignore[override]
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        output_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        input_ids = input_ids.reshape(-1)
+        num_tokens = input_ids.shape[0]
+        if is_offload_process():
+            ngram_ids = self.compute_ngram_ids(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
+        else:
+            ngram_ids = input_ids.new_empty(
+                (num_tokens, self.ngram_heads),
+                dtype=torch.long,
+            )
+            torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                ngram_ids,
+                self.layer_name,
+            )
+        ngram_ids = snapshot_ple_diagnostic(
+            ngram_ids,
+            self.layer_name + ":02_ngram_ids",
+            getattr(self, "_sm70_hcx_diagnostics", False),
+        )
+        if output_buffer is not None:
+            if getattr(self, "_packed_result_layout", None) is not None:
+                reader = self.ngram_embedding._cpu_reader
+                if reader is None or not is_offload_process():
+                    raise RuntimeError("Packed PLE result requires the CPU row owner")
+                packed = reader.lookup_packed_iq4nl(ngram_ids.numpy())
+                output = output_buffer[:num_tokens]
+                output.copy_(torch.from_numpy(packed.reshape(num_tokens, -1)))
+                return output
+            output = output_buffer[:num_tokens, : self.embedding_dim]
+            # Cross-process FP8 results travel as raw bytes. Keeping the IPC
+            # buffers uint8 prevents TorchInductor from treating their graph
+            # inputs as native FP8, which SM70 Triton does not support.
+            embedding_output = (
+                output.view(torch.float8_e4m3fn)
+                if output.dtype == torch.uint8
+                else output
+            )
+            if self._packed_gguf:
+                ids = ngram_ids.reshape(-1)
+                target = embedding_output.reshape(-1, self.head_dim)
+                if self._cascade:
+                    mask = ple_disk_mask(ids, self._disk_segments)
+                    target[mask] = self.ngram_embedding.embedding_lookup(ids[mask])
+                else:
+                    target.copy_(self.ngram_embedding.embedding_lookup(ids))
+            elif getattr(self, "_cascade", False):
+                self._remote_lookup(ngram_ids, embedding_output)
+            elif getattr(self, "_disk_offload", False):
+                self._disk_embedding_lookup(ngram_ids, embedding_output)
+            else:
+                torch.index_select(
+                    self.ngram_embedding.weight,
+                    0,
+                    ngram_ids.reshape(-1),
+                    out=embedding_output.reshape(-1, self.head_dim),
+                )
+            return output
+        if self._is_cpu_offloaded and getattr(self, "_cascade", False):
+            # Cascade: the resident tiers are gathered here, the rows beyond
+            # them arrive from the worker in the shared output buffer.
+            remote_rows = self.wait_offloaded_output(hidden_states, num_tokens)
+            return self.ngram_embedding(ngram_ids, remote_rows=remote_rows).flatten(-2)
+        # Hybrid decode reads the complete device/pinned-host table locally.
+        # Graph replay submits no remote request, so it must not wait for IPC.
         return self.ngram_embedding(ngram_ids).flatten(-2)
+
+    def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
+        """Transport quantized lookup results as opaque E4M3FN bytes."""
+        if getattr(self, "_packed_result_layout", None) is not None:
+            return torch.uint8
+        embedding = getattr(self, "ngram_embedding", None)
+        if getattr(self, "_packed_gguf", False):
+            assert embedding is not None
+            return embedding._output_dtype
+        weight = getattr(embedding, "weight", None)
+        if weight is not None and weight.dtype == torch.float8_e4m3fn:
+            return torch.uint8
+        if hasattr(self, "_offload_weight_scale"):
+            return torch.uint8
+        if weight is not None:
+            return weight.dtype
+        return default_dtype
+
+    def get_offload_output_dim(self, default_dim: int) -> int:
+        layout = getattr(self, "_packed_result_layout", None)
+        return layout["packed_width"] if layout is not None else default_dim
+
+    def offload_result_layout(self):
+        return getattr(self, "_packed_result_layout", None)
+
+    def bind_offload_result_layout(self, layout):
+        if layout is None:
+            self._packed_result_layout = None
+            return
+        reader = getattr(getattr(self, "ngram_embedding", None), "_cpu_reader", None)
+        if (
+            reader is None
+            or not layout.get("enabled")
+            or layout.get("operator") != "ple_decode_iq4nl_result_out"
+            or layout.get("source_type") != 20
+            or reader.source_type != 20
+            or reader.hidden_size != layout.get("row_width")
+            or self.head_dim != layout.get("row_width")
+            or self.ngram_heads != layout.get("heads")
+            or layout.get("packed_width") != self.ngram_heads * reader.data.shape[1]
+            or layout.get("output_dtype") != "float16"
+            or self.ngram_embedding._output_dtype != torch.float16
+        ):
+            raise ValueError("CPU PLE row storage disagrees with result decoder")
+        self._packed_result_layout = dict(layout)
+
+    def wait_offloaded_output(
+        self, hidden_states: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        layout = getattr(self, "_packed_result_layout", None)
+        if layout is None:
+            return super().wait_offloaded_output(hidden_states, num_tokens)
+        import vllm.model_executor.kernels.ple.gguf_packed_result  # noqa: F401
+
+        workspace = self._packed_result_output
+        cpu_output = getattr(self, "_cpu_output_buffer", None)
+        if cpu_output is None:
+            torch.ops.vllm.ple_offload_wait_decode_iq4nl(
+                self._sem.flag_tensor,
+                self._gpu_output_buffer,
+                workspace,
+                hidden_states,
+                self._packed_result_codebook,
+                layout["row_width"],
+                None,
+                num_tokens,
+            )
+        else:
+            torch.ops.vllm.ple_offload_wait_decode_iq4nl(
+                self._sem.flag_tensor,
+                self._gpu_output_buffer,
+                workspace,
+                hidden_states,
+                self._packed_result_codebook,
+                layout["row_width"],
+                cpu_output,
+                num_tokens,
+            )
+        return workspace[:num_tokens]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
+
+        file_backed = getattr(self, "_file_backed_shards", False)
+
+        # GPU workers keep only the scale required to dequantize the FP8 rows
+        # returned by the CPU process. The embedding weights live exclusively
+        # in that process.
+        if (
+            ple_offload_enabled()
+            and not ple_policy().hybrid
+            and not self.offload_keeps_local_tables()
+            and not is_offload_process()
+        ):
+            retained: set[str] = set()
+            for name, loaded_weight in weights:
+                if name != "ngram_embedding.weight_scale":
+                    continue
+                # Match the resident FP8 embedding contract: its global scale
+                # is a graph input in the model dtype. Retaining a checkpoint
+                # BF16 scale in an otherwise-FP16 graph makes Inductor reject
+                # SM70 before the explicit dequantization cast is lowered.
+                scale_dtype = getattr(self, "_offload_model_dtype", loaded_weight.dtype)
+                self.register_buffer(
+                    "_offload_weight_scale",
+                    loaded_weight.to(
+                        device=torch.accelerator.current_accelerator(),
+                        dtype=scale_dtype,
+                    ),
+                    persistent=False,
+                )
+                retained.add(name)
+            return retained
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
@@ -637,7 +2066,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         }
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
-        shard_prefix = "ngram_embedding.shard_"
+        shard_prefix = PLE_SHARD_PREFIX
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
@@ -680,17 +2109,86 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
-                copy_ple_embedding_shard_(
-                    embedding.weight.data,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                    tp_start=embedding.shard_indices.org_vocab_start_index,
-                    tp_end=embedding.shard_indices.org_vocab_end_index,
-                )
+                if file_backed:
+                    if loaded_weight.dtype != embedding.weight.dtype:
+                        raise ValueError(
+                            "PLE disk shard dtype mismatch: expected "
+                            f"{embedding.weight.dtype}, got {loaded_weight.dtype}"
+                        )
+                    mapped_path = _advise_random_file_access(loaded_weight)
+                    self._disk_shards[shard_index] = loaded_weight
+                    self._disk_mapped_paths.add(mapped_path)
+                    loaded.add("ngram_embedding.weight")
+                    continue
+                if isinstance(embedding, Qwen4ExpPinnedHostEmbedding):
+                    # Split placement: the embedding routes each shard into
+                    # its device or host part (tables built on first shard).
+                    embedding.load_shard(
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                        tp_start=embedding.shard_indices.org_vocab_start_index,
+                        tp_end=embedding.shard_indices.org_vocab_end_index,
+                    )
+                else:
+                    copy_ple_embedding_shard_(
+                        embedding.weight.data,
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                        tp_start=embedding.shard_indices.org_vocab_start_index,
+                        tp_end=embedding.shard_indices.org_vocab_end_index,
+                    )
                 loaded.add("ngram_embedding.weight")
+                continue
+            if file_backed and name == "ngram_embedding.weight_scale":
+                self._disk_weight_scale = loaded_weight.clone()
+                loaded.add(name)
                 continue
             regular_weights.append((name, loaded_weight))
 
+        if file_backed:
+            missing_shards = [
+                index for index, shard in enumerate(self._disk_shards) if shard is None
+            ]
+            if missing_shards:
+                raise RuntimeError(
+                    f"PLE disk offload did not load shards: {missing_shards}"
+                )
+            self._disk_shard_arrays = [
+                shard.view(torch.uint8).numpy()
+                for shard in self._disk_shards
+                if shard is not None
+            ]
+            self._disk_shard_pointers = [
+                array.ctypes.data for array in self._disk_shard_arrays
+            ]
+            self._disk_row_kernel, row_admission = prepare_mapped_row_gather(
+                pointers=self._disk_shard_pointers,
+                shard_size=self._disk_shard_size,
+                num_rows=self.ngram_embedding.org_vocab_size,
+                row_bytes=self.head_dim,
+                file_backed=bool(self._disk_mapped_paths),
+                enabled=self._disk_row_gather,
+                cache_bytes=getattr(self._kernel_config, "ple_row_cache_mib", 0) << 20,
+            )
+            if self._kernel_config is not None:
+                self._kernel_config.ple_disk_row_readers[self.layer_name] = (
+                    row_admission
+                )
+            logger.info("PLE mapped row-reader admission: %s", row_admission)
+            mapped_gib = (
+                sum(
+                    shard.numel() * shard.element_size()
+                    for shard in self._disk_shards
+                    if shard is not None
+                )
+                / 2**30
+            )
+            logger.info(
+                "Qwen4Exp PLE retained %.3f GiB across %d file-backed "
+                "safetensor mappings without an anonymous table copy.",
+                mapped_gib,
+                len(self._disk_mapped_paths),
+            )
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
@@ -724,18 +2222,66 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_kernel_size = int(config.ple_conv_kernel_size)
         self.short_conv_dilation = int(config.ngram_size)
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
+        self._prefill_short_conv = (
+            vllm_config.kernel_config.layer_execution.ple_prefill_conv
+        )
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
-        self.ple_embedding: nn.Module = Qwen4ExpNGramEmbedding(
-            config,
-            int(config.ple_embed_dim),
-            self.ple_dense_layer_id,
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            vllm_config.scheduler_config.max_num_seqs,
-            f"{prefix}.ple_embedding",
-            quant_config=quant_config,
-            params_dtype=model_config.dtype,
+        # The offload subprocess constructs the surrounding model on meta, but
+        # its N-gram table must own real CPU storage. With offload disabled,
+        # preserve the caller's existing device context (including SM70 UVA).
+        ple_device = (
+            torch.device(Qwen4ExpNGramEmbedding.get_target_device())
+            if ple_offload_enabled()
+            else nullcontext()
         )
+        with ple_device:
+            self.ple_embedding: nn.Module = Qwen4ExpNGramEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                self.ple_dense_layer_id,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.scheduler_config.max_num_seqs,
+                prefix=f"{prefix}.ple_embedding",
+                layer_name=prefix,
+                quant_config=quant_config,
+                params_dtype=model_config.dtype,
+            )
+        # PleOffloadLayer skips the embedding subclass constructor in GPU
+        # workers, so preserve the model-dtype scale contract explicitly for
+        # its checkpoint-only load path.
+        self.ple_embedding._offload_model_dtype = model_config.dtype
+        from vllm.model_executor.kernels.ple.gguf_packed_result import (
+            packed_result_layout,
+        )
+
+        self.ple_embedding._packed_result_layout = packed_result_layout(
+            f"{prefix}.ple_embedding"
+        )
+        if (
+            self.ple_embedding._packed_result_layout is not None
+            and not is_offload_process()
+        ):
+            import gguf
+
+            self.ple_embedding.register_buffer(
+                "_packed_result_codebook",
+                torch.tensor(gguf.quants.IQ4_NL.kvalues, dtype=torch.float32),
+                persistent=False,
+            )
+            self.ple_embedding.register_buffer(
+                "_packed_result_output",
+                torch.empty(
+                    (
+                        vllm_config.scheduler_config.max_num_batched_tokens,
+                        int(config.ple_embed_dim),
+                    ),
+                    dtype=torch.float16,
+                ),
+                persistent=False,
+            )
+        self._sm70_hcx_diagnostics = vllm_config.kernel_config.sm70_hcx_diagnostics
+        self.ple_embedding._sm70_hcx_diagnostics = self._sm70_hcx_diagnostics
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hc_hidden_size,
@@ -779,7 +2325,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
     def _get_embedding_weight_scale(self) -> torch.Tensor | None:
         embedding = getattr(self.ple_embedding, "ngram_embedding", None)
-        return getattr(embedding, "weight_scale", None)
+        weight_scale = getattr(embedding, "weight_scale", None)
+        if weight_scale is not None:
+            return weight_scale
+        return getattr(self.ple_embedding, "_offload_weight_scale", None)
 
     def _dequantize_embeddings(
         self,
@@ -788,6 +2337,21 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     ) -> torch.Tensor:
         """Dequantize PLE lookup output."""
 
+        if embeddings.dtype == torch.uint8:
+            weight_scale = self._get_embedding_weight_scale()
+            if weight_scale is None:
+                raise RuntimeError("FP8 PLE embedding is missing its global scale")
+            if weight_scale.device != embeddings.device:
+                raise RuntimeError(
+                    "FP8 PLE embedding scale must be on the output device"
+                )
+            output = torch.empty_like(embeddings, dtype=output_dtype)
+            torch.ops.vllm.qwen4_exp_ple_fp8_bytes_dequant(
+                embeddings,
+                weight_scale,
+                output,
+            )
+            return output
         if not is_fp8(embeddings):
             return embeddings
         weight_scale = self._get_embedding_weight_scale()
@@ -841,6 +2405,67 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         state_indices_tensor_d: torch.Tensor,
         has_initial_states_d: torch.Tensor | None,
     ) -> torch.Tensor:
+        has_initial_ok = has_initial_states_d is None or (
+            has_initial_states_d.numel() >= 1
+            and has_initial_states_d.is_cuda
+            and has_initial_states_d.is_contiguous()
+        )
+        if (
+            current_platform.is_device_capability((7, 0))
+            and x_d.shape == (1, 10240)
+            and x_d.dtype == torch.float16
+            and x_d.is_cuda
+            and x_d.is_contiguous()
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == 10240
+            and conv_state.shape[2] == 9
+            and conv_state.dtype == torch.float16
+            and conv_state.is_cuda
+            and conv_weights.shape == (10240, 4)
+            and conv_weights.dtype == torch.float16
+            and conv_weights.is_cuda
+            and conv_weights.is_contiguous()
+            and state_indices_tensor_d.numel() == 1
+            and state_indices_tensor_d.dtype in (torch.int32, torch.int64)
+            and state_indices_tensor_d.is_cuda
+            and state_indices_tensor_d.is_contiguous()
+            and has_initial_ok
+            and x_d.device
+            == conv_state.device
+            == conv_weights.device
+            == state_indices_tensor_d.device
+            and (
+                has_initial_states_d is None
+                or has_initial_states_d.device == x_d.device
+            )
+        ):
+            conv_output = torch.empty_like(x_d)
+            has_initial_ptr = (
+                state_indices_tensor_d
+                if has_initial_states_d is None
+                else has_initial_states_d
+            )
+            _qwen38_ple_m1_short_conv_kernel[(triton.cdiv(10240, 256),)](
+                x_d,
+                conv_state,
+                conv_weights,
+                conv_output,
+                state_indices_tensor_d,
+                has_initial_ptr,
+                STATE_STRIDE_0=conv_state.stride(0),
+                STATE_STRIDE_1=conv_state.stride(1),
+                STATE_STRIDE_2=conv_state.stride(2),
+                HAS_INITIAL=has_initial_states_d is not None,
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                HIDDEN_SIZE=10240,
+                BLOCK=256,
+                num_warps=4,
+            )
+            logger.info_once(
+                "SM70 Qwen3.8 fused M=1 PLE short-conv state path enabled."
+            )
+            return F.silu(conv_output)
+
         state_indices = state_indices_tensor_d.to(
             device=conv_state.device, dtype=torch.int64
         )
@@ -911,6 +2536,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         num_prefills: int,
         num_decode_tokens: int,
         num_prefill_tokens: int,
+        *,
+        output_start: int = 0,
+        output_rows: int | None = None,
     ) -> torch.Tensor:
         # ``non_spec_query_start_loc`` covers the non-spec (decode + prefill)
         # requests and equals ``query_start_loc`` when spec-decode is inactive.
@@ -927,7 +2555,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if has_initial_states_p is None:
             raise ValueError("has_initial_states_p is required for prefill short-conv")
 
-        output = torch.empty_like(x_p)
         q_starts = query_start_loc_p.to(torch.int64)
         if state_indices_tensor_p.numel() < num_prefills:
             raise ValueError(
@@ -942,24 +2569,73 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"need >= {num_prefills}."
             )
         if num_prefills == 0 or x_p.numel() == 0:
-            return output
+            result = torch.empty_like(x_p)
+            return _ple_output_rows(result, output_start, output_rows)
         lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
         if max_len <= 0:
-            return output
+            result = torch.empty_like(x_p)
+            return _ple_output_rows(result, output_start, output_rows)
 
         hidden_size = x_p.shape[1]
+        state_len = self.conv_state_len
+        if (
+            getattr(self, "_prefill_short_conv", False)
+            and current_platform.is_device_capability(70)
+            and hidden_size == 10240
+            and state_len == 9
+            and self.short_conv_dilation == 3
+            and conv_weights.shape == (hidden_size, 4)
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == hidden_size
+            and conv_state.shape[2] >= state_len
+            and x_p.stride(1) == 1
+            and all(
+                t.is_cuda and t.dtype == torch.float16
+                for t in (x_p, conv_state, conv_weights)
+            )
+            and all(
+                t.device == x_p.device
+                for t in (
+                    conv_state,
+                    conv_weights,
+                    q_starts,
+                    state_indices_tensor_p,
+                    has_initial_states_p,
+                )
+            )
+            and state_indices_tensor_p.is_contiguous()
+            and has_initial_states_p.is_contiguous()
+        ):
+            from vllm.model_executor.kernels.ple.short_conv import (
+                dilated_prefill_short_conv,
+            )
+
+            logger.info_once(
+                "Using SM70 PLE prefill convolution without padded history."
+            )
+            return dilated_prefill_short_conv(
+                x_p,
+                conv_state,
+                conv_weights,
+                q_starts,
+                state_indices_tensor_p[:num_prefills],
+                has_initial_states_p[:num_prefills],
+                max_len,
+                0,
+                self.short_conv_dilation,
+                NULL_BLOCK_ID,
+                token_tile=16,
+                output_start=output_start,
+                output_rows=output_rows,
+            )
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
         req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
         col_indices = positions - q_starts[req_indices]
-
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
 
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
@@ -971,65 +2647,186 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         has_initial = has_initial_states_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.bool
         )
-        if self.conv_state_len > 0:
-            if conv_state.shape[0] == 0:
-                state = conv_state.new_zeros(
-                    (num_prefills, hidden_size, self.conv_state_len),
-                    dtype=x_p.dtype,
-                )
-            else:
-                state = conv_state.index_select(0, state_indices)[
-                    ..., : self.conv_state_len
-                ].to(x_p.dtype)
+
+        chunk = self._short_conv_prefill_channel_chunk(
+            num_prefills, max_len, num_prefill_tokens, hidden_size
+        )
+        if chunk is not None:
+            result = self._short_conv_dilated_prefill_channel_chunks(
+                x_p=x_p,
+                conv_state=conv_state,
+                conv_weights=conv_weights,
+                state_indices=state_indices,
+                valid_state=valid_state,
+                has_initial=has_initial,
+                lengths=lengths,
+                req_indices=req_indices,
+                col_indices=col_indices,
+                num_prefills=num_prefills,
+                max_len=max_len,
+                chunk=chunk,
+            )
+            return _ple_output_rows(result, output_start, output_rows)
+
+        # Every [num_prefills, hidden, max_len] buffer here is as large as the
+        # whole prefill batch, and a batched step runs max_num_seqs full state
+        # blocks (4 x 1,600 tokens x 10,240 channels = 125 MiB each), a pattern
+        # the profiling run never takes. Keep at most two alive: pack the
+        # tokens straight into the channels-first history, take the next state
+        # before the convolution, and free each buffer as soon as it is spent.
+        history = x_p.new_zeros((num_prefills, hidden_size, state_len + max_len))
+        history[..., state_len:].transpose(1, 2)[req_indices, col_indices] = x_p
+        next_state = None
+        if state_len > 0 and conv_state.shape[0] > 0:
+            state = conv_state.index_select(0, state_indices)[..., :state_len].to(
+                x_p.dtype
+            )
             use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
-            initial_state = torch.where(
+            history[..., :state_len] = torch.where(
                 use_initial_mask,
                 state,
                 torch.zeros_like(state),
             )
-            history = torch.cat((initial_state, packed_tokens), dim=-1)
-        else:
-            history = packed_tokens
-
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
-        )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
-
-        token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
-        valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
-        valid_output_mask = valid_tokens & valid_state.to(device=x_p.device).view(
-            num_prefills, 1
-        )
-        conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
-
-        if self.conv_state_len > 0 and conv_state.shape[0] > 0:
             state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
                 num_prefills, 1, 1
             )
             state_offsets = torch.arange(
-                self.conv_state_len, device=history.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
+                state_len, device=history.device, dtype=torch.int64
+            ).view(1, 1, state_len)
             next_state = history.gather(
                 dim=2,
-                index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
+                index=(state_starts + state_offsets).expand(-1, hidden_size, -1),
             )
+
+        conv_output = F.conv1d(
+            history,
+            conv_weights.unsqueeze(1).contiguous(),
+            groups=hidden_size,
+            dilation=self.short_conv_dilation,
+        )
+        del history
+        F.silu(conv_output, inplace=True)
+        # Only whole rows of requests without a valid state are zeroed: padding
+        # columns past each request's length are never gathered below.
+        conv_output.masked_fill_(
+            ~valid_state.to(device=x_p.device).view(num_prefills, 1, 1), 0
+        )
+        output = conv_output.transpose(1, 2)[req_indices, col_indices]
+        del conv_output
+
+        if next_state is not None:
             # Write back without a host synchronization. Valid, non-empty rows
             # receive their new state; padding and zero-length rows keep the
             # current cache value.
             existing_state = conv_state.index_select(0, state_indices)
-            existing_base_state = existing_state[..., : self.conv_state_len]
+            existing_base_state = existing_state[..., :state_len]
             update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
             safe_next_state = torch.where(
                 update_mask.view(num_prefills, 1, 1),
                 next_state.to(conv_state.dtype),
                 existing_base_state,
             )
-            existing_state[..., : self.conv_state_len] = safe_next_state
+            existing_state[..., :state_len] = safe_next_state
+            conv_state.index_copy_(0, state_indices, existing_state)
+        return _ple_output_rows(output, output_start, output_rows)
+
+    def _short_conv_prefill_channel_chunk(
+        self,
+        num_prefills: int,
+        max_len: int,
+        num_prefill_tokens: int,
+        hidden_size: int,
+    ) -> int | None:
+        """Channel chunk width for the batched prefill short-conv, or None.
+
+        Padding every prefill to the longest one can make the packed history
+        several times larger than the step itself, e.g. long chunked prefills
+        next to short prompts. The profiling run never takes that shape, so at
+        max_num_seqs=8 one such step ran out of memory. Keep each padded buffer
+        at most half of one unpadded step by splitting channels; the
+        convolution is depthwise, so per-channel arithmetic is unchanged.
+        Long single prefills also need headroom: keep each temporary at most
+        a quarter of the step instead of retaining two full-sized buffers.
+        """
+        if num_prefills <= 0 or (num_prefills == 1 and max_len < 4096):
+            return None
+        per_channel = num_prefills * (self.conv_state_len + max_len)
+        divisor = 4 if num_prefills == 1 else 2
+        budget = (num_prefill_tokens + self.conv_state_len) * hidden_size // divisor
+        if per_channel * hidden_size <= budget:
+            return None
+        chunk = max(64, (budget // per_channel) // 64 * 64)
+        return chunk if chunk < hidden_size else None
+
+    def _short_conv_dilated_prefill_channel_chunks(
+        self,
+        x_p: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        state_indices: torch.Tensor,
+        valid_state: torch.Tensor,
+        has_initial: torch.Tensor,
+        lengths: torch.Tensor,
+        req_indices: torch.Tensor,
+        col_indices: torch.Tensor,
+        num_prefills: int,
+        max_len: int,
+        chunk: int,
+    ) -> torch.Tensor:
+        """Same result as the packed prefill path, ``chunk`` channels at a time."""
+        hidden_size = x_p.shape[1]
+        state_len = self.conv_state_len
+        output = torch.empty_like(x_p)
+        have_state = state_len > 0 and conv_state.shape[0] > 0
+        if have_state:
+            # Snapshot before any write-back; also the base of the write-back.
+            existing_state = conv_state.index_select(0, state_indices)
+            use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
+            state_starts = lengths.to(device=x_p.device, dtype=torch.int64).view(
+                num_prefills, 1, 1
+            )
+            state_offsets = torch.arange(
+                state_len, device=x_p.device, dtype=torch.int64
+            ).view(1, 1, state_len)
+            next_state = x_p.new_empty((num_prefills, hidden_size, state_len))
+        invalid_rows = ~valid_state.to(device=x_p.device).view(num_prefills, 1, 1)
+        weights = conv_weights.unsqueeze(1).contiguous()
+        for c0 in range(0, hidden_size, chunk):
+            c1 = min(hidden_size, c0 + chunk)
+            width = c1 - c0
+            history = x_p.new_zeros((num_prefills, width, state_len + max_len))
+            history[..., state_len:].transpose(1, 2)[req_indices, col_indices] = x_p[
+                :, c0:c1
+            ]
+            if have_state:
+                state = existing_state[:, c0:c1, :state_len].to(x_p.dtype)
+                history[..., :state_len] = torch.where(
+                    use_initial_mask, state, torch.zeros_like(state)
+                )
+                next_state[:, c0:c1] = history.gather(
+                    dim=2,
+                    index=(state_starts + state_offsets).expand(-1, width, -1),
+                )
+            conv_output = F.conv1d(
+                history,
+                weights[c0:c1],
+                groups=width,
+                dilation=self.short_conv_dilation,
+            )
+            del history
+            F.silu(conv_output, inplace=True)
+            conv_output.masked_fill_(invalid_rows, 0)
+            output[:, c0:c1] = conv_output.transpose(1, 2)[req_indices, col_indices]
+            del conv_output
+        if have_state:
+            existing_base_state = existing_state[..., :state_len]
+            update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
+            safe_next_state = torch.where(
+                update_mask.view(num_prefills, 1, 1),
+                next_state.to(conv_state.dtype),
+                existing_base_state,
+            )
+            existing_state[..., :state_len] = safe_next_state
             conv_state.index_copy_(0, state_indices, existing_state)
         return output
 
@@ -1058,6 +2855,44 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         """
         num_reqs = spec_state_indices_tensor.numel()
         hidden_size = x_spec.size(-1)
+        if (
+            layer_policy().value("ple_spec_conv")
+            and 1 <= num_reqs <= 8
+            and spec_query_len == 5
+            and self.conv_state_len == 9
+            and self.short_conv_dilation == 3
+            and 1 <= x_spec.shape[0] <= 40
+            and x_spec.shape[1] == 10240
+            and x_spec.is_cuda
+            and x_spec.dtype == torch.float16
+            and x_spec.is_contiguous()
+            and conv_weights.shape == (10240, 4)
+            and conv_weights.dtype == torch.float16
+            and conv_weights.is_contiguous()
+            and conv_state.shape[1:] == (10240, 13)
+            and conv_state.dtype in (torch.float16, torch.float32)
+            and all(
+                t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
+                for t in (
+                    spec_state_indices_tensor,
+                    spec_query_start_loc,
+                    num_accepted_tokens,
+                )
+            )
+            and current_platform.is_device_capability((7, 0))
+        ):
+            output = torch.empty_like(x_spec)
+            torch.ops._C.qwen38_ple_spec_sm70_out(
+                output,
+                conv_state,
+                x_spec,
+                conv_weights,
+                spec_state_indices_tensor,
+                spec_query_start_loc,
+                num_accepted_tokens,
+            )
+            logger.info_once("SM70 MTP4 PLE rollback/conv/SiLU/state fusion enabled.")
+            return output
         # Use a fixed packing width instead of synchronizing on lengths.max().
         max_len = spec_query_len
         # Full CUDA graphs can pad these buffers. Only the first num_reqs
@@ -1256,7 +3091,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                         num_prefill_tokens=num_prefill_tokens,
                     )
                 )
-                conv_out_non_spec = torch.vstack(non_spec_parts)
+                # A single part is already the result; vstack would copy it.
+                conv_out_non_spec = (
+                    non_spec_parts[0]
+                    if len(non_spec_parts) == 1
+                    else torch.vstack(non_spec_parts)
+                )
             else:
                 conv_out_non_spec = self._short_conv_dilated_decode_batched(
                     x_d=x_non_spec,
@@ -1282,11 +3122,19 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             return x
         return conv_out_non_spec
 
-    def _short_conv(self, inputs: torch.Tensor) -> torch.Tensor:
+    def _short_conv(
+        self,
+        inputs: torch.Tensor,
+        *,
+        output_start: int = 0,
+        output_rows: int | None = None,
+    ) -> torch.Tensor:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return self._short_conv_fallback(inputs)
+            return _ple_output_rows(
+                self._short_conv_fallback(inputs), output_start, output_rows
+            )
 
         if not isinstance(attn_metadata, dict):
             raise RuntimeError(
@@ -1321,12 +3169,32 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                     f"expect at least {state_capacity}."
                 )
             conv_state = conv_state[..., -state_capacity:]
-        return self._short_conv_dilated_dispatch(
+        if (
+            output_rows is not None
+            and layer_attn_metadata.num_prefills > 0
+            and layer_attn_metadata.num_decodes == 0
+            and layer_attn_metadata.spec_sequence_masks is None
+        ):
+            assert layer_attn_metadata.state_indices_tensor is not None
+            return self._short_conv_dilated_prefill_batched(
+                inputs[: layer_attn_metadata.num_actual_tokens],
+                layer_attn_metadata,
+                conv_state,
+                conv_weights.to(dtype=inputs.dtype),
+                layer_attn_metadata.state_indices_tensor,
+                layer_attn_metadata.num_prefills,
+                0,
+                layer_attn_metadata.num_prefill_tokens,
+                output_start=output_start,
+                output_rows=output_rows,
+            )
+        result = self._short_conv_dilated_dispatch(
             inputs,
             layer_attn_metadata,
             conv_state,
             conv_weights.to(dtype=inputs.dtype),
         )
+        return _ple_output_rows(result, output_start, output_rows)
 
     def forward(
         self,
@@ -1334,32 +3202,84 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        hc_sequence_parallel: bool = False,
     ) -> torch.Tensor:
+        diagnostic = self._sm70_hcx_diagnostics
         input_ids = input_ids.reshape(-1)
-        if input_ids.shape[0] != hidden_states.shape[0]:
+        input_ids = snapshot_ple_diagnostic(
+            input_ids, self.prefix + ":02_input_ids", diagnostic
+        )
+        expected_rows = (
+            (input_ids.shape[0] + 3) // 4
+            if hc_sequence_parallel
+            else input_ids.shape[0]
+        )
+        if expected_rows != hidden_states.shape[0]:
             raise ValueError(
-                "PLE expects input_ids and hidden_states to have the same "
-                f"token length, got {input_ids.shape[0]} and "
-                f"{hidden_states.shape[0]}"
+                f"PLE expects {expected_rows} hidden rows for "
+                f"{input_ids.shape[0]} query tokens, got {hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self.ple_embedding(
+            hidden_states,
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
+        embeddings = snapshot_ple_diagnostic(
+            embeddings, self.prefix + ":02_embeddings", diagnostic
+        )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+        if hc_sequence_parallel:
+            from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+
+            # Lookup/offload keeps its full-row ABI. Projection, gate and
+            # grouped norms are row independent and need only this TP owner.
+            embeddings = hc_sequence_shard_rows(embeddings)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
+        key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
+        value = snapshot_ple_diagnostic(value, self.prefix + ":04_value", diagnostic)
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
         key = self._apply_norm(self.norm_key, key)
         query = self._apply_norm(self.norm_query, query)
+        key = snapshot_ple_diagnostic(key, self.prefix + ":05_key_norm", diagnostic)
+        query = snapshot_ple_diagnostic(
+            query, self.prefix + ":06_query_norm", diagnostic
+        )
         gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
         gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
         gated_value = gate * value.unsqueeze(-2)
         normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
-        conv_output = torch.zeros_like(normalized)
-        torch.ops.vllm.qwen4_exp_ple_short_conv(
-            normalized,
-            conv_output,
-            self.prefix,
+        normalized = snapshot_ple_diagnostic(
+            normalized, self.prefix + ":07_conv_input", diagnostic
+        )
+        if hc_sequence_parallel:
+            from vllm.distributed import get_tp_group
+
+            # Convolution and its commit retain the original complete query,
+            # segment metadata, causal history and state owner. Padding is not
+            # committed; the returned residual is local again.
+            normalized = get_tp_group().all_gather(normalized, dim=0)[
+                : input_ids.shape[0]
+            ]
+        if hc_sequence_parallel:
+            # Each TP owner emits only its residual rows. The existing family
+            # still reads the full causal input and commits every base state.
+            conv_output = torch.ops.vllm.qwen4_exp_ple_short_conv_rows(
+                normalized, self.prefix, get_tp_group().rank_in_group, 4
+            )
+        else:
+            conv_output = torch.zeros_like(normalized)
+            torch.ops.vllm.qwen4_exp_ple_short_conv(
+                normalized,
+                conv_output,
+                self.prefix,
+            )
+        conv_output = snapshot_ple_diagnostic(
+            conv_output, self.prefix + ":08_conv_output", diagnostic
         )
         return gated_value.flatten(-2) + conv_output
 
@@ -1382,15 +3302,111 @@ def qwen4_exp_ple_short_conv_fake(
     return
 
 
+def qwen4_exp_ple_short_conv_result(
+    inputs: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    result = layer._short_conv(inputs)
+    if result.shape == inputs.shape:
+        return result
+    # Keep the old initialized-padding contract for padded or profiling calls.
+    output = torch.zeros_like(inputs)
+    output[: result.shape[0]].copy_(result)
+    return output
+
+
+def qwen4_exp_ple_short_conv_result_fake(inputs, layer_name):
+    return torch.empty_like(inputs)
+
+
+def _ple_output_rows(result, start, rows):
+    if rows is None:
+        return result
+    output = result.new_zeros((rows, result.shape[1]))
+    count = max(0, min(rows, result.shape[0] - start))
+    output[:count].copy_(result[start : start + count])
+    return output
+
+
+def qwen4_exp_ple_short_conv_rows(
+    inputs: torch.Tensor, layer_name: str, rank: int, parts: int
+) -> torch.Tensor:
+    if parts < 1 or not 0 <= rank < parts:
+        raise ValueError("PLE output owner must be inside its partition range")
+    rows = (inputs.shape[0] + parts - 1) // parts
+    layer = get_forward_context().no_compile_layers[layer_name]
+    return layer._short_conv(inputs, output_start=rank * rows, output_rows=rows)
+
+
+def qwen4_exp_ple_short_conv_rows_fake(inputs, layer_name, rank, parts):
+    if parts < 1 or not 0 <= rank < parts:
+        raise ValueError("PLE output owner must be inside its partition range")
+    return inputs.new_empty(((inputs.shape[0] + parts - 1) // parts, inputs.shape[1]))
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_short_conv_rows",
+    op_func=qwen4_exp_ple_short_conv_rows,
+    fake_impl=qwen4_exp_ple_short_conv_rows_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_short_conv_result",
+    op_func=qwen4_exp_ple_short_conv_result,
+    fake_impl=qwen4_exp_ple_short_conv_result_fake,
+)
+
+
+def qwen4_exp_compute_ple_ngram_ids(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Compute request-dependent PLE IDs outside PIECEWISE CUDA graphs."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    ngram_ids = layer.ple_embedding.compute_ngram_ids(
+        input_ids,
+        query_start_loc,
+        ngram_context,
+    )
+    output.copy_(ngram_ids)
+
+
+def qwen4_exp_compute_ple_ngram_ids_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_pinned_gather(
     input_ids: torch.Tensor,
     output: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_ptr: int,
+    layer_name: str,
+    use_host_table: bool,
     embedding_dim: int,
 ) -> None:
     if input_ids.numel() == 0:
         return
+    # Resolve the table pointer here, inside the opaque op, so that neither
+    # torch.compile nor a serialized AOT artifact ever sees the address.
+    table = get_forward_context().no_compile_layers[layer_name]
+    if use_host_table:
+        device_index = (
+            torch.accelerator.current_device_index()
+            if input_ids.device.index is None
+            else input_ids.device.index
+        )
+        weight_ptr = table._accelerator_weight_ptrs[device_index]
+    else:
+        weight_ptr = table._device_table_ptr
     block_d = triton.next_power_of_2(embedding_dim)
     _gather_ple_fp8_from_pinned_kernel[(input_ids.numel(),)](
         weight_ptr,
@@ -1407,10 +3423,49 @@ def qwen4_exp_ple_pinned_gather_fake(
     input_ids: torch.Tensor,
     output: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_ptr: int,
+    layer_name: str,
+    use_host_table: bool,
     embedding_dim: int,
 ) -> None:
     return
+
+
+def qwen4_exp_ple_fp8_bytes_dequant(
+    input_bytes: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    if input_bytes.dtype != torch.uint8:
+        raise TypeError(
+            f"Qwen4Exp PLE byte dequant expects uint8 input, got {input_bytes.dtype}"
+        )
+    if input_bytes.numel() == 0:
+        return
+    block = 1024
+    _dequantize_ple_fp8_bytes_kernel[(triton.cdiv(input_bytes.numel(), block),)](
+        input_bytes,
+        weight_scale,
+        output,
+        input_bytes.numel(),
+        BLOCK=block,
+        num_warps=4,
+    )
+
+
+def qwen4_exp_ple_fp8_bytes_dequant_fake(
+    input_bytes: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_compute_ple_ngram_ids",
+    op_func=qwen4_exp_compute_ple_ngram_ids,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_compute_ple_ngram_ids_fake,
+)
 
 
 direct_register_custom_op(
@@ -1418,6 +3473,14 @@ direct_register_custom_op(
     op_func=qwen4_exp_ple_pinned_gather,
     mutates_args=["output"],
     fake_impl=qwen4_exp_ple_pinned_gather_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_fp8_bytes_dequant",
+    op_func=qwen4_exp_ple_fp8_bytes_dequant,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_fp8_bytes_dequant_fake,
 )
 
 

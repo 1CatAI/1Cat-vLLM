@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -99,6 +99,16 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+    dcp_sharded: bool = field(default=False, kw_only=True)
+    """Whether context parallel ranks own disjoint token slots in this cache."""
+
+    def global_block_size(
+        self, dcp_world_size: int = 1, pcp_world_size: int = 1
+    ) -> int:
+        """Token span represented by one physical block on this rank."""
+        if self.dcp_sharded:
+            return self.block_size * dcp_world_size * pcp_world_size
+        return self.block_size
 
     @property
     def prefix_cacheable(self) -> bool:
@@ -151,11 +161,48 @@ class KVCacheSpec:
 
 @dataclass(frozen=True, kw_only=True)
 class AttentionSpec(KVCacheSpec):
+    dcp_sharded: bool = True
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+
+    def copy_with_new_block_size(self, block_size: int) -> Self:
+        """
+        Create a new KVCacheSpec from self but replacing the block size.
+
+        A padded physical page is a byte count, not a token count, so growing
+        the logical block grows the payload underneath it. Keep the padding at
+        or above the new payload; otherwise the returned spec fails its own
+        ``page_size_padded >= real_page_size`` invariant the first time
+        ``page_size_bytes`` is read. (A MambaSpec page does not depend on the
+        block size, so only attention pages need this.)
+        """
+        new_spec = replace(self, block_size=block_size)
+        padded = self.page_size_padded
+        if padded is not None and new_spec.real_page_size_bytes > padded:
+            new_spec = replace(new_spec, page_size_padded=new_spec.real_page_size_bytes)
+        return new_spec
+
+    def layout_cache_dtype(self, configured_dtype: str) -> str:
+        """Bind carrier shape to this spec's declared quantization layout.
+
+        Target and draft share an allocator but may use different codecs. This
+        compatibility spelling is only for backend shape/block-dim APIs; each
+        attention implementation retains its independently bound reader codec.
+        """
+        if get_kv_quant_mode(configured_dtype) == self.kv_quant_mode:
+            return configured_dtype
+        # Keep one entry per KVQuantMode: a missing spelling raises KeyError
+        # during KV allocation, far from the mode that was actually requested.
+        return {
+            KVQuantMode.NONE: "auto",
+            KVQuantMode.FP8_PER_TENSOR: "fp8",
+            KVQuantMode.INT8_PER_TOKEN_HEAD: "int8_per_token_head",
+            KVQuantMode.FP8_PER_TOKEN_HEAD: "fp8_per_token_head",
+            KVQuantMode.NVFP4: "nvfp4",
+        }[self.kv_quant_mode]
 
     @property
     def page_size_bytes(self) -> int:
@@ -206,6 +253,9 @@ class FullAttentionSpec(AttentionSpec):
 
     head_size_v: int = None  # type: ignore[assignment]
 
+    host_backed: bool = False
+    """Allocate authoritative attention pages in pinned host memory."""
+
     sliding_window: int | None = None
     """
     Default to None for not using sliding window attention.
@@ -222,7 +272,7 @@ class FullAttentionSpec(AttentionSpec):
         pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         # Note(hc): each dcp rank only need save
         # (max_model_len//dcp_world_size) tokens locally.
-        if dcp_world_size * pcp_world_size > 1:
+        if self.dcp_sharded and dcp_world_size * pcp_world_size > 1:
             max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
@@ -261,6 +311,8 @@ class FullAttentionSpec(AttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            host_backed=specs[0].host_backed,
+            dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -305,6 +357,22 @@ class FullAttentionSpec(AttentionSpec):
             * (self.head_size + self.head_size_v)
             * get_dtype_size(self.dtype)
         )
+
+
+def _bind_cache_dtype_codec(spec: MLAAttentionSpec | SlidingWindowMLASpec):
+    # An MLA spec that names its cache dtype stores that codec. The KV
+    # allocator shapes every carrier by the codec a spec declares
+    # (AttentionSpec.layout_cache_dtype), so a packed fp8 page left at NONE
+    # would be reshaped as a 16-bit one of the wrong width.
+    if spec.cache_dtype_str is None:
+        return
+    codec = get_kv_quant_mode(spec.cache_dtype_str)
+    if spec.kv_quant_mode not in (KVQuantMode.NONE, codec):
+        raise ValueError(
+            f"kv_quant_mode {spec.kv_quant_mode.name} contradicts "
+            f"cache_dtype_str {spec.cache_dtype_str!r}"
+        )
+    object.__setattr__(spec, "kv_quant_mode", codec)
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
@@ -353,6 +421,7 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        _bind_cache_dtype_codec(self)
         _apply_alignment_padding(self)
 
     @property
@@ -387,6 +456,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
+        assert len({spec.dcp_sharded for spec in specs}) == 1
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
@@ -400,6 +470,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         return cls(
             block_size=specs[0].block_size,
+            dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -452,6 +523,7 @@ class PrefixAnchoredSWASpec(FullAttentionSpec):
         base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
         return cls(
             block_size=base.block_size,
+            dcp_sharded=base.dcp_sharded,
             num_kv_heads=base.num_kv_heads,
             head_size=base.head_size,
             head_size_v=base.head_size_v,
@@ -588,6 +660,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     model_version: str | None = None
 
     def __post_init__(self):
+        _bind_cache_dtype_codec(self)
         _apply_alignment_padding(self)
 
     @property
@@ -615,6 +688,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             "All attention layers in the same KV cache group must be "
             "SlidingWindowMLASpec."
         )
+        assert len({spec.dcp_sharded for spec in specs}) == 1
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
@@ -631,6 +705,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
         return cls(
             block_size=specs[0].block_size,
+            dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -647,9 +722,9 @@ class KpoolTailSpec(SlidingWindowSpec):
     """Per-request circular cache for an incomplete GLM KPool group."""
 
     def max_admission_blocks_per_request(
-        self, max_num_batched_tokens: int, max_model_len: int
+        self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:
-        del max_num_batched_tokens, max_model_len
+        del max_in_flight_tokens, max_model_len
         return 1
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
@@ -750,6 +825,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -785,6 +861,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+    dcp_sharded: bool = field(default=True, kw_only=True)
 
     @property
     def prefix_cacheable(self) -> bool:
@@ -802,11 +879,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return max_num_pages * self.page_size_bytes
 
     @classmethod
-    def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
+    def is_uniform_type(
+        cls, kv_cache_specs: dict[str, KVCacheSpec], dcp_world_size: int = 1
+    ) -> bool:
         """
         Whether all layers have the same type of KV cache spec.
         """
-        block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
+        block_sizes = {
+            spec.global_block_size(dcp_world_size) for spec in kv_cache_specs.values()
+        }
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
             return False
@@ -858,14 +939,21 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             )
 
     @classmethod
-    def from_specs(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> Self | None:
+    def from_specs(
+        cls, kv_cache_specs: dict[str, KVCacheSpec], dcp_world_size: int = 1
+    ) -> Self | None:
         """
         Return a SameTypeKVCacheSpecs object if all layers have the same type
         of KV cache spec. Return None if not.
         """
-        if cls.is_uniform_type(kv_cache_specs):
-            block_size = next(iter(kv_cache_specs.values())).block_size
-            return cls(block_size=block_size, kv_cache_specs=kv_cache_specs)
+        if cls.is_uniform_type(kv_cache_specs, dcp_world_size):
+            specs = list(kv_cache_specs.values())
+            representative = next((s for s in specs if s.dcp_sharded), specs[0])
+            return cls(
+                block_size=representative.block_size,
+                kv_cache_specs=kv_cache_specs,
+                dcp_sharded=representative.dcp_sharded,
+            )
         else:
             return None
 
@@ -937,6 +1025,15 @@ class KVCacheTensor:
 
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
+    packed_members: list[str] | None = None
+    """Attention layers that split each physical block of this tensor,
+    interleaved one kernel block at a time in this order. ``None`` means at
+    most one attention layer owns each block."""
+
+    host_backed: bool = False
+    """Pinned host allocation exposed through a lifetime-owning CUDA view."""
+    physical_num_blocks: int | None = None
+    """A fixed physical state pool independent of logical history capacity."""
 
 
 @dataclass
@@ -972,6 +1069,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    device_state_blocks: int = 0
+    device_state_group_ids: tuple[int, ...] = ()
 
     @property
     def has_mamba_layers(self) -> bool:

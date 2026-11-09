@@ -115,6 +115,53 @@ def _dflash_rmsnorm_sm70_kernel(
     tl.store(output_ptr + row_offsets, output, mask=mask)
 
 
+@triton.jit
+def _dflash_layered_rmsnorm_sm70_kernel(
+    output_ptr,
+    input_ptr,
+    weight_ptr,
+    rows_per_layer,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """RMSNorm with one independent weight row per leading layer."""
+    row = tl.program_id(0).to(tl.int64)
+    layer = row // rows_per_layer
+    lanes = tl.arange(0, BLOCK_SIZE)
+    row_base = row * n_cols
+    weight_base = layer * n_cols
+
+    # Mirror vLLM's CUDA RMSNorm reduction: each lane accumulates one aligned
+    # 16-byte vector, then the lane partials are reduced. Besides preserving
+    # its rounding topology, this uses only 16 lanes for a 128-wide FP16 head.
+    variance = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for item in tl.static_range(0, VEC_SIZE):
+        offsets = lanes * VEC_SIZE + item
+        mask = offsets < n_cols
+        value = tl.load(input_ptr + row_base + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        variance += value * value
+    variance = tl.sum(variance, axis=0) / n_cols
+    inv_rms = tl.rsqrt(variance + eps)
+    for item in tl.static_range(0, VEC_SIZE):
+        offsets = lanes * VEC_SIZE + item
+        mask = offsets < n_cols
+        value = tl.load(input_ptr + row_base + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        layer_weight = tl.load(
+            weight_ptr + weight_base + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        tl.store(
+            output_ptr + row_base + offsets,
+            value * inv_rms * layer_weight,
+            mask=mask,
+        )
+
+
 def _num_warps(n_cols: int) -> int:
     return max(min(triton.next_power_of_2(triton.cdiv(n_cols, 256)), 16), 4)
 
@@ -204,6 +251,78 @@ def dflash_scale_output_sm70(
         residual_scale=residual_scale,
         BLOCK_SIZE=block_size,
         num_warps=_num_warps(n_cols),
+    )
+    return output
+
+
+def dflash_layered_rms_norm_sm70(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Normalize ``[layers, ..., hidden]`` with one launch on SM70.
+
+    The stable vLLM RMSNorm ABI only learned two-dimensional grouped weights
+    recently. Older installed extensions silently reuse weight row zero for
+    every layer, which destroys DFlash context K accuracy. This kernel keeps
+    the grouped fast path independent of the installed extension version.
+    """
+    if input_.ndim < 2 or weight.ndim != 2:
+        raise ValueError(
+            "DFlash layered RMSNorm expects [layers, ..., hidden] input and "
+            f"[layers, hidden] weight, got {tuple(input_.shape)} and "
+            f"{tuple(weight.shape)}."
+        )
+    if input_.shape[0] != weight.shape[0] or input_.shape[-1] != weight.shape[1]:
+        raise ValueError(
+            "DFlash layered RMSNorm shape mismatch: "
+            f"input={tuple(input_.shape)}, weight={tuple(weight.shape)}."
+        )
+    if input_.dtype != weight.dtype:
+        raise ValueError(
+            "DFlash layered RMSNorm requires matching input and weight dtypes, "
+            f"got {input_.dtype} and {weight.dtype}."
+        )
+
+    if not input_.is_cuda:
+        normalized = input_.float() * torch.rsqrt(
+            input_.float().square().mean(dim=-1, keepdim=True) + eps
+        )
+        weight_view = weight.view(
+            weight.shape[0], *([1] * (input_.ndim - 2)), weight.shape[1]
+        )
+        return (normalized * weight_view.float()).to(input_.dtype)
+
+    if input_.dtype != torch.float16:
+        raise ValueError(
+            "DFlash SM70 layered RMSNorm requires FP16 CUDA transport, "
+            f"got {input_.dtype}."
+        )
+    if not input_.is_contiguous():
+        input_ = input_.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
+    n_cols = input_.shape[-1]
+    num_layers = input_.shape[0]
+    n_rows = input_.numel() // n_cols
+    rows_per_layer = n_rows // num_layers
+    output = torch.empty_like(input_)
+    vec_size = 8
+    while n_cols % vec_size:
+        vec_size //= 2
+    block_size = triton.next_power_of_2(triton.cdiv(n_cols, vec_size))
+    num_warps = max(min(triton.cdiv(block_size, 32), 8), 1)
+    _dflash_layered_rmsnorm_sm70_kernel[(n_rows,)](
+        output,
+        input_,
+        weight,
+        rows_per_layer,
+        n_cols=n_cols,
+        eps=eps,
+        VEC_SIZE=vec_size,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
     )
     return output
 

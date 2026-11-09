@@ -1,3 +1,4 @@
+#include "flash_v100_policy.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -54,16 +55,6 @@ using namespace nvcuda::wmma;
 #define BLOCK_M_256_LOW_SMEM 16
 #define BLOCK_N_256_LOW_SMEM 32
 #define WARPS_256_LOW_SMEM 16
-
-inline bool env_flag_enabled(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw != nullptr && std::strcmp(raw, "0") != 0;
-}
-
-inline bool env_flag_enabled_default_on(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw == nullptr || std::strcmp(raw, "0") != 0;
-}
 
 template <int D, bool LOW_SMEM = false>
 struct KernelConfig {
@@ -907,9 +898,10 @@ void launcher_flash_attention_forward(
     bool is_causal, bool scalar_pv, int window_size_left, int window_size_right,
     cudaStream_t stream) {
   if constexpr (D == 256) {
-    const bool use_wmma_qk =
-        env_flag_enabled_default_on("VLLM_FLASH_V100_DENSE_D256_WMMA_QK");
-    if (env_flag_enabled("VLLM_FLASH_V100_DENSE_D256_LOW_SMEM")) {
+    const bool use_wmma_qk = flash_v100::policy::value(
+        flash_v100::policy::Field::dense_d256_wmma_qk_default_on);
+    if (flash_v100::policy::value(
+            flash_v100::policy::Field::dense_d256_low_smem_off)) {
       if (use_wmma_qk) {
         launcher_flash_attention_forward_impl<D, true, true>(
             Q, K, V, Out, softmax_lse, softmax_scale, is_causal, scalar_pv,
@@ -1083,9 +1075,8 @@ std::vector<at::Tensor> flash_attention_forward(
   auto props = at::cuda::getCurrentDeviceProperties();
   bool sm70 = props->major == 7 && props->minor == 0;
   TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
-  const char* scalar_pv_env = std::getenv("VLLM_FLASH_V100_PREFILL_SCALAR_PV");
-  const bool scalar_pv = scalar_pv_env != nullptr && scalar_pv_env[0] != '\0' &&
-                         scalar_pv_env[0] != '0';
+  const bool scalar_pv =
+      flash_v100::policy::value(flash_v100::policy::Field::prefill_scalar_pv);
 
   switch (D) {
     case 16:

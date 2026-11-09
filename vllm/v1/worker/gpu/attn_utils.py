@@ -14,6 +14,12 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.ops.gdn_state import (
+    CommonGDNSpecMetadata as CommonGDNSpecMetadata,
+)
+from vllm.v1.attention.ops.gdn_state import (
+    compute_common_gdn_attn_metadata as _compute_gdn_metadata,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -25,9 +31,13 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
+    allocate_host_kv_cache_pool,
     bind_kv_cache,
+    compressed_kernel_block_size,
     prepare_kernel_block_sizes,
 )
+
+compute_common_gdn_attn_metadata = _compute_gdn_metadata
 
 
 @dataclass(frozen=True)
@@ -150,8 +160,10 @@ def init_attn_backend(
 def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
 ):
-    kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+    kv_cache_raw_tensors = allocate_host_kv_cache_pool(kv_cache_config, device)
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+        if kv_cache_tensor.host_backed:
+            continue
         tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
@@ -166,12 +178,25 @@ def _allocate_kv_cache(
     return kv_cache_raw_tensors
 
 
+def _packed_attention_members(
+    kv_cache_config: KVCacheConfig,
+) -> dict[str, tuple[int, int]]:
+    """Map each packed attention layer to (member index, member count)."""
+    packed: dict[str, tuple[int, int]] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        members = getattr(tensor, "packed_members", None) or []
+        for index, layer_name in enumerate(members):
+            packed[layer_name] = (index, len(members))
+    return packed
+
+
 def _reshape_kv_cache(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, torch.Tensor],
     cache_dtype: str,
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
+    packed_members: dict[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     kv_caches: dict[str, Any] = {}
     has_attn, has_mamba = False, False
@@ -181,10 +206,21 @@ def _reshape_kv_cache(
             continue
 
         kv_cache_spec = group.kv_cache_spec
-        if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-            # use storage_block_size as the kernel block size for groups
-            # that apply a compression on block size (eg. DeepSeek V4).
-            kernel_block_size = kv_cache_spec.storage_block_size
+        if (
+            isinstance(kv_cache_spec, AttentionSpec)
+            and kv_cache_spec.storage_block_size != kv_cache_spec.block_size
+        ):
+            uses_physical_block_table = (
+                group.backend.get_builder_cls().uses_physical_block_table
+            )
+            # Paged-MQA indexers consume 32/64-entry virtual pages inside the
+            # compressed storage block. Backends with physical block tables
+            # (for example QSA side caches) address the whole storage block.
+            kernel_block_size = (
+                kv_cache_spec.storage_block_size
+                if uses_physical_block_table
+                else compressed_kernel_block_size(kv_cache_spec)
+            )
         else:
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
 
@@ -194,8 +230,12 @@ def _reshape_kv_cache(
                 continue
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            packed = (packed_members or {}).get(layer_name)
+            member_index, member_count = packed if packed is not None else (0, 1)
+            # A packed physical block holds one page of every member.
+            block_bytes = kv_cache_spec.page_size_bytes * member_count
+            assert kv_raw_tensor.numel() % block_bytes == 0
+            num_blocks = kv_raw_tensor.numel() // block_bytes
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
@@ -208,7 +248,7 @@ def _reshape_kv_cache(
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=kv_cache_spec.layout_cache_dtype(cache_dtype),
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -226,7 +266,35 @@ def _reshape_kv_cache(
 
                 dtype = kv_cache_spec.dtype
                 kv_tensor = kv_raw_tensor.view(dtype)
-                if kv_cache_spec.page_size_padded is not None:
+                if packed is not None:
+                    if kv_cache_spec.page_size_padded is not None:
+                        raise ValueError("Packed attention pages cannot be padded")
+                    if inv_order[0] != 0:
+                        raise ValueError(
+                            "Packed attention pages need the block dimension "
+                            "outermost in physical memory"
+                        )
+                    # Members interleave one kernel block at a time, so member
+                    # j's kernel block k starts (k * count + j) kernel blocks
+                    # into the tensor: a uniform stride of `count` kernel
+                    # blocks with an offset of j. That holds across physical
+                    # block boundaries because each block holds `count` pages.
+                    # A meta tensor gives the strides without allocating.
+                    strides = list(torch.empty(kv_cache_shape, device="meta").stride())
+                    kernel_block_numel = strides[0]
+                    strides[0] = kernel_block_numel * member_count
+                    kv_cache = torch.as_strided(
+                        kv_tensor,
+                        size=kv_cache_shape,
+                        stride=tuple(strides),
+                        storage_offset=kernel_block_numel * member_index,
+                    )
+                elif kv_cache_spec.page_size_padded is not None:
+                    if kernel_num_blocks != num_blocks:
+                        raise ValueError(
+                            "Virtually split compressed KV caches cannot use "
+                            "padded physical pages"
+                        )
                     # Use strided view to handle page_size_bytes that
                     # include padding. This follows the same pattern as
                     # MambaSpec handling in gpu_model_runner.py.
@@ -279,6 +347,7 @@ def _reshape_kv_cache(
             kv_caches=kv_caches,
             kernel_block_sizes=kernel_block_sizes,
             cache_dtype=cache_dtype,
+            packed_members=packed_members,
         )
 
     # Map any sharing layers to their target layer's KV cache.
@@ -293,6 +362,7 @@ def _update_hybrid_attention_layout(
     kv_caches: dict[str, Any],
     kernel_block_sizes: list[int],
     cache_dtype: str,
+    packed_members: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
@@ -305,7 +375,7 @@ def _update_hybrid_attention_layout(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=kv_cache_spec.layout_cache_dtype(cache_dtype),
         )
         # if the first dim of the kvcache's layout is already num_blocks, continue
         if block_dim == 0:
@@ -320,6 +390,10 @@ def _update_hybrid_attention_layout(
             if layer_name not in kv_caches:
                 # Shared layer — will be aliased to its target after this pass.
                 continue
+            if layer_name in (packed_members or {}):
+                raise ValueError(
+                    "Packed attention pages need the block dimension first"
+                )
 
             kv_cache = kv_caches[layer_name]
             if kv_cache.shape[0] == 2:
@@ -358,6 +432,7 @@ def init_kv_cache(
         kernel_block_sizes=kernel_block_sizes,
         cache_dtype=cache_dtype,
         shared_kv_cache_layers=shared_kv_cache_layers,
+        packed_members=_packed_attention_members(kv_cache_config),
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches
@@ -372,159 +447,6 @@ def build_slot_mappings_by_layer(
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
     return slot_mappings_by_layer
-
-
-@dataclass(frozen=True)
-class CommonGDNSpecMetadata:
-    """Batch-level GDN speculative metadata shared by every cache group."""
-
-    num_prefills: int
-    num_prefill_tokens: int
-    num_decodes: int
-    num_decode_tokens: int
-    num_spec_decodes: int
-    num_spec_decode_tokens: int
-    spec_query_start_loc: torch.Tensor
-    non_spec_query_start_loc: torch.Tensor | None
-    non_spec_query_start_loc_cpu: torch.Tensor | None
-    spec_sequence_masks_cpu: torch.Tensor
-    spec_sequence_masks: torch.Tensor
-    spec_token_indx: torch.Tensor
-    non_spec_token_indx: torch.Tensor
-
-
-def compute_common_gdn_attn_metadata(
-    *,
-    num_decode_draft_tokens_cpu: torch.Tensor | None,
-    query_start_loc: torch.Tensor,
-    query_start_loc_cpu: torch.Tensor,
-    num_spec_state_tokens: int,
-    legacy_mixed_decode_routing: bool,
-) -> CommonGDNSpecMetadata | None:
-    """Compute GDN speculative batch metadata once instead of per group.
-
-    State block IDs remain group-specific and are deliberately excluded. This
-    is the dependency boundary needed to share request classification, token
-    indices, and query offsets without changing recurrent-state ownership.
-    """
-    if num_spec_state_tokens <= 0 or num_decode_draft_tokens_cpu is None:
-        return None
-
-    num_reqs = query_start_loc_cpu.numel() - 1
-    if num_decode_draft_tokens_cpu.ndim != 1:
-        raise ValueError("num_decode_draft_tokens_cpu must be one-dimensional")
-    if num_decode_draft_tokens_cpu.numel() != num_reqs:
-        raise ValueError("num_decode_draft_tokens_cpu must align with query_start_loc")
-
-    spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
-    num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
-    if num_spec_decodes == 0:
-        return None
-    num_spec_draft_tokens = int(
-        num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
-    )
-    if num_spec_draft_tokens == 0:
-        return None
-
-    spec_sequence_masks = spec_sequence_masks_cpu.to(
-        query_start_loc.device, non_blocking=True
-    )
-    query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-    non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-    num_zero_len = int((non_spec_query_lens_cpu == 0).sum().item())
-
-    if legacy_mixed_decode_routing:
-        num_decodes = int((non_spec_query_lens_cpu == 1).sum().item())
-        num_prefills = non_spec_query_lens_cpu.numel() - num_decodes - num_zero_len
-        num_decode_tokens = num_decodes
-        num_prefill_tokens = (
-            int(non_spec_query_lens_cpu.sum().item()) - num_decode_tokens
-        )
-    else:
-        num_decodes = 0
-        num_prefills = non_spec_query_lens_cpu.numel() - num_zero_len
-        num_decode_tokens = 0
-        num_prefill_tokens = int(non_spec_query_lens_cpu.sum().item())
-
-    num_spec_decode_tokens = (
-        int(query_lens_cpu.sum().item()) - num_prefill_tokens - num_decode_tokens
-    )
-    if num_prefills == 0 and num_decodes == 0:
-        spec_token_size = min(
-            num_spec_decodes * (num_spec_state_tokens + 1),
-            int(query_start_loc_cpu[-1].item()),
-        )
-        spec_token_indx = torch.arange(
-            spec_token_size,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
-        non_spec_token_indx = torch.empty(
-            0,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
-        spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
-        non_spec_query_start_loc = None
-        non_spec_query_start_loc_cpu = None
-    else:
-        query_lens = query_lens_cpu.to(query_start_loc.device, non_blocking=True)
-        spec_token_masks = torch.repeat_interleave(
-            spec_sequence_masks,
-            query_lens,
-            output_size=int(query_start_loc_cpu[-1].item()),
-        )
-        index = torch.argsort(spec_token_masks, stable=True)
-        num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
-        non_spec_token_indx = index[:num_non_spec_tokens]
-        spec_token_indx = index[num_non_spec_tokens:]
-
-        spec_query_start_loc = torch.zeros(
-            num_spec_decodes + 1,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
-        torch.cumsum(
-            query_lens[spec_sequence_masks],
-            dim=0,
-            out=spec_query_start_loc[1:],
-        )
-        non_spec_query_start_loc = torch.zeros(
-            query_lens.numel() - num_spec_decodes + 1,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
-        torch.cumsum(
-            query_lens[~spec_sequence_masks],
-            dim=0,
-            out=non_spec_query_start_loc[1:],
-        )
-        non_spec_query_start_loc_cpu = torch.zeros(
-            query_lens_cpu.numel() - num_spec_decodes + 1,
-            dtype=torch.int32,
-            device="cpu",
-        )
-        torch.cumsum(
-            query_lens_cpu[~spec_sequence_masks_cpu],
-            dim=0,
-            out=non_spec_query_start_loc_cpu[1:],
-        )
-
-    return CommonGDNSpecMetadata(
-        num_prefills=num_prefills,
-        num_prefill_tokens=num_prefill_tokens,
-        num_decodes=num_decodes,
-        num_decode_tokens=num_decode_tokens,
-        num_spec_decodes=num_spec_decodes,
-        num_spec_decode_tokens=num_spec_decode_tokens,
-        spec_query_start_loc=spec_query_start_loc,
-        non_spec_query_start_loc=non_spec_query_start_loc,
-        non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
-        spec_sequence_masks_cpu=spec_sequence_masks_cpu,
-        spec_sequence_masks=spec_sequence_masks,
-        spec_token_indx=spec_token_indx,
-        non_spec_token_indx=non_spec_token_indx,
-    )
 
 
 def build_attn_metadata(
@@ -546,6 +468,7 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     prefix_anchor_lens: torch.Tensor | None = None,
+    is_dummy_batch: bool = False,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -581,6 +504,7 @@ def build_attn_metadata(
             max_query_len=max_query_len,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
+            is_dummy_batch=is_dummy_batch,
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,

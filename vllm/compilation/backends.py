@@ -29,6 +29,7 @@ from vllm.compilation.codegen import (
 )
 from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
 from vllm.config.compilation import DynamicShapesType
+from vllm.config.execution_policy import graph_policy
 from vllm.config.utils import Range, hash_factors
 from vllm.logger import init_logger
 from vllm.logging_utils import lazy
@@ -54,6 +55,24 @@ from .passes.ir.inplace_functionalization import VllmIRInplaceFunctionalizationP
 from .passes.pass_manager import PostGradPassManager
 
 logger = init_logger(__name__)
+
+
+def _compute_backend_code_hash(forward_code_files: Sequence[str]) -> str:
+    hash_content = []
+    for filepath in sorted(forward_code_files):
+        if filepath == "<string>" or filepath.startswith("<frozen "):
+            # Dynamo can trace frozen Python modules such as os.getenv, but
+            # SourceInfo does not restore them after AOT loading. They have no
+            # source file to hash; including their name makes the first reload
+            # miss the Inductor artifacts saved by the cold compile.
+            continue
+        hash_content.append(filepath)
+        try:
+            with open(filepath) as f:
+                hash_content.append(f.read())
+        except (OSError, UnicodeDecodeError):
+            logger.warning("Failed to read file %s", filepath)
+    return hashlib.sha256("\n".join(hash_content).encode()).hexdigest()
 
 
 def make_copy_and_call(
@@ -94,7 +113,7 @@ def make_copy_and_call(
 
 
 def make_compiler(compilation_config: CompilationConfig) -> CompilerInterface:
-    assert not envs.VLLM_USE_MEGA_AOT_ARTIFACT or envs.VLLM_USE_STANDALONE_COMPILE, (
+    assert not bool(graph_policy().mega_aot) or envs.VLLM_USE_STANDALONE_COMPILE, (
         "VLLM_USE_MEGA_AOT_ARTIFACT=1 requires VLLM_USE_STANDALONE_COMPILE=1"
     )
 
@@ -880,7 +899,7 @@ class VllmBackend:
                   returns_tuple
         """
 
-        if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+        if not bool(graph_policy().mega_aot):
             return None, None, None
 
         from .caching import StandaloneCompiledArtifacts
@@ -1023,7 +1042,9 @@ class VllmBackend:
 
         # Minimal hashing here with existing utilities, reused below.
 
-        env_factors = envs.compile_factors()
+        env_factors = envs.compile_factors(
+            vllm_config.kernel_config, vllm_config=vllm_config
+        )
         env_hash = hash_factors(env_factors)
         # Compute config/compiler/code hashes once and reuse
         config_hash = vllm_config.compute_hash()
@@ -1034,20 +1055,7 @@ class VllmBackend:
             "Traced files (to be considered for compilation cache):\n%s",
             lazy(lambda: "\n".join(forward_code_files)),
         )
-        hash_content = []
-        for filepath in forward_code_files:
-            if filepath == "<string>":
-                # This means the function was dynamically generated, with
-                # e.g. exec(). We can't actually check these.
-                continue
-            hash_content.append(filepath)
-            try:
-                with open(filepath) as f:
-                    hash_content.append(f.read())
-            except (OSError, UnicodeDecodeError):
-                logger.warning("Failed to read file %s", filepath)
-                continue
-        code_hash = hashlib.sha256("\n".join(hash_content).encode()).hexdigest()
+        code_hash = _compute_backend_code_hash(forward_code_files)
         # Clear after consumption
         self.compilation_config.traced_files.clear()
         if not self.compilation_config.cache_dir:
@@ -1173,7 +1181,7 @@ class VllmBackend:
         # keep a split_gm copy from BEFORE the interpreter replaces
         # submodules with PiecewiseBackend -- used for serialization
         original_split_gm = None
-        if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+        if bool(graph_policy().mega_aot):
             original_split_gm = deepcopy(self.split_gm)
 
         from torch._dynamo.utils import lazy_format_graph_code
@@ -1265,7 +1273,7 @@ class VllmBackend:
 
         self._called = True
         graph_to_serialize = (
-            original_split_gm if envs.VLLM_USE_MEGA_AOT_ARTIFACT else self.graph
+            original_split_gm if bool(graph_policy().mega_aot) else self.graph
         )
 
         execution_code, submod_names, consts = generate_execution_code(self.split_gm)

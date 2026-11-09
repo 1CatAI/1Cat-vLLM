@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from types import SimpleNamespace as NS
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from vllm import _sm70_ops as ops
+from vllm.model_executor.layers.fused_moe.sm70 import fp4_stages, fp4_workspace
+from vllm.model_executor.layers.fused_moe.sm70.fp4_codec import Fp4MoECodec
+from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as moe
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    LayerWorkspaceView,
+)
+from vllm.model_executor.models import qwen2_moe
+
+
+def test_raw_scale_shared_workspace_rejects_microbatching(monkeypatch):
+    monkeypatch.setattr(
+        fp4_workspace,
+        "get_current_vllm_config_or_none",
+        lambda: NS(parallel_config=NS(use_ubatching=True)),
+    )
+    allocate = Mock(side_effect=AssertionError("must reject before allocating"))
+    monkeypatch.setattr(torch, "empty", allocate)
+    with pytest.raises(NotImplementedError, match="DBO or microbatching"):
+        moe._get_qwen38_raw_scale_workspace(torch.device("cuda", 0))
+    allocate.assert_not_called()
+
+
+@pytest.mark.parametrize("raw_scale", [False, True])
+@pytest.mark.parametrize("fused", [False, True])
+def test_m1_fusions_never_consume_raw_scale_workspace(monkeypatch, raw_scale, fused):
+    # Execute host dispatch on CPU tensors; every GPU operator is intercepted.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(moe, "is_exact_sm70_cuda", lambda *a, **k: True)
+    for name in (
+        "_use_qwen38_indexed_prefill",
+        "_use_grouped_decode",
+        "_use_qwen38_qpn_batch_decode",
+        "_use_qwen38_qpn_mtp5_decode",
+        "_use_qwen38_qpn_batch_fused_w13",
+        "_use_qwen38_qpn_batch_fused_w2",
+    ):
+        monkeypatch.setattr(moe, name, lambda *a: False)
+    monkeypatch.setattr(moe, "_use_qwen38_qpn_m1_decode", lambda *a: True)
+    monkeypatch.delenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG", raising=False)
+    layer = NS(
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_top_k=10,
+        sm70_nvfp4_qwen38_fused_swiglu_prefill=True,
+        sm70_nvfp4_qwen38_fused_swiglu_decode=fused,
+        sm70_nvfp4_qwen38_w2_direct_reduce=fused,
+        sm70_nvfp4_qwen38_raw_scale=raw_scale,
+        w13_tm_weight=object(),
+        w2_tm_weight=object(),
+        w13_tm_scales=object(),
+        w2_tm_scales=object(),
+        w13_raw_scale_codes=object(),
+        w2_raw_scale_codes=object(),
+        w13_raw_global_scales=object(),
+        w2_raw_global_scales=object(),
+    )
+    layer.sm70_fp4_codec = Fp4MoECodec(
+        "nvfp4",
+        LayerWorkspaceView(layer, ""),
+        LayerWorkspaceView(layer, "sm70_nvfp4_"),
+        raw_scale=raw_scale,
+    )
+    buffers = {
+        key: torch.empty(1)
+        for key in ("output", "intermediate", "gate_up", "sorted_output")
+    }
+    method = object.__new__(moe.ModelOptNvFp4SM70MoEMethod)
+    method._get_buffers = Mock(return_value=buffers)
+    monkeypatch.setattr(fp4_stages, "apply_swiglu", Mock())
+    calls = {}
+    for name in (
+        "nvfp4_moe_qpn_m1_sm70_out",
+        "nvfp4_moe_qpn_raw_scale_sm70_out",
+        "nvfp4_qwen38_w13_fused_swiglu_out",
+        "nvfp4_qwen38_w2_direct_reduce_out",
+    ):
+        calls[name] = Mock()
+        monkeypatch.setattr(ops, name, calls[name])
+    reduce = Mock()
+    monkeypatch.setattr(fp4_stages, "_single_token_weighted_reduce", reduce)
+    result = method.apply(
+        layer,
+        torch.zeros(1, 2560, dtype=torch.float16),
+        torch.ones(1, 10),
+        torch.zeros(1, 10, dtype=torch.int32),
+        None,
+        None,
+    )
+    assert result is buffers["output"]
+    use_fused = fused and not raw_scale
+    assert calls["nvfp4_qwen38_w13_fused_swiglu_out"].call_count == int(use_fused)
+    assert calls["nvfp4_qwen38_w2_direct_reduce_out"].call_count == int(use_fused)
+    assert calls["nvfp4_moe_qpn_raw_scale_sm70_out"].call_count == (
+        2 if raw_scale else 0
+    )
+    assert calls["nvfp4_moe_qpn_m1_sm70_out"].call_count == (
+        0 if raw_scale or fused else 2
+    )
+    assert reduce.call_count == int(not use_fused)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("available", [False, True])
+def test_shared_gate_m1_kernel_is_not_called_for_batch(monkeypatch, rows, available):
+    monkeypatch.setattr(
+        qwen2_moe, "_sm70_dump_qwen_mlp_tensor", lambda label, idx, x: x
+    )
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_exact", lambda: available)
+    exact = Mock()
+    monkeypatch.setattr(ops, "qwen38_shared_gate_exact_out", exact)
+    gate = Mock(return_value=(torch.ones(rows, 1, dtype=torch.float16), None))
+    gate.weight = torch.zeros(1, 2560, dtype=torch.float16)
+    layer = NS(
+        layer_idx=0,
+        _sm70_exact_shared_expert_gate=True,
+        _sm70_batch_shared_expert_gate=False,
+        gate_up_proj=NS(forward_fused_silu_and_mul=lambda x: x),
+        down_proj=lambda x: (x, None),
+        expert_gate=gate,
+    )
+    x = torch.ones(rows, 2560, dtype=torch.float16)
+    result = qwen2_moe.Qwen2MoeMLP.forward(layer, x)
+    use_fused = rows == 1 and available
+    assert exact.call_count == int(use_fused)
+    assert gate.call_count == int(not use_fused)
+    if not use_fused:
+        torch.testing.assert_close(result, torch.sigmoid(torch.ones_like(x)))
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8, 16, 17])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("decode_phase", [False, True])
+def test_batch_shared_gate_preserves_linear(
+    monkeypatch, rows, enabled, available, decode_phase
+):
+    monkeypatch.setattr(
+        qwen2_moe, "_sm70_dump_qwen_mlp_tensor", lambda label, idx, x: x
+    )
+    monkeypatch.setattr(
+        qwen2_moe, "use_sm70_decode_graph_semantics", lambda: decode_phase
+    )
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_exact", lambda: False)
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_sigmoid_mul", lambda: available)
+    fused = Mock(side_effect=lambda out, gate: out.mul_(torch.sigmoid(gate)))
+    monkeypatch.setattr(ops, "qwen38_shared_gate_sigmoid_mul_out", fused)
+    logits = torch.linspace(-3, 3, rows, dtype=torch.float16).reshape(rows, 1)
+    gate = Mock(return_value=(logits, None))
+    layer = NS(
+        layer_idx=0,
+        _sm70_exact_shared_expert_gate=True,
+        _sm70_batch_shared_expert_gate=enabled,
+        gate_up_proj=NS(forward_fused_silu_and_mul=lambda x: x.clone()),
+        down_proj=lambda x: (x, None),
+        expert_gate=gate,
+    )
+    x = torch.ones(rows, 2560, dtype=torch.float16)
+    result = qwen2_moe.Qwen2MoeMLP.forward(layer, x)
+    gate.assert_called_once_with(x)
+    assert fused.call_count == int(
+        enabled and available and decode_phase and 2 <= rows <= 16
+    )
+    torch.testing.assert_close(result, x * torch.sigmoid(logits), atol=0, rtol=0)

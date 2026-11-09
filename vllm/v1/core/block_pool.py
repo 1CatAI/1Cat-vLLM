@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+from itertools import groupby
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -17,7 +18,6 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
-    ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
     generate_block_hash_extra_keys,
@@ -127,6 +127,48 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
+class _PartitionedBlockQueue:
+    """Keep state IDs in a small GPU range; history uses the remaining IDs.
+
+    Blocks retain globally unique IDs and the ordinary hash/refcount lifetime.
+    Each range has its own eviction order, so prefix checkpoints can be evicted
+    without growing GPU state tensors to the host-history capacity.
+    """
+
+    def __init__(self, blocks, state_blocks, state_group_ids):
+        self.state_blocks = state_blocks
+        self.state_group_ids = frozenset(state_group_ids)
+        self.state = FreeKVCacheBlockQueue(blocks[1:state_blocks])
+        self.history = FreeKVCacheBlockQueue(blocks[state_blocks:])
+
+    @property
+    def num_free_blocks(self):
+        return self.state.num_free_blocks + self.history.num_free_blocks
+
+    def for_group(self, group_id):
+        if group_id is None:
+            raise ValueError("Partitioned cache allocation requires a group ID")
+        return self.state if group_id in self.state_group_ids else self.history
+
+    def popleft_n(self, n, group_id=None):
+        return self.for_group(group_id).popleft_n(n)
+
+    def remove(self, block):
+        queue = self.state if block.block_id < self.state_blocks else self.history
+        queue.remove(block)
+
+    def append_n(self, blocks):
+        self.state.append_n([b for b in blocks if b.block_id < self.state_blocks])
+        self.history.append_n([b for b in blocks if b.block_id >= self.state_blocks])
+
+    def prepend_n(self, blocks):
+        self.state.prepend_n([b for b in blocks if b.block_id < self.state_blocks])
+        self.history.prepend_n([b for b in blocks if b.block_id >= self.state_blocks])
+
+    def get_all_free_blocks(self):
+        return self.state.get_all_free_blocks() + self.history.get_all_free_blocks()
+
+
 class BlockPool:
     """BlockPool that manages KVCacheBlocks.
     It provides methods to allocate, free and cache the kv cache blocks. The
@@ -153,6 +195,8 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        device_state_blocks: int = 0,
+        device_state_group_ids: tuple[int, ...] = (),
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -165,7 +209,10 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        initial_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue: FreeKVCacheBlockQueue | _PartitionedBlockQueue = (
+            initial_queue
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -173,8 +220,15 @@ class BlockPool:
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
+        self.null_block = initial_queue.popleft()
         self.null_block.is_null = True
+
+        if device_state_blocks:
+            if not 1 < device_state_blocks < num_gpu_blocks:
+                raise ValueError("State partition must leave history capacity")
+            self.free_block_queue = _PartitionedBlockQueue(
+                self.blocks, device_state_blocks, device_state_group_ids
+            )
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -261,7 +315,7 @@ class BlockPool:
             )
 
         new_block_hashes = block_hashes[num_cached_blocks:]
-        new_hashes: list[ExternalBlockHash] | None = (
+        event_block_indices: list[int] | None = (
             [] if self.enable_kv_cache_events else None
         )
         for i, blk in enumerate(new_full_blocks):
@@ -279,58 +333,59 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
-            if new_hashes is not None:
-                new_hashes.append(maybe_convert_block_hash(block_hash))
+            if event_block_indices is not None:
+                event_block_indices.append(num_cached_blocks + i)
 
-        if self.enable_kv_cache_events:
-            if num_cached_blocks == 0:
-                parent_block_hash: ExternalBlockHash | None = None
-            else:
-                parent_block_hash = maybe_convert_block_hash(
-                    block_hashes[num_cached_blocks - 1]
-                )
-
-            # Calculate token range for the blocks being cached
-            start_token_idx = num_cached_blocks * block_size
-            end_token_idx = num_full_blocks * block_size
-
-            # Generate extra keys for each block individually.
-            # Each block may have different extra_keys (e.g., different MM
-            # features, or cache_salt only for the first block).
-            # Skip null/masked-out blocks to match the length of new_hashes.
-            extra_keys_list: list[tuple[Any, ...] | None] = []
+        if event_block_indices:
+            # A BlockStored describes one contiguous logical token range. Sparse
+            # retention/null blocks can leave gaps; each run needs its own tokens
+            # and logical parent hash, including when that parent is not resident.
             curr_mm_idx = 0
-            for i in range(num_cached_blocks, num_full_blocks):
-                if blocks[i].is_null:
-                    continue
-                if block_mask is not None and not block_mask[i - num_cached_blocks]:
-                    continue
-                block_start = i * block_size
-                block_end = block_start + block_size
-                extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                    request, block_start, block_end, curr_mm_idx
+            for _, run in groupby(
+                enumerate(event_block_indices), lambda item: item[1] - item[0]
+            ):
+                indices = [block_idx for _, block_idx in run]
+                start, end = indices[0], indices[-1] + 1
+                parent_block_hash = (
+                    maybe_convert_block_hash(block_hashes[start - 1])
+                    if start > 0
+                    else None
                 )
-                extra_keys_list.append(extra_keys)
+                extra_keys_list: list[tuple[Any, ...] | None] = []
+                for block_idx in indices:
+                    extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                        request,
+                        block_idx * block_size,
+                        (block_idx + 1) * block_size,
+                        curr_mm_idx,
+                    )
+                    extra_keys_list.append(extra_keys)
 
-            self.kv_event_queue.append(
-                BlockStored(
-                    block_hashes=new_hashes,
-                    parent_block_hash=parent_block_hash,
-                    token_ids=request.all_token_ids[start_token_idx:end_token_idx],
-                    block_size=block_size,
-                    lora_id=request.lora_request.adapter_id
-                    if request.lora_request
-                    else None,
-                    medium=MEDIUM_GPU,
-                    lora_name=request.lora_request.name
-                    if request.lora_request
-                    else None,
-                    extra_keys=extra_keys_list if extra_keys_list else None,
-                    group_idx=kv_cache_group_id,
+                self.kv_event_queue.append(
+                    BlockStored(
+                        block_hashes=[
+                            maybe_convert_block_hash(block_hashes[i]) for i in indices
+                        ],
+                        parent_block_hash=parent_block_hash,
+                        token_ids=request.all_token_ids[
+                            start * block_size : end * block_size
+                        ],
+                        block_size=block_size,
+                        lora_id=request.lora_request.adapter_id
+                        if request.lora_request
+                        else None,
+                        medium=MEDIUM_GPU,
+                        lora_name=request.lora_request.name
+                        if request.lora_request
+                        else None,
+                        extra_keys=extra_keys_list,
+                        group_idx=kv_cache_group_id,
+                    )
                 )
-            )
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self, num_blocks: int, kv_cache_group_id: int | None = None
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
@@ -341,10 +396,14 @@ class BlockPool:
         Returns:
             A list of new block.
         """
-        if num_blocks > self.get_num_free_blocks():
+        if num_blocks > self.get_num_free_blocks(kv_cache_group_id):
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] = (
+            self.free_block_queue.popleft_n(num_blocks, kv_cache_group_id)
+            if isinstance(self.free_block_queue, _PartitionedBlockQueue)
+            else self.free_block_queue.popleft_n(num_blocks)
+        )
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -416,21 +475,51 @@ class BlockPool:
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self, ordered_blocks: Iterable[KVCacheBlock], reuse_first: bool = False
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            reuse_first: Hand these blocks out again before any other free
+                block, cached or not. A sliding window that has moved past its
+                blocks releases them with this: their KV can never serve a
+                future hit at any alignment boundary the window still covers,
+                so keeping them cache-valuable would only let the running
+                prefill rotate the whole pool and evict other requests.
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        freed_blocks = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        if self.enable_caching:
+            # Uncached scratch has no reusable prefix to evict, and blocks a
+            # sliding window has moved past (``reuse_first``) can never serve a
+            # future hit. Recycle both before consuming the queue's older
+            # cached entries, so a long prefill does not rotate the whole pool
+            # and evict other requests' prefixes.
+            self.free_block_queue.prepend_n(
+                [
+                    block
+                    for block in freed_blocks
+                    if reuse_first or block.block_hash is None
+                ]
+            )
+            self.free_block_queue.append_n(
+                [
+                    block
+                    for block in freed_blocks
+                    if not reuse_first and block.block_hash is not None
+                ]
+            )
+        else:
+            self.free_block_queue.append_n(freed_blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -486,13 +575,30 @@ class BlockPool:
 
         return True
 
-    def get_num_free_blocks(self) -> int:
+    def get_num_free_blocks(self, kv_cache_group_id: int | None = None) -> int:
         """Get the number of free blocks in the pool.
 
         Returns:
             The number of free blocks.
         """
+        if kv_cache_group_id is not None and isinstance(
+            self.free_block_queue, _PartitionedBlockQueue
+        ):
+            return self.free_block_queue.for_group(kv_cache_group_id).num_free_blocks
         return self.free_block_queue.num_free_blocks
+
+    def can_allocate_group_blocks(self, demand: dict[int, int]) -> bool:
+        """Check partition quotas; callers still check aggregate free capacity."""
+        if not isinstance(self.free_block_queue, _PartitionedBlockQueue):
+            return True
+        state = sum(
+            n for i, n in demand.items() if i in self.free_block_queue.state_group_ids
+        )
+        history = sum(demand.values()) - state
+        return (
+            state <= self.free_block_queue.state.num_free_blocks
+            and history <= self.free_block_queue.history.num_free_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

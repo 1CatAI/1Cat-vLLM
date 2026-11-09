@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
@@ -16,12 +17,190 @@ logger = init_logger(__name__)
 
 class VerifyAndUpdateConfig:
     @staticmethod
+    def apply_runtime_defaults(vllm_config, defaults, phase: str, *, is_sm70: bool):
+        from vllm.model_executor.models.runtime_defaults import apply_runtime_defaults
+
+        return apply_runtime_defaults(vllm_config, defaults, phase, is_sm70=is_sm70)
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         return
 
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         return
+
+
+def fla_schedule_family(model_config) -> str | None:
+    """Existing FLA consumers; this describes ownership, not new admission."""
+    if any(
+        getattr(getattr(model_config, name, None), "linear_key_head_dim", None)
+        is not None
+        for name in ("hf_text_config", "hf_config")
+    ):
+        return "gdn"
+    if getattr(model_config, "architecture", None) in {
+        "KimiLinearForCausalLM",
+        "BailingMoeV3ForCausalLM",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+    }:
+        return "kda"
+    return None
+
+
+def effective_layer_policy_hash_fields(model, speculative, fields):
+    """Omit policy families with no consumer in the model contract.
+
+    This only selects cache factors; provider admission and dynamic dispatch
+    remain unchanged. Unknown/plugin architectures conservatively keep factors.
+    """
+    selected = set(fields)
+    architecture = getattr(model, "architecture", None)
+    if architecture is not None and architecture not in {
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+    }:
+        selected.difference_update(
+            {
+                "glm_exact_kda_gemv",
+                "glm_cublaslt",
+                "glm_fused_fg_b",
+                "glm_pp_mhc_materialize",
+            }
+        )
+    text = getattr(model, "hf_text_config", None)
+    if text is not None and getattr(text, "hc_count", 1) <= 1:
+        selected.discard("hc_prefill_sequence_parallel")
+        selected.discard("hc_mtp_prefill_sequence_parallel")
+        selected.discard("hc_prefill_peer_norm")
+    if text is not None and not getattr(text, "ple_layer_ids", None):
+        selected.discard("ple_spec_conv")
+    # A speculative draft can have a different quantization format. Keep the
+    # shared loader inputs until its own worker config describes that format.
+    if model is not None and speculative is None:
+        quantization = getattr(model, "quantization", None)
+        for field, formats in (
+            ("gptq_turbomind", ("gptq", "gptq_marlin")),
+            ("compressed_tensors_turbomind", ("compressed-tensors",)),
+            ("mxfp4_turbomind", ("mxfp4",)),
+        ):
+            if quantization not in formats:
+                selected.discard(field)
+    return tuple(field for field in fields if field in selected)
+
+
+def sm70_flash_next_batch_qualified(vllm_config: "VllmConfig") -> bool:
+    """Batch quality covers ordinary decode and MTP; other proposers await gates."""
+    speculative = vllm_config.speculative_config
+    return speculative is None or getattr(speculative, "method", None) == "mtp"
+
+
+def sm70_fp8_serialized_pipeline_qualified(vllm_config: "VllmConfig") -> bool:
+    """Retain the measured PP2/TP4 no-spec single-request validation boundary.
+
+    QPN8 and reversible-scale M1 use the same qualification. They do not
+    require this scheduling layout to execute; wider layouts need paired
+    output and concurrent workspace tests before lifting the boundary.
+    """
+    parallel_config = vllm_config.parallel_config
+    scheduler_config = vllm_config.scheduler_config
+    return bool(
+        parallel_config.pipeline_parallel_size == 2
+        and parallel_config.tensor_parallel_size == 4
+        and scheduler_config.max_num_seqs == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
+        and getattr(vllm_config, "speculative_config", None) is None
+    )
+
+
+def sm70_awq_prefill_projection_qualified(prefix: str) -> bool:
+    """Retain the measured AWQ exact-dense projection roles.
+
+    This is a quality boundary, not a shape or TP requirement. Renamed and
+    additional roles need a paired kernel/quality check before admission.
+    """
+    return prefix.rsplit(".", 1)[-1] in {
+        "gate_up_proj",
+        "down_proj",
+        "in_proj_qkvz",
+        "out_proj",
+        "o_proj",
+    }
+
+
+def sm70_dflash2_nvfp4_qualified(vllm_config: "VllmConfig") -> bool:
+    """Retained QPN2 whole-workload qualification, not operator capability.
+
+    TP, KV dtype and service concurrency are already outside this boundary.
+    Keep the draft selector/state contract until a broader quality gate passes.
+    """
+    parallel = vllm_config.parallel_config
+    spec = vllm_config.speculative_config
+    draft = getattr(spec, "draft_model_config", None)
+    hf = getattr(draft, "hf_config", None)
+    dflash = getattr(hf, "dflash_config", None) or {}
+    selector = (
+        int(dflash.get("selector_top_k", 0) or 0) if isinstance(dflash, Mapping) else 0
+    )
+    return bool(
+        getattr(spec, "method", None) == "dflash"
+        and int(getattr(spec, "num_speculative_tokens", 0) or 0) == 7
+        and selector == 16
+        and parallel.pipeline_parallel_size == 1
+        and not parallel.enable_dbo
+        and int(parallel.ubatch_size or 0) <= 1
+    )
+
+
+def sm70_nvfp4_projection_qualified(prefix: str) -> bool:
+    """Roles covered by the existing real-weight QPN2 quality audit.
+
+    This whitelist is a temporary qualification boundary. Local K/N checks
+    belong to Qpn2NvFp4LinearKernel.can_implement, independent of these names.
+    """
+    return prefix.rsplit(".", 1)[-1] in {
+        "in_proj_qkvz",
+        "qkv_proj",
+        "out_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+    }
+
+
+def sm70_nvfp4_gate_up_qualified(layer) -> bool:
+    """Retained dense gated layout audited with the 5120-wide model."""
+    return bool(
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "gate_up_proj"
+        and getattr(layer, "input_size_per_partition", 0) == 5120
+        and getattr(layer, "output_size_per_partition", 0) > 0
+        and layer.output_size_per_partition % 64 == 0
+        and getattr(layer, "logical_widths", None)
+        == [layer.output_size_per_partition // 2] * 2
+    )
+
+
+def sm70_nvfp4_down_qualified(layer) -> bool:
+    """Retained QPN4 down projection audited with the 5120-wide model."""
+    return bool(
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
+        and getattr(layer, "input_size_per_partition", 0) > 0
+        and layer.input_size_per_partition % 128 == 0
+        and getattr(layer, "output_size_per_partition", 0) == 5120
+    )
+
+
+def sm70_nvfp4_qpn4_qualified(vllm_config: "VllmConfig") -> bool:
+    """QPN4's quality audit covers a single sequence without speculation."""
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    return (
+        int(getattr(scheduler, "max_num_seqs", 1)) == 1
+        and vllm_config.speculative_config is None
+    )
 
 
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
@@ -291,7 +470,7 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             "last": "LAST",
         }
 
-        pooling_type = pooling_type_map.get(hf_config.pooling, None)
+        pooling_type = pooling_type_map.get(hf_config.pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 
@@ -595,6 +774,13 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             raise ValueError("Qwen4Exp requires hc_count > 1")
 
         parallel_config = vllm_config.parallel_config
+        if parallel_config.decode_context_parallel_size > 1 and getattr(
+            text_config, "indexer_n_heads", 0
+        ):
+            # One all-to-all per QSA layer replaces all-gather(LSE) plus
+            # reduce-scatter(output); on TP4/DCP2 V100 decode the combine drops
+            # from 31.9 to 19.9 us per layer. An explicit user choice still wins.
+            parallel_config.set_dcp_defaults(comm_backend="a2a")
         uses_ple_or_qsa = bool(text_config.ple_layer_ids) or (
             getattr(text_config, "indexer_n_heads", None) is not None
         )
@@ -607,13 +793,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
 
         model_config = vllm_config.model_config
         multimodal_config = model_config.multimodal_config
-        if multimodal_config is not None:
-            if not multimodal_config.language_model_only:
-                raise NotImplementedError(
-                    "Qwen4Exp multimodal inference is not enabled in the initial "
-                    "SM70 route; pass --language-model-only while the vision "
-                    "tower remains outside the TP4 memory and quality gates"
-                )
+        if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(model_config)
 
         spec_config = vllm_config.speculative_config
@@ -712,3 +892,53 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
 }
+
+
+def sm70_dflash2_verifier_qualified(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit the quality-audited Qwen3.8 DFlash2 verifier contract.
+
+    Target quantization, KV dtype, TP degree, and service capacity are
+    intentionally not part of this admission. Each fast operator capability-
+    checks its local weight, cache dtype, and live batch shape, then falls back
+    independently when it cannot handle that contract.
+    """
+    import torch
+
+    if any(
+        config is None
+        for config in (
+            model_config,
+            speculative_config,
+            parallel_config,
+        )
+    ):
+        return False
+
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
+    dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+    selector_top_k = (
+        int(dflash_config.get("selector_top_k", 0) or 0)
+        if isinstance(dflash_config, Mapping)
+        else 0
+    )
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    return bool(
+        architectures & {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(hf_text_config, "hidden_size", None) == 5120
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 4
+        and getattr(hf_text_config, "head_dim", None) == 256
+        and getattr(speculative_config, "method", None) == "dflash"
+        and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
+        and selector_top_k == 16
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )

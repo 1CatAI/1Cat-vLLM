@@ -8,16 +8,17 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.quantization import sm70_online_qpn8 as online_qpn8
+from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces as ws
 
 
-def test_qwen4_exp_online_qpn8_defaults_on_and_can_be_disabled(monkeypatch):
+def test_qwen4_exp_online_qpn8_defaults_off_and_can_be_enabled(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", raising=False)
     envs.disable_envs_cache()
     try:
-        assert envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
-        monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
-        envs.disable_envs_cache()
         assert not envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
+        monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1")
+        envs.disable_envs_cache()
+        assert envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
     finally:
         envs.disable_envs_cache()
 
@@ -34,7 +35,7 @@ def test_qwen3next_shared_gate_fusion_defaults_on_and_can_be_disabled(monkeypatc
         envs.disable_envs_cache()
 
 
-def test_default_on_qpn_sidecars_load_without_enable_overrides(monkeypatch):
+def test_qpn_sidecars_respect_safe_online_default(monkeypatch):
     calls: list[str] = []
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_LIBRARY", "/tmp/qpn8.so")
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY", "/tmp/qpn-m1.so")
@@ -45,7 +46,58 @@ def test_default_on_qpn_sidecars_load_without_enable_overrides(monkeypatch):
     online_qpn8.sm70_ops._maybe_load_fp8_qpn8_library()
     online_qpn8.sm70_ops._maybe_load_nvfp4_qpn_m1_library()
 
-    assert calls == ["/tmp/qpn8.so", "/tmp/qpn-m1.so"]
+    assert calls == ["/tmp/qpn-m1.so"]
+
+    calls.clear()
+    monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1")
+    online_qpn8.sm70_ops._maybe_load_fp8_qpn8_library()
+    assert calls == ["/tmp/qpn8.so"]
+
+
+def test_nvfp4_sidecar_loads_for_mtp5_when_m1_is_disabled(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY", "/tmp/qpn-mtp5.so")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "0")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1")
+    monkeypatch.setattr(torch.ops, "load_library", calls.append)
+
+    online_qpn8.sm70_ops._maybe_load_nvfp4_qpn_m1_library()
+
+    assert calls == ["/tmp/qpn-mtp5.so"]
+
+
+def test_nvfp4_mtp5_capability_is_not_inferred_from_m1(monkeypatch):
+    legacy_sidecar = SimpleNamespace(nvfp4_moe_qpn_m1_sm70_out=object())
+    monkeypatch.setattr(torch.ops, "_C_qwen38", legacy_sidecar)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    assert online_qpn8.sm70_ops.has_nvfp4_qpn_m1_dispatch()
+    assert not online_qpn8.sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+
+    legacy_sidecar.nvfp4_moe_qpn_mtp5_sm70_out = object()
+    assert online_qpn8.sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+
+
+def test_nvfp4_w2_direct_reduce_capability_is_explicit(monkeypatch):
+    legacy_sidecar = SimpleNamespace(nvfp4_moe_qpn_m1_sm70_out=object())
+    monkeypatch.setattr(torch.ops, "_C_qwen38", legacy_sidecar)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    assert not online_qpn8.sm70_ops.has_nvfp4_qwen38_w2_direct_reduce()
+
+    legacy_sidecar.nvfp4_qwen38_w2_direct_reduce_out = object()
+    assert online_qpn8.sm70_ops.has_nvfp4_qwen38_w2_direct_reduce()
+
+
+def test_qwen38_shared_gate_exact_capability_is_explicit(monkeypatch):
+    sidecar = SimpleNamespace(qwen38_shared_gate_exact_out=object())
+    monkeypatch.setattr(torch.ops, "_C_qwen38", sidecar)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    assert online_qpn8.sm70_ops.has_qwen38_shared_gate_exact()
+
+    del sidecar.qwen38_shared_gate_exact_out
+    assert not online_qpn8.sm70_ops.has_qwen38_shared_gate_exact()
 
 
 @pytest.mark.parametrize(
@@ -123,7 +175,12 @@ def test_online_qpn8_apply_uses_prepared_state(monkeypatch):
     layer._sm70_qwen4_exp_online_qpn8_split_k = 4
     layer._sm70_qwen4_exp_online_qpn8_nacc = 2
     layer._sm70_qwen4_exp_online_qpn8_prefetch = False
-    layer._sm70_qwen4_exp_online_qpn8_workspace_ptr = 123
+    layer.prefix = "online_qpn8.apply"
+    workspace = torch.zeros(32)
+    ws.register_layer_workspace(layer, workspace)
+    monkeypatch.setattr(
+        torch.ops.vllm, "sm70_fp8_qpn8_dispatch", ws._sm70_fp8_qpn8_dispatch
+    )
     calls = []
 
     def fake_dispatch(*args):
@@ -138,7 +195,8 @@ def test_online_qpn8_apply_uses_prepared_state(monkeypatch):
     out = online_qpn8.maybe_apply_online_qpn8(layer, x, bias)
     assert out is not None and out.shape == (2, 3, 32)
     assert torch.equal(out, torch.full_like(out, 3))
-    assert calls[0][1] == 123
+    assert calls[0][1] == workspace.data_ptr()
+    ws.clear_layer_workspaces()
     assert calls[0][-1] is False
 
 
@@ -156,6 +214,12 @@ def test_fused_hc_uses_prepared_partials_without_global_lookup(monkeypatch):
         layer.register_buffer(
             online_qpn8._SCALES_ATTR, torch.empty((1,), dtype=torch.float16)
         )
+    down.prefix = "online_qpn8.down"
+    workspace = torch.zeros(32)
+    ws.register_layer_workspace(down, workspace)
+    monkeypatch.setattr(
+        torch.ops.vllm, "sm70_online_qpn8_hc_dispatch", ws._sm70_online_qpn8_hc_dispatch
+    )
     partials = torch.empty((32 * 384,), dtype=torch.float32)
     down.register_buffer(
         online_qpn8._HC_PARTIALS_ATTR,
@@ -180,6 +244,8 @@ def test_fused_hc_uses_prepared_partials_without_global_lookup(monkeypatch):
     assert torch.equal(block_out, torch.full_like(block_out, 2))
     assert torch.equal(injection_out, torch.full_like(injection_out, 3))
     assert calls[0][5] is partials
+    assert calls[0][6] == workspace.data_ptr()
+    ws.clear_layer_workspaces()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

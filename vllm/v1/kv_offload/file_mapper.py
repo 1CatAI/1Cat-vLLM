@@ -35,6 +35,7 @@ class FileMapper:
         kv_cache_groups: list[dict] | None = None,
         inference_engine: str = "vllm",
         parallel_agnostic: bool = False,
+        persistent_layout: dict | None = None,
     ):
         """
         Initialize the file mapper. Each worker constructs its own, but
@@ -58,6 +59,12 @@ class FileMapper:
             "kv_cache_groups": kv_cache_groups or [],
             "inference_engine": inference_engine,
         }
+        # Preserve legacy paths unless a producer explicitly declares a layout.
+        # Physical byte layouts must not share files solely because keys match.
+        if persistent_layout is not None:
+            self.fields["persistent_layout"] = json.loads(
+                json.dumps(persistent_layout, sort_keys=True)
+            )
         self.base_path: str = self._compute_base_path(root_dir, self.fields)
 
     @classmethod
@@ -94,6 +101,7 @@ class FileMapper:
             dtype=dtype,
             kv_cache_groups=kv_cache_groups,
             parallel_agnostic=parallel_agnostic,
+            persistent_layout=getattr(offloading_spec, "persistent_layout", None),
         )
 
     def get_file_name(self, key: OffloadKey) -> str:

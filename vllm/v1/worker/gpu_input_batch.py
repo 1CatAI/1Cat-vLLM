@@ -8,8 +8,8 @@ from typing import cast
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm.config.reasoning import ReasoningConfig
+from vllm.config.sm70_runtime import Sm70RuntimeConfig, bind_output_token_repair
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -107,7 +107,10 @@ class InputBatch:
         is_pooling_model: bool = False,
         cp_kv_cache_interleave_size: int = 1,
         reasoning_config: ReasoningConfig | None = None,
+        dcp_sharded: list[bool] | None = None,
+        runtime_policy: Sm70RuntimeConfig | None = None,
     ):
+        self._output_token_repair = bind_output_token_repair(runtime_policy)
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
             reasoning_config,
             max_num_reqs,
@@ -179,6 +182,7 @@ class InputBatch:
             kernel_block_sizes=kernel_block_sizes,
             max_num_blocks=max_num_blocks_per_req,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            dcp_sharded=dcp_sharded,
         )
 
         # Sampling-related.
@@ -1074,10 +1078,23 @@ class InputBatch:
             sampled_ids: list[int] = sampled_token_ids[prev_index]
             if not sampled_ids:
                 continue
-            num_sampled_ids = (
-                len(sampled_ids) if sampled_ids[-1] != -1 else sampled_ids.index(-1)
+            # A sampled id is only a real token when it is a valid token id. The
+            # speculative rejection path also emits `vocab_size` for rejected
+            # slots, not only the documented -1 placeholder; counting such an id
+            # as sampled copies it into token_ids_cpu and from there into
+            # input_ids, where the embedding lookup trips a CUDA device-side
+            # assert (Indexing.cu, indexSelectSmallIndex: `srcIndex <
+            # srcSelectDimSize`). Stop at the first id outside [0, vocab_size),
+            # the same rule _valid_async_draft_prefix() applies to draft ids.
+            num_sampled_ids = next(
+                (
+                    i
+                    for i, token_id in enumerate(sampled_ids)
+                    if token_id < 0 or token_id >= self.vocab_size
+                ),
+                len(sampled_ids),
             )
-            if envs.VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR:
+            if self._output_token_repair():
                 first_placeholder = req_output_token_ids.index(-1)
                 num_placeholders = len(req_output_token_ids) - first_placeholder
                 num_to_replace = min(num_sampled_ids, num_placeholders)

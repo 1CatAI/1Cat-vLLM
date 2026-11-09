@@ -35,8 +35,10 @@ SM70_F16_DENSE_SUFFIXES = {
 }
 
 
-def _parse_sm70_f16_dense_allowlist() -> set[str] | None:
-    raw = envs.VLLM_SM70_F16_DENSE_ALLOWLIST
+def _parse_sm70_f16_dense_allowlist(policy=None) -> set[str] | None:
+    from vllm.config.execution_policy import layer_policy
+
+    raw = (policy if policy is not None else layer_policy()).dense_allowlist
     if raw is None:
         return None
     suffixes = {item.strip() for item in raw.split(",") if item.strip()}
@@ -49,11 +51,11 @@ def is_layer_moe_router_gate(prefix: str) -> bool:
     return prefix.rsplit(".", 1)[-1] in MOE_LAYER_ROUTER_GATE_SUFFIXES
 
 
-def is_layer_sm70_f16_dense(prefix: str) -> bool:
+def is_layer_sm70_f16_dense(prefix: str, *, policy=None) -> bool:
     if not prefix:
         return False
     suffix = prefix.rsplit(".", 1)[-1]
-    allowlist = _parse_sm70_f16_dense_allowlist()
+    allowlist = _parse_sm70_f16_dense_allowlist(policy)
     if allowlist is not None:
         return suffix in allowlist
     return suffix in SM70_F16_DENSE_SUFFIXES

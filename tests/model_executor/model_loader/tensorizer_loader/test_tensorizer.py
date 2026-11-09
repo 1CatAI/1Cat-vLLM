@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.tensorizer_loader import (
     BLACKLISTED_TENSORIZER_ARGS,
 )
 from vllm.utils.import_utils import PlaceholderModule
+from vllm.utils.network_utils import get_open_port
 
 from .conftest import DummyExecutor, assert_from_collective_rpc
 
@@ -503,6 +504,8 @@ async def test_serialize_and_serve_entrypoints(tmp_path):
         "serve",
         "--host",
         "localhost",
+        "--port",
+        str(get_open_port()),
         "--load-format",
         "tensorizer",
         model_ref,

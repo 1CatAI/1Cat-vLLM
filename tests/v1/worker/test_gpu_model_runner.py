@@ -15,6 +15,7 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -691,6 +692,67 @@ def test_update_states_pp_async_multi_request_keeps_rank_state_consistent(
             ].tolist()
             == last_runner.input_batch.token_ids_cpu[last_idx, :last_len].tolist()
         )
+
+
+def test_update_states_pp_async_spec_trims_optimistic_tokens_on_every_rank(
+    model_runner, model_runner_2, dist_init, monkeypatch
+):
+    """The optimistic spec-decode extend is not gated on the pipeline rank,
+    so the trim that undoes it must not be either.
+
+    With async scheduling every rank appends ``prev_num_draft_len``
+    placeholders to ``output_token_ids`` before the model runs, and the
+    deferred correction only fixes the token *counts* -- it never removes the
+    placeholders. Only the trim does, and on a non-final pipeline rank it has
+    to run for the cached state to stay aligned with the scheduler's view.
+    """
+    req_ids = ["req_0"]
+    non_last_runner = model_runner
+    last_runner = model_runner_2
+    for runner in (non_last_runner, last_runner):
+        runner.use_async_scheduling = True
+        runner.sync_spec_decode_accept_counts = False
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
+    )
+    non_last_runner._update_states(_schedule_new_request(*req_ids))
+    last_runner._update_states(_schedule_new_request(*req_ids))
+
+    # One token was really sampled last step; three drafts were scheduled on
+    # top of it and are optimistically assumed accepted.
+    num_draft_tokens = 3
+    for runner in (non_last_runner, last_runner):
+        req_state = runner.requests[req_ids[0]]
+        req_state.output_token_ids.append(111)
+        req_state.prev_num_draft_len = num_draft_tokens
+
+    # The scheduler saw a single output token: all three drafts were rejected.
+    scheduler_output = _schedule_cached_requests(
+        req_ids=req_ids,
+        num_scheduled_tokens={req_ids[0]: 1},
+        new_token_ids=[],
+        num_computed_tokens=[4],
+        num_output_tokens=[1],
+    )
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
+    )
+    non_last_runner._update_states(scheduler_output)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True, world_size=2),
+    )
+    last_runner._update_states(scheduler_output)
+
+    non_last_state = non_last_runner.requests[req_ids[0]]
+    last_state = last_runner.requests[req_ids[0]]
+    assert len(last_state.output_token_ids) == 1
+    assert len(non_last_state.output_token_ids) == len(last_state.output_token_ids)
+    assert -1 not in non_last_state.output_token_ids
 
 
 def test_kv_cache_stride_order(monkeypatch, model_runner):
@@ -1721,6 +1783,66 @@ def test_is_uniform_decode() -> None:
     )
 
 
+def test_compute_force_uniform_decode_rejects_hybrid_prefills() -> None:
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(is_hybrid=True),
+        requests={"req_a": SimpleNamespace(num_prompt_tokens=8)},
+    )
+    compute = GPUModelRunner._compute_force_uniform_decode
+
+    # Exact 1+K shape aliases for MTP0, MTP2, and MTP4 are prefills.
+    for prompt_len in (1, 3, 5):
+        scheduled = _schedule_new_request("req_new")
+        new_req = scheduled.scheduled_new_reqs[0]
+        new_req.prompt_token_ids = list(range(prompt_len))
+        scheduled.num_scheduled_tokens["req_new"] = prompt_len
+        scheduled.total_num_scheduled_tokens = prompt_len
+        force_uniform_decode = compute(runner, scheduled)
+        assert force_uniform_decode is False
+        assert not GPUModelRunner._is_uniform_decode(
+            max_num_scheduled_tokens=prompt_len,
+            uniform_decode_query_len=prompt_len,
+            num_tokens=prompt_len,
+            num_reqs=1,
+            force_uniform_decode=force_uniform_decode,
+        )
+
+    # A fully prefix-cached new request has finished its prompt and can defer
+    # to the normal uniform-decode shape heuristic.
+    prefix_hit = _schedule_new_request("req_new")
+    prefix_hit.scheduled_new_reqs[0].num_computed_tokens = 3
+    assert compute(runner, prefix_hit) is None
+
+    # A later chunk is still prefill until all prompt tokens are computed.
+    chunked_prefill = _schedule_cached_requests(
+        req_ids=["req_a"],
+        num_scheduled_tokens={"req_a": 3},
+        new_token_ids=[[]],
+        num_computed_tokens=[5],
+        num_output_tokens=[0],
+    )
+    assert compute(runner, chunked_prefill) is False
+
+    decode = _schedule_cached_requests(
+        req_ids=["req_a"],
+        num_scheduled_tokens={"req_a": 1},
+        new_token_ids=[[7]],
+        num_computed_tokens=[8],
+        num_output_tokens=[1],
+    )
+    assert compute(runner, decode) is None
+
+    mixed = _schedule_new_request("req_new")
+    mixed.scheduled_cached_reqs = decode.scheduled_cached_reqs
+    mixed.num_scheduled_tokens["req_a"] = 1
+    mixed.total_num_scheduled_tokens += 1
+    assert compute(runner, mixed) is False
+
+    # The guard is intentionally limited to stateful hybrid models.
+    runner.model_config.is_hybrid = False
+    assert compute(runner, _schedule_new_request("req_new")) is None
+
+
 @pytest.mark.skipif(
     current_platform.is_rocm() or current_platform.is_device_capability((7, 0)),
     reason="Attention backend FLASHINFER is not supported on ROCm or SM70.",
@@ -1824,3 +1946,58 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+def _spec_config_for(vllm_config, method: str):
+    kwargs = dict(
+        target_model_config=vllm_config.model_config,
+        target_parallel_config=vllm_config.parallel_config,
+        method=method,
+        num_speculative_tokens=2,
+    )
+    if method == "ngram":
+        kwargs.update(prompt_lookup_min=2, prompt_lookup_max=3)
+    elif method == "draft_model":
+        kwargs["model"] = vllm_config.model_config.model
+    return SpeculativeConfig(**kwargs)
+
+
+@pytest.mark.parametrize("method", ["ngram", "draft_model", "extract_hidden_states"])
+def test_non_last_pp_rank_profiles_with_speculative_config(
+    dist_init, monkeypatch: pytest.MonkeyPatch, method: str
+):
+    """Regression for #439.
+
+    The draft model lives on the last PP rank only, so ``self.drafter`` is
+    created there only. Every rank, however, runs memory profiling
+    (``_dummy_run`` -> ``_build_attention_metadata``) and the KV-cache
+    initialisation, and both probe ``self.drafter``. On a non-last rank
+    that used to raise AttributeError before the first request arrived.
+    """
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(
+            world_size=2,
+            rank=0,
+            rank_in_group=0,
+            is_first_rank=True,
+            is_last_rank=False,
+        ),
+    )
+    vllm_config = get_vllm_config()
+    vllm_config.speculative_config = _spec_config_for(vllm_config, method)
+    with set_current_vllm_config(vllm_config):
+        runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
+        runner.load_model()
+        current_platform.update_block_size_for_backend(vllm_config)
+        kv_cache_config = get_kv_cache_configs(
+            vllm_config, [runner.get_kv_cache_spec()], [GiB_bytes]
+        )[0]
+        # The real initialize_kv_cache(), not the trimmed test helper: it is
+        # the entry point for three of the drafter-only assertions.
+        runner.initialize_kv_cache(kv_cache_config)
+        # force_attention takes the profiling run through
+        # _build_attention_metadata, the frame in the reported traceback.
+        runner._dummy_run(num_tokens=16, is_profile=True, force_attention=True)
+        # Non-last ranks build no drafter -- but the attribute must exist.
+        assert runner.drafter is None

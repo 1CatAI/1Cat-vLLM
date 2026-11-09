@@ -120,6 +120,7 @@ def build_params(
     src_caches: dict[str, torch.Tensor],
     dst_caches: dict[str, torch.Tensor],
     stream: torch.cuda.Stream,
+    src_access_order_any: bool = True,
 ) -> BatchMemcpyParams:
     global _batch_memcpy_fn
     if _batch_memcpy_fn is None:
@@ -137,10 +138,15 @@ def build_params(
         dst_bases.append(d.data_ptr())
         bpb.append(s_bpb)
 
-    # ``srcAccessOrder=3`` == CU_MEMCPY_SRC_ACCESS_ORDER_ANY /
-    # hipMemcpySrcAccessOrderAny. See
+    # ``srcAccessOrder=3`` == CU_MEMCPY_SRC_ACCESS_ORDER_ANY, ``1`` ==
+    # CU_MEMCPY_SRC_ACCESS_ORDER_STREAM. See
     # https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g6f1ff58e3065df3eb4b573dba77ad31f  # noqa: E501
-    attrs = _CUmemcpyAttributes(srcAccessOrder=3)
+    # CPU->GPU reads from host pinned memory, which no GPU stream writes, so
+    # ANY is safe there and lets the driver pipeline the source reads. GPU->CPU
+    # reads from the live KV cache that the compute stream keeps writing, so it
+    # must stay STREAM-ordered: only then are the source reads gated by the
+    # transfer stream's barrier against the compute stream.
+    attrs = _CUmemcpyAttributes(srcAccessOrder=3 if src_access_order_any else 1)
 
     return BatchMemcpyParams(
         src_bases=np.array(src_bases, dtype=np.uint64),

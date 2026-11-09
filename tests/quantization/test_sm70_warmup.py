@@ -3,11 +3,14 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 import vllm.envs as envs
-from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+    TurboMindFp8LinearKernel,
+)
 from vllm.model_executor.warmup import awq_sm70_warmup as warmup
 
 
@@ -51,6 +54,82 @@ def test_fp8_warmup_skips_static_qpn8_dispatch():
     model = nn.Sequential(layer)
 
     assert list(warmup._iter_unique_fp8_dense_layers(model)) == []
+
+
+def _batch_qpn8_layer(*, gated=False, prescaled=False) -> nn.Module:
+    layer = nn.Module()
+    layer.sm70_fp8_turbomind = True
+    layer.sm70_fp8_qpn8 = True
+    layer.sm70_fp8_batch_tm = True
+    layer.sm70_fp8_batch_tm_prescaled = prescaled
+    layer.sm70_fp8_gated_silu = gated
+    # QPN8's primary layout has a different shape from the TurboMind buffer.
+    layer.weight = nn.Parameter(
+        torch.empty((2, 4, 32, 16), dtype=torch.uint8), requires_grad=False
+    )
+    layer.sm70_fp8_batch_tm_weight = torch.empty((128, 64), dtype=torch.uint8)
+    layer.sm70_fp8_batch_tm_scales = torch.empty((1, 64), dtype=torch.float16)
+    layer.sm70_fp8_batch_tm_k_ld = 128
+    layer.sm70_fp8_batch_tm_q_ld = 64
+    return layer
+
+
+def test_fp8_warmup_discovers_secondary_batch_layouts():
+    batch = _batch_qpn8_layer()
+    duplicate = _batch_qpn8_layer()
+    gated = _batch_qpn8_layer(gated=True)
+    prescaled = _batch_qpn8_layer(prescaled=True)
+    ordinary = _grouped_fp8_layer()
+    model = nn.Sequential(batch, duplicate, gated, prescaled, ordinary)
+
+    assert list(warmup._iter_unique_fp8_dense_layers(model)) == [
+        (batch, False),
+        (gated, True),
+        (prescaled, False),
+        (ordinary, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    "gated,prescaled", [(False, False), (True, False), (False, True)]
+)
+def test_fp8_warmup_matches_secondary_batch_dispatch(monkeypatch, gated, prescaled):
+    layer = _batch_qpn8_layer(gated=gated, prescaled=prescaled)
+    calls = []
+    prescaled_calls = []
+    policies = []
+
+    def record_call(*args, **kwargs):
+        calls.append(args)
+        policies.append(kwargs)
+
+    monkeypatch.setattr(torch.ops._C, "fp8_gemm_sm70_out_meta", object(), raising=False)
+    monkeypatch.setattr(warmup.sm70_ops, "fp8_gemm_sm70_out", record_call)
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "fp8_gemm_sm70_prefill_prescaled_out",
+        lambda *args: prescaled_calls.append(args),
+    )
+    rows = [1, 8, 16, 32, 33, 48, 64, 65]
+
+    count = warmup._warmup_fp8_dense_layers([(layer, gated)], rows)
+
+    assert count == 3
+    if prescaled:
+        assert not calls
+        assert not policies
+        calls = prescaled_calls
+    else:
+        assert not prescaled_calls
+        assert policies == [{"preserve_default_partition": True}] * 3
+    assert [tuple(call[0].shape) for call in calls] == [
+        (m, 32 if gated else 64) for m in (33, 48, 64)
+    ]
+    assert [tuple(call[1].shape) for call in calls] == [(m, 128) for m in (33, 48, 64)]
+    assert all(call[2] is layer.sm70_fp8_batch_tm_weight for call in calls)
+    assert all(call[3] is layer.sm70_fp8_batch_tm_scales for call in calls)
+    expected_meta = (128, 128, 64) if prescaled else (128, 128, 64, gated)
+    assert all(call[4:] == expected_meta for call in calls)
 
 
 def test_fp8_warmup_matches_grouped_bmm_runtime_slice(monkeypatch):
@@ -156,7 +235,9 @@ def test_fp8_grouped_bmm_decode_uses_one_dispatch(monkeypatch):
     )
     x = torch.empty((1, 2, 128), dtype=torch.float16)
 
-    out = object.__new__(Fp8LinearMethod).apply(layer, x)
+    kernel = object.__new__(TurboMindFp8LinearKernel)
+    kernel.native_ops = warmup.sm70_ops
+    out = kernel.apply_weights(layer, x)
 
     assert tuple(out.shape) == (1, 2, 64)
     assert len(calls) == 1
@@ -195,7 +276,9 @@ def test_fp8_grouped_bmm_decode_retains_multirow_fallback(monkeypatch):
     )
     x = torch.empty((2, 2, 128), dtype=torch.float16)
 
-    out = object.__new__(Fp8LinearMethod).apply(layer, x)
+    kernel = object.__new__(TurboMindFp8LinearKernel)
+    kernel.native_ops = warmup.sm70_ops
+    out = kernel.apply_weights(layer, x)
 
     assert tuple(out.shape) == (2, 2, 64)
     assert [call[:2] for call in dense_calls] == [
@@ -237,6 +320,91 @@ def test_fp8_warmup_supports_modelopt_turbomind_layout(monkeypatch):
     assert all(call[3:] == (128, 128, 64) for call in calls)
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_nvfp4_warmup_uses_converter_padded_output_size(monkeypatch, compact):
+    state = SimpleNamespace(
+        native_ops=warmup.sm70_ops,
+        weight=torch.empty((32, 4), dtype=torch.int32),
+        scales=torch.empty((2, 32), dtype=torch.float16),
+        group_size=16,
+        k_ld=32,
+        q_ld=32,
+        output_size=24,
+        padded_output_size=32,
+        op_kind="nvfp4",
+        gated_silu=False,
+        use_scale_code=compact,
+        global_scale=0.125,
+    )
+    calls = []
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_gemm_sm70_out_meta", object(), raising=False
+    )
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "nvfp4_gemm_sm70_out",
+        lambda *args: calls.append(args),
+    )
+    compact_calls = []
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "nvfp4_qpn2_compact_tm_gemm_sm70_out",
+        lambda *args: compact_calls.append(args),
+    )
+
+    count = warmup._warmup_fp4_dense_layers([state], [1, 4])
+
+    assert count == 2
+    if compact:
+        assert not calls
+        assert all(call[4] == state.global_scale for call in compact_calls)
+        calls = compact_calls
+    else:
+        assert not compact_calls
+    assert [tuple(call[0].shape) for call in calls] == [(1, 32), (4, 32)]
+    assert [tuple(call[1].shape) for call in calls] == [(1, 32), (4, 32)]
+
+
+@pytest.mark.parametrize("gated_silu", [False, True])
+def test_nvfp4_warmup_preserves_batch_scale_format(monkeypatch, gated_silu):
+    state = SimpleNamespace(
+        native_ops=warmup.sm70_ops,
+        weight=torch.empty((32, 4), dtype=torch.int32),
+        scales=torch.empty((2, 32), dtype=torch.float16),
+        group_size=16,
+        k_ld=32,
+        q_ld=32,
+        output_size=24,
+        padded_output_size=32,
+        op_kind="nvfp4",
+        gated_silu=gated_silu,
+        use_scale_code=False,
+        prescaled_scales=True,
+    )
+    calls = []
+    monkeypatch.setattr(torch.ops._C, "nvfp4_gemm_sm70_out", object(), raising=False)
+
+    def wrong_format(*args):
+        pytest.fail("Shifted scales must use the prescaled batch transform")
+
+    monkeypatch.setattr(warmup.sm70_ops, "nvfp4_gemm_sm70_out", wrong_format)
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "nvfp4_gemm_sm70_prescaled_out",
+        lambda *args: calls.append(args),
+    )
+    count = warmup._warmup_fp4_dense_layers([state], [1, 8, 16, 32, 33, 64])
+
+    assert count == 2
+    assert [tuple(call[1].shape) for call in calls] == [(33, 32), (64, 32)]
+    assert [tuple(call[0].shape) for call in calls] == [
+        (33, 32),
+        (64, 32),
+    ]
+    assert all(call[3] is state.scales for call in calls)
+    assert all(call[-1] is False for call in calls)
+
+
 def _nvfp4_moe_layer() -> nn.Module:
     layer = nn.Module()
     layer.sm70_nvfp4_moe = True
@@ -249,7 +417,7 @@ def _nvfp4_moe_layer() -> nn.Module:
     layer.sm70_nvfp4_w2_n_dim = 2048
     layer.sm70_nvfp4_group_size = 16
     layer.sm70_nvfp4_graph_safe_max_tokens = 18
-    layer.sm70_nvfp4_compact_grouped_max_tokens = 10
+    layer.sm70_nvfp4_compact_grouped_max_slots = 80
     layer.w13_tm_weight = nn.Parameter(
         torch.empty((1, 1), dtype=torch.uint8), requires_grad=False
     )
@@ -323,7 +491,7 @@ def test_nvfp4_moe_warmup_discovers_and_uses_compact_decode_shapes(monkeypatch):
 
 
 def test_nvfp4_moe_warmup_includes_opted_in_cuda_graph_shapes(monkeypatch):
-    monkeypatch.setattr(warmup.envs, "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", 640)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "640")
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(
@@ -337,7 +505,7 @@ def test_nvfp4_moe_warmup_includes_opted_in_cuda_graph_shapes(monkeypatch):
     ) == [*range(1, 11), 18, 20, 40, 60, 80]
 
 
-def test_nvfp4_moe_warmup_uses_slot_compact_through_b10(monkeypatch):
+def test_nvfp4_moe_warmup_uses_slot_compact_through_80_rows(monkeypatch):
     layer = _nvfp4_moe_layer()
     calls = []
     monkeypatch.setattr(
@@ -371,7 +539,7 @@ def test_nvfp4_moe_warmup_uses_slot_compact_through_b10(monkeypatch):
     assert calls[2][2].tolist() == list(range(81))
 
 
-def test_nvfp4_moe_warmup_uses_full_expert_groups_above_compact_b10(monkeypatch):
+def test_nvfp4_moe_warmup_uses_full_expert_groups_above_80_rows(monkeypatch):
     layer = _nvfp4_moe_layer()
     calls = []
     monkeypatch.setattr(
@@ -429,6 +597,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
 
     calls = []
     broadcasts = []
+    imports = []
     barriers = []
 
     def broadcast_object(payload, src):
@@ -455,11 +624,12 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
         warmup_layers,
     )
     monkeypatch.setattr(warmup, "_export_lut_bytes", lambda device: (b"lut", 7))
-    monkeypatch.setattr(
-        warmup,
-        "_import_lut_bytes",
-        lambda device, payload: (_ for _ in ()).throw(AssertionError()),
-    )
+
+    def import_lut(device, payload):
+        imports.append((device, payload))
+        return 7
+
+    monkeypatch.setattr(warmup, "_import_lut_bytes", import_lut)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
 
     layers = [(nn.Module(), False)]
@@ -472,6 +642,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
     assert count == 5
     assert calls == [(layers, [1, 4]), (layers, [1, 4])]
     assert broadcasts == [(b"lut", 0)]
+    assert imports == [(torch.device("cuda:0"), b"lut")]
     assert barriers == [True]
 
 

@@ -391,6 +391,11 @@ class CommonAttentionMetadata:
     cudagraph_graph_variant: int | None = None
     """Optional semantic variant for CUDA graph capture dummy runs."""
 
+    is_dummy_batch: bool = False
+    """A profile/capture batch has no real cache writes. Under DCP a PAD slot
+    can also mean a different rank owns the token, so side caches need this
+    explicit flag instead of inferring dummy state from the slot mapping."""
+
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
@@ -526,6 +531,7 @@ class CommonAttentionMetadata:
             max_seq_len=self.max_seq_len,
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
+            is_dummy_batch=self.is_dummy_batch,
             causal=self.causal,
             cudagraph_graph_variant=self.cudagraph_graph_variant,
             logits_indices_padded=self.logits_indices_padded,
@@ -571,6 +577,26 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # metadata
     supports_update_block_table: bool = False
     requires_block_table_width: ClassVar[bool] = False
+    # Whether this builder consumes scheduler-level physical block IDs rather
+    # than the cache group's virtual kernel-block IDs. Compressed-cache builders
+    # that set this retain the original logical/storage block geometry.
+    uses_physical_block_table: ClassVar[bool] = False
+
+    accepts_speculative_state_metadata: bool = False
+    """Consume accepted counts and draft counts from a hybrid model state."""
+
+    def get_model_state_kwargs(self, metadata: Any, num_reqs: int) -> dict[str, Any]:
+        """Backend-owned inputs at the existing model-state metadata boundary."""
+        if not self.accepts_speculative_state_metadata:
+            return {}
+        return {
+            "num_accepted_tokens": None
+            if metadata.num_accepted_tokens is None
+            else metadata.num_accepted_tokens[:num_reqs],
+            "num_decode_draft_tokens_cpu": None
+            if metadata.num_decode_draft_tokens_cpu is None
+            else metadata.num_decode_draft_tokens_cpu[:num_reqs],
+        }
 
     @abstractmethod
     def __init__(

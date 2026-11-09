@@ -388,7 +388,7 @@ def fused_indexer_q_rope_quant(
 
     index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
 
-    if current_platform.is_cuda() and current_platform.is_device_capability((7, 0)):
+    if current_platform.is_cuda() and current_platform.is_device_capability_family(70):
         if use_fp4:
             raise RuntimeError(
                 "DeepSeek V4 SM70 uses the FP8 indexer cache; FP4 indexer "

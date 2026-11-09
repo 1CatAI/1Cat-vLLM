@@ -16,6 +16,15 @@
 
 namespace turbomind::gemm {
 
+template<class Decoder, class = void>
+struct DecoderCodebookSize { static constexpr int value = 0; };
+template<class Decoder>
+struct DecoderCodebookSize<Decoder, std::void_t<decltype(Decoder::kCodebookBytes)>> {
+    static constexpr int value = Decoder::kCodebookBytes;
+};
+template<class Base, int Bytes>
+struct WithDecoderCodebook : Base { __align__(16) uint8_t codebook[Bytes]; };
+
 template<int Stages>
 struct GroupIter {
 
@@ -137,12 +146,24 @@ struct MainloopSm70 {
     using GmemIterU = typename OperandU::GmemIter;
     using GmemIterV = typename OperandV::GmemIter;
 
-    struct SharedStorage {
+    struct OperandStorage {
         __align__(16) Array<Ta, Stages * SmemLayoutA::kSize> A;
         __align__(16) Array<Tb, Stages * SmemLayoutB::kSize> B;
         __align__(16) Array<Tu, Stages * SmemLayoutU::kSize> U;
         __align__(16) Array<Tv, Stages * SmemLayoutV::kSize> V;
     };
+
+    static constexpr int kCodebookBytes = DecoderCodebookSize<TransformB>::value;
+    using SharedStorage = std::conditional_t<kCodebookBytes == 0, OperandStorage,
+        WithDecoderCodebook<OperandStorage,kCodebookBytes>>;
+    template<class F, class D, class S>
+    __device__ static void TransformWeights(F& frag, int k, D& data, S& stat,
+                                            int div, SharedStorage& storage) {
+        if constexpr (kCodebookBytes > 0)
+            TransformB::apply(frag,k,data,stat,div,storage.codebook);
+        else
+            TransformB::apply(frag,k,data,stat,div);
+    }
 
     template<class GmemIter, class SmemIter>
     __device__ void _advance_smem(GmemIter& gmem_iter, SmemIter& smem_iter)
@@ -206,6 +227,7 @@ struct MainloopSm70 {
                                SharedStorage& storage)
     {
         static_assert(MMA::kAtomK == 1);
+        if constexpr (kCodebookBytes > 0) TransformB::initialize(storage.codebook);
 
         static constexpr int UU = 1;  // ceil_div(GroupSizeU_, MMA_Map::TileK);
         static constexpr int VV = 1;  // ceil_div(GroupSizeV_, MMA_Map::TileK);
@@ -315,7 +337,7 @@ struct MainloopSm70 {
         preload(0);  // smem -> data_[A,B,U,V]
 
         TransformA::apply(frag_A, 0, data_A, data_U, UU);
-        TransformB::apply(frag_B, 0, data_B, data_V, VV);
+        TransformWeights(frag_B, 0, data_B, data_V, VV, storage);
 
         constexpr int ITER_K = MMA::kTileIterK;
         static_assert(ITER_K > 1);
@@ -351,7 +373,7 @@ struct MainloopSm70 {
                     }
 
                     TransformA::apply(frag_A, (k + 1) % ITER_K, data_A, data_U, UU);
-                    TransformB::apply(frag_B, (k + 1) % ITER_K, data_B, data_V, VV);
+                    TransformWeights(frag_B, (k + 1) % ITER_K, data_B, data_V, VV, storage);
                 }
             }
         }
@@ -384,7 +406,7 @@ struct MainloopSm70 {
                     }
 
                     TransformA::apply(frag_A, (k + 1) % ITER_K, data_A, data_U, UU);
-                    TransformB::apply(frag_B, (k + 1) % ITER_K, data_B, data_V, VV);
+                    TransformWeights(frag_B, (k + 1) % ITER_K, data_B, data_V, VV, storage);
                 }
             };
 

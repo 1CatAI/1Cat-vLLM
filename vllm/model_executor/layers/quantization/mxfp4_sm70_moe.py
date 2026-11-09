@@ -15,8 +15,8 @@ from typing import Final
 import torch
 from torch.nn import Parameter
 
-from vllm import _sm70_ops as sm70_ops
-from vllm import envs
+from vllm._sm70.policy import NativeBindings
+from vllm.config.sm70_moe import Sm70MxFp4MoEConfig, capture_mxfp4_moe_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -27,11 +27,26 @@ from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     SharedExperts,
 )
+from vllm.model_executor.layers.fused_moe.sm70.fp4_codec import Fp4MoECodec
+from vllm.model_executor.layers.fused_moe.sm70.fp4_stages import (
+    apply_swiglu,
+    execute_fp4,
+)
+from vllm.model_executor.layers.fused_moe.sm70.fp4_workspace import MxFp4MoEWorkspace
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.sm70_moe_router import (
+    Sm70MoeStageRoute as Stage,
+)
+from vllm.model_executor.layers.quantization.sm70_moe_router import (
+    select_fp4_stage_plan,
+)
 from vllm.model_executor.layers.quantization.sm70_turbomind import (
     MXFP4_GROUP_SIZE,
     is_exact_sm70_cuda,
     unpack_mxfp4_weight,
+)
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    LayerWorkspaceView,
 )
 from vllm.triton_utils import tl, triton
 
@@ -46,17 +61,28 @@ _MXFP4_QPN_M1_ENV: Final = "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE"
 _MXFP4_QPN_M1_OP: Final = "mxfp4_moe_qpn_m1_sm70_out"
 
 
+# One grouped launch for small one-row-per-route batches (V4.1 DSpark draft:
+# M5 x top-3); the native op reads this once on first use.
+os.environ.setdefault("VLLM_SM70_MXFP4_GROUPED_ANY", "1")
+
+
+def _mxfp4_policy(layer) -> Sm70MxFp4MoEConfig:
+    policy = getattr(layer, "sm70_moe_policy", None)
+    return policy if policy is not None else capture_mxfp4_moe_config()
+
+
 def _mxfp4_qpn_m1_op_available() -> bool:
     return hasattr(torch.ops._C, _MXFP4_QPN_M1_OP)
 
 
-def _mxfp4_qpn_m1_extension_enabled() -> bool:
+def _mxfp4_qpn_m1_extension_enabled(policy: Sm70MxFp4MoEConfig | None = None) -> bool:
     """Resolve the default-on route without breaking an older extension."""
-    if not envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE:
+    policy = policy if policy is not None else capture_mxfp4_moe_config()
+    if not policy.qpn_m1:
         return False
     if _mxfp4_qpn_m1_op_available():
         return True
-    if os.getenv(_MXFP4_QPN_M1_ENV) is not None:
+    if "qpn_m1" in policy.explicit_fields:
         raise RuntimeError(
             "The explicitly enabled SM70 MXFP4 QPN M1 route requires the "
             f"source-built {_MXFP4_QPN_M1_OP} operator."
@@ -68,45 +94,55 @@ def _mxfp4_qpn_m1_extension_enabled() -> bool:
     return False
 
 
-def _mxfp4_active_expert_b1_enabled() -> bool:
+def _mxfp4_active_expert_b1_enabled(policy: Sm70MxFp4MoEConfig | None = None) -> bool:
+    policy = policy if policy is not None else capture_mxfp4_moe_config()
     return bool(
-        envs.VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1
-        and not envs.VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH
-        and not envs.VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH
+        policy.active_experts
+        and not policy.single_token_fastpath
+        and not policy.single_token_permute
     )
 
 
-def _mxfp4_active_expert_max_tokens() -> int:
-    if not _mxfp4_active_expert_b1_enabled():
+def _mxfp4_active_expert_max_tokens(policy: Sm70MxFp4MoEConfig | None = None) -> int:
+    policy = policy if policy is not None else capture_mxfp4_moe_config()
+    if not _mxfp4_active_expert_b1_enabled(policy):
         return 0
     return min(
-        int(envs.VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS),
+        int(policy.active_expert_max_tokens or 0),
         _GRAPH_SAFE_MAX_TOKENS,
     )
 
 
-def _mxfp4_grouped_m8_enabled() -> bool:
-    return bool(envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8)
+def _mxfp4_grouped_m8_enabled(policy: Sm70MxFp4MoEConfig | None = None) -> bool:
+    policy = policy if policy is not None else capture_mxfp4_moe_config()
+    return bool(policy.grouped_m8)
 
 
-def _mxfp4_grouped_verifier_enabled() -> bool:
-    return bool(envs.VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER)
+def _mxfp4_grouped_verifier_enabled(policy: Sm70MxFp4MoEConfig | None = None) -> bool:
+    policy = policy if policy is not None else capture_mxfp4_moe_config()
+    return bool(policy.grouped_verifier)
 
 
-def _mxfp4_grouped_verifier_for_tokens(num_tokens: int) -> bool:
+def _mxfp4_grouped_verifier_for_tokens(
+    num_tokens: int, policy: Sm70MxFp4MoEConfig | None = None
+) -> bool:
+    policy = policy if policy is not None else capture_mxfp4_moe_config()
     return bool(
-        (num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled())
+        (num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled(policy))
         or (
             1 < num_tokens <= _GRAPH_SAFE_MAX_TOKENS
-            and _mxfp4_grouped_verifier_enabled()
+            and _mxfp4_grouped_verifier_enabled(policy)
         )
     )
 
 
-def _mxfp4_grouped_m8_expert_rows_enabled() -> bool:
+def _mxfp4_grouped_m8_expert_rows_enabled(
+    policy: Sm70MxFp4MoEConfig | None = None,
+) -> bool:
+    policy = policy if policy is not None else capture_mxfp4_moe_config()
     return bool(
-        (_mxfp4_grouped_m8_enabled() or _mxfp4_grouped_verifier_enabled())
-        and envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS
+        (_mxfp4_grouped_m8_enabled(policy) or _mxfp4_grouped_verifier_enabled(policy))
+        and policy.grouped_expert_rows
     )
 
 
@@ -180,14 +216,19 @@ def _select_mxfp4_stage_dispatch(
     num_tokens: int,
     num_experts: int,
     fully_replicated_experts: bool,
+    policy: Sm70MxFp4MoEConfig | None = None,
+    top_k: int = 6,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    if 0 < num_tokens <= _mxfp4_active_expert_max_tokens() and fully_replicated_experts:
+    if (
+        0 < num_tokens <= _mxfp4_active_expert_max_tokens(policy)
+        and fully_replicated_experts
+    ):
         # Keep the graph launch count fixed. The compactor represents unused
         # tail entries as zero-row experts, avoiding a host readback of the
         # dynamic unique-expert count.
-        graph_expert_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
-        if _mxfp4_grouped_verifier_for_tokens(num_tokens):
-            if _mxfp4_grouped_m8_expert_rows_enabled():
+        graph_expert_slots = num_tokens * top_k
+        if _mxfp4_grouped_verifier_for_tokens(num_tokens, policy):
+            if _mxfp4_grouped_m8_expert_rows_enabled(policy):
                 return (
                     buffers["compact_expert_offsets"],
                     buffers["active_expert_ids"],
@@ -225,7 +266,7 @@ def _select_mxfp4_direct_order_offsets(
 def _mxfp4_qpn_m1_decode_contract(layer: RoutedExperts, *, direct_order: bool) -> bool:
     """Admit only the measured TP4 six-route W13/W2 tensor pair."""
     return bool(
-        envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE
+        _mxfp4_policy(layer).qpn_m1
         and getattr(layer, "sm70_mxfp4_qpn_m1_available", False)
         and direct_order
         and int(layer.moe_config.tp_size) == 4
@@ -251,7 +292,15 @@ def validate_mxfp4_sm70_moe_contract(
     intermediate_size_per_partition: int,
     tp_size: int,
 ) -> None:
-    """Reject shapes outside the exact V4-Flash SM70 implementation contract."""
+    """Admit V4 Flash and the separately qualified V4.1 DSpark TP4 shape."""
+    if (
+        global_num_experts,
+        top_k,
+        hidden_size,
+        intermediate_size_per_partition,
+        tp_size,
+    ) == (128, 3, 5120, 576, 4):
+        return
     if global_num_experts != _DEEPSEEK_V4_FLASH_NUM_EXPERTS:
         raise NotImplementedError(
             "SM70 TurboMind MXFP4 MoE currently supports DeepSeek-V4-Flash "
@@ -339,8 +388,39 @@ def validate_mxfp4_sm70_moe_weight_layout(
             )
 
 
+def _prepare_mxfp4_sm70_experts(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> list[torch.Tensor]:
+    """Repack one projection's experts into stacked TurboMind tensors.
+
+    Each prepared expert is copied straight into its slot, so the repack holds
+    the checkpoint projection and one stacked copy instead of a per-expert
+    list next to its stack. The converter only repacks nibbles and scales; it
+    does not dequantize or materialize a full-precision expert weight.
+    """
+    num_experts = weight.shape[0]
+    stacks: list[torch.Tensor] = []
+    for expert_id in range(num_experts):
+        prepared = Fp4MoECodec.prepare_weights(
+            "mxfp4",
+            unpack_mxfp4_weight(weight[expert_id].data),
+            weight_scale[expert_id].data.t().contiguous(),
+            MXFP4_GROUP_SIZE,
+        )
+        if not stacks:
+            stacks = [
+                torch.empty(
+                    (num_experts, *part.shape), dtype=part.dtype, device=part.device
+                )
+                for part in prepared
+            ]
+        for stack, part in zip(stacks, prepared):
+            stack[expert_id].copy_(part)
+    return stacks
+
+
 class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
-    """Exact-SM70 V4-Flash MXFP4 MoE using TurboMind packed GEMMs.
+    """Native V4 Flash and V4.1 DSpark MXFP4 using TurboMind packed GEMMs.
 
     ``Mxfp4MoEMethod`` owns the checkpoint parameter layout. Its generic
     Oracle backends are intentionally bypassed here because they are not an
@@ -349,6 +429,8 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
 
     def __init__(self, moe: FusedMoEConfig):
         FusedMoEMethodBase.__init__(self, moe)
+        self.sm70_moe_policy = capture_mxfp4_moe_config()
+        self.native_ops = NativeBindings(self.sm70_moe_policy.native.values)
         self.weight_dtype = "mxfp4"
         if moe.moe_parallel_config.use_all2all_kernels:
             raise NotImplementedError(
@@ -394,17 +476,15 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         return hidden_size, intermediate_size_per_partition
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        layer.sm70_moe_policy = self.sm70_moe_policy
         required_ops: tuple[str, ...] = (
             "mxfp4_sm70_prepare",
             "mxfp4_moe_dense_stage_sm70_out",
             "awq_moe_build_strided_ptrs",
         )
-        if envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE:
+        if self.sm70_moe_policy.direct_top6:
             required_ops += ("mxfp4_moe_single_token_prepare_w13_sm70_out",)
-        if (
-            envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE
-            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE
-        ):
+        if self.sm70_moe_policy.direct_top6 and self.sm70_moe_policy.direct_order:
             required_ops += ("awq_moe_single_token_weighted_reduce_out",)
         missing_ops = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if missing_ops:
@@ -412,7 +492,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                 "DeepSeek-V4 MXFP4 MoE on SM70 requires the TurboMind CUDA "
                 "extension with " + ", ".join(missing_ops) + "."
             )
-        layer.sm70_mxfp4_qpn_m1_available = _mxfp4_qpn_m1_extension_enabled()
+        layer.sm70_mxfp4_qpn_m1_available = _mxfp4_qpn_m1_extension_enabled(
+            self.sm70_moe_policy
+        )
         if not hasattr(torch.ops._moe_C, "moe_permute_with_scratch"):
             raise RuntimeError(
                 "DeepSeek-V4 MXFP4 MoE graph-safe B1 requires "
@@ -449,69 +531,44 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             w2_weight_scale=layer.w2_weight_scale,
         )
 
-        w13_tm_weights: list[torch.Tensor] = []
-        w13_tm_scales: list[torch.Tensor] = []
-        w13_meta: list[torch.Tensor] = []
-        w2_tm_weights: list[torch.Tensor] = []
-        w2_tm_scales: list[torch.Tensor] = []
-        w2_meta: list[torch.Tensor] = []
-        for expert_id in range(num_experts):
-            # The converter only repacks nibbles/scales for TurboMind; it does
-            # not dequantize or materialize a full-precision expert weight.
-            w13_packed = unpack_mxfp4_weight(layer.w13_weight[expert_id].data)
-            w13_scales = layer.w13_weight_scale[expert_id].data.t().contiguous()
-            prepared_w13 = sm70_ops.mxfp4_sm70_prepare(
-                w13_packed, w13_scales, MXFP4_GROUP_SIZE
-            )
-            w13_tm_weights.append(prepared_w13[0])
-            w13_tm_scales.append(prepared_w13[1])
-            w13_meta.append(prepared_w13[2])
-
-            w2_packed = unpack_mxfp4_weight(layer.w2_weight[expert_id].data)
-            w2_scales = layer.w2_weight_scale[expert_id].data.t().contiguous()
-            prepared_w2 = sm70_ops.mxfp4_sm70_prepare(
-                w2_packed, w2_scales, MXFP4_GROUP_SIZE
-            )
-            w2_tm_weights.append(prepared_w2[0])
-            w2_tm_scales.append(prepared_w2[1])
-            w2_meta.append(prepared_w2[2])
-
-        layer.w13_tm_weight = Parameter(
-            torch.stack(w13_tm_weights), requires_grad=False
+        # post-load processing runs after every layer of the stage is
+        # resident, so each projection's checkpoint copy is released as soon
+        # as its TurboMind stack exists.
+        w13_tm_weight, w13_tm_scales, w13_meta = _prepare_mxfp4_sm70_experts(
+            layer.w13_weight, layer.w13_weight_scale
         )
-        layer.w13_tm_scales = Parameter(torch.stack(w13_tm_scales), requires_grad=False)
-        layer.w13_tm_meta = Parameter(torch.stack(w13_meta), requires_grad=False)
-        layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
-        layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
-        layer.w2_tm_meta = Parameter(torch.stack(w2_meta), requires_grad=False)
+        del layer.w13_weight
+        del layer.w13_weight_scale
+        w2_tm_weight, w2_tm_scales, w2_meta = _prepare_mxfp4_sm70_experts(
+            layer.w2_weight, layer.w2_weight_scale
+        )
+        del layer.w2_weight
+        del layer.w2_weight_scale
+        # Return the released checkpoint blocks before the pointer tables
+        # allocate, so V100 does not exhaust driver memory while the CUDA
+        # caching allocator retains them.
+        torch.accelerator.empty_cache()
+
+        layer.w13_tm_weight = Parameter(w13_tm_weight, requires_grad=False)
+        layer.w13_tm_scales = Parameter(w13_tm_scales, requires_grad=False)
+        layer.w13_tm_meta = Parameter(w13_meta, requires_grad=False)
+        layer.w2_tm_weight = Parameter(w2_tm_weight, requires_grad=False)
+        layer.w2_tm_scales = Parameter(w2_tm_scales, requires_grad=False)
+        layer.w2_tm_meta = Parameter(w2_meta, requires_grad=False)
 
         w13_k_ld = int(w13_meta[0][0].item())
         w13_q_ld = int(w13_meta[0][1].item())
         w2_k_ld = int(w2_meta[0][0].item())
         w2_q_ld = int(w2_meta[0][1].item())
 
-        # Stacking 256 experts temporarily holds both the per-expert tensors
-        # and their contiguous replacements. Release those load-only tensors
-        # before the pointer tables allocate so V100 does not exhaust driver
-        # memory while the CUDA caching allocator retains the stack workspace.
-        del w13_tm_weights, w13_tm_scales, w13_meta
-        del w2_tm_weights, w2_tm_scales, w2_meta
-        del w13_packed, w13_scales, prepared_w13
-        del w2_packed, w2_scales, prepared_w2
-        del layer.w13_weight
-        del layer.w13_weight_scale
-        del layer.w2_weight
-        del layer.w2_weight_scale
-        torch.accelerator.empty_cache()
-
-        w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w13_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
             layer.w13_tm_scales,
             w13_k_ld,
             w13_q_ld,
             num_experts,
         )
-        w2_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w2_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w2_tm_weight,
             layer.w2_tm_scales,
             w2_k_ld,
@@ -532,227 +589,73 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer.sm70_mxfp4_w2_k_dim = intermediate_size
         layer.sm70_mxfp4_w2_n_dim = hidden_size
         layer.sm70_mxfp4_group_size = MXFP4_GROUP_SIZE
+        layer.sm70_fp4_codec = Fp4MoECodec(
+            "mxfp4",
+            LayerWorkspaceView(layer, ""),
+            LayerWorkspaceView(layer, "sm70_mxfp4_"),
+            raw_scale=False,
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
+            bindings=self.native_ops,
+        )
         self._allocate_graph_safe_decode_buffers(layer)
 
         logger.info_once(
-            "SM70 TurboMind MXFP4 MoE enabled for DeepSeek-V4-Flash "
-            "(local_experts=%d, graph_safe_decode=B1-B%d, "
+            "SM70 TurboMind MXFP4 MoE enabled "
+            "(local_experts=%d, hidden=%d, local_intermediate=%d, top_k=%d, "
+            "graph_safe_decode=B1-B%d, "
             "active_expert_max_tokens=%d).",
             num_experts,
-            _GRAPH_SAFE_MAX_TOKENS,
-            _mxfp4_active_expert_max_tokens(),
-        )
-
-    def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
-        device = layer.w13_tm_weight.device
-        top_k = _DEEPSEEK_V4_FLASH_TOP_K
-        max_slots = _GRAPH_SAFE_MAX_TOKENS * top_k
-        num_experts = int(layer.sm70_mxfp4_num_experts)
-        hidden_size = int(layer.sm70_mxfp4_hidden_size)
-        intermediate_size = int(layer.sm70_mxfp4_intermediate_size)
-
-        layer._mxfp4_sm70_buf_output = torch.empty(
-            _GRAPH_SAFE_MAX_TOKENS,
             hidden_size,
-            dtype=torch.float16,
-            device=device,
+            intermediate_size,
+            layer.top_k,
+            _GRAPH_SAFE_MAX_TOKENS,
+            _mxfp4_active_expert_max_tokens(self.sm70_moe_policy),
         )
-        layer._mxfp4_sm70_buf_permuted_input = torch.empty(
-            max_slots, hidden_size, dtype=torch.float16, device=device
-        )
-        layer._mxfp4_sm70_buf_gate_up = torch.empty(
-            max_slots,
-            int(layer.sm70_mxfp4_w13_n_dim),
-            dtype=torch.float16,
-            device=device,
-        )
-        layer._mxfp4_sm70_buf_intermediate = torch.empty(
-            max_slots, intermediate_size, dtype=torch.float16, device=device
-        )
-        layer._mxfp4_sm70_buf_sorted_output = torch.empty(
-            max_slots, hidden_size, dtype=torch.float16, device=device
-        )
-        layer._mxfp4_sm70_buf_expert_offsets = torch.empty(
-            num_experts + 1, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_expert_offsets64 = torch.empty(
-            num_experts + 1, dtype=torch.int64, device=device
-        )
-        layer._mxfp4_sm70_buf_inv_permuted_idx = torch.empty(
-            _GRAPH_SAFE_MAX_TOKENS, top_k, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_topk_ids = torch.empty(
-            _GRAPH_SAFE_MAX_TOKENS, top_k, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_token_expert_indices = torch.arange(
-            max_slots, dtype=torch.int32, device=device
-        ).view(_GRAPH_SAFE_MAX_TOKENS, top_k)
-        layer._mxfp4_sm70_buf_permuted_idx = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_permuted_experts_id = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_sorted_row_idx = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_topk_ids_for_sort = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        sort_workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
-            max_slots, layer.global_num_experts
-        )
-        layer._mxfp4_sm70_buf_sort_workspace = torch.empty(
-            sort_workspace_size, dtype=torch.int8, device=device
-        )
-        layer._mxfp4_sm70_buf_dense_expert_ids = torch.arange(
-            num_experts, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_compact_expert_offsets = torch.arange(
-            max_slots + 1, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_compact_expert_offsets64 = torch.arange(
-            max_slots + 1, dtype=torch.int64, device=device
-        )
-        layer._mxfp4_sm70_buf_slot_expert_offsets = torch.arange(
-            max_slots + 1, dtype=torch.int32, device=device
-        )
-        layer._mxfp4_sm70_buf_active_expert_ids = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
+
+    def _allocate_graph_safe_decode_buffers(self, layer):
+        MxFp4MoEWorkspace.allocate(layer)
+
+    def _get_buffers(self, layer, num_tokens):
+        return MxFp4MoEWorkspace.get(layer, num_tokens)
 
     @staticmethod
-    def _persistent_decode_buffers(
-        layer: RoutedExperts, num_tokens: int
-    ) -> dict[str, torch.Tensor]:
-        total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
-        return {
-            "output": layer._mxfp4_sm70_buf_output[:num_tokens],
-            "permuted_input": layer._mxfp4_sm70_buf_permuted_input[:total_slots],
-            "gate_up": layer._mxfp4_sm70_buf_gate_up[:total_slots],
-            "intermediate": layer._mxfp4_sm70_buf_intermediate[:total_slots],
-            "sorted_output": layer._mxfp4_sm70_buf_sorted_output[:total_slots],
-            "expert_offsets": layer._mxfp4_sm70_buf_expert_offsets,
-            "expert_offsets64": layer._mxfp4_sm70_buf_expert_offsets64,
-            "inv_permuted_idx": layer._mxfp4_sm70_buf_inv_permuted_idx[:num_tokens],
-            "topk_ids": layer._mxfp4_sm70_buf_topk_ids[:num_tokens],
-            "token_expert_indices": (
-                layer._mxfp4_sm70_buf_token_expert_indices[:num_tokens]
-            ),
-            "permuted_idx": layer._mxfp4_sm70_buf_permuted_idx[:total_slots],
-            "sort_workspace": layer._mxfp4_sm70_buf_sort_workspace,
-            "permuted_experts_id": (
-                layer._mxfp4_sm70_buf_permuted_experts_id[:total_slots]
-            ),
-            "sorted_row_idx": layer._mxfp4_sm70_buf_sorted_row_idx[:total_slots],
-            "topk_ids_for_sort": (
-                layer._mxfp4_sm70_buf_topk_ids_for_sort[:total_slots]
-            ),
-            "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
-            "compact_expert_offsets": (
-                layer._mxfp4_sm70_buf_compact_expert_offsets[: total_slots + 1]
-            ),
-            "compact_expert_offsets64": (
-                layer._mxfp4_sm70_buf_compact_expert_offsets64[: total_slots + 1]
-            ),
-            "slot_expert_offsets": (
-                layer._mxfp4_sm70_buf_slot_expert_offsets[: total_slots + 1]
-            ),
-            "active_expert_ids": (
-                layer._mxfp4_sm70_buf_active_expert_ids[:total_slots]
-            ),
-        }
+    def _apply_swiglu(layer, out, gate_up, *, interleaved=False) -> None:
+        apply_swiglu(out, gate_up, layer.swiglu_limit, interleaved=interleaved)
 
-    @staticmethod
-    def _eager_buffers(
-        layer: RoutedExperts, num_tokens: int
-    ) -> dict[str, torch.Tensor]:
-        device = layer.w13_tm_weight.device
-        top_k = _DEEPSEEK_V4_FLASH_TOP_K
-        total_slots = num_tokens * top_k
-        num_experts = int(layer.sm70_mxfp4_num_experts)
-        hidden_size = int(layer.sm70_mxfp4_hidden_size)
-        intermediate_size = int(layer.sm70_mxfp4_intermediate_size)
-        sort_workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
-            total_slots, layer.global_num_experts
+    def _apply_v41_draft(self, layer, x, probabilities, ids):
+        """At most fifteen native TC rows, with probability before down FP16."""
+        if not 1 <= x.shape[0] <= 5 or layer.swiglu_limit != 10.0:
+            raise ValueError("V4.1 draft experts require M1..5 and clamp 10")
+        buffers = self._get_buffers(layer, x.shape[0])
+        order = ids.flatten().argsort(stable=True)
+        experts = ids.flatten()[order].int().contiguous()
+        buffers["permuted_input"].copy_(x[order // 3])
+        plan = select_fp4_stage_plan(Stage.DENSE, Stage.DENSE)
+        offsets = buffers["slot_expert_offsets"]
+        codec = layer.sm70_fp4_codec
+        codec.gemm_w13(
+            plan,
+            buffers,
+            buffers["permuted_input"],
+            None,
+            offsets,
+            experts,
+            ids.numel(),
+            ids,
         )
-        return {
-            "output": torch.empty(
-                num_tokens, hidden_size, dtype=torch.float16, device=device
-            ),
-            "permuted_input": torch.empty(
-                total_slots, hidden_size, dtype=torch.float16, device=device
-            ),
-            "gate_up": torch.empty(
-                total_slots,
-                int(layer.sm70_mxfp4_w13_n_dim),
-                dtype=torch.float16,
-                device=device,
-            ),
-            "intermediate": torch.empty(
-                total_slots, intermediate_size, dtype=torch.float16, device=device
-            ),
-            "sorted_output": torch.empty(
-                total_slots, hidden_size, dtype=torch.float16, device=device
-            ),
-            "expert_offsets": torch.empty(
-                num_experts + 1, dtype=torch.int32, device=device
-            ),
-            "expert_offsets64": torch.empty(
-                num_experts + 1, dtype=torch.int64, device=device
-            ),
-            "inv_permuted_idx": torch.empty(
-                num_tokens, top_k, dtype=torch.int32, device=device
-            ),
-            "topk_ids": torch.empty(
-                num_tokens, top_k, dtype=torch.int32, device=device
-            ),
-            "token_expert_indices": torch.arange(
-                total_slots, dtype=torch.int32, device=device
-            ).view(num_tokens, top_k),
-            "permuted_idx": torch.empty(total_slots, dtype=torch.int32, device=device),
-            "sort_workspace": torch.empty(
-                sort_workspace_size, dtype=torch.int8, device=device
-            ),
-            "permuted_experts_id": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
-            "sorted_row_idx": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
-            "topk_ids_for_sort": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
-            "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
-            "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
-            "compact_expert_offsets64": (
-                layer._mxfp4_sm70_buf_compact_expert_offsets64
-            ),
-            "slot_expert_offsets": torch.arange(
-                total_slots + 1, dtype=torch.int32, device=device
-            ),
-            "active_expert_ids": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
-        }
-
-    def _get_buffers(
-        self, layer: RoutedExperts, num_tokens: int
-    ) -> dict[str, torch.Tensor]:
-        if 0 < num_tokens <= _GRAPH_SAFE_MAX_TOKENS:
-            return self._persistent_decode_buffers(layer, num_tokens)
-        return self._eager_buffers(layer, num_tokens)
-
-    @staticmethod
-    def _apply_swiglu(
-        layer: RoutedExperts, out: torch.Tensor, gate_up: torch.Tensor
-    ) -> None:
-        if layer.swiglu_limit is None:
-            torch.ops._C.silu_and_mul(out, gate_up)
-        else:
-            torch.ops._C.silu_and_mul_with_clamp(
-                out, gate_up, float(layer.swiglu_limit)
-            )
+        gate, up = buffers["gate_up"].float().chunk(2, dim=-1)
+        intermediate = (
+            torch.nn.functional.silu(gate.clamp(max=10))
+            * up.clamp(-10, 10)
+            * probabilities.flatten()[order, None]
+        ).half()
+        buffers["intermediate"].copy_(intermediate)
+        codec.gemm_w2(plan, buffers, None, offsets, experts, ids.numel(), probabilities)
+        restored = buffers["sorted_output"][order.argsort()].view(x.shape[0], 3, -1)
+        # Each native matrix product keeps its FP16 boundary. The routed sum
+        # and following TP reduction feed the FP32 HC residual: valid draft
+        # queries can exceed FP16 range when four finite partials are added.
+        return restored.float().sum(1)
 
     def apply(
         self,
@@ -768,16 +671,16 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             raise TypeError("SM70 MXFP4 MoE requires CUDA FP16 activations [M, H].")
         if not is_exact_sm70_cuda(x, enabled=True):
             raise RuntimeError("SM70 MXFP4 MoE dispatch is restricted to CUDA SM70.")
-        if x.shape[1] != _DEEPSEEK_V4_FLASH_HIDDEN_SIZE:
+        if x.shape[1] != layer.sm70_mxfp4_hidden_size:
             raise ValueError(
                 "SM70 MXFP4 MoE activation hidden size mismatch: expected "
-                f"{_DEEPSEEK_V4_FLASH_HIDDEN_SIZE}, got {x.shape[1]}."
+                f"{layer.sm70_mxfp4_hidden_size}, got {x.shape[1]}."
             )
         if tuple(topk_ids.shape) != (
             x.shape[0],
-            _DEEPSEEK_V4_FLASH_TOP_K,
+            layer.top_k,
         ):
-            raise ValueError("SM70 MXFP4 MoE requires top-k IDs with shape [M, 6].")
+            raise ValueError("SM70 MXFP4 MoE top-k IDs do not match the layer.")
         if tuple(topk_weights.shape) != tuple(topk_ids.shape):
             raise ValueError("SM70 MXFP4 MoE top-k weights and IDs must share shape.")
         if topk_weights.dtype != torch.float32:
@@ -789,144 +692,79 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
 
         num_tokens = x.shape[0]
         if num_tokens == 0:
-            return x.new_empty((0, _DEEPSEEK_V4_FLASH_HIDDEN_SIZE))
+            return x.new_empty((0, layer.sm70_mxfp4_hidden_size))
+        if (layer.global_num_experts, layer.top_k, x.shape[1]) == (128, 3, 5120):
+            return self._apply_v41_draft(layer, x, topk_weights, topk_ids)
         buffers = self._get_buffers(layer, num_tokens)
         output = buffers["output"]
 
         direct_top6 = (
             num_tokens == 1
-            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE
+            and layer.top_k == 6
+            and self.sm70_moe_policy.direct_top6
             and layer.expert_map is None
             and layer.local_num_experts == layer.global_num_experts
         )
-        direct_order = (
+        direct_order = bool(
             direct_top6
-            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE
+            and self.sm70_moe_policy.direct_order
             and topk_ids.dtype == torch.int32
             and topk_ids.is_contiguous()
         )
         if _mxfp4_qpn_m1_decode_contract(layer, direct_order=direct_order):
-            route_ids = topk_ids.view(-1)
-            sm70_ops.mxfp4_moe_qpn_m1_sm70_out(
-                buffers["gate_up"],
-                x,
-                layer.w13_tm_weight,
-                layer.w13_tm_scales,
-                route_ids,
-                True,
+            plan = select_fp4_stage_plan(
+                Stage.QPN, Stage.QPN, reduction="native_weighted"
             )
-            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
-            sm70_ops.mxfp4_moe_qpn_m1_sm70_out(
-                buffers["sorted_output"],
-                buffers["intermediate"],
-                layer.w2_tm_weight,
-                layer.w2_tm_scales,
-                route_ids,
-                False,
-            )
-            sm70_ops.awq_moe_single_token_weighted_reduce_out(
-                buffers["sorted_output"],
-                topk_weights,
-                buffers["token_expert_indices"],
-                output,
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                layer.sm70_mxfp4_hidden_size,
-            )
+            execute_fp4(layer.sm70_fp4_codec, plan, buffers, x, topk_ids, topk_weights)
             logger.info_once(
                 "Default SM70 MXFP4 QPN M1 route enabled for the exact "
                 "TP4 six-route W13/W2 tensor contract."
             )
             return output
         if direct_order:
-            route_ids = topk_ids.view(-1)
-            route_offsets = _select_mxfp4_direct_order_offsets(buffers)
-            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-                buffers["gate_up"],
-                x,
-                route_offsets,
-                route_ids,
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                layer.sm70_mxfp4_w13_k_dim,
-                layer.sm70_mxfp4_w13_n_dim,
-                layer.sm70_mxfp4_group_size,
+            plan = select_fp4_stage_plan(
+                Stage.DENSE, Stage.DENSE, reduction="native_weighted"
             )
-            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
-            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-                buffers["sorted_output"],
-                buffers["intermediate"],
-                route_offsets,
-                route_ids,
-                layer.w2_strided_ptrs_w,
-                layer.w2_strided_ptrs_s,
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                layer.sm70_mxfp4_w2_k_dim,
-                layer.sm70_mxfp4_w2_n_dim,
-                layer.sm70_mxfp4_group_size,
-            )
-            sm70_ops.awq_moe_single_token_weighted_reduce_out(
-                buffers["sorted_output"],
-                topk_weights,
-                buffers["token_expert_indices"],
-                output,
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                layer.sm70_mxfp4_hidden_size,
-            )
-            return output
-        if direct_top6:
-            sm70_ops.mxfp4_moe_single_token_prepare_w13_sm70_out(
-                buffers["gate_up"],
-                buffers["permuted_input"],
+            return execute_fp4(
+                layer.sm70_fp4_codec,
+                plan,
+                buffers,
                 x,
                 topk_ids,
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                buffers["compact_expert_offsets"],
-                buffers["inv_permuted_idx"],
-                buffers["permuted_experts_id"],
-                layer.sm70_mxfp4_w13_k_dim,
-                layer.sm70_mxfp4_w13_n_dim,
-                layer.sm70_mxfp4_group_size,
-                layer.sm70_mxfp4_hidden_size,
-            )
-            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
-            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-                buffers["sorted_output"],
-                buffers["intermediate"],
-                buffers["compact_expert_offsets"],
-                buffers["permuted_experts_id"],
-                layer.w2_strided_ptrs_w,
-                layer.w2_strided_ptrs_s,
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                layer.sm70_mxfp4_w2_k_dim,
-                layer.sm70_mxfp4_w2_n_dim,
-                layer.sm70_mxfp4_group_size,
-            )
-            torch.ops._moe_C.moe_unpermute(
-                buffers["sorted_output"],
                 topk_weights,
-                buffers["inv_permuted_idx"],
-                buffers["compact_expert_offsets64"],
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                output,
+                offsets=_select_mxfp4_direct_order_offsets(buffers),
+                expert_ids=topk_ids.view(-1),
+                expert_count=_DEEPSEEK_V4_FLASH_TOP_K,
             )
-            return output
+        if direct_top6:
+            plan = select_fp4_stage_plan(Stage.PREPARE_W13, Stage.DENSE)
+            return execute_fp4(
+                layer.sm70_fp4_codec,
+                plan,
+                buffers,
+                x,
+                topk_ids,
+                topk_weights,
+                offsets=buffers["compact_expert_offsets"],
+                expert_ids=buffers["permuted_experts_id"],
+                expert_count=_DEEPSEEK_V4_FLASH_TOP_K,
+                unpermute_offsets=buffers["compact_expert_offsets64"],
+            )
 
         output.zero_()
 
-        total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
+        total_slots = num_tokens * layer.top_k
         topk_ids_i32 = buffers["topk_ids"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
         buffers["permuted_idx"].fill_(total_slots)
-        torch.ops._moe_C.moe_permute_with_scratch(
+        self.native_ops.moe_permute_with_scratch(
             x,
             topk_ids_i32,
             buffers["token_expert_indices"],
             layer.expert_map,
             layer.global_num_experts,
             layer.local_num_experts,
-            _DEEPSEEK_V4_FLASH_TOP_K,
+            layer.top_k,
             buffers["permuted_input"],
             buffers["expert_offsets64"],
             buffers["inv_permuted_idx"],
@@ -940,10 +778,10 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
 
         if (
             num_tokens > 1
-            and num_tokens <= _mxfp4_active_expert_max_tokens()
+            and num_tokens <= _mxfp4_active_expert_max_tokens(self.sm70_moe_policy)
             and not (
-                _mxfp4_grouped_verifier_for_tokens(num_tokens)
-                and not _mxfp4_grouped_m8_expert_rows_enabled()
+                _mxfp4_grouped_verifier_for_tokens(num_tokens, self.sm70_moe_policy)
+                and not _mxfp4_grouped_m8_expert_rows_enabled(self.sm70_moe_policy)
             )
             and layer.expert_map is None
             and layer.local_num_experts == layer.global_num_experts
@@ -957,49 +795,29 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         stage_offsets, stage_expert_ids, stage_expert_count = (
             _select_mxfp4_stage_dispatch(
                 buffers,
+                policy=self.sm70_moe_policy,
                 num_tokens=num_tokens,
                 num_experts=layer.sm70_mxfp4_num_experts,
                 fully_replicated_experts=(
                     layer.expert_map is None
                     and layer.local_num_experts == layer.global_num_experts
                 ),
+                top_k=layer.top_k,
             )
         )
 
-        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-            buffers["gate_up"],
+        return execute_fp4(
+            layer.sm70_fp4_codec,
+            select_fp4_stage_plan(Stage.DENSE, Stage.DENSE),
+            buffers,
             buffers["permuted_input"],
-            stage_offsets,
-            stage_expert_ids,
-            layer.w13_strided_ptrs_w,
-            layer.w13_strided_ptrs_s,
-            stage_expert_count,
-            layer.sm70_mxfp4_w13_k_dim,
-            layer.sm70_mxfp4_w13_n_dim,
-            layer.sm70_mxfp4_group_size,
-        )
-        self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
-        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-            buffers["sorted_output"],
-            buffers["intermediate"],
-            stage_offsets,
-            stage_expert_ids,
-            layer.w2_strided_ptrs_w,
-            layer.w2_strided_ptrs_s,
-            stage_expert_count,
-            layer.sm70_mxfp4_w2_k_dim,
-            layer.sm70_mxfp4_w2_n_dim,
-            layer.sm70_mxfp4_group_size,
-        )
-        torch.ops._moe_C.moe_unpermute(
-            buffers["sorted_output"],
+            topk_ids,
             topk_weights,
-            buffers["inv_permuted_idx"],
-            buffers["expert_offsets64"],
-            _DEEPSEEK_V4_FLASH_TOP_K,
-            output,
+            offsets=stage_offsets,
+            expert_ids=stage_expert_ids,
+            expert_count=stage_expert_count,
+            unpermute_offsets=buffers["expert_offsets64"],
         )
-        return output
 
     def apply_monolithic(
         self,

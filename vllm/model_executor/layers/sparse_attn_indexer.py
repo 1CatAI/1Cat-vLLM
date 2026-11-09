@@ -37,8 +37,11 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 MXFP4_BLOCK_SIZE = 32
 
 
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+def _is_volta_or_turing_cuda() -> bool:
+    # Neither has DeepGEMM or native FP8, so Turing takes the FP16 indexer too.
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        70
+    )
 
 
 def _gather_workspace_shapes(
@@ -80,6 +83,21 @@ def kv_cache_as_quant_view(
             stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
         )
     return kv_cache.unsqueeze(-2)
+
+
+def _block_table_rows_per_request(decode_metadata) -> int:
+    """Consecutive decode block-table rows that belong to one request: the
+    verifier length when a uniform speculative decode was flattened to one row
+    per token, 1 otherwise."""
+    per_request = decode_metadata.per_req_decode_lens
+    if (
+        per_request is None
+        or per_request.shape[0] == 0
+        or not decode_metadata.decode_is_uniform
+        or decode_metadata.block_table.shape[0] % per_request.shape[0]
+    ):
+        return 1
+    return max(1, decode_metadata.block_table.shape[0] // per_request.shape[0])
 
 
 @eager_break_during_capture
@@ -149,7 +167,7 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
-    sm70_fp16_indexer = _is_exact_sm70_cuda()
+    sm70_fp16_indexer = _is_volta_or_turing_cuda()
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -356,6 +374,10 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 attn_metadata_narrowed.compressed_max_seq_len,
+                _block_table_rows_per_request(decode_metadata),
+                indexer_decode_cublas=get_forward_context()
+                .no_compile_layers[k_cache_prefix]
+                .sm70_sparse.indexer_decode_cublas,
             )
         elif current_platform.is_xpu():
             if padded_q_scale is not None:
@@ -494,7 +516,7 @@ class SparseAttnIndexer(CustomOp):
         self.use_fp4_cache = use_fp4_cache
         if (
             current_platform.is_cuda()
-            and not _is_exact_sm70_cuda()
+            and not _is_volta_or_turing_cuda()
             and not has_deep_gemm()
         ):
             raise RuntimeError(

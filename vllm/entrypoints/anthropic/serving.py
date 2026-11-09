@@ -67,35 +67,16 @@ def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
 
 
 def _anthropic_input_tokens(usage: UsageInfo | None) -> int:
-    """Anthropic `input_tokens` = **fresh** tokens only.
+    """Report fresh prompt tokens, subtracting measured cache reads.
 
-    vLLM's `prompt_tokens` is fresh + cached (OpenAI semantics). Anthropic
-    instead reports the cached part separately in `cache_read_input_tokens`
-    and counts only the miss in `input_tokens`. Reporting the total as
-    `input_tokens` lets clients that bill `total = input + cached` double
-    count, which both distorts cache-hit accounting and makes them believe
-    the context is twice as full as it is — enough to trigger a premature
-    context compaction, dropping conversation history.
-
-    When the cache breakdown is not available yet, report 0 rather than
-    falling back to the total. The streaming usage sequence is::
-
-        chunk#1  {"prompt_tokens": N}                      <- message_start
-        ...
-        chunk#k  {"prompt_tokens": N, "prompt_tokens_details": {"cached_tokens": C}}
-
-    `message_start` is built from chunk#1, before `prompt_tokens_details`
-    exists. A client has nothing to subtract from, so reporting N there
-    overstates the context by N/C-fold. The accurate value arrives later in
-    `message_delta`, where the breakdown is present.
+    Without a cache breakdown, preserve the engine's prompt count. This also
+    covers deployments that do not enable prompt token details. Streaming
+    updates can refine the count when cache details become available.
     """
     if usage is None:
         return 0
-    if usage.prompt_tokens_details is None:
-        return 0
-    prompt_tokens = usage.prompt_tokens or 0
-    cached = usage.prompt_tokens_details.cached_tokens or 0
-    return max(0, prompt_tokens - cached)
+    cached = _cache_usage_fields(usage).get("cache_read_input_tokens", 0)
+    return max(0, usage.prompt_tokens - cached)
 
 
 class AnthropicServingMessages(OpenAIServingChat):

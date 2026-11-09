@@ -11,7 +11,9 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.config.execution_policy import ple_policy
 from vllm.logger import init_logger
+from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -63,10 +65,22 @@ class UniProcExecutor(Executor):
         self.driver_worker.init_worker(all_kwargs=[kwargs])
         self.driver_worker.init_device()
 
+        if (
+            ple_offload_enabled(self.vllm_config)
+            and not ple_policy(self.vllm_config).hybrid
+        ):
+            self.driver_worker.spawn_ple_offload()
+        elif ple_policy(self.vllm_config).hybrid:
+            self.driver_worker.prepare_ple_offload_spawn()
+
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.driver_worker.elastic_ep_execute("load_model")
         else:
             self.driver_worker.load_model()
+        if ple_policy(self.vllm_config).hybrid:
+            self.driver_worker.spawn_ple_offload()
+        if ple_offload_enabled(self.vllm_config):
+            self.driver_worker.wait_ple_offload_ready()
         current_platform.update_block_size_for_backend(self.vllm_config)
 
     def _distributed_args(self) -> tuple[str, int, int]:
@@ -80,7 +94,7 @@ class UniProcExecutor(Executor):
     @cached_property
     def max_concurrent_batches(self) -> int:
         if self.scheduler_config.async_scheduling:
-            return max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH)
+            return max(2, self.scheduler_config.sm70_queue_depth())
         return 1
 
     def collective_rpc(  # type: ignore[override]

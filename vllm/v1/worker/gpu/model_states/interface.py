@@ -36,6 +36,13 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
+    supports_early_input_preparation: bool = False
+    """Inputs can be prepared from request/token buffers before attention metadata.
+
+    Opt in only when prepare_inputs does not consume attention metadata or
+    recurrent-state migration results. Operations stay on the current stream.
+    """
+
     @abstractmethod
     def __init__(
         self,
@@ -68,8 +75,8 @@ class ModelState(ABC):
 
     def postprocess_state(
         self,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         return None

@@ -138,7 +138,11 @@ def is_gguf(model: str | Path) -> bool:
     if check_gguf_file(model):
         return True
 
-    # Check if it's a remote GGUF model (repo_id:quant_type format)
+    # Explicit Hub filenames may include subdirectories, e.g. org/repo/Q4/model.gguf.
+    if not Path(model).is_absolute() and re.fullmatch(
+        r"[\w.-]+/[\w.-]+/(?:[^/:]+/)*[^/:]+\.gguf", model
+    ):
+        return True
     return is_remote_gguf(model)
 
 

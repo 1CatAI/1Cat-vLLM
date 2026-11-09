@@ -1,3 +1,6 @@
+#include "sm70_policy.h"
+#include "gemm_runtime.h"
+#include "packed_gemm.h"
 /*
  * SM70 AWQ GEMM integration using TurboMind s884h kernels.
  * Adapted from LMDeploy TurboMind (Apache-2.0).
@@ -11,26 +14,20 @@
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cutlass/half.h>
 
 #include <atomic>
 #include <cfloat>
 #include <cstring>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <limits>
-#include <mutex>
-#include <optional>
 #include <type_traits>
-#include <unordered_set>
-#include <unordered_map>
 #include <vector>
 
 #include "src/turbomind/core/data_type.h"
 #include "src/turbomind/kernels/gemm/arch/config_sm70_s884.h"
 #include "src/turbomind/kernels/gemm/cast.h"
-#include "src/turbomind/kernels/gemm/convert.h"
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/gemm_universal.h"
 #include "src/turbomind/kernels/gemm/matrix_ptr.h"
@@ -111,8 +108,7 @@ void sm70_silu_and_mul_interleaved_fp16_out(torch::Tensor out,
 }
 
 bool sm70_profile_trace_enabled() {
-  const char* value = std::getenv("VLLM_SM70_PROFILE_TRACE");
-  return value != nullptr && std::strcmp(value, "1") == 0;
+  return vllm::sm70::policy_exact_one(vllm::sm70::PolicyField::profile_trace);
 }
 
 const char* sm70_scalar_type_name(at::ScalarType scalar_type) {
@@ -154,13 +150,13 @@ unsigned sm70_capture_status_bit(cudaStreamCaptureStatus status) {
   }
 }
 
-void maybe_log_sm70_moe_route_once(std::atomic<unsigned>& logged_mask,
-                                   const char* route,
+void maybe_log_sm70_moe_route_once(const char* counter_name, const char* route,
                                    const torch::Tensor& input, int64_t tokens,
                                    int64_t experts_or_top_k) {
   if (!sm70_profile_trace_enabled()) {
     return;
   }
+  auto& logged_mask = vllm::sm70::diagnostic_counter(counter_name);
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
@@ -890,631 +886,13 @@ __global__ void nvfp4_raw_gemv_warp_kernel(
 
 namespace {
 
-struct WorkspaceHolder {
-  torch::Tensor barriers;
-  torch::Tensor partials;
-  torch::Tensor tensormaps;
-  torch::Tensor flags;
-  turbomind::gemm::Workspace workspace{};
-};
-
-struct GemmHolder {
-  std::unique_ptr<turbomind::gemm::Gemm> gemm;
-};
-
-enum class TuneKeyKind : int {
-  kGenericDense = 0,
-  kAwqDense = 1,
-  kFp8Dense = 2,
-  kGenericMoe = 3,
-  kAwqMoe = 4,
-  kFp8Moe = 5,
-  kMxfp4Dense = 6,
-  kNvfp4Dense = 7,
-  kMxfp4Moe = 8,
-  kNvfp4Moe = 9,
-};
-
-struct DenseTuneKey {
-  TuneKeyKind kind;
-  int device;
-  int m;
-  int n;
-  int k;
-  int group_size;
-
-  bool operator==(const DenseTuneKey& other) const {
-    return kind == other.kind && device == other.device && m == other.m &&
-           n == other.n && k == other.k && group_size == other.group_size;
+int glm_mhc_pre_threads() {
+  const char* raw = std::getenv("VLLM_SM70_GLM_MHC_PRE_THREADS");
+  const int threads = raw == nullptr ? 256 : std::atoi(raw);
+  if (threads == 128 || threads == 256 || threads == 512 || threads == 1024) {
+    return threads;
   }
-};
-
-struct DenseTuneKeyHash {
-  std::size_t operator()(const DenseTuneKey& key) const {
-    std::size_t h = std::hash<int>()(static_cast<int>(key.kind));
-    h ^= std::hash<int>()(key.device) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.m) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.n) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.k) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.group_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
-struct MoeTuneKey {
-  TuneKeyKind kind;
-  int device;
-  int total_tokens;
-  int n;
-  int k;
-  int num_experts;
-  int group_size;
-
-  bool operator==(const MoeTuneKey& other) const {
-    return kind == other.kind && device == other.device &&
-           total_tokens == other.total_tokens && n == other.n && k == other.k &&
-           num_experts == other.num_experts && group_size == other.group_size;
-  }
-};
-
-struct MoeTuneKeyHash {
-  std::size_t operator()(const MoeTuneKey& key) const {
-    std::size_t h = std::hash<int>()(static_cast<int>(key.kind));
-    h ^= std::hash<int>()(key.device) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.total_tokens) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.n) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.k) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.num_experts) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>()(key.group_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
-struct Sm70F16WeightCacheKey {
-  int device;
-  const void* tensor_impl;
-  int64_t rows;
-  int64_t cols;
-
-  bool operator==(const Sm70F16WeightCacheKey& other) const {
-    return device == other.device && tensor_impl == other.tensor_impl &&
-           rows == other.rows && cols == other.cols;
-  }
-};
-
-struct Sm70F16WeightCacheKeyHash {
-  std::size_t operator()(const Sm70F16WeightCacheKey& key) const {
-    std::size_t h = std::hash<int>()(key.device);
-    h ^= std::hash<const void*>()(key.tensor_impl) + 0x9e3779b9 + (h << 6) +
-         (h >> 2);
-    h ^= std::hash<int64_t>()(key.rows) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int64_t>()(key.cols) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
-struct Sm70F16WeightCacheEntry {
-  torch::Tensor tm_weight;
-  int64_t k_ld;
-};
-
-// Per-stream workspace management to eliminate mutex contention
-struct StreamWorkspaceKey {
-  int device;
-  cudaStream_t stream;
-
-  bool operator==(const StreamWorkspaceKey& other) const {
-    return device == other.device && stream == other.stream;
-  }
-};
-
-struct StreamWorkspaceKeyHash {
-  std::size_t operator()(const StreamWorkspaceKey& k) const {
-    return std::hash<int>()(k.device) ^
-           (std::hash<cudaStream_t>()(k.stream) << 1);
-  }
-};
-
-std::mutex workspace_mutex;
-std::mutex gemm_mutex;
-std::mutex tune_mutex;
-std::mutex sm70_f16_weight_cache_mutex;
-std::unordered_map<StreamWorkspaceKey, WorkspaceHolder, StreamWorkspaceKeyHash>
-    workspace_cache;
-std::unordered_map<int, GemmHolder> gemm_cache;
-std::unordered_set<DenseTuneKey, DenseTuneKeyHash> dense_tuned_shapes;
-std::unordered_set<MoeTuneKey, MoeTuneKeyHash> moe_tuned_shapes;
-std::unordered_set<int> imported_cache_devices;
-std::unordered_map<Sm70F16WeightCacheKey, Sm70F16WeightCacheEntry,
-                   Sm70F16WeightCacheKeyHash>
-    sm70_f16_weight_cache;
-
-turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_awq_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-
-bool tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool awq_tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool mxfp4_tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_compact_grouped_decode_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_broadcast_input_decode_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_grouped_m8_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_grouped_verifier_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_grouped_m8_expert_rows_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool mxfp4_moe_grouped_m8_fast_selector_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool nvfp4_tune_small_shapes_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool nvfp4_moe_grouped_prefill_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool nvfp4_qwen38_tp4_m1_fast_selector_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool fp8_moe_single_token_per_expert_dispatch_enabled() {
-  const char* raw =
-      std::getenv("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_0dot3_dense_selector_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_safe_fast_selector_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_grouped_bmm_decode_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool awq_reuse_imported_cache_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool awq_preserve_default_splits_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool awq_preserve_default_splits_only_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-bool fp8_preserve_default_splits_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS");
-  return raw == nullptr || std::atoi(raw) != 0;
-}
-
-bool fp8_preserve_default_splits_only_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY");
-  return raw != nullptr && std::atoi(raw) != 0;
-}
-
-inline turbomind::gemm::DispatchPolicy maybe_preserve_default_splits(
-    turbomind::gemm::DispatchPolicy policy) {
-  if (policy == turbomind::gemm::DispatchPolicy::kMeasure ||
-      policy == turbomind::gemm::DispatchPolicy::kReuse) {
-    if (awq_preserve_default_splits_only_enabled()) {
-      return policy |
-             turbomind::gemm::DispatchPolicy::kPreserveDefaultSplitCount;
-    }
-    if (!awq_preserve_default_splits_enabled()) {
-      return policy;
-    }
-    return policy | turbomind::gemm::DispatchPolicy::kPreserveDefaultSplits;
-  }
-  return policy;
-}
-
-inline turbomind::gemm::DispatchPolicy maybe_preserve_fp8_default_splits(
-    turbomind::gemm::DispatchPolicy policy) {
-  if (policy == turbomind::gemm::DispatchPolicy::kMeasure ||
-      policy == turbomind::gemm::DispatchPolicy::kReuse) {
-    if (fp8_preserve_default_splits_only_enabled()) {
-      return policy |
-             turbomind::gemm::DispatchPolicy::kPreserveDefaultSplitCount;
-    }
-    if (!fp8_preserve_default_splits_enabled()) {
-      return policy;
-    }
-    return policy | turbomind::gemm::DispatchPolicy::kPreserveDefaultSplits;
-  }
-  return policy;
-}
-
-std::optional<turbomind::gemm::DispatchPolicy>
-dispatch_policy_override_from_env(const char* env_name) {
-  const char* raw = std::getenv(env_name);
-  if (raw == nullptr || std::strcmp(raw, "") == 0) {
-    return std::nullopt;
-  }
-  if (std::strcmp(raw, "default") == 0) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  if (std::strcmp(raw, "reuse") == 0) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (std::strcmp(raw, "measure") == 0) {
-    return turbomind::gemm::DispatchPolicy::kMeasure;
-  }
-  TORCH_CHECK(false, env_name, " must be one of: default, reuse, measure.");
-  return std::nullopt;
-}
-
-std::optional<turbomind::gemm::DispatchPolicy>
-awq_moe_dispatch_policy_override() {
-  return dispatch_policy_override_from_env("VLLM_SM70_AWQ_MOE_DISPATCH_POLICY");
-}
-
-int awq_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int generic_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_F16_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int fp8_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int mxfp4_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int nvfp4_dense_tune_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
-}
-
-int moe_tune_max_tokens() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS");
-  return raw ? std::max(std::atoi(raw), 0) : 128;
-}
-
-int nvfp4_moe_tune_max_tokens() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS");
-  return raw ? std::max(std::atoi(raw), 0) : 128;
-}
-
-int sm70_f16_dense_max_m() {
-  const char* raw = std::getenv("VLLM_SM70_F16_DENSE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 64;
-}
-
-bool is_stream_capturing(cudaStream_t stream) {
-  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-  const auto ec = cudaStreamIsCapturing(stream, &status);
-  if (ec != cudaSuccess) {
-    cudaGetLastError();
-    return false;
-  }
-  return status != cudaStreamCaptureStatusNone;
-}
-
-bool has_imported_cache(int device) {
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  return imported_cache_devices.find(device) != imported_cache_devices.end();
-}
-
-turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream,
-    TuneKeyKind kind, bool tune_enabled, bool reuse_imported_cache, int max_m) {
-  if (m > max_m) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  if (reuse_imported_cache && has_imported_cache(device)) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (!tune_enabled) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-
-  DenseTuneKey key{kind, device, m, n, k, group_size};
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  if (dense_tuned_shapes.find(key) != dense_tuned_shapes.end()) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (is_stream_capturing(stream)) {
-    // tune_mutex is already held here. Calling has_imported_cache() would
-    // acquire it recursively and deadlock on the first uncached graph shape.
-    if (imported_cache_devices.find(device) != imported_cache_devices.end()) {
-      return turbomind::gemm::DispatchPolicy::kReuse;
-    }
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  dense_tuned_shapes.insert(key);
-  return turbomind::gemm::DispatchPolicy::kMeasure;
-}
-
-turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  const char* dflash2_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
-  const char* dflash2_shadow =
-      std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");
-  const bool exact_dflash2_rerank =
-      (dflash2_rerank && std::atoi(dflash2_rerank) != 0) ||
-      (dflash2_shadow && std::atoi(dflash2_shadow) != 0);
-  if (exact_dflash2_rerank && m >= 1 && m <= 8 && n == 62080 && k == 5120 &&
-      group_size == 0) {
-    // The sparse reranker reproduces this exact split-K contract. Do not let
-    // concurrent startup noise choose a numerically different LM-head spec on
-    // one TP rank.
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  return select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kGenericDense,
-      tune_small_shapes_enabled(), false, generic_dense_tune_max_m());
-}
-
-turbomind::gemm::DispatchPolicy select_awq_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  return maybe_preserve_default_splits(select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kAwqDense,
-      awq_tune_small_shapes_enabled(), awq_reuse_imported_cache_enabled(),
-      awq_dense_tune_max_m()));
-}
-
-turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  if (fp8_0dot3_dense_selector_enabled()) {
-    return select_dense_dispatch_policy_impl(
-        device, m, n, k, group_size, stream, TuneKeyKind::kGenericDense,
-        tune_small_shapes_enabled(), false, generic_dense_tune_max_m());
-  }
-  auto policy = select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kFp8Dense,
-      fp8_tune_small_shapes_enabled(), false, fp8_dense_tune_max_m());
-  if (!fp8_safe_fast_selector_enabled()) {
-    return policy;
-  }
-  return maybe_preserve_fp8_default_splits(policy);
-}
-
-turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  return select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kMxfp4Dense,
-      mxfp4_tune_small_shapes_enabled(), false, mxfp4_dense_tune_max_m());
-}
-
-turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  if (nvfp4_qwen38_tp4_m1_fast_selector_enabled() && m == 1 &&
-      group_size == 16 &&
-      ((n == 8704 && k == 5120) || (n == 5120 && k == 4352))) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  return select_dense_dispatch_policy_impl(
-      device, m, n, k, group_size, stream, TuneKeyKind::kNvfp4Dense,
-      nvfp4_tune_small_shapes_enabled(), false, nvfp4_dense_tune_max_m());
-}
-
-turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream, TuneKeyKind kind, bool tune_enabled,
-    int max_tune_tokens = -1) {
-  const int tune_limit =
-      max_tune_tokens >= 0 ? max_tune_tokens : moe_tune_max_tokens();
-  if (!tune_enabled || total_tokens > tune_limit) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-
-  MoeTuneKey key{kind, device, total_tokens, n, k, num_experts, group_size};
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  if (moe_tuned_shapes.find(key) != moe_tuned_shapes.end()) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (is_stream_capturing(stream)) {
-    if (imported_cache_devices.find(device) != imported_cache_devices.end()) {
-      return turbomind::gemm::DispatchPolicy::kReuse;
-    }
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  moe_tuned_shapes.insert(key);
-  return turbomind::gemm::DispatchPolicy::kMeasure;
-}
-
-turbomind::gemm::DispatchPolicy select_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream) {
-  return select_moe_dispatch_policy_impl(
-      device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kGenericMoe, tune_small_shapes_enabled());
-}
-
-turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream) {
-  if (fp8_grouped_bmm_decode_enabled() && total_tokens == 2 && n == 1024 &&
-      k == 4096 && num_experts == 2 && group_size == 128) {
-    // The matching dense WO-A projection uses the fixed launch spec selected
-    // in gemm.cu. Do not let measurement replace its accumulation tree.
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  return select_moe_dispatch_policy_impl(
-      device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kFp8Moe, fp8_tune_small_shapes_enabled());
-}
-
-turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream) {
-  const bool exact_grouped_m8 =
-      total_tokens == 48 && num_experts == 48 && group_size == 32 &&
-      ((n == 512 && k == 4096) || (n == 4096 && k == 256));
-  if (mxfp4_moe_grouped_m8_enabled() &&
-      !mxfp4_moe_grouped_m8_expert_rows_enabled() &&
-      mxfp4_moe_grouped_m8_fast_selector_enabled() && exact_grouped_m8) {
-    return turbomind::gemm::DispatchPolicy::kMxfp4MoeGroupedM8Fast;
-  }
-  return select_moe_dispatch_policy_impl(
-      device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kMxfp4Moe, mxfp4_tune_small_shapes_enabled());
-}
-
-turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream) {
-  return select_moe_dispatch_policy_impl(
-      device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kNvfp4Moe, nvfp4_tune_small_shapes_enabled(),
-      nvfp4_moe_tune_max_tokens());
-}
-
-WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
-  thread_local int cached_device = -1;
-  thread_local cudaStream_t cached_stream = nullptr;
-  thread_local WorkspaceHolder* cached_holder = nullptr;
-  if (cached_holder != nullptr && cached_device == device &&
-      cached_stream == stream) {
-    return *cached_holder;
-  }
-
-  StreamWorkspaceKey key{device, stream};
-
-  // Fast path: check if workspace exists without lock
-  {
-    std::lock_guard<std::mutex> lock(workspace_mutex);
-    auto it = workspace_cache.find(key);
-    if (it != workspace_cache.end()) {
-      cached_device = device;
-      cached_stream = stream;
-      cached_holder = &it->second;
-      return it->second;
-    }
-  }
-
-  // Slow path: create new workspace
-  WorkspaceHolder holder;
-  auto byte_opts = torch::TensorOptions()
-                       .device(torch::Device(torch::kCUDA, device))
-                       .dtype(torch::kUInt8);
-  auto int_opts = torch::TensorOptions()
-                      .device(torch::Device(torch::kCUDA, device))
-                      .dtype(torch::kInt32);
-
-  holder.barriers = torch::zeros(
-      {(long long)turbomind::gemm::Gemm::kBarriersSize}, byte_opts);
-  holder.partials = torch::zeros(
-      {(long long)turbomind::gemm::Gemm::kPartialsSize}, byte_opts);
-  // Keep same tensormap size as TurboMind LlamaLinear.
-  holder.tensormaps = torch::empty({(long long)(8192 * 128)}, byte_opts);
-  holder.flags = torch::zeros({1}, int_opts);
-
-  holder.workspace.barriers = holder.barriers.data_ptr();
-  holder.workspace.barriers_size = holder.barriers.numel();
-  holder.workspace.partials = holder.partials.data_ptr();
-  holder.workspace.partials_size = holder.partials.numel();
-  holder.workspace.tensormaps = holder.tensormaps.data_ptr();
-  holder.workspace.tensormaps_size = holder.tensormaps.numel();
-  holder.workspace.flags = holder.flags.data_ptr<int>();
-
-  std::lock_guard<std::mutex> lock(workspace_mutex);
-  auto [insert_it, _] = workspace_cache.emplace(key, std::move(holder));
-  cached_device = device;
-  cached_stream = stream;
-  cached_holder = &insert_it->second;
-  return insert_it->second;
-}
-
-turbomind::gemm::Gemm& get_gemm(int device) {
-  thread_local int cached_device = -1;
-  thread_local turbomind::gemm::Gemm* cached_gemm = nullptr;
-  if (cached_gemm != nullptr && cached_device == device) {
-    return *cached_gemm;
-  }
-
-  std::lock_guard<std::mutex> lock(gemm_mutex);
-  auto it = gemm_cache.find(device);
-  if (it != gemm_cache.end()) {
-    cached_device = device;
-    cached_gemm = it->second.gemm.get();
-    return *it->second.gemm;
-  }
-  GemmHolder holder;
-  holder.gemm = std::make_unique<turbomind::gemm::Gemm>();
-  auto [insert_it, _] = gemm_cache.emplace(device, std::move(holder));
-  cached_device = device;
-  cached_gemm = insert_it->second.gemm.get();
-  return *insert_it->second.gemm;
+  return 256;
 }
 
 void validate_awq_inputs(const torch::Tensor& qweight,
@@ -1734,87 +1112,139 @@ void validate_f16_lm_head_top20_input(const torch::Tensor& values_out,
               "sm70_f16_lm_head_top20_tc_out: invalid vocab padding.");
 }
 
-Sm70F16WeightCacheKey make_sm70_f16_weight_cache_key(
-    const torch::Tensor& weight) {
-  return Sm70F16WeightCacheKey{
-      weight.get_device(),
-      static_cast<const void*>(weight.unsafeGetTensorImpl()),
-      weight.size(0),
-      weight.size(1),
-  };
-}
-
-Sm70F16WeightCacheEntry prepare_sm70_f16_weight(torch::Tensor weight,
-                                                cudaStream_t stream) {
-  const int64_t n = weight.size(0);
-  const int64_t k = weight.size(1);
-
-  const auto converters = turbomind::gemm::GetConverters(
-      turbomind::kHalf, turbomind::kHalf, turbomind::kHalf, true, 70);
-  const auto* conv_w = converters[0];
-  TORCH_CHECK(conv_w, "sm70_f16_prepare: no compatible TurboMind converter.");
-
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout k_desc = w_desc;
-  k_desc.type = turbomind::kHalf;
-  k_desc.pack = conv_w->pack;
-  if (is_A_w) {
-    k_desc = turbomind::gemm::transpose(k_desc);
-  }
-
-  auto tm_weight = torch::empty_like(weight);
-  TORCH_CHECK(conv_w->Convert(weight.data_ptr(), w_desc, tm_weight.data_ptr(),
-                              k_desc, stream) == 0,
-              "sm70_f16_prepare: weight conversion failed.");
-
-  return {std::move(tm_weight), static_cast<int64_t>(k_desc.ld)};
-}
-
-Sm70F16WeightCacheEntry get_sm70_f16_cached_weight(torch::Tensor weight,
-                                                   cudaStream_t stream) {
-  weight = weight.contiguous();
-  const auto key = make_sm70_f16_weight_cache_key(weight);
-
-  {
-    std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
-    auto it = sm70_f16_weight_cache.find(key);
-    if (it != sm70_f16_weight_cache.end()) {
-      return it->second;
-    }
-  }
-
-  TORCH_CHECK(!is_stream_capturing(stream),
-              "sm70_f16_prepare: cache miss during CUDA graph capture.");
-
-  auto entry = prepare_sm70_f16_weight(weight, stream);
-
-  std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
-  auto [it, _] = sm70_f16_weight_cache.emplace(key, entry);
-  return it->second;
-}
-
 __device__ __forceinline__ float warp_reduce_sum(float val) {
   for (int offset = 16; offset > 0; offset >>= 1) {
     val += __shfl_down_sync(0xffffffff, val, offset);
   }
   return val;
+}
+
+__device__ __forceinline__ float warp_reduce_sum_bfly(float val) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    val += __shfl_xor_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
+template <int kTileN>
+__global__ __launch_bounds__(256) void sm70_glm_mhc_post_dot_q8_kernel(
+    half* __restrict__ residual_out, float* __restrict__ gemm_mul,
+    float* __restrict__ gemm_sqrsum, const float* __restrict__ comb_mix,
+    const half* __restrict__ residual, const float* __restrict__ post_mix,
+    const half* __restrict__ x, const float* __restrict__ weight) {
+  constexpr int kTokens = 8;
+  constexpr int kStreams = 4;
+  constexpr int kHidden = 4096;
+  constexpr int kOutputs = 24;
+  constexpr int kSplits = 4;
+  constexpr int kThreads = 256;
+  constexpr int kWarps = kThreads / 32;
+  constexpr int kHiddenPerSplit = kHidden / kSplits;
+  constexpr int kHiddenIters = kHiddenPerSplit / kThreads;
+  static_assert(kOutputs % kTileN == 0);
+
+  __shared__ float post_shared[kStreams];
+  __shared__ float comb_shared[kStreams * kStreams];
+  __shared__ float warp_shared[kWarps][kTileN + 1];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int token = blockIdx.x;
+  const int output_tile = blockIdx.y;
+  const int split = blockIdx.z;
+  if (tid < kStreams) {
+    post_shared[tid] = post_mix[token * kStreams + tid];
+  }
+  if (tid < kStreams * kStreams) {
+    comb_shared[tid] = comb_mix[token * kStreams * kStreams + tid];
+  }
+  __syncthreads();
+
+  float post[kStreams];
+  float comb[kStreams][kStreams];
+#pragma unroll
+  for (int stream = 0; stream < kStreams; ++stream) {
+    post[stream] = post_shared[stream];
+#pragma unroll
+    for (int input_stream = 0; input_stream < kStreams; ++input_stream) {
+      comb[input_stream][stream] =
+          comb_shared[input_stream * kStreams + stream];
+    }
+  }
+
+  float dot[kTileN] = {};
+  float sqrsum = 0.f;
+  const int split_start = split * kHiddenPerSplit;
+#pragma unroll
+  for (int item = 0; item < kHiddenIters; ++item) {
+    const int hidden = split_start + item * kThreads + tid;
+    const float x_value = static_cast<float>(x[token * kHidden + hidden]);
+    float mapped[kStreams];
+#pragma unroll
+    for (int stream = 0; stream < kStreams; ++stream) {
+      float value = post[stream] * x_value;
+#pragma unroll
+      for (int input_stream = 0; input_stream < kStreams; ++input_stream) {
+        const float residual_value = static_cast<float>(
+            residual[(token * kStreams + input_stream) * kHidden + hidden]);
+        value += comb[input_stream][stream] * residual_value;
+      }
+      mapped[stream] = value;
+      if (output_tile == 0) {
+        residual_out[(token * kStreams + stream) * kHidden + hidden] =
+            __float2half_rn(value);
+        sqrsum += value * value;
+      }
+    }
+
+#pragma unroll
+    for (int output = 0; output < kTileN; ++output) {
+      const int output_index = output_tile * kTileN + output;
+#pragma unroll
+      for (int stream = 0; stream < kStreams; ++stream) {
+        const float weight_value =
+            weight[(output_index * kStreams + stream) * kHidden + hidden];
+        dot[output] += weight_value * mapped[stream];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int output = 0; output < kTileN; ++output) {
+    dot[output] = warp_reduce_sum_bfly(dot[output]);
+  }
+  if (output_tile == 0) {
+    sqrsum = warp_reduce_sum_bfly(sqrsum);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int output = 0; output < kTileN; ++output) {
+      warp_shared[warp][output] = dot[output];
+    }
+    if (output_tile == 0) {
+      warp_shared[warp][kTileN] = sqrsum;
+    }
+  }
+  __syncthreads();
+
+  if (warp == 0 && lane < kTileN) {
+    float total = 0.f;
+#pragma unroll
+    for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
+      total += warp_shared[source_warp][lane];
+    }
+    gemm_mul[(split * kTokens + token) * kOutputs + output_tile * kTileN +
+             lane] = total;
+  }
+  if (output_tile == 0 && warp == 0 && lane == 0) {
+    float total = 0.f;
+#pragma unroll
+    for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
+      total += warp_shared[source_warp][kTileN];
+    }
+    gemm_sqrsum[split * kTokens + token] = total;
+  }
 }
 
 __device__ __forceinline__ float warp_group4_sum(float value) {
@@ -1847,8 +1277,8 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
     const float* gemm_mul, const float* gemm_sqrsum, const float* hc_scale,
     const float* hc_base, const half* residual, float* post_mix,
     float* comb_mix, half* layer_input, const half* norm_weight, int num_splits,
-    float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult,
-    int sinkhorn_repeat, float norm_eps) {
+    int num_tokens, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
+    float hc_post_mult, int sinkhorn_repeat, float norm_eps) {
   static_assert(kStreams == 4);
   static_assert(kThreads % 32 == 0);
   __shared__ float pre_shared[kStreams];
@@ -1858,10 +1288,17 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
+  const int token = blockIdx.x;
+  const half* token_residual =
+      residual + static_cast<size_t>(token) * kStreams * kHiddenSize;
+  float* token_post_mix = post_mix + token * kStreams;
+  float* token_comb_mix = comb_mix + token * kStreams * kStreams;
+  half* token_layer_input =
+      layer_input + static_cast<size_t>(token) * kHiddenSize;
   if (warp == 0) {
     float sqrsum = 0.f;
     for (int split = 0; split < num_splits; ++split) {
-      sqrsum += gemm_sqrsum[split];
+      sqrsum += gemm_sqrsum[split * num_tokens + token];
     }
     const float input_rsqrt =
         rsqrtf(sqrsum / static_cast<float>(kStreams * kHiddenSize) + rms_eps);
@@ -1870,7 +1307,7 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
       float pre_logit = 0.f;
       float post_logit = 0.f;
       for (int split = 0; split < num_splits; ++split) {
-        const float* row = gemm_mul + split * 24;
+        const float* row = gemm_mul + (split * num_tokens + token) * 24;
         pre_logit += row[lane];
         post_logit += row[kStreams + lane];
       }
@@ -1878,15 +1315,17 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
           sm70_sigmoid(pre_logit * input_rsqrt * hc_scale[0] + hc_base[lane]) +
           hc_pre_eps;
       pre_shared[lane] = pre;
-      post_mix[lane] = sm70_sigmoid(post_logit * input_rsqrt * hc_scale[1] +
-                                    hc_base[kStreams + lane]) *
-                       hc_post_mult;
+      token_post_mix[lane] =
+          sm70_sigmoid(post_logit * input_rsqrt * hc_scale[1] +
+                       hc_base[kStreams + lane]) *
+          hc_post_mult;
     }
 
     if (lane < kStreams * kStreams) {
       float logit = 0.f;
       for (int split = 0; split < num_splits; ++split) {
-        logit += gemm_mul[split * 24 + 2 * kStreams + lane];
+        logit +=
+            gemm_mul[(split * num_tokens + token) * 24 + 2 * kStreams + lane];
       }
       logit = logit * input_rsqrt * hc_scale[2] + hc_base[2 * kStreams + lane];
       const float row_max = warp_group4_max(logit);
@@ -1897,7 +1336,7 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
         value /= warp_group4_sum(value) + hc_sinkhorn_eps;
         value /= warp_stride4_sum(value) + hc_sinkhorn_eps;
       }
-      comb_mix[lane] = value;
+      token_comb_mix[lane] = value;
     }
   }
   __syncthreads();
@@ -1905,8 +1344,8 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
   constexpr int kHiddenPairs = kHiddenSize / 2;
   constexpr int kPairsPerThread = kHiddenPairs / kThreads;
   static_assert(kHiddenPairs % kThreads == 0);
-  const half2* residual2 = reinterpret_cast<const half2*>(residual);
-  half2* layer_input2 = reinterpret_cast<half2*>(layer_input);
+  const half2* residual2 = reinterpret_cast<const half2*>(token_residual);
+  half2* layer_input2 = reinterpret_cast<half2*>(token_layer_input);
   half2 staged_values[kPairsPerThread];
   float local_sqrsum = 0.f;
 #pragma unroll
@@ -1950,12 +1389,11 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
   }
 }
 
-template <int kRows, int kCols, int kWarps>
-__global__ void sm70_glm_kda_fg_b_kernel(half* f_out, half* g_out,
-                                         const half* f_input,
-                                         const half* g_input,
-                                         const half* f_weight,
-                                         const half* g_weight) {
+template <int kRows, int kCols, int kWarps, int kBatch>
+__global__ void sm70_glm_kda_fg_b_kernel(
+    half* f_out, half* g_out, const half* f_input, const half* g_input,
+    const half* f_weight, const half* g_weight, int64_t f_input_stride,
+    int64_t g_input_stride) {
   constexpr int kThreads = kWarps * WARP_SIZE;
   constexpr int kCols2 = kCols / 2;
   static_assert(kThreads <= 1024);
@@ -1970,21 +1408,58 @@ __global__ void sm70_glm_kda_fg_b_kernel(half* f_out, half* g_out,
 
   const bool is_g = combined_row >= kRows;
   const int row = is_g ? combined_row - kRows : combined_row;
-  const half2* input = reinterpret_cast<const half2*>(is_g ? g_input : f_input);
   const half2* weight = reinterpret_cast<const half2*>(
       (is_g ? g_weight : f_weight) + row * kCols);
 
-  float dot = 0.f;
+  float dot[kBatch] = {};
   for (int col2 = lane; col2 < kCols2; col2 += WARP_SIZE) {
-    const float2 input_value = __half22float2(input[col2]);
     const float2 weight_value = __half22float2(weight[col2]);
-    dot = fmaf(input_value.x, weight_value.x, dot);
-    dot = fmaf(input_value.y, weight_value.y, dot);
+#pragma unroll
+    for (int batch = 0; batch < kBatch; ++batch) {
+      const int64_t input_stride = is_g ? g_input_stride : f_input_stride;
+      const half2* input = reinterpret_cast<const half2*>(
+          (is_g ? g_input : f_input) + batch * input_stride);
+      const float2 input_value = __half22float2(input[col2]);
+      dot[batch] = fmaf(input_value.x, weight_value.x, dot[batch]);
+      dot[batch] = fmaf(input_value.y, weight_value.y, dot[batch]);
+    }
   }
-  dot = warp_reduce_sum(dot);
-  if (lane == 0) {
-    (is_g ? g_out : f_out)[row] = __float2half_rn(dot);
+#pragma unroll
+  for (int batch = 0; batch < kBatch; ++batch) {
+    dot[batch] = warp_reduce_sum(dot[batch]);
+    if (lane == 0) {
+      (is_g ? g_out : f_out)[batch * kRows + row] = __float2half_rn(dot[batch]);
+    }
   }
+}
+
+template <int kRows>
+void launch_sm70_glm_kda_fg_b(half* f_out, half* g_out, const half* f_input,
+                              const half* g_input, const half* f_weight,
+                              const half* g_weight, int64_t f_input_stride,
+                              int64_t g_input_stride, int64_t num_tokens,
+                              cudaStream_t stream) {
+  constexpr int kWarps = 8;
+  constexpr int kThreads = kWarps * WARP_SIZE;
+  constexpr int kBlocks = (2 * kRows + kWarps - 1) / kWarps;
+#define VLLM_LAUNCH_GLM_KDA_FG_B(batch)                                        \
+  case batch:                                                                  \
+    sm70_glm_kda_fg_b_kernel<kRows, 128, kWarps, batch>                        \
+        <<<kBlocks, kThreads, 0, stream>>>(f_out, g_out, f_input, g_input,     \
+                                           f_weight, g_weight, f_input_stride, \
+                                           g_input_stride);                    \
+    break
+  switch (num_tokens) {
+    VLLM_LAUNCH_GLM_KDA_FG_B(1);
+    VLLM_LAUNCH_GLM_KDA_FG_B(2);
+    VLLM_LAUNCH_GLM_KDA_FG_B(3);
+    VLLM_LAUNCH_GLM_KDA_FG_B(4);
+    VLLM_LAUNCH_GLM_KDA_FG_B(5);
+    VLLM_LAUNCH_GLM_KDA_FG_B(6);
+    VLLM_LAUNCH_GLM_KDA_FG_B(7);
+    VLLM_LAUNCH_GLM_KDA_FG_B(8);
+  }
+#undef VLLM_LAUNCH_GLM_KDA_FG_B
 }
 
 void sm70_glm_mhc_pre_norm_out(
@@ -1993,7 +1468,7 @@ void sm70_glm_mhc_pre_norm_out(
     torch::Tensor comb_mix, torch::Tensor layer_input,
     torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
     double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
-    double norm_eps) {
+    double norm_eps, int64_t configured_threads) {
   TORCH_CHECK(
       gemm_mul.is_cuda() && gemm_sqrsum.is_cuda() && hc_scale.is_cuda() &&
           hc_base.is_cuda() && residual.is_cuda() && post_mix.is_cuda() &&
@@ -2019,14 +1494,17 @@ void sm70_glm_mhc_pre_norm_out(
   TORCH_CHECK(gemm_mul.dim() == 3,
               "sm70_glm_mhc_pre_norm_out: gemm_mul must be rank 3.");
   const int64_t num_splits = gemm_mul.size(0);
-  TORCH_CHECK(gemm_mul.size(1) == 1 && gemm_mul.size(2) == 24 &&
+  const int64_t num_tokens = residual.size(0);
+  TORCH_CHECK(num_tokens >= 1 && num_tokens <= 8 &&
+                  gemm_mul.size(1) == num_tokens && gemm_mul.size(2) == 24 &&
                   gemm_sqrsum.dim() == 2 && gemm_sqrsum.size(0) == num_splits &&
-                  gemm_sqrsum.size(1) == 1,
+                  gemm_sqrsum.size(1) == num_tokens,
               "sm70_glm_mhc_pre_norm_out: invalid staging shape.");
-  TORCH_CHECK(residual.dim() == 3 && residual.size(0) == 1 &&
-                  residual.size(1) == 4 && residual.size(2) == 4096 &&
-                  post_mix.numel() == 4 && comb_mix.numel() == 16 &&
-                  layer_input.dim() == 2 && layer_input.size(0) == 1 &&
+  TORCH_CHECK(residual.dim() == 3 && residual.size(1) == 4 &&
+                  residual.size(2) == 4096 &&
+                  post_mix.numel() == num_tokens * 4 &&
+                  comb_mix.numel() == num_tokens * 16 &&
+                  layer_input.dim() == 2 && layer_input.size(0) == num_tokens &&
                   layer_input.size(1) == 4096 && norm_weight.numel() == 4096 &&
                   hc_scale.numel() == 3 && hc_base.numel() == 24,
               "sm70_glm_mhc_pre_norm_out: invalid GLM mHC shape.");
@@ -2040,19 +1518,112 @@ void sm70_glm_mhc_pre_norm_out(
   TORCH_CHECK(num_splits >= 1 && num_splits <= 8 && sinkhorn_repeat >= 1,
               "sm70_glm_mhc_pre_norm_out: invalid reduction configuration.");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(residual));
-  constexpr int kThreads = 128;
-  sm70_glm_mhc_pre_norm_kernel<4096, 4, kThreads>
-      <<<1, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
-          gemm_mul.data_ptr<float>(), gemm_sqrsum.data_ptr<float>(),
-          hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
-          reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),
-          post_mix.data_ptr<float>(), comb_mix.data_ptr<float>(),
-          reinterpret_cast<half*>(layer_input.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(norm_weight.data_ptr<at::Half>()),
-          static_cast<int>(num_splits), static_cast<float>(rms_eps),
-          static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps),
-          static_cast<float>(hc_post_mult), static_cast<int>(sinkhorn_repeat),
-          static_cast<float>(norm_eps));
+#define VLLM_LAUNCH_GLM_MHC_PRE(threads)                                       \
+  sm70_glm_mhc_pre_norm_kernel<4096, 4, threads>                               \
+      <<<num_tokens, threads, 0, at::cuda::getCurrentCUDAStream()>>>(          \
+          gemm_mul.data_ptr<float>(), gemm_sqrsum.data_ptr<float>(),           \
+          hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),               \
+          reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),        \
+          post_mix.data_ptr<float>(), comb_mix.data_ptr<float>(),              \
+          reinterpret_cast<half*>(layer_input.data_ptr<at::Half>()),           \
+          reinterpret_cast<const half*>(norm_weight.data_ptr<at::Half>()),     \
+          static_cast<int>(num_splits), static_cast<int>(num_tokens),          \
+          static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),         \
+          static_cast<float>(hc_sinkhorn_eps),                                 \
+          static_cast<float>(hc_post_mult), static_cast<int>(sinkhorn_repeat), \
+          static_cast<float>(norm_eps))
+  const int requested_threads = static_cast<int>(configured_threads);
+  const int valid_threads =
+      (requested_threads == 128 || requested_threads == 256 ||
+       requested_threads == 512 || requested_threads == 1024)
+          ? requested_threads
+          : 256;
+  const int threads = num_tokens == 1 ? 128 : valid_threads;
+  switch (threads) {
+    case 128:
+      VLLM_LAUNCH_GLM_MHC_PRE(128);
+      break;
+    case 512:
+      VLLM_LAUNCH_GLM_MHC_PRE(512);
+      break;
+    case 1024:
+      VLLM_LAUNCH_GLM_MHC_PRE(1024);
+      break;
+    default:
+      VLLM_LAUNCH_GLM_MHC_PRE(256);
+      break;
+  }
+#undef VLLM_LAUNCH_GLM_MHC_PRE
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sm70_glm_mhc_post_dot_q8_out(torch::Tensor residual_out,
+                                  torch::Tensor gemm_mul,
+                                  torch::Tensor gemm_sqrsum,
+                                  torch::Tensor comb_mix,
+                                  torch::Tensor residual,
+                                  torch::Tensor post_mix, torch::Tensor x,
+                                  torch::Tensor weight, int64_t tile_n) {
+  TORCH_CHECK(residual_out.is_cuda() && gemm_mul.is_cuda() &&
+                  gemm_sqrsum.is_cuda() && comb_mix.is_cuda() &&
+                  residual.is_cuda() && post_mix.is_cuda() && x.is_cuda() &&
+                  weight.is_cuda(),
+              "sm70_glm_mhc_post_dot_q8_out: all tensors must be CUDA.");
+  TORCH_CHECK(residual_out.scalar_type() == torch::kFloat16 &&
+                  residual.scalar_type() == torch::kFloat16 &&
+                  x.scalar_type() == torch::kFloat16 &&
+                  gemm_mul.scalar_type() == torch::kFloat32 &&
+                  gemm_sqrsum.scalar_type() == torch::kFloat32 &&
+                  comb_mix.scalar_type() == torch::kFloat32 &&
+                  post_mix.scalar_type() == torch::kFloat32 &&
+                  weight.scalar_type() == torch::kFloat32,
+              "sm70_glm_mhc_post_dot_q8_out: invalid tensor dtype.");
+  TORCH_CHECK(residual_out.is_contiguous() && gemm_mul.is_contiguous() &&
+                  gemm_sqrsum.is_contiguous() && comb_mix.is_contiguous() &&
+                  residual.is_contiguous() && post_mix.is_contiguous() &&
+                  x.is_contiguous() && weight.is_contiguous(),
+              "sm70_glm_mhc_post_dot_q8_out: tensors must be contiguous.");
+  TORCH_CHECK(residual_out.sizes() == torch::IntArrayRef({8, 4, 4096}) &&
+                  residual.sizes() == torch::IntArrayRef({8, 4, 4096}) &&
+                  x.sizes() == torch::IntArrayRef({8, 4096}) &&
+                  comb_mix.sizes() == torch::IntArrayRef({8, 4, 4}) &&
+                  post_mix.sizes() == torch::IntArrayRef({8, 4}) &&
+                  weight.sizes() == torch::IntArrayRef({24, 4, 4096}) &&
+                  gemm_mul.sizes() == torch::IntArrayRef({4, 8, 24}) &&
+                  gemm_sqrsum.sizes() == torch::IntArrayRef({4, 8}),
+              "sm70_glm_mhc_post_dot_q8_out: invalid GLM-5.3 q8 shape.");
+  const auto device = residual.device();
+  TORCH_CHECK(residual_out.device() == device && gemm_mul.device() == device &&
+                  gemm_sqrsum.device() == device &&
+                  comb_mix.device() == device && post_mix.device() == device &&
+                  x.device() == device && weight.device() == device,
+              "sm70_glm_mhc_post_dot_q8_out: tensors must share one device.");
+  TORCH_CHECK(tile_n == 6 || tile_n == 8 || tile_n == 12,
+              "sm70_glm_mhc_post_dot_q8_out: tile_n must be 6, 8, or 12.");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(residual));
+  const dim3 grid(8, 24 / tile_n, 4);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+#define VLLM_LAUNCH_GLM_MHC_POST_DOT(tile)                          \
+  sm70_glm_mhc_post_dot_q8_kernel<tile><<<grid, 256, 0, stream>>>(  \
+      reinterpret_cast<half*>(residual_out.data_ptr<at::Half>()),   \
+      gemm_mul.data_ptr<float>(), gemm_sqrsum.data_ptr<float>(),    \
+      comb_mix.data_ptr<float>(),                                   \
+      reinterpret_cast<const half*>(residual.data_ptr<at::Half>()), \
+      post_mix.data_ptr<float>(),                                   \
+      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),        \
+      weight.data_ptr<float>())
+  switch (tile_n) {
+    case 6:
+      VLLM_LAUNCH_GLM_MHC_POST_DOT(6);
+      break;
+    case 8:
+      VLLM_LAUNCH_GLM_MHC_POST_DOT(8);
+      break;
+    default:
+      VLLM_LAUNCH_GLM_MHC_POST_DOT(12);
+      break;
+  }
+#undef VLLM_LAUNCH_GLM_MHC_POST_DOT
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2070,16 +1641,22 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
                   g_weight.scalar_type() == torch::kFloat16,
               "sm70_glm_kda_fg_b_out: all tensors must be float16.");
   TORCH_CHECK(f_out.is_contiguous() && g_out.is_contiguous() &&
-                  f_input.is_contiguous() && g_input.is_contiguous() &&
+                  f_input.stride(1) == 1 && g_input.stride(1) == 1 &&
                   f_weight.is_contiguous() && g_weight.is_contiguous(),
-              "sm70_glm_kda_fg_b_out: all tensors must be contiguous.");
-  TORCH_CHECK(f_out.sizes() == torch::IntArrayRef({1, 2048}) &&
-                  g_out.sizes() == torch::IntArrayRef({1, 2048}) &&
-                  f_input.sizes() == torch::IntArrayRef({1, 128}) &&
-                  g_input.sizes() == torch::IntArrayRef({1, 128}) &&
-                  f_weight.sizes() == torch::IntArrayRef({2048, 128}) &&
-                  g_weight.sizes() == torch::IntArrayRef({2048, 128}),
-              "sm70_glm_kda_fg_b_out: requires the GLM TP4 B1 shape.");
+              "sm70_glm_kda_fg_b_out: outputs/weights must be contiguous and "
+              "inputs must have contiguous inner dimensions.");
+  const int64_t num_tokens = f_input.size(0);
+  const int64_t output_rows = f_out.size(1);
+  TORCH_CHECK(f_input.dim() == 2 && num_tokens >= 1 && num_tokens <= 8 &&
+                  f_input.size(1) == 128 &&
+                  g_input.sizes() == f_input.sizes() && f_out.dim() == 2 &&
+                  f_out.size(0) == num_tokens &&
+                  (output_rows == 1024 || output_rows == 2048) &&
+                  g_out.sizes() == f_out.sizes() &&
+                  f_weight.sizes() == torch::IntArrayRef({output_rows, 128}) &&
+                  g_weight.sizes() == torch::IntArrayRef({output_rows, 128}),
+              "sm70_glm_kda_fg_b_out: requires the GLM TP4/TP8 B1-B8 "
+              "shape.");
   const auto device = f_out.device();
   TORCH_CHECK(g_out.device() == device && f_input.device() == device &&
                   g_input.device() == device && f_weight.device() == device &&
@@ -2087,17 +1664,26 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
               "sm70_glm_kda_fg_b_out: all tensors must share one device.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(f_out));
-  constexpr int kWarps = 8;
-  constexpr int kThreads = kWarps * WARP_SIZE;
-  constexpr int kBlocks = (2 * 2048 + kWarps - 1) / kWarps;
-  sm70_glm_kda_fg_b_kernel<2048, 128, kWarps>
-      <<<kBlocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<half*>(f_out.data_ptr<at::Half>()),
-          reinterpret_cast<half*>(g_out.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(f_input.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(g_input.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(f_weight.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(g_weight.data_ptr<at::Half>()));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  auto* f_out_ptr = reinterpret_cast<half*>(f_out.data_ptr<at::Half>());
+  auto* g_out_ptr = reinterpret_cast<half*>(g_out.data_ptr<at::Half>());
+  const auto* f_input_ptr =
+      reinterpret_cast<const half*>(f_input.data_ptr<at::Half>());
+  const auto* g_input_ptr =
+      reinterpret_cast<const half*>(g_input.data_ptr<at::Half>());
+  const auto* f_weight_ptr =
+      reinterpret_cast<const half*>(f_weight.data_ptr<at::Half>());
+  const auto* g_weight_ptr =
+      reinterpret_cast<const half*>(g_weight.data_ptr<at::Half>());
+  if (output_rows == 1024) {
+    launch_sm70_glm_kda_fg_b<1024>(
+        f_out_ptr, g_out_ptr, f_input_ptr, g_input_ptr, f_weight_ptr,
+        g_weight_ptr, f_input.stride(0), g_input.stride(0), num_tokens, stream);
+  } else {
+    launch_sm70_glm_kda_fg_b<2048>(
+        f_out_ptr, g_out_ptr, f_input_ptr, g_input_ptr, f_weight_ptr,
+        g_weight_ptr, f_input.stride(0), g_input.stride(0), num_tokens, stream);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2839,11 +2425,908 @@ torch::Tensor interleave_gated_silu_cols(torch::Tensor tensor) {
   return torch::stack({first, second}, -1).reshape(tensor.sizes());
 }
 
-std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
-                                            torch::Tensor scales,
-                                            torch::Tensor qzeros,
-                                            int64_t group_size,
-                                            bool interleave_gated_silu) {
+__global__ void pack_awq_compact_source_kernel(uint32_t* packed,
+                                               const half* scales,
+                                               const uint8_t* zeros,
+                                               int64_t numel) {
+  const int64_t idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < numel) {
+    const uint16_t scale_bits = __half_as_ushort(scales[idx]);
+    packed[idx] = static_cast<uint32_t>(scale_bits) |
+                  (static_cast<uint32_t>(zeros[idx]) << 16);
+  }
+}
+
+__global__ void compact_awq_stats_kernel(uint8_t* compact,
+                                         const uint32_t* packed,
+                                         int64_t numel) {
+  const int64_t idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < numel) {
+    const uint32_t value = packed[idx];
+    compact[idx * 3] = static_cast<uint8_t>(value);
+    compact[idx * 3 + 1] = static_cast<uint8_t>(value >> 8);
+    compact[idx * 3 + 2] = static_cast<uint8_t>(value >> 16);
+  }
+}
+
+namespace {
+
+bool gguf_uses_bitplanes(int bits) {
+  return bits == 3 || bits == 5 || bits == 6;
+}
+
+auto gguf_affine_quant_type(int bits) {
+  return bits == 3 ? turbomind::gemm::QuantType::kCenteredBitPlane3
+                   : (gguf_uses_bitplanes(bits)
+                          ? turbomind::gemm::QuantType::kBitPlane
+                          : turbomind::gemm::QuantType::kK);
+}
+
+int gguf_low_bits(int bits) {
+  return bits == 3 ? 2 : ((bits == 5 || bits == 6) ? 4 : bits);
+}
+
+bool gguf_affine_group_supported(int bits, int group_size) {
+  if (gguf_uses_bitplanes(bits)) return group_size == (bits == 5 ? 32 : 16);
+  return group_size == 32 || (bits == 2 && group_size == 16);
+}
+
+auto gguf_affine_weight_type(int bits) {
+  const int low_bits = gguf_low_bits(bits);
+  TORCH_CHECK(low_bits == 2 || low_bits == 4 || low_bits == 8,
+              "GGUF affine canonical code width is unsupported");
+  return low_bits == 2
+             ? turbomind::kUint2
+             : (low_bits == 4 ? turbomind::kUint4 : turbomind::kUint8);
+}
+
+auto gguf_affine_converters(int bits) {
+  if (gguf_uses_bitplanes(bits)) {
+    return turbomind::gemm::GetGgufBitPlaneConverters(gguf_low_bits(bits), 70);
+  }
+  return turbomind::gemm::GetConverters(turbomind::kHalf,
+                                        gguf_affine_weight_type(bits),
+                                        turbomind::kHalf, true, 70);
+}
+
+std::array<turbomind::gemm::MatrixLayout, 2> gguf_affine_layouts(
+    int n, int k, int bits, int group_size) {
+  const auto weight_type = gguf_affine_weight_type(bits);
+  const auto converters = gguf_affine_converters(bits);
+  TORCH_CHECK(converters[0] && converters[1],
+              "GGUF affine TurboMind converters unavailable");
+  turbomind::gemm::MatrixLayout w{weight_type, converters[0]->order, n, k, k};
+  std::swap(w.rows, w.cols);
+  w.order = ~w.order;
+  w.pack = converters[0]->pack;
+  turbomind::gemm::MatrixLayout s{gguf_uses_bitplanes(bits) && bits != 3
+                                      ? turbomind::kUint64
+                                      : turbomind::kUint32,
+                                  converters[1]->order, n, k / group_size, n};
+  std::swap(s.rows, s.cols);
+  s.order = ~s.order;
+  s.pack = converters[1]->pack;
+  return {w, s};
+}
+
+}  // namespace
+
+template <class T>
+__global__ void gguf_bitplane_metadata_kernel(T* metadata, const uint8_t* codes,
+                                              const uint16_t* scales,
+                                              const uint16_t* mins, int n,
+                                              int k, int group, int low_bits,
+                                              int high_bits) {
+  const int64_t index =
+      blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  const int groups = k / group;
+  if (index >= static_cast<int64_t>(n) * groups) return;
+  const int row = index / groups;
+  const int g = index % groups;
+  uint32_t high = 0;
+  for (int i = 0; i < group; ++i) {
+    high |=
+        static_cast<uint32_t>(
+            codes[static_cast<int64_t>(row) * k + g * group + i] >> low_bits)
+        << (i * high_bits);
+  }
+  if constexpr (sizeof(T) == 4) {
+    metadata[static_cast<int64_t>(g) * n + row] =
+        static_cast<uint32_t>(scales[index]) | (high << 16);
+  } else {
+    const uint32_t affine = static_cast<uint32_t>(scales[index]) |
+                            (static_cast<uint32_t>(mins[index]) << 16);
+    metadata[static_cast<int64_t>(g) * n + row] =
+        affine | (static_cast<uint64_t>(high) << 32);
+  }
+}
+
+std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
+                                                    torch::Tensor scales,
+                                                    torch::Tensor mins,
+                                                    int64_t bits,
+                                                    int64_t group_size) {
+  const auto weight_type = gguf_affine_weight_type(bits);
+  TORCH_CHECK(gguf_affine_group_supported(bits, group_size),
+              "GGUF affine canonical group is not supported");
+  TORCH_CHECK(codes.is_cuda() && scales.device() == codes.device() &&
+                  mins.device() == codes.device(),
+              "GGUF affine coefficients must be on the codes' CUDA device");
+  TORCH_CHECK(
+      codes.scalar_type() == torch::kUInt8 && codes.dim() == 2 &&
+          scales.scalar_type() == torch::kFloat16 &&
+          mins.scalar_type() == torch::kFloat16 && scales.dim() == 2 &&
+          mins.sizes() == scales.sizes(),
+      "GGUF affine expects uint8 codes [N,K], FP16 scale/min [N,K/group]");
+  const int64_t n = codes.size(0), k = codes.size(1);
+  TORCH_CHECK(n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  scales.size(0) == n && scales.size(1) == k / group_size,
+              "GGUF affine requires complete canonical K groups and group-32 N "
+              "packing");
+  TORCH_CHECK(n <= INT_MAX && k <= INT_MAX, "GGUF affine shape exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(codes));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF affine TurboMind operators require SM70");
+  if (bits < 8) {
+    TORCH_CHECK((codes < (1 << bits)).all().item<bool>(),
+                "GGUF affine code exceeds canonical width");
+  }
+  if (bits == 3) {
+    TORCH_CHECK(
+        (mins == scales.mul(-4)).all().item<bool>(),
+        "GGUF centered Q3 scale/min mismatch requires the reference fallback");
+  }
+  const auto converters = gguf_affine_converters(bits);
+  auto layouts = gguf_affine_layouts(n, k, bits, group_size);
+  auto source_w = layouts[0];
+  source_w.type = turbomind::kHalf;
+  source_w.pack = 0;
+  auto numeric_codes = (gguf_uses_bitplanes(bits)
+                            ? codes.bitwise_and((1 << gguf_low_bits(bits)) - 1)
+                            : codes)
+                           .to(torch::kInt16)
+                           .contiguous();
+  auto weight = torch::empty({k, n * gguf_low_bits(bits) / 32},
+                             codes.options().dtype(torch::kInt32));
+  TORCH_CHECK(
+      converters[0]->Convert(numeric_codes.data_ptr(), source_w,
+                             weight.data_ptr(), layouts[0], stream) == 0,
+      "GGUF affine weight layout conversion failed");
+  // Store scale and additive bias directly. Dividing min by scale would add
+  // rounding and make a zero-scale constant block undefined.
+  auto coefficients =
+      torch::stack({scales.transpose(0, 1), mins.transpose(0, 1)}, -1)
+          .contiguous();
+  auto source_s = layouts[1];
+  source_s.pack = 0;
+  auto stats =
+      torch::empty({k / group_size, n},
+                   codes.options().dtype(gguf_uses_bitplanes(bits) && bits != 3
+                                             ? torch::kInt64
+                                             : torch::kInt32));
+  torch::Tensor raw_metadata;
+  if (gguf_uses_bitplanes(bits)) {
+    raw_metadata = torch::empty_like(stats);
+    auto contiguous_codes = codes.contiguous();
+    auto contiguous_scales = scales.contiguous();
+    auto contiguous_mins = mins.contiguous();
+    const int64_t count = n * (k / group_size);
+    if (bits == 3) {
+      gguf_bitplane_metadata_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+          reinterpret_cast<uint32_t*>(raw_metadata.data_ptr<int32_t>()),
+          contiguous_codes.data_ptr<uint8_t>(),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_scales.data_ptr<at::Half>()),
+          nullptr, n, k, group_size, gguf_low_bits(bits),
+          bits - gguf_low_bits(bits));
+    } else {
+      gguf_bitplane_metadata_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+          reinterpret_cast<uint64_t*>(raw_metadata.data_ptr<int64_t>()),
+          contiguous_codes.data_ptr<uint8_t>(),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_scales.data_ptr<at::Half>()),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_mins.data_ptr<at::Half>()),
+          n, k, group_size, gguf_low_bits(bits), bits - gguf_low_bits(bits));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  TORCH_CHECK(converters[1]->Convert(
+                  gguf_uses_bitplanes(bits) ? raw_metadata.data_ptr()
+                                            : coefficients.data_ptr(),
+                  source_s, stats.data_ptr(), layouts[1], stream) == 0,
+              "GGUF affine coefficient layout conversion failed");
+  auto meta = torch::tensor({static_cast<int64_t>(layouts[0].ld),
+                             static_cast<int64_t>(layouts[1].ld)},
+                            torch::TensorOptions().dtype(torch::kInt64));
+  return {weight, stats, meta};
+}
+
+void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor stats,
+                               int64_t bits, int64_t k_ld, int64_t q_ld,
+                               int64_t group_size) {
+  gguf_affine_weight_type(bits);
+  TORCH_CHECK(gguf_affine_group_supported(bits, group_size),
+              "GGUF affine canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device(),
+              "GGUF affine GEMM tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          weight.scalar_type() == torch::kInt32 &&
+          stats.scalar_type() == (gguf_uses_bitplanes(bits) && bits != 3
+                                      ? torch::kInt64
+                                      : torch::kInt32) &&
+          input.dim() == 2 && out.dim() == 2 && weight.dim() == 2 &&
+          stats.dim() == 2 && input.stride(1) == 1 && out.stride(1) == 1 &&
+          weight.is_contiguous() && stats.is_contiguous(),
+      "GGUF affine GEMM requires FP16 matrices and prepared int32 storage");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  out.size(0) == m && weight.size(0) == k &&
+                  weight.size(1) == n * gguf_low_bits(bits) / 32 &&
+                  stats.size(0) == k / group_size && stats.size(1) == n,
+              "GGUF affine GEMM shape mismatch");
+  TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
+                  q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
+              "GGUF affine GEMM descriptor exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_affine_layouts(n, k, bits, group_size);
+  layouts[0].ld = k_ld;
+  layouts[1].ld = q_ld;
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  turbomind::gemm::Operation operation{};
+  // Canonical affine types use distinct keys and the existing measured cache.
+  // Never inherit AWQ's opt-in tuning gate or alias u4 and u8 tuning state.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group_size, stream,
+      bits == 3
+          ? TuneKeyKind::kGgufBitPlane3
+          : (bits == 5
+                 ? TuneKeyKind::kGgufBitPlane5
+                 : (bits == 6
+                        ? TuneKeyKind::kGgufBitPlane6
+                        : (bits == 2
+                               ? TuneKeyKind::kGgufAffineU2
+                               : (bits == 4 ? TuneKeyKind::kGgufAffineU4
+                                            : TuneKeyKind::kGgufAffineU8)))),
+      true, false, 32);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_affine_quant_type(bits),
+                       static_cast<int>(group_size)};
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF affine TurboMind GEMM failed");
+}
+
+void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor offsets,
+                                       torch::Tensor weight_ptrs,
+                                       torch::Tensor stats_ptrs, int64_t bits,
+                                       int64_t num_experts,
+                                       int64_t group_size) {
+  gguf_affine_weight_type(bits);
+  TORCH_CHECK(gguf_affine_group_supported(bits, group_size),
+              "GGUF affine canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF grouped affine tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          offsets.scalar_type() == torch::kInt32 &&
+          weight_ptrs.scalar_type() == torch::kUInt8 &&
+          stats_ptrs.scalar_type() == torch::kUInt8 && input.dim() == 2 &&
+          out.dim() == 2 && input.is_contiguous() && out.is_contiguous() &&
+          offsets.is_contiguous() && weight_ptrs.is_contiguous() &&
+          stats_ptrs.is_contiguous(),
+      "GGUF grouped affine requires FP16 matrices and prepared pointers");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF grouped affine descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_affine_layouts(n, k, bits, group_size);
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::Operation operation{};
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_affine_quant_type(bits),
+                       static_cast<int>(group_size)};
+  operation.batch_dim = 0;
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF affine TurboMind grouped GEMM failed");
+}
+
+namespace {
+
+auto gguf_lut4_quant_type(int lut_id) {
+  TORCH_CHECK(lut_id == 0 || lut_id == 1, "GGUF LUT4 table is unsupported");
+  return lut_id == 0 ? turbomind::gemm::QuantType::kLut4IQ
+                     : turbomind::gemm::QuantType::kLut4E2M1;
+}
+
+bool gguf_lut4_group_supported(int lut_id, int group_size) {
+  return group_size == 32 || (lut_id == 1 && group_size == 16);
+}
+
+std::array<turbomind::gemm::MatrixLayout, 2> gguf_lut4_layouts(int n, int k,
+                                                               int group_size) {
+  const auto converters = turbomind::gemm::GetGgufLut4Converters(70);
+  TORCH_CHECK(converters[0] && converters[1],
+              "GGUF LUT4 converters unavailable");
+  turbomind::gemm::MatrixLayout w{turbomind::kUint4, converters[0]->order, n, k,
+                                  k};
+  std::swap(w.rows, w.cols);
+  w.order = ~w.order;
+  w.pack = converters[0]->pack;
+  turbomind::gemm::MatrixLayout s{turbomind::kUint16, converters[1]->order, n,
+                                  k / group_size, n};
+  std::swap(s.rows, s.cols);
+  s.order = ~s.order;
+  s.pack = converters[1]->pack;
+  return {w, s};
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
+                                                  torch::Tensor scales,
+                                                  int64_t lut_id,
+                                                  int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is unsupported");
+  TORCH_CHECK(codes.is_cuda() && scales.device() == codes.device(),
+              "GGUF LUT4 tensors must share a CUDA device");
+  TORCH_CHECK(codes.scalar_type() == torch::kUInt8 && codes.dim() == 2 &&
+                  scales.scalar_type() == torch::kFloat16 && scales.dim() == 2,
+              "GGUF LUT4 expects uint8 codes [N,K], FP16 scales [N,K/group]");
+  const int64_t n = codes.size(0), k = codes.size(1);
+  TORCH_CHECK(
+      n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+          scales.size(0) == n && scales.size(1) == k / group_size &&
+          n <= INT_MAX && k <= INT_MAX,
+      "GGUF LUT4 requires complete canonical groups and group-32 N packing");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(codes));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF LUT4 requires SM70");
+  TORCH_CHECK((codes < 16).all().item<bool>(),
+              "GGUF LUT4 code exceeds a nibble");
+  const auto converters = turbomind::gemm::GetGgufLut4Converters(70);
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  auto source_w = layouts[0];
+  source_w.type = turbomind::kHalf;
+  source_w.pack = 0;
+  auto numeric_codes = codes.to(torch::kInt16).contiguous();
+  auto weight = torch::empty({k, n / 8}, codes.options().dtype(torch::kInt32));
+  TORCH_CHECK(
+      converters[0]->Convert(numeric_codes.data_ptr(), source_w,
+                             weight.data_ptr(), layouts[0], stream) == 0,
+      "GGUF LUT4 weight conversion failed");
+  auto coefficients = scales.transpose(0, 1).contiguous();
+  auto source_s = layouts[1];
+  source_s.pack = 0;
+  auto stats =
+      torch::empty({k / group_size, n}, codes.options().dtype(torch::kInt16));
+  TORCH_CHECK(converters[1]->Convert(coefficients.data_ptr(), source_s,
+                                     stats.data_ptr(), layouts[1], stream) == 0,
+              "GGUF LUT4 scale conversion failed");
+  auto meta = torch::tensor({static_cast<int64_t>(layouts[0].ld),
+                             static_cast<int64_t>(layouts[1].ld)},
+                            torch::TensorOptions().dtype(torch::kInt64));
+  return {weight, stats, meta};
+}
+
+void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             int64_t lut_id, int64_t k_ld, int64_t q_ld,
+                             int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device(),
+              "GGUF LUT4 GEMM tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  weight.scalar_type() == torch::kInt32 &&
+                  stats.scalar_type() == torch::kInt16 && input.dim() == 2 &&
+                  out.dim() == 2 && weight.dim() == 2 && stats.dim() == 2 &&
+                  input.stride(1) == 1 && out.stride(1) == 1 &&
+                  weight.is_contiguous() && stats.is_contiguous(),
+              "GGUF LUT4 GEMM requires FP16 matrices and prepared U4 weights "
+              "and FP16 scale storage");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  out.size(0) == m && weight.size(0) == k &&
+                  weight.size(1) == n / 8 && stats.size(0) == k / group_size &&
+                  stats.size(1) == n,
+              "GGUF LUT4 GEMM shape mismatch");
+  TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
+                  q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
+              "GGUF LUT4 GEMM descriptor exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  layouts[0].ld = k_ld;
+  layouts[1].ld = q_ld;
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  turbomind::gemm::Operation operation{};
+  // Decoder families use distinct keys in the measured cache.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group_size, stream,
+      lut_id == 0 ? TuneKeyKind::kGgufLut4IQ : TuneKeyKind::kGgufLut4E2M1, true,
+      false, 32);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lut4_quant_type(lut_id),
+                       static_cast<int>(group_size)};
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind GEMM failed");
+}
+
+void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs, int64_t lut_id,
+                                     int64_t num_experts, int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF grouped LUT4 tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  offsets.scalar_type() == torch::kInt32 &&
+                  weight_ptrs.scalar_type() == torch::kUInt8 &&
+                  stats_ptrs.scalar_type() == torch::kUInt8 &&
+                  input.dim() == 2 && out.dim() == 2 && input.is_contiguous() &&
+                  out.is_contiguous() && offsets.is_contiguous() &&
+                  weight_ptrs.is_contiguous() && stats_ptrs.is_contiguous(),
+              "GGUF grouped LUT4 requires FP16 matrices and prepared pointers");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF grouped LUT4 descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::Operation operation{};
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lut4_quant_type(lut_id),
+                       static_cast<int>(group_size)};
+  operation.batch_dim = 0;
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind grouped GEMM failed");
+}
+
+namespace {
+
+int gguf_lattice_type_index(int type) {
+  switch (type) {
+    case 16:
+      return 0;
+    case 17:
+      return 1;
+    case 18:
+      return 2;
+    case 19:
+      return 3;
+    case 21:
+      return 4;
+    case 22:
+      return 5;
+    case 29:
+      return 6;
+  }
+  TORCH_CHECK(false, "GGUF lattice codebook is unsupported");
+}
+auto gguf_lattice_quant_type(int type) {
+  return static_cast<turbomind::gemm::QuantType>(8 +
+                                                 gguf_lattice_type_index(type));
+}
+bool gguf_lattice_group_supported(int type, int group) {
+  return group == ((type == 17 || type == 22 || type == 29) ? 16 : 32);
+}
+auto gguf_lattice_stat_type(int type) {
+  return type == 18 || type == 21   ? turbomind::kUint64
+         : type == 19 || type == 29 ? turbomind::kUint16
+                                    : turbomind::kUint32;
+}
+auto gguf_lattice_torch_stat_type(int type) {
+  return type == 18 || type == 21   ? torch::kInt64
+         : type == 19 || type == 29 ? torch::kInt16
+                                    : torch::kInt32;
+}
+
+std::array<turbomind::gemm::MatrixLayout, 2> gguf_lattice_layouts(
+    int n, int k, int source_type, int group_size) {
+  const auto converters =
+      turbomind::gemm::GetGgufLatticeConverters(source_type, 70);
+  TORCH_CHECK(converters[0] && converters[1],
+              "GGUF lattice converters unavailable");
+  turbomind::gemm::MatrixLayout w{turbomind::kUint2, converters[0]->order, n, k,
+                                  k};
+  std::swap(w.rows, w.cols);
+  w.order = ~w.order;
+  w.pack = converters[0]->pack;
+  turbomind::gemm::MatrixLayout s{gguf_lattice_stat_type(source_type),
+                                  converters[1]->order, n, k / group_size, n};
+  std::swap(s.rows, s.cols);
+  s.order = ~s.order;
+  s.pack = converters[1]->pack;
+  return {w, s};
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
+                                                     torch::Tensor scales,
+                                                     int64_t source_type,
+                                                     int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is unsupported");
+  TORCH_CHECK(codes.is_cuda() && scales.device() == codes.device(),
+              "GGUF lattice tensors must share a CUDA device");
+  TORCH_CHECK(
+      codes.scalar_type() == torch::kUInt8 && codes.dim() == 2 &&
+          scales.scalar_type() == gguf_lattice_torch_stat_type(source_type) &&
+          scales.dim() == 2,
+      "GGUF lattice expects uint8 codes [N,K], packed metadata [N,K/group]");
+  const int64_t n = codes.size(0), k = codes.size(1);
+  TORCH_CHECK(
+      n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+          scales.size(0) == n && scales.size(1) == k / group_size &&
+          n <= INT_MAX && k <= INT_MAX,
+      "GGUF lattice requires complete canonical groups and group-32 N packing");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(codes));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF lattice requires SM70");
+  TORCH_CHECK((codes < 4).all().item<bool>(),
+              "GGUF lattice code exceeds a two-bit carrier");
+  const auto converters =
+      turbomind::gemm::GetGgufLatticeConverters(source_type, 70);
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  auto source_w = layouts[0];
+  source_w.type = turbomind::kHalf;
+  source_w.pack = 0;
+  auto numeric_codes = codes.to(torch::kInt16).contiguous();
+  auto weight = torch::empty({k, n / 16}, codes.options().dtype(torch::kInt32));
+  TORCH_CHECK(
+      converters[0]->Convert(numeric_codes.data_ptr(), source_w,
+                             weight.data_ptr(), layouts[0], stream) == 0,
+      "GGUF lattice weight conversion failed");
+  auto coefficients = scales.transpose(0, 1).contiguous();
+  auto source_s = layouts[1];
+  source_s.pack = 0;
+  auto stats = torch::empty(
+      {k / group_size, n},
+      codes.options().dtype(gguf_lattice_torch_stat_type(source_type)));
+  TORCH_CHECK(converters[1]->Convert(coefficients.data_ptr(), source_s,
+                                     stats.data_ptr(), layouts[1], stream) == 0,
+              "GGUF lattice scale conversion failed");
+  auto meta = torch::tensor({static_cast<int64_t>(layouts[0].ld),
+                             static_cast<int64_t>(layouts[1].ld)},
+                            torch::TensorOptions().dtype(torch::kInt64));
+  return {weight, stats, meta};
+}
+
+void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor weight, torch::Tensor stats,
+                                int64_t source_type, int64_t k_ld, int64_t q_ld,
+                                int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device(),
+              "GGUF lattice GEMM tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          weight.scalar_type() == torch::kInt32 &&
+          stats.scalar_type() == gguf_lattice_torch_stat_type(source_type) &&
+          input.dim() == 2 && out.dim() == 2 && weight.dim() == 2 &&
+          stats.dim() == 2 && input.stride(1) == 1 && out.stride(1) == 1 &&
+          weight.is_contiguous() && stats.is_contiguous(),
+      "GGUF lattice GEMM requires FP16 matrices and prepared U2 carriers "
+      "and packed metadata");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  out.size(0) == m && weight.size(0) == k &&
+                  weight.size(1) == n / 16 && stats.size(0) == k / group_size &&
+                  stats.size(1) == n,
+              "GGUF lattice GEMM shape mismatch");
+  TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
+                  q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
+              "GGUF lattice GEMM descriptor exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  layouts[0].ld = k_ld;
+  layouts[1].ld = q_ld;
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  turbomind::gemm::Operation operation{};
+  // Decoder families use distinct keys in the measured cache.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group_size, stream,
+      static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(source_type)), true,
+      false, 32);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lattice_quant_type(source_type),
+                       static_cast<int>(group_size)};
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF lattice TurboMind GEMM failed");
+}
+
+void gguf_lattice_grouped_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
+    int64_t num_experts, int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF grouped lattice tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          offsets.scalar_type() == torch::kInt32 &&
+          weight_ptrs.scalar_type() == torch::kUInt8 &&
+          stats_ptrs.scalar_type() == torch::kUInt8 && input.dim() == 2 &&
+          out.dim() == 2 && input.is_contiguous() && out.is_contiguous() &&
+          offsets.is_contiguous() && weight_ptrs.is_contiguous() &&
+          stats_ptrs.is_contiguous(),
+      "GGUF grouped lattice requires FP16 matrices and prepared pointers");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF grouped lattice descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::Operation operation{};
+  // Measure these grouped descriptors before capture and reuse the shared
+  // dispatch cache. Capture without an existing entry retains the heuristic.
+  operation.dispatch = select_moe_dispatch_policy_impl(
+      device, m, n, k, num_experts, group_size, stream,
+      static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(source_type)),
+      m >= 512, 8192);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lattice_quant_type(source_type),
+                       static_cast<int>(group_size)};
+  operation.batch_dim = 0;
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF lattice TurboMind grouped GEMM failed");
+}
+
+// Prefill grouped GEMM over canonical banks written by the prefill transcode
+// (any source buffer per expert through the pointer tables). family: 0
+// lattice (decoder = GGUF type), 1 LUT4 (decoder = lut id), 2 affine
+// (decoder = bits). gated: the bank interleaves gate/up columns and the
+// epilogue writes silu(gate) * up, so out has n / 2 columns. tune: measure
+// this batch size (warmup only); otherwise reuse the closest measured one.
+void gguf_grouped_prefill_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t family,
+    int64_t decoder, int64_t n, int64_t num_experts, int64_t group_size,
+    bool gated, bool tune, std::optional<torch::Tensor> a_indices) {
+  TORCH_CHECK(family >= 0 && family <= 2, "GGUF prefill GEMM family");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF prefill GEMM tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  offsets.scalar_type() == torch::kInt32 &&
+                  weight_ptrs.scalar_type() == torch::kUInt8 &&
+                  stats_ptrs.scalar_type() == torch::kUInt8 &&
+                  input.dim() == 2 && out.dim() == 2 && input.stride(1) == 1 &&
+                  out.stride(1) == 1 && offsets.is_contiguous() &&
+                  weight_ptrs.is_contiguous() && stats_ptrs.is_contiguous(),
+              "GGUF prefill GEMM requires FP16 rows and prepared pointers");
+  // Rows are routes in expert order: input rows themselves, or input rows
+  // selected by a_indices (no gathered copy of the activations).
+  const bool indexed = a_indices.has_value();
+  TORCH_CHECK(
+      !indexed ||
+          (a_indices->is_cuda() && a_indices->scalar_type() == torch::kInt32 &&
+           a_indices->is_contiguous() && a_indices->device() == input.device()),
+      "GGUF prefill GEMM a_indices must be contiguous int32 CUDA");
+  const int64_t m = indexed ? a_indices->numel() : input.size(0);
+  const int64_t k = input.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  out.size(1) == (gated ? n / 2 : n) &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF prefill GEMM descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  std::array<turbomind::gemm::MatrixLayout, 2> layouts{};
+  turbomind::gemm::Operation operation{};
+  TuneKeyKind kind;
+  if (family == 0) {
+    TORCH_CHECK(gguf_lattice_group_supported(decoder, group_size),
+                "GGUF lattice canonical group is not supported");
+    layouts = gguf_lattice_layouts(n, k, decoder, group_size);
+    operation.quant_b = {gguf_lattice_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    kind = static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(decoder));
+  } else if (family == 1) {
+    TORCH_CHECK(gguf_lut4_group_supported(decoder, group_size),
+                "GGUF LUT4 canonical group is not supported");
+    layouts = gguf_lut4_layouts(n, k, group_size);
+    operation.quant_b = {gguf_lut4_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    kind = decoder == 0 ? TuneKeyKind::kGgufLut4IQ : TuneKeyKind::kGgufLut4E2M1;
+  } else {
+    TORCH_CHECK(!gated, "GGUF affine prefill GEMM is not gated");
+    gguf_affine_weight_type(decoder);
+    TORCH_CHECK(gguf_affine_group_supported(decoder, group_size),
+                "GGUF affine canonical group is not supported");
+    layouts = gguf_affine_layouts(n, k, decoder, group_size);
+    operation.quant_b = {gguf_affine_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    TORCH_CHECK(decoder == 2, "GGUF affine prefill GEMM supports U2 only");
+    kind = TuneKeyKind::kGgufAffineU2;
+  }
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  // Logical N before the gated epilogue; the epilogue halves the columns.
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  a.idxs = indexed ? a_indices->data_ptr<int>() : nullptr;
+  operation.dispatch = select_prefill_moe_dispatch_policy(
+      device, m, n, k, num_experts, group_size, stream, kind, tune);
+  operation.epilogue = gated ? turbomind::gemm::Epilogue::kGatedSilu
+                             : turbomind::gemm::Epilogue::kNone;
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.batch_dim = 0;
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF prefill TurboMind grouped GEMM failed");
+}
+
+std::vector<torch::Tensor> awq_sm70_prepare_impl(
+    torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros,
+    int64_t group_size, bool interleave_gated_silu, bool compact_metadata) {
   validate_awq_inputs(qweight, scales, qzeros);
 
   qweight = qweight.contiguous();
@@ -2952,21 +3435,36 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
   for (int i = 0; i < 8; ++i) {
     zordered.push_back(zslices[awq_order[i]]);
   }
-  auto zeros_half =
-      torch::stack(zordered, -1).reshape({num_groups, n}).to(torch::kFloat16);
+  auto zeros_u8 = torch::stack(zordered, -1).reshape({num_groups, n});
   if (interleave_gated_silu) {
     scales = interleave_gated_silu_cols(scales);
-    zeros_half = interleave_gated_silu_cols(zeros_half);
+    zeros_u8 = interleave_gated_silu_cols(zeros_u8);
   }
 
-  auto fused = torch::empty(
-      {num_groups, n * 2},
-      torch::TensorOptions().device(scales.device()).dtype(torch::kFloat16));
-  turbomind::fuse_scales_and_zeros(
-      reinterpret_cast<half*>(fused.data_ptr<at::Half>()),
-      reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(zeros_half.data_ptr<at::Half>()), scales.numel(),
-      stream);
+  torch::Tensor source_stats;
+  if (compact_metadata) {
+    source_stats = torch::empty(
+        {num_groups, n},
+        torch::TensorOptions().device(scales.device()).dtype(torch::kInt32));
+    constexpr int kThreads = 256;
+    const int blocks =
+        static_cast<int>((scales.numel() + kThreads - 1) / kThreads);
+    pack_awq_compact_source_kernel<<<blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<uint32_t*>(source_stats.data_ptr<int32_t>()),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        zeros_u8.data_ptr<uint8_t>(), scales.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    auto zeros_half = zeros_u8.to(torch::kFloat16);
+    source_stats = torch::empty(
+        {num_groups, n * 2},
+        torch::TensorOptions().device(scales.device()).dtype(torch::kFloat16));
+    turbomind::fuse_scales_and_zeros(
+        reinterpret_cast<half*>(source_stats.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(zeros_half.data_ptr<at::Half>()),
+        scales.numel(), stream);
+  }
 
   const auto order_s = conv_s->order;
   const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
@@ -2989,18 +3487,52 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
     q_desc = turbomind::gemm::transpose(q_desc);
   }
 
-  auto tm_scales = torch::empty(
+  auto tm_stats = torch::empty(
       {num_groups, n},
       torch::TensorOptions().device(scales.device()).dtype(torch::kInt32));
-  TORCH_CHECK(conv_s->Convert(fused.data_ptr(), s_desc, tm_scales.data_ptr(),
-                              q_desc, stream) == 0,
+  TORCH_CHECK(conv_s->Convert(source_stats.data_ptr(), s_desc,
+                              tm_stats.data_ptr(), q_desc, stream) == 0,
               "awq_sm70_prepare: scale conversion failed.");
+
+  torch::Tensor tm_scales = tm_stats;
+  if (compact_metadata) {
+    tm_scales = torch::empty(
+        {num_groups, n, 3},
+        torch::TensorOptions().device(scales.device()).dtype(torch::kUInt8));
+    constexpr int kThreads = 256;
+    const int blocks =
+        static_cast<int>((tm_stats.numel() + kThreads - 1) / kThreads);
+    compact_awq_stats_kernel<<<blocks, kThreads, 0, stream>>>(
+        tm_scales.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(tm_stats.data_ptr<int32_t>()),
+        tm_stats.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 
   auto meta = torch::empty({2}, torch::TensorOptions().dtype(torch::kInt64));
   meta.index_put_({0}, k_desc.ld);
-  meta.index_put_({1}, q_desc.ld);
+  // q_ld is an internal contract between prepare, pointer construction and
+  // the SM70 iterator.  Its sign distinguishes compact 3-byte statistics;
+  // the magnitude remains the logical TurboMind leading dimension.
+  meta.index_put_({1}, compact_metadata ? -q_desc.ld : q_desc.ld);
 
   return {tm_weight, tm_scales, meta};
+}
+
+std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
+                                            torch::Tensor scales,
+                                            torch::Tensor qzeros,
+                                            int64_t group_size,
+                                            bool interleave_gated_silu) {
+  return awq_sm70_prepare_impl(qweight, scales, qzeros, group_size,
+                               interleave_gated_silu, false);
+}
+
+std::vector<torch::Tensor> awq_sm70_prepare_compact(
+    torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros,
+    int64_t group_size, bool interleave_gated_silu) {
+  return awq_sm70_prepare_impl(qweight, scales, qzeros, group_size,
+                               interleave_gated_silu, true);
 }
 
 std::vector<torch::Tensor> uint4_sm70_prepare(torch::Tensor qweight,
@@ -3533,6 +4065,7 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
                        bool gated_silu,
                        const turbomind::gemm::TileAllReduceParam* tile_reduce) {
+  const bool compact_metadata = q_ld < 0;
   TORCH_CHECK(in_feats.is_cuda(), "awq_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "awq_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "awq_gemm_sm70: scales must be CUDA.");
@@ -3541,8 +4074,10 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
               "awq_gemm_sm70: input must be float16.");
   TORCH_CHECK(tm_weight.scalar_type() == torch::kInt32,
               "awq_gemm_sm70: weight must be int32.");
-  TORCH_CHECK(tm_scales.scalar_type() == torch::kInt32,
-              "awq_gemm_sm70: scales must be int32.");
+  TORCH_CHECK(
+      (!compact_metadata && tm_scales.scalar_type() == torch::kInt32) ||
+          (compact_metadata && tm_scales.scalar_type() == torch::kUInt8),
+      "awq_gemm_sm70: scales must be int32, or uint8 with compact q_ld.");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16,
               "awq_gemm_sm70: output must be float16.");
 
@@ -3559,6 +4094,14 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(tm_scales.size(0) == k / group_size,
               "awq_gemm_sm70: scale groups mismatch.");
   TORCH_CHECK(tm_scales.size(1) == n, "awq_gemm_sm70: scale shape mismatch.");
+  if (compact_metadata) {
+    TORCH_CHECK(tm_scales.dim() == 3 && tm_scales.size(2) == 3 &&
+                    tm_scales.is_contiguous(),
+                "awq_gemm_sm70: compact scales must be contiguous [G,N,3].");
+  } else {
+    TORCH_CHECK(tm_scales.dim() == 2,
+                "awq_gemm_sm70: regular scales must be rank 2.");
+  }
   TORCH_CHECK(out.size(0) == m,
               "awq_gemm_sm70: output rows must match input rows.");
   TORCH_CHECK(out.stride(1) == 1,
@@ -3580,66 +4123,12 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(conv_w && conv_s,
               "awq_gemm_sm70: no compatible TurboMind converters.");
 
-  turbomind::gemm::MatrixLayout desc_A{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor, static_cast<int>(m),
-      static_cast<int>(k), static_cast<int>(k),
-  };
-  turbomind::gemm::MatrixLayout desc_U{};
+  auto desc_B =
+      vllm::sm70::packed_weight_layout(*conv_w, turbomind::kUint4, n, k, k_ld);
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::data_type_v<turbomind::uint4_t>;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = static_cast<int>(k_ld);
-
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-
-  const int64_t num_groups_raw = k / group_size;
-
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint32,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups_raw),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = static_cast<int>(q_ld);
-
-  turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
-  };
+  auto desc_V = vllm::sm70::packed_scale_layout(
+      *conv_s, turbomind::kUint32, n, k / group_size,
+      compact_metadata ? -q_ld : q_ld);
 
   turbomind::gemm::Operation op{};
   op.dispatch = select_awq_dense_dispatch_policy(
@@ -3660,13 +4149,17 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
-  const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, tm_scales.data_ptr(),
-                          desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
-                          desc_D, workspace_holder.workspace, stream);
+  void* stats_ptr = tm_scales.data_ptr();
+  if (compact_metadata) {
+    stats_ptr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(stats_ptr) |
+                                        uintptr_t{1});
+  }
+  const int ec = vllm::sm70::run_dense_packed_gemm(
+      gemm, workspace_holder, op, stream, in_feats, out, tm_weight.data_ptr(),
+      desc_B, stats_ptr, desc_V, n, k);
   TORCH_CHECK(ec == 0, "awq_gemm_sm70: TurboMind GEMM failed.");
 }
 
@@ -3761,8 +4254,8 @@ void awq_gemm_sm70_out_tile_reduce(
 void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                        torch::Tensor tm_weight, torch::Tensor tm_scales,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
-                       bool gated_silu,
-                       bool exact_8k_prefill_prescaled = false) {
+                       bool gated_silu, bool exact_8k_prefill_prescaled = false,
+                       bool preserve_default_partition = false) {
   TORCH_CHECK(in_feats.is_cuda(), "fp8_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "fp8_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "fp8_gemm_sm70: scales must be CUDA.");
@@ -3800,9 +4293,12 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
         m == 1 && ((n == 1536 && k == 4096) || (n == 8192 && k == 1024) ||
                    (n == 4096 && k == 2048) || (n == 1024 && k == 4096) ||
                    (n == 4096 && k == 512));
-    TORCH_CHECK(qwen38_prefill || prescaled_m1,
+    const bool prescaled_batch =
+        m > 32 && m <= 64 &&
+        ((n == 5120 && k == 1536) || ((n == 4096 || n == 3584) && k == 5120));
+    TORCH_CHECK(qwen38_prefill || prescaled_m1 || prescaled_batch,
                 "fp8_gemm_sm70: pre-scaled block-FP8 requires an accepted "
-                "8K prefill or M=1 tensor shape.");
+                "8K prefill, M=1, or M=33..64 tensor shape.");
     TORCH_CHECK(!gated_silu,
                 "fp8_gemm_sm70: pre-scaled path does not fuse gated SILU.");
   }
@@ -3823,64 +4319,11 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(conv_w && conv_s,
               "fp8_gemm_sm70: no compatible TurboMind converters.");
 
-  turbomind::gemm::MatrixLayout desc_A{
-      turbomind::kHalf,
-      turbomind::gemm::kRowMajor,
-      static_cast<int>(m),
-      static_cast<int>(k),
-      static_cast<int>(in_feats.stride(0)),
-  };
-  turbomind::gemm::MatrixLayout desc_U{};
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat8_e4m3, n, k, k_ld);
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::kFloat8_e4m3;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = static_cast<int>(k_ld);
-
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-  const int64_t num_groups = (k + group_size - 1) / group_size;
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint16,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = static_cast<int>(q_ld);
-
-  turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
-  };
+  auto desc_V = vllm::sm70::packed_scale_layout(
+      *conv_s, turbomind::kUint16, n, (k + group_size - 1) / group_size, q_ld);
 
   turbomind::gemm::Operation op{};
   op.dispatch = select_fp8_dense_dispatch_policy(
@@ -3890,27 +4333,32 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
     op.dispatch =
         op.dispatch | turbomind::gemm::DispatchPolicy::kSm70Fp8PrefillPrescaled;
   }
+  if (preserve_default_partition) {
+    op.dispatch = op.dispatch |
+                  turbomind::gemm::DispatchPolicy::kPreserveDefaultPartition;
+  }
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
-  const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, tm_scales.data_ptr(),
-                          desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
-                          desc_D, workspace_holder.workspace, stream);
+  const int ec = vllm::sm70::run_dense_packed_gemm(
+      gemm, workspace_holder, op, stream, in_feats, out, tm_weight.data_ptr(),
+      desc_B, tm_scales.data_ptr(), desc_V, n, in_feats.stride(0));
   TORCH_CHECK(ec == 0, "fp8_gemm_sm70: TurboMind GEMM failed.");
 }
 
 bool sm70_fp8_prefill_cutlass_gated_silu_enabled(
     const torch::Tensor& in_feats, const torch::Tensor& dense_weight) {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
-  return (raw == nullptr || std::atoi(raw) != 0) && in_feats.size(0) == 8000 &&
-         in_feats.size(1) == 5120 && dense_weight.size(1) == 8704;
+  return (vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_prefill_cutlass,
+                                  1) != 0) &&
+         in_feats.size(0) >= 8000 && in_feats.size(0) <= 8192 &&
+         in_feats.size(1) > 0 && in_feats.size(1) % 128 == 0 &&
+         dense_weight.size(1) > 0 && dense_weight.size(1) % 128 == 0;
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(
@@ -4003,64 +4451,11 @@ void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(conv_w && conv_s,
               "mxfp4_gemm_sm70: no compatible TurboMind converters.");
 
-  turbomind::gemm::MatrixLayout desc_A{
-      turbomind::kHalf,
-      turbomind::gemm::kRowMajor,
-      static_cast<int>(m),
-      static_cast<int>(k),
-      static_cast<int>(in_feats.stride(0)),
-  };
-  turbomind::gemm::MatrixLayout desc_U{};
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat4_e2m1, n, k, k_ld);
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::kFloat4_e2m1;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = static_cast<int>(k_ld);
-
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-  const int64_t num_groups = k / group_size;
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint8,   order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = static_cast<int>(q_ld);
-
-  turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
-  };
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint8, n,
+                                                k / group_size, q_ld);
 
   turbomind::gemm::Operation op{};
   op.dispatch = select_mxfp4_dense_dispatch_policy(
@@ -4072,20 +4467,19 @@ void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
-  const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, tm_scales.data_ptr(),
-                          desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
-                          desc_D, workspace_holder.workspace, stream);
+  const int ec = vllm::sm70::run_dense_packed_gemm(
+      gemm, workspace_holder, op, stream, in_feats, out, tm_weight.data_ptr(),
+      desc_B, tm_scales.data_ptr(), desc_V, n, in_feats.stride(0));
   TORCH_CHECK(ec == 0, "mxfp4_gemm_sm70: TurboMind GEMM failed.");
 }
 
 void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                          torch::Tensor tm_weight, torch::Tensor tm_scales,
                          int64_t group_size, int64_t k_ld, int64_t q_ld,
-                         bool gated_silu) {
+                         bool gated_silu, bool prescaled = false) {
   TORCH_CHECK(in_feats.is_cuda(), "nvfp4_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "nvfp4_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "nvfp4_gemm_sm70: scales must be CUDA.");
@@ -4138,82 +4532,33 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(conv_w && conv_s,
               "nvfp4_gemm_sm70: no compatible TurboMind converters.");
 
-  turbomind::gemm::MatrixLayout desc_A{
-      turbomind::kHalf,
-      turbomind::gemm::kRowMajor,
-      static_cast<int>(m),
-      static_cast<int>(k),
-      static_cast<int>(in_feats.stride(0)),
-  };
-  turbomind::gemm::MatrixLayout desc_U{};
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat4_e2m1, n, k, k_ld);
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::kFloat4_e2m1;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = static_cast<int>(k_ld);
-
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-  const int64_t num_groups = k / group_size;
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint16,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = static_cast<int>(q_ld);
-
-  turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
-  };
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint16, n,
+                                                k / group_size, q_ld);
 
   turbomind::gemm::Operation op{};
   op.dispatch = select_nvfp4_dense_dispatch_policy(
       device, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
       static_cast<int>(group_size), stream);
+  if (prescaled) {
+    TORCH_CHECK(m > 32, "nvfp4_gemm_sm70: prescaled input requires M>32.");
+    op.dispatch =
+        op.dispatch | turbomind::gemm::DispatchPolicy::kSm70Nvfp4Prescaled;
+  }
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
-  const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, tm_scales.data_ptr(),
-                          desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
-                          desc_D, workspace_holder.workspace, stream);
+  const int ec = vllm::sm70::run_dense_packed_gemm(
+      gemm, workspace_holder, op, stream, in_feats, out, tm_weight.data_ptr(),
+      desc_B, tm_scales.data_ptr(), desc_V, n, in_feats.stride(0));
   TORCH_CHECK(ec == 0, "nvfp4_gemm_sm70: TurboMind GEMM failed.");
 }
 
@@ -4580,13 +4925,13 @@ void sm70_f16_gemm_out(torch::Tensor out, torch::Tensor in_feats,
   op.quant_b = {turbomind::gemm::QuantType::kNone, 0};
   op.batch_dim = 0;
 
-  auto& workspace_holder = get_workspace(device, stream);
+  auto& workspace_holder = workspace_for(device, stream);
   auto& gemm = get_gemm(device);
 
   const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
                           tm_weight.data_ptr(), desc_B, nullptr, desc_V, 0.f,
                           out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-                          workspace_holder.workspace, stream);
+                          workspace_holder, stream);
   TORCH_CHECK(ec == 0, "sm70_f16_gemm: TurboMind GEMM failed.");
 }
 
@@ -5749,6 +6094,95 @@ turbomind::gemm::DispatchPolicy select_awq_moe_dispatch_policy(
 }  // namespace awq_sm70
 }  // namespace vllm
 
+std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
+                                                  torch::Tensor scales,
+                                                  int64_t lut_id,
+                                                  int64_t group_size) {
+  return vllm::awq_sm70::gguf_lut4_sm70_prepare(codes, scales, lut_id,
+                                                group_size);
+}
+
+void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             int64_t lut_id, int64_t k_ld, int64_t q_ld,
+                             int64_t group_size) {
+  vllm::awq_sm70::gguf_lut4_gemm_sm70_out(out, input, weight, stats, lut_id,
+                                          k_ld, q_ld, group_size);
+}
+
+void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs, int64_t lut_id,
+                                     int64_t num_experts, int64_t group_size) {
+  vllm::awq_sm70::gguf_lut4_grouped_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, lut_id, num_experts,
+      group_size);
+}
+
+std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
+                                                     torch::Tensor scales,
+                                                     int64_t source_type,
+                                                     int64_t group_size) {
+  return vllm::awq_sm70::gguf_lattice_sm70_prepare(codes, scales, source_type,
+                                                   group_size);
+}
+
+void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor weight, torch::Tensor stats,
+                                int64_t source_type, int64_t k_ld, int64_t q_ld,
+                                int64_t group_size) {
+  vllm::awq_sm70::gguf_lattice_gemm_sm70_out(
+      out, input, weight, stats, source_type, k_ld, q_ld, group_size);
+}
+
+void gguf_grouped_prefill_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t family,
+    int64_t decoder, int64_t n, int64_t num_experts, int64_t group_size,
+    bool gated, bool tune, std::optional<torch::Tensor> a_indices) {
+  vllm::awq_sm70::gguf_grouped_prefill_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, family, decoder, n,
+      num_experts, group_size, gated, tune, std::move(a_indices));
+}
+
+void gguf_lattice_grouped_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
+    int64_t num_experts, int64_t group_size) {
+  vllm::awq_sm70::gguf_lattice_grouped_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, source_type, num_experts,
+      group_size);
+}
+
+std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
+                                                    torch::Tensor scales,
+                                                    torch::Tensor mins,
+                                                    int64_t bits,
+                                                    int64_t group_size) {
+  return vllm::awq_sm70::gguf_affine_sm70_prepare(codes, scales, mins, bits,
+                                                  group_size);
+}
+
+void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor stats,
+                               int64_t bits, int64_t k_ld, int64_t q_ld,
+                               int64_t group_size) {
+  vllm::awq_sm70::gguf_affine_gemm_sm70_out(out, input, weight, stats, bits,
+                                            k_ld, q_ld, group_size);
+}
+
+void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor offsets,
+                                       torch::Tensor weight_ptrs,
+                                       torch::Tensor stats_ptrs, int64_t bits,
+                                       int64_t num_experts,
+                                       int64_t group_size) {
+  vllm::awq_sm70::gguf_affine_grouped_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, bits, num_experts,
+      group_size);
+}
+
 std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                             torch::Tensor _scaling_factors,
                                             torch::Tensor _zeros,
@@ -5756,6 +6190,13 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                             bool interleave_gated_silu) {
   return vllm::awq_sm70::awq_sm70_prepare(_kernel, _scaling_factors, _zeros,
                                           group_size, interleave_gated_silu);
+}
+
+std::vector<torch::Tensor> awq_sm70_prepare_compact(
+    torch::Tensor _kernel, torch::Tensor _scaling_factors, torch::Tensor _zeros,
+    int64_t group_size, bool interleave_gated_silu) {
+  return vllm::awq_sm70::awq_sm70_prepare_compact(
+      _kernel, _scaling_factors, _zeros, group_size, interleave_gated_silu);
 }
 
 void awq_sm70_dequantize_out(torch::Tensor out, torch::Tensor _kernel,
@@ -5821,8 +6262,8 @@ torch::Tensor sm70_f16_gemm(torch::Tensor _in_feats, torch::Tensor _kernel) {
 }
 
 bool sm70_fp8_moe_prepare_vec_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_MOE_PREPARE_VEC");
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_moe_prepare_vec,
+                                 0) != 0;
 }
 
 void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
@@ -5846,9 +6287,10 @@ void awq_gemm_sm70_out_tile_reduce(
 void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                        torch::Tensor _kernel, torch::Tensor _scaling_factors,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
-                       bool gated_silu) {
+                       bool gated_silu, bool preserve_default_partition) {
   vllm::awq_sm70::fp8_gemm_sm70_out(out, _in_feats, _kernel, _scaling_factors,
-                                    group_size, k_ld, q_ld, gated_silu);
+                                    group_size, k_ld, q_ld, gated_silu, false,
+                                    preserve_default_partition);
 }
 
 void fp8_gemm_sm70_prefill_prescaled_out(torch::Tensor out,
@@ -5895,6 +6337,14 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                          bool gated_silu) {
   vllm::awq_sm70::nvfp4_gemm_sm70_out(out, _in_feats, _kernel, _scaling_factors,
                                       group_size, k_ld, q_ld, gated_silu);
+}
+
+void nvfp4_gemm_sm70_prescaled_out(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor weight, torch::Tensor scales,
+                                   int64_t group_size, int64_t k_ld,
+                                   int64_t q_ld, bool gated_silu) {
+  vllm::awq_sm70::nvfp4_gemm_sm70_out(out, input, weight, scales, group_size,
+                                      k_ld, q_ld, gated_silu, true);
 }
 
 void nvfp4_gemv_sm70_raw_out(torch::Tensor out, torch::Tensor _in_feats,
@@ -5953,7 +6403,33 @@ void sm70_glm_mhc_pre_norm_out(
   vllm::awq_sm70::sm70_glm_mhc_pre_norm_out(
       gemm_mul, gemm_sqrsum, hc_scale, hc_base, residual, post_mix, comb_mix,
       layer_input, norm_weight, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-      hc_post_mult, sinkhorn_repeat, norm_eps);
+      hc_post_mult, sinkhorn_repeat, norm_eps,
+      vllm::awq_sm70::glm_mhc_pre_threads());
+}
+
+void sm70_glm_mhc_pre_norm_configured_out(
+    torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
+    torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,
+    torch::Tensor comb_mix, torch::Tensor layer_input,
+    torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
+    double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
+    double norm_eps, int64_t configured_threads) {
+  vllm::awq_sm70::sm70_glm_mhc_pre_norm_out(
+      gemm_mul, gemm_sqrsum, hc_scale, hc_base, residual, post_mix, comb_mix,
+      layer_input, norm_weight, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+      hc_post_mult, sinkhorn_repeat, norm_eps, configured_threads);
+}
+
+void sm70_glm_mhc_post_dot_q8_out(torch::Tensor residual_out,
+                                  torch::Tensor gemm_mul,
+                                  torch::Tensor gemm_sqrsum,
+                                  torch::Tensor comb_mix,
+                                  torch::Tensor residual,
+                                  torch::Tensor post_mix, torch::Tensor x,
+                                  torch::Tensor weight, int64_t tile_n) {
+  vllm::awq_sm70::sm70_glm_mhc_post_dot_q8_out(residual_out, gemm_mul,
+                                               gemm_sqrsum, comb_mix, residual,
+                                               post_mix, x, weight, tile_n);
 }
 
 void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
@@ -6076,54 +6552,6 @@ void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
   vllm::awq_sm70::sm70_f16_gate_mul_out(out, _in_feats, _gate_weight);
 }
 
-int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
-                               const std::string& path) {
-  TORCH_CHECK(device_hint.is_cuda(),
-              "sm70_gemm_import_cache: device_hint must be CUDA.");
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(device_hint));
-  const int device = device_hint.get_device();
-
-  std::ifstream ifs(path, std::ios::binary);
-  if (!ifs.good()) {
-    return 0;
-  }
-
-  auto& gemm = vllm::awq_sm70::get_gemm(device);
-  const int64_t imported = gemm.Import(ifs);
-  if (imported > 0) {
-    std::lock_guard<std::mutex> lock(vllm::awq_sm70::tune_mutex);
-    vllm::awq_sm70::imported_cache_devices.insert(device);
-  }
-  return imported;
-}
-
-int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
-                               const std::string& path) {
-  TORCH_CHECK(device_hint.is_cuda(),
-              "sm70_gemm_export_cache: device_hint must be CUDA.");
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(device_hint));
-  const int device = device_hint.get_device();
-
-  try {
-    const std::filesystem::path fs_path(path);
-    if (fs_path.has_parent_path()) {
-      std::filesystem::create_directories(fs_path.parent_path());
-    }
-  } catch (const std::exception& e) {
-    TORCH_CHECK(false,
-                "sm70_gemm_export_cache: failed to create parent "
-                "directory for ",
-                path, " (", e.what(), ").");
-  }
-
-  std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-  TORCH_CHECK(ofs.good(), "sm70_gemm_export_cache: failed to open ", path,
-              " for writing.");
-
-  auto& gemm = vllm::awq_sm70::get_gemm(device);
-  return gemm.Export(ofs);
-}
-
 // ---------------------------------------------------------------------------
 // MoE batched GEMM support
 // ---------------------------------------------------------------------------
@@ -6134,12 +6562,15 @@ namespace {
 
 __global__ void awq_moe_fill_strided_ptrs_kernel(
     turbomind::gemm::StridedPtr* ptrs, char* base, int64_t expert_stride,
-    int stride, int64_t num_experts) {
+    int stride, int64_t num_experts, bool compact_metadata) {
   const int64_t expert_id =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (expert_id < num_experts) {
+    const uintptr_t data_ptr =
+        reinterpret_cast<uintptr_t>(base + expert_id * expert_stride);
     ptrs[expert_id] = {
-        base + expert_id * expert_stride,
+        reinterpret_cast<void*>(
+            data_ptr | (compact_metadata ? uintptr_t{1} : uintptr_t{0})),
         stride,
     };
   }
@@ -6161,6 +6592,13 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
               "awq_moe_build_strided_ptrs: weights dim0 != num_experts.");
   TORCH_CHECK(tm_scales.size(0) == num_experts,
               "awq_moe_build_strided_ptrs: scales dim0 != num_experts.");
+  if (q_ld < 0) {
+    TORCH_CHECK(tm_scales.scalar_type() == torch::kUInt8 &&
+                    tm_scales.dim() == 4 && tm_scales.size(3) == 3 &&
+                    tm_scales.is_contiguous(),
+                "awq_moe_build_strided_ptrs: compact scales must be "
+                "contiguous uint8 [E,G,N,3].");
+  }
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(tm_weights));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -6171,6 +6609,7 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
       tm_scales.stride(0) * tm_scales.element_size();
   char* w_base = static_cast<char*>(tm_weights.data_ptr());
   char* s_base = static_cast<char*>(tm_scales.data_ptr());
+  const bool compact_metadata = q_ld < 0;
 
   // StridedPtr is 16 bytes (__align__(16): void* ptr + int stride + padding).
   const int64_t buf_bytes = num_experts * 16;
@@ -6182,10 +6621,12 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
   const int blocks = static_cast<int>((num_experts + kThreads - 1) / kThreads);
   awq_moe_fill_strided_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
       reinterpret_cast<turbomind::gemm::StridedPtr*>(w_tensor.data_ptr()),
-      w_base, w_expert_stride, static_cast<int>(k_ld), num_experts);
+      w_base, w_expert_stride, static_cast<int>(k_ld), num_experts, false);
   awq_moe_fill_strided_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
       reinterpret_cast<turbomind::gemm::StridedPtr*>(s_tensor.data_ptr()),
-      s_base, s_expert_stride, static_cast<int>(q_ld), num_experts);
+      s_base, s_expert_stride,
+      static_cast<int>(compact_metadata ? -q_ld : q_ld), num_experts,
+      compact_metadata);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {w_tensor, s_tensor};
@@ -6512,7 +6953,8 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
     bool gated_silu, torch::Tensor b_group_indices, bool per_expert_dispatch,
     torch::Tensor reduce_out, torch::Tensor sorted_weights,
-    bool weighted_reduce);
+    bool weighted_reduce, int64_t logical_total_tokens,
+    torch::Tensor a_indices);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -7331,7 +7773,8 @@ void awq_moe_gemm_sm70_out_impl(
     bool per_expert_dispatch = false,
     torch::Tensor reduce_out = torch::Tensor(),
     torch::Tensor sorted_weights = torch::Tensor(),
-    bool weighted_reduce = false) {
+    bool weighted_reduce = false, int64_t logical_total_tokens = -1,
+    torch::Tensor a_indices = torch::Tensor()) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "awq_moe_gemm_sm70: input must be CUDA float16.");
@@ -7354,6 +7797,8 @@ void awq_moe_gemm_sm70_out_impl(
               "awq_moe_gemm_sm70: invalid dimensions.");
   TORCH_CHECK(k % group_size == 0,
               "awq_moe_gemm_sm70: input dim must be divisible by group size.");
+  TORCH_CHECK(sorted_input.dim() == 2 && sorted_input.size(1) == k,
+              "awq_moe_gemm_sm70: input shape mismatch.");
   torch::Tensor b_group_indices_flat = b_group_indices;
   const bool use_b_group_indices =
       b_group_indices.defined() && b_group_indices.numel() > 0;
@@ -7370,7 +7815,25 @@ void awq_moe_gemm_sm70_out_impl(
   const int device = sorted_input.get_device();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  const int64_t total_tokens = sorted_input.size(0);
+  const int64_t input_tokens = sorted_input.size(0);
+  const int64_t total_tokens =
+      logical_total_tokens > 0 ? logical_total_tokens : input_tokens;
+  const bool use_a_indices = a_indices.defined() && a_indices.numel() > 0;
+  torch::Tensor a_indices_flat = a_indices;
+  if (use_a_indices) {
+    TORCH_CHECK(a_indices.is_cuda() &&
+                    a_indices.scalar_type() == torch::kInt32 &&
+                    a_indices.is_contiguous(),
+                "awq_moe_gemm_sm70: A row indices must be contiguous CUDA "
+                "int32.");
+    a_indices_flat = a_indices.view({-1});
+    TORCH_CHECK(a_indices_flat.numel() >= total_tokens,
+                "awq_moe_gemm_sm70: A row indices size mismatch.");
+  } else {
+    TORCH_CHECK(input_tokens == total_tokens,
+                "awq_moe_gemm_sm70: non-indexed input rows must match "
+                "logical rows.");
+  }
   TORCH_CHECK(out.size(0) == total_tokens,
               "awq_moe_gemm_sm70: output rows must match input rows.");
   TORCH_CHECK(out.stride(1) == 1,
@@ -7412,67 +7875,24 @@ void awq_moe_gemm_sm70_out_impl(
       turbomind::gemm::kRowMajor,
       static_cast<int>(total_tokens),
       static_cast<int>(k),
-      static_cast<int>(k),
+      static_cast<int>(sorted_input.stride(0)),
   };
   desc_A.num = static_cast<int>(num_experts);
   desc_A.offsets = expert_offsets.data_ptr<int>();
+  desc_A.idxs = use_a_indices ? a_indices_flat.data_ptr<int>() : nullptr;
 
   turbomind::gemm::MatrixLayout desc_U{};
 
   // desc_B: weights via StridedPtr (ld=0 triggers StridedPtr resolution)
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::data_type_v<turbomind::uint4_t>;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = 0;  // StridedPtr mode
+  auto desc_B =
+      vllm::sm70::packed_weight_layout(*conv_w, turbomind::kUint4, n, k, 0);
   desc_B.num = static_cast<int>(num_experts);
   desc_B.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
 
   // desc_V: scales via StridedPtr
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-
-  const int64_t num_groups_raw = k / group_size;
-
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint32,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups_raw),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = 0;  // StridedPtr mode
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint32, n,
+                                                k / group_size, 0);
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
@@ -7512,14 +7932,13 @@ void awq_moe_gemm_sm70_out_impl(
   op.batch_dim = 0;
   op.dispatch_num_override = per_expert_dispatch ? 1 : 0;
 
-  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& workspace_holder = vllm::awq_sm70::workspace_for(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
 
-  const int ec =
-      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+      strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f,
+      out.data_ptr(), desc_D, out.data_ptr(), desc_D, workspace_holder, stream);
 
   TORCH_CHECK(ec == 0,
               "awq_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
@@ -7545,6 +7964,52 @@ void awq_moe_gemm_sm70_per_expert_dispatch_out(
   awq_moe_gemm_sm70_out_impl(out, sorted_input, expert_offsets, strided_ptrs_w,
                              strided_ptrs_s, num_experts, k, n, group_size,
                              gated_silu, torch::Tensor(), true);
+}
+
+void awq_moe_indexed_dense_w13_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
+    int64_t n, int64_t group_size) {
+  constexpr int kQwen38TopK = 10;
+  TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
+                  input.scalar_type() == torch::kFloat16 && input.is_cuda() &&
+                  input.is_contiguous(),
+              "awq_moe_indexed_dense_w13_sm70_out: exact Qwen3.8 CUDA FP16 "
+              "[tokens, 2560] input is required.");
+  TORCH_CHECK(num_experts == 512 && k == 2560 && n == 320 && group_size == 32,
+              "awq_moe_indexed_dense_w13_sm70_out: exact Qwen3.8 TP4 W13 "
+              "g32 contract is required.");
+  TORCH_CHECK(input_row_indices.is_cuda() &&
+                  input_row_indices.scalar_type() == torch::kInt32 &&
+                  input_row_indices.is_contiguous() &&
+                  input_row_indices.numel() == input.size(0) * kQwen38TopK,
+              "awq_moe_indexed_dense_w13_sm70_out: input row indices must "
+              "contain exactly tokens*10 contiguous CUDA int32 entries.");
+  TORCH_CHECK(expert_offsets.is_cuda() &&
+                  expert_offsets.scalar_type() == torch::kInt32 &&
+                  expert_offsets.is_contiguous() &&
+                  expert_offsets.numel() >= num_experts + 1,
+              "awq_moe_indexed_dense_w13_sm70_out: expert offsets must be "
+              "contiguous CUDA int32 with num_experts+1 entries.");
+  TORCH_CHECK(dense_expert_ids.is_cuda() &&
+                  dense_expert_ids.scalar_type() == torch::kInt32 &&
+                  dense_expert_ids.is_contiguous() &&
+                  dense_expert_ids.numel() >= num_experts,
+              "awq_moe_indexed_dense_w13_sm70_out: dense expert IDs must be "
+              "contiguous CUDA int32.");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == input_row_indices.numel() &&
+                  out.size(1) == n && out.stride(1) == 1,
+              "awq_moe_indexed_dense_w13_sm70_out: output shape mismatch.");
+
+  maybe_log_sm70_moe_route_once(
+      "logged_awq_indexed_prefill",
+      "SM70 Qwen3.8 AWQ indexed-A W13 prefill path enabled C++ op reached",
+      input, input_row_indices.numel(), num_experts);
+  awq_moe_gemm_sm70_out_impl(
+      out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, group_size,
+      false, dense_expert_ids, true, torch::Tensor(), torch::Tensor(), false,
+      input_row_indices.numel(), input_row_indices);
 }
 
 torch::Tensor awq_moe_gemm_sm70(torch::Tensor sorted_input,
@@ -7600,9 +8065,8 @@ void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "awq_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_awq_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_dense_stage,
+      "logged_awq_dense_stage",
       "SM70 AWQ MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
@@ -7614,6 +8078,148 @@ void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
 }
 
 namespace {
+
+constexpr int kGlm53MoeQ8Tokens = 8;
+constexpr int kGlm53MoeQ8TopK = 8;
+constexpr int kGlm53MoeQ8Slots = kGlm53MoeQ8Tokens * kGlm53MoeQ8TopK;
+constexpr int kGlm53MoeQ8Hidden = 4096;
+
+__global__ void sm70_glm53_moe_sort_shared_q8_kernel(
+    const int* __restrict__ topk_ids, int* __restrict__ sorted_row_idx,
+    int* __restrict__ inv_permuted_idx, int* __restrict__ compact_offsets,
+    int* __restrict__ active_expert_ids) {
+  __shared__ uint32_t composite_keys[kGlm53MoeQ8Slots];
+  const int slot = threadIdx.x;
+  if (slot < kGlm53MoeQ8Slots) {
+    const uint32_t expert = static_cast<uint32_t>(topk_ids[slot]);
+    composite_keys[slot] = (expert << 6) | static_cast<uint32_t>(slot);
+  }
+  __syncthreads();
+
+  // Sorting (expert, original slot) is equivalent to the stable expert-only
+  // CUB sort used by the reference route.
+  #pragma unroll
+  for (int width = 2; width <= kGlm53MoeQ8Slots; width <<= 1) {
+  #pragma unroll
+    for (int stride = width >> 1; stride > 0; stride >>= 1) {
+      if (slot < kGlm53MoeQ8Slots) {
+        const int peer = slot ^ stride;
+        if (peer > slot) {
+          const uint32_t self_key = composite_keys[slot];
+          const uint32_t peer_key = composite_keys[peer];
+          const bool ascending = (slot & width) == 0;
+          const bool swap =
+              ascending ? self_key > peer_key : self_key < peer_key;
+          if (swap) {
+            composite_keys[slot] = peer_key;
+            composite_keys[peer] = self_key;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  if (slot < kGlm53MoeQ8Slots) {
+    const int source_slot = static_cast<int>(composite_keys[slot] & 63u);
+    sorted_row_idx[slot] = source_slot;
+    inv_permuted_idx[source_slot] = slot;
+  }
+
+  if (slot == 0) {
+    int active_count = 0;
+    int previous_expert = -1;
+  #pragma unroll
+    for (int row = 0; row < kGlm53MoeQ8Slots; ++row) {
+      const int expert = static_cast<int>(composite_keys[row] >> 6);
+      if (row == 0 || expert != previous_expert) {
+        compact_offsets[active_count] = row;
+        active_expert_ids[active_count] = expert;
+        ++active_count;
+      }
+      previous_expert = expert;
+    }
+    compact_offsets[active_count] = kGlm53MoeQ8Slots;
+    for (int group = active_count + 1; group <= kGlm53MoeQ8Slots; ++group) {
+      compact_offsets[group] = kGlm53MoeQ8Slots;
+    }
+    for (int group = active_count; group < kGlm53MoeQ8Slots; ++group) {
+      active_expert_ids[group] = 0;
+    }
+  }
+}
+
+__global__ void sm70_glm53_moe_sort_q8_kernel(
+    const int* __restrict__ topk_ids, int* __restrict__ sorted_row_idx,
+    int* __restrict__ inv_permuted_idx, int* __restrict__ compact_offsets,
+    int* __restrict__ active_expert_ids) {
+  __shared__ uint32_t cross_warp_keys[kGlm53MoeQ8Slots];
+  __shared__ uint32_t sorted_keys[kGlm53MoeQ8Slots];
+  const int slot = threadIdx.x;
+  uint32_t key = (static_cast<uint32_t>(topk_ids[slot]) << 6) |
+                 static_cast<uint32_t>(slot);
+
+  #pragma unroll
+  for (int width = 2; width <= kGlm53MoeQ8Slots; width <<= 1) {
+  #pragma unroll
+    for (int stride = width >> 1; stride > 0; stride >>= 1) {
+      uint32_t peer_key;
+      if (stride == 32) {
+        cross_warp_keys[slot] = key;
+        __syncthreads();
+        peer_key = cross_warp_keys[slot ^ stride];
+      } else {
+        peer_key = __shfl_xor_sync(0xffffffffu, key, stride);
+      }
+      const bool ascending = (slot & width) == 0;
+      const bool lower_lane = (slot & stride) == 0;
+      const bool take_min = lower_lane == ascending;
+      key = take_min ? min(key, peer_key) : max(key, peer_key);
+    }
+  }
+
+  sorted_keys[slot] = key;
+  __syncthreads();
+  const int source_slot = static_cast<int>(key & 63u);
+  sorted_row_idx[slot] = source_slot;
+  inv_permuted_idx[source_slot] = slot;
+
+  if (slot == 0) {
+    int active_count = 0;
+    int previous_expert = -1;
+  #pragma unroll
+    for (int row = 0; row < kGlm53MoeQ8Slots; ++row) {
+      const int expert = static_cast<int>(sorted_keys[row] >> 6);
+      if (row == 0 || expert != previous_expert) {
+        compact_offsets[active_count] = row;
+        active_expert_ids[active_count] = expert;
+        ++active_count;
+      }
+      previous_expert = expert;
+    }
+    compact_offsets[active_count] = kGlm53MoeQ8Slots;
+    for (int group = active_count + 1; group <= kGlm53MoeQ8Slots; ++group) {
+      compact_offsets[group] = kGlm53MoeQ8Slots;
+    }
+    for (int group = active_count; group < kGlm53MoeQ8Slots; ++group) {
+      active_expert_ids[group] = 0;
+    }
+  }
+}
+
+__global__ void sm70_glm53_moe_copy_q8_kernel(
+    const uint4* __restrict__ input, const int* __restrict__ sorted_row_idx,
+    uint4* __restrict__ permuted_input) {
+  constexpr int kVectorsPerRow =
+      kGlm53MoeQ8Hidden * sizeof(half) / sizeof(uint4);
+  const int destination_row = blockIdx.x;
+  const int source_row = sorted_row_idx[destination_row] / kGlm53MoeQ8TopK;
+  for (int vector = threadIdx.x; vector < kVectorsPerRow;
+       vector += blockDim.x) {
+    permuted_input[destination_row * kVectorsPerRow + vector] =
+        input[source_row * kVectorsPerRow + vector];
+  }
+}
 
 __global__ void awq_moe_build_active_expert_segments_kernel(
     const int* __restrict__ permuted_experts_id,
@@ -7648,6 +8254,83 @@ __global__ void awq_moe_build_active_expert_segments_kernel(
 }
 
 }  // namespace
+
+void sm70_glm53_moe_permute_q8_out(torch::Tensor input, torch::Tensor topk_ids,
+                                   torch::Tensor permuted_input,
+                                   torch::Tensor sorted_row_idx,
+                                   torch::Tensor inv_permuted_idx,
+                                   torch::Tensor compact_offsets,
+                                   torch::Tensor active_expert_ids) {
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+                  input.is_contiguous() &&
+                  input.sizes() == torch::IntArrayRef(
+                                       {kGlm53MoeQ8Tokens, kGlm53MoeQ8Hidden}),
+              "sm70_glm53_moe_permute_q8_out: input must be contiguous CUDA "
+              "float16 [8, 4096].");
+  TORCH_CHECK(topk_ids.is_cuda() && topk_ids.scalar_type() == torch::kInt32 &&
+                  topk_ids.is_contiguous() &&
+                  topk_ids.numel() == kGlm53MoeQ8Slots,
+              "sm70_glm53_moe_permute_q8_out: topk_ids must be contiguous "
+              "CUDA int32 [8, 8].");
+  TORCH_CHECK(permuted_input.is_cuda() &&
+                  permuted_input.scalar_type() == torch::kFloat16 &&
+                  permuted_input.is_contiguous() &&
+                  permuted_input.sizes() ==
+                      torch::IntArrayRef({kGlm53MoeQ8Slots, kGlm53MoeQ8Hidden}),
+              "sm70_glm53_moe_permute_q8_out: permuted_input must be "
+              "contiguous CUDA float16 [64, 4096].");
+  for (const auto& item :
+       std::initializer_list<std::pair<const char*, torch::Tensor>>{
+           {"sorted_row_idx", sorted_row_idx},
+           {"inv_permuted_idx", inv_permuted_idx},
+           {"compact_offsets", compact_offsets},
+           {"active_expert_ids", active_expert_ids}}) {
+    TORCH_CHECK(item.second.is_cuda() &&
+                    item.second.scalar_type() == torch::kInt32 &&
+                    item.second.is_contiguous(),
+                "sm70_glm53_moe_permute_q8_out: ", item.first,
+                " must be contiguous CUDA int32.");
+  }
+  TORCH_CHECK(sorted_row_idx.numel() >= kGlm53MoeQ8Slots &&
+                  inv_permuted_idx.numel() >= kGlm53MoeQ8Slots &&
+                  compact_offsets.numel() >= kGlm53MoeQ8Slots + 1 &&
+                  active_expert_ids.numel() >= kGlm53MoeQ8Slots,
+              "sm70_glm53_moe_permute_q8_out: index buffers are too small.");
+  const auto device = input.device();
+  TORCH_CHECK(topk_ids.device() == device &&
+                  permuted_input.device() == device &&
+                  sorted_row_idx.device() == device &&
+                  inv_permuted_idx.device() == device &&
+                  compact_offsets.device() == device &&
+                  active_expert_ids.device() == device,
+              "sm70_glm53_moe_permute_q8_out: all tensors must share one "
+              "device.");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto* properties = at::cuda::getDeviceProperties(input.get_device());
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "sm70_glm53_moe_permute_q8_out: requires SM70.");
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const bool use_shuffle_sort =
+      vllm::sm70::policy_atoi(
+          vllm::sm70::PolicyField::glm53_moe_shuffle_sort_q8, 1) != 0;
+  if (use_shuffle_sort) {
+    sm70_glm53_moe_sort_q8_kernel<<<1, kGlm53MoeQ8Slots, 0, stream>>>(
+        topk_ids.data_ptr<int>(), sorted_row_idx.data_ptr<int>(),
+        inv_permuted_idx.data_ptr<int>(), compact_offsets.data_ptr<int>(),
+        active_expert_ids.data_ptr<int>());
+  } else {
+    sm70_glm53_moe_sort_shared_q8_kernel<<<1, kGlm53MoeQ8Slots, 0, stream>>>(
+        topk_ids.data_ptr<int>(), sorted_row_idx.data_ptr<int>(),
+        inv_permuted_idx.data_ptr<int>(), compact_offsets.data_ptr<int>(),
+        active_expert_ids.data_ptr<int>());
+  }
+  sm70_glm53_moe_copy_q8_kernel<<<kGlm53MoeQ8Slots, 256, 0, stream>>>(
+      reinterpret_cast<const uint4*>(input.data_ptr<at::Half>()),
+      sorted_row_idx.data_ptr<int>(),
+      reinterpret_cast<uint4*>(permuted_input.data_ptr<at::Half>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 void awq_moe_active_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor permuted_experts_id,
@@ -7696,17 +8379,299 @@ void awq_moe_active_dense_stage_sm70_out(
       static_cast<int>(total_slots));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  static std::atomic<unsigned> logged_awq_active_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_active_dense_stage,
+      "logged_awq_active_dense_stage",
       "SM70 AWQ MoE active dense-stage path enabled C++ op reached", input,
       total_slots, total_slots);
+
+  // Reuse the active-segment ABI for the narrow Qwen3.8 TP4 decode shapes.
+  // Equal trailing offsets describe empty groups; nonempty groups may contain
+  // multiple rows. Keep offsets-based scheduling (not one-row slot dispatch).
+
+  if ((vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::awq_qwen38_moe_compact_grouped_decode, 1) !=
+       0) &&
+      (vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::awq_moe_batched_active_exact_w2, 0) == 0) &&
+      group_size == 32 && total_slots >= 20 && total_slots <= 80 &&
+      total_slots % 10 == 0 &&
+      ((k == 2560 && n == 320) || (k == 160 && n == 2560))) {
+    awq_moe_gemm_sm70_out_impl(out, input, active_expert_offsets, ptrs_w,
+                               ptrs_s, total_slots, k, n, group_size, false,
+                               active_expert_ids, true);
+    return;
+  }
 
   for (int segment = 0; segment < static_cast<int>(total_slots); ++segment) {
     torch::Tensor offsets = active_expert_offsets.narrow(0, segment, 2);
     torch::Tensor expert_idx = active_expert_ids.narrow(0, segment, 1);
     awq_moe_gemm_sm70_out_impl(out, input, offsets, ptrs_w, ptrs_s, 1, k, n,
                                group_size, false, expert_idx);
+  }
+}
+
+namespace {
+
+__device__ __forceinline__ int awq_moe_lower_bound_source_row(
+    const int* __restrict__ permuted_idx, int begin, int end, int target) {
+  while (begin < end) {
+    const int middle = begin + (end - begin) / 2;
+    if (permuted_idx[middle] < target) {
+      begin = middle + 1;
+    } else {
+      end = middle;
+    }
+  }
+  return begin;
+}
+
+__global__ void awq_moe_chunk_ranges_kernel(
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ permuted_idx,
+    int* __restrict__ chunk_expert_offsets, int* __restrict__ chunk_range_begin,
+    int* __restrict__ chunk_range_end, int num_experts, int source_begin,
+    int source_end) {
+  const int expert = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (expert >= num_experts) {
+    return;
+  }
+
+  const int expert_begin = expert_offsets[expert];
+  const int expert_end = expert_offsets[expert + 1];
+  const int range_begin = awq_moe_lower_bound_source_row(
+      permuted_idx, expert_begin, expert_end, source_begin);
+  const int range_end = awq_moe_lower_bound_source_row(
+      permuted_idx, range_begin, expert_end, source_end);
+  chunk_range_begin[expert] = range_begin;
+  chunk_range_end[expert] = range_end;
+  chunk_expert_offsets[expert + 1] = range_end - range_begin;
+}
+
+__global__ void awq_moe_prefix_chunk_offsets_kernel(
+    int* __restrict__ chunk_expert_offsets, int num_experts) {
+  int prefix = 0;
+  chunk_expert_offsets[0] = 0;
+  for (int expert = 0; expert < num_experts; ++expert) {
+    prefix += chunk_expert_offsets[expert + 1];
+    chunk_expert_offsets[expert + 1] = prefix;
+  }
+}
+
+__global__ void awq_moe_fill_chunk_indices_kernel(
+    const int* __restrict__ permuted_idx,
+    const int* __restrict__ chunk_expert_offsets,
+    const int* __restrict__ chunk_range_begin,
+    const int* __restrict__ chunk_range_end, int* __restrict__ chunk_a_indices,
+    int* __restrict__ chunk_inv_permuted_idx, int source_begin) {
+  const int expert = static_cast<int>(blockIdx.x);
+  const int range_begin = chunk_range_begin[expert];
+  const int range_end = chunk_range_end[expert];
+  const int chunk_begin = chunk_expert_offsets[expert];
+  for (int global_row = range_begin + threadIdx.x; global_row < range_end;
+       global_row += blockDim.x) {
+    const int chunk_row = chunk_begin + global_row - range_begin;
+    const int local_source_row = permuted_idx[global_row] - source_begin;
+    chunk_a_indices[chunk_row] = global_row;
+    chunk_inv_permuted_idx[local_source_row] = chunk_row;
+  }
+}
+
+__global__ void awq_moe_chunk_weighted_reduce_kernel(
+    __half* __restrict__ out, const __half* __restrict__ chunk_output,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ chunk_inv_permuted_idx, int output_token_begin,
+    int chunk_tokens, int top_k, int hidden_logical_size, int out_stride,
+    int chunk_output_stride) {
+  const int local_token = static_cast<int>(blockIdx.x);
+  if (local_token >= chunk_tokens) {
+    return;
+  }
+  const int output_token = output_token_begin + local_token;
+  for (int col = threadIdx.x; col < hidden_logical_size; col += blockDim.x) {
+    float reduced = 0.0f;
+    for (int route = 0; route < top_k; ++route) {
+      const int source_row = local_token * top_k + route;
+      const int chunk_row = chunk_inv_permuted_idx[source_row];
+      const float value = __half2float(
+          chunk_output[static_cast<int64_t>(chunk_row) * chunk_output_stride +
+                       col]);
+      const float weight = topk_weights[output_token * top_k + route];
+      reduced = fmaf(weight, value, reduced);
+    }
+    out[static_cast<int64_t>(output_token) * out_stride + col] =
+        __float2half_rn(reduced);
+  }
+}
+
+}  // namespace
+
+void awq_moe_chunked_w2_sm70_out(
+    torch::Tensor out, torch::Tensor chunk_output, torch::Tensor input,
+    torch::Tensor expert_offsets, torch::Tensor permuted_idx,
+    torch::Tensor topk_weights, torch::Tensor chunk_expert_offsets,
+    torch::Tensor chunk_range_begin, torch::Tensor chunk_range_end,
+    torch::Tensor chunk_a_indices, torch::Tensor chunk_inv_permuted_idx,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_tokens,
+    int64_t top_k, int64_t num_experts, int64_t k, int64_t n,
+    int64_t hidden_logical_size, int64_t group_size, int64_t chunk_tokens) {
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16 &&
+                  out.is_contiguous(),
+              "awq_moe_chunked_w2_sm70_out: out must be contiguous CUDA "
+              "float16.");
+  TORCH_CHECK(chunk_output.is_cuda() &&
+                  chunk_output.scalar_type() == torch::kFloat16 &&
+                  chunk_output.is_contiguous(),
+              "awq_moe_chunked_w2_sm70_out: chunk output must be "
+              "contiguous CUDA float16.");
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+                  input.is_contiguous(),
+              "awq_moe_chunked_w2_sm70_out: input must be contiguous "
+              "CUDA float16.");
+  TORCH_CHECK(expert_offsets.is_cuda() &&
+                  expert_offsets.scalar_type() == torch::kInt32 &&
+                  expert_offsets.is_contiguous() && permuted_idx.is_cuda() &&
+                  permuted_idx.scalar_type() == torch::kInt32 &&
+                  permuted_idx.is_contiguous() && topk_weights.is_cuda() &&
+                  topk_weights.scalar_type() == torch::kFloat32 &&
+                  topk_weights.is_contiguous(),
+              "awq_moe_chunked_w2_sm70_out: route metadata dtype/device "
+              "mismatch.");
+  TORCH_CHECK(
+      chunk_expert_offsets.is_cuda() &&
+          chunk_expert_offsets.scalar_type() == torch::kInt32 &&
+          chunk_expert_offsets.is_contiguous() && chunk_range_begin.is_cuda() &&
+          chunk_range_begin.scalar_type() == torch::kInt32 &&
+          chunk_range_begin.is_contiguous() && chunk_range_end.is_cuda() &&
+          chunk_range_end.scalar_type() == torch::kInt32 &&
+          chunk_range_end.is_contiguous() && chunk_a_indices.is_cuda() &&
+          chunk_a_indices.scalar_type() == torch::kInt32 &&
+          chunk_a_indices.is_contiguous() && chunk_inv_permuted_idx.is_cuda() &&
+          chunk_inv_permuted_idx.scalar_type() == torch::kInt32 &&
+          chunk_inv_permuted_idx.is_contiguous(),
+      "awq_moe_chunked_w2_sm70_out: chunk scratch must be "
+      "contiguous CUDA int32.");
+  TORCH_CHECK(ptrs_w.is_cuda() && ptrs_s.is_cuda(),
+              "awq_moe_chunked_w2_sm70_out: weight metadata must be CUDA.");
+  TORCH_CHECK(num_tokens > 0 && top_k > 0 && num_experts > 0 && k > 0 &&
+                  n > 0 && group_size > 0 &&
+                  (chunk_tokens == 4096 || chunk_tokens == 6144) &&
+                  chunk_tokens < num_tokens && hidden_logical_size > 0 &&
+                  hidden_logical_size <= n,
+              "awq_moe_chunked_w2_sm70_out: invalid dimensions.");
+  constexpr int64_t kIntMax = std::numeric_limits<int>::max();
+  TORCH_CHECK(num_tokens <= kIntMax / top_k && num_experts <= kIntMax &&
+                  k <= kIntMax && n <= kIntMax &&
+                  hidden_logical_size <= kIntMax && group_size <= kIntMax &&
+                  chunk_tokens <= kIntMax,
+              "awq_moe_chunked_w2_sm70_out: dimensions exceed int32.");
+  const int64_t total_slots = num_tokens * top_k;
+  const int64_t max_chunk_slots = std::min(num_tokens, chunk_tokens) * top_k;
+  constexpr int64_t kMinIndexedChunkTokens = 2048;
+  const int64_t num_chunks = (num_tokens + chunk_tokens - 1) / chunk_tokens;
+  const int64_t base_chunk_tokens = num_tokens / num_chunks;
+  const int64_t extra_tokens = num_tokens % num_chunks;
+  const int64_t tail_tokens = num_tokens % chunk_tokens;
+  const bool balance_chunks =
+      tail_tokens > 0 && tail_tokens < kMinIndexedChunkTokens;
+  TORCH_CHECK(base_chunk_tokens >= kMinIndexedChunkTokens,
+              "awq_moe_chunked_w2_sm70_out: a balanced chunk must contain at "
+              "least 2048 tokens.");
+  TORCH_CHECK(
+      out.dim() == 2 && out.size(0) == num_tokens &&
+          out.size(1) == hidden_logical_size && input.dim() == 2 &&
+          input.size(0) == total_slots && input.size(1) == k &&
+          expert_offsets.dim() == 1 &&
+          expert_offsets.numel() == num_experts + 1 &&
+          permuted_idx.dim() == 1 && permuted_idx.numel() == total_slots &&
+          topk_weights.dim() == 2 && topk_weights.size(0) == num_tokens &&
+          topk_weights.size(1) == top_k,
+      "awq_moe_chunked_w2_sm70_out: input/metadata shape "
+      "mismatch.");
+  TORCH_CHECK(
+      chunk_output.dim() == 2 && chunk_output.size(0) >= max_chunk_slots &&
+          chunk_output.size(1) == n && chunk_expert_offsets.dim() == 1 &&
+          chunk_expert_offsets.numel() >= num_experts + 1 &&
+          chunk_range_begin.dim() == 1 &&
+          chunk_range_begin.numel() >= num_experts &&
+          chunk_range_end.dim() == 1 &&
+          chunk_range_end.numel() >= num_experts &&
+          chunk_a_indices.dim() == 1 &&
+          chunk_a_indices.numel() >= max_chunk_slots &&
+          chunk_inv_permuted_idx.dim() == 1 &&
+          chunk_inv_permuted_idx.numel() >= max_chunk_slots,
+      "awq_moe_chunked_w2_sm70_out: scratch/output too small.");
+
+  const int device = input.get_device();
+  TORCH_CHECK(
+      out.get_device() == device && chunk_output.get_device() == device &&
+          expert_offsets.get_device() == device &&
+          permuted_idx.get_device() == device &&
+          topk_weights.get_device() == device &&
+          chunk_expert_offsets.get_device() == device &&
+          chunk_range_begin.get_device() == device &&
+          chunk_range_end.get_device() == device &&
+          chunk_a_indices.get_device() == device &&
+          chunk_inv_permuted_idx.get_device() == device &&
+          ptrs_w.get_device() == device && ptrs_s.get_device() == device,
+      "awq_moe_chunked_w2_sm70_out: tensors must share a device.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int kThreads = 256;
+  const int range_blocks =
+      static_cast<int>((num_experts + kThreads - 1) / kThreads);
+
+  // The production permutation is a stable expert-major sort, so source route
+  // indices remain ascending inside each expert segment. Intersecting every
+  // segment with a contiguous source-route interval therefore keeps the GEMM
+  // expert-major while allowing the final reduction to replay route 0..top_k-1
+  // in exactly the same FP32 order as moe_unpermute.
+  // Preserve the existing schedule when its tail is safe. Only rebalance tiny
+  // tails, keeping every partition within [2048, chunk_tokens].
+  int64_t token_begin = 0;
+  for (int64_t chunk = 0; chunk < num_chunks; ++chunk) {
+    const int64_t current_tokens =
+        balance_chunks ? base_chunk_tokens + (chunk < extra_tokens)
+                       : std::min(chunk_tokens, num_tokens - token_begin);
+    const int64_t current_slots = current_tokens * top_k;
+    const int64_t source_begin = token_begin * top_k;
+    const int64_t source_end = source_begin + current_slots;
+
+    awq_moe_chunk_ranges_kernel<<<range_blocks, kThreads, 0, stream>>>(
+        expert_offsets.data_ptr<int>(), permuted_idx.data_ptr<int>(),
+        chunk_expert_offsets.data_ptr<int>(), chunk_range_begin.data_ptr<int>(),
+        chunk_range_end.data_ptr<int>(), static_cast<int>(num_experts),
+        static_cast<int>(source_begin), static_cast<int>(source_end));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    awq_moe_prefix_chunk_offsets_kernel<<<1, 1, 0, stream>>>(
+        chunk_expert_offsets.data_ptr<int>(), static_cast<int>(num_experts));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    awq_moe_fill_chunk_indices_kernel<<<num_experts, kThreads, 0, stream>>>(
+        permuted_idx.data_ptr<int>(), chunk_expert_offsets.data_ptr<int>(),
+        chunk_range_begin.data_ptr<int>(), chunk_range_end.data_ptr<int>(),
+        chunk_a_indices.data_ptr<int>(), chunk_inv_permuted_idx.data_ptr<int>(),
+        static_cast<int>(source_begin));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    awq_moe_gemm_sm70_out_impl(
+        chunk_output.narrow(0, 0, current_slots), input, chunk_expert_offsets,
+        ptrs_w, ptrs_s, num_experts, k, n, group_size, false, torch::Tensor(),
+        false, torch::Tensor(), torch::Tensor(), false, current_slots,
+        chunk_a_indices);
+
+    awq_moe_chunk_weighted_reduce_kernel<<<current_tokens, kThreads, 0,
+                                           stream>>>(
+        reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(chunk_output.data_ptr<at::Half>()),
+        topk_weights.data_ptr<float>(), chunk_inv_permuted_idx.data_ptr<int>(),
+        static_cast<int>(token_begin), static_cast<int>(current_tokens),
+        static_cast<int>(top_k), static_cast<int>(hidden_logical_size),
+        static_cast<int>(out.stride(0)),
+        static_cast<int>(chunk_output.stride(0)));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    token_begin += current_tokens;
   }
 }
 
@@ -7867,8 +8832,7 @@ void awq_moe_single_token_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token{0u};
-  maybe_log_sm70_moe_route_once(logged_awq_single_token,
+  maybe_log_sm70_moe_route_once("logged_awq_single_token",
                                 "SM70 AWQ MoE single-token active-expert dense "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -7965,9 +8929,8 @@ void awq_moe_single_token_indexed_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token_indexed{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_single_token_indexed,
+      "logged_awq_single_token_indexed",
       "SM70 AWQ MoE single-token indexed dense path enabled C++ op reached", x,
       x.size(0), top_k);
   constexpr int kThreads = 256;
@@ -8076,8 +9039,7 @@ void awq_moe_single_token_compact_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token_compact{0u};
-  maybe_log_sm70_moe_route_once(logged_awq_single_token_compact,
+  maybe_log_sm70_moe_route_once("logged_awq_single_token_compact",
                                 "SM70 AWQ MoE single-token compact grouped W13 "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -8245,53 +9207,14 @@ void fp8_moe_gemm_sm70_out_impl(
   desc_A.idxs = use_a_indices ? a_indices_flat.data_ptr<int>() : nullptr;
   turbomind::gemm::MatrixLayout desc_U{};
 
-  const auto order_w = conv_w->order;
-  const bool is_A_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_B_w = !is_A_w;
-  turbomind::gemm::MatrixLayout w_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_B_w) {
-    std::swap(w_desc.rows, w_desc.cols);
-    w_desc.order = ~w_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = w_desc;
-  desc_B.type = turbomind::kFloat8_e4m3;
-  desc_B.pack = conv_w->pack;
-  if (is_A_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = 0;
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat8_e4m3, n, k, 0);
   desc_B.num = static_cast<int>(num_experts);
   desc_B.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
 
-  const auto order_s = conv_s->order;
-  const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_B_s = !is_A_s;
-  const int64_t num_groups = (k + group_size - 1) / group_size;
-  turbomind::gemm::MatrixLayout s_desc{
-      turbomind::kUint16,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_B_s) {
-    std::swap(s_desc.rows, s_desc.cols);
-    s_desc.order = ~s_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = s_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_A_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = 0;
+  auto desc_V = vllm::sm70::packed_scale_layout(
+      *conv_s, turbomind::kUint16, n, (k + group_size - 1) / group_size, 0);
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
@@ -8335,13 +9258,12 @@ void fp8_moe_gemm_sm70_out_impl(
   op.active_group_count =
       use_active_group_indices ? static_cast<int>(active_group_count) : 0;
 
-  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& workspace_holder = vllm::awq_sm70::workspace_for(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
-  const int ec =
-      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+      strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f,
+      out.data_ptr(), desc_D, out.data_ptr(), desc_D, workspace_holder, stream);
   TORCH_CHECK(ec == 0,
               "fp8_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
               ").");
@@ -8408,9 +9330,8 @@ void fp8_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_fp8_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_fp8_dense_stage,
+      "logged_fp8_dense_stage",
       "SM70 FP8 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
@@ -8499,52 +9420,13 @@ void mxfp4_moe_gemm_sm70_out_impl(
       broadcast_input_rows ? nullptr : expert_offsets.data_ptr<int>();
   turbomind::gemm::MatrixLayout desc_U{};
 
-  const auto order_w = conv_w->order;
-  const bool is_a_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_b_w = !is_a_w;
-  turbomind::gemm::MatrixLayout weight_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_b_w) {
-    std::swap(weight_desc.rows, weight_desc.cols);
-    weight_desc.order = ~weight_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = weight_desc;
-  desc_B.type = turbomind::kFloat4_e2m1;
-  desc_B.pack = conv_w->pack;
-  if (is_a_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = 0;
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat4_e2m1, n, k, 0);
   desc_B.num = static_cast<int>(num_experts);
   desc_B.group_idxs = b_group_indices.data_ptr<int>();
 
-  const auto order_s = conv_s->order;
-  const bool is_a_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_b_s = !is_a_s;
-  const int64_t num_groups = k / group_size;
-  turbomind::gemm::MatrixLayout scale_desc{
-      turbomind::kUint8,   order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_b_s) {
-    std::swap(scale_desc.rows, scale_desc.cols);
-    scale_desc.order = ~scale_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = scale_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_a_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = 0;
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint8, n,
+                                                k / group_size, 0);
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs = b_group_indices.data_ptr<int>();
 
@@ -8581,13 +9463,12 @@ void mxfp4_moe_gemm_sm70_out_impl(
                               ? -static_cast<int>(num_experts)
                               : 0;
 
-  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& workspace_holder = vllm::awq_sm70::workspace_for(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
-  const int ec =
-      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+      strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f,
+      out.data_ptr(), desc_D, out.data_ptr(), desc_D, workspace_holder, stream);
   TORCH_CHECK(ec == 0,
               "mxfp4_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
               ").");
@@ -8635,9 +9516,8 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "mxfp4_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_mxfp4_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_mxfp4_dense_stage,
+      "logged_mxfp4_dense_stage",
       "SM70 MXFP4 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   const bool compact_decode_shape = input.size(0) == num_experts &&
@@ -8659,9 +9539,18 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       input.size(0) == num_experts && num_experts >= 12 && num_experts <= 48 &&
       num_experts % 6 == 0 &&
       ((k == 4096 && n == 512) || (k == 256 && n == 4096));
+  // Any small one-row-per-route batch (e.g. the V4.1 DSpark draft, M5 x
+  // top-3 = 15 rows) runs as one grouped launch instead of a launch per row.
+  static const bool grouped_any = [] {
+    const char* v = std::getenv("VLLM_SM70_MXFP4_GROUPED_ANY");
+    return v != nullptr && v[0] == '1';
+  }();
+  const bool grouped_any_shape = grouped_any && input.size(0) == num_experts &&
+                                 num_experts >= 2 && num_experts <= 48;
   if ((vllm::awq_sm70::mxfp4_moe_grouped_m8_enabled() && grouped_m8_shape) ||
       (vllm::awq_sm70::mxfp4_moe_grouped_verifier_enabled() &&
-       grouped_verifier_shape)) {
+       grouped_verifier_shape) ||
+      grouped_any_shape) {
     // Keep every routed slot as an independent one-row group. Repeated experts
     // reuse the same weight pointer row, while the scheduler retains the exact
     // arithmetic contract already accepted for compact B1 decode.
@@ -8682,7 +9571,9 @@ void nvfp4_moe_gemm_sm70_out_impl(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    torch::Tensor b_group_indices, bool compact_grouped_rows = false) {
+    torch::Tensor b_group_indices, bool compact_grouped_rows = false,
+    int64_t logical_total_tokens = -1,
+    torch::Tensor a_indices = torch::Tensor(), bool gated_silu = false) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "nvfp4_moe_gemm_sm70: input must be CUDA float16.");
@@ -8703,9 +9594,6 @@ void nvfp4_moe_gemm_sm70_out_impl(
               "nvfp4_moe_gemm_sm70: k must be divisible by group_size.");
   TORCH_CHECK(sorted_input.dim() == 2 && sorted_input.size(1) == k,
               "nvfp4_moe_gemm_sm70: input shape mismatch.");
-  TORCH_CHECK(out.dim() == 2 && out.size(0) == sorted_input.size(0) &&
-                  out.size(1) == n && out.stride(1) == 1,
-              "nvfp4_moe_gemm_sm70: output must be contiguous [tokens, n].");
   TORCH_CHECK(expert_offsets.numel() >= num_experts + 1,
               "nvfp4_moe_gemm_sm70: expert_offsets too small.");
   TORCH_CHECK(b_group_indices.is_cuda() &&
@@ -8715,7 +9603,30 @@ void nvfp4_moe_gemm_sm70_out_impl(
               "nvfp4_moe_gemm_sm70: B group indices must be contiguous CUDA "
               "int32.");
 
-  const int64_t total_tokens = sorted_input.size(0);
+  const int64_t input_tokens = sorted_input.size(0);
+  const int64_t total_tokens =
+      logical_total_tokens > 0 ? logical_total_tokens : input_tokens;
+  const bool use_a_indices = a_indices.defined() && a_indices.numel() > 0;
+  torch::Tensor a_indices_flat = a_indices;
+  if (use_a_indices) {
+    TORCH_CHECK(a_indices.is_cuda() &&
+                    a_indices.scalar_type() == torch::kInt32 &&
+                    a_indices.is_contiguous(),
+                "nvfp4_moe_gemm_sm70: A row indices must be contiguous CUDA "
+                "int32.");
+    a_indices_flat = a_indices.view({-1});
+    TORCH_CHECK(a_indices_flat.numel() >= total_tokens,
+                "nvfp4_moe_gemm_sm70: A row indices size mismatch.");
+  } else {
+    TORCH_CHECK(input_tokens == total_tokens,
+                "nvfp4_moe_gemm_sm70: non-indexed input rows must match "
+                "logical rows.");
+  }
+  TORCH_CHECK(!gated_silu || n % 2 == 0,
+              "nvfp4_moe_gemm_sm70: gated SiLU requires even n.");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == total_tokens &&
+                  out.size(1) == (gated_silu ? n / 2 : n) && out.stride(1) == 1,
+              "nvfp4_moe_gemm_sm70: output must be contiguous [tokens, n].");
   if (total_tokens == 0) {
     return;
   }
@@ -8742,54 +9653,16 @@ void nvfp4_moe_gemm_sm70_out_impl(
   };
   desc_A.num = static_cast<int>(num_experts);
   desc_A.offsets = expert_offsets.data_ptr<int>();
+  desc_A.idxs = use_a_indices ? a_indices_flat.data_ptr<int>() : nullptr;
   turbomind::gemm::MatrixLayout desc_U{};
 
-  const auto order_w = conv_w->order;
-  const bool is_a_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
-                      turbomind::gemm::OPERAND_A;
-  const bool is_b_w = !is_a_w;
-  turbomind::gemm::MatrixLayout weight_desc{
-      turbomind::kHalf,
-      order_w,
-      static_cast<int>(n),
-      static_cast<int>(k),
-      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
-                                            : static_cast<int>(n),
-  };
-  if (is_b_w) {
-    std::swap(weight_desc.rows, weight_desc.cols);
-    weight_desc.order = ~weight_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_B = weight_desc;
-  desc_B.type = turbomind::kFloat4_e2m1;
-  desc_B.pack = conv_w->pack;
-  if (is_a_w) {
-    desc_B = turbomind::gemm::transpose(desc_B);
-  }
-  desc_B.ld = 0;
+  auto desc_B = vllm::sm70::packed_weight_layout(
+      *conv_w, turbomind::kFloat4_e2m1, n, k, 0);
   desc_B.num = static_cast<int>(num_experts);
   desc_B.group_idxs = b_group_indices.data_ptr<int>();
 
-  const auto order_s = conv_s->order;
-  const bool is_a_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
-                      turbomind::gemm::OPERAND_U;
-  const bool is_b_s = !is_a_s;
-  const int64_t num_groups = k / group_size;
-  turbomind::gemm::MatrixLayout scale_desc{
-      turbomind::kUint16,  order_s,
-      static_cast<int>(n), static_cast<int>(num_groups),
-      static_cast<int>(n),
-  };
-  if (is_b_s) {
-    std::swap(scale_desc.rows, scale_desc.cols);
-    scale_desc.order = ~scale_desc.order;
-  }
-  turbomind::gemm::MatrixLayout desc_V = scale_desc;
-  desc_V.pack = conv_s->pack;
-  if (is_a_s) {
-    desc_V = turbomind::gemm::transpose(desc_V);
-  }
-  desc_V.ld = 0;
+  auto desc_V = vllm::sm70::packed_scale_layout(*conv_s, turbomind::kUint16, n,
+                                                k / group_size, 0);
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs = b_group_indices.data_ptr<int>();
 
@@ -8808,24 +9681,98 @@ void nvfp4_moe_gemm_sm70_out_impl(
       device, static_cast<int>(total_tokens), static_cast<int>(n),
       static_cast<int>(k), static_cast<int>(num_experts),
       static_cast<int>(group_size), stream);
-  op.epilogue = turbomind::gemm::Epilogue::kNone;
+  op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
+                           : turbomind::gemm::Epilogue::kNone;
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
   op.dispatch_num_override = compact_grouped_rows ? 1 : 0;
-  op.active_group_count =
-      compact_grouped_rows ? -static_cast<int>(num_experts) : 0;
+  const bool dynamic_glm53_expert_rows =
+      compact_grouped_rows && num_experts >= 16 && num_experts <= 80 &&
+      num_experts % 8 == 0 && group_size == 16 &&
+      ((k == 4096 && (n == 512 || n == 1024)) ||
+       (n == 4096 && (k == 256 || k == 512))) &&
+      vllm::awq_sm70::nvfp4_moe_grouped_expert_rows_enabled();
+  op.active_group_count = compact_grouped_rows && !dynamic_glm53_expert_rows
+                              ? -static_cast<int>(num_experts)
+                              : 0;
 
-  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& workspace_holder = vllm::awq_sm70::workspace_for(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
-  const int ec =
-      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+      strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f,
+      out.data_ptr(), desc_D, out.data_ptr(), desc_D, workspace_holder, stream);
   TORCH_CHECK(ec == 0,
               "nvfp4_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
               ").");
+}
+
+void nvfp4_moe_indexed_dense_stage_sm70_out_impl(
+    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
+    int64_t n, int64_t group_size, bool fused_swiglu) {
+  constexpr int kQwen38TopK = 10;
+
+  const bool split_w13_candidate =
+      (vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) != 0) &&
+      fused_swiglu && (n == 256 || n == 64);
+  TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
+                  input.scalar_type() == torch::kFloat16 && input.is_cuda(),
+              "nvfp4_moe_indexed_dense_stage_sm70_out: exact Qwen3.8 CUDA "
+              "FP16 [tokens, 2560] input is required.");
+  TORCH_CHECK(num_experts == 512 && k == 2560 &&
+                  (n == 320 || split_w13_candidate) && group_size == 16,
+              "nvfp4_moe_indexed_dense_stage_sm70_out: exact Qwen3.8 TP4 W13 "
+              "contract is required.");
+  TORCH_CHECK(input_row_indices.is_cuda() &&
+                  input_row_indices.scalar_type() == torch::kInt32 &&
+                  input_row_indices.is_contiguous() &&
+                  input_row_indices.numel() == input.size(0) * kQwen38TopK,
+              "nvfp4_moe_indexed_dense_stage_sm70_out: input row indices must "
+              "contain exactly tokens*10 contiguous CUDA int32 entries.");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == input_row_indices.numel() &&
+                  out.size(1) == (fused_swiglu ? n / 2 : n),
+              "nvfp4_moe_indexed_dense_stage_sm70_out: output shape mismatch.");
+  TORCH_CHECK(vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled(),
+              "nvfp4_moe_indexed_dense_stage_sm70_out requires grouped "
+              "prefill dispatch.");
+
+  maybe_log_sm70_moe_route_once(
+      fused_swiglu ? "logged_nvfp4_indexed_fused_prefill"
+                   : "logged_nvfp4_indexed_prefill",
+      fused_swiglu
+          ? "SM70 Qwen3.8 NVFP4 MoE indexed-A fused-SwiGLU W13 prefill "
+            "path enabled C++ op reached"
+          : "SM70 Qwen3.8 NVFP4 MoE indexed-A W13 prefill path enabled C++ "
+            "op reached",
+      input, input_row_indices.numel(), num_experts);
+  nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
+                               num_experts, k, n, group_size, dense_expert_ids,
+                               false, input_row_indices.numel(),
+                               input_row_indices, fused_swiglu);
+}
+
+void nvfp4_moe_indexed_dense_stage_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
+    int64_t n, int64_t group_size) {
+  nvfp4_moe_indexed_dense_stage_sm70_out_impl(
+      out, input, input_row_indices, expert_offsets, dense_expert_ids, ptrs_w,
+      ptrs_s, num_experts, k, n, group_size, false);
+}
+
+void nvfp4_moe_indexed_fused_swiglu_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
+    int64_t n, int64_t group_size) {
+  nvfp4_moe_indexed_dense_stage_sm70_out_impl(
+      out, input, input_row_indices, expert_offsets, dense_expert_ids, ptrs_w,
+      ptrs_s, num_experts, k, n, group_size, true);
 }
 
 void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
@@ -8866,9 +9813,8 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "nvfp4_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_nvfp4_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_nvfp4_dense_stage,
+      "logged_nvfp4_dense_stage",
       "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
       input, input.size(0), num_experts);
   constexpr int kNvfp4LegacyCompactGroups = 8 * 8;
@@ -8894,9 +9840,8 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       ((k == 2560 && n == 320) || (k == 160 && n == 2560));
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
       (exact_qwen36_prefill_shape || exact_qwen4_exp_prefill_shape)) {
-    static std::atomic<unsigned> logged_nvfp4_grouped_prefill{0u};
     maybe_log_sm70_moe_route_once(
-        logged_nvfp4_grouped_prefill,
+        "logged_nvfp4_grouped_prefill",
         "SM70 NVFP4 MoE grouped TurboMind prefill path enabled C++ op reached",
         input, input.size(0), num_experts);
     nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
@@ -8979,9 +9924,8 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_mxfp4_direct_top6{0u};
   maybe_log_sm70_moe_route_once(
-      logged_mxfp4_direct_top6,
+      "logged_mxfp4_direct_top6",
       "SM70 MXFP4 MoE direct top-6 prepare/W13 path enabled C++ op reached", x,
       x.size(0), kTopK);
 
@@ -9193,8 +10137,7 @@ void fp8_moe_single_token_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token{0u};
-  maybe_log_sm70_moe_route_once(logged_fp8_single_token,
+  maybe_log_sm70_moe_route_once("logged_fp8_single_token",
                                 "SM70 FP8 MoE single-token active-expert dense "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -9292,9 +10235,8 @@ void fp8_moe_single_token_indexed_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token_indexed{0u};
   maybe_log_sm70_moe_route_once(
-      logged_fp8_single_token_indexed,
+      "logged_fp8_single_token_indexed",
       "SM70 FP8 MoE single-token indexed dense path enabled C++ op reached", x,
       x.size(0), top_k);
   constexpr int kThreads = 256;
@@ -9404,8 +10346,7 @@ void fp8_moe_single_token_compact_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token_compact{0u};
-  maybe_log_sm70_moe_route_once(logged_fp8_single_token_compact,
+  maybe_log_sm70_moe_route_once("logged_fp8_single_token_compact",
                                 "SM70 FP8 MoE single-token compact grouped W13 "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);

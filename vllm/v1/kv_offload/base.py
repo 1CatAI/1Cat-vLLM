@@ -173,6 +173,18 @@ class OffloadingManager(ABC):
         """
         return
 
+    def demote(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """
+        Mark the given blocks as the first eviction candidates, e.g. recurrent
+        checkpoints that a newer boundary of the same request has superseded.
+        Missing keys are ignored.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context (e.g. kv_transfer_params).
+        """
+        return
+
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Marks previous blocks that were prepared to load as done loading.
@@ -387,16 +399,20 @@ class OffloadingSpec(ABC):
         self.offload_prompt_only: bool = bool(
             self.extra_config.get("offload_prompt_only", True)
         )
-
-        parallel_config = vllm_config.parallel_config
-        context_parallel_factor = (
-            parallel_config.decode_context_parallel_size
-            * parallel_config.prefill_context_parallel_size
+        # Hybrid recurrent groups store a new boundary state every turn; when a
+        # request finishes, demote the states its newest boundary supersedes so
+        # they are evicted before other conversations' reusable prefixes.
+        self.demote_superseded_states: bool = bool(
+            self.extra_config.get("demote_superseded_states", True)
         )
 
+        parallel_config = vllm_config.parallel_config
         # gpu block size per group
         self.gpu_block_size: tuple[int, ...] = tuple(
-            kv_cache_group.kv_cache_spec.block_size * context_parallel_factor
+            kv_cache_group.kv_cache_spec.global_block_size(
+                parallel_config.decode_context_parallel_size,
+                parallel_config.prefill_context_parallel_size,
+            )
             for kv_cache_group in kv_cache_config.kv_cache_groups
         )
 
@@ -406,7 +422,16 @@ class OffloadingSpec(ABC):
             kv_cache_config, vllm_config
         )
 
-        for block_size in self.gpu_block_size:
+        # Keep the full worker layout, but scratch rings have no offload keys
+        # and must not constrain offload/hash geometry.
+        cacheable_block_sizes = {
+            block_size
+            for block_size, group in zip(
+                self.gpu_block_size, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.prefix_cacheable
+        }
+        for block_size in cacheable_block_sizes:
             assert block_size % self.hash_block_size == 0, (
                 f"gpu_block_size={block_size} not divisible by "
                 f"hash_block_size={self.hash_block_size}. "
@@ -420,11 +445,11 @@ class OffloadingSpec(ABC):
         offloaded_block_size = self.extra_config.get("block_size")
         if offloaded_block_size is not None:
             offloaded_block_size_int = int(offloaded_block_size)
-            gpu_block_sizes = set(self.gpu_block_size)
+            gpu_block_sizes = cacheable_block_sizes.copy()
             assert len(gpu_block_sizes) == 1, (
                 "If 'block_size' is specified in kv_connector_extra_config, "
-                "there must be at least one KV cache group, "
-                "and all groups must have the same block size."
+                "there must be at least one prefix-cacheable KV cache group, "
+                "and all prefix-cacheable groups must have the same block size."
             )
             gpu_block_size = gpu_block_sizes.pop()
 

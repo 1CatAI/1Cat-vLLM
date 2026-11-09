@@ -18,6 +18,7 @@ expansion consequences via the pure-torch expand/append pair that the fused
 kernel is documented to replicate.
 """
 
+import pytest
 import torch
 
 # Bootstrap the glm5next package before entering the indexer module: its
@@ -28,6 +29,7 @@ import torch
 import vllm.models.glm5next  # noqa: F401
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (  # noqa: E402
     append_tail_to_topk,
+    expand_pools_and_append_tail,
     expand_pools_to_tokens,
 )
 # isort: on
@@ -116,8 +118,7 @@ def test_helper_padded_layout_per_row():
 
 def expand_tail_region(dec_seq):
     """Run the production pure-torch expand + append pair (the fused kernel
-    replicates it exactly on the identity path) and return the tail columns
-    [TOPK_TOKENS, TOPK_TOKENS + KPOOL - 1)."""
+    replicates it exactly on the identity path) and return compacted tails."""
     rows = dec_seq.shape[0]
     pool_ids = torch.arange(SELECT_K, dtype=torch.int64).expand(rows, SELECT_K)
     valid = torch.ones_like(pool_ids, dtype=torch.bool)
@@ -125,7 +126,15 @@ def expand_tail_region(dec_seq):
     seq_lens = dec_seq.to(torch.int32)
     pool_lens = (seq_lens // KPOOL).to(torch.int32)
     out = append_tail_to_topk(expanded, seq_lens, pool_lens, KPOOL)
-    return out[:, TOPK_TOKENS:]
+    tail = torch.full((rows, KPOOL - 1), -1, dtype=torch.int32)
+    history_lens = (
+        torch.minimum(pool_lens, torch.full_like(pool_lens, SELECT_K)) * KPOOL
+    )
+    for row in range(rows):
+        tail_count = int(seq_lens[row] % KPOOL)
+        start = int(history_lens[row])
+        tail[row, :tail_count] = out[row, start : start + tail_count]
+    return tail
 
 
 def test_tail_expansion_legacy_vs_fixed():
@@ -154,3 +163,48 @@ def test_tail_expansion_legacy_vs_fixed():
     assert legacy_tail[10, :2].tolist() == [556, 557]
 
     assert not torch.equal(legacy_tail, fixed_tail)
+
+
+@pytest.mark.parametrize("seq_len", [0, 2, 10, 16, 18, 21])
+def test_append_tail_compacts_valid_prefix(seq_len):
+    """Padded pool slots must never separate history from a valid tail."""
+    pool_len = seq_len // KPOOL
+    valid_pool_count = min(pool_len, SELECT_K)
+    pool_ids = torch.full((1, SELECT_K), -1, dtype=torch.int64)
+    if valid_pool_count:
+        pool_ids[0, :valid_pool_count] = torch.arange(valid_pool_count)
+    valid = pool_ids >= 0
+    expanded = expand_pools_to_tokens(pool_ids, valid, TOPK_TOKENS, KPOOL)
+    out = append_tail_to_topk(
+        expanded,
+        torch.tensor([seq_len], dtype=torch.int32),
+        torch.tensor([pool_len], dtype=torch.int32),
+        KPOOL,
+    )[0]
+
+    expected_valid = valid_pool_count * KPOOL + seq_len % KPOOL
+    if seq_len <= TOPK_TOKENS:
+        expected = list(range(seq_len))
+    else:
+        expected = list(range(TOPK_TOKENS)) + list(range(pool_len * KPOOL, seq_len))
+    assert out[:expected_valid].tolist() == expected
+    assert torch.all(out[expected_valid:] == -1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_expand_tail_matches_compact_reference():
+    seq_lens = torch.tensor([0, 2, 10, 16, 18, 21], dtype=torch.int32, device="cuda")
+    pool_lens = seq_lens // KPOOL
+    valid_pool_counts = torch.minimum(pool_lens, torch.full_like(pool_lens, SELECT_K))
+    pool_ids = torch.full(
+        (seq_lens.shape[0], SELECT_K), -1, dtype=torch.int64, device="cuda"
+    )
+    cols = torch.arange(SELECT_K, device="cuda")
+    pool_ids[:] = torch.where(
+        cols[None, :] < valid_pool_counts[:, None], cols[None, :], -1
+    )
+    valid = pool_ids >= 0
+    expanded = expand_pools_to_tokens(pool_ids, valid, TOPK_TOKENS, KPOOL)
+    expected = append_tail_to_topk(expanded, seq_lens, pool_lens, KPOOL)
+    actual = expand_pools_and_append_tail(pool_ids, seq_lens, KPOOL)
+    torch.testing.assert_close(actual, expected)

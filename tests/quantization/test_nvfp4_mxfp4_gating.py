@@ -123,7 +123,7 @@ def test_sm70_tp4_nvfp4_gate_up_match_is_shape_exact():
     assert nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
 
     layer.tp_size = 2
-    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
+    assert nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
     layer.tp_size = 4
     layer.output_size_per_partition = 8703
     assert not nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)

@@ -19,6 +19,7 @@ from vllm.models.glm5next.sm70 import sparse as sparse_module
 from vllm.models.glm5next.sm70.fp8_kv import (
     sm70_glm5_fp8_kv_insert,
     sm70_glm5_sparse_attention_paged_fp8,
+    sm70_glm5_sparse_attention_paged_fp8_batched_gemm,
     sm70_glm5_sparse_attention_paged_fp8_gemm,
 )
 from vllm.models.glm5next.sm70.sparse import Glm5NextSM70SparseBackend
@@ -154,6 +155,15 @@ def test_glm53_sm70_fp8_kv_layout_contract():
     assert isinstance(emitted, MLAAttentionSpec)
     assert emitted.model_version == "glm5_next"
     assert emitted.real_page_size_bytes == 64 * 520
+    # The V2 runner reshapes each KV tensor with the backend shape of the codec
+    # the spec declares, so that shape must fill the spec's page.
+    assert Glm5NextSM70SparseBackend.get_kv_cache_shape(
+        num_blocks=3,
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        cache_dtype_str=emitted.layout_cache_dtype("fp8_e4m3"),
+    ) == (3, 64, 520)
 
 
 @pytest.mark.skipif(
@@ -295,6 +305,117 @@ def test_glm53_sm70_fp8_kv_gemm_decode_matches_reference():
     ref = (ref_probs @ selected).half().unsqueeze(0)
     torch.testing.assert_close(out, ref, rtol=3e-2, atol=4e-3)
     assert torch.equal(out, repeat)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability((7, 0)),
+    reason="requires an exact SM70 CUDA device",
+)
+def test_glm53_sm70_fp8_kv_batched_gemm_matches_b1_decode():
+    torch.manual_seed(20260901)
+    device = torch.device("cuda")
+    num_tokens = 8
+    num_heads = 16
+    num_kv = 256
+    index_width = 2048
+    kv = torch.randn(num_kv, 512, dtype=torch.float16, device=device) * 0.1
+    cache = torch.zeros(4, 64, 520, dtype=torch.uint8, device=device)
+    sm70_glm5_fp8_kv_insert(
+        kv,
+        cache,
+        torch.arange(num_kv, dtype=torch.int64, device=device),
+    )
+    q = (
+        torch.randn(
+            num_tokens,
+            num_heads,
+            512,
+            dtype=torch.float16,
+            device=device,
+        )
+        * 0.1
+    )
+    indices = torch.full(
+        (num_tokens, index_width),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    lengths = torch.arange(131, 139, dtype=torch.int32, device=device)
+    for row, length in enumerate(lengths.cpu().tolist()):
+        indices[row, :length] = torch.randperm(num_kv, device=device)[:length]
+
+    actual = torch.empty_like(q)
+    expected = torch.empty_like(q)
+    gathered = torch.empty(
+        num_tokens,
+        index_width,
+        512,
+        dtype=torch.float16,
+        device=device,
+    )
+    scores = torch.empty(
+        num_tokens,
+        num_heads,
+        index_width,
+        dtype=torch.float16,
+        device=device,
+    )
+    probs = torch.empty_like(scores)
+    b1_gathered = torch.empty(index_width, 512, dtype=torch.float16, device=device)
+    b1_scores = torch.empty(
+        num_heads,
+        index_width,
+        dtype=torch.float16,
+        device=device,
+    )
+    b1_probs = torch.empty_like(b1_scores)
+    scale = 512**-0.5
+
+    sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
+        q,
+        cache,
+        indices,
+        lengths,
+        scale,
+        actual,
+        gathered,
+        scores,
+        probs,
+    )
+    for row in range(num_tokens):
+        sm70_glm5_sparse_attention_paged_fp8_gemm(
+            q[row : row + 1],
+            cache,
+            indices[row : row + 1],
+            lengths[row : row + 1],
+            scale,
+            expected[row : row + 1],
+            b1_gathered,
+            b1_scores,
+            b1_probs,
+        )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(actual, expected)
+    eager = actual.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
+            q,
+            cache,
+            indices,
+            lengths,
+            scale,
+            actual,
+            gathered,
+            scores,
+            probs,
+        )
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    assert torch.equal(actual, eager)
 
 
 @pytest.mark.skipif(

@@ -12,7 +12,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.torch_utils import is_torch_equal_or_newer
+from vllm.utils.torch_utils import set_high_precision_cuda_matmul_defaults
 
 
 def _matmul_launch_metadata(
@@ -946,21 +946,11 @@ def enable_batch_invariant_mode():
     )
     torch.bmm = bmm_batch_invariant
 
-    reduced_precision_val = (
-        (False, False) if is_torch_equal_or_newer("2.10.0") else False
-    )
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
-        reduced_precision_val
-    )
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
-        reduced_precision_val
-    )
+    set_high_precision_cuda_matmul_defaults(allow_split_k=False)
     torch.backends.cuda.preferred_blas_library(backend="cublaslt")
 
 
 def override_envs_for_invariance():
-    os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
     # NCCL determinism settings
@@ -976,7 +966,16 @@ def override_envs_for_invariance():
     os.environ["NCCL_SOCKET_NTHREADS"] = "1"
 
     # torch.compile settings
-    os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is not None:
+        cfg.parallel_config.communication.symm_mem = False
+        cfg.parallel_config.communication.sources["symm_mem"] = "safety:batch_invariant"
+        cfg.compilation_config.runtime.aot_compile = False
+        cfg.compilation_config.runtime.sources["aot_compile"] = "safety:batch_invariant"
+        if cfg.compilation_config.runtime.sources.get("mega_aot") == "default":
+            cfg.compilation_config.runtime.mega_aot = False
 
 
 def init_batch_invariance():

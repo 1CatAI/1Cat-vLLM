@@ -85,7 +85,9 @@ def _use_sm70_awq_moe_route(
         and not current_platform.has_device_capability(75)
     ):
         return False
-    if not envs.VLLM_SM70_AWQ_TURBOMIND or envs.VLLM_SM70_AWQ_MOE_DISABLE:
+    if not sm70_tm.format_option("awq", "enabled") or sm70_tm.format_option(
+        "awq", "moe_disable"
+    ):
         return False
     if quant_config.weight_bits != 4:
         return False
@@ -103,7 +105,7 @@ def _should_prepare_sm70_awq_dense_route(
 ) -> bool:
     if not sm70_tm.is_exact_sm70_cuda(
         layer.qweight,
-        envs.VLLM_SM70_AWQ_TURBOMIND,
+        sm70_tm.format_option("awq", "enabled"),
     ):
         return False
     if input_dtype is not None:
@@ -131,7 +133,7 @@ def _replace_or_register_parameter(
 def _convert_awq_to_standard_format(
     layer: torch.nn.Module,
     w_q_name: str,
-    w_zp_name: str,
+    w_zp_name: str | None,
     size_bits: int,
 ) -> None:
     """Convert AWQ weight and zero-point tensors to standard GPTQ-like format.
@@ -139,6 +141,7 @@ def _convert_awq_to_standard_format(
     AWQ packs qweight along the output dim with a non-standard bit order.
     This converts to standard bit order and repacks qweight along the input
     dim, matching the format expected by the MPLinearKernel framework.
+    If w_zp_name is None (symmetric quantization), only the weight is converted.
     """
     pack_factor = 32 // size_bits
     mask = (1 << size_bits) - 1
@@ -176,6 +179,9 @@ def _convert_awq_to_standard_format(
         weight_loader=_noop_loader,
     )
     setattr(layer, w_q_name, new_param)
+
+    if w_zp_name is None:
+        return
 
     # --- Convert qzeros: fix AWQ bit ordering and repack
     # AWQ qzeros: (G, N // pack) packed along dim 1, AWQ bit order
@@ -291,7 +297,7 @@ class AWQMarlinConfig(QuantizationConfig):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
-        sm70_quant_backend = envs.get_sm70_quant_backend()
+        sm70_quant_backend = sm70_tm.quant_backend()
         if (
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
@@ -301,7 +307,7 @@ class AWQMarlinConfig(QuantizationConfig):
                 or (
                     sm70_quant_backend == "auto"
                     and user_quant not in ("marlin", "awq_marlin")
-                    and sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
+                    and sm70_tm.format_enabled("awq")
                 )
             )
         ):
@@ -309,6 +315,12 @@ class AWQMarlinConfig(QuantizationConfig):
                 "marlin",
                 "awq_marlin",
             ):
+                # The returned name replaces the checkpoint's quant_method, so
+                # the caller's mismatch check never sees it. Only claim real
+                # AWQ checkpoints; anything else must keep failing loudly.
+                ckpt_method = str((hf_quant_cfg or {}).get("quant_method", ""))
+                if ckpt_method.lower() != "awq":
+                    return None
                 logger.info(
                     "VLLM_SM70_QUANT_BACKEND=turbomind overrides "
                     "quantization=%s for AWQ; using the AWQ TurboMind route.",
@@ -596,6 +608,19 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             layer._awq_sm70_k_ld = int(meta[0])
             layer._awq_sm70_q_ld = int(meta[1])
             layer._awq_sm70_group_size = self.quant_config.group_size
+            setattr(
+                layer,
+                sm70_tm.STATE_ATTR,
+                sm70_tm.SM70TurboMindLinearState(
+                    tm_weight,
+                    tm_scales,
+                    self.quant_config.group_size,
+                    int(meta[0]),
+                    int(meta[1]),
+                    tm_weight.shape[-1] * self.quant_config.pack_factor,
+                    "uint4",
+                ),
+            )
             layer._awq_sm70_prepared = True
 
             layer.qweight = torch.nn.Parameter(
@@ -629,29 +654,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "_awq_sm70_prepared", False):
-            reshaped_x = x.reshape(-1, x.shape[-1])
-            out_shape = x.shape[:-1] + (
-                layer._awq_sm70_weight.shape[-1] * self.quant_config.pack_factor,
-            )
-            out = torch.empty(
-                (reshaped_x.shape[0], out_shape[-1]),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            from vllm import _sm70_ops as sm70_ops
-
-            sm70_ops.awq_gemm_sm70_out(
-                out,
-                reshaped_x,
-                layer._awq_sm70_weight,
-                layer._awq_sm70_scales,
-                layer._awq_sm70_group_size,
-                layer._awq_sm70_k_ld,
-                layer._awq_sm70_q_ld,
-            )
-            if bias is not None:
-                out.add_(bias)
-            return out.reshape(out_shape)
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self.kernel.apply_weights(layer, x, bias)
 
 

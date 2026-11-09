@@ -110,6 +110,13 @@ def process_weights_after_loading(
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
 
+    # Some checkpoint methods discover an ordinary dense matrix only after
+    # loading its type descriptors. Let models prepare their dense routes now,
+    # before attention postprocessing and graph capture.
+    prepare_loaded_linears = getattr(model, "prepare_loaded_linear_weights", None)
+    if prepare_loaded_linears is not None:
+        prepare_loaded_linears()
+
     # Initialize post-load attention weights for Attention, MLA, and MM encoder.
     # NOTE: Happens after other modules so we can easily decompress weights.
     for _, module in model.named_modules():

@@ -16,7 +16,10 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CpuGpuOffloadingHandlers,
+    SingleDirectionOffloadingHandler,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -29,6 +32,52 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA stream ordering")
+@pytest.mark.parametrize("strided", [False, True])
+@torch.inference_mode()
+def test_load_waits_for_destination_zeroing(default_vllm_config, strided):
+    page_size = 8192
+    gpu_slots = 13 if strided else 1
+    cpu_workers = 4 if strided else 1
+    gpu_storage = torch.full(
+        (32, gpu_slots, page_size), 19, dtype=torch.int8, device="cuda"
+    )
+    cpu_storage = torch.full(
+        (8, cpu_workers, page_size), 37, dtype=torch.int8, pin_memory=True
+    )
+    gpu = gpu_storage[:, 0, :]
+    cpu = cpu_storage[:, 0, :]
+    handler = SingleDirectionOffloadingHandler(
+        [gpu], [cpu], 1, [[CanonicalKVCacheRef(0, page_size)]], False
+    )
+    compute = torch.cuda.Stream()
+    torch.accelerator.synchronize()
+    try:
+        # Repeat to exercise transfer stream/event reuse as well as first use.
+        for job in range(3):
+            with torch.cuda.stream(compute):
+                torch.cuda._sleep(300_000_000)
+                gpu[job].zero_()
+                zero_done = compute.record_event()
+                assert not zero_done.query(), "Destination preparation must be pending"
+                assert handler.transfer_async(
+                    job,
+                    (
+                        CPULoadStoreSpec([job]),
+                        GPULoadStoreSpec([job], group_sizes=(1,), block_indices=(0,)),
+                    ),
+                )
+            handler.wait({job})
+            finished = handler.get_finished()
+            assert len(finished) == 1 and finished[0].success
+            torch.accelerator.synchronize()
+            assert torch.equal(gpu[job].cpu(), cpu[job])
+        if strided:
+            assert (gpu_storage[:, 1:, :] == 19).all().item()
+    finally:
+        handler.shutdown()
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])
@@ -417,3 +466,67 @@ def test_transfer_multi_group(
 
     handlers.cpu_to_gpu_handler.shutdown()
     handlers.gpu_to_cpu_handler.shutdown()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA stream ordering")
+@pytest.mark.parametrize("flush_first", [True, False])
+@torch.inference_mode()
+def test_store_of_reused_block_finishes_before_zeroing(
+    default_vllm_config, flush_first
+):
+    """A deferred GPU->CPU store whose source block is reused this step must
+    finish before the step zeroes that block.
+
+    MRv2 used to zero new blocks first and only then submit and flush the
+    deferred stores; the store stream waits on the compute stream, so it
+    copied the zeros. flush_first=False reproduces that order and shows the
+    hazard on the real handler; flush_first=True is the fixed order.
+    """
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
+    from vllm.v1.kv_offload.worker.worker import OffloadingWorker
+
+    page_size = 8192
+    gpu = torch.full((8, page_size), 19, dtype=torch.int8, device="cuda")
+    cpu = torch.zeros((4, page_size), dtype=torch.int8, pin_memory=True)
+    handler = SingleDirectionOffloadingHandler(
+        [gpu], [cpu], 1, [[CanonicalKVCacheRef(0, page_size)]], True
+    )
+    connector = OffloadingConnectorWorker.__new__(OffloadingConnectorWorker)
+    connector.worker = OffloadingWorker()
+    connector.worker.register_handler(GPULoadStoreSpec, CPULoadStoreSpec, handler)
+    # Step k queued a store of GPU block 2 into CPU block 0; in step k+1
+    # block 2 is handed out again, so the scheduler lists the job to flush.
+    connector._unsubmitted_store_jobs = [
+        (
+            7,
+            (
+                GPULoadStoreSpec([2], group_sizes=(1,), block_indices=(0,)),
+                CPULoadStoreSpec([0]),
+            ),
+        )
+    ]
+    metadata = SimpleNamespace(jobs_to_flush={7})
+    torch.accelerator.synchronize()
+
+    def zero_reused_block():
+        # A pending zero on the compute stream, as the KV block zeroer issues.
+        torch.cuda._sleep(100_000_000)
+        gpu[2].zero_()
+
+    try:
+        if flush_first:
+            connector.handle_preemptions(metadata)
+            zero_reused_block()
+        else:
+            zero_reused_block()
+            connector.handle_preemptions(metadata)
+        torch.accelerator.synchronize()
+        expected = 19 if flush_first else 0
+        assert (cpu[0] == expected).all().item()
+        assert (gpu[2] == 0).all().item()
+    finally:
+        handler.shutdown()

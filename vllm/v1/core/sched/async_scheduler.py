@@ -16,6 +16,7 @@ class AsyncScheduler(Scheduler):
         # its own list instance because scheduler outputs and worker feedback
         # mutate spec-token rows in later phases.
         self._spec_token_placeholders: tuple[int, ...] = (-1,) * self.num_spec_tokens
+        self.pp_size = self.parallel_config.pipeline_parallel_size
         speculative_config = self.vllm_config.speculative_config
         draft_model_config = (
             speculative_config.draft_model_config
@@ -53,6 +54,9 @@ class AsyncScheduler(Scheduler):
                 request.spec_token_ids = list(self._spec_token_placeholders)
             else:
                 request.spec_token_ids = []
+
+            if self.use_v2_model_runner:
+                request.next_decode_eligible_step = self.current_step + self.pp_size
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

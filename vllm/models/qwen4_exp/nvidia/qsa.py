@@ -4,15 +4,19 @@
 
 from __future__ import annotations
 
+import math
+import os
 from typing import ClassVar, cast
 
 import torch
 from torch import nn
 
-from vllm.config import VllmConfig
+import vllm.envs as envs
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -21,7 +25,10 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
-from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+from vllm.model_executor.models.qwen3_next import (
+    Qwen3NextAttention,
+    _sm70_dump_qwen_layer_tensor,
+)
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -38,6 +45,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionType,
+    CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 from vllm.v1.attention.backends.flash_attn import (
@@ -46,20 +54,249 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
 )
 
-from ..common.qsa_cache import QSAForwardMetadata
+from ..common.qsa_cache import (
+    QSAForwardMetadata,
+    build_qsa_metadata,
+    qsa_dcp_block_geometry,
+)
 from .indexer_qsa import QSAIndexer
+
+logger = init_logger(__name__)
+
+# Target-model QSA host histories in layer order (prefill staging prefetch).
+_TARGET_HOST_KV: list = []
+# Prefix staging prefetch: side stream, per-buffer "free" events (after the
+# last attention that read it) and pending prefetches by owner.
+_PREFETCH: dict = {"stream": None, "free": [None, None], "pending": {}}
+
+# Diagnostics: real prefill reader inputs (TP rank 0, one long-context step
+# per selected target layer) for offline kernel work. Off unless set.
+_QSA_DUMP_DIR = envs.VLLM_QSA_DUMP_DIR
+_QSA_DUMPED: set[int] = set()
+
+
+def _dump_prefill_inputs(
+    order,
+    query,
+    history,
+    scales,
+    indices,
+    table,
+    requests,
+    positions,
+    lengths,
+    output,
+    gate,
+):
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    if (
+        order in _QSA_DUMPED
+        or get_tensor_model_parallel_rank() != 0
+        or query.shape[0] < 8000
+        or int(lengths.max()) < 24000
+    ):
+        return
+    _QSA_DUMPED.add(order)
+    tensors = {
+        "query": query,
+        "history": history,
+        "scales": scales,
+        "indices": indices,
+        "table": table,
+        "requests": requests,
+        "positions": positions,
+        "lengths": lengths,
+        "output": output,
+        "gate": gate,
+    }
+    torch.save(
+        {k: v.detach().cpu() if v is not None else None for k, v in tensors.items()},
+        os.path.join(str(_QSA_DUMP_DIR), f"qsa_prefill_{order}.pt"),
+    )
+    logger.info("Dumped QSA prefill reader inputs of target layer %d.", order)
+
+
+def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens, stage_slots=2):
+    """After target layer `order`'s attention: mark its buffer free and stage
+    the next target layer's prefix pages into a released buffer."""
+    free = torch.cuda.Event()
+    free.record()
+    _PREFETCH["free"][order % stage_slots] = free
+    if order + 1 >= len(_TARGET_HOST_KV):
+        return
+    nxt = _TARGET_HOST_KV[order + 1]
+    if nxt.prefix_pages(plan, new_tokens) <= 0:
+        return
+    if _PREFETCH["stream"] is None:
+        _PREFETCH["stream"] = torch.cuda.Stream()
+    slot = (order + 1) % stage_slots
+    done, prefix = nxt.prefetch_prefix(
+        plan,
+        new_tokens,
+        capacity_tokens,
+        slot,
+        _PREFETCH["stream"],
+        _PREFETCH["free"][slot],
+    )
+    _PREFETCH["pending"][id(nxt)] = (plan, done, prefix)
+
+
+def _qsa_rope_cache_length(config, model_config) -> int:
+    """Bound fixed-frequency text RoPE by the engine's position limit."""
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    # Image MRoPE positions advance by at most one per token, so they stay
+    # below max_model_len like text; only video time indices can exceed it.
+    bounded = text_only or mm_config.get_limit_per_prompt("video") == 0
+    if not bounded or config.rope_parameters.get("rope_type", "default") != "default":
+        return config.max_position_embeddings
+    limit = min(config.max_position_embeddings, model_config.max_model_len)
+    if config.rope_parameters.get("mrope_section"):
+        # MRotaryEmbedding enlarges its cache 4x for video positions. Text and
+        # image positions stay below max_model_len, so a quarter covers every row;
+        # each row's values do not depend on the table length.
+        return -(-limit // 4)
+    return limit
+
+
+def _bound_scaled_rope_cache(rotary_emb, config, model_config) -> None:
+    """Trim a scaled (YaRN) RoPE table to the engine's position limit.
+
+    Scaled tables span original_max_position * factor rows, and MRoPE enlarges
+    that 4x for video time indices. Text and image positions stay below
+    max_model_len and each row depends only on its own position, so the
+    trimmed table is exact. Stock RoPE is already bounded at construction.
+    """
+    if config.rope_parameters.get("rope_type", "default") == "default":
+        return
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    if not (text_only or mm_config.get_limit_per_prompt("video") == 0):
+        return
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    # A draft serves its target's window; the scaled config spans it.
+    limit = max(
+        int(model_config.max_model_len),
+        int(getattr(model_config, "spec_target_max_model_len", None) or 0),
+        int(config.max_position_embeddings),
+    )
+    if cache is not None and cache.shape[0] > limit:
+        rotary_emb.cos_sin_cache = cache[:limit].clone()
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # The replicated draft's slot map depends on logical positions as well
+    # as the block table; FlashAttention's update hook only receives a table.
+    supports_update_block_table: bool = False
+    # QSA's DCP attention localizes its own selections and never reads the
+    # per-rank context lengths, which cost a dozen small kernels per build.
+    builds_dcp_context_lens: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.replicated_draft = (
+            vllm_config.parallel_config.decode_context_parallel_size == 2
+            and all("mtp" in name.split(".") for name in layer_names)
+        )
+        if self.replicated_draft:
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self.draft_block_table_buffer: torch.Tensor | None = None
+            self.draft_token_to_req = torch.empty(
+                max_tokens, dtype=torch.int32, device=device
+            )
+            self.draft_logical_positions = torch.empty(
+                max_tokens, dtype=torch.int64, device=device
+            )
+            self.draft_slot_mapping = torch.empty(
+                max_tokens, dtype=torch.int64, device=device
+            )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> FlashAttentionMetadata:
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if not self.replicated_draft:
+            return metadata
+        # Draft K/V owns the full global span on every DCP rank. The mixed
+        # target/draft group has already expanded each scheduler page into
+        # kernel blocks using the target's rank-local page size, so only
+        # expand the remaining draft-to-target ratio.
+        draft_page_size, _, _ = qsa_dcp_block_geometry(
+            self.vllm_config, self.layer_names[0]
+        )
+        if draft_page_size % self.block_size:
+            raise RuntimeError("QSA draft kernel block must divide its physical page")
+        group_page_size = (
+            self.vllm_config.cache_config.block_size
+            // self.vllm_config.parallel_config.decode_context_parallel_size
+        )
+        if group_page_size >= self.block_size and group_page_size % self.block_size:
+            raise RuntimeError("QSA group page must divide into kernel blocks")
+        group_blocks_per_page = max(1, group_page_size // self.block_size)
+        draft_blocks_per_page = draft_page_size // self.block_size
+        if draft_blocks_per_page % group_blocks_per_page:
+            raise RuntimeError("QSA draft blocks must divide the group page")
+        expansion = draft_blocks_per_page // group_blocks_per_page
+        if expansion > 1:
+            table = common_attn_metadata.block_table_tensor
+            rows, columns = table.shape
+            if self.draft_block_table_buffer is None:
+                self.draft_block_table_buffer = torch.empty(
+                    (
+                        self.vllm_config.scheduler_config.max_num_seqs,
+                        columns * expansion,
+                    ),
+                    dtype=table.dtype,
+                    device=table.device,
+                )
+            if (
+                rows > self.draft_block_table_buffer.shape[0]
+                or columns * expansion > self.draft_block_table_buffer.shape[1]
+            ):
+                raise RuntimeError("QSA draft block-table buffer is too small")
+            expanded = self.draft_block_table_buffer[:rows, : columns * expansion]
+            expanded_view = expanded.view(rows, columns, expansion)
+            for sub_block in range(expansion):
+                torch.mul(table, expansion, out=expanded_view[:, :, sub_block])
+                expanded_view[:, :, sub_block].add_(sub_block)
+            common_attn_metadata = common_attn_metadata.replace(
+                block_table_tensor=expanded
+            )
+            metadata.block_table = expanded
+        _, _, slot_mapping = build_qsa_metadata(
+            common_attn_metadata,
+            self.draft_token_to_req,
+            self.draft_logical_positions,
+            self.draft_slot_mapping,
+            storage_block_size=self.block_size,
+            compress_ratio=1,
+            map_plain_slot=True,
+        )
+        if common_attn_metadata.is_dummy_batch:
+            slot_mapping.fill_(PAD_SLOT_ID)
+        metadata.slot_mapping = slot_mapping
+        return metadata
 
 
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
@@ -73,6 +310,8 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ]
 
     @staticmethod
@@ -92,6 +331,12 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         return True
 
     @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # QSA chooses its split-K reduction depth from the runtime batch
+        # shape, so it cannot inherit FlashAttention's stronger guarantee.
+        return False
+
+    @classmethod
     def supports_kv_connector(cls) -> bool:
         return False
 
@@ -99,20 +344,24 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
 class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     """Run paged sparse GQA with the QSA Triton kernel."""
 
-    supports_dcp: bool = False
+    supports_dcp: bool = True
     supports_pcp: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if not is_flash_attn_varlen_func_available():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
-        if self.dcp_world_size != 1:
+        if self.dcp_world_size not in (1, 2):
+            raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
+        if self.kv_cache_dtype not in (
+            "auto",
+            "float16",
+            "bfloat16",
+            "fp8",
+            "fp8_e4m3",
+        ):
             raise NotImplementedError(
-                "Qwen4Exp QSA does not support decode context parallelism"
-            )
-        if self.kv_cache_dtype not in ("auto", "float16", "bfloat16"):
-            raise NotImplementedError(
-                "Qwen4Exp QSA requires an FP16/BF16 main KV cache"
+                "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
             )
         self.supports_quant_query_input = False
 
@@ -126,8 +375,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
+        query_positions: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        dense_short_context: bool = False,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -138,7 +391,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
         num_tokens = attn_metadata.num_actual_tokens
-        output.zero_()
+        if num_tokens and getattr(layer, "host_kv_enabled", False):
+            # Direct host QSA writes every active row, including empty
+            # selections. Only graph padding requires explicit initialization.
+            output[num_tokens:].zero_()
+        else:
+            output.zero_()
         if num_tokens == 0:
             return output
 
@@ -147,19 +405,83 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
+        if getattr(layer, "host_kv_enabled", False):
+            if query_positions is None or sequence_lengths is None:
+                raise RuntimeError(
+                    "Host QSA requires exact positions and sequence lengths"
+                )
+            layer.host_kv_forward(
+                query[:num_tokens],
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                query_positions[:num_tokens],
+                sequence_lengths,
+                output[:num_tokens],
+                output_gate[:num_tokens] if output_gate is not None else None,
+                attn_metadata,
+            )
+            return output
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
         # [num_blocks, 2, block_size, num_kv_heads, head_size].
         key_cache, value_cache = kv_cache.unbind(1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if key_cache.dtype != query.dtype or query.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-        ):
-            raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 Q/K/V")
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 queries")
+        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
+                raise RuntimeError("Qwen4Exp QSA E4M3 cache must use uint8 storage")
+        elif key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
+            raise RuntimeError("Qwen4Exp QSA FP16/BF16 cache must match query dtype")
 
         from .ops.qsa import qsa_sparse_paged_attention
 
+        if dense_short_context:
+            from .ops.qsa_dense import qsa_dense_decode
+
+            gate = None
+            if output_gate is not None:
+                gate = output_gate[:num_tokens].reshape(
+                    num_tokens, query.shape[1], query.shape[2]
+                )
+            assert sequence_lengths is not None and query_positions is not None
+            qsa_dense_decode(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                token_to_req,
+                query_positions[:num_tokens],
+                output[:num_tokens],
+                gate,
+                sequence_lengths.shape[0],
+            )
+            return output
+
+        if getattr(layer, "qsa_dcp_sharded", False):
+            if output_gate is None:
+                raise RuntimeError("QSA DCP requires its output gate")
+            self._forward_qsa_dcp(
+                layer,
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                output[:num_tokens],
+                output_gate[:num_tokens],
+            )
+            return output
+
+        qsa_metadata: dict[str, torch.Tensor] = {}
+        if query_positions is not None:
+            qsa_metadata["query_positions"] = query_positions[:num_tokens]
+        if sequence_lengths is not None:
+            qsa_metadata["sequence_lengths"] = sequence_lengths
+        if output_gate is not None:
+            qsa_metadata["output_gate"] = output_gate[:num_tokens]
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
@@ -168,14 +490,118 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            **qsa_metadata,
         )
         return output
+
+    def _forward_qsa_dcp(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        logical_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_req: torch.Tensor,
+        output: torch.Tensor,
+        output_gate: torch.Tensor,
+    ) -> None:
+        from vllm.distributed import get_dcp_group
+
+        from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
+        from .ops.qsa_dcp import (
+            qsa_dcp_local_selection_width,
+            qsa_localize_dcp_indices,
+        )
+
+        local_indices_buffer = layer.dcp_local_indices_buffer
+        partial_output_buffer = layer.dcp_partial_output_buffer
+        partial_lse_buffer = layer.dcp_partial_lse_buffer
+        if any(
+            buffer is None
+            for buffer in (
+                local_indices_buffer,
+                partial_output_buffer,
+                partial_lse_buffer,
+            )
+        ):
+            raise RuntimeError("QSA DCP target workspaces are not initialized")
+        local_indices = qsa_localize_dcp_indices(
+            logical_indices,
+            local_indices_buffer[: query.shape[0]],
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            interleave_size=layer.cp_kv_cache_interleave_size,
+            local_block_size=key_cache.shape[1],
+        )
+        group = get_dcp_group()
+        gathered_query = group.all_gather(query.contiguous(), dim=1)
+        partial_output = partial_output_buffer[: query.shape[0]]
+        partial_lse = partial_lse_buffer[: query.shape[0]]
+        if partial_output.shape != gathered_query.shape:
+            raise RuntimeError("QSA DCP partial output has wrong head geometry")
+        # Only this prefix of the compacted columns can hold an owned token.
+        local_width = qsa_dcp_local_selection_width(
+            layer.indexer.token_topk,
+            layer.indexer.compress_ratio,
+            self.dcp_world_size,
+            layer.cp_kv_cache_interleave_size,
+            local_indices.shape[1],
+        )
+        qsa_sparse_paged_attention(
+            gathered_query,
+            key_cache,
+            value_cache,
+            local_indices[:, :local_width],
+            block_table,
+            token_to_req,
+            partial_output,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            lse=partial_lse,
+        )
+        merged = cast(
+            torch.Tensor,
+            self.dcp_combine(
+                partial_output,
+                partial_lse,
+                group,
+                is_lse_base_on_e=False,
+            ),
+        )
+        # Round to the output dtype first, as DCP1's attention output is, then
+        # apply the Triton gate DCP1's page4 route uses. This replaces a chain
+        # of five elementwise kernels (12.2 us per decode layer on V100).
+        output.copy_(merged)
+        _qsa_output_gate(output, output_gate.view_as(output))
+
+
+def _verify_e4m3_kv_requirements(
+    vllm_config: VllmConfig,
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+) -> None:
+    """Admit calibrated E4M3 from kernel capabilities, independent of TP/MTP."""
+    if cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
+        return
+    from .ops.qsa import qsa_e4m3_capability_reason
+
+    if reason := qsa_e4m3_capability_reason(model_config.dtype):
+        raise NotImplementedError(f"QSA E4M3 cache unavailable: {reason}")
 
 
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA index side branch."""
 
-    supports_dcp = False
+    supports_dcp = True
+    # The paged indexer and sparse attention switch launch profiles after 32
+    # query rows. Advertise the first row count in the wider profile so the
+    # generic MRV2 warmup can compile it before serving traffic.
+    kernel_warmup_prefill_token_counts = (33,)
 
     def __init__(
         self,
@@ -186,6 +612,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
+        dcp_local_indices_buffer: torch.Tensor | None = None,
+        dcp_partial_output_buffer: torch.Tensor | None = None,
+        dcp_partial_lse_buffer: torch.Tensor | None = None,
     ) -> None:
         nn.Module.__init__(self)
         cache_config = vllm_config.cache_config
@@ -194,20 +624,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16")
-        if cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):
+        if cache_config.cache_dtype not in (
+            "auto",
+            "float16",
+            "bfloat16",
+            "fp8",
+            "fp8_e4m3",
+        ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires an FP16/BF16 main KV cache"
+                "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
             )
+        _verify_e4m3_kv_requirements(vllm_config, model_config, cache_config)
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
-        if (
-            parallel_config.prefill_context_parallel_size > 1
-            or parallel_config.decode_context_parallel_size > 1
-        ):
+        if parallel_config.prefill_context_parallel_size > 1:
             raise NotImplementedError(
-                "Qwen4Exp QSA does not support context parallelism"
+                "Qwen4Exp QSA does not support prefill context parallelism"
             )
+        if parallel_config.decode_context_parallel_size not in (1, 2):
+            raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
         if not getattr(config, "is_causal", True):
             raise NotImplementedError("Qwen4Exp QSA requires causal decoder attention")
 
@@ -260,9 +696,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=_qsa_rope_cache_length(config, model_config),
             rope_parameters=config.rope_parameters,
         )
+        _bound_scaled_rope_cache(self.rotary_emb, config, model_config)
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
@@ -289,18 +726,85 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
 
         self.layer_name = f"{prefix}.attn"
+        _, _, self.qsa_dcp_sharded = qsa_dcp_block_geometry(
+            vllm_config, self.layer_name
+        )
+        self.qsa_dcp_sharded &= parallel_config.decode_context_parallel_size > 1
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.dcp_local_indices_buffer = dcp_local_indices_buffer
+        self.dcp_partial_output_buffer = dcp_partial_output_buffer
+        self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = cache_config.cache_dtype
+        if self.kv_cache_dtype in ("fp8", "fp8_e4m3") and (
+            cache_config.calculate_kv_scales
+        ):
+            raise ValueError(
+                "QSA calibrated E4M3 forbids calculate_kv_scales; "
+                "load an offline scale overlay instead"
+            )
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != model_config.dtype:
+        self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
+        self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
+        self.host_kv_staging_rows = vllm_config.kernel_config.qsa_host_kv_staging_rows
+        # Verification batches (every concurrent request with its drafts)
+        # stay on the graph-capturable decode reader.
+        spec = vllm_config.speculative_config
+        self.host_kv_decode_rows = vllm_config.scheduler_config.max_num_seqs * (
+            1 + ((spec.num_speculative_tokens or 0) if spec is not None else 0)
+        )
+        self.host_kv_prefill_stage_tokens = (
+            vllm_config.kernel_config.qsa_host_kv_prefill_stage_tokens
+        )
+        self.host_kv_prefill_stage_slots = (
+            vllm_config.kernel_config.qsa_host_kv_prefill_stage_slots
+        )
+        self.host_kv_device_reference = (
+            vllm_config.kernel_config.qsa_host_kv_device_reference
+        )
+        # Cache binding runs under the target worker's config, also for draft
+        # layers. Retain each owner's policy from model construction.
+        self.host_kv_is_draft = vllm_config.is_speculative_draft
+        if self.host_kv_is_draft:
+            self.host_kv_hot_tokens = (
+                vllm_config.kernel_config.qsa_host_kv_draft_hot_tokens
+                or self.host_kv_hot_tokens
+            )
+        self.host_kv_hot_fp8 = (
+            not self.host_kv_is_draft
+            and vllm_config.kernel_config.qsa_host_kv_hot_dtype == "fp8_e4m3"
+        )
+        self.host_kv_direct_device = vllm_config.kernel_config.sm70_qsa_device_history
+        self.host_kv_dtype = (
+            vllm_config.kernel_config.qsa_host_kv_draft_dtype
+            if self.host_kv_is_draft
+            else vllm_config.kernel_config.qsa_host_kv_dtype
+        )
+        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
+            self.kv_cache_torch_dtype != model_config.dtype
+        ):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
+            )
+        if self.host_kv_enabled:
+            self.kv_cache_torch_dtype = (
+                torch.uint8 if self.host_kv_dtype == "fp8_e4m3" else torch.float16
             )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
+        self._qsa_kv_scales_finalized = self.kv_cache_dtype not in (
+            "fp8",
+            "fp8_e4m3",
+        )
+        if not self._qsa_kv_scales_finalized:
+            # Keep checkpoint loading state separate from runtime scales.
+            # Negative is deliberately invalid and the slots are deleted once
+            # validation copies them into the runtime buffers.
+            self.k_scale = nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+            self.v_scale = nn.Parameter(torch.tensor(-1.0), requires_grad=False)
 
         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
         self.impl = Qwen4ExpQSAFlashAttentionImpl(
@@ -323,33 +827,462 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.indexer",
         )
-        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.register_buffer(
-            "topk_indices_buffer",
-            torch.empty(
-                max_tokens,
-                self.indexer.output_width,
-                dtype=torch.int32,
-            ),
-            persistent=False,
+        self._dense_short_context = bool(
+            vllm_config.kernel_config.qsa_dense_short_context
         )
+        self._sm70_qsa_prep = bool(
+            vllm_config.kernel_config.sm70_qsa_prep
+            and not self.host_kv_enabled
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and self.head_dim == 256
+            and self.num_kv_heads == 1
+            and cache_config.cache_dtype in ("auto", "float16")
+            and model_config.dtype == torch.float16
+            and self.attn_output_gate
+        )
+        speculative = vllm_config.speculative_config
+        # Bucketed graphs are only replayed for uniform decode batches, whose
+        # requests each hold exactly this many query tokens.
+        self._decode_query_len = 1 + (
+            speculative.num_speculative_tokens if speculative is not None else 0
+        )
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self._set_topk_indices_buffer(
+            max_tokens=max_tokens,
+            topk_indices_buffer=topk_indices_buffer,
+        )
+
+        self._round_cost_selection = None
+        if (
+            vllm_config.kernel_config.sm70_round_cost_diagnostics
+            and self.topk_indices_buffer.is_cuda
+        ):
+            from vllm.sm70_round_cost import attach_selection_recorder
+
+            self._round_cost_selection = attach_selection_recorder(
+                self.layer_name,
+                self.indexer.output_width,
+                self.topk_indices_buffer.device,
+                self,
+            )
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         static_context[self.layer_name] = self
 
+    def _set_topk_indices_buffer(
+        self,
+        *,
+        max_tokens: int,
+        topk_indices_buffer: torch.Tensor | None,
+    ) -> None:
+        if topk_indices_buffer is None:
+            self.register_buffer(
+                "topk_indices_buffer",
+                torch.empty(
+                    max_tokens,
+                    self.indexer.output_width,
+                    dtype=torch.int32,
+                ),
+                persistent=False,
+            )
+            return
+
+        expected_width = self.indexer.output_width
+        if (
+            topk_indices_buffer.dtype != torch.int32
+            or topk_indices_buffer.ndim != 2
+            or topk_indices_buffer.shape[0] < max_tokens
+            or topk_indices_buffer.shape[1] != expected_width
+        ):
+            raise ValueError(
+                "QSA shared top-k buffer must have dtype int32 and shape "
+                f"[{max_tokens} or more, {expected_width}], got "
+                f"dtype={topk_indices_buffer.dtype}, "
+                f"shape={tuple(topk_indices_buffer.shape)}"
+            )
+        self.topk_indices_buffer = topk_indices_buffer
+
+    def adopt_default_kv_scales(self) -> None:
+        """Use the module's own unit scales when the checkpoint has none.
+
+        The calibrated overlay exists to keep FP8 E4M3 K/V inside range; a
+        checkpoint that was never calibrated has no such overlay, so the layer
+        keeps the 1.0 defaults set at construction instead of the -1.0 loading
+        sentinel and is marked finalized so nothing re-validates it.
+        """
+        set_default_quant_scales(self, register_buffer=False)
+        if hasattr(self, "k_scale"):
+            del self.k_scale
+        if hasattr(self, "v_scale"):
+            del self.v_scale
+        self._qsa_kv_scales_finalized = True
+
+    def validate_loaded_kv_scales(self) -> None:
+        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            return
+        if self._qsa_kv_scales_finalized:
+            raise RuntimeError(
+                f"QSA E4M3 scales already finalized for {self.layer_name}"
+            )
+        if not hasattr(self, "k_scale") or not hasattr(self, "v_scale"):
+            raise RuntimeError(
+                f"QSA E4M3 loading slots are unavailable for {self.layer_name}"
+            )
+
+        scales = {
+            "K": float(self.k_scale.item()),
+            "V": float(self.v_scale.item()),
+        }
+        invalid = [
+            name
+            for name, value in scales.items()
+            if not math.isfinite(value) or value <= 0.0
+        ]
+        if invalid:
+            raise ValueError(
+                f"QSA E4M3 calibrated scales are required for {self.layer_name} "
+                f"(invalid: {', '.join(invalid)}). Refusing to start."
+            )
+        self._k_scale.copy_(scales["K"])
+        self._v_scale.copy_(scales["V"])
+        self._k_scale_float = scales["K"]
+        self._v_scale_float = scales["V"]
+        del self.k_scale
+        del self.v_scale
+        self._qsa_kv_scales_finalized = True
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if self.host_kv_enabled:
+            from .ops.host_kv import HostQSAKV
+
+            self.host_kv = HostQSAKV(
+                kv_cache.shape[0],
+                kv_cache.shape[2],
+                self.head_dim,
+                kv_cache.device,
+                hot_tokens=self.host_kv_hot_tokens,
+                rows=self.host_kv_staging_rows,
+                history=kv_cache,
+                width=self.indexer.output_width,
+                device_reference=self.host_kv_device_reference,
+                direct_device=self.host_kv_direct_device,
+                is_speculative_draft=self.host_kv_is_draft,
+                hot_fp8=self.host_kv_hot_fp8,
+            )
+            if not self.host_kv_is_draft:
+                _TARGET_HOST_KV.append(self.host_kv)
+            logger.info_once(
+                "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
+                "direct device M1..20/H6/D256=%s, fallback_reason=%s; "
+                "other shapes use protected hot pages and FP16 miss staging.",
+                "device_reference" if self.host_kv_device_reference else "host",
+                self.host_kv_dtype,
+                self.host_kv_hot_tokens,
+                self.host_kv.device_history_workspace is not None,
+                self.host_kv.device_history_reason,
+            )
+
+    def _windowed_rows(
+        self,
+        windows,
+        query,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        output,
+        gate,
+        workspace,
+    ) -> None:
+        from .ops.device_kv_attention import PREFILL_ROWS
+        from .ops.host_kv import merge_windows
+
+        state = self.host_kv
+        rows = query.shape[0]
+        acc = torch.empty((rows, 6, 256), dtype=torch.float32, device=query.device)
+        part = torch.empty_like(acc)
+        acc_state = torch.empty((rows, 6, 2), dtype=torch.float32, device=query.device)
+        part_state = torch.empty_like(acc_state)
+        gate_rows = gate.view_as(query) if gate is not None else None
+        for number, plan in enumerate(windows):
+            history, scales, staged_table = state.stage_history(
+                table, lengths, self.host_kv_prefill_stage_tokens, plan
+            )
+            first = number == 0
+            if history.dtype == torch.uint8:
+                torch.ops.vllm_sm70_qsa_device.run_rows_window(
+                    query,
+                    history,
+                    scales,
+                    indices,
+                    staged_table,
+                    requests,
+                    positions,
+                    lengths,
+                    acc if first else part,
+                    acc_state if first else part_state,
+                    12,
+                )
+            else:
+                torch.ops.vllm_sm70_qsa_device.run_tiled_window(
+                    query,
+                    history,
+                    scales,
+                    indices,
+                    staged_table,
+                    requests,
+                    positions,
+                    lengths,
+                    *workspace,
+                    acc if first else part,
+                    acc_state if first else part_state,
+                    PREFILL_ROWS,
+                )
+            if not first:
+                last = number == len(windows) - 1
+                merge_windows(
+                    acc,
+                    acc_state,
+                    part,
+                    part_state,
+                    output if last else None,
+                    gate_rows if last else None,
+                )
+
+    def host_kv_forward(
+        self,
+        query,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        output,
+        gate,
+        metadata=None,
+    ) -> None:
+        from .ops.host_kv_attention import host_qsa_attention
+
+        state = self.host_kv
+        workspace = None
+        if (
+            self.host_kv_prefill_stage_tokens
+            and query.shape[0] > max(state.resolve_rows, self.host_kv_decode_rows)
+            and query.shape[1:] == (6, 256)
+            and indices.shape[1] <= state.width
+        ):
+            from .ops.device_kv_attention import (
+                PREFILL_ROWS,
+                prefill_history_workspace,
+            )
+
+            workspace = prefill_history_workspace(state)
+        if workspace is not None:
+            # Prefill: one DMA of the whole history per layer, then device
+            # reads, instead of re-reading host history for every query row.
+            # Every layer of a step shares the block table: plan the copies
+            # (one host sync) once per step and geometry.
+            plans = getattr(metadata, "_qsa_stage_plans", None)
+            if plans is None:
+                plans = {}
+                if metadata is not None:
+                    metadata._qsa_stage_plans = plans
+            plan_key = (state.page_size, state.blocks, state.history.dtype)
+            if plan_key not in plans:
+                plans[plan_key] = state.stage_plan(
+                    table, lengths, self.host_kv_prefill_stage_tokens
+                )
+            plan = plans[plan_key]
+            # Target layers reuse the configured stage buffers. The previous
+            # layer staged this layer's prefix pages (written before this
+            # step) on a side stream; only the rest is copied here, after
+            # this step's writes.
+            order = (
+                _TARGET_HOST_KV.index(state)
+                if not self.host_kv_is_draft and state in _TARGET_HOST_KV
+                else -1
+            )
+            stage_slots = getattr(self, "host_kv_prefill_stage_slots", 2)
+            slot = order % stage_slots if order >= 0 else 0
+            staged_pages = 0
+            pending = _PREFETCH["pending"].pop(id(state), None)
+            if plan and pending is not None and pending[0] is plan:
+                torch.cuda.current_stream().wait_event(pending[1])
+                staged_pages = pending[2]
+            # One request: pages holding only this step's tokens are written
+            # into the stage buffer directly (write_staged) instead of being
+            # copied back from the host they were just written to.
+            new_kv = getattr(self, "_host_kv_new", None)
+            self._host_kv_new: tuple[torch.Tensor, ...] | None = None
+            upto = None
+            if plan and new_kv is not None and len(plan[4]) == 1:
+                old_tokens = max(0, plan[4][0] - query.shape[0])
+                upto = -(-old_tokens // state.page_size)
+            staged = plan and state.stage_history(
+                table,
+                lengths,
+                self.host_kv_prefill_stage_tokens,
+                plan,
+                slot=slot,
+                staged_pages=staged_pages,
+                upto=upto,
+            )
+            if staged is not None:
+                history, scales, staged_table = staged
+                if upto is not None and new_kv is not None:
+                    new_key, new_value, new_slots = new_kv
+                    state.write_staged(
+                        new_key, new_value, new_slots, plan, history, scales
+                    )
+                gate_rows = gate.view_as(query) if gate is not None else None
+                if history.dtype == torch.uint8:
+                    # One CTA per row over all its keys (tensor-core QK/PV,
+                    # 2 CTAs per SM): no partial workspace, no merge pass.
+                    torch.ops.vllm_sm70_qsa_device.run_rows(
+                        query,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate_rows,
+                        12,
+                    )
+                else:
+                    torch.ops.vllm_sm70_qsa_device.run_tiled(
+                        query,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate_rows,
+                        *workspace,
+                        PREFILL_ROWS,
+                    )
+                if order >= 0:
+                    _prefetch_next_prefix(
+                        order,
+                        plan,
+                        query.shape[0],
+                        self.host_kv_prefill_stage_tokens,
+                        stage_slots,
+                    )
+                if _QSA_DUMP_DIR and order in (0, 5, 11):
+                    _dump_prefill_inputs(
+                        order,
+                        query,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate,
+                    )
+                logger.info_once(
+                    "QSA prefill reads host history staged on device (draft=%s).",
+                    self.host_kv_is_draft,
+                )
+                return
+            if plan is None and query.shape[0] > 0:
+                # Longer than the stage buffer: stage it window by window and
+                # merge the windows' softmax states instead of falling back to
+                # per-row host reads.
+                window_key = plan_key + ("windows",)
+                if window_key not in plans:
+                    plans[window_key] = state.stage_window_plans(
+                        table, lengths, self.host_kv_prefill_stage_tokens
+                    )
+                windows = plans[window_key]
+                if windows:
+                    self._windowed_rows(
+                        windows,
+                        query,
+                        indices,
+                        table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate,
+                        workspace,
+                    )
+                    logger.info_once(
+                        "QSA prefill stages host history in %d windows.",
+                        len(windows),
+                    )
+                    return
+        if (
+            state.device_history_workspace is not None
+            and state.device_history_hot
+            and indices.shape[1] == state.width
+        ):
+            # The native reader needs no staging: one resolve and one launch per
+            # resolve_rows slice. Rows are independent, so slicing does not
+            # change the arithmetic.
+            step = state.resolve_rows
+            for start in range(0, query.shape[0], step):
+                stop = min(start + step, query.shape[0])
+                host_qsa_attention(
+                    query[start:stop],
+                    state,
+                    indices[start:stop],
+                    table,
+                    requests[start:stop],
+                    positions[start:stop],
+                    lengths,
+                    output[start:stop],
+                    gate[start:stop] if gate is not None else None,
+                )
+            return
+        # Preserve the default 32-row grouping and its arithmetic while
+        # subdividing only the shared host-miss staging allocation.
+        for base in range(0, query.shape[0], 32):
+            end = min(base + 32, query.shape[0])
+            for start in range(base, end, state.rows):
+                stop = min(start + state.rows, end)
+                host_qsa_attention(
+                    query[start:stop],
+                    state,
+                    indices[start:stop],
+                    table,
+                    requests[start:stop],
+                    positions[start:stop],
+                    lengths,
+                    output[start:stop],
+                    gate[start:stop] if gate is not None else None,
+                    launch_rows=end - base,
+                )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        block_size, _, dcp_sharded = qsa_dcp_block_geometry(
+            vllm_config, self.layer_name
+        )
         return FullAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
+            host_backed=self.host_kv_enabled,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            dcp_sharded=dcp_sharded,
         )
 
     def _project_qkv_gate(
@@ -371,6 +1304,43 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         query, key = self.rotary_emb(positions, query, key)
         return query, key, value, gate.reshape(*token_shape, self.q_size)
 
+    def _use_dense_short_context(
+        self, num_tokens: int, side_metadata: QSAForwardMetadata
+    ) -> bool:
+        """True in context-bucketed graphs where QSA would select every token."""
+        if not self._dense_short_context or self.indexer.skip_topk:
+            return False
+        if getattr(self, "qsa_dcp_sharded", False):
+            return False
+        descriptor = get_forward_context().batch_descriptor
+        bucket = getattr(descriptor, "attention_context_bucket", None)
+        if bucket is None or bucket > self.indexer.token_topk:
+            logger.info_once(
+                "QSA dense short-context skipped: tokens=%d bucket=%s budget=%d",
+                num_tokens,
+                bucket,
+                self.indexer.token_topk,
+            )
+            return False
+        from .ops.qsa_dense import qsa_dense_supported
+
+        supported = qsa_dense_supported(
+            self._decode_query_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.kv_cache.dtype,
+            side_metadata.seq_lens.shape[0],
+        )
+        logger.info_once(
+            "QSA dense short-context %s: tokens=%d requests=%d bucket=%d",
+            "enabled" if supported else "unsupported",
+            num_tokens,
+            side_metadata.seq_lens.shape[0],
+            bucket,
+        )
+        return supported
+
     def _run_qsa(
         self,
         hidden_states: torch.Tensor,
@@ -379,7 +1349,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         output: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
     ) -> None:
+        if not self._qsa_kv_scales_finalized:
+            raise RuntimeError(
+                f"QSA E4M3 scales were not finalized for {self.layer_name}"
+            )
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
             metadata = metadata[0]
@@ -397,24 +1372,72 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
+        from vllm.diagnostics import diagnostic_channel
+
+        if diagnostic_channel("qsa_calibration").policy.directory:
+            from .ops.qsa_kv_calibration import observe_qsa_kv
+
+            observe_qsa_kv(
+                self.indexer.layer_id,
+                key[:num_tokens],
+                value[:num_tokens],
+            )
+        dense = self._use_dense_short_context(num_tokens, side_metadata)
         selected = self.indexer(
             hidden_states,
             positions,
             self.topk_indices_buffer[:num_tokens],
+            select=not dense,
         )
         if selected.shape != (
             num_tokens,
             self.indexer.output_width,
         ):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
-        impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        impl.do_kv_cache_update(
-            self,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata.slot_mapping,
+        selected = _sm70_dump_qwen_layer_tensor(
+            "qsa_selected_indices",
+            self.indexer.layer_id,
+            "qsa",
+            selected,
         )
+        recorder = self._round_cost_selection
+        if recorder is not None and not dense:
+            recorder.capture(
+                selected,
+                side_metadata.token_to_req[:num_tokens],
+                side_metadata.logical_positions[:num_tokens],
+            )
+        impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+        if self.host_kv_enabled:
+            self.host_kv.write(key, value, main_metadata.slot_mapping)
+            # A staged prefill writes these rows into its stage buffer too.
+            self._host_kv_new = (key, value, main_metadata.slot_mapping)
+        elif query.dim() == 2:
+            # SM70 prep: raw qkv rows -> normalized/rotated query + cache write.
+            key_cache, value_cache = self.kv_cache.unbind(1)
+            prepared = query.new_empty((num_tokens, self.num_heads, self.head_dim))
+            text_positions = positions[0] if positions.dim() == 2 else positions
+            torch.ops._C.qsa_prep_sm70_out(
+                query[:num_tokens],
+                text_positions[:num_tokens].to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+                prepared,
+                key_cache,
+                value_cache,
+                main_metadata.slot_mapping[:num_tokens].to(torch.int64),
+            )
+            query = key = value = prepared
+        else:
+            impl.do_kv_cache_update(
+                self,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+            )
         impl.forward_qsa(
             self,
             query,
@@ -424,6 +1447,18 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            output_gate=output_gate,
+            query_positions=side_metadata.logical_positions,
+            sequence_lengths=side_metadata.seq_lens,
+            dense_short_context=dense,
+        )
+        if recorder is not None and self.host_kv_enabled and not dense:
+            recorder.capture_cache(self.host_kv._stats, num_tokens)
+        _sm70_dump_qwen_layer_tensor(
+            "qsa_core_out",
+            self.indexer.layer_id,
+            "qsa",
+            output[:num_tokens],
         )
 
     def forward(
@@ -432,37 +1467,64 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]
-        query = q.view(num_tokens, self.num_heads, self.head_dim)
-        key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-        value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
-        attn_output = torch.empty_like(query)
+        side = getattr(self, "sm70_side_projection", None)
+        indexer_input = hidden_states
+        if side is not None:
+            # The indexer receives its projected q/k instead of hidden states.
+            # The opaque op fuses both projections for small batches; a
+            # Python bound here would be frozen for the whole compiled range.
+            qkv, indexer_input = side(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+        if self._sm70_qsa_prep and num_tokens <= 32:
+            # Raw rows go to the attention op, which normalizes, rotates and
+            # caches them in one launch; the gate stays strided in q_gate.
+            q_gate = qkv[:, : self.q_size * 2].view(
+                num_tokens, self.num_heads, 2 * self.head_dim
+            )
+            gate = q_gate[..., self.head_dim :].reshape(num_tokens, self.q_size)
+            query = qkv
+            key = value = qkv
+            attn_output = qkv.new_empty((num_tokens, self.num_heads, self.head_dim))
+        else:
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            query = q.view(num_tokens, self.num_heads, self.head_dim)
+            key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+            value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+            attn_output = torch.empty_like(query)
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_with_output(
-                hidden_states,
+                indexer_input,
                 positions,
                 query,
                 key,
                 value,
                 attn_output,
+                gate,
                 encoded_layer_name,
             )
         else:
             qwen4_exp_qsa_with_output(
-                hidden_states,
+                indexer_input,
                 positions,
                 query,
                 key,
                 value,
                 attn_output,
+                gate,
                 encoded_layer_name,
             )
         flat_output = attn_output.view(num_tokens, -1)
-        if gate is not None:
-            flat_output = flat_output * torch.sigmoid(gate)
+        hcx_projection = getattr(self, "sm70_hcx_projection_name", None)
+        if hcx_projection is not None:
+            projected_output = torch.ops.vllm.qwen38_sm70_hcx_output_projection(
+                flat_output, hcx_projection
+            )
+            if output is not None:
+                output.copy_(projected_output)
+            return projected_output
         projected_output, _ = self.o_proj(flat_output)
         if output is not None:
             output.copy_(projected_output)
@@ -476,6 +1538,7 @@ def qwen4_exp_qsa_with_output(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
+    output_gate: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> None:
     """Run the complete QSA state/update/attend transaction."""
@@ -491,6 +1554,7 @@ def qwen4_exp_qsa_with_output(
         key,
         value,
         output,
+        output_gate,
     )
 
 
@@ -501,9 +1565,10 @@ def qwen4_exp_qsa_with_output_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
+    output_gate: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> None:
-    del hidden_states, positions, query, key, value, output, layer_name
+    del hidden_states, positions, query, key, value, output, output_gate, layer_name
 
 
 direct_register_custom_op(

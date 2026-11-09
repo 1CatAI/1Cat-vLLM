@@ -5,7 +5,12 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 import torch
+
+from vllm.model_executor.layers.quantization.utils import (
+    sm70_layer_workspaces as workspaces,
+)
 
 
 def _load_adapter():
@@ -83,6 +88,82 @@ def test_mxfp4_unpack_flattens_last_two_block_dims_like_lmdeploy():
     assert weight.tolist() == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
 
+@pytest.mark.parametrize("logical_n", [24, 48])
+def test_nvfp4_prepare_pads_output_to_converter_alignment(monkeypatch, logical_n):
+    # The converter is mocked below; no compiled extension is required here.
+    monkeypatch.setattr(torch.ops._C, "nvfp4_sm70_prepare", object(), raising=False)
+    tm = _load_adapter()
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((logical_n, 16), dtype=torch.uint8), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones((logical_n, 2), dtype=torch.float16), requires_grad=False
+    )
+    layer.weight_global_scale = torch.nn.Parameter(
+        torch.tensor(0.25, dtype=torch.float32), requires_grad=False
+    )
+
+    from vllm import _sm70_ops as sm70_ops
+
+    prepared = []
+    physical_n = (logical_n + 31) // 32 * 32
+
+    def fake_prepare(qweight, scales, group_size, interleave_gated_silu):
+        prepared.append(
+            (
+                tuple(qweight.shape),
+                tuple(scales.shape),
+                group_size,
+                interleave_gated_silu,
+            )
+        )
+        return (
+            torch.empty((32, physical_n // 8), dtype=torch.int32),
+            torch.empty((2, physical_n), dtype=torch.float16),
+            torch.tensor([32, physical_n], dtype=torch.int64),
+        )
+
+    monkeypatch.setattr(sm70_ops, "nvfp4_sm70_prepare", fake_prepare)
+
+    tm.prepare_nvfp4_linear(layer)
+
+    state = getattr(layer, tm.STATE_ATTR)
+    assert prepared == [((32, physical_n), (2, physical_n), 16, False)]
+    assert state.output_size == logical_n
+
+
+def test_nvfp4_apply_crops_converter_padding(monkeypatch):
+    tm = _load_adapter()
+    layer = torch.nn.Module()
+    state = tm.SM70TurboMindLinearState(
+        weight=torch.empty((32, 4), dtype=torch.int32),
+        scales=torch.empty((2, 32), dtype=torch.float16),
+        group_size=16,
+        k_ld=32,
+        q_ld=32,
+        output_size=24,
+        op_kind="nvfp4",
+        padded_output_size=32,
+    )
+    setattr(layer, tm.STATE_ATTR, state)
+
+    from vllm import _sm70_ops as sm70_ops
+
+    def fake_gemm(out, *args):
+        del args
+        out.copy_(torch.arange(32, dtype=out.dtype).view(1, 32))
+
+    monkeypatch.setattr(sm70_ops, "nvfp4_gemm_sm70_out", fake_gemm)
+
+    output = tm.apply_prepared_linear(
+        layer, torch.ones((1, 32), dtype=torch.float16), bias=None
+    )
+
+    assert output.shape == (1, 24)
+    assert output.tolist() == [list(map(float, range(24)))]
+
+
 def test_symmetric_int4_zero_points_are_eight():
     tm = _load_adapter()
     scales = torch.ones((2, 3), dtype=torch.float32)
@@ -120,7 +201,6 @@ def _make_nvfp4_qpn4_state(tm, *, gated_silu: bool):
         output_size=output_size,
         op_kind="nvfp4_qpn4",
         gated_silu=gated_silu,
-        dense_weight_ptr=1234,
         global_scale=0.25 if gated_silu else 0.0,
         use_scale_code=gated_silu,
     )
@@ -228,10 +308,35 @@ def test_nvfp4_fused_silu_rejects_non_gated_state():
     assert output is None
 
 
-def test_nvfp4_qpn4_regular_apply_uses_opaque_dynamic_m_dispatch(monkeypatch):
-    tm = _load_adapter()
+@pytest.fixture
+def qpn4_workspace():
+    """A registered workspace, and a CPU kernel for the opaque dispatch op."""
+    workspaces.clear_layer_workspaces()
+    library = None
+    if not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "vllm::sm70_nvfp4_qpn4_dispatch", "CPU"
+    ):
+        library = torch.library.Library("vllm", "IMPL", "CPU")
+        library.impl("sm70_nvfp4_qpn4_dispatch", workspaces._sm70_nvfp4_qpn4_dispatch)
+    yield torch.empty(1, dtype=torch.float16)
+    workspaces.clear_layer_workspaces()
+    if library is not None:
+        library._destroy()
+
+
+def _qpn4_layer(tm, workspace, *, gated_silu: bool) -> torch.nn.Module:
     layer = torch.nn.Module()
-    setattr(layer, tm.STATE_ATTR, _make_nvfp4_qpn4_state(tm, gated_silu=False))
+    layer.prefix = "model.layers.0.mlp.down_proj"
+    setattr(layer, tm.STATE_ATTR, _make_nvfp4_qpn4_state(tm, gated_silu=gated_silu))
+    workspaces.register_layer_workspace(layer, workspace)
+    return layer
+
+
+def test_nvfp4_qpn4_regular_apply_uses_opaque_dynamic_m_dispatch(
+    monkeypatch, qpn4_workspace
+):
+    tm = _load_adapter()
+    layer = _qpn4_layer(tm, qpn4_workspace, gated_silu=False)
 
     from vllm import _sm70_ops as sm70_ops
 
@@ -268,13 +373,12 @@ def test_nvfp4_qpn4_regular_apply_uses_opaque_dynamic_m_dispatch(monkeypatch):
     )
 
     assert output.tolist() == [[2.0] * 4, [2.0] * 4]
-    assert calls == [((2, 4), 1234, (2, 3), 0.0, False, False)]
+    assert calls == [((2, 4), qpn4_workspace.data_ptr(), (2, 3), 0.0, False, False)]
 
 
-def test_nvfp4_qpn4_fused_gate_uses_scale_code_dispatch(monkeypatch):
+def test_nvfp4_qpn4_fused_gate_uses_scale_code_dispatch(monkeypatch, qpn4_workspace):
     tm = _load_adapter()
-    layer = torch.nn.Module()
-    setattr(layer, tm.STATE_ATTR, _make_nvfp4_qpn4_state(tm, gated_silu=True))
+    layer = _qpn4_layer(tm, qpn4_workspace, gated_silu=True)
 
     from vllm import _sm70_ops as sm70_ops
 
@@ -311,4 +415,4 @@ def test_nvfp4_qpn4_fused_gate_uses_scale_code_dispatch(monkeypatch):
 
     assert output is not None
     assert output.tolist() == [[4.0, 4.0]]
-    assert calls == [((1, 2), 1234, (1, 3), 0.25, True, True)]
+    assert calls == [((1, 2), qpn4_workspace.data_ptr(), (1, 3), 0.25, True, True)]

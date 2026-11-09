@@ -1,22 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import regex as re
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
+import vllm.models.qwen4_exp.common.ple as ple_common
 import vllm.models.qwen4_exp.nvidia.ple_layer as ple_module
+from tests.utils import set_lazy_env
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.models.qwen4_exp.common.ple import (
+    PLEDiskSegment,
+    PLEPlacement,
+    PLERemotePlacement,
     PLEShardOverlap,
+    auto_ple_host_budget_bytes,
+    available_host_bytes,
+    cap_host_budget_bytes,
+    check_ple_host_share,
     compute_ple_shard_overlap,
     copy_ple_embedding_shard_,
+    copy_ple_embedding_shard_tiers_,
+    plan_ple_disk_segments,
+    plan_ple_placement,
+    ple_disk_mask,
+    total_host_bytes,
 )
 from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpNGramEmbedding,
@@ -27,85 +46,688 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import (
 )
 
 
+def _patch_tp(monkeypatch: pytest.MonkeyPatch, rank: int, world_size: int) -> None:
+    monkeypatch.setattr(ple_module, "is_pin_memory_available", lambda: True)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_rank", lambda: rank
+    )
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: world_size
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_rank", lambda: rank
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: world_size
+    )
+
+
+def _pinned_layer(
+    num_embeddings: int = 32,
+    embedding_dim: int = 8,
+    prefix: str = "model.layers.2.ple.ngram_embedding",
+):
+    # The table registers itself in the config's static forward context so
+    # the gather op can resolve it by name at run time.
+    with set_current_vllm_config(VllmConfig()):
+        return Qwen4ExpPinnedHostEmbedding(
+            num_embeddings=num_embeddings,
+            embedding_dim=embedding_dim,
+            params_dtype=torch.float16,
+            padding_size=8,
+            prefix=prefix,
+            quant_method=Qwen4ExpPLEFp8EmbeddingMethod(),
+        )
+
+
+def _expose_to_gather_op(monkeypatch: pytest.MonkeyPatch, *layers) -> None:
+    # qwen4_exp_ple_pinned_gather resolves the table through the forward
+    # context, like qwen4_exp_compute_ple_ngram_ids does for its layer.
+    by_name = {layer.layer_name: layer for layer in layers}
+    monkeypatch.setattr(
+        ple_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers=by_name),
+    )
+
+
+def _patch_cascade(monkeypatch: pytest.MonkeyPatch, *, host_bytes: int | None) -> None:
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: host_bytes)
+    monkeypatch.setattr(ple_module, "ple_cascade_configured", lambda: True)
+
+
+def _patch_device_spill(monkeypatch: pytest.MonkeyPatch, layer, spill: int) -> None:
+    # The real measurement reads the device, the KV specs and the config.
+    monkeypatch.setattr(layer, "_device_spill_bytes", lambda device, table_bytes: spill)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
-def test_pinned_host_ple_allocates_tp_shard_without_device_table(
+def test_pinned_host_ple_allocates_nothing_before_the_first_shard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ple_module, "is_pin_memory_available", lambda: True)
-    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 2)
-    monkeypatch.setattr(
-        embedding_module, "get_tensor_model_parallel_world_size", lambda: 4
-    )
-    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 2)
-    monkeypatch.setattr(
-        parameter_module, "get_tensor_model_parallel_world_size", lambda: 4
-    )
+    _patch_tp(monkeypatch, rank=2, world_size=4)
 
-    layer = Qwen4ExpPinnedHostEmbedding(
-        num_embeddings=32,
-        embedding_dim=8,
-        params_dtype=torch.float16,
-        padding_size=8,
-        prefix="model.layers.2.ple.ngram_embedding",
-        quant_method=Qwen4ExpPLEFp8EmbeddingMethod(),
-    )
+    layer = _pinned_layer()
 
     assert layer.tp_size == 4
-    assert layer.weight.shape == (8, 8)
+    # The loader contract is kept by a row-less CPU placeholder; the TP shard
+    # of 8 rows is only placed once the budget can see the real headroom.
+    assert layer.weight.shape == (0, 8)
     assert layer.weight.dtype == torch.float8_e4m3fn
     assert layer.weight.device.type == "cpu"
-    assert layer.weight.is_pinned()
     assert layer.weight._vllm_keep_on_cpu
-    assert not layer.weight.is_meta
+    assert layer.ple_device_table is None and layer.ple_host_storage is None
     assert not layer.weight_scale.is_meta
     assert layer.weight_scale.dtype == torch.float16
     assert layer._accelerator_weight_views == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_pinned_host_ple_splits_the_shard_by_host_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_tp(monkeypatch, rank=2, world_size=4)
+    # 3 rows x 8 bytes fit the host budget, the other 5 rows stay on device.
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: 3 * 8)
+
+    layer = _pinned_layer()
+    layer.materialize_tables()
+
+    assert layer.ple_device_table is not None and layer.ple_host_storage is not None
+    assert layer.ple_device_table.shape == (5, 8)
+    assert layer.ple_device_table.device.type == "cuda"
+    assert layer.ple_host_storage.shape == (3, 8)
+    assert layer.ple_host_storage.is_pinned()
+    assert (layer._device_rows, layer._host_rows) == (5, 3)
+    # Idempotent: a second call keeps the tables.
+    device_table = layer.ple_device_table
+    layer.materialize_tables()
+    assert layer.ple_device_table is device_table
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_pinned_host_ple_without_budget_keeps_everything_on_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: 0)
+
+    layer = _pinned_layer(num_embeddings=8)
+    # Preparing the accelerator view (process_weights_after_loading) must not
+    # depend on a shard having been loaded, e.g. with dummy weights.
+    layer.prepare_accelerator_weight()
+
+    assert layer.ple_device_table is not None
+    assert layer.ple_device_table.shape == (8, 8)
+    assert layer.ple_host_storage is not None
+    assert layer.ple_host_storage.shape == (0, 8)
+    assert layer._host_rows == 0
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires an exact SM70 CUDA device",
 )
-def test_pinned_host_ple_fp8_rows_are_gatherable_on_sm70(
+@pytest.mark.parametrize("host_rows", [0, 4, 8])
+def test_pinned_host_ple_fp8_rows_are_gatherable_across_the_split_on_sm70(
     monkeypatch: pytest.MonkeyPatch,
+    host_rows: int,
 ) -> None:
-    monkeypatch.setattr(ple_module, "is_pin_memory_available", lambda: True)
-    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
-    )
+    _patch_tp(monkeypatch, rank=0, world_size=1)
     monkeypatch.setattr(
         embedding_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
     )
-    layer = Qwen4ExpPinnedHostEmbedding(
-        num_embeddings=8,
-        embedding_dim=8,
-        params_dtype=torch.float16,
-        padding_size=8,
-        prefix="model.layers.2.ple.ngram_embedding",
-        quant_method=Qwen4ExpPLEFp8EmbeddingMethod(),
-    )
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: host_rows * 8)
+    layer = _pinned_layer(num_embeddings=8)
+    _expose_to_gather_op(monkeypatch, layer)
     raw = torch.tensor(
         [0x00, 0x01, 0x08, 0x38, 0x7E, 0x80, 0xB8, 0xFE],
         dtype=torch.uint8,
     ).repeat(8, 1)
-    layer.weight.data.copy_(raw.view(torch.float8_e4m3fn))
+    # Distinct rows: row i carries the pattern rotated by i.
+    raw = torch.stack([raw[i].roll(i) for i in range(8)])
+    checkpoint = raw.view(torch.float8_e4m3fn)
+    copied = layer.load_shard(checkpoint, checkpoint_start=0, tp_start=0, tp_end=8)
+    assert copied == 8
+    assert (layer._device_rows, layer._host_rows) == (8 - host_rows, host_rows)
     layer.weight_scale = nn.Parameter(
         torch.tensor([0.25], dtype=torch.float16, device="cuda"),
         requires_grad=False,
     )
     layer.prepare_accelerator_weight()
 
-    output = layer(torch.tensor([0, 7], dtype=torch.int64, device="cuda"))
+    ids = torch.tensor([0, 3, 4, 7, 2], dtype=torch.int64, device="cuda")
+    output = layer(ids)
     torch.accelerator.synchronize()
 
     assert output.dtype == torch.float16
-    expected = raw.view(torch.float8_e4m3fn).float() * 0.25
-    torch.testing.assert_close(output.float().cpu(), expected[[0, 7]])
+    expected = checkpoint.float() * 0.25
+    torch.testing.assert_close(output.float().cpu(), expected[ids.cpu()])
+
+    pointers = (layer._device_table_ptr, dict(layer._accelerator_weight_ptrs))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            layer(ids)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        graph_output = layer(ids)
+    for offset in range(4):
+        # Reload both halves in-place; captured pointers must stay live.
+        reloaded = raw.roll(offset, dims=0).view(torch.float8_e4m3fn)
+        layer.load_shard(reloaded, checkpoint_start=0, tp_start=0, tp_end=8)
+        layer.prepare_accelerator_weight()
+        ids.copy_((ids + 1) % 8)
+        graph.replay()
+        expected = reloaded.float() * 0.25
+        torch.testing.assert_close(graph_output.float().cpu(), expected[ids.cpu()])
+        assert pointers == (layer._device_table_ptr, layer._accelerator_weight_ptrs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires pinned memory")
+@pytest.mark.parametrize("host_rows", [0, 4, 8])
+def test_dummy_ple_tables_do_not_retain_uninitialized_bytes(monkeypatch, host_rows):
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: host_rows * 8)
+    layer = _pinned_layer(num_embeddings=8)
+    empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        result = empty(*args, **kwargs)
+        if result.dtype == torch.float8_e4m3fn:
+            result.view(torch.uint8).fill_(0x7F)  # E4M3 NaN, not valid dummy data.
+        return result
+
+    monkeypatch.setattr(ple_module.torch, "empty", poisoned_empty)
+    layer.prepare_accelerator_weight()
+    for table in (layer.ple_device_table, layer.ple_host_storage):
+        assert torch.all(table.view(torch.uint8) == 0)
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("kind", ["HOST", "HOST_RESERVE", "VRAM_RESERVE"])
+def test_ple_budget_rejects_invalid_values(monkeypatch, kind, value):
+    monkeypatch.setattr(ple_module.envs, f"VLLM_QWEN4EXP_PLE_{kind}_GIB", value)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        if kind == "HOST":
+            ple_common.ple_host_budget_bytes()
+        elif kind == "HOST_RESERVE":
+            ple_common.ple_host_reserve_bytes(32 * 1024**3)
+        else:
+            ple_common.ple_vram_reserve_bytes(32 * 1024**3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_cascade_rank_leaves_the_overflow_to_the_disk_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    _patch_cascade(monkeypatch, host_bytes=3 * 8)
+    layer = _pinned_layer(num_embeddings=16)
+    # 10.6 rows do not fit on the device: the partial row stays there as it
+    # does without the cascade, the host takes its 3 rows, the disk the rest.
+    _patch_device_spill(monkeypatch, layer, 10 * 8 + 5)
+    layer.materialize_tables()
+
+    assert layer.ple_device_table is not None and layer.ple_host_storage is not None
+    assert layer.ple_device_table.shape == (6, 8)
+    assert layer.ple_host_storage.shape == (3, 8)
+    assert (layer._device_rows, layer._host_rows, layer._disk_rows) == (6, 3, 7)
+    assert layer.local_rows == 9
+
+    raw = torch.arange(16 * 8, dtype=torch.uint8).view(16, 8)
+    copied = layer.load_shard(
+        raw.view(torch.float8_e4m3fn), checkpoint_start=0, tp_start=0, tp_end=16
+    )
+    assert copied == 9
+    assert torch.equal(layer.ple_device_table.view(torch.uint8).cpu(), raw[:6])
+    assert torch.equal(layer.ple_host_storage.view(torch.uint8), raw[6:9])
+
+    with pytest.raises(RuntimeError, match="no rows from the PLE offload worker"):
+        layer.embedding_lookup(torch.zeros(2, dtype=torch.int64, device="cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_cascade_rank_keeps_at_least_one_resident_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing may stay resident: the always-running gathers would read row 0.
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    _patch_cascade(monkeypatch, host_bytes=0)
+    layer = _pinned_layer(num_embeddings=16)
+    _patch_device_spill(monkeypatch, layer, 16 * 8)
+    with pytest.raises(RuntimeError, match="at least one resident row"):
+        layer.materialize_tables()
+    assert layer.ple_device_table is None
+
+
+def test_configured_host_share_is_checked_once_before_the_ranks_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1024**3
+    ple_config = SimpleNamespace(ple_layer_ids=[1])
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "6")
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    monkeypatch.setattr(ple_common, "total_host_bytes", lambda: 30 * gib)
+    # 30 GiB host, 7.5 GiB reserve: two ranks of 6 GiB need 19.5 GiB available.
+    monkeypatch.setattr(ple_common, "available_host_bytes", lambda: int(19.5 * gib))
+    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    monkeypatch.setattr(ple_common, "available_host_bytes", lambda: 19 * gib)
+    with pytest.raises(ValueError, match="asks for 6.0 GiB .* at most 5.75 GiB"):
+        check_ple_host_share(ple_config, ranks_sharing_host=2)
+    # A smaller reserve makes room again.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "4")
+    check_ple_host_share(ple_config, ranks_sharing_host=2)
+
+    # Nothing to check: models without PLE, a derived share, an unknown host.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    check_ple_host_share(SimpleNamespace(), ranks_sharing_host=2)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", None)
+    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "6")
+    monkeypatch.setattr(ple_common, "available_host_bytes", lambda: None)
+    check_ple_host_share(ple_config, ranks_sharing_host=2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_configured_host_share_is_used_as_given_by_the_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The rank does not read the host memory again: its siblings may already
+    # pin their shares, which would count them twice.
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: 4 * 8)
+    monkeypatch.setattr(ple_module, "available_host_bytes", lambda: 0)
+    layer = _pinned_layer(num_embeddings=16)
+    layer.materialize_tables()
+    assert (layer._device_rows, layer._host_rows, layer._disk_rows) == (12, 4, 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_derived_host_share_cut_by_the_host_goes_to_the_disk_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    _patch_cascade(monkeypatch, host_bytes=None)
+    monkeypatch.setattr(ple_module, "available_host_bytes", lambda: 3 * 8)
+    monkeypatch.setattr(ple_module, "total_host_bytes", lambda: 32 * 1024**3)
+    monkeypatch.setattr(ple_module, "ple_host_reserve_bytes", lambda total: 0)
+    layer = _pinned_layer(num_embeddings=16)
+    _patch_device_spill(monkeypatch, layer, 10 * 8)
+    # The host cap counts the ranks sharing the host from the parallel config,
+    # which is set while the model loads.
+    with set_current_vllm_config(VllmConfig()):
+        layer.materialize_tables()
+    assert (layer._device_rows, layer._host_rows, layer._disk_rows) == (6, 3, 7)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ple_host_allocation_failure_keeps_materialization_retryable(monkeypatch):
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: 4 * 8)
+    layer = _pinned_layer(num_embeddings=8)
+    pin = ple_module._pin_host_tensor_exact
+
+    def failing_pin(tensor):
+        raise RuntimeError("injected pinned allocation failure")
+
+    monkeypatch.setattr(ple_module, "_pin_host_tensor_exact", failing_pin)
+    with pytest.raises(RuntimeError, match="injected pinned allocation failure"):
+        layer.materialize_tables()
+    assert layer.ple_device_table is None
+    assert layer.ple_host_storage is None
+    assert layer._device_table_ptr == 0
+    monkeypatch.setattr(ple_module, "_pin_host_tensor_exact", pin)
+    layer.materialize_tables()
+    assert (layer._device_rows, layer._host_rows) == (4, 4)
+    assert layer.ple_host_storage is not None
+    assert layer.ple_host_storage.is_pinned()
+
+
+class _FakeCudart:
+    """Records cudaHostRegister/Unregister calls instead of making them."""
+
+    def __init__(self, register_error: int = 0) -> None:
+        self.calls: list[tuple] = []
+        self.register_error = register_error
+
+    def cudaHostRegister(self, ptr, size, flags):
+        self.calls.append(("register", ptr, size, flags))
+        return SimpleNamespace(value=self.register_error)
+
+    def cudaHostUnregister(self, ptr):
+        self.calls.append(("unregister", ptr))
+        return SimpleNamespace(value=0)
+
+
+def _patch_cudart(
+    monkeypatch: pytest.MonkeyPatch, *, register_error: int = 0, pinned: bool
+) -> _FakeCudart:
+    cudart = _FakeCudart(register_error)
+    monkeypatch.setattr(ple_module.torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: pinned)
+    return cudart
+
+
+def test_exact_pin_registers_exactly_the_tensor_bytes(monkeypatch) -> None:
+    # 3 rows x 8 bytes: pin_memory=True would round this up to 32 bytes.
+    cudart = _patch_cudart(monkeypatch, pinned=True)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+    ptr = host.data_ptr()
+
+    ple_module._pin_host_tensor_exact(host)
+
+    assert cudart.calls == [("register", ptr, 24, 0x01 | 0x02)]
+    # The registration lives exactly as long as the table.
+    del host
+    gc.collect()
+    assert cudart.calls[-1] == ("unregister", ptr)
+
+
+def test_exact_pin_raises_when_registration_fails(monkeypatch) -> None:
+    cudart = _patch_cudart(monkeypatch, register_error=2, pinned=False)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(RuntimeError, match="cudaHostRegister"):
+        ple_module._pin_host_tensor_exact(host)
+    assert [call[0] for call in cudart.calls] == ["register"]
+
+
+def test_exact_pin_refuses_a_table_torch_does_not_see_as_pinned(monkeypatch) -> None:
+    # get_cuda_view_from_cpu_tensor would otherwise copy the whole table.
+    cudart = _patch_cudart(monkeypatch, pinned=False)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+    ptr = host.data_ptr()
+
+    with pytest.raises(RuntimeError, match="not pinned"):
+        ple_module._pin_host_tensor_exact(host)
+    assert cudart.calls == [("register", ptr, 24, 0x01 | 0x02), ("unregister", ptr)]
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((7, 0), True), ((7, 5), True), ((8, 0), False), ((8, 9), False)],
+)
+def test_pinned_host_ple_decides_on_the_worker_device(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], expected: bool
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+
+    seen: list[int] = []
+
+    def fake_capability(device_id: int = 0) -> DeviceCapability:
+        seen.append(device_id)
+        return DeviceCapability(*capability)
+
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: False)
+    monkeypatch.setattr(ple_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        ple_module.current_platform, "get_device_capability", fake_capability
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
+
+    config = SimpleNamespace(ple_offload_embedding=None)
+    assert ple_module._should_use_pinned_host_ple(config) is expected
+    # The worker's own device, not device 0 of the visible list.
+    assert seen == [3]
+    # An explicit config choice wins over the capability.
+    assert ple_module._should_use_pinned_host_ple(
+        SimpleNamespace(ple_offload_embedding=not expected)
+    ) is (not expected)
+
+
+def _plan(
+    total_rows: int,
+    host_rows: int,
+    vram_rows: int | None,
+    disk_allowed: bool = True,
+):
+    return plan_ple_placement(
+        total_rows=total_rows,
+        row_bytes=8,
+        host_budget_bytes=host_rows * 8,
+        vram_budget_bytes=None if vram_rows is None else vram_rows * 8,
+        disk_allowed=disk_allowed,
+    )
+
+
+def test_plan_ple_placement_spills_only_what_the_budget_holds() -> None:
+    assert _plan(total_rows=10, host_rows=0, vram_rows=None) == plan_ple_placement(
+        total_rows=10, row_bytes=8, host_budget_bytes=7, vram_budget_bytes=None
+    )
+    placement = plan_ple_placement(
+        total_rows=10, row_bytes=8, host_budget_bytes=3 * 8 + 7, vram_budget_bytes=None
+    )
+    assert placement == PLEPlacement(vram_rows=7, host_rows=3, disk_rows=0)
+    # A budget beyond the table never inflates the host part.
+    big = plan_ple_placement(
+        total_rows=10, row_bytes=8, host_budget_bytes=10**9, vram_budget_bytes=None
+    )
+    assert big == PLEPlacement(vram_rows=0, host_rows=10, disk_rows=0)
+    with pytest.raises(ValueError):
+        plan_ple_placement(
+            total_rows=10, row_bytes=8, host_budget_bytes=-1, vram_budget_bytes=None
+        )
+
+
+def test_plan_ple_placement_cascades_beyond_device_and_host() -> None:
+    # The device takes its measured budget, the host its share, the disk the rest.
+    placement = _plan(total_rows=20, host_rows=5, vram_rows=9)
+    assert placement == PLEPlacement(vram_rows=9, host_rows=5, disk_rows=6)
+    assert (placement.local_rows, placement.total_rows) == (14, 20)
+    # Fastest tier first: a device that holds the whole table leaves the host
+    # share unused, so a fitting table pins no host memory.
+    assert _plan(total_rows=20, host_rows=5, vram_rows=99) == (
+        PLEPlacement(vram_rows=20, host_rows=0, disk_rows=0)
+    )
+    # The host takes only what the device could not hold.
+    assert _plan(total_rows=20, host_rows=5, vram_rows=18) == (
+        PLEPlacement(vram_rows=18, host_rows=2, disk_rows=0)
+    )
+    # Without a cascade the configured host share comes first, as before.
+    assert _plan(total_rows=20, host_rows=5, vram_rows=None) == PLEPlacement(
+        vram_rows=15, host_rows=5, disk_rows=0
+    )
+    # Rows are never dropped: without the disk tier a remainder is refused.
+    with pytest.raises(ValueError, match="does not fit"):
+        _plan(total_rows=20, host_rows=5, vram_rows=9, disk_allowed=False)
+    with pytest.raises(ValueError, match="device budget"):
+        _plan(total_rows=20, host_rows=0, vram_rows=-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shard_copy_to_the_device_keeps_no_staging_memory() -> None:
+    # The allocator keeps a cached staging copy of the shard slice reserved on
+    # the card that holds the device tier, memory the KV cache would get.
+    # 10 MiB: smaller slices share a 2 MiB allocator block with the table, and
+    # the old staging copy would pass unnoticed.
+    rows = 65536
+    table = torch.empty(rows, 160, dtype=torch.uint8, device="cuda")
+    shard = torch.randint(0, 255, (rows, 160), dtype=torch.uint8)
+    torch.accelerator.synchronize()
+    reserved = torch.accelerator.memory_reserved()
+    copied = copy_ple_embedding_shard_(
+        table, shard, checkpoint_start=0, tp_start=0, tp_end=rows
+    )
+    torch.accelerator.synchronize()
+    assert copied == rows
+    assert torch.equal(table.cpu(), shard)
+    assert torch.accelerator.memory_reserved() == reserved
+
+
+def test_copy_ple_embedding_shard_tiers_matches_the_single_copy() -> None:
+    checkpoint = torch.arange(20 * 4, dtype=torch.int8).view(20, 4)
+    # TP range [5, 15) of a 20-row table, checkpoint shards of 6 rows; the
+    # last three rows belong to a tier another process holds.
+    reference = torch.zeros(10, 4, dtype=torch.int8)
+    vram = torch.zeros(4, 4, dtype=torch.int8)
+    host = torch.zeros(3, 4, dtype=torch.int8)
+    copied = 0
+    for shard_index in range(4):
+        start = shard_index * 6
+        shard = checkpoint[start : start + 6]
+        copy_ple_embedding_shard_(
+            reference, shard, checkpoint_start=start, tp_start=5, tp_end=15
+        )
+        copied += copy_ple_embedding_shard_tiers_(
+            [(4, vram), (3, host), (3, None)],
+            shard,
+            checkpoint_start=start,
+            tp_start=5,
+            tp_end=15,
+        )
+    assert copied == 7
+    torch.testing.assert_close(torch.cat([vram, host]), reference[:7])
+    with pytest.raises(ValueError, match="do not cover"):
+        copy_ple_embedding_shard_tiers_(
+            [(4, vram), (3, host), (2, None)],
+            checkpoint[:6],
+            checkpoint_start=0,
+            tp_start=5,
+            tp_end=15,
+        )
+
+
+@pytest.mark.parametrize("host_rows", [0, 4, 8, 12])
+def test_tier_copy_accepts_tp_padding(host_rows: int) -> None:
+    checkpoint = torch.arange(20 * 4, dtype=torch.int8).view(20, 4)
+    device = torch.full((12 - host_rows, 4), -1, dtype=torch.int8)
+    host = torch.full((host_rows, 4), -1, dtype=torch.int8)
+    count = copy_ple_embedding_shard_tiers_(
+        [(12 - host_rows, device), (host_rows, host)],
+        checkpoint,
+        checkpoint_start=0,
+        tp_start=7,
+        tp_end=17,
+    )
+    result = torch.cat([device, host])
+    assert count == 10
+    torch.testing.assert_close(result[:10], checkpoint[7:17])
+    assert torch.all(result[10:] == -1)
+
+
+def test_disk_segments_cover_each_ranks_remote_rows() -> None:
+    placements = [
+        PLERemotePlacement(tp_start=0, tp_end=100, local_rows=60),
+        PLERemotePlacement(tp_start=100, tp_end=200, local_rows=90),
+        PLERemotePlacement(tp_start=200, tp_end=300, local_rows=128),
+    ]
+    disk = plan_ple_disk_segments(placements)
+    # A rank that holds all of its rows leaves no segment.
+    assert disk == [
+        PLEDiskSegment(start=60, end=100),
+        PLEDiskSegment(start=190, end=200),
+    ]
+    ids = torch.tensor([[59, 60, 99], [100, 189, 190], [199, 0, 250]])
+    expected = torch.tensor(
+        [[False, True, True], [False, False, True], [True, False, False]]
+    )
+    assert torch.equal(ple_disk_mask(ids, disk), expected)
+    assert not ple_disk_mask(ids, []).any()
+    with pytest.raises(ValueError, match="overlap"):
+        plan_ple_disk_segments(
+            [
+                PLERemotePlacement(tp_start=0, tp_end=100, local_rows=0),
+                PLERemotePlacement(tp_start=90, tp_end=200, local_rows=0),
+            ]
+        )
+
+
+def test_auto_ple_host_budget_spills_only_the_shortfall() -> None:
+    gib = 1024**3
+    common = dict(
+        device_total_bytes=48 * gib,
+        gpu_memory_utilization=0.95,
+        reserve_bytes=2 * gib,
+    )
+    # 45.6 usable - 20 weights - 10 KV - 2 reserve = 13.6 GiB room: a 10 GiB
+    # table fits entirely, a 20 GiB table spills 6.4 GiB.
+    assert (
+        auto_ple_host_budget_bytes(
+            table_bytes=10 * gib,
+            device_allocated_bytes=20 * gib,
+            kv_cache_bytes=10 * gib,
+            **common,
+        )
+        == 0
+    )
+    spill = auto_ple_host_budget_bytes(
+        table_bytes=20 * gib,
+        device_allocated_bytes=20 * gib,
+        kv_cache_bytes=10 * gib,
+        **common,
+    )
+    assert spill == 20 * gib - (int(48 * gib * 0.95) - 32 * gib)
+    # No room at all: the whole table goes to the host, never more.
+    assert (
+        auto_ple_host_budget_bytes(
+            table_bytes=20 * gib,
+            device_allocated_bytes=46 * gib,
+            kv_cache_bytes=10 * gib,
+            **common,
+        )
+        == 20 * gib
+    )
+
+
+def test_available_host_bytes_reads_meminfo() -> None:
+    available = available_host_bytes()
+    assert available is None or available > 0
+    total = total_host_bytes()
+    assert total is None or total >= (available or 0)
+
+
+def test_cap_host_budget_shares_the_host_between_ranks() -> None:
+    gib = 1024**3
+    # 30 GB host, 20 GiB available, 7.5 GiB reserve, two ranks: 6.25 GiB each.
+    # The 7.09 GiB that double-booked the host on 2026-09-06 is cut to that.
+    share = cap_host_budget_bytes(
+        budget_bytes=int(7.09 * gib),
+        available_bytes=20 * gib,
+        reserve_bytes=int(7.5 * gib),
+        ranks_sharing_host=2,
+    )
+    assert share == int(12.5 * gib) // 2
+    # A budget below the share passes untouched.
+    assert (
+        cap_host_budget_bytes(
+            budget_bytes=2 * gib,
+            available_bytes=20 * gib,
+            reserve_bytes=int(7.5 * gib),
+            ranks_sharing_host=2,
+        )
+        == 2 * gib
+    )
+    # Reserve swallows everything: nothing may be pinned.
+    assert (
+        cap_host_budget_bytes(
+            budget_bytes=2 * gib,
+            available_bytes=6 * gib,
+            reserve_bytes=8 * gib,
+            ranks_sharing_host=2,
+        )
+        == 0
+    )
+    with pytest.raises(ValueError):
+        cap_host_budget_bytes(
+            budget_bytes=gib, available_bytes=gib, reserve_bytes=0, ranks_sharing_host=0
+        )
+
+
+def test_ple_host_reserve_defaults_to_a_quarter_of_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.models.qwen4_exp.nvidia import ple_layer
+
+    monkeypatch.setattr(ple_layer.envs, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    assert ple_layer.ple_host_reserve_bytes(30 * 1024**3) == int(7.5 * 1024**3)
+    monkeypatch.setattr(ple_layer.envs, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", 4.0)
+    assert ple_layer.ple_host_reserve_bytes(30 * 1024**3) == 4 * 1024**3
+    monkeypatch.setattr(ple_layer.envs, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", -1.0)
+    with pytest.raises(ValueError):
+        ple_layer.ple_host_reserve_bytes(30 * 1024**3)
 
 
 def test_post_load_context_keeps_marked_parameter_on_cpu() -> None:
@@ -152,6 +774,7 @@ def test_ngram_embedding_accepts_checkpoint_seed_none(
             max_total_tokens=8,
             max_num_reqs=2,
             prefix="model.layers.2.ple.ple_embedding",
+            layer_name="model.layers.2.ple",
             params_dtype=torch.float16,
         )
 
@@ -159,6 +782,50 @@ def test_ngram_embedding_accepts_checkpoint_seed_none(
     assert layer.head_dim == 16
     assert layer.ngram_embedding.weight.dtype == torch.float8_e4m3fn
     assert layer.ngram_embedding.weight.is_meta
+
+
+def test_ngram_embedding_disk_offload_allocates_only_meta_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setenv("VLLM_PLE_DISK_OFFLOAD", "1")
+    monkeypatch.setattr(ple_module.envs, "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", 0)
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    config = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=8,
+        eos_token_id=2,
+        vocab_size=64,
+        split_ngram_parts=2,
+        seed=None,
+        ngram_vocab_size_base=101,
+        make_ngram_vocab_size_divisible_by=128,
+        ple_embedding_dtype="float8_e4m3fn",
+        ple_offload_embedding=False,
+    )
+
+    layer = Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim=256,
+        ple_dense_layer_id=0,
+        max_total_tokens=8,
+        max_num_reqs=2,
+        prefix="model.layers.2.ple.ple_embedding",
+        layer_name="model.layers.2.ple",
+        params_dtype=torch.float16,
+    )
+
+    assert layer._disk_offload
+    assert len(layer._disk_shards) == 2
+    assert layer.ngram_embedding.weight.is_meta
+    assert layer.positions_buffer.device.type == "cpu"
 
 
 def _make_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
@@ -201,6 +868,25 @@ def _make_fp8_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
         nn.Parameter(torch.zeros(1, dtype=torch.bfloat16), requires_grad=False),
     )
     module.ngram_embedding = embedding
+    return module
+
+
+def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
+    module = _make_fp8_ngram_embedding_for_load_test()
+    module._disk_offload = True
+    module._file_backed_shards = True
+    module._disk_shards = [None, None]
+    module._disk_mapped_paths = set()
+    # Off unless a test maps real file-backed shards: releasing the pages of
+    # anonymous memory would destroy it.
+    module._release_disk_pages = False
+    # No engine config around the module: the default row-gather policy, nothing
+    # to record the admission in.
+    module._kernel_config = None
+    module._disk_row_gather = True
+    module._disk_shard_size = 4
+    module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
+    module.head_dim = 2
     return module
 
 
@@ -292,6 +978,163 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
         torch.cat((shard_0[2:4], shard_1[0:2])).float(),
     )
     assert torch.equal(module.ngram_embedding.weight_scale, weight_scale)
+    assert module.get_offload_output_dtype(torch.bfloat16) == torch.uint8
+
+
+def test_ngram_embedding_retains_and_gathers_disk_shards(tmp_path) -> None:
+    # Real file-backed shards, as the loader hands them over: the disk lane
+    # refuses anything else, and with kernel_config.ple_disk_release_pages the gather
+    # releases the mapped pages, which would destroy anonymous memory.
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    module = _make_disk_ngram_embedding_for_load_test()
+    module._release_disk_pages = True
+    path = str(tmp_path / "ple.safetensors")
+    save_file(
+        {
+            "shard_0": torch.arange(8, dtype=torch.float32)
+            .reshape(4, 2)
+            .to(torch.float8_e4m3fn),
+            "shard_1": torch.arange(8, 16, dtype=torch.float32)
+            .reshape(4, 2)
+            .to(torch.float8_e4m3fn),
+        },
+        path,
+    )
+    with safe_open(path, framework="pt") as checkpoint:
+        shard_0 = checkpoint.get_tensor("shard_0")
+        shard_1 = checkpoint.get_tensor("shard_1")
+
+    loaded = module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+            ("ngram_embedding.weight_scale", torch.tensor([0.25])),
+        ]
+    )
+    output = torch.empty(4, 2, dtype=torch.uint8)
+    ngram_ids = torch.tensor([[7], [0], [7], [2]], dtype=torch.int64)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        module._disk_executor = executor
+        module._disk_embedding_lookup(ngram_ids, output)
+
+    assert loaded == {"ngram_embedding.weight", "ngram_embedding.weight_scale"}
+    assert module._disk_shards[0] is shard_0
+    assert module._disk_shards[1] is shard_1
+    expected = torch.cat((shard_0, shard_1))[ngram_ids.reshape(-1)]
+    assert torch.equal(output, expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("num_rows", [0, 1, 80, 128, 129, 256])
+def test_ngram_embedding_disk_decode_short_gather_matches_prefill(
+    monkeypatch: pytest.MonkeyPatch, num_rows: int
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    shard_1 = (
+        torch.arange(8, 16, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    )
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+    module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+        ]
+    )
+    ngram_ids = (torch.arange(num_rows, dtype=torch.long) * 5 % 8).reshape(-1, 1)
+    output = torch.empty(num_rows, 2, dtype=torch.uint8)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        module._disk_executor = executor
+        module._disk_embedding_lookup(ngram_ids, output)
+    expected = torch.cat((shard_0, shard_1))[ngram_ids.reshape(-1)]
+    assert torch.equal(output, expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("num_rows,bad_id", [(1, -1), (80, 8), (129, 8)])
+def test_ngram_embedding_disk_gather_rejects_invalid_ids(
+    monkeypatch: pytest.MonkeyPatch, num_rows: int, bad_id: int
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    shard = torch.zeros(4, 2).to(torch.float8_e4m3fn)
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+    module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard),
+            ("ngram_embedding.shard_1.weight", shard),
+        ]
+    )
+    ngram_ids = torch.zeros(num_rows, 1, dtype=torch.long)
+    ngram_ids[-1] = bad_id
+    with pytest.raises(IndexError, match="PLE disk row id out of range"):
+        module._disk_embedding_lookup(
+            ngram_ids, torch.empty(num_rows, 2, dtype=torch.uint8)
+        )
+
+
+def test_ngram_embedding_disk_offload_rejects_missing_shard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+
+    with pytest.raises(RuntimeError, match=r"did not load shards: \[1\]"):
+        module.load_weights(
+            [
+                (
+                    "ngram_embedding.shard_0.weight",
+                    torch.zeros(4, 2).to(torch.float8_e4m3fn),
+                )
+            ]
+        )
+
+
+def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._offload_model_dtype = torch.float16
+    weight_scale = torch.tensor([0.25], dtype=torch.bfloat16)
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: False)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: torch.device("cpu"),
+    )
+
+    loaded = module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", torch.empty(4, 2)),
+            ("ngram_embedding.weight_scale", weight_scale),
+        ]
+    )
+
+    assert loaded == {"ngram_embedding.weight_scale"}
+    assert module._offload_weight_scale.dtype == torch.float16
+    assert torch.equal(module._offload_weight_scale, weight_scale.to(torch.float16))
+    assert module.get_offload_output_dtype(torch.bfloat16) == torch.uint8
+
+    ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(ple_layer)
+    ple_layer.ple_embedding = module
+    embeddings = torch.tensor([[4.0, 8.0]]).to(torch.float8_e4m3fn)
+    output = ple_layer._dequantize_embeddings(embeddings, torch.bfloat16)
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+    )
 
 
 def _make_fp8_embedding_layer(
@@ -415,6 +1258,251 @@ def test_ple_fp8_embedding_respects_checkpoint_shard_exclusions() -> None:
     assert _get_ple_embedding_quant_method(quant_config, prefix) is None
 
 
+def _modelopt_mixed(quantized_layers: dict, exclude_modules: list[str]):
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    return ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": None,
+                "exclude_modules": exclude_modules,
+                "quantized_layers": quantized_layers,
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "language_model.model.layers.1.ple.ple_embedding.ngram_embedding",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding",
+    ],
+)
+def test_ple_fp8_embedding_from_modelopt_mixed_precision(prefix: str) -> None:
+    """nvidia/Qwen3.8-Flash-Next-NVFP4 declares the FP8 PLE table per layer
+    and does not set ple_embedding_dtype; the table must still select the FP8
+    embedding method, otherwise pinned-host PLE refuses to start."""
+    ple = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    experts = {"model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}}
+
+    fp8 = _modelopt_mixed({ple: {"quant_algo": "FP8"}, **experts}, ["lm_head"])
+    assert isinstance(
+        _get_ple_embedding_quant_method(fp8, prefix), Qwen4ExpPLEFp8EmbeddingMethod
+    )
+
+    unlisted = _modelopt_mixed(experts, ["lm_head"])
+    assert _get_ple_embedding_quant_method(unlisted, prefix) is None
+
+    excluded = _modelopt_mixed(
+        {ple: {"quant_algo": "FP8"}, **experts},
+        ["*.ple.ple_embedding.ngram_embedding*"],
+    )
+    assert _get_ple_embedding_quant_method(excluded, prefix) is None
+
+
+def test_ple_ngram_ids_custom_op_uses_current_request_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RuntimeNGramEmbedding(nn.Module):
+        def compute_ngram_ids(
+            self,
+            input_ids: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            ngram_context: torch.Tensor,
+        ) -> torch.Tensor:
+            del input_ids, ngram_context
+            num_reqs = query_start_loc.numel() - 1
+            return torch.full((4, 2), num_reqs, dtype=torch.long)
+
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embedding = RuntimeNGramEmbedding()
+    monkeypatch.setattr(
+        ple_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"ple": layer}),
+    )
+    input_ids = torch.arange(4)
+    ngram_context = torch.zeros(2, 2, dtype=torch.long)
+    output = torch.empty(4, 2, dtype=torch.long)
+
+    ple_module.qwen4_exp_compute_ple_ngram_ids(
+        input_ids,
+        torch.tensor([0, 4]),
+        ngram_context,
+        output,
+        "ple",
+    )
+    assert torch.equal(output, torch.ones_like(output))
+
+    ple_module.qwen4_exp_compute_ple_ngram_ids(
+        input_ids,
+        torch.tensor([0, 2, 4]),
+        ngram_context,
+        output,
+        "ple",
+    )
+    assert torch.equal(output, torch.full_like(output, 2))
+
+
+def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._packed_gguf = False
+    module.layer_name = "model.layers.0.ple"
+    module.embedding_dim = 1
+    module.head_dim = 1
+    module.ngram_size = 2
+    module.heads_per_ngram = 1
+    module.eos_token_id = 99
+    module.register_buffer("positions_buffer", torch.arange(4))
+    module.register_buffer("padded_buffer", torch.empty(1, 4, dtype=torch.long))
+    module.register_buffer("layer_multipliers", torch.tensor([3, 5]))
+    module.register_buffer("ngram_heads_vocab_sizes", torch.tensor([101]))
+    module.register_buffer("ngram_heads_offsets", torch.tensor([0]))
+    module.ngram_embedding = nn.Embedding(101, 1)
+    module.ngram_embedding.weight.requires_grad_(False)
+    with torch.no_grad():
+        module.ngram_embedding.weight.copy_(torch.arange(101).reshape(-1, 1))
+
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    query_start_loc = torch.tensor([0, 2])
+    ngram_context = torch.full((1, 1), 99, dtype=torch.long)
+    expected = module.forward_impl(
+        torch.empty(2, 0),
+        torch.tensor([11, 13]),
+        query_start_loc,
+        ngram_context,
+        output_buffer=torch.empty(2, 1),
+    )
+    actual = module.forward_impl(
+        torch.empty(4, 0),
+        torch.tensor([11, 13, 777, 888]),
+        query_start_loc,
+        ngram_context,
+        output_buffer=torch.empty(4, 1),
+    )
+
+    torch.testing.assert_close(actual[:2], expected)
+
+
+@pytest.mark.parametrize(
+    ("starts", "num_tokens"),
+    [
+        ([0, 1], 1),
+        ([0, 5], 5),
+        ([0, 3], 5),
+        ([0, 2, 5], 5),
+        ([0, 2, 2, 4], 7),
+        ([0, 16], 16),
+        ([0, 16], 17),
+        ([0, 5, 10, 15, 20], 20),
+        ([0, 64], 64),
+        ([0, 60, 65], 65),
+        ([0, 0, 5, 5, 20], 20),
+        ([0, 5, 10, 15, 18], 20),
+        ([0, 32], 32),
+    ],
+)
+def test_ngram_cpu_small_ids_match_torch_with_eos_and_padding(
+    monkeypatch: pytest.MonkeyPatch,
+    starts: list[int],
+    num_tokens: int,
+) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.ngram_size = 3
+    module.heads_per_ngram = 8
+    module.ngram_heads = 16
+    module._packed_result_layout = {"enabled": True}
+    module.eos_token_id = 248044
+    module.register_buffer("positions_buffer", torch.arange(128))
+    module.register_buffer("padded_buffer", torch.empty(4, 128, dtype=torch.long))
+    module.register_buffer(
+        "layer_multipliers",
+        torch.tensor([3229177723303, 2164907095717, 1840338581269]),
+    )
+    module.register_buffer(
+        "ngram_heads_vocab_sizes",
+        torch.tensor([20000003 + 14 * i for i in range(16)]),
+    )
+    module.register_buffer(
+        "ngram_heads_offsets",
+        torch.tensor([20000003 * i for i in range(16)]),
+    )
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    generator = torch.Generator().manual_seed(20260924)
+    for _ in range(32):
+        input_ids = torch.randint(
+            0, 248050, (num_tokens,), generator=generator, dtype=torch.int32
+        )
+        context = torch.randint(
+            0, 248050, (len(starts) - 1, 2), generator=generator, dtype=torch.int32
+        )
+        input_ids[input_ids % 7 == 0] = module.eos_token_id
+        context[context % 5 == 0] = module.eos_token_id
+        # int16 query offsets exercise the original Torch implementation;
+        # int32 offsets select the short CPU path on otherwise identical data.
+        reference = module.compute_ngram_ids(
+            input_ids, torch.tensor(starts, dtype=torch.int16), context
+        )
+        actual = module.compute_ngram_ids(
+            input_ids, torch.tensor(starts, dtype=torch.int32), context
+        )
+        assert torch.equal(actual, reference)
+
+
+def test_ngram_fp8_cpu_offload_preserves_quantized_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._packed_gguf = False
+    module.layer_name = "model.layers.0.ple"
+    module.embedding_dim = 2
+    module.head_dim = 2
+    module.ngram_size = 2
+    module.heads_per_ngram = 1
+    module.eos_token_id = 99
+    module.register_buffer("positions_buffer", torch.arange(2))
+    module.register_buffer("padded_buffer", torch.empty(1, 2, dtype=torch.long))
+    module.register_buffer("layer_multipliers", torch.tensor([1, 1]))
+    module.register_buffer("ngram_heads_vocab_sizes", torch.tensor([3]))
+    module.register_buffer("ngram_heads_offsets", torch.tensor([0]))
+    module.ngram_embedding = _make_fp8_embedding_layer(monkeypatch)
+
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    hidden_states = torch.empty(2, 0)
+    input_ids = torch.tensor([0, 1])
+    query_start_loc = torch.tensor([0, 2])
+    ngram_context = torch.tensor([[99]])
+    quantized = module.forward_impl(
+        hidden_states,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+    )
+    output_buffer = torch.empty(2, 2, dtype=torch.uint8)
+
+    output = module.forward_impl(
+        hidden_states,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        output_buffer=output_buffer,
+    )
+
+    assert output.data_ptr() == output_buffer.data_ptr()
+    assert output.dtype == torch.uint8
+    assert torch.equal(output, quantized.view(torch.uint8))
+
+
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:
     module = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(module)
@@ -493,3 +1581,500 @@ def test_ple_state_shape_reserves_speculative_tokens() -> None:
     module.num_spec_tokens = 3
 
     assert module.get_state_shape()[0] in ((32, 12), (12, 32))
+
+
+# ---------------------------------------------------------------------------
+# PP gate: the pipeline partition decides, not the pipeline size (#479)
+# ---------------------------------------------------------------------------
+
+
+def _text_config(ple_layer_ids, num_hidden_layers=48):
+    return SimpleNamespace(
+        ple_layer_ids=ple_layer_ids, num_hidden_layers=num_hidden_layers
+    )
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "pp_size", "partition"),
+    [
+        pytest.param([2], 1, None, id="pp1"),
+        pytest.param([2], 2, None, id="pp2-even-split"),
+        pytest.param([2], 2, "2,46", id="pp2-custom-split-rank0-holds-layer1"),
+        pytest.param([2, 24], 2, None, id="pp2-two-ple-layers-on-rank0"),
+    ],
+)
+def test_ple_pp_gate_accepts_ple_layers_on_first_rank(
+    monkeypatch: pytest.MonkeyPatch, ple_layer_ids, pp_size, partition
+):
+    from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+
+    if partition is None:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+
+    check_ple_layers_on_first_pp_rank(_text_config(ple_layer_ids), pp_size)
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "pp_size", "partition", "misplaced"),
+    [
+        pytest.param([2, 30], 2, None, "[29]", id="pp2-even-split"),
+        # ple_layer_ids are 1-based: id 2 is decoder layer 1, which a 1,47
+        # split puts on the second stage.
+        pytest.param([2], 2, "1,47", "[1]", id="pp2-custom-split-off-by-one"),
+        pytest.param([2, 20, 40], 4, None, "[19, 39]", id="pp4-two-misplaced"),
+    ],
+)
+def test_ple_pp_gate_rejects_ple_layers_beyond_first_rank(
+    monkeypatch: pytest.MonkeyPatch, ple_layer_ids, pp_size, partition, misplaced
+):
+    from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+
+    if partition is None:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+
+    with pytest.raises(RuntimeError, match=re.escape(f"decoder layers {misplaced}")):
+        check_ple_layers_on_first_pp_rank(_text_config(ple_layer_ids), pp_size)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+@pytest.mark.parametrize("host_rows", [0, 3, 8])
+def test_pinned_host_ple_merges_the_workers_rows_bit_identically(
+    monkeypatch: pytest.MonkeyPatch,
+    host_rows: int,
+) -> None:
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(
+        embedding_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
+    )
+    monkeypatch.setattr(
+        ple_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
+    )
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: host_rows * 8)
+    layer = _pinned_layer(num_embeddings=8)
+    _expose_to_gather_op(monkeypatch, layer)
+    # Twelve distinct rows: the rank holds the first eight across its device
+    # and host tiers, the offload worker serves the remaining four.
+    raw = torch.tensor(
+        [0x00, 0x01, 0x08, 0x38, 0x7E, 0x80, 0xB8, 0xFE],
+        dtype=torch.uint8,
+    ).repeat(12, 1)
+    raw = torch.stack([raw[i].roll(i) for i in range(12)])
+    resident = raw[:8].view(torch.float8_e4m3fn)
+    assert layer.load_shard(resident, checkpoint_start=0, tp_start=0, tp_end=8) == 8
+    layer.weight_scale = nn.Parameter(
+        torch.tensor([0.25], dtype=torch.float16, device="cuda"),
+        requires_grad=False,
+    )
+    layer.prepare_accelerator_weight()
+    assert layer.local_rows == 8
+
+    ids = torch.tensor([0, 9, 3, 11, 8, 7], dtype=torch.int64, device="cuda")
+    ids_cpu = ids.cpu()
+    expected = (raw.view(torch.float8_e4m3fn).float() * 0.25).to(torch.float16)
+    # The worker delivers one row per id; slots the rank serves itself carry
+    # NaN bytes that the merge has to ignore.
+    remote = raw[ids_cpu].clone()
+    remote[ids_cpu < 8] = 0xFF
+    remote = remote.cuda()
+    output = layer(ids, remote_rows=remote)
+    torch.accelerator.synchronize()
+    assert output.dtype == torch.float16
+    assert torch.equal(output.cpu(), expected[ids_cpu])
+
+    # With every id resident the merge changes nothing against the plain path.
+    resident_ids = ids.clamp_max(7)
+    plain = layer(resident_ids)
+    merged = layer(resident_ids, remote_rows=torch.full_like(remote, 0xFF))
+    assert torch.equal(plain, merged)
+
+    # Inside a CUDA graph the merge reads the worker's buffer at replay time.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            layer(ids, remote_rows=remote)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        graph_output = layer(ids, remote_rows=remote)
+    remote_slots = ids_cpu >= 8
+    for offset in range(1, 4):
+        rolled = raw.roll(offset, dims=0)
+        remote.copy_(rolled[ids_cpu])
+        graph.replay()
+        torch.accelerator.synchronize()
+        rolled_expected = (rolled.view(torch.float8_e4m3fn).float() * 0.25).to(
+            torch.float16
+        )
+        replayed = graph_output.cpu()
+        assert torch.equal(
+            replayed[remote_slots], rolled_expected[ids_cpu][remote_slots]
+        )
+        assert torch.equal(replayed[~remote_slots], expected[ids_cpu][~remote_slots])
+
+
+def _make_cascade_worker_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Qwen4ExpNGramEmbedding:
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", None)
+    monkeypatch.setattr(ple_module, "ple_cascade_configured", lambda: True)
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    config = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=8,
+        eos_token_id=2,
+        vocab_size=64,
+        split_ngram_parts=2,
+        seed=None,
+        ngram_vocab_size_base=101,
+        make_ngram_vocab_size_divisible_by=128,
+        ple_embedding_dtype="float8_e4m3fn",
+        ple_offload_embedding=False,
+    )
+    return Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim=256,
+        ple_dense_layer_id=0,
+        max_total_tokens=8,
+        max_num_reqs=2,
+        prefix="model.layers.2.ple.ple_embedding",
+        layer_name="model.layers.2.ple",
+        params_dtype=torch.float16,
+    )
+
+
+def test_ngram_embedding_cascade_worker_keeps_shards_file_backed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = _make_cascade_worker_embedding(monkeypatch)
+
+    assert Qwen4ExpNGramEmbedding.offload_keeps_local_tables()
+    assert layer._file_backed_shards
+    assert not layer._disk_offload
+    # The disk tier is the worker's only outer tier: its reader always runs.
+    assert layer._disk_executor is not None
+    assert len(layer._disk_shards) == 2
+    assert layer.ngram_embedding.weight.is_meta
+    assert layer.get_offload_output_dtype(torch.float16) == torch.uint8
+
+
+def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    output = torch.full((8, 256), 7, dtype=torch.uint8)
+
+    with pytest.raises(RuntimeError, match="before the ranks registered"):
+        layer._remote_lookup(
+            torch.zeros(8, 16, dtype=torch.int64), output.view(torch.float8_e4m3fn)
+        )
+    with pytest.raises(TypeError, match="PLERemotePlacement"):
+        layer.bind_remote_placements([object()])
+
+    resident = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=128)
+    layer.bind_remote_placements([resident])
+    assert layer._remote_placements == [resident]
+    assert layer._disk_segments == []
+
+    input_ids = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
+    ngram_context = torch.full((2, 2), 2, dtype=torch.int32)
+    result = layer.forward_impl(
+        input_ids, input_ids, query_start_loc, ngram_context, output_buffer=output
+    )
+    assert result.shape == (5, 256)
+    assert not output[:5].any()
+    assert output[5:].eq(7).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_one_worker_buffer_merges_into_every_rank_bit_identically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The worker reads the disk rows of both ranks into one buffer. Each rank
+    # merges the slots of its own disk segment and masks the ids of the other
+    # rank, so the reduced output equals a lookup in the complete table.
+    worker = _make_cascade_worker_embedding(monkeypatch)
+    rows, dim = worker.ngram_embedding.org_vocab_size, worker.head_dim
+    shard_size = worker._disk_shard_size
+    raw = torch.randint(0, 255, (rows, dim), dtype=torch.uint8)
+    raw[(raw & 0x78) == 0x78] = 0x11  # keep NaN/Inf codes out of the comparison
+    worker._disk_shards = [
+        raw[index * shard_size : (index + 1) * shard_size].view(torch.float8_e4m3fn)
+        for index in range(len(worker._disk_shards))
+    ]
+    _retain_shard_views(worker)
+
+    scale = torch.tensor([0.0371], dtype=torch.float16, device="cuda")
+    monkeypatch.setattr(ple_module, "tensor_model_parallel_all_reduce", lambda t: t)
+    ranks = []
+    for tp_rank, host_rows in ((0, 5), (1, 0)):
+        _patch_tp(monkeypatch, rank=tp_rank, world_size=2)
+        _patch_cascade(monkeypatch, host_bytes=host_rows * dim)
+        layer = _pinned_layer(
+            num_embeddings=rows,
+            embedding_dim=dim,
+            prefix=f"model.layers.2.ple.rank{tp_rank}.ngram_embedding",
+        )
+        # Half of the rank's rows fit on the device.
+        _patch_device_spill(monkeypatch, layer, rows // 4 * dim)
+        for shard_index, shard in enumerate(worker._disk_shards):
+            layer.load_shard(
+                shard,
+                checkpoint_start=shard_index * shard_size,
+                tp_start=layer.shard_indices.org_vocab_start_index,
+                tp_end=layer.shard_indices.org_vocab_end_index,
+            )
+        layer.weight_scale = nn.Parameter(scale.clone(), requires_grad=False)
+        layer.prepare_accelerator_weight()
+        assert layer._device_rows == rows // 4 and layer._disk_rows > 0
+        ranks.append(layer)
+    _expose_to_gather_op(monkeypatch, *ranks)
+
+    worker.bind_remote_placements(
+        [
+            PLERemotePlacement(
+                tp_start=layer.shard_indices.org_vocab_start_index,
+                tp_end=layer.shard_indices.org_vocab_end_index,
+                local_rows=layer.local_rows,
+            )
+            for layer in ranks
+        ]
+    )
+    assert sum(segment.end - segment.start for segment in worker._disk_segments) == (
+        sum(r._disk_rows for r in ranks)
+    )
+
+    table = (raw.view(torch.float8_e4m3fn).float() * scale.float().cpu()).to(
+        torch.float16
+    )
+    for tokens in (1, 5, 37):
+        ids = torch.randint(0, rows, (tokens, worker.ngram_heads))
+        output = torch.full((tokens, worker.embedding_dim), 0x7F, dtype=torch.uint8)
+        worker._remote_lookup(ids, output.view(torch.float8_e4m3fn))
+        remote = output.cuda()
+        ids_cuda = ids.cuda()
+        reduced = ranks[0](ids_cuda, remote_rows=remote) + ranks[1](
+            ids_cuda, remote_rows=remote
+        )
+        assert torch.equal(reduced.cpu(), table[ids])
+
+
+def test_remote_placement_counts_the_rows_left_to_the_worker() -> None:
+    placement = PLERemotePlacement(tp_start=100, tp_end=250, local_rows=100)
+    assert placement.remote_rows == 50
+    assert PLERemotePlacement(tp_start=0, tp_end=100, local_rows=128).remote_rows == 0
+    with pytest.raises(ValueError, match="TP vocabulary range"):
+        PLERemotePlacement(tp_start=10, tp_end=5, local_rows=0)
+    with pytest.raises(ValueError, match="local_rows"):
+        PLERemotePlacement(tp_start=0, tp_end=5, local_rows=-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_cascade_rank_reports_its_resident_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: 3 * 8)
+    embedding = _pinned_layer(num_embeddings=8)
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._cascade = False
+    module.ngram_embedding = embedding
+    assert module.remote_placement() is None
+
+    module._cascade = True
+    assert module.remote_placement() == PLERemotePlacement(
+        tp_start=0, tp_end=8, local_rows=8
+    )
+    assert (embedding._device_rows, embedding._host_rows) == (5, 3)
+
+    module.ngram_embedding = nn.Module()
+    with pytest.raises(RuntimeError, match="split device/host table"):
+        module.remote_placement()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_pinned_host_ple_merge_stays_bit_identical_under_inductor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The resident gather writes the host tier and then the worker's rows into
+    # the same output view. A wrong ordering of those two copies under
+    # Inductor would lose host rows silently; eager tests cannot see it.
+    rows, host_rows, dim, heads = 512, 128, 8, 16
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(
+        embedding_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
+    )
+    monkeypatch.setattr(
+        ple_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
+    )
+    monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: host_rows * dim)
+    layer = _pinned_layer(num_embeddings=rows, embedding_dim=dim)
+    _expose_to_gather_op(monkeypatch, layer)
+    raw = torch.randint(0, 255, (rows, dim), dtype=torch.uint8)
+    raw[(raw & 0x78) == 0x78] = 0x11  # keep NaN/Inf codes out of the comparison
+    layer.load_shard(
+        raw.view(torch.float8_e4m3fn), checkpoint_start=0, tp_start=0, tp_end=rows
+    )
+    layer.weight_scale = nn.Parameter(
+        torch.tensor([0.0371], dtype=torch.float16, device="cuda"),
+        requires_grad=False,
+    )
+    layer.prepare_accelerator_weight()
+    assert layer._host_rows == host_rows
+
+    def merged(ids: torch.Tensor, remote: torch.Tensor) -> torch.Tensor:
+        return layer(ids, remote_rows=remote)
+
+    compiled = torch.compile(merged, dynamic=True, fullgraph=True)
+    table = (raw.view(torch.float8_e4m3fn).float() * 0.0371).to(torch.float16).cuda()
+    for tokens in (5, 333):
+        ids = torch.randint(0, rows, (tokens, heads), device="cuda")
+        remote = torch.full(
+            (tokens, heads * dim), 0x7F, dtype=torch.uint8, device="cuda"
+        )
+        assert torch.equal(compiled(ids, remote), table[ids])
+
+
+def _retain_shard_views(layer: Qwen4ExpNGramEmbedding) -> None:
+    """Keep the shard views load_weights retains for the gathers."""
+    layer._disk_shard_arrays = [
+        shard.view(torch.uint8).numpy() for shard in layer._disk_shards
+    ]
+    layer._disk_shard_pointers = [
+        array.ctypes.data for array in layer._disk_shard_arrays
+    ]
+
+
+def _fill_worker_shards(layer: Qwen4ExpNGramEmbedding) -> torch.Tensor:
+    """Give the worker mapped-looking shards and return the whole raw table."""
+    rows, dim = layer.ngram_embedding.org_vocab_size, layer.head_dim
+    raw = torch.randint(0, 255, (rows, dim), dtype=torch.uint8)
+    raw[(raw & 0x78) == 0x78] = 0x11  # keep NaN/Inf codes out of the comparison
+    shard_size = layer._disk_shard_size
+    layer._disk_shards = [
+        raw[index * shard_size : (index + 1) * shard_size].view(torch.float8_e4m3fn)
+        for index in range(len(layer._disk_shards))
+    ]
+    _retain_shard_views(layer)
+    return raw
+
+
+def _mapped_rss_kib(path: str) -> int:
+    """Resident pages of every mapping of one file in this process."""
+    total = 0
+    in_file = False
+    with open("/proc/self/smaps") as smaps:
+        for line in smaps:
+            fields = line.split()
+            if "-" in fields[0] and len(fields) >= 5:
+                in_file = fields[-1] == path
+            elif in_file and fields[0] == "Rss:":
+                total += int(fields[1])
+    return total
+
+
+def _map_worker_shards_from_file(
+    layer: Qwen4ExpNGramEmbedding, monkeypatch, tmp_path, shard_size: int = 20_000
+) -> tuple[torch.Tensor, str]:
+    """Give the worker file-backed shards, as the loader does, and the raw table.
+
+    Shards large enough that scattered rows touch pages the open did not.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    shards, dim = len(layer._disk_shards), layer.head_dim
+    rows = shards * shard_size
+    monkeypatch.setattr(layer.ngram_embedding, "org_vocab_size", rows)
+    layer._disk_shard_size = shard_size
+    layer._disk_shard_boundaries = (
+        torch.arange(1, shards, dtype=torch.int64) * shard_size
+    )
+    raw = torch.randint(0, 255, (rows, dim), dtype=torch.uint8)
+    path = str(tmp_path / "ple.safetensors")
+    save_file(
+        {
+            f"shard_{index}": raw[index * shard_size : (index + 1) * shard_size]
+            .clone()
+            .contiguous()
+            for index in range(shards)
+        },
+        path,
+    )
+    with safe_open(path, framework="pt") as checkpoint:
+        layer._disk_shards = [
+            checkpoint.get_tensor(f"shard_{index}") for index in range(shards)
+        ]
+    _retain_shard_views(layer)
+    layer._disk_mapped_paths.add(path)
+    return raw, path
+
+
+def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
+    # A mapped page is one the kernel keeps; with the release switch the disk
+    # tier must not collect them. The rows stay readable from the file.
+    runtime = VllmConfig()
+    runtime.kernel_config.ple_disk_release_pages = True
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: runtime)
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
+    # Opening the checkpoint may touch its header pages; only the gather counts.
+    resident_before = _mapped_rss_kib(path)
+
+    ids = torch.randint(0, raw.shape[0], (512,)).numpy()
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    assert _mapped_rss_kib(path) <= resident_before
+    # Unmapped, not lost: the second read maps the pages back in.
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+
+
+def test_disk_gather_keeps_its_pages_mapped_by_default(monkeypatch, tmp_path) -> None:
+    # Without the switch the worker keeps what it read mapped, as before.
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: None)
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
+    resident_before = _mapped_rss_kib(path)
+
+    ids = torch.randint(0, raw.shape[0], (512,)).numpy()
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    assert _mapped_rss_kib(path) > resident_before
+
+
+def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Everything beyond the resident tiers is read from the checkpoint.
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw = _fill_worker_shards(layer)
+    rows, dim, heads = raw.shape[0], layer.head_dim, layer.ngram_heads
+    resident = rows // 2
+
+    layer.bind_remote_placements(
+        [PLERemotePlacement(tp_start=0, tp_end=rows, local_rows=resident)]
+    )
+    assert layer._disk_segments == [PLEDiskSegment(start=resident, end=rows)]
+
+    tokens = 9
+    ids = torch.randint(0, rows, (tokens, heads))
+    output = torch.full((tokens, layer.embedding_dim), 0x7F, dtype=torch.uint8)
+    layer._remote_lookup(ids, output.view(torch.float8_e4m3fn))
+
+    served = output.view(-1, dim)
+    on_disk = ids.reshape(-1) >= resident
+    assert torch.equal(served[on_disk], raw[ids.reshape(-1)][on_disk])
+    # Rows the ranks hold themselves are not read, and not written either.
+    assert served[~on_disk].eq(0x7F).all()

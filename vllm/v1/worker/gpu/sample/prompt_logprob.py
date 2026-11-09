@@ -46,6 +46,8 @@ class PromptLogprobsWorker:
         prefill_lens: np.ndarray,
         # [max_num_reqs]
         num_computed_prefill_tokens: np.ndarray,
+        # [max_num_reqs], existing device/UVA metadata (no per-step host copy).
+        prompt_lens_gpu: torch.Tensor,
     ) -> dict[str, LogprobsTensors]:
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
@@ -79,6 +81,7 @@ class PromptLogprobsWorker:
             input_batch.idx_mapping,
             num_computed_tokens,
             all_token_ids,
+            prompt_lens_gpu,
         )
         prompt_token_ids, prompt_logprobs, prompt_ranks = (
             compute_prompt_logprobs_with_chunking(
@@ -159,6 +162,7 @@ def _prompt_logprobs_token_ids_kernel(
     num_computed_tokens_ptr,
     all_token_ids_ptr,
     all_token_ids_stride,
+    prompt_lens_ptr,
     BLOCK_SIZE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -169,6 +173,7 @@ def _prompt_logprobs_token_ids_kernel(
     query_len = query_end - query_start
 
     num_computed_tokens = tl.load(num_computed_tokens_ptr + req_state_idx)
+    prompt_len = tl.load(prompt_lens_ptr + req_state_idx)
     for i in range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
@@ -177,7 +182,10 @@ def _prompt_logprobs_token_ids_kernel(
         target_pos = num_computed_tokens + 1 + block
         token_ids = tl.load(
             all_token_ids_ptr + req_state_idx * all_token_ids_stride + target_pos,
-            mask=mask,
+            # The final prompt row and other requests' decode rows have no
+            # known next prompt token. Their logprobs are discarded later.
+            mask=mask & (target_pos < prompt_len),
+            other=0,
         )
         tl.store(
             prompt_logprobs_token_ids_ptr + query_start + block, token_ids, mask=mask
@@ -190,6 +198,7 @@ def get_prompt_logprobs_token_ids(
     idx_mapping: torch.Tensor,
     num_computed_tokens: torch.Tensor,
     all_token_ids: torch.Tensor,
+    prompt_lens: torch.Tensor,
 ) -> torch.Tensor:
     token_ids = torch.empty(num_tokens, dtype=torch.int64, device=idx_mapping.device)
     num_reqs = idx_mapping.shape[0]
@@ -200,6 +209,7 @@ def get_prompt_logprobs_token_ids(
         num_computed_tokens,
         all_token_ids,
         all_token_ids.stride(0),
+        prompt_lens,
         BLOCK_SIZE=1024,
     )
     return token_ids

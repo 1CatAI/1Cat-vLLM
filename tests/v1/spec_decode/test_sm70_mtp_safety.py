@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
 
+import vllm.distributed.parallel_state as parallel_state
+import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer_module
+import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
+from vllm.config.observability import ObservabilityConfig
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.llm_base_proposer import (
@@ -15,6 +18,7 @@ from vllm.v1.spec_decode.llm_base_proposer import (
     _clone_drafter_mutable_metadata,
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.profiling import create_step_profiler
 from vllm.v1.spec_decode.utils import (
     eagle_prepare_next_token_padded_kernel,
     next_power_of_2,
@@ -34,19 +38,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_dspark_uses_sm70_mtp_profile_timing() -> None:
-    runner = SimpleNamespace(
-        speculative_config=SimpleNamespace(
-            method="dspark",
-            use_dflash_ddtree=lambda: False,
+def _profile(role, logger):
+    return create_step_profiler(
+        SimpleNamespace(
+            observability_config=ObservabilityConfig(),
+            speculative_config=SimpleNamespace(method="dspark"),
         ),
-        device=torch.device("cuda"),
+        torch.device("cuda"),
+        role=role,
+        logger=logger,
     )
-    with patch(
-        "vllm.v1.worker.gpu_model_runner._sm70_mtp_profile_env_enabled",
-        return_value=True,
-    ):
-        assert GPUModelRunner._sm70_mtp_profile_enabled(runner)
+
+
+def test_dspark_uses_sm70_mtp_profile_timing(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SM70_MTP_PROFILE", "1")
+    assert _profile("runner", gpu_model_runner_module.logger).enabled
+    assert _profile("proposer", llm_base_proposer_module.logger).enabled
 
 
 def test_prepare_next_token_padded_counts_only_contiguous_prefix():
@@ -320,3 +327,121 @@ def test_dynamic_vocab_merge_preserves_finite_top20_order():
         pairs[:, 1].to(torch.int64).cpu(),
         all_ids[expected_positions].cpu(),
     )
+
+
+class _FakeEvent:
+    def __init__(self, elapsed_ms: float = 0.0):
+        self.elapsed_ms = elapsed_ms
+
+    def elapsed_time(self, end: "_FakeEvent") -> float:
+        del end
+        return self.elapsed_ms
+
+    def synchronize(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("pp_is_last_rank", "tp_rank_in_group", "expected"),
+    [
+        (True, 0, True),
+        (True, 1, False),
+        (False, 0, False),
+        (False, 1, False),
+    ],
+)
+def test_is_last_pp_first_tp_rank(
+    monkeypatch, pp_is_last_rank, tp_rank_in_group, expected
+):
+    monkeypatch.setattr(
+        parallel_state, "_PP", SimpleNamespace(is_last_rank=pp_is_last_rank)
+    )
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(rank_in_group=tp_rank_in_group)
+    )
+    assert parallel_state.is_last_pp_first_tp_rank() is expected
+
+
+def test_is_last_pp_first_tp_rank_without_model_parallel_groups(monkeypatch):
+    monkeypatch.setattr(parallel_state, "_PP", None)
+    monkeypatch.setattr(parallel_state, "_TP", None)
+    assert parallel_state.is_last_pp_first_tp_rank() is True
+
+
+def _record_info(monkeypatch, module) -> list[str]:
+    messages: list[str] = []
+    monkeypatch.setattr(
+        module.logger, "info", lambda msg, *args, **kwargs: messages.append(msg)
+    )
+    return messages
+
+
+# (global first rank, last PP stage, TP rank in group) -> report expected.
+# PP=2: the last stage never holds the global first rank -- that is #414.
+_REPORT_RANK_CASES = [
+    pytest.param(False, True, 0, True, id="pp2-last-stage-leader"),
+    pytest.param(False, True, 1, False, id="pp2-last-stage-tp1"),
+    pytest.param(True, False, 0, False, id="pp2-first-stage"),
+]
+
+
+def _simulate_rank(monkeypatch, global_first: bool, pp_last: bool, tp_rank: int):
+    monkeypatch.setattr(
+        parallel_state, "_WORLD", SimpleNamespace(is_first_rank=global_first)
+    )
+    monkeypatch.setattr(parallel_state, "_PP", SimpleNamespace(is_last_rank=pp_last))
+    monkeypatch.setattr(parallel_state, "_TP", SimpleNamespace(rank_in_group=tp_rank))
+
+
+@pytest.mark.parametrize(
+    ("global_first", "pp_last", "tp_rank", "expected"), _REPORT_RANK_CASES
+)
+def test_runner_mtp_profile_reports_from_last_pp_stage(
+    monkeypatch, global_first, pp_last, tp_rank, expected
+):
+    """Regression for #414: the events are recorded on the last PP stage,
+    so the report must come from there, not from the global first rank."""
+    monkeypatch.setenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "1")
+    _simulate_rank(monkeypatch, global_first, pp_last, tp_rank)
+    messages = _record_info(monkeypatch, gpu_model_runner_module)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    ctx = {
+        "events": [
+            ("target_forward", _FakeEvent(24.3), _FakeEvent()),
+            ("draft_total", _FakeEvent(83.9), _FakeEvent()),
+        ],
+        "cpu_ms": {"draft_wall_cpu": 90.0},
+        "has_spec_decode_metadata": True,
+        "num_tokens": 6,
+        "num_reqs": 1,
+    }
+
+    runner._step_profiler = _profile("runner", gpu_model_runner_module.logger)
+    runner._step_profiler.report(ctx)
+
+    # Totals accumulate on every rank; only the report rank logs them.
+    assert runner._step_profiler.totals["draft_total"] == 83.9
+    assert any("SM70 spec runner profile" in m for m in messages) is expected
+
+
+@pytest.mark.parametrize(
+    ("global_first", "pp_last", "tp_rank", "expected"), _REPORT_RANK_CASES
+)
+def test_proposer_mtp_profile_reports_from_last_pp_stage(
+    monkeypatch, global_first, pp_last, tp_rank, expected
+):
+    monkeypatch.setenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "1")
+    _simulate_rank(monkeypatch, global_first, pp_last, tp_rank)
+    messages = _record_info(monkeypatch, llm_base_proposer_module)
+    proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+
+    proposer._step_profiler = _profile("proposer", llm_base_proposer_module.logger)
+    proposer._step_profiler.report_proposal(
+        events=[("total_gpu", _FakeEvent(83.9), _FakeEvent())],
+        cpu_ms={"total_wall_cpu": 90.0},
+        batch_size=1,
+        num_tokens=6,
+    )
+
+    assert proposer._step_profiler.totals["total_gpu"] == 83.9
+    assert bool(messages) is expected

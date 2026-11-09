@@ -23,6 +23,14 @@ from vllm.utils.import_utils import has_cutedsl
 from .fp8_software import fp8_e4m3fn_bits_to_fp32, fp32_to_fp8_e4m3fn_bits
 
 
+def needs_software_fp8() -> bool:
+    """Whether Triton has to decode FP8 in software: native FP8 exists from
+    Ada (sm89) on."""
+    return current_platform.is_cuda() and not current_platform.has_device_capability(
+        (8, 9)
+    )
+
+
 @triton.jit
 def quantize_and_insert_k_kernel(
     # Input tensors
@@ -199,9 +207,7 @@ def quantize_and_insert_k_cache(
         block_stride=block_stride,
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
-        use_software_fp8=(
-            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
-        ),
+        use_software_fp8=needs_software_fp8(),
     )
 
 
@@ -362,9 +368,7 @@ def dequantize_and_gather_k_cache_triton(
         output_dim=512,
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
-        use_software_fp8=(
-            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
-        ),
+        use_software_fp8=needs_software_fp8(),
     )
 
 
@@ -382,9 +386,8 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    use_cutedsl = has_cutedsl() and not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
-    )
+    # The CuteDSL path needs native FP8 units, see needs_software_fp8.
+    use_cutedsl = has_cutedsl() and not needs_software_fp8()
     if use_cutedsl:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (

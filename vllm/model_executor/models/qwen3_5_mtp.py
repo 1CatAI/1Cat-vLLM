@@ -3,16 +3,15 @@
 """Inference-only Qwen3_5 MTP model."""
 
 import copy
-import os
 import typing
 from collections.abc import Callable, Iterable
 
 import torch
 from torch import nn
 
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.execution_policy import layer_policy
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -34,6 +33,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsPP,
     _require_is_multimodal,
 )
 from .utils import (
@@ -57,8 +57,9 @@ _SM70_MTP_DENSE_F16_SUFFIXES = {
 }
 
 
-def _parse_sm70_mtp_dense_f16_allowlist() -> set[str]:
-    raw = envs.VLLM_SM70_MTP_DENSE_F16_ALLOWLIST
+def _parse_sm70_mtp_dense_f16_allowlist(policy=None) -> set[str]:
+    policy = layer_policy() if policy is None else policy
+    raw = policy.mtp_dense_allowlist
     if raw is None:
         return set(_SM70_MTP_DENSE_F16_SUFFIXES)
     lowered = raw.strip().lower()
@@ -67,11 +68,12 @@ def _parse_sm70_mtp_dense_f16_allowlist() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
-def _mark_sm70_mtp_dense_f16_modules(model: nn.Module) -> None:
-    if not envs.VLLM_SM70_MTP_DENSE_F16_FASTPATH:
+def _mark_sm70_mtp_dense_f16_modules(model: nn.Module, policy=None) -> None:
+    policy = layer_policy() if policy is None else policy
+    if not policy.value("mtp_dense_fastpath"):
         return
 
-    suffixes = _parse_sm70_mtp_dense_f16_allowlist()
+    suffixes = _parse_sm70_mtp_dense_f16_allowlist(policy)
     if not suffixes:
         return
 
@@ -122,10 +124,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = model_config.hf_text_config
 
         self.config = config
+        self._runtime_trace = vllm_config.observability_config.runtime_trace
 
         self.vocab_size = config.vocab_size
 
-        if envs.VLLM_DEBUG_MTP_LOAD:
+        if self._runtime_trace.value("mtp_load"):
             logger.warning(
                 "Qwen3_5MultiTokenPredictor init quant_config=%s",
                 type(quant_config).__name__ if quant_config is not None else "None",
@@ -182,7 +185,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.pre_fc_norm_embedding = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        _mark_sm70_mtp_dense_f16_modules(self)
+        _mark_sm70_mtp_dense_f16_modules(self, layer_policy(vllm_config))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -196,31 +199,27 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_input_ids(input_ids)
-            assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        # The drafter is stage-local, so this module is always a complete
+        # model: gpu_model_runner returns the IntermediateTensors on every
+        # non-final pipeline rank before speculation is reached, and the MTP
+        # layers here are replicated rather than partitioned. Branching on the
+        # TARGET model's pipeline position sent the final rank into the
+        # "receive from the previous stage" path and asserted on intermediate
+        # tensors that nobody sends.
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         hidden_states, residual = self.layers[current_step_idx](
             positions=positions,
             hidden_states=hidden_states,
-            residual=residual,
+            residual=None,
         )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -399,13 +398,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
-        if envs.VLLM_DEBUG_MTP_LOAD:
+        if self._runtime_trace.value("mtp_load"):
             logger.warning(
                 "Qwen3_5MultiTokenPredictor loaded %d tensors into %d params",
                 len(loaded_params),
                 len(params_dict),
             )
-            if envs.VLLM_DEBUG_MTP_LOAD_VERBOSE:
+            if self._runtime_trace.value("mtp_load_verbose"):
                 missing_params = sorted(set(params_dict.keys()) - loaded_params)
                 if missing_params:
                     logger.warning(
@@ -434,7 +433,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(nn.Module, SupportsMultiModal):
+class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -479,11 +478,10 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             )
 
         self.quant_config = vllm_config.quant_config
-        self.share_target_io_weights = (
-            os.getenv("VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS", "1") != "0"
-        )
+        policy = layer_policy(vllm_config)
+        self.share_target_io_weights = policy.mtp_share_io_weights
         mtp_vllm_config = vllm_config
-        keep_quant = os.getenv("VLLM_QWEN35_MTP_KEEP_QUANT", "0") == "1"
+        keep_quant = policy.mtp_keep_quant
         if (
             self.quant_config is not None
             and not keep_quant
@@ -505,10 +503,16 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
 
         super().__init__()
         self.config = config
+        # The target's embedding only lives on the first pipeline rank, and
+        # load_eagle_model skips embedding sharing under PP. A shared (missing)
+        # embedding would stay a PPMissingLayer on the drafter's rank, so the
+        # drafter builds and loads its own copy there.
         self.model = Qwen3_5MultiTokenPredictor(
             vllm_config=mtp_vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
-            share_target_embed_tokens=self.share_target_io_weights,
+            share_target_embed_tokens=(
+                self.share_target_io_weights and get_pp_group().world_size == 1
+            ),
         )
 
         if get_pp_group().is_last_rank:
@@ -527,6 +531,9 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(
         self,
@@ -588,17 +595,29 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
     ) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
+    @staticmethod
+    def _draft_weight_name(name: str) -> str | None:
+        """The drafter's name for a checkpoint tensor, None for the target's."""
+        if name.startswith("mtp."):
+            return name.replace("mtp.", "model.")
+        if "embed_tokens" in name:
+            return name.replace("language_model.", "")
+        if "lm_head" in name:
+            return name
+        return None
+
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        # The drafter ships inside its target's checkpoint; without this the
+        # loader reads the whole target again only for load_weights to drop
+        # everything but mtp.* (47 s for the 27B under direct I/O).
+        return self._draft_weight_name(name) is None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):
             for name, weight in weights:
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                elif any(key in name for key in ["embed_tokens", "lm_head"]):
-                    if "embed_tokens" in name:
-                        name = name.replace("language_model.", "")
-                else:
-                    continue
-                yield name, weight
+                draft_name = self._draft_weight_name(name)
+                if draft_name is not None:
+                    yield draft_name, weight
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(remap_weight_names(weights))

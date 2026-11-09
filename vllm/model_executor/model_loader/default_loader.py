@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import cast
 
 import torch
@@ -16,6 +16,7 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.direct_io import decoder_layer_filter
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
@@ -26,18 +27,62 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     get_quant_config,
+    get_safetensors_index_weights_by_file,
+    indexed_shards_in_subfolders,
+    indexed_shards_not_selected,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    raise_on_missing_safetensors_shards,
     safetensors_weights_iterator,
 )
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+
+def _decoder_root(model: nn.Module) -> nn.Module:
+    """The module to search for the decoder stack: the language model of a
+    multimodal model, otherwise the model itself."""
+    if isinstance(model, SupportsMultiModal):
+        return model.get_language_model()
+    return model
+
+
+def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
+    """[start, end) of the decoder layers this pipeline stage holds, or None
+    when it holds all of them. vLLM decoder stacks keep a full-length
+    `layers` list with placeholders and record their range in
+    start_layer/end_layer.
+
+    Multimodal models are searched in their language model only: an encoder
+    tower built with make_layers carries its own pipeline range, which must
+    not filter the language model's layers. Two different partial ranges
+    are ambiguous and raise instead of skipping the wrong layers."""
+    ranges = set()
+    for module in _decoder_root(model).modules():
+        start = getattr(module, "start_layer", None)
+        end = getattr(module, "end_layer", None)
+        layers = getattr(module, "layers", None)
+        if (
+            isinstance(start, int)
+            and isinstance(end, int)
+            and layers is not None
+            and not (start == 0 and end == len(layers))
+        ):
+            ranges.add((start, end))
+    if len(ranges) > 1:
+        raise ValueError(
+            "Direct I/O loading found several pipeline-partial layer stacks "
+            f"{sorted(ranges)} in {type(model).__name__} and cannot tell which "
+            "one the checkpoint's decoder layers belong to"
+        )
+    return ranges.pop() if ranges else None
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -67,6 +112,15 @@ class DefaultModelLoader(BaseModelLoader):
 
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
+
+        skip_weight: Callable[[str], bool] | None = None
+        """If defined, tensors whose checkpoint name (before *prefix*) it
+        accepts are skipped before they are read from disk."""
+
+        map_weight: Callable[[str], bool] | None = None
+        """If defined, tensors whose checkpoint name (before *prefix*) it
+        accepts stay memory-mapped under direct I/O: the model reads them
+        only partially or keeps them file-backed."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -101,7 +155,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
-    ) -> tuple[str, list[str], bool]:
+    ) -> tuple[str, list[str], bool, dict[str, set[str]] | None]:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
@@ -179,6 +233,9 @@ class DefaultModelLoader(BaseModelLoader):
             if len(hf_weights_files) > 0:
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True
+                    hf_weights_files += indexed_shards_in_subfolders(
+                        hf_folder, index_file, pattern
+                    )
                 break
 
         if use_safetensors:
@@ -198,6 +255,29 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
             )
+            # An incomplete download or copy fails here, naming the missing
+            # files, instead of leaving parameters unloaded. A model's own
+            # allow patterns may load a deliberate subset of an index.
+            raise_on_missing_safetensors_shards(
+                hf_folder,
+                index_file,
+                hf_weights_files,
+                ignore_patterns=self.load_config.ignore_patterns,
+                check_index=allow_patterns_overrides is None,
+            )
+            # A shard the index names but the loader would skip leaves its
+            # parameters unloaded without any error; only a model's own
+            # allow patterns may leave shards out on purpose.
+            unread = (
+                indexed_shards_not_selected(hf_folder, index_file, hf_weights_files)
+                if allow_patterns_overrides is None
+                else []
+            )
+            if unread:
+                raise RuntimeError(
+                    f"The checkpoint index of {model_name_or_path} names shards "
+                    f"that would not be loaded: {unread[:4]}"
+                )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -206,14 +286,31 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
-        return hf_folder, hf_weights_files, use_safetensors
+        indexed_weights_by_file = (
+            get_safetensors_index_weights_by_file(
+                hf_folder, index_file, hf_weights_files
+            )
+            if use_safetensors
+            else None
+        )
+        return (
+            hf_folder,
+            hf_weights_files,
+            use_safetensors,
+            indexed_weights_by_file,
+        )
 
     def _get_weights_iterator(
         self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
-        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+        (
+            hf_folder,
+            hf_weights_files,
+            use_safetensors,
+            indexed_weights_by_file,
+        ) = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
             source.revision,
@@ -231,12 +328,29 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
-            if self.load_config.load_format == "fastsafetensors":
+            # fastsafetensors/instanttensor iterators cannot filter tensors
+            # inside a reused shard. `indexed_weights_by_file` is only set when
+            # a shard really does store unindexed tensors, so ordinary indexed
+            # checkpoints keep using these accelerated backends and only
+            # reused-shard checkpoints take the standard filtered iterator.
+            use_special_format = self.load_config.load_format in (
+                "fastsafetensors",
+                "instanttensor",
+            )
+            if use_special_format and indexed_weights_by_file is not None:
+                logger.warning(
+                    "Checkpoint shards store tensors the index does not "
+                    "assign to them; falling back from %s to the filtered "
+                    "safetensors iterator so the index is honored.",
+                    self.load_config.load_format,
+                )
+                use_special_format = False
+            if use_special_format and self.load_config.load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                 )
-            elif self.load_config.load_format == "instanttensor":
+            elif use_special_format and self.load_config.load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
@@ -249,6 +363,7 @@ class DefaultModelLoader(BaseModelLoader):
                         max_workers=extra_config.get(
                             "num_threads", self.DEFAULT_NUM_THREADS
                         ),
+                        indexed_weights_by_file=indexed_weights_by_file,
                     )
                 else:
                     weights_iterator = safetensors_weights_iterator(
@@ -256,6 +371,10 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        indexed_weights_by_file=indexed_weights_by_file,
+                        skip_weight=source.skip_weight,
+                        map_weight=source.map_weight,
+                        auto_direct=not getattr(self, "_auto_direct_disabled", False),
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -285,17 +404,69 @@ class DefaultModelLoader(BaseModelLoader):
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
+    def _skip_weight_for(self, model: nn.Module) -> Callable[[str], bool] | None:
+        """The model's own skip predicate, plus, for direct I/O under pipeline
+        parallelism, the decoder layers another stage owns. A memory-mapped
+        shard only reads what a stage touches; direct I/O reads up front, so
+        it must leave those tensors out itself."""
+        from vllm.distributed import get_pp_group
+
+        skip_weight = getattr(model, "skip_checkpoint_weight", None)
+        strategy = self.load_config.safetensors_load_strategy
+        if strategy not in (None, "direct"):
+            return skip_weight
+        from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+        if not model_parallel_is_initialized():
+            return skip_weight
+        # Without pipeline parallelism there is no stage to filter, and not
+        # every multimodal model can name its language model.
+        if get_pp_group().world_size == 1:
+            return skip_weight
+        try:
+            layer_range = _pipeline_stage_layer_range(model)
+        except ValueError:
+            if strategy == "direct":
+                raise
+            self._auto_direct_disabled = True
+            logger.info_once(
+                "Auto direct I/O unavailable: pipeline decoder layer ranges "
+                "are ambiguous; retaining mapped loading."
+            )
+            return skip_weight
+        if layer_range is None:
+            return skip_weight
+        other_stage = decoder_layer_filter(*layer_range)
+        if skip_weight is None:
+            return other_stage
+        return lambda name: skip_weight(name) or other_stage(name)
+
     def get_all_weights(
         self,
         model_config: ModelConfig,
         model: nn.Module,
+        skip_weight: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Stream the primary checkpoint's tensors, then the secondary ones.
+
+        *skip_weight* lets a caller that needs only part of the checkpoint
+        leave the rest out before it is touched: even a memory-mapped tensor
+        is read (with readahead) once it is handed out.
+        """
+        model_skip = self._skip_weight_for(model)
+        if skip_weight is not None and model_skip is not None:
+            caller_skip = skip_weight
+            skip_weight = lambda name: caller_skip(name) or model_skip(name)  # noqa: E731
+        elif skip_weight is None:
+            skip_weight = model_skip
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            skip_weight=skip_weight,
+            map_weight=getattr(model, "map_checkpoint_weight", None),
         )
         yield from self._get_weights_iterator(primary_weights)
 

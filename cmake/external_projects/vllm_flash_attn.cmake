@@ -36,15 +36,29 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 elseif(VLLM_FLASH_ATTN_SM70)
+  set(VLLM_FLASH_ATTN_SM70_COMMIT c2eda5e6115b98c3ba4bfd181570668742eece22)
+  find_package(Git REQUIRED)
   find_program(PATCH_EXECUTABLE patch REQUIRED)
   FetchContent_Declare(
           vllm-flash-attn
           GIT_REPOSITORY https://github.com/zhinianqin/flash-attention-v100.git
-          GIT_TAG c2eda5e6115b98c3ba4bfd181570668742eece22
+          GIT_TAG ${VLLM_FLASH_ATTN_SM70_COMMIT}
           GIT_PROGRESS TRUE
           GIT_SUBMODULES csrc/cutlass
           GIT_SUBMODULES_RECURSE TRUE
           PATCH_COMMAND
+            # FetchContent can rerun PATCH_COMMAND on reconfigure. Restore the
+            # pinned dependency first so an incremental wheel rebuild is
+            # deterministic instead of trying to patch an already-patched tree.
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR> reset --hard
+            ${VLLM_FLASH_ATTN_SM70_COMMIT}
+          COMMAND
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR> clean -fd
+          COMMAND
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR>/csrc/cutlass reset --hard
+          COMMAND
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR>/csrc/cutlass clean -fd
+          COMMAND
             ${PATCH_EXECUTABLE} --batch --forward -p1 -l
             -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_pipeline.patch
           COMMAND
@@ -56,6 +70,9 @@ elseif(VLLM_FLASH_ATTN_SM70)
           COMMAND
             ${PATCH_EXECUTABLE} --batch --forward -p1 -l
             -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_gqa_arch.patch
+          COMMAND
+            ${PATCH_EXECUTABLE} --batch --forward -p1 -l
+            -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_splitkv_n.patch
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
@@ -79,6 +96,47 @@ install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_
 # Fetch the vllm-flash-attn library
 FetchContent_MakeAvailable(vllm-flash-attn)
 message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
+
+# Keep the precision-qualified SM70 prefill route in the parent repository.
+# Its private CUTLASS visitors have distinct types and do not modify the
+# legacy FA2 headers or operators, which remain available for rollback.
+if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
+  set(SM70_V37_DIR "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_v37")
+  target_include_directories(_vllm_fa2_C PRIVATE
+    "${vllm-flash-attn_SOURCE_DIR}/csrc/cutlass/examples/35_gemm_softmax")
+  set(SM70_V37_CUDA_SRCS
+    "${SM70_V37_DIR}/prefill.cu"
+    "${SM70_V37_DIR}/tail.cu"
+    "${SM70_V37_DIR}/bridge.cu")
+  # FA2 is created in a child directory. Source properties must be visible in
+  # that target's scope; setting them only in the parent silently loses SM70.
+  set_source_files_properties(${SM70_V37_CUDA_SRCS}
+    TARGET_DIRECTORY _vllm_fa2_C
+    PROPERTIES COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70")
+  target_sources(_vllm_fa2_C PRIVATE
+    ${SM70_V37_CUDA_SRCS}
+    "${SM70_V37_DIR}/register.cpp")
+endif()
+
+# The grouped E4M3 FP32 long-context route ships inside the same extension, so
+# the accelerated path is available without an externally built DSO.
+if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
+  set(SM70_GROUPED_LONG_DIR
+      "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_grouped_long")
+  set(SM70_GROUPED_LONG_SRC
+      "${SM70_GROUPED_LONG_DIR}/kernel/grouped-attention.cu"
+      "${SM70_GROUPED_LONG_DIR}/kernel/scalar-attention.cu")
+  # Flags mirror the manifest the operator was qualified with. As with v37, the
+  # properties must be set in the target scope or SM70 silently loses them.
+  set_source_files_properties(${SM70_GROUPED_LONG_SRC}
+    TARGET_DIRECTORY _vllm_fa2_C
+    PROPERTIES COMPILE_OPTIONS
+      "-gencode=arch=compute_70,code=sm_70;-O3;-std=c++17;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-U__CUDA_NO_HALF_OPERATORS__;-U__CUDA_NO_HALF_CONVERSIONS__;-U__CUDA_NO_HALF2_OPERATORS__")
+  target_include_directories(_vllm_fa2_C PRIVATE "${SM70_GROUPED_LONG_DIR}/include")
+  target_sources(_vllm_fa2_C PRIVATE ${SM70_GROUPED_LONG_SRC})
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/../sm70_79t.cmake")
 
 # Restore the install prefix after FA's install rules
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)

@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 
 
 class Sm70MoeStageRoute(str, Enum):
@@ -11,6 +12,21 @@ class Sm70MoeStageRoute(str, Enum):
     PER_EXPERT_DISPATCH = "per_expert_dispatch"
     DENSE = "dense"
     ACTIVE_DENSE = "active_dense"
+    INDEXED = "indexed"
+    COMPACT = "compact"
+    INDEXED_PREFILL = "indexed_prefill"
+    ACTIVE_GROUPED = "active_grouped"
+    CHUNKED = "chunked"
+    QPN = "qpn"
+    FUSED_QPN = "fused_qpn"
+    FUSED_BATCH_QPN = "fused_batch_qpn"
+    DIRECT_REDUCE = "direct_reduce"
+    BATCH_REDUCE = "batch_reduce"
+    INDEXED_FUSED = "indexed_fused"
+    INDEXED_SPLIT_FUSED = "indexed_split_fused"
+    PREPARE_W13 = "prepare_w13"
+    GLM_QPN = "glm_qpn"
+    GROUPED_BATCH_REDUCE = "grouped_batch_reduce"
 
 
 @dataclass(frozen=True)
@@ -21,6 +37,18 @@ class Sm70MoeRoutePlan:
     use_batched_active_exact_w2: bool
     w13: Sm70MoeStageRoute
     w2: Sm70MoeStageRoute
+    chunk_tokens: int = 0
+    weighted_reduce: bool = False
+    strict: bool = False
+    batched_indexed: bool = False
+    w13_split_k: int = 1
+    w2_split_k: int = 1
+    qpn_mtp: bool = False
+    reduction: Literal[
+        "unpermute", "native_weighted", "triton_single", "triton_batch"
+    ] = "unpermute"
+    interleaved: bool = False
+    zero_output_before_reduce: bool = False
 
 
 def select_sm70_quantized_moe_route(
@@ -83,4 +111,63 @@ def select_sm70_quantized_moe_route(
         use_batched_active_exact_w2=use_batched_active_exact_w2,
         w13=w13,
         w2=w2,
+    )
+
+
+def select_single_token_plan(
+    *,
+    compact_w13: bool,
+    indexed_w13: bool,
+    indexed_w2: bool,
+    weighted_reduce: bool,
+    strict: bool = False,
+    batched_indexed: bool = False,
+) -> Sm70MoeRoutePlan:
+    """Keep compact > indexed > dense and the legacy strict-W2 override."""
+    return Sm70MoeRoutePlan(
+        use_batched_moe_gemm=False,
+        use_batched_strict_w13=strict,
+        use_batched_exact_w2=False,
+        use_batched_active_exact_w2=False,
+        w13=Sm70MoeStageRoute.COMPACT
+        if compact_w13
+        else Sm70MoeStageRoute.INDEXED
+        if indexed_w13 and not strict
+        else Sm70MoeStageRoute.ACTIVE_DENSE,
+        w2=Sm70MoeStageRoute.INDEXED
+        if indexed_w2 and not strict
+        else Sm70MoeStageRoute.ACTIVE_DENSE,
+        weighted_reduce=weighted_reduce,
+        strict=strict,
+        batched_indexed=batched_indexed,
+    )
+
+
+def select_fp4_stage_plan(
+    w13: Sm70MoeStageRoute,
+    w2: Sm70MoeStageRoute,
+    *,
+    w13_split_k: int = 1,
+    qpn_mtp: bool = False,
+    reduction: Literal[
+        "unpermute", "native_weighted", "triton_single", "triton_batch"
+    ] = "unpermute",
+    interleaved: bool = False,
+) -> Sm70MoeRoutePlan:
+    """Normalize an admitted FP4 route; numerical split choices stay explicit.
+
+    Model qualification and dynamic M remain in the existing selectors. This
+    is the same stage plan used by AWQ/FP8, not another candidate dispatcher.
+    """
+    return Sm70MoeRoutePlan(
+        False,
+        False,
+        False,
+        False,
+        w13,
+        w2,
+        w13_split_k=w13_split_k,
+        qpn_mtp=qpn_mtp,
+        reduction=reduction,
+        interleaved=interleaved,
     )

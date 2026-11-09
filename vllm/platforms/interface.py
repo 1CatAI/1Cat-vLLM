@@ -296,18 +296,35 @@ class Platform:
         return AttentionBackendEnum.TORCH_SDPA
 
     @classmethod
+    def resolve_device_id(cls, device_id: int | None) -> int:
+        """Turn an unspecified device index into a concrete one.
+
+        ``None`` means "the device this process runs on". The base platform
+        cannot know that device and keeps the historical answer, index 0 of
+        the visibility list. Accelerator platforms override this so that a
+        worker which has already selected its device answers for that device
+        rather than for whichever card happens to be listed first.
+        """
+        return 0 if device_id is None else device_id
+
+    @classmethod
     def get_device_capability(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> DeviceCapability | None:
-        """Stateless version of [torch.cuda.get_device_capability][]."""
+        """Stateless version of [torch.cuda.get_device_capability][].
+
+        ``device_id=None`` answers for the current device of this process
+        where the platform can tell (see
+        [`resolve_device_id`][vllm.platforms.interface.Platform.resolve_device_id]).
+        """
         return None
 
     @classmethod
     def has_device_capability(
         cls,
         capability: tuple[int, int] | int,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> bool:
         """
         Test whether this platform is compatible with a device capability.
@@ -318,7 +335,9 @@ class Platform:
         - An integer `<major><minor>`. (See
         [`DeviceCapability.to_int`][vllm.platforms.interface.DeviceCapability.to_int])
         """
-        current_capability = cls.get_device_capability(device_id=device_id)
+        current_capability = cls.get_device_capability(
+            device_id=cls.resolve_device_id(device_id)
+        )
         if current_capability is None:
             return False
 
@@ -331,7 +350,7 @@ class Platform:
     def is_device_capability(
         cls,
         capability: tuple[int, int] | int,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> bool:
         """
         Test whether this platform has exactly the specified device capability.
@@ -342,7 +361,9 @@ class Platform:
         - An integer `<major><minor>`. (See
         [`DeviceCapability.to_int`][vllm.platforms.interface.DeviceCapability.to_int])
         """
-        current_capability = cls.get_device_capability(device_id=device_id)
+        current_capability = cls.get_device_capability(
+            device_id=cls.resolve_device_id(device_id)
+        )
         if current_capability is None:
             return False
 
@@ -355,13 +376,15 @@ class Platform:
     def is_device_capability_family(
         cls,
         capability: int,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> bool:
         """
         Returns True if the device capability is any <major>.x.
         Mirrors CUDA 13 'family' architecture semantics (e.g. 10.x, 11.x, 12.x).
         """
-        current_capability = cls.get_device_capability(device_id=device_id)
+        current_capability = cls.get_device_capability(
+            device_id=cls.resolve_device_id(device_id)
+        )
         if current_capability is None:
             return False
         return (current_capability.to_int() // 10) == (capability // 10)
@@ -431,6 +454,13 @@ class Platform:
         registered here dynamically.
         """
         pass
+
+    @classmethod
+    def apply_runtime_policy_defaults(cls, vllm_config: "VllmConfig"):
+        """Resolve early graph/kernel defaults before the existing late checks."""
+        from vllm.platforms.runtime_defaults import apply_runtime_policy_defaults
+
+        return apply_runtime_policy_defaults(vllm_config)
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
@@ -547,6 +577,7 @@ class Platform:
         from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
         from vllm.v1.attention.backend import MultipleOf
         from vllm.v1.kv_cache_interface import (
+            AttentionSpec,
             FullAttentionSpec,
             MambaSpec,
             MLAAttentionSpec,
@@ -564,16 +595,20 @@ class Platform:
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
-        # Compute attention page size for 1 token
+        # A one-token page is only an estimate for selecting a block. Padding
+        # and separate scale regions need not grow linearly with token count.
+        attention_page_specs: list[AttentionSpec]
         if model_config.use_mla:
-            attn_page_size_1_token = MLAAttentionSpec(
-                block_size=1,
-                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                head_size=model_config.get_head_size(),
-                dtype=kv_cache_dtype,
-                cache_dtype_str=cache_config.cache_dtype,
-                kv_quant_mode=kv_quant_mode,
-            ).page_size_bytes
+            attention_page_specs = [
+                MLAAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=kv_cache_dtype,
+                    cache_dtype_str=cache_config.cache_dtype,
+                    kv_quant_mode=kv_quant_mode,
+                )
+            ]
         elif cache_config.cache_dtype.startswith("turboquant_"):
             # TQ has a packed K|V layout; the standard FullAttentionSpec
             # formula over-sizes it and trips unify_kv_cache_spec_page_size
@@ -588,7 +623,7 @@ class Platform:
             tq_cfg = TurboQuantConfig.from_cache_dtype(
                 cache_config.cache_dtype, model_config.get_head_size()
             )
-            tq_page = TQFullAttentionSpec(
+            tq_spec = TQFullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
@@ -596,39 +631,56 @@ class Platform:
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
                 tq_slot_size=tq_cfg.slot_size_aligned,
-            ).page_size_bytes
+            )
+            attention_page_specs = [tq_spec]
             if cache_config.kv_cache_dtype_skip_layers:
-                skip_page = FullAttentionSpec(
+                skip_spec = FullAttentionSpec(
                     block_size=1,
                     num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                     head_size=model_config.get_head_size(),
                     dtype=model_config.dtype,
-                ).page_size_bytes
+                )
                 # lcm, not max: skip_page is often not a multiple of
                 # tq_page, so max would leave per-layer page sizes
                 # un-unifiable downstream.
-                attn_page_size_1_token = lcm(tq_page, skip_page)
-            else:
-                attn_page_size_1_token = tq_page
+                attention_page_specs.append(skip_spec)
         else:
-            attn_page_size_1_token = FullAttentionSpec(
-                block_size=1,
-                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                head_size=model_config.get_head_size(),
-                dtype=kv_cache_dtype,
-                kv_quant_mode=kv_quant_mode,
-            ).page_size_bytes
+            attention_page_specs = [
+                FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=kv_cache_dtype,
+                    kv_quant_mode=kv_quant_mode,
+                )
+            ]
+
+        def attention_page_bytes(block_tokens: int) -> int:
+            return lcm(
+                *(
+                    spec.copy_with_new_block_size(block_tokens).page_size_bytes
+                    for spec in attention_page_specs
+                )
+            )
+
+        attn_page_size_1_token = attention_page_bytes(1)
 
         # Compute mamba page size
         model_cls, _ = ModelRegistry.resolve_model_cls(
             model_config.architecture,
             model_config=model_config,
         )
-        mamba_page_size = MambaSpec(
-            shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
-            dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
-            block_size=-1,
-        ).page_size_bytes
+        if hasattr(model_cls, "get_mamba_specs_from_config"):
+            mamba_page_size = max(
+                spec.page_size_bytes
+                for spec in model_cls.get_mamba_specs_from_config(vllm_config)
+            )
+        else:
+            mamba_page_size = MambaSpec(
+                shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+                dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+                block_size=-1,
+            ).page_size_bytes
 
         if mamba_page_size == 0:
             return
@@ -642,12 +694,21 @@ class Platform:
 
         # Get kernel block alignment from the backend's supported sizes
         with set_current_vllm_config(vllm_config):
-            kernel_block_alignment_size = max(
-                min(
-                    s.base if isinstance(s, MultipleOf) else s
-                    for s in backend_cls.get_supported_kernel_block_sizes()
-                ),
-                cache_config.block_size,
+            kernel_block_size = min(
+                s.base if isinstance(s, MultipleOf) else s
+                for s in backend_cls.get_supported_kernel_block_sizes()
+            )
+        kernel_block_alignment_size = max(kernel_block_size, cache_config.block_size)
+
+        # A model that shards part of each block over DCP ranks needs the
+        # rank-local share to keep the alignment of a whole block. The backend
+        # found above may accept smaller kernel blocks than the one serving the
+        # sharded layers, so scale the full alignment, not its kernel minimum.
+        block_multiple = getattr(model_cls, "get_kv_block_size_multiple", None)
+        if block_multiple is not None:
+            kernel_block_alignment_size = lcm(
+                kernel_block_alignment_size,
+                kernel_block_alignment_size * block_multiple(vllm_config),
             )
 
         if cache_config.mamba_cache_mode == "all":
@@ -661,6 +722,7 @@ class Platform:
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
             attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
             cache_config.mamba_block_size = attn_block_size
+            block_step = chunk_size
         else:
             # Without prefix caching, use minimum block size that satisfies
             # both backend alignment and mamba page size compatibility
@@ -671,6 +733,11 @@ class Platform:
             indexer_align = cls._get_indexer_block_alignment(vllm_config)
             if indexer_align:
                 attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
+            block_step = lcm(kernel_block_alignment_size, indexer_align or 1)
+        while attention_page_bytes(attn_block_size) < mamba_page_size:
+            attn_block_size += block_step
+        if cache_config.mamba_cache_mode == "all":
+            cache_config.mamba_block_size = attn_block_size
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size
@@ -681,10 +748,23 @@ class Platform:
             )
 
         if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = cache_config.block_size
+            # An explicit --mamba-block-size is the recurrent-state checkpoint
+            # grid, not a KV page multiplier: keep it instead of forcing it to the
+            # KV block size. It must stay a multiple of the block size, because a
+            # cached prefix is restorable only if some length is both block-aligned
+            # (KV blocks) and grid-aligned (recurrent state); otherwise prefix
+            # caching silently drops to zero hits.
+            if cache_config.user_specified_mamba_block_size:
+                grid = cache_config.mamba_block_size
+                assert grid is not None and grid % cache_config.block_size == 0, (
+                    "--mamba-block-size must be a multiple of --block-size in "
+                    f"align mode, got {grid} and {cache_config.block_size}"
+                )
+            else:
+                cache_config.mamba_block_size = cache_config.block_size
 
         # Pad mamba page size to exactly match attention page size
-        attn_page_size = cache_config.block_size * attn_page_size_1_token
+        attn_page_size = attention_page_bytes(cache_config.block_size)
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
@@ -767,6 +847,17 @@ class Platform:
     ) -> float:
         """
         Return the memory usage in bytes.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def limit_allocator_headroom(
+        cls, headroom_bytes: int, device: torch.types.Device | None = None
+    ) -> int:
+        """Bound cached device reservation, returning the allocator byte limit.
+
+        Must retain active tensors and captured pools. Unsupported platforms
+        explicitly reject this requested resource limit.
         """
         raise NotImplementedError
 

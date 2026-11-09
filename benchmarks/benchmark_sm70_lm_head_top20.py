@@ -19,6 +19,7 @@ from vllm.utils.torch_utils import set_random_seed
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--m", type=int, default=1)
     parser.add_argument("--n", type=int, default=32768)
     parser.add_argument("--k", type=int, default=5120)
     parser.add_argument("--top-k", type=int, default=20)
@@ -73,15 +74,15 @@ def main() -> int:
         raise RuntimeError("The experimental top-20 op is not built.")
 
     set_random_seed(args.seed)
-    hidden = torch.randn((1, args.k), dtype=torch.float16, device=device)
+    hidden = torch.randn((args.m, args.k), dtype=torch.float16, device=device)
     weight = torch.randn((args.n, args.k), dtype=torch.float16, device=device)
     prepared = sm70_ops.sm70_f16_prepare(weight)
     tm_weight = prepared[0]
     k_ld = int(prepared[1][0].item())
 
-    dense_logits = torch.empty((1, args.n), dtype=torch.float16, device=device)
-    fused_values = torch.empty((1, args.top_k), dtype=torch.float32, device=device)
-    fused_indices = torch.empty((1, args.top_k), dtype=torch.int64, device=device)
+    dense_logits = torch.empty((args.m, args.n), dtype=torch.float16, device=device)
+    fused_values = torch.empty((args.m, args.top_k), dtype=torch.float32, device=device)
+    fused_indices = torch.empty((args.m, args.top_k), dtype=torch.int64, device=device)
 
     def dense_gemm() -> None:
         sm70_ops.sm70_f16_gemm_out(
@@ -131,7 +132,12 @@ def main() -> int:
     result = {
         "device": torch.cuda.get_device_name(device),
         "device_capability": list(capability),
-        "shape": {"m": 1, "n": args.n, "k": args.k, "top_k": args.top_k},
+        "shape": {
+            "m": args.m,
+            "n": args.n,
+            "k": args.k,
+            "top_k": args.top_k,
+        },
         "correctness": {
             "values_equal": values_equal,
             "indices_equal": indices_equal,

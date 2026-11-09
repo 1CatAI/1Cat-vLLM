@@ -928,10 +928,13 @@ def append_tail_to_topk(
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Append non-pooled tail tokens after expanded history tokens.
+    """Append non-pooled tail tokens after the valid expanded history prefix.
 
     ``index_kpool_always_select_tail`` keeps the (incomplete) trailing pool so
-    the most recent tokens are always attended to.
+    the most recent tokens are always attended to. Top-k pads unused pool slots
+    with ``-1``; placing the tail after the fixed-width padded history would
+    leave holes before valid tail tokens. Sparse attention consumes a compact
+    prefix, so the tail must start after ``min(pool_len, capacity)`` pools.
     """
     assert topk_result.dtype == torch.int32
     assert seq_lens.ndim == 1
@@ -954,9 +957,13 @@ def append_tail_to_topk(
     tail_count = seq_len - tail_start  # in [0, pool_size)
 
     cols = torch.arange(out_cols, device=topk_result.device)[None, :]
-    history_len = n_cols
-    is_history = cols < history_len
-    tail_off = cols - history_len
+    history_capacity = n_cols // pool_size
+    valid_pool_count = torch.minimum(
+        pool_len, torch.full_like(pool_len, history_capacity)
+    )
+    history_len = valid_pool_count * pool_size
+    is_history = cols < history_len[:, None]
+    tail_off = cols - history_len[:, None]
     is_tail = (tail_off >= 0) & (tail_off < tail_count[:, None])
 
     # safe_hist must be per-row [rows, out_cols] so the gather reads each row's
@@ -1009,16 +1016,23 @@ def _expand_pools_and_append_tail_kernel(
     tail_start = pool_len * POOL_SIZE
     tail_count = seq_len - tail_start  # in [0, POOL_SIZE)
 
-    # History region [0, topk): expand selected pool g = cols // POOL_SIZE.
-    is_history = cols < topk
+    # Top-k pads unused pool slots with -1 when pool_len < n_groups. Compact
+    # the valid expanded pools and the incomplete tail into one prefix because
+    # sparse attention reads only [0, valid_count), not every non-negative slot.
+    history_capacity = topk // POOL_SIZE
+    valid_pool_count = tl.minimum(pool_len, history_capacity)
+    history_count = valid_pool_count * POOL_SIZE
+
+    # History region [0, history_count): expand selected pool g = col / pool.
+    is_history = cols < history_count
     g = cols // POOL_SIZE
     o = cols % POOL_SIZE
     pid = tl.load(pool_ids_ptr + row * pid_s0 + g, mask=mask & is_history, other=-1)
     hist_val = (pid * POOL_SIZE + o).to(tl.int32)
     hist_out = tl.where(pid >= 0, hist_val, -1)
 
-    # Tail region [topk, out_cols): the request's trailing incomplete pool.
-    tail_off = cols - topk
+    # Tail immediately follows the valid history rather than fixed-width topk.
+    tail_off = cols - history_count
     is_tail = (tail_off >= 0) & (tail_off < tail_count)
     tail_val = (tail_start + tail_off).to(tl.int32)
     tail_out = tl.where(is_tail, tail_val, -1)
@@ -1037,9 +1051,10 @@ def expand_pools_and_append_tail(
     Produces the same ``[rows, topk + pool_size - 1]`` int32 output as calling
     the two functions in sequence when neither ``page_table`` nor
     ``topk_offsets`` is passed — the only path used by the GLM-5.3-Flash indexer.
-    The kernel derives ``pool_len = seq_len // pool_size`` internally, so the
-    caller no longer needs to precompute it. Replaces ~25 elementwise kernels
-    with one Triton launch.
+    Valid expanded pools and the incomplete tail occupy one compact prefix; the
+    remaining fixed-width capacity is padded with ``-1``. The kernel derives
+    ``pool_len = seq_len // pool_size`` internally, so the caller no longer
+    needs to precompute it. Replaces ~25 elementwise kernels with one launch.
     """
     rows, n_groups = pool_ids.shape
     topk = n_groups * pool_size
