@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from openai_harmony import Message as OpenAIMessage
 
+import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -558,6 +559,18 @@ class OpenAIServingRender:
             default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
+
+        # Debug probe (off by default): dump the three views of the template
+        # kwargs that feed the chat template -- request-level, server default,
+        # and the merged result -- to diagnose why
+        # `--default-chat-template-kwargs` appears not to take effect.
+        if envs.VLLM_DEBUG_RENDER_TEMPLATE_KWARGS:
+            logger.info(
+                "[RENDER-TRACE] req_ctk=%r default_ctk=%r merged_ctk=%r",
+                getattr(request, "chat_template_kwargs", "<no-attr>"),
+                default_template_kwargs,
+                chat_params.chat_template_kwargs,
+            )
 
         (conversation,), (engine_input,) = await renderer.render_chat_async(
             [messages],

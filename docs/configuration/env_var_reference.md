@@ -63,6 +63,7 @@ This is the user reference. Internal tuning, diagnostics and compatibility alias
 | `VLLM_DEBUG_DUMP_PATH` | debug | Dump fx graphs to the given directory. It will override CompilationConfig.debug\_dump\_path if set. | None | None | None | No SM70 path association |
 | `VLLM_DEBUG_LOG_API_SERVER_RESPONSE` | debug | Whether to log responses from API Server for debugging | False | False | None | No SM70 path association |
 | `VLLM_DEBUG_MFU_METRICS` | debug | Debug logging for --enable-mfu-metrics | False | False | None | No SM70 path association |
+| `VLLM_DEBUG_RENDER_TEMPLATE_KWARGS` | debug | vLLM: dump the request-level, server-default and merged chat\_template\_kwargs before rendering. Off by default. | False | False | None | No SM70 path association |
 | `VLLM_DEBUG_WORKSPACE` | debug | Debug workspace allocations. logging of workspace resize operations. | False | False | None | No SM70 path association |
 | `VLLM_DEEPEPLL_NVFP4_DISPATCH` | configuration | Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method only supported on Blackwell GPUs and with <https://github.com/deepseek-ai/DeepEP/pull/341> | False | False | None | No SM70 path association |
 | `VLLM_DEEPEP_BUFFER_SIZE_MB` | configuration | The size in MB of the buffers (NVL and RDMA) used by DeepEP | 1024 | 1024 | None | No SM70 path association |
