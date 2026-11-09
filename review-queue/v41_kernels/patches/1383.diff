@@ -1,0 +1,783 @@
+diff --git a/benchmarks/deepseek_v41/plan_fuse_check.py b/benchmarks/deepseek_v41/plan_fuse_check.py
+new file mode 100644
+index 0000000000..48f6072243
+--- /dev/null
++++ b/benchmarks/deepseek_v41/plan_fuse_check.py
+@@ -0,0 +1,240 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GPU check for VLLM_V41_PLAN_FUSE (one GPU, synthetic inputs).
++
++Today:    q8_aligned  -> gate_up7  (gate_up7 launches moe_plan, then gate/up)
++Fused:    q8_plan     -> gate_up7p (q8_plan builds the plan in grid row 0)
++
++1. Bit equality, M = 1..6 (6 routes per row): the whole 512-int plan buffer
++   (both prefilled with the same garbage, so untouched entries count too),
++   xq/xd, and the gate/up outputs hq/hd. Route mixes: random experts from
++   pools of 6..384 (many repeats across rows), dropped routes (id -1, as the
++   expert prune or a truncated verify position writes them), one expert in
++   every row, and all routes dropped.
++2. Time per layer inside a CUDA graph (``--reps`` layers per replay) for
++   q8 + gate/up both ways, and the q8 launch alone both ways.
++
++Synthetic data only. Needs a v41k.so built from this tree (q8_plan and
++gate_up7p); pass it with --lib or VLLM_V41K_LIB. Exit status 1 on any
++difference.
++
++    python benchmarks/deepseek_v41/plan_fuse_check.py --lib /path/v41k.so
++"""
++
++import argparse
++import json
++import os
++import sys
++
++import torch
++
++E, ROWS, K_DIM, TOP_K = 384, 576, 5120, 6
++# bytes per 256-weight block: IQ2_XXS 66, IQ2_XS 74, IQ1_M 56
++BLOCK_BYTES = {16: 66, 17: 74, 29: 56}
++
++
++def _library(path):
++    if not path:
++        here = os.path.dirname(os.path.abspath(__file__))
++        path = os.path.join(here, "v41k", "build", "v41k.so")
++    torch.ops.load_library(path)
++    for op in ("q8_aligned", "gate_up7", "q8_plan", "gate_up7p", "table"):
++        if not hasattr(torch.ops.v41k, op):
++            sys.exit(f"{path} has no v41k.{op}; rebuild it from this tree")
++    return path
++
++
++def _ids(m, trial, g, dev):
++    routes = m * TOP_K
++    kind = trial % 6
++    if kind == 4:  # one expert in every row
++        ids = torch.arange(TOP_K, device=dev).repeat(m) + 7
++    elif kind == 5 and trial % 12 == 11:  # everything dropped
++        return torch.full((routes,), -1, dtype=torch.int32, device=dev)
++    else:
++        pool = (6, 8, 12, 24, 96, E)[(trial // 6) % 6]
++        perm = torch.randperm(E, device=dev, generator=g)[:pool]
++        ids = torch.stack(
++            [
++                perm[torch.randperm(pool, device=dev, generator=g)[:TOP_K]]
++                for _ in range(m)
++            ]
++        ).flatten()
++    ids = ids.to(torch.int32)
++    if kind in (1, 3, 5):  # drop the lowest-weight routes of some rows
++        view = ids.view(m, TOP_K)
++        for r in range(m):
++            keep = int(torch.randint(1, TOP_K + 1, (1,), device=dev, generator=g))
++            view[r, keep:] = -1
++    return ids.contiguous()
++
++
++def _weights(gtype, g, dev):
++    stride = K_DIM // 256 * BLOCK_BYTES[gtype]
++
++    # Bytes 0..59: every fp16 scale these bytes can form is finite and below 1.
++    def one():
++        return torch.randint(
++            0, 60, (E, ROWS, stride), dtype=torch.uint8, device=dev, generator=g
++        )
++
++    return one(), one()
++
++
++class Layer:
++    def __init__(self, m, ids, x, prob, gate, up, gtype, book, garbage):
++        dev = x.device
++        routes = m * TOP_K
++        self.args = (ids, prob, gate, up, gtype, book)
++        self.x = x
++        self.xq = torch.zeros((m, 160, 32), dtype=torch.int8, device=dev)
++        self.xd = torch.zeros((m, 160), dtype=torch.float32, device=dev)
++        self.hq = torch.zeros((routes, 18, 32), dtype=torch.int8, device=dev)
++        self.hd = torch.zeros((routes, 18), dtype=torch.float32, device=dev)
++        self.plan = garbage.clone()
++
++    def today(self):
++        ids, prob, gate, up, gtype, book = self.args
++        torch.ops.v41k.q8_aligned(self.xq, self.xd, self.x)
++        torch.ops.v41k.gate_up7(
++            self.xq,
++            self.xd,
++            self.hq,
++            self.hd,
++            ids,
++            prob,
++            gate,
++            up,
++            gtype,
++            book,
++            self.plan,
++        )
++
++    def fused(self):
++        ids, prob, gate, up, gtype, book = self.args
++        torch.ops.v41k.q8_plan(self.xq, self.xd, self.x, ids, self.plan)
++        torch.ops.v41k.gate_up7p(
++            self.xq,
++            self.xd,
++            self.hq,
++            self.hd,
++            ids,
++            prob,
++            gate,
++            up,
++            gtype,
++            book,
++            self.plan,
++        )
++
++    def q8_today(self):
++        torch.ops.v41k.q8_aligned(self.xq, self.xd, self.x)
++
++    def q8_fused(self):
++        ids = self.args[0]
++        torch.ops.v41k.q8_plan(self.xq, self.xd, self.x, ids, self.plan)
++
++
++def _same(a, b):
++    if a.dtype == torch.float32:
++        a, b = a.view(torch.int32), b.view(torch.int32)
++    return torch.equal(a, b)
++
++
++def _graph_us(fn, reps):
++    fn()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        for _ in range(reps):
++            fn()
++    graph.replay()
++    torch.cuda.synchronize()
++    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
++    best = float("inf")
++    for _ in range(5):
++        start.record()
++        graph.replay()
++        end.record()
++        torch.cuda.synchronize()
++        best = min(best, start.elapsed_time(end) * 1000.0 / reps)
++    return best
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--lib", default=os.environ.get("VLLM_V41K_LIB", ""))
++    ap.add_argument("--gtype", type=int, default=16, choices=sorted(BLOCK_BYTES))
++    ap.add_argument("--trials", type=int, default=300)
++    ap.add_argument("--reps", type=int, default=100)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--no-time", action="store_true", help="bit checks only")
++    args = ap.parse_args()
++    lib = _library(args.lib)
++    dev = torch.device("cuda")
++    g = torch.Generator(device=dev).manual_seed(args.seed)
++    gate, up = _weights(args.gtype, g, dev)
++    book = torch.ops.v41k.table(args.gtype, dev)
++    report = {"lib": os.path.basename(lib), "gtype": args.gtype, "mismatch": {}}
++    report["us"] = {}
++    bad = 0
++    for m in range(1, 7):
++        miss = {"plan": 0, "xq_xd": 0, "hq_hd": 0}
++        finite = 0
++        for trial in range(args.trials):
++            ids = _ids(m, trial, g, dev)
++            x = torch.randn(m, K_DIM, device=dev, generator=g).half()
++            prob = torch.rand(m, TOP_K, device=dev, generator=g)
++            garbage = torch.randint(
++                -(2**31),
++                2**31 - 1,
++                (512,),
++                dtype=torch.int32,
++                device=dev,
++                generator=g,
++            )
++            a = Layer(m, ids, x, prob, gate, up, args.gtype, book, garbage)
++            b = Layer(m, ids, x, prob, gate, up, args.gtype, book, garbage)
++            a.today()
++            b.fused()
++            miss["plan"] += int(not _same(a.plan, b.plan))
++            miss["xq_xd"] += int(not (_same(a.xq, b.xq) and _same(a.xd, b.xd)))
++            miss["hq_hd"] += int(not (_same(a.hq, b.hq) and _same(a.hd, b.hd)))
++            finite += int(torch.isfinite(a.hd).all())
++        bad += sum(miss.values())
++        # Synthetic weights keep every fp16 scale finite, so a non-finite hd is a
++        # kernel fault; gate it separately (it is a count of good trials).
++        bad += int(finite != args.trials)
++        report["mismatch"][f"M{m}"] = dict(miss, hd_all_finite_trials=finite)
++        if args.no_time:
++            continue
++        ids = _ids(m, 0, g, dev)
++        x = torch.randn(m, K_DIM, device=dev, generator=g).half()
++        prob = torch.rand(m, TOP_K, device=dev, generator=g)
++        lay = Layer(
++            m,
++            ids,
++            x,
++            prob,
++            gate,
++            up,
++            args.gtype,
++            book,
++            torch.zeros(512, dtype=torch.int32, device=dev),
++        )
++        us = {
++            "q8_aligned+gate_up7": _graph_us(lay.today, args.reps),
++            "q8_plan+gate_up7p": _graph_us(lay.fused, args.reps),
++            "q8_aligned": _graph_us(lay.q8_today, args.reps),
++            "q8_plan": _graph_us(lay.q8_fused, args.reps),
++        }
++        us["saved_per_layer"] = us["q8_aligned+gate_up7"] - us["q8_plan+gate_up7p"]
++        report["us"][f"M{m}"] = {k: round(v, 2) for k, v in us.items()}
++    report["trials_per_m"] = args.trials
++    report["ok"] = bad == 0
++    print(json.dumps(report, indent=1))
++    return 0 if bad == 0 else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/benchmarks/deepseek_v41/v41k/v41k.cu b/benchmarks/deepseek_v41/v41k/v41k.cu
+index 2245702499..9b87e620a6 100644
+--- a/benchmarks/deepseek_v41/v41k/v41k.cu
++++ b/benchmarks/deepseek_v41/v41k/v41k.cu
+@@ -1171,12 +1171,13 @@ __global__ void fp8_reduce(half* out, const float* partials, const half* bias,
+ }
+ 
+ // ---- v5: aligned activations (int8 qs as two int4 + float scale arrays) ----
+-__global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
+-                                  float* __restrict__ ds,
+-                                  const half* __restrict__ x, int K) {
+-  // one warp per 32-element group
++// one warp per 32-element group
++__device__ __forceinline__ void q8_aligned_row(int8_t* __restrict__ qs,
++                                               float* __restrict__ ds,
++                                               const half* __restrict__ x,
++                                               int K, int row) {
+   const int g = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+-  const int lane = threadIdx.x % 32, row = blockIdx.y, groups = K / 32;
++  const int lane = threadIdx.x % 32, groups = K / 32;
+   if (g >= groups) return;
+   const float v = __half2float(x[int64_t(row) * K + g * 32 + lane]);
+   float m = fabsf(v);
+@@ -1188,6 +1189,78 @@ __global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
+   if (!lane) ds[int64_t(row) * groups + g] = __half2float(__float2half_rn(d));
+ }
+ 
++__global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
++                                  float* __restrict__ ds,
++                                  const half* __restrict__ x, int K) {
++  q8_aligned_row(qs, ds, x, K, blockIdx.y);
++}
++
++// The moe_plan plan (same entries, same values, other entries untouched) from
++// registers: each lane holds routes lane and lane + 32 and compares them with
++// every route broadcast by shuffle, so there is no shared memory and no serial
++// first-occurrence scan. One full warp calls it.
++__device__ __forceinline__ void plan_warp(int* __restrict__ plan,
++                                          const int* __restrict__ ids,
++                                          int routes) {
++  const int lane = threadIdx.x % 32;
++  int e[2], c[2] = {0, 0}, cnt[2] = {0, 0}, q0[2];
++  bool live[2];
++#pragma unroll
++  for (int h = 0; h < 2; ++h) {
++    const int r = lane + 32 * h;
++    e[h] = r < routes ? ids[r] : -1;
++    live[h] = r < routes && e[h] >= 0;  // id < 0: route dropped
++    q0[h] = r;
++  }
++  for (int q = 0; q < routes; ++q) {
++    const int v = __shfl_sync(0xffffffffU, q < 32 ? e[0] : e[1], q & 31);
++#pragma unroll
++    for (int h = 0; h < 2; ++h) {
++      const int r = lane + 32 * h;
++      if (live[h] && v == e[h]) {
++        if (q < r) {
++          ++c[h];  // earlier routes of this expert
++          q0[h] = min(q0[h], q);
++        } else {
++          ++cnt[h];  // this and later routes of this expert
++        }
++      }
++    }
++  }
++  const bool first0 = live[0] && c[0] == 0, first1 = live[1] && c[1] == 0;
++  const unsigned b0 = __ballot_sync(0xffffffffU, first0);
++  const unsigned b1 = __ballot_sync(0xffffffffU, first1);
++  const unsigned below = (1u << lane) - 1u;
++  const int own0 = __popc(b0 & below), own1 = __popc(b0) + __popc(b1 & below);
++#pragma unroll
++  for (int h = 0; h < 2; ++h) {
++    // distinct index of this route's expert = own index of its first route
++    const int u0 = __shfl_sync(0xffffffffU, own0, q0[h] & 31);
++    const int u1 = __shfl_sync(0xffffffffU, own1, q0[h] & 31);
++    const int u = q0[h] < 32 ? u0 : u1, r = lane + 32 * h;
++    if (!live[h]) continue;
++    if (c[h] < 6) plan[73 + 6 * u + c[h]] = r;
++    if (c[h] == 0) {
++      plan[1 + u] = e[h];
++      plan[37 + u] = cnt[h] < 6 ? cnt[h] : 6;
++    }
++  }
++  if (lane == 0) plan[0] = __popc(b0) + __popc(b1);
++}
++
++// q8_aligned for rows 0..M-1 (grid y 1..M) plus the expert plan (grid y 0, one
++// warp), so the plan needs no launch of its own and overlaps the quantization.
++__global__ void q8_plan_kernel(int8_t* __restrict__ qs, float* __restrict__ ds,
++                               const half* __restrict__ x, int K,
++                               int* __restrict__ plan,
++                               const int* __restrict__ ids, int routes) {
++  if (blockIdx.y == 0) {
++    if (blockIdx.x == 0 && threadIdx.x < 32) plan_warp(plan, ids, routes);
++    return;
++  }
++  q8_aligned_row(qs, ds, x, K, blockIdx.y - 1);
++}
++
+ __device__ __forceinline__ void load_q8(const int8_t* qs, const float* ds,
+                                         int64_t idx, int (&q)[8], float& d) {
+   const int4* p = reinterpret_cast<const int4*>(qs + idx * 32);
+@@ -2873,6 +2946,21 @@ void v41k_fp8_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor w,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// q8_aligned plus the moe_plan plan for ids32 in the same launch.
++void v41k_q8_plan(torch::Tensor qs, torch::Tensor ds, torch::Tensor x,
++                  torch::Tensor ids32, torch::Tensor plan) {
++  const at::cuda::OptionalCUDAGuard guard(x.device());
++  const int M = x.size(0), K = x.size(1), routes = ids32.numel();
++  TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
++  TORCH_CHECK(ids32.is_contiguous() && plan.is_contiguous());
++  auto stream = at::cuda::getCurrentCUDAStream();
++  v41k::q8_plan_kernel<<<dim3((K / 32 + 7) / 8, M + 1), 256, 0, stream>>>(
++      reinterpret_cast<int8_t*>(qs.data_ptr()), ds.data_ptr<float>(),
++      reinterpret_cast<const half*>(x.data_ptr()), K, plan.data_ptr<int>(),
++      ids32.data_ptr<int>(), routes);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void v41k_q8_aligned(torch::Tensor qs, torch::Tensor ds, torch::Tensor x) {
+   const at::cuda::OptionalCUDAGuard guard(x.device());
+   const int M = x.size(0), K = x.size(1);
+@@ -3301,10 +3389,11 @@ void v41k_swap_combined(torch::Tensor b0, torch::Tensor b1, torch::Tensor b2,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+-void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+-                   torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
+-                   torch::Tensor gate, torch::Tensor up, int64_t gtype,
+-                   torch::Tensor gbook, torch::Tensor plan) {
++static void gate_up7_impl(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
++                          torch::Tensor hd, torch::Tensor ids32,
++                          torch::Tensor prob, torch::Tensor gate,
++                          torch::Tensor up, int64_t gtype, torch::Tensor gbook,
++                          torch::Tensor plan, bool build_plan) {
+   const at::cuda::OptionalCUDAGuard guard(xq.device());
+   const int routes = ids32.numel();
+   TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
+@@ -3313,7 +3402,8 @@ void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+     return reinterpret_cast<int8_t*>(t.data_ptr());
+   };
+   int* pl = plan.data_ptr<int>();
+-  v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
++  if (build_plan)
++    v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
+ #define V41K_GU7R(T)                                                           \
+   v41k::gate_up_em5<T><<<dim3(18, routes), 512, 0, stream>>>(                  \
+       i8(hq), hd.data_ptr<float>(), i8(xq), xd.data_ptr<float>(),              \
+@@ -3329,6 +3419,23 @@ void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
++                   torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
++                   torch::Tensor gate, torch::Tensor up, int64_t gtype,
++                   torch::Tensor gbook, torch::Tensor plan) {
++  gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,
++                true);
++}
++
++// gate_up7 with the plan already built by q8_plan (VLLM_V41_PLAN_FUSE).
++void v41k_gate_up7p(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
++                    torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
++                    torch::Tensor gate, torch::Tensor up, int64_t gtype,
++                    torch::Tensor gbook, torch::Tensor plan) {
++  gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,
++                false);
++}
++
+ void v41k_down_rows(torch::Tensor out, torch::Tensor gathered,
+                     int64_t rank_stride, int64_t routes, torch::Tensor down,
+                     int64_t dtype, int64_t row_base, torch::Tensor dbook,
+@@ -3458,6 +3565,15 @@ TORCH_LIBRARY(v41k, m) {
+       &v41k_diag);
+   m.def("q8_aligned(Tensor(a!) qs, Tensor(b!) ds, Tensor x) -> ()",
+         &v41k_q8_aligned);
++  m.def(
++      "q8_plan(Tensor(a!) qs, Tensor(b!) ds, Tensor x, Tensor ids32, "
++      "Tensor(c!) plan) -> ()",
++      &v41k_q8_plan);
++  m.def(
++      "gate_up7p(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "
++      "ids32, Tensor prob, "
++      "Tensor gate, Tensor up, int gtype, Tensor gbook, Tensor plan) -> ()",
++      &v41k_gate_up7p);
+   m.def(
+       "moe5(Tensor(a!) out, Tensor xq, Tensor xd, Tensor(b!) hq, Tensor(c!) "
+       "hd, Tensor ids32, "
+diff --git a/tests/models/test_deepseek_v41_plan_fuse.py b/tests/models/test_deepseek_v41_plan_fuse.py
+new file mode 100644
+index 0000000000..d389c24da2
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_plan_fuse.py
+@@ -0,0 +1,228 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""VLLM_V41_PLAN_FUSE: the register plan must write moe_plan's plan (CPU).
++
++``plan_warp`` (v41k.cu, run inside the q8_plan launch) replaces the
++shared-memory ``moe_plan`` kernel. Both are modelled here lane by lane as
++written in CUDA and must write the same entries with the same values for any
++ids (repeats across rows, dropped routes id < 0, 0..36 routes). The dispatch
++test runs ``_q8_and_plan`` against recorded fake ops.
++
++Scope: a Python model of the two kernels, not the GPU. The GPU check is
++benchmarks/deepseek_v41/plan_fuse_check.py.
++
++    python tests/models/test_deepseek_v41_plan_fuse.py   # or pytest
++"""
++
++import ast
++import random
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++CU = ROOT / "benchmarks/deepseek_v41/v41k/v41k.cu"
++MOE = ROOT / "vllm/model_executor/layers/quantization/gguf_v41_moe.py"
++
++
++def _popc(x):
++    return bin(x & 0xFFFFFFFF).count("1")
++
++
++def moe_plan(ids, routes):
++    """v41k::moe_plan, one warp, as written (shared s_ids, serial scans)."""
++    plan = {}
++    s_ids = [ids[r] if r < routes else -1 for r in range(64)]
++    e = {(lane, h): s_ids[lane + 32 * h] for lane in range(32) for h in range(2)}
++    first = {}
++    for lane in range(32):
++        for h in range(2):
++            r = lane + 32 * h
++            f = r < routes and e[lane, h] >= 0
++            q = 0
++            while q < r and f:
++                f = s_ids[q] != e[lane, h]
++                q += 1
++            first[lane, h] = f
++    b0 = sum(1 << lane for lane in range(32) if first[lane, 0])
++    b1 = sum(1 << lane for lane in range(32) if first[lane, 1])
++    s_first_u = {}
++    for lane in range(32):
++        below = (1 << lane) - 1
++        for h in range(2):
++            r = lane + 32 * h
++            u = _popc(b0 & below) if h == 0 else _popc(b0) + _popc(b1 & below)
++            if first[lane, h]:
++                s_first_u[r] = u
++    for lane in range(32):
++        for h in range(2):
++            r = lane + 32 * h
++            if r >= routes or e[lane, h] < 0:
++                continue
++            q0 = 0
++            while s_ids[q0] != e[lane, h]:
++                q0 += 1
++            c = sum(s_ids[q] == e[lane, h] for q in range(q0, r))
++            u = s_first_u[q0]
++            if c < 6:
++                plan[73 + 6 * u + c] = r
++            if first[lane, h]:
++                cnt = sum(s_ids[q] == e[lane, h] for q in range(r, routes))
++                plan[1 + u] = e[lane, h]
++                plan[37 + u] = min(cnt, 6)
++    plan[0] = _popc(b0) + _popc(b1)
++    return plan
++
++
++def plan_warp(ids, routes):
++    """v41k::plan_warp, one warp, as written (registers and shuffles)."""
++    plan = {}
++    lanes = range(32)
++    e = {
++        (ln, h): ids[ln + 32 * h] if ln + 32 * h < routes else -1
++        for ln in lanes
++        for h in range(2)
++    }
++    live = {k: k[0] + 32 * k[1] < routes and e[k] >= 0 for k in e}
++    c = dict.fromkeys(e, 0)
++    cnt = dict.fromkeys(e, 0)
++    q0 = {k: k[0] + 32 * k[1] for k in e}
++    for q in range(routes):
++        src = {ln: e[ln, 0] if q < 32 else e[ln, 1] for ln in lanes}
++        v = src[q & 31]  # __shfl_sync(src, q & 31): same value in every lane
++        for ln, h in e:
++            r = ln + 32 * h
++            if live[ln, h] and v == e[ln, h]:
++                if q < r:
++                    c[ln, h] += 1
++                    q0[ln, h] = min(q0[ln, h], q)
++                else:
++                    cnt[ln, h] += 1
++    b0 = sum(1 << ln for ln in lanes if live[ln, 0] and c[ln, 0] == 0)
++    b1 = sum(1 << ln for ln in lanes if live[ln, 1] and c[ln, 1] == 0)
++    own0 = {ln: _popc(b0 & ((1 << ln) - 1)) for ln in lanes}
++    own1 = {ln: _popc(b0) + _popc(b1 & ((1 << ln) - 1)) for ln in lanes}
++    for ln, h in e:
++        u0, u1 = own0[q0[ln, h] & 31], own1[q0[ln, h] & 31]
++        u, r = (u0 if q0[ln, h] < 32 else u1), ln + 32 * h
++        if not live[ln, h]:
++            continue
++        if c[ln, h] < 6:
++            plan[73 + 6 * u + c[ln, h]] = r
++        if c[ln, h] == 0:
++            plan[1 + u] = e[ln, h]
++            plan[37 + u] = min(cnt[ln, h], 6)
++    plan[0] = _popc(b0) + _popc(b1)
++    return plan
++
++
++def _cases():
++    rng = random.Random(0)
++    yield [], 0
++    yield [-1] * 36, 36
++    yield [5] * 36, 36  # one expert: 36 routes, only 6 recorded
++    yield list(range(6)) * 6, 36
++    for _ in range(400):
++        rows = rng.randint(1, 6)
++        pool = rng.choice([6, 7, 8, 12, 24, 96, 384])
++        experts = rng.sample(range(384), pool)
++        ids = []
++        for _ in range(rows):
++            row = rng.sample(experts, 6)
++            keep = rng.choice([6, 6, 6, 5, 3, 1])
++            ids += row[:keep] + [-1] * (6 - keep)
++        yield ids, len(ids)
++
++
++@pytest.mark.parametrize("case", list(_cases()), ids=lambda c: f"r{c[1]}")
++def test_register_plan_writes_moe_plan_entries(case):
++    ids, routes = case
++    want = moe_plan(ids, routes)
++    got = plan_warp(ids, routes)
++    assert got == want
++    assert all(0 <= k < 73 + 216 for k in got)
++
++
++def test_kernel_sources_and_ops():
++    src = CU.read_text()
++    assert "void plan_warp(int* __restrict__ plan," in src
++    assert (
++        "if (blockIdx.x == 0 && threadIdx.x < 32) plan_warp(plan, ids, routes);" in src
++    )
++    assert "q8_aligned_row(qs, ds, x, K, blockIdx.y - 1);" in src
++    assert "q8_aligned_row(qs, ds, x, K, blockIdx.y);" in src
++    # gate_up7 keeps its own moe_plan launch; gate_up7p skips it.
++    assert (
++        "gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,\n"
++        "                true);" in src
++    )
++    assert (
++        "gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,\n"
++        "                false);" in src
++    )
++    assert '"q8_plan(Tensor(a!) qs, Tensor(b!) ds, Tensor x, Tensor ids32, "' in src
++    assert (
++        '"gate_up7p(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "' in src
++    )
++    envs = (ROOT / "vllm/envs.py").read_text()
++    assert '    VLLM_V41_PLAN_FUSE: str = "0"\n' in envs
++    assert 'lambda: os.getenv("VLLM_V41_PLAN_FUSE", "0")' in envs
++    assert '_PLAN_FUSE = envs.VLLM_V41_PLAN_FUSE == "1"' in MOE.read_text()
++    ast.parse((ROOT / "benchmarks/deepseek_v41/plan_fuse_check.py").read_text())
++
++
++def _dispatch(fuse, ops):
++    tree = ast.parse(MOE.read_text())
++    fn = next(
++        n
++        for n in tree.body
++        if isinstance(n, ast.FunctionDef) and n.name == "_q8_and_plan"
++    )
++    calls = []
++
++    def op(name):
++        def call(*a):
++            calls.append(name)
++
++        call.name = name
++        return call
++
++    v41k = types.SimpleNamespace(**{n: op(n) for n in ops})
++    ns = {
++        "torch": types.SimpleNamespace(ops=types.SimpleNamespace(v41k=v41k)),
++        "_PLAN_FUSE": fuse,
++        "default_v41k_library": lambda: "/x/v41k.so",
++        "_PLAN_FUSE_LOGGED": False,
++        "logger": types.SimpleNamespace(
++            info=lambda msg, *a: calls.append(("log", msg))
++        ),
++    }
++    exec(compile(ast.Module([fn], []), str(MOE), "exec"), ns)
++    return ns["_q8_and_plan"], calls
++
++
++def test_dispatch_off_is_todays_ops():
++    fn, calls = _dispatch(False, ["q8_aligned", "gate_up7"])
++    nxt = fn(1, 2, 3, 4, 5)
++    assert calls == ["q8_aligned"] and nxt.name == "gate_up7"
++
++
++def test_dispatch_on_uses_fused_ops():
++    fn, calls = _dispatch(True, ["q8_aligned", "gate_up7", "q8_plan", "gate_up7p"])
++    nxt = fn(1, 2, 3, 4, 5)
++    fn(1, 2, 3, 4, 5)
++    log = ("log", "VLLM_V41_PLAN_FUSE=1: expert plan built in q8_plan, gate_up7p")
++    # the fused ops on every call; the activation logged once
++    assert calls == [log, "q8_plan", "q8_plan"] and nxt.name == "gate_up7p"
++
++
++def test_dispatch_on_with_an_old_library_raises():
++    fn, _ = _dispatch(True, ["q8_aligned", "gate_up7"])
++    with pytest.raises(RuntimeError, match="VLLM_V41_PLAN_FUSE=1 needs"):
++        fn(1, 2, 3, 4, 5)
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-q"]))
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..f97872c2f9 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -500,6 +500,7 @@
+     VLLM_V41_MAX_LEN: str = "16384"
+     VLLM_V41_MISS_HIST: str = "0"
+     VLLM_V41_PACKED_KV: str | None = None
++    VLLM_V41_PLAN_FUSE: str = "0"
+     VLLM_V41_PLAN_STATS: str | None = None
+     VLLM_V41_PRED_STATS: str = "0"
+     VLLM_V41_PREFETCH: str = "0"
+@@ -7666,6 +7667,20 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_PLAN_FUSE": env_var(
++        lambda: os.getenv("VLLM_V41_PLAN_FUSE", "0"),
++        description=(
++            "DS-V4.1 TP4 row-split experts: 1 = build the per-layer expert "
++            "plan inside the q8 activation launch (v41k q8_plan + gate_up7p) "
++            "instead of a separate moe_plan launch; same plan bit for bit."
++        ),
++        category="tuning",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_PLAN_STATS": env_var(
+         lambda: os.getenv("VLLM_V41_PLAN_STATS"),
+         description=("DS-V4.1 SM70 runtime switch (developer)."),
+diff --git a/vllm/model_executor/layers/quantization/gguf_v41_moe.py b/vllm/model_executor/layers/quantization/gguf_v41_moe.py
+index 86f874a9ea..b4167a2fdb 100644
+--- a/vllm/model_executor/layers/quantization/gguf_v41_moe.py
++++ b/vllm/model_executor/layers/quantization/gguf_v41_moe.py
+@@ -9,9 +9,12 @@
+ 
+ import vllm.envs as envs
+ from vllm._sm70.policy import register_policy_op
++from vllm.logger import init_logger
+ 
+ from .gguf_native import native_dense
+ 
++logger = init_logger(__name__)
++
+ 
+ def v41_fp16_experts(
+     x,
+@@ -145,6 +148,33 @@ def _expert_major_ready():
+ os.environ.setdefault("VLLM_V41_EM8", "0")  # single-barrier down: no gain measured
+ 
+ 
++_PLAN_FUSE = envs.VLLM_V41_PLAN_FUSE == "1"
++_PLAN_FUSE_LOGGED = False
++
++
++def _q8_and_plan(xq, xd, x, ids32, plan):
++    """Quantize x for the expert rows path and build this layer's expert plan.
++
++    Returns the gate/up op to call next: gate_up7 builds the plan itself in a
++    separate moe_plan launch; with VLLM_V41_PLAN_FUSE=1 q8_plan builds the
++    same plan inside the quantization launch and gate_up7p skips moe_plan.
++    """
++    if not _PLAN_FUSE:
++        torch.ops.v41k.q8_aligned(xq, xd, x)
++        return torch.ops.v41k.gate_up7
++    if not hasattr(torch.ops.v41k, "q8_plan"):
++        raise RuntimeError(
++            "VLLM_V41_PLAN_FUSE=1 needs a v41k.so with q8_plan and gate_up7p "
++            "(rebuild benchmarks/deepseek_v41/v41k); loaded: " + default_v41k_library()
++        )
++    global _PLAN_FUSE_LOGGED
++    if not _PLAN_FUSE_LOGGED:
++        _PLAN_FUSE_LOGGED = True
++        logger.info("VLLM_V41_PLAN_FUSE=1: expert plan built in q8_plan, gate_up7p")
++    torch.ops.v41k.q8_plan(xq, xd, x, ids32, plan)
++    return torch.ops.v41k.gate_up7p
++
++
+ def _plan(device):
+     key = ("plan", device)
+     if key not in _EM["books"]:  # type: ignore[operator]
+@@ -197,15 +227,15 @@ def _v41_experts_rows(
+     stride = (routes * 648 + 255) // 256 * 256
+     xq = torch.empty((m, 160, 32), dtype=torch.int8, device=x.device)
+     xd = torch.empty((m, 160), dtype=torch.float32, device=x.device)
+-    torch.ops.v41k.q8_aligned(xq, xd, x.contiguous())
++    plan = _plan(x.device)
++    gate_up7 = _q8_and_plan(xq, xd, x.contiguous(), ids32, plan)
+     peer = _PEER.get(x.device)
+     if peer is not None and hasattr(torch.ops.v41k, "peer_gather"):
+         rank, pointers, own, epoch = peer
+         slot = own[rank * stride : rank * stride + routes * 648]
+         hq = slot[: routes * 576].view(torch.int8).view(routes, 18, 32)
+         hd = slot[routes * 576 :].view(torch.float32).view(routes, 18)
+-        plan = _plan(x.device)
+-        torch.ops.v41k.gate_up7(
++        gate_up7(
+             xq,
+             xd,
+             hq,
+@@ -238,8 +268,7 @@ def _v41_experts_rows(
+     packed = torch.empty(stride, dtype=torch.uint8, device=x.device)
+     hq = packed[: routes * 576].view(torch.int8).view(routes, 18, 32)
+     hd = packed[routes * 576 : routes * 648].view(torch.float32).view(routes, 18)
+-    plan = _plan(x.device)
+-    torch.ops.v41k.gate_up7(
++    gate_up7(
+         xq,
+         xd,
+         hq,

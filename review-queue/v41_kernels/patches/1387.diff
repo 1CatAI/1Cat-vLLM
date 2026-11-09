@@ -1,0 +1,782 @@
+diff --git a/benchmarks/deepseek_v41/v41prefmoe/build.py b/benchmarks/deepseek_v41/v41prefmoe/build.py
+new file mode 100644
+index 0000000000..7926ffa49f
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41prefmoe/build.py
+@@ -0,0 +1,51 @@
++"""Build v41prefmoe.so, the SM70 prefill IQ GEMM library of VLLM_V41_PREFILL_IQ_GEMM.
++
++csrc/prefill_iq.cu reuses the OpenMMLab TurboMind / 1Cat SM70 GEMM headers in the
++repository's csrc/. The library is loaded from next to
++vllm/model_executor/layers/quantization/gguf_prefill_iq.py, so the result is copied
++there.
++
++  cd benchmarks/deepseek_v41/v41prefmoe && TORCH_CUDA_ARCH_LIST=7.0 python build.py
++"""
++
++import os
++import shutil
++from pathlib import Path
++
++from torch.utils.cpp_extension import load
++
++root = Path(__file__).resolve().parent
++src = root.parents[2]  # repository root
++if os.environ.get("TORCH_CUDA_ARCH_LIST") != "7.0":
++    raise RuntimeError(
++        "set TORCH_CUDA_ARCH_LIST=7.0: this library is built for SM70 only"
++    )
++build = root / "build"
++build.mkdir(exist_ok=True)
++load(
++    name="v41prefmoe",
++    sources=[str(root / "csrc/prefill_iq.cu")],
++    build_directory=str(build),
++    extra_include_paths=[
++        str(src / "csrc"),
++        str(src / "csrc/sm70_turbomind/lmdeploy"),
++    ],
++    extra_cflags=["-O3", "-std=c++20", "-fvisibility=hidden"],
++    extra_cuda_cflags=[
++        "-O3",
++        "-std=c++20",
++        "-UNDEBUG",
++        "--expt-relaxed-constexpr",
++        "-Xptxas=-v",
++        "--compiler-options=-fvisibility=hidden",
++        "-U__CUDA_NO_HALF_OPERATORS__",
++        "-U__CUDA_NO_HALF_CONVERSIONS__",
++        "-U__CUDA_NO_HALF2_OPERATORS__",
++    ],
++    with_cuda=True,
++    is_python_module=False,
++    verbose=True,
++)
++dest = src / "vllm/model_executor/layers/quantization/v41prefmoe.so"
++shutil.copyfile(build / "v41prefmoe.so", dest)
++print(f"v41prefmoe.so -> {dest}")
+diff --git a/benchmarks/deepseek_v41/v41prefmoe/csrc/prefill_iq.cu b/benchmarks/deepseek_v41/v41prefmoe/csrc/prefill_iq.cu
+new file mode 100644
+index 0000000000..57705dd59e
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41prefmoe/csrc/prefill_iq.cu
+@@ -0,0 +1,252 @@
++// SPDX-License-Identifier: Apache-2.0
++// Compact scheduling for the existing OpenMMLab/1Cat SM70 canonical MMA.
++// Arithmetic, operand decoders and epilogue are reused with original notices.
++#include <torch/types.h>
++#include <torch/library.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAException.h>
++#include <cassert>
++#include <climits>
++#include <vector>
++#include "src/turbomind/kernels/gemm/arch/config_sm70_s884.h"
++
++namespace prefmoe {
++namespace tm = turbomind;
++namespace tg = turbomind::gemm;
++using tm::Array;
++
++struct MemberTile { int expert, tile, rows, reserved; };
++
++// One stream owns this plan until the GEMM completes. No ticket or stale
++// generation can survive: every launch overwrites count and every live entry.
++template<int BM>
++__global__ void plan_members(const int* offsets, const int* indices,
++                             const tg::StridedPtr* weights,
++                             const tg::StridedPtr* stats,
++                             int experts, int routes, int input_rows,
++                             int* count, MemberTile* tasks, int capacity) {
++  __shared__ int prefix[33];
++  const int e = threadIdx.x;
++  if (e < experts) {
++    const int lo = offsets[e], hi = offsets[e + 1];
++    assert(lo >= 0 && hi >= lo && hi <= routes);
++    if (hi > lo) {
++      assert(weights[e].ptr != nullptr && stats[e].ptr != nullptr);
++      assert(weights[e].stride > 0 && stats[e].stride > 0);
++    }
++    prefix[e + 1] = (hi - lo + BM - 1) / BM;
++  }
++  if (e == 0) prefix[0] = 0;
++  __syncthreads();
++  if (e == 0) {
++    for (int j = 0; j < experts; ++j) prefix[j + 1] += prefix[j];
++    assert(prefix[experts] <= capacity);
++    *count = prefix[experts];
++  }
++  __syncthreads();
++  if (e < experts) {
++    for (int j = prefix[e]; j < prefix[e + 1]; ++j)
++      tasks[j] = {e, j - prefix[e], offsets[e + 1] - offsets[e], 0};
++  }
++  if (indices) {
++    for (int r = offsets[0] + e; r < offsets[experts]; r += blockDim.x)
++      assert(indices[r] >= 0 && indices[r] < input_rows);
++  }
++}
++
++template<int BM, int BN, int BK>
++struct CompactScheduler {
++  static constexpr int group_axis = 0;
++  using Tile = typename tg::SchedulerSm70<tg::kColMajor, BM, BN, BK, BK, false, 0>::Tile;
++  struct SharedStorage {};
++  Array<int, 3> tiles_;
++  MemberTile member;
++  int n_tile, n, k;
++  template<class Reinit>
++  __device__ bool init(Tile& t, SharedStorage&, Reinit) {
++    t.tile_id = {member.tile, n_tile, 0};
++    t.shape = {member.rows, n, k};
++    t.k_iters = {0, k / BK};
++    t.group_id = member.expert;
++    t.linear_tile_id = 0;  // no partial-buffer indexing without split K
++    return true;
++  }
++};
++
++template<int Type, int BM, int BN>
++struct Configuration {
++  static constexpr int group = Type == 16 ? 32 : 16;
++  using C = tg::sm70_s884::Config_GgufLattice<Type, group, tg::kColMajor, 0>;
++  using T = typename C::template Type<BM, BN, 32, (BM == 128 && BN == 128 ? 4 : 2), 2, 1,
++      tm::cache_policy::Default, tm::cache_policy::Default, 2, false, 1, group>;
++  using Scheduler = CompactScheduler<BM, BN, 32>;
++  using Kernel = tg::GemmUniversal<tg::Sm70, typename T::Mainloop,
++                                  typename T::Epilogue, Scheduler>;
++};
++
++template<int Type, int BM, int BN>
++__global__ void compact_gemm(tg::GemmParam p, tg::EpilogueParam ep,
++                             const int* count, const MemberTile* tasks,
++                             int n, int k, bool persistent) {
++  using C = Configuration<Type, BM, BN>;
++  using Kernel = typename C::Kernel;
++  extern __shared__ __align__(16) char scratch[];
++  const int nt = (n + BN - 1) / BN;
++  const int total = *count * nt;
++  // N fastest: weight reuse across nearby member tiles without global tickets.
++  for (int task = blockIdx.x; task < total; task += gridDim.x) {
++    const auto member = tasks[task / nt];
++    typename C::Scheduler sched{{0, nt, 1}, member, task % nt, n, k};
++    Kernel kernel;
++    kernel(p, ep, sched, scratch);
++    // Epilogue/mainloop storage is a union and will be reused by the next tile.
++    __syncthreads();
++    if (!persistent) break;
++  }
++}
++
++template<int Type, int BM, int BN>
++void launch(torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
++            torch::Tensor wp, torch::Tensor sp, torch::Tensor plan,
++            const int* indices, int experts, int routes, int grid,
++            cudaStream_t stream) {
++  using C = Configuration<Type, BM, BN>;
++  using Kernel = typename C::Kernel;
++  const int n = out.size(1), k = input.size(1);
++  const int capacity = (plan.numel() - 1) / 4;
++  int* count = plan.data_ptr<int>();
++  auto* tasks = reinterpret_cast<MemberTile*>(count + 1);
++  plan_members<BM><<<1, 32, 0, stream>>>(offsets.data_ptr<int>(), indices,
++      reinterpret_cast<tg::StridedPtr*>(wp.data_ptr()),
++      reinterpret_cast<tg::StridedPtr*>(sp.data_ptr()), experts, routes,
++      input.size(0), count, tasks, capacity);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++  tg::MatrixParam a{input.data_ptr(), int(input.stride(0)), offsets.data_ptr<int>(),
++                    const_cast<int*>(indices), nullptr};
++  tg::MatrixParam b{wp.data_ptr(), 0, nullptr, nullptr, nullptr};
++  tg::MatrixParam v{sp.data_ptr(), 0, nullptr, nullptr, nullptr};
++  tg::MatrixParam d{out.data_ptr(), int(out.stride(0)), offsets.data_ptr<int>(), nullptr, nullptr};
++  tg::GemmParam p{a, b, {}, v};
++  tg::EpilogueParam ep{};
++  ep.c = d;
++  ep.combine_mat = {d, 1.f, 0.f};
++  constexpr int shared = sizeof(typename Kernel::SharedStorage);
++  auto fn = compact_gemm<Type, BM, BN>;
++  if constexpr (shared > 48 * 1024)
++    C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
++  const bool persistent = grid != 0;
++  const int blocks = persistent ? grid : capacity * ((n + BN - 1) / BN);
++  fn<<<blocks, Kernel::WARP_CNT * 32, shared, stream>>>(p, ep, count, tasks, n, k, persistent);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++template<int Type>
++void dispatch(torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
++              torch::Tensor wp, torch::Tensor sp, torch::Tensor plan,
++              const int* indices, int experts, int routes, int tile, int grid,
++              cudaStream_t stream) {
++#define CELL(ID, M, N) case ID: launch<Type, M, N>(out, input, offsets, wp, sp, plan, indices, experts, routes, grid, stream); return
++  switch (tile) {
++    CELL(0, 32, 64); CELL(1, 64, 64); CELL(2, 128, 64);
++    CELL(3, 32, 128); CELL(4, 64, 128); CELL(5, 128, 128);
++  }
++#undef CELL
++  TORCH_CHECK(false, "prefill IQ tile must be 0..5");
++}
++
++void gemm(torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
++          torch::Tensor wp, torch::Tensor sp, torch::Tensor plan,
++          int64_t codec, int64_t token_count, int64_t tile, int64_t grid,
++          std::optional<torch::Tensor> indices) {
++  TORCH_CHECK(token_count > 6, "prefill IQ forbids decode/verify M1..6");
++  TORCH_CHECK(codec == 29 || codec == 16 || codec == 17, "prefill IQ codec must be IQ1_M/IQ2_XXS/IQ2_XS");
++  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
++              input.dim() == 2 && input.stride(1) == 1,
++              "prefill IQ input must be CUDA FP16 rows");
++  for (const auto& t : {out, offsets, wp, sp, plan})
++    TORCH_CHECK(t.device() == input.device(), "prefill IQ device mismatch");
++  TORCH_CHECK(out.scalar_type() == torch::kFloat16 && out.dim() == 2 &&
++              out.stride(1) == 1 && out.stride(0) >= out.size(1), "prefill IQ output rows");
++  TORCH_CHECK(offsets.scalar_type() == torch::kInt32 && offsets.dim() == 1 &&
++              offsets.is_contiguous() && offsets.numel() >= 2 && offsets.numel() <= 33,
++              "prefill IQ offsets require 1..32 experts");
++  const int64_t experts = offsets.numel() - 1;
++  for (const auto& t : {wp, sp})
++    TORCH_CHECK(t.scalar_type() == torch::kUInt8 && t.is_contiguous() &&
++                t.numel() == experts * 16, "prefill IQ prepared pointer table size/type");
++  TORCH_CHECK(tile >= 0 && tile < 6 && (grid == 0 || grid == 80 || grid == 160),
++              "prefill IQ tile/grid unsupported");
++  const int64_t routes = out.size(0);
++  const int64_t n = out.size(1), k = input.size(1);
++  TORCH_CHECK((n == 1152 && k == 5120) || (n == 1280 && k == 2304),
++              "prefill IQ only accepts V4.1 TP4 gate/up or row-split down");
++  TORCH_CHECK(routes <= 6 * 16384 && input.size(0) <= 6 * 16384 &&
++              input.stride(0) >= k && input.stride(0) <= INT_MAX &&
++              out.stride(0) <= INT_MAX, "prefill IQ capacity/stride invalid");
++  const int bm = 32 << (tile % 3);
++  const int64_t capacity = routes / bm + experts;
++  TORCH_CHECK(plan.scalar_type() == torch::kInt32 && plan.dim() == 1 &&
++              plan.is_contiguous() && plan.numel() >= 1 + capacity * 4,
++              "prefill IQ member plan capacity/type invalid");
++  TORCH_CHECK(!out.is_alias_of(input), "prefill IQ input/output storage alias");
++  for (const auto& t : {out, input, offsets, wp, sp})
++    TORCH_CHECK(!plan.is_alias_of(t), "prefill IQ plan storage alias");
++  const int* idx = nullptr;
++  if (indices) {
++    TORCH_CHECK(n == 1152 && input.size(0) == token_count &&
++                indices->device() == input.device() &&
++                indices->scalar_type() == torch::kInt32 && indices->dim() == 1 &&
++                indices->is_contiguous() && indices->numel() == routes,
++                "prefill IQ gate/up requires matching CUDA int32 route indices");
++    idx = indices->data_ptr<int>();
++    TORCH_CHECK(!plan.is_alias_of(*indices), "prefill IQ plan/index storage alias");
++  } else {
++    TORCH_CHECK(n == 1280 && input.size(0) == routes,
++                "prefill IQ down requires contiguous route rows");
++  }
++  const c10::cuda::CUDAGuard guard(input.device());
++  TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major == 7 &&
++              at::cuda::getCurrentDeviceProperties()->minor == 0, "prefill IQ requires SM70");
++  const auto stream = at::cuda::getCurrentCUDAStream();
++  if (routes == 0) { plan.zero_(); return; }
++  switch (codec) {
++#define CODEC(T) case T: dispatch<T>(out,input,offsets,wp,sp,plan,idx,experts,routes,tile,grid,stream); return
++    CODEC(29); CODEC(16); CODEC(17);
++#undef CODEC
++  }
++  TORCH_CHECK(false, "prefill IQ codec must be IQ1_M/IQ2_XXS/IQ2_XS");
++}
++
++template<int Type, int BM, int BN>
++void resource_cell(std::vector<int64_t>& values, int tile) {
++  using Kernel = typename Configuration<Type, BM, BN>::Kernel;
++  constexpr int shared = sizeof(typename Kernel::SharedStorage);
++  constexpr int threads = Kernel::WARP_CNT * 32;
++  auto fn = compact_gemm<Type, BM, BN>;
++  if constexpr (shared > 48 * 1024)
++    C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
++  cudaFuncAttributes attrs{};
++  C10_CUDA_CHECK(cudaFuncGetAttributes(&attrs, fn));
++  int blocks = 0;
++  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, threads, shared));
++  values.insert(values.end(), {Type, tile, threads, shared, attrs.numRegs, blocks});
++}
++
++std::vector<int64_t> resources(torch::Tensor device_anchor) {
++  TORCH_CHECK(device_anchor.is_cuda(), "resource query requires actual CUDA device");
++  const c10::cuda::CUDAGuard guard(device_anchor.device());
++  TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major == 7 &&
++              at::cuda::getCurrentDeviceProperties()->minor == 0, "resource query requires SM70");
++  std::vector<int64_t> values;
++#define RES(T) resource_cell<T,32,64>(values,0); resource_cell<T,64,64>(values,1); resource_cell<T,128,64>(values,2); resource_cell<T,32,128>(values,3); resource_cell<T,64,128>(values,4); resource_cell<T,128,128>(values,5)
++  RES(29); RES(16); RES(17);
++#undef RES
++  return values;
++}
++}  // namespace prefmoe
++
++TORCH_LIBRARY(v41prefmoe, m) {
++  m.def("gemm(Tensor(a!) out, Tensor input, Tensor offsets, Tensor weights, Tensor stats, Tensor(b!) plan, int codec, int token_count, int tile, int grid, Tensor? indices) -> ()", &prefmoe::gemm);
++  m.def("resources(Tensor device_anchor) -> int[]", &prefmoe::resources);
++}
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..ecc87603c1 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -504,6 +504,10 @@
+     VLLM_V41_PRED_STATS: str = "0"
+     VLLM_V41_PREFETCH: str = "0"
+     VLLM_V41_PREFETCH_EVAL: str | None = None
++    VLLM_V41_PREFILL_IQ_GEMM: str = "0"
++    VLLM_V41_PREFILL_IQ_TILES: str = "1,1,1,1,1,1"
++    VLLM_V41_PREFILL_IQ_GRID: str = "160"
++    VLLM_V41_PREFILL_IQ_OBSERVE: str = "0"
+     VLLM_V41_PREFILL_DMA: str = "1"
+     VLLM_V41_PREFILL_GROUP: str | None = None
+     VLLM_V41_PREFILL_TIMING: str = "0"
+@@ -1436,6 +1440,62 @@ def _resolve_rust_frontend_path() -> str | None:
+ 
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    "VLLM_V41_PREFILL_IQ_GEMM": env_var(
++        lambda: os.getenv("VLLM_V41_PREFILL_IQ_GEMM", "0"),
++        description=(
++            "DS-V4.1 prefill (more than 6 rows): 1 = the routed-expert IQ1_M,"
++            " IQ2_XXS and IQ2_XS GEMMs run on the v41prefmoe SM70 grouped kernel"
++            " (benchmarks/deepseek_v41/v41prefmoe); 0 = the existing grouped"
++            " prefill GEMM. Decode never enters it."
++        ),
++        category="tuning",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
++    "VLLM_V41_PREFILL_IQ_TILES": env_var(
++        lambda: os.getenv("VLLM_V41_PREFILL_IQ_TILES", "1,1,1,1,1,1"),
++        description=(
++            "DS-V4.1 prefill IQ GEMM: six tile ids 0..5 for IQ1_M gate/up and"
++            " down, IQ2_XXS gate/up and down, IQ2_XS gate/up and down; frozen at"
++            " load. Read only with VLLM_V41_PREFILL_IQ_GEMM=1."
++        ),
++        category="tuning",
++        declared_default="'1,1,1,1,1,1'",
++        effective_default="'1,1,1,1,1,1'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
++    "VLLM_V41_PREFILL_IQ_GRID": env_var(
++        lambda: os.getenv("VLLM_V41_PREFILL_IQ_GRID", "160"),
++        description=(
++            "DS-V4.1 prefill IQ GEMM launch: 0 = one block per output tile;"
++            " 80 or 160 = a persistent grid of that many blocks."
++        ),
++        category="tuning",
++        declared_default="'160'",
++        effective_default="'160'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
++    "VLLM_V41_PREFILL_IQ_OBSERVE": env_var(
++        lambda: os.getenv("VLLM_V41_PREFILL_IQ_OBSERVE", "0"),
++        description=(
++            "DS-V4.1 prefill: 1 = log one descriptor line per grouped expert GEMM"
++            " (shapes and per-expert row counts, no activations) on the existing"
++            " kernel; refused together with VLLM_V41_PREFILL_IQ_GEMM=1."
++        ),
++        category="debug",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_SM70_E4M3_LONG_ATTENTION": env_var(
+         lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION"),
+         description=(
+@@ -20322,6 +20382,10 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
+         "VLLM_V41_PRED_STATS",
+         "VLLM_V41_PREFETCH",
+         "VLLM_V41_PREFETCH_EVAL",
++        "VLLM_V41_PREFILL_IQ_GEMM",
++        "VLLM_V41_PREFILL_IQ_TILES",
++        "VLLM_V41_PREFILL_IQ_GRID",
++        "VLLM_V41_PREFILL_IQ_OBSERVE",
+         "VLLM_V41_PREFILL_DMA",
+         "VLLM_V41_PREFILL_GROUP",
+         "VLLM_V41_PREFILL_TIMING",
+diff --git a/vllm/model_executor/layers/quantization/gguf_prefill_iq.py b/vllm/model_executor/layers/quantization/gguf_prefill_iq.py
+new file mode 100644
+index 0000000000..b3ad07484a
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/gguf_prefill_iq.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One-forward, stream-owned compact canonical prefill GEMM context.
++
++Imported only on an enabled M>6 prefill. The caller retains sole ownership of
++its canonical bank and all activation/peer/accumulation transitions.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from enum import IntEnum
++from pathlib import Path
++
++import torch
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class Codec(IntEnum):
++    IQ1_M = 29
++    IQ2_XXS = 16
++    IQ2_XS = 17
++
++
++@dataclass(frozen=True)
++class IndexedGateUp:
++    output: torch.Tensor
++    input: torch.Tensor
++    offsets: torch.Tensor
++    weights: torch.Tensor
++    stats: torch.Tensor
++    codec: Codec
++    indices: torch.Tensor
++
++
++@dataclass(frozen=True)
++class ContiguousDown:
++    output: torch.Tensor
++    input: torch.Tensor
++    offsets: torch.Tensor
++    weights: torch.Tensor
++    stats: torch.Tensor
++    codec: Codec
++
++
++@dataclass(frozen=True)
++class TileSelection:
++    # IQ1_M GU/DN, IQ2_XXS GU/DN, IQ2_XS GU/DN; immutable after load.
++    tiles: tuple[int, ...]
++    grid: int
++
++    @classmethod
++    def parse(cls, text: str, grid: str) -> TileSelection:
++        parts = text.split(",")
++        if len(parts) != 6 or any(
++            p not in ("0", "1", "2", "3", "4", "5") for p in parts
++        ):
++            raise ValueError("VLLM_V41_PREFILL_IQ_TILES requires six tile IDs 0..5")
++        if grid not in ("0", "80", "160"):
++            raise ValueError("VLLM_V41_PREFILL_IQ_GRID requires 0, 80 or 160")
++        return cls(tuple(int(p) for p in parts), int(grid))
++
++    def tile(self, request: IndexedGateUp | ContiguousDown) -> int:
++        index = (Codec.IQ1_M, Codec.IQ2_XXS, Codec.IQ2_XS).index(request.codec)
++        return self.tiles[2 * index + int(isinstance(request, ContiguousDown))]
++
++
++_selection = TileSelection.parse(
++    envs.VLLM_V41_PREFILL_IQ_TILES, envs.VLLM_V41_PREFILL_IQ_GRID
++)
++_library = Path(__file__).with_name("v41prefmoe.so")
++if not _library.is_file():
++    raise FileNotFoundError(f"Enabled prefill IQ requires {_library}")
++torch.ops.load_library(str(_library))
++_announced = False
++
++
++class IqPrefill:
++    def __init__(self, tokens: int, max_routes: int, device: torch.device) -> None:
++        if tokens <= 6 or not 0 < max_routes <= 6 * 16384:
++            raise ValueError("Prefill IQ requires M>6 and at most 16384 routed tokens")
++        self.tokens = tokens
++        self.plan = torch.empty(
++            1 + 4 * (max_routes // 32 + 32), dtype=torch.int32, device=device
++        )
++        self.stream = torch.cuda.current_stream(device)
++        self.launches = 0
++
++    def run(self, request: IndexedGateUp | ContiguousDown) -> None:
++        global _announced
++        if torch.cuda.current_stream(request.input.device) != self.stream:
++            raise RuntimeError("Prefill IQ plan stream ownership changed")
++        indices = request.indices if isinstance(request, IndexedGateUp) else None
++        torch.ops.v41prefmoe.gemm(
++            request.output,
++            request.input,
++            request.offsets,
++            request.weights,
++            request.stats,
++            self.plan,
++            int(request.codec),
++            self.tokens,
++            _selection.tile(request),
++            _selection.grid,
++            indices,
++        )
++        self.launches += 1
++        if not _announced:
++            logger.info(
++                "V4.1 prefill IQ GEMM: enabled SM70 grouped canonical; launches=1"
++            )
++            _announced = True
++
++    def gemm(
++        self,
++        output: torch.Tensor,
++        input: torch.Tensor,
++        offsets: torch.Tensor,
++        weights: torch.Tensor,
++        stats: torch.Tensor,
++        family: int,
++        decoder: int,
++        n: int,
++        experts: int,
++        group: int,
++        gated: bool,
++        tune: bool,
++        indices: torch.Tensor | None,
++    ) -> None:
++        codec = Codec(decoder)
++        if (
++            family != 0
++            or gated
++            or n != output.shape[1]
++            or experts != offsets.numel() - 1
++        ):
++            raise ValueError(
++                "Prefill IQ requires ungated canonical lattice descriptors"
++            )
++        if group != (32 if codec == Codec.IQ2_XXS else 16):
++            raise ValueError("Prefill IQ canonical group size mismatch")
++        if tune:
++            raise ValueError("Candidate selection must be frozen before serving")
++        if indices is None:
++            self.run(ContiguousDown(output, input, offsets, weights, stats, codec))
++        else:
++            self.run(
++                IndexedGateUp(output, input, offsets, weights, stats, codec, indices)
++            )
+diff --git a/vllm/model_executor/layers/quantization/gguf_prefill_iq_observe.py b/vllm/model_executor/layers/quantization/gguf_prefill_iq_observe.py
+new file mode 100644
+index 0000000000..e0c754876b
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/gguf_prefill_iq_observe.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Untimed owner-window descriptor census; no activation or prompt capture."""
++
++from __future__ import annotations
++
++import json
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class ObservedBaseline:
++    def __init__(self, layer: int, rank: int, tokens: int) -> None:
++        self.layer, self.rank, self.tokens = layer, rank, tokens
++
++    def gemm(
++        self,
++        output: torch.Tensor,
++        input: torch.Tensor,
++        offsets: torch.Tensor,
++        weights: torch.Tensor,
++        stats: torch.Tensor,
++        family: int,
++        decoder: int,
++        n: int,
++        experts: int,
++        group: int,
++        gated: bool,
++        tune: bool,
++        indices: torch.Tensor | None,
++    ) -> None:
++        bounds = offsets.cpu().tolist()
++        counts = [b - a for a, b in zip(bounds, bounds[1:])]
++        logger.info(
++            "PREFMOE_DESCRIPTOR %s",
++            json.dumps(
++                dict(
++                    layer=self.layer,
++                    rank=self.rank,
++                    tokens=self.tokens,
++                    role="gu" if indices is not None else "dn",
++                    codec=decoder,
++                    n=n,
++                    k=input.shape[1],
++                    descriptor_m=output.shape[0],
++                    low=bounds[0],
++                    high=bounds[-1],
++                    counts=counts,
++                ),
++                separators=(",", ":"),
++            ),
++        )
++        torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
++            output,
++            input,
++            offsets,
++            weights,
++            stats,
++            family,
++            decoder,
++            n,
++            experts,
++            group,
++            gated,
++            tune,
++            indices,
++        )
+diff --git a/vllm/model_executor/layers/quantization/gguf_shared_prefill.py b/vllm/model_executor/layers/quantization/gguf_shared_prefill.py
+index ea5a5a9125..8033e3fb29 100644
+--- a/vllm/model_executor/layers/quantization/gguf_shared_prefill.py
++++ b/vllm/model_executor/layers/quantization/gguf_shared_prefill.py
+@@ -197,6 +197,17 @@ def _v41_prefill_activation_rows_p(
+ # startup profile run); later passes reuse the measured family.
+ _TUNE_PASSES = int(envs.VLLM_V41_TUNE_PREFILL_PASSES)
+ 
++_PREFILL_IQ_VALUE = envs.VLLM_V41_PREFILL_IQ_GEMM
++if _PREFILL_IQ_VALUE not in ("0", "1"):
++    raise ValueError("VLLM_V41_PREFILL_IQ_GEMM requires 0 or 1")
++_PREFILL_IQ = _PREFILL_IQ_VALUE == "1"
++_PREFILL_IQ_OBSERVE_VALUE = envs.VLLM_V41_PREFILL_IQ_OBSERVE
++if _PREFILL_IQ_OBSERVE_VALUE not in ("0", "1"):
++    raise ValueError("VLLM_V41_PREFILL_IQ_OBSERVE requires 0 or 1")
++_PREFILL_IQ_OBSERVE = _PREFILL_IQ_OBSERVE_VALUE == "1"
++if _PREFILL_IQ and _PREFILL_IQ_OBSERVE:
++    raise ValueError("Descriptor census and candidate measurement are separate modes")
++
+ 
+ class _DeviceView:
+     """Zero-copy torch view of a raw device allocation."""
+@@ -864,6 +875,17 @@ def forward(self, layer, x, ids, probabilities):
+             (f, min(self.tile_experts, spec.experts - f))
+             for f in range(0, spec.experts, self.tile_experts)
+         ]
++        iq = None
++        if _PREFILL_IQ_OBSERVE and x.shape[0] > 6:
++            from .gguf_prefill_iq_observe import ObservedBaseline
++
++            iq = ObservedBaseline(self.cache.layers[layer], self.cache.rank, x.shape[0])
++        if _PREFILL_IQ and x.shape[0] > 6:
++            from .gguf_prefill_iq import IqPrefill
++
++            if not self.rows_mode:
++                raise ValueError("Prefill IQ requires TP4 row-split down")
++            iq = IqPrefill(x.shape[0], maximum, x.device)
+         host_offsets = [o.tolist() for _, _, o, *_ in routes] if _EXACT_GEMM else None
+         tune = self.tuned_passes < _TUNE_PASSES
+         ring = self.dma and self.ring
+@@ -915,20 +937,36 @@ def forward(self, layer, x, ids, probabilities):
+                     lo, hi, rel = 0, count, bounds
+                 fmt = info["gu"]
+                 self._sub("gu")
+-                torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
+-                    projection[lo:hi],
+-                    x,
+-                    rel,
+-                    *(t[: expert_count * 16] for t in tables["gu"]),
+-                    fmt[0],
+-                    fmt[1],
+-                    2 * info["rows"],
+-                    expert_count,
+-                    fmt[2],
+-                    False,
+-                    tune,
+-                    rows[lo:hi],
+-                )
++                if iq is not None:
++                    iq.gemm(
++                        projection[lo:hi],
++                        x,
++                        rel,
++                        *(t[: expert_count * 16] for t in tables["gu"]),
++                        fmt[0],
++                        fmt[1],
++                        2 * info["rows"],
++                        expert_count,
++                        fmt[2],
++                        False,
++                        tune,
++                        rows[lo:hi],
++                    )
++                else:
++                    torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
++                        projection[lo:hi],
++                        x,
++                        rel,
++                        *(t[: expert_count * 16] for t in tables["gu"]),
++                        fmt[0],
++                        fmt[1],
++                        2 * info["rows"],
++                        expert_count,
++                        fmt[2],
++                        False,
++                        tune,
++                        rows[lo:hi],
++                    )
+                 self._sub("act")
+                 if self.rows_mode:
+                     parity = self.rows_parity
+@@ -987,20 +1025,36 @@ def forward(self, layer, x, ids, probabilities):
+                     h = hidden[:count]  # type: ignore[index]
+                 fmt = info["dn"]
+                 self._sub("dn")
+-                torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
+-                    down[lo:hi],
+-                    h[lo:hi],
+-                    rel,
+-                    *(t[: expert_count * 16] for t in tables["dn"]),
+-                    fmt[0],
+-                    fmt[1],
+-                    out_n,
+-                    expert_count,
+-                    fmt[2],
+-                    False,
+-                    tune,
+-                    None,
+-                )
++                if iq is not None:
++                    iq.gemm(
++                        down[lo:hi],
++                        h[lo:hi],
++                        rel,
++                        *(t[: expert_count * 16] for t in tables["dn"]),
++                        fmt[0],
++                        fmt[1],
++                        out_n,
++                        expert_count,
++                        fmt[2],
++                        False,
++                        tune,
++                        None,
++                    )
++                else:
++                    torch.ops._C.gguf_grouped_prefill_gemm_sm70_out(
++                        down[lo:hi],
++                        h[lo:hi],
++                        rel,
++                        *(t[: expert_count * 16] for t in tables["dn"]),
++                        fmt[0],
++                        fmt[1],
++                        out_n,
++                        expert_count,
++                        fmt[2],
++                        False,
++                        tune,
++                        None,
++                    )
+                 # Route probabilities were applied before the FP16 down input.
+                 self._sub("accumulate")
+                 _v41_prefill_accumulate[(last - first, triton.cdiv(out_n, 1024))](

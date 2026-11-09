@@ -1,0 +1,100 @@
+{
+  "initial_inventory": {
+    "number": 1386,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Reduce decode index scores over the live prefix through an IPC bank (VLLM_V41_INDEX_REDUCE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1386",
+    "isDraft": false,
+    "headRefOid": "7b1b689f528382ee20041d5fc27a4f05d61060dc",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1386,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Reduce decode index scores over the live prefix through an IPC bank (VLLM_V41_INDEX_REDUCE, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone (TP4). It touches `select_packed_positions` near our tiled-scorer PR #1372; whichever lands second needs a small rebase.\n\n## Purpose\n\nAt decode, each TP rank scores the packed index keys for its heads, and the four partial score rows are summed by an all-reduce over every key slot of the store, live or not.\n\nWith **`VLLM_V41_INDEX_REDUCE=1`** (default off):\n\n- `kv_store.py`: a `V41IndexBank`, one IPC-shared FP16 partial-score buffer per rank plus epoch flags, set up once through the custom all-reduce's IPC handles.\n- `attention_ops.py`: each rank's decode scores are written straight into its bank slot (`index_scores_decode` uses the slot as `out`), and the new v41k kernel `index_reduce_live` reads all four slots over CUDA IPC (per-CTA epoch flags, release/acquire at system scope) and sums only the live columns `[0, (positions[-1] + 1) // ratio)` in rank order 0..3 in FP32, rounding once. Those are the custom all-reduce one-stage numerics, the same on every rank. Columns past the live end are not written; `index_topk` never reads them.\n- Fallbacks: without TP4 and a fully connected custom all-reduce, the bank is not built and the first use logs `VLLM_V41_INDEX_REDUCE=1 needs TP4 and a fully connected custom all-reduce`; a batch larger than the bank, keys wider than it, or no CUDA scorer take the all-reduce.\n- `tests/models/test_deepseek_v41_index_reduce.py`: CPU tests (switch off keeps the all-reduce; the bank path equals the custom all-reduce sum; fallbacks; the kernel's column walk and argument contract against the Python side).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_index_reduce.py tests/models/test_deepseek_v41_attention_ops.py\npython benchmarks/deepseek_v41/v41k/build.py   # sm_70; then load it and check that v41k::index_reduce_live is registered\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Live-prefix reduce | DeepSeek-V4.1 packed index keys | SM70, TP4, fully connected custom all-reduce, decode, switch on | bank + `index_reduce_live`; else the all-reduce (logged) | CPU tests; sm_70 build; measured on 8x V100 (each PP stage a TP4 group) | single-stage TP4 (no PP) not measured |\n| Switch off | all | default | all-reduce, unchanged | CPU test | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_INDEX_REDUCE` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_INDEX_REDUCE=1`, TP4 with the custom all-reduce, and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; the fallback reason is logged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: one tuning variable with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +1 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark 5, one request, paired arms, switch on vs off: about **-0.85 ms per round**; T=1 output text byte-identical across boots. (A first screening run the same day: 31.6 -> 30.3 ms per round, 98.0 -> 102.9 tok/s.)\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41k.so` from this tree: OK; `v41k::index_reduce_live` is registered.\n- pytest, the two files above, CPU only: 10 passed, 10 skipped (CUDA-only attention-op cases).\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: the kernel on GPUs (it needs four connected GPUs with IPC), timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1386",
+    "isDraft": false,
+    "headRefName": "pli/v41-index-reduce",
+    "headRefOid": "7b1b689f528382ee20041d5fc27a4f05d61060dc",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1386,
+    "id": "PR_kwDORjYFXs8AAAABNJnmnw",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "7b1b689f528382ee20041d5fc27a4f05d61060dc",
+    "title": "[Perf][SM70][DeepSeek-V4.1] Reduce decode index scores over the live prefix through an IPC bank (VLLM_V41_INDEX_REDUCE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1386",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone (TP4). It touches `select_packed_positions` near our tiled-scorer PR #1372; whichever lands second needs a small rebase.\n\n## Purpose\n\nAt decode, each TP rank scores the packed index keys for its heads, and the four partial score rows are summed by an all-reduce over every key slot of the store, live or not.\n\nWith **`VLLM_V41_INDEX_REDUCE=1`** (default off):\n\n- `kv_store.py`: a `V41IndexBank`, one IPC-shared FP16 partial-score buffer per rank plus epoch flags, set up once through the custom all-reduce's IPC handles.\n- `attention_ops.py`: each rank's decode scores are written straight into its bank slot (`index_scores_decode` uses the slot as `out`), and the new v41k kernel `index_reduce_live` reads all four slots over CUDA IPC (per-CTA epoch flags, release/acquire at system scope) and sums only the live columns `[0, (positions[-1] + 1) // ratio)` in rank order 0..3 in FP32, rounding once. Those are the custom all-reduce one-stage numerics, the same on every rank. Columns past the live end are not written; `index_topk` never reads them.\n- Fallbacks: without TP4 and a fully connected custom all-reduce, the bank is not built and the first use logs `VLLM_V41_INDEX_REDUCE=1 needs TP4 and a fully connected custom all-reduce`; a batch larger than the bank, keys wider than it, or no CUDA scorer take the all-reduce.\n- `tests/models/test_deepseek_v41_index_reduce.py`: CPU tests (switch off keeps the all-reduce; the bank path equals the custom all-reduce sum; fallbacks; the kernel's column walk and argument contract against the Python side).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_index_reduce.py tests/models/test_deepseek_v41_attention_ops.py\npython benchmarks/deepseek_v41/v41k/build.py   # sm_70; then load it and check that v41k::index_reduce_live is registered\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Live-prefix reduce | DeepSeek-V4.1 packed index keys | SM70, TP4, fully connected custom all-reduce, decode, switch on | bank + `index_reduce_live`; else the all-reduce (logged) | CPU tests; sm_70 build; measured on 8x V100 (each PP stage a TP4 group) | single-stage TP4 (no PP) not measured |\n| Switch off | all | default | all-reduce, unchanged | CPU test | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_INDEX_REDUCE` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_INDEX_REDUCE=1`, TP4 with the custom all-reduce, and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; the fallback reason is logged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: one tuning variable with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +1 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark 5, one request, paired arms, switch on vs off: about **-0.85 ms per round**; T=1 output text byte-identical across boots. (A first screening run the same day: 31.6 -> 30.3 ms per round, 98.0 -> 102.9 tok/s.)\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41k.so` from this tree: OK; `v41k::index_reduce_live` is registered.\n- pytest, the two files above, CPU only: 10 passed, 10 skipped (CUDA-only attention-op cases).\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: the kernel on GPUs (it needs four connected GPUs with IPC), timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-index-reduce",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1386,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Reduce decode index scores over the live prefix through an IPC bank (VLLM_V41_INDEX_REDUCE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1386",
+    "isDraft": false,
+    "headRefOid": "7b1b689f528382ee20041d5fc27a4f05d61060dc",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/v41k/v41k.cu",
+      "tests/models/test_deepseek_v41_index_reduce.py",
+      "vllm/envs.py",
+      "vllm/models/deepseek_v41/attention_ops.py",
+      "vllm/models/deepseek_v41/kv_store.py",
+      "vllm/models/deepseek_v41/model.py"
+    ],
+    "diff_bytes": 32230,
+    "diff_sha256": "8e2d03af80ef6fc222fdb20d3a1cec1e530bd4f1b451c7e8e675ea245b1e7d2b"
+  },
+  "full_tree_diff_proof": null
+}

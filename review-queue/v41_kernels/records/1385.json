@@ -1,0 +1,111 @@
+{
+  "initial_inventory": {
+    "number": 1385,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Instruction-diet routed-expert kernels (VLLM_V41_EXPERT_DIET, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1385",
+    "isDraft": false,
+    "headRefOid": "2fe80a0f046cce68fcb3d2ca43903b8708216428",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1385,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Instruction-diet routed-expert kernels (VLLM_V41_EXPERT_DIET, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1383 and #1384.** This branch is #1383, #1384, then one commit; review only the last commit.\n\n## Purpose\n\nInstruction-diet variants of #1384's kernels, beside them, selected by **`VLLM_V41_EXPERT_DIET`** (default `0` = off; bit 1 = `gate_up_diet`, bit 2 = `down_rows_diet`, bit 4 = `down_rows_diet` keeps the activations in shared memory where they fit; read once by `v41k.so`; needs `VLLM_V41_EXPERT_FAST=1`).\n\n`gate_up_diet` is bitwise identical to `gate_up_fast`: same 512 threads, persistent grid and unit walk, thread-to-(row, K group) map, integer weights, per-lane serial FFMA chain, xor butterfly and epilogue. What changes is the instruction count per step:\n\n- the activations of all M tokens (M <= 6, 160 Q8 groups each) are copied once per CTA into shared memory as 48-byte records, so a member's activation is 3 LDS at an immediate offset instead of a 64-bit address pair and 3 LDG behind a branch; the next member's record is read before the current member's dots, so the fixed LDS latency overlaps math;\n- weight addresses: one 32-bit row offset per thread, advanced once per two steps, plus per-lane 64-bit field bases (the old code rebuilt every 64-bit field address per step);\n- IQ1_M octet indices from 2 PRMT (old: PRMT, SHL, 2 LOP3, 2 PRMT) and block-scale bits from PRMT, 2 SHF, 1 LOP3 (old: ~9 shifts and masks); IQ2_XXS with `m0 == m1` as one dp4a chain and one IMUL.\n\nAll integer arithmetic is exact, and the float ops are the old ones in the old order. The host requires gate / up under 2 GB (32-bit offsets) and M <= 6. With the switch off, the fast kernels' SASS is unchanged.\n\n`benchmarks/deepseek_v41/expert_diet_check.py`: one-GPU bit check of the diet kernels against the fast kernels; `v41k/emu/diet_dectest.cpp`: exhaustive host check of the new decode pieces.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_expert_fast.py\npython benchmarks/deepseek_v41/v41k/build.py                                       # sm_70\npython benchmarks/deepseek_v41/expert_diet_check.py --lib v41k.so --no-time        # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Diet experts | GGUF IQ routed experts | SM70, `VLLM_V41_EXPERT_FAST=1`, `VLLM_V41_EXPERT_DIET` bits, M <= 6, gate / up < 2 GB | diet kernels; else the fast kernels | GPU bit check (one V100); measured on 8x V100 | other gtypes |\n| Switch off | all | default | #1384's kernels, unchanged | CPU tests | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_EXPERT_DIET` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_EXPERT_FAST=1`, `VLLM_V41_EXPERT_DIET=3` and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below; the route logs its activation once.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; the old kernels are not touched.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: variables registered with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: new variables registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark 5, one request, paired ABBA arms, `VLLM_V41_EXPERT_DIET=3` vs `0` on top of `EXPERT_FAST`: **-0.871 ms per round on average** (T=0 -0.74 / -1.02, T=1 -0.79 / -0.93). Output texts identical (11 of 11); compute-sanitizer clean.\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41k.so` from this tree, then on one V100-SXM2-32GB: `expert_diet_check.py --no-time` (diet kernels against the fast kernels, both roles, gtypes 29 / 16 / 17, M = 1..6, 48 trials per M and mode): **0 failing trials**; and `expert_fast_check.py --no-time` with `VLLM_V41_EXPERT_DIET=0` on the same build: **0 failing trials** (the fast path is unchanged with the switch off).\n\n- pytest, CPU only: `test_deepseek_v41_expert_fast.py` 19 passed.\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing (the GPU check ran with `--no-time`), sanitizers and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1385",
+    "isDraft": false,
+    "headRefName": "pli/v41-expert-diet",
+    "headRefOid": "2fe80a0f046cce68fcb3d2ca43903b8708216428",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1385,
+    "id": "PR_kwDORjYFXs8AAAABNJjYdw",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "2fe80a0f046cce68fcb3d2ca43903b8708216428",
+    "title": "[Perf][SM70][DeepSeek-V4.1] Instruction-diet routed-expert kernels (VLLM_V41_EXPERT_DIET, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1385",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1383 and #1384.** This branch is #1383, #1384, then one commit; review only the last commit.\n\n## Purpose\n\nInstruction-diet variants of #1384's kernels, beside them, selected by **`VLLM_V41_EXPERT_DIET`** (default `0` = off; bit 1 = `gate_up_diet`, bit 2 = `down_rows_diet`, bit 4 = `down_rows_diet` keeps the activations in shared memory where they fit; read once by `v41k.so`; needs `VLLM_V41_EXPERT_FAST=1`).\n\n`gate_up_diet` is bitwise identical to `gate_up_fast`: same 512 threads, persistent grid and unit walk, thread-to-(row, K group) map, integer weights, per-lane serial FFMA chain, xor butterfly and epilogue. What changes is the instruction count per step:\n\n- the activations of all M tokens (M <= 6, 160 Q8 groups each) are copied once per CTA into shared memory as 48-byte records, so a member's activation is 3 LDS at an immediate offset instead of a 64-bit address pair and 3 LDG behind a branch; the next member's record is read before the current member's dots, so the fixed LDS latency overlaps math;\n- weight addresses: one 32-bit row offset per thread, advanced once per two steps, plus per-lane 64-bit field bases (the old code rebuilt every 64-bit field address per step);\n- IQ1_M octet indices from 2 PRMT (old: PRMT, SHL, 2 LOP3, 2 PRMT) and block-scale bits from PRMT, 2 SHF, 1 LOP3 (old: ~9 shifts and masks); IQ2_XXS with `m0 == m1` as one dp4a chain and one IMUL.\n\nAll integer arithmetic is exact, and the float ops are the old ones in the old order. The host requires gate / up under 2 GB (32-bit offsets) and M <= 6. With the switch off, the fast kernels' SASS is unchanged.\n\n`benchmarks/deepseek_v41/expert_diet_check.py`: one-GPU bit check of the diet kernels against the fast kernels; `v41k/emu/diet_dectest.cpp`: exhaustive host check of the new decode pieces.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_expert_fast.py\npython benchmarks/deepseek_v41/v41k/build.py                                       # sm_70\npython benchmarks/deepseek_v41/expert_diet_check.py --lib v41k.so --no-time        # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Diet experts | GGUF IQ routed experts | SM70, `VLLM_V41_EXPERT_FAST=1`, `VLLM_V41_EXPERT_DIET` bits, M <= 6, gate / up < 2 GB | diet kernels; else the fast kernels | GPU bit check (one V100); measured on 8x V100 | other gtypes |\n| Switch off | all | default | #1384's kernels, unchanged | CPU tests | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_EXPERT_DIET` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_EXPERT_FAST=1`, `VLLM_V41_EXPERT_DIET=3` and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below; the route logs its activation once.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; the old kernels are not touched.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: variables registered with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: new variables registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark 5, one request, paired ABBA arms, `VLLM_V41_EXPERT_DIET=3` vs `0` on top of `EXPERT_FAST`: **-0.871 ms per round on average** (T=0 -0.74 / -1.02, T=1 -0.79 / -0.93). Output texts identical (11 of 11); compute-sanitizer clean.\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41k.so` from this tree, then on one V100-SXM2-32GB: `expert_diet_check.py --no-time` (diet kernels against the fast kernels, both roles, gtypes 29 / 16 / 17, M = 1..6, 48 trials per M and mode): **0 failing trials**; and `expert_fast_check.py --no-time` with `VLLM_V41_EXPERT_DIET=0` on the same build: **0 failing trials** (the fast path is unchanged with the switch off).\n\n- pytest, CPU only: `test_deepseek_v41_expert_fast.py` 19 passed.\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing (the GPU check ran with `--no-time`), sanitizers and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-expert-diet",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1385,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Instruction-diet routed-expert kernels (VLLM_V41_EXPERT_DIET, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1385",
+    "isDraft": false,
+    "headRefOid": "2fe80a0f046cce68fcb3d2ca43903b8708216428",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/expert_diet_check.py",
+      "benchmarks/deepseek_v41/expert_fast_check.py",
+      "benchmarks/deepseek_v41/plan_fuse_check.py",
+      "benchmarks/deepseek_v41/v41k/emu/dectest.cpp",
+      "benchmarks/deepseek_v41/v41k/emu/diet_dectest.cpp",
+      "benchmarks/deepseek_v41/v41k/emu/emu.cpp",
+      "benchmarks/deepseek_v41/v41k/emu/extract_old.py",
+      "benchmarks/deepseek_v41/v41k/emu/old_extract.inc",
+      "benchmarks/deepseek_v41/v41k/emu/shim.h",
+      "benchmarks/deepseek_v41/v41k/v41k.cu",
+      "benchmarks/deepseek_v41/v41k/v41k_diet.cuh",
+      "benchmarks/deepseek_v41/v41k/v41k_fast.cuh",
+      "benchmarks/deepseek_v41/v41k/v41k_fast_gu.cuh",
+      "tests/models/test_deepseek_v41_expert_fast.py",
+      "tests/models/test_deepseek_v41_plan_fuse.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py"
+    ],
+    "diff_bytes": 222905,
+    "diff_sha256": "de7796c0b723adb3a9233ad712d8f06bfafcf804ca4bbac6be004f665cb6b006"
+  },
+  "full_tree_diff_proof": null
+}

@@ -1,0 +1,142 @@
+diff --git a/csrc/custom_all_reduce.cuh b/csrc/custom_all_reduce.cuh
+index d6d04f3896..e0485de899 100644
+--- a/csrc/custom_all_reduce.cuh
++++ b/csrc/custom_all_reduce.cuh
+@@ -2159,6 +2159,7 @@ class CustomAllreduce {
+   const CollectivePolicy policy_;
+   std::atomic<bool> logged_norm_route_{false};
+   std::atomic<bool> logged_sum2_route_{false};
++  std::atomic<bool> logged_sum2_generic_push_{false};
+   int rank_;
+   int world_size_;
+   // Full NVLink or xGMI connection between GPUs.
+@@ -2818,6 +2819,17 @@ class CustomAllreduce {
+           bytes == kSm70Tp4PushAllreduceQwen4ExpBytes &&
+           (qwen4_exp_m1 == nullptr || std::strcmp(qwen4_exp_m1, "1") == 0);
+ 
++      // Reuse ordinary TP4's bounded 16-byte admission. The opt-in is
++      // communicator-owned; unset/zero preserves sum2's existing selectors.
++      const char* sum2_push_any =
++          policy_.raw(CollectivePolicyField::sm70_tp4_sum2_push_any);
++      const char* small = policy_.raw(
++          CollectivePolicyField::sm70_tp4_push_allreduce_small_messages);
++      const bool generic_small =
++          sum2_push_any != nullptr && std::strcmp(sum2_push_any, "1") == 0 &&
++          small != nullptr && std::strcmp(small, "1") == 0 && bytes > 0 &&
++          bytes <= kSm70Tp4PushAllreduceM8Bytes && bytes % 16 == 0;
++
+       if (sm70_tp8_hierarchical_push_buffers_registered_ &&
+           status == cudaStreamCaptureStatusActive &&
+           sm70_tp8_hierarchical_custom_ar_enabled(policy_, world_size_,
+@@ -2834,10 +2846,17 @@ class CustomAllreduce {
+       if (sm70_tp4_push_buffers_registered_ &&
+           status == cudaStreamCaptureStatusActive &&
+           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
+-          (qwen38_batch || qwen38_m2 || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
++          (generic_small || qwen38_batch || qwen38_m2 || qwen38_mtp5 ||
++           qwen4_exp_m1_enabled) &&
+           custom_allreduce_current_device_is_sm70()) {
+-        const int push_blocks = sm70_tp4_push_allreduce_blocks(policy_, bytes);
++        const int push_blocks =
++            sm70_tp4_push_allreduce_blocks(policy_, bytes, generic_small);
+         if (push_blocks > 0) {
++          if (generic_small && !logged_sum2_generic_push_.exchange(true)) {
++            std::cerr << "V41 sum2 generic push active bytes=" << bytes
++                      << " blocks=" << push_blocks << " rank=" << rank_
++                      << std::endl;
++          }
+           sm70_cross_device_reduce_sum2_1stage_push<
+               kSm70Tp4PushAllreduceWorldSize>
+               <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
+diff --git a/csrc/custom_all_reduce_policy.h b/csrc/custom_all_reduce_policy.h
+index ecbcd6dc48..dad03fa47a 100644
+--- a/csrc/custom_all_reduce_policy.h
++++ b/csrc/custom_all_reduce_policy.h
+@@ -26,6 +26,11 @@ class CollectivePolicy {
+     if (values.size() != size)
+       throw std::invalid_argument("Custom all-reduce policy ABI size mismatch");
+     std::copy(values.begin(), values.end(), values_.begin());
++    const auto& sum2_push_any = values_[
++        static_cast<size_t>(CollectivePolicyField::sm70_tp4_sum2_push_any)];
++    if (sum2_push_any != "\x1f" && sum2_push_any != "0" &&
++        sum2_push_any != "1")
++      throw std::invalid_argument("VLLM_V41_SUM2_PUSH_ANY must be 0 or 1");
+   }
+   static CollectivePolicy legacy() {
+     std::vector<std::string> values;
+diff --git a/csrc/custom_all_reduce_policy_fields.inc b/csrc/custom_all_reduce_policy_fields.inc
+index f7439f5836..0b81f93f6f 100644
+--- a/csrc/custom_all_reduce_policy_fields.inc
++++ b/csrc/custom_all_reduce_policy_fields.inc
+@@ -18,3 +18,4 @@ COLLECTIVE_POLICY_FIELD(sm70_tp4_small_ar_pack32, "VLLM_SM70_TP4_SMALL_AR_PACK32
+ COLLECTIVE_POLICY_FIELD(custom_allreduce_algo, "VLLM_CUSTOM_ALLREDUCE_ALGO")
+ COLLECTIVE_POLICY_FIELD(sm70_tp4_push_allreduce_sum2_m1, "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1")
+ COLLECTIVE_POLICY_FIELD(sm70_profile_trace, "VLLM_SM70_PROFILE_TRACE")
++COLLECTIVE_POLICY_FIELD(sm70_tp4_sum2_push_any, "VLLM_V41_SUM2_PUSH_ANY")
+diff --git a/docs/design/architecture/runtime_reference.md b/docs/design/architecture/runtime_reference.md
+index fec78b664f..46ab406aa2 100644
+--- a/docs/design/architecture/runtime_reference.md
++++ b/docs/design/architecture/runtime_reference.md
+@@ -75,7 +75,7 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.sm70_moe.Sm70MxFp4MoEConfig` | kernel_config.sm70_moe.mxfp4 | resolve: [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L620); capture_inputs: [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L504); hash_options: [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L536) | [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L596) |
+ | `vllm.config.sm70_moe.Sm70NvFp4MoEConfig` | kernel_config.sm70_moe.nvfp4 | resolve: [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L586); capture_inputs: [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L504); hash_options: [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L536) | [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L546) |
+ | `vllm.config.sm70_moe.Sm70UnquantizedMoEConfig` | kernel_config.sm70_moe.unquantized | resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L57); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/sm70_moe.py](../../../vllm/config/sm70_moe.py#L625) |
+-| `vllm.config.sm70_native.CollectiveNativeConfig` | parallel_config.communication.native, speculative_config.draft_parallel_config.communication.native, speculative_config.target_parallel_config.communication.native | resolve: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L651); finalize_hash: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L698); compute_hash: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L721) | [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L550) |
++| `vllm.config.sm70_native.CollectiveNativeConfig` | parallel_config.communication.native, speculative_config.draft_parallel_config.communication.native, speculative_config.target_parallel_config.communication.native | resolve: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L655); finalize_hash: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L702); compute_hash: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L725) | [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L550) |
+ | `vllm.config.sm70_native.Sm70NativeConfig` | kernel_config.layer_execution.native, kernel_config.sm70_awq.native, kernel_config.sm70_fp8.native, kernel_config.sm70_gguf.native, kernel_config.sm70_marlin, kernel_config.sm70_moe.awq.native, kernel_config.sm70_moe.fp8.native, kernel_config.sm70_moe.mxfp4.native, kernel_config.sm70_moe.nvfp4.native, kernel_config.sm70_mxfp4, kernel_config.sm70_nvfp4.native | capture_inputs: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L391); resolve: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L397); hash_options: [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L457) | [vllm/config/sm70_native.py](../../../vllm/config/sm70_native.py#L242) |
+ | `vllm.config.sm70_runtime.RuntimeTraceConfig` | observability_config.runtime_trace | value: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L306); __post_init__: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L311); compile_ignored_aliases: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L398) | [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L164) |
+ | `vllm.config.sm70_runtime.Sm70RuntimeConfig` | kernel_config.sm70_runtime | value: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L89); __post_init__: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L94); compile_ignored_aliases: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L109) | [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L42) |
+diff --git a/vllm/config/sm70_native.py b/vllm/config/sm70_native.py
+index d222b88a3d..959f0bf7a3 100644
+--- a/vllm/config/sm70_native.py
++++ b/vllm/config/sm70_native.py
+@@ -609,6 +609,9 @@ class CollectiveNativeConfig:
+     sm70_profile_trace: str | int | bool | None = None
+     """Initialization override for VLLM_SM70_PROFILE_TRACE."""
+ 
++    sm70_tp4_sum2_push_any: bool | None = None
++    """Opt in to bounded generic FP16 sum2 push (VLLM_V41_SUM2_PUSH_ANY)."""
++
+     aliases: ClassVar[dict[str, str]] = {
+         "sm70_tp4_push_allreduce_small_messages": (
+             "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES"
+@@ -636,6 +639,7 @@ class CollectiveNativeConfig:
+         "custom_allreduce_algo": "VLLM_CUSTOM_ALLREDUCE_ALGO",
+         "sm70_tp4_push_allreduce_sum2_m1": "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1",
+         "sm70_profile_trace": "VLLM_SM70_PROFILE_TRACE",
++        "sm70_tp4_sum2_push_any": "VLLM_V41_SUM2_PUSH_ANY",
+     }
+ 
+     values: tuple[str, ...] = Field(default=(), init=False)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..832ca793ac 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -431,6 +431,7 @@
+     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
+     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
+     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
++    VLLM_V41_SUM2_PUSH_ANY: bool = False
+     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
+     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
+     VLLM_SM70_TOP1_CUSTOM_AR: bool = True
+@@ -6920,6 +6921,19 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=("SM70 collectives",),
+         user_visible=False,
+     ),
++    "VLLM_V41_SUM2_PUSH_ANY": env_var(
++        lambda: bool(int(os.getenv("VLLM_V41_SUM2_PUSH_ANY", "0"))),
++        description=(
++            "Admit aligned FP16 sum2 messages up to 80 KiB to the existing "
++            "push kernel on captured, fully connected SM70 TP4 communicators."
++        ),
++        category="experimental",
++        declared_default="False",
++        effective_default="False",
++        automatic_conditions=(),
++        acceleration_paths=("SM70 collectives",),
++        user_visible=False,
++    ),
+     # Refuse to start when a checkpoint carries no calibrated QSA E4M3 K/V
+     # scales. Off by default: an uncalibrated checkpoint runs on the module's
+     # 1.0 defaults with a warning instead of failing to serve.

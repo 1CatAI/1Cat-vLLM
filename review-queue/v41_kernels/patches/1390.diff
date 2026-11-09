@@ -1,0 +1,1488 @@
+diff --git a/benchmarks/deepseek_v41/v41k/bench_dmv_x.py b/benchmarks/deepseek_v41/v41k/bench_dmv_x.py
+new file mode 100644
+index 0000000000..b6380212a5
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41k/bench_dmv_x.py
+@@ -0,0 +1,345 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DMV_X microbench: dmv13 (vllm._C) vs dmv13_x (v41k), V4.1 dense shapes.
++
++Standalone (no server, one GPU). Per shape, at M verify rows:
++  old    dmv13 with dense_tm's config (wo_a: one launch per O group)
++  same   dmv13_x, same warps/split, acc 1 (wo_a: one merged launch);
++         expected bitwise equal to old
++  probe  dmv13_x loads/staging/barriers only (no decode or mma): floor
++  sweep  dmv13_x warps x split x acc (only `same` is bit-identical; the
++         others change the FP32 summation order -> near-tie gate)
++Times are CUDA-graph replays of back-to-back launches over rotating weight
++copies (>= --l2-mb per arm, so the 6 MB L2 holds none of them), reported as
++us per projection; --kernel-time adds profiler kernel-only times.
++
++  python benchmarks/deepseek_v41/v41k/bench_dmv_x.py --json out.json
++  python benchmarks/deepseek_v41/v41k/bench_dmv_x.py --no-time   # bits only
++--no-time runs no timing: for M = 1..8 and every role it compares `same`
++(dmv13_x at dmv13's warps/split, acc 1) with `old` bit for bit and exits 1
++on any difference.
++Env: VLLM_V41K_LIB (default benchmarks/deepseek_v41/v41k/build/v41k.so).
++"""
++
++import argparse
++import glob
++import importlib.util
++import json
++import math
++import os
++import statistics
++
++import torch
++
++Q5K, Q8 = 1, 4
++# role -> (format, K, widths, block-diagonal groups); per TP4 rank.
++SHAPES = {
++    "qkv": (Q8, 5120, [1280, 512], 1),
++    "q_b": (Q5K, 1280, [8192], 1),
++    "wo_a": (Q5K, 4096, [1024], 2),
++    "wo_b": (Q5K, 2048, [5120], 1),
++    "shared": (Q5K, 5120, [576, 576], 1),
++    "head": (Q5K, 5120, [32320], 1),
++}
++LAYER_ROLES = ("qkv", "q_b", "wo_a", "wo_b", "shared")
++FLOOR_GBS = 735.0  # MEASURED lm-head rate on repacked bytes (decode profile)
++
++
++def load_ops():
++    torch.ops.load_library(
++        os.environ.get("VLLM_V41K_LIB")
++        or os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "v41k.so")
++    )
++    assert hasattr(torch.ops.v41k, "dmv13_x"), "v41k library predates dmv13_x"
++    spec = importlib.util.find_spec("vllm")
++    libs = []
++    for root in spec.submodule_search_locations if spec else []:
++        libs += glob.glob(os.path.join(root, "_C.*so")) + glob.glob(
++            os.path.join(root, "_C.abi3.so")
++        )
++    if libs:
++        torch.ops.load_library(libs[0])
++    else:
++        import vllm._C  # noqa: F401
++    assert hasattr(torch.ops._C, "sm70_dmv13_out"), "vllm._C has no dmv13"
++
++
++def default_config(k, widths, target=80):
++    """dense_tm.default_config (VLLM_V41_DMV_CTAS=80): (warps, split)."""
++    tiles = sum((w + 31) // 32 for w in widths)
++    groups = (k // 32 + 3) // 4
++    split = max(1, min(8, round(target / tiles), groups // 4))
++    split = max(c for c in (1, 2, 3, 4, 6, 8) if c <= split)
++    return (8, split) if split > 1 else (4, 1)
++
++
++def planes(fmt, n, k, gen):
++    tiles, groups = n // 32, k // 128
++    cw = 2 if fmt == Q8 else 1
++
++    def rand_bytes(count):
++        return torch.randint(
++            0, 256, (count,), dtype=torch.uint8, device="cuda", generator=gen
++        )
++
++    codes = rand_bytes(tiles * groups * 2048 * cw)
++    high = (
++        rand_bytes(tiles * groups * 512)
++        if fmt == Q5K
++        else torch.empty(0, dtype=torch.uint8, device="cuda")
++    )
++    # one 32-bit stats word per lane and K step: half2 (scale, min); Q8 uses
++    # the low half only.
++    words = tiles * groups * 128
++    u = torch.rand(words, 2, device="cuda", generator=gen)
++    stats = torch.stack(
++        [0.002 + 0.018 * u[:, 0], -0.1 * u[:, 1] if fmt == Q5K else 0 * u[:, 1]], 1
++    )
++    return codes, high, stats.half().view(torch.uint8).flatten()
++
++
++class Arm:
++    """One projection on rotating weight copies; call(i) runs copy i."""
++
++    def __init__(self, role, copies, x, kind, warps, split, acc=1, probe=0):
++        fmt, k, widths, groups = SHAPES[role]
++        self.role, self.kind, self.copies, self.x = role, kind, copies, x
++        self.fmt, self.k, self.groups = fmt, k, groups
++        self.warps, self.split, self.acc, self.probe = warps, split, acc, probe
++        self.widths = widths * groups
++        m = x.shape[0]
++        self.out = torch.empty(m, sum(self.widths), dtype=torch.half, device="cuda")
++        cols, self.views = 0, []
++        for w in self.widths:
++            self.views.append(self.out[:, cols : cols + w])
++            cols += w
++        launches = groups if kind == "old" else 1
++        tiles = sum(w // 32 for w in self.widths) // launches
++        self.ws = [
++            torch.zeros(tiles * split * 256, device="cuda") for _ in range(launches)
++        ]
++        self.cnt = [
++            torch.zeros(tiles, dtype=torch.int32, device="cuda")
++            for _ in range(launches)
++        ]
++
++    def __call__(self, i):
++        codes, high, scale = self.copies[i % len(self.copies)]
++        if self.kind == "old" and self.groups > 1:
++            for g in range(self.groups):
++                torch.ops._C.sm70_dmv13_out(
++                    self.x[:, g * self.k : (g + 1) * self.k],
++                    [codes[g]], [high[g]], [scale[g]], [self.views[g]],
++                    [self.fmt], [self.widths[g]], self.k, self.split,
++                    self.warps, self.ws[g], self.cnt[g], 1, None, None,
++                )  # fmt: skip
++        elif self.kind == "old":
++            torch.ops._C.sm70_dmv13_out(
++                self.x, codes, high, scale, self.views,
++                [self.fmt] * len(self.widths), self.widths, self.k,
++                self.split, self.warps, self.ws[0], self.cnt[0], 1, None, None,
++            )  # fmt: skip
++        else:
++            n = len(self.widths)
++            offs = [g * self.k for g in range(n)] if self.groups > 1 else [0] * n
++            torch.ops.v41k.dmv13_x(
++                self.x, codes, high, scale, self.views, offs, self.fmt,
++                self.k, self.split, self.warps, self.acc, self.ws[0],
++                self.cnt[0], self.probe,
++            )  # fmt: skip
++
++
++def time_arm(arm, reps, iters, kernel_time):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for i in range(len(arm.copies)):
++            arm(i)
++    torch.cuda.current_stream().wait_stream(side)
++    torch.accelerator.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        for r in range(reps):
++            arm(r)
++    graph.replay()
++    torch.accelerator.synchronize()
++    times = []
++    for _ in range(iters):
++        a = torch.cuda.Event(enable_timing=True)
++        b = torch.cuda.Event(enable_timing=True)
++        a.record()
++        graph.replay()
++        b.record()
++        b.synchronize()
++        times.append(a.elapsed_time(b) * 1000.0 / reps)
++    result = {"us": statistics.median(times)}
++    if kernel_time:
++        from torch.profiler import ProfilerActivity, profile
++
++        with profile(activities=[ProfilerActivity.CUDA]) as prof:
++            graph.replay()
++            torch.accelerator.synchronize()
++        total = 0.0
++        for e in prof.key_averages():
++            if "dense_mv" in e.key or "dmv_x" in e.key:
++                total += getattr(
++                    e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0)
++                )
++        result["kernel_us"] = total / reps
++    del graph
++    return result
++
++
++def diff(ref, out):
++    a, b = ref.float(), out.float()
++    d = (a - b).abs()
++    return {
++        "bitwise": bool(torch.equal(ref.view(torch.int16), out.view(torch.int16))),
++        "n_diff": int((ref.view(torch.int16) != out.view(torch.int16)).sum()),
++        "max_abs": float(d.max()),
++        "max_rel": float(d.max() / a.abs().max().clamp_min(1e-6)),
++        "finite": bool(torch.isfinite(b).all()),
++    }
++
++
++def check_bits(roles, gen):
++    """dmv13_x at dmv13's config vs dmv13, bit for bit, M = 1..8 (no timing)."""
++    failed = 0
++    for role in roles:
++        fmt, k, widths, groups = SHAPES[role]
++        one = [planes(fmt, w, k, gen) for w in widths * groups]
++        copies = [tuple(list(t) for t in zip(*one))]
++        warps, split = default_config(k, widths)
++        for m in range(1, 9):
++            x = torch.randn(m, k * groups, device="cuda", generator=gen).half()
++            old = Arm(role, copies, x, "old", warps, split)
++            same = Arm(role, copies, x, "x", warps, split)
++            old(0)
++            same(0)
++            torch.accelerator.synchronize()
++            d = diff(old.out, same.out)
++            ok = d["bitwise"] and d["finite"]
++            failed += not ok
++            print(
++                f"{role:7s} M={m} w{warps} s{split}: bitwise={d['bitwise']}"
++                f" n_diff={d['n_diff']} finite={d['finite']}",
++                flush=True,
++            )
++    print("PASS" if not failed else f"FAIL: {failed} cases differ")
++    return 1 if failed else 0
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    ap.add_argument("--m", type=int, default=6)
++    ap.add_argument("--roles", default=",".join(SHAPES))
++    ap.add_argument("--l2-mb", type=float, default=64.0)
++    ap.add_argument("--iters", type=int, default=20)
++    ap.add_argument("--no-sweep", action="store_true")
++    ap.add_argument("--kernel-time", action="store_true")
++    ap.add_argument("--layers", type=int, default=40)
++    ap.add_argument("--head-calls", type=int, default=2)
++    ap.add_argument("--seed", type=int, default=1103)
++    ap.add_argument("--json")
++    ap.add_argument("--no-time", action="store_true")
++    args = ap.parse_args()
++    load_ops()
++    torch.accelerator.set_device_index(0)
++    gen = torch.Generator(device="cuda").manual_seed(args.seed)
++    if args.no_time:
++        raise SystemExit(check_bits(args.roles.split(","), gen))
++    print(torch.cuda.get_device_name(), "M =", args.m)
++    report = {"m": args.m, "roles": {}}
++    for role in args.roles.split(","):
++        fmt, k, widths, groups = SHAPES[role]
++        one = [planes(fmt, w, k, gen) for w in widths * groups]
++        nbytes = sum(t.numel() for p in one for t in p)
++        count = max(1, math.ceil(args.l2_mb * 2**20 / nbytes))
++        copies = [one] + [
++            [planes(fmt, w, k, gen) for w in widths * groups] for _ in range(count - 1)
++        ]
++        copies = [tuple(list(t) for t in zip(*c)) for c in copies]
++        reps = count * max(1, math.ceil(64 / count))
++        x = torch.randn(args.m, k * groups, device="cuda", generator=gen).half()
++        warps, split = default_config(k, widths)
++        floor = nbytes / (FLOOR_GBS * 1e3)
++        row = {"bytes": nbytes, "copies": count, "floor_us": floor}
++        old = Arm(role, copies, x, "old", warps, split)
++        row["old"] = time_arm(old, reps, args.iters, args.kernel_time)
++        old(0)
++        ref = old.out.clone()
++        row["old"]["config"] = [warps, split, 1]
++        arms = [("same", warps, split, 1, 0), ("probe", warps, split, 1, 1)]
++        if not args.no_sweep:
++            arms += [
++                (f"w{w}s{s}a{a}", w, s, a, 0)
++                for w in (2, 4, 8)
++                for s in (1, 2, 3, 4, 6, 8)
++                for a in (1, 2)
++                if s <= k // 128
++            ]
++        row["arms"] = {}
++        for name, w, s, a, probe in arms:
++            arm = Arm(role, copies, x, "x", w, s, a, probe)
++            res = time_arm(arm, reps, args.iters, args.kernel_time)
++            res["config"] = [w, s, a]
++            if not probe:
++                arm(0)
++                res.update(diff(ref, arm.out))
++            row["arms"][name] = res
++            del arm
++        swept = {n: r for n, r in row["arms"].items() if n != "probe"}
++        best = min(swept, key=lambda n: swept[n]["us"])
++        row["best"] = best
++        same, probe_r, b = row["arms"]["same"], row["arms"]["probe"], swept[best]
++        print(
++            f"{role:7s} {nbytes / 2**20:7.2f} MB x{count:<3d} floor {floor:6.1f}"
++            f" | old {row['old']['us']:6.1f} (w{warps} s{split})"
++            f" | same {same['us']:6.1f} bitwise={same['bitwise']}"
++            f" | probe {probe_r['us']:6.1f}"
++            f" | best {b['us']:6.1f} {best} n_diff={b['n_diff']}"
++            f" max_abs={b['max_abs']:.3g} max_rel={b['max_rel']:.2g}",
++            flush=True,
++        )
++        if args.kernel_time:
++            print(
++                f"{'':7s} kernel-only: old {row['old'].get('kernel_us', 0):6.1f}"
++                f" | same {same.get('kernel_us', 0):6.1f}"
++                f" | probe {probe_r.get('kernel_us', 0):6.1f}"
++                f" | best {b.get('kernel_us', 0):6.1f}"
++            )
++        report["roles"][role] = row
++        del old, copies, one
++        torch.accelerator.empty_cache()
++    roles = report["roles"]
++    layer = [r for r in LAYER_ROLES if r in roles]
++    if layer:
++        old_l = sum(roles[r]["old"]["us"] for r in layer)
++        same_l = sum(roles[r]["arms"]["same"]["us"] for r in layer)
++        best_l = sum(roles[r]["arms"][roles[r]["best"]]["us"] for r in layer)
++        print(
++            f"per layer ({'+'.join(layer)}): old {old_l:.1f} us, same {same_l:.1f}"
++            f" us, best {best_l:.1f} us -> per round ({args.layers} layers):"
++            f" same {(old_l - same_l) * args.layers / 1e3:+.3f} ms saved,"
++            f" best {(old_l - best_l) * args.layers / 1e3:+.3f} ms saved"
++        )
++        report["per_layer_us"] = {"old": old_l, "same": same_l, "best": best_l}
++    if "head" in roles:
++        h = roles["head"]
++        gain = h["old"]["us"] - h["arms"][h["best"]]["us"]
++        print(f"head x{args.head_calls}: best saves {gain * args.head_calls:.1f} us")
++    config = ";".join(
++        f"{r}={','.join(map(str, row['arms'][row['best']]['config']))}"
++        for r, row in roles.items()
++        if row["arms"][row["best"]]["us"] < row["arms"]["same"]["us"] * 0.97
++    )
++    print("suggested VLLM_V41_DMV_X_CONFIG (near-tie gate):", repr(config))
++    report["suggested_config"] = config
++    if args.json:
++        with open(args.json, "w") as f:
++            json.dump(report, f, indent=1)
++        print("wrote", args.json)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/deepseek_v41/v41k/v41k.cu b/benchmarks/deepseek_v41/v41k/v41k.cu
+index 2245702499..891a53ea27 100644
+--- a/benchmarks/deepseek_v41/v41k/v41k.cu
++++ b/benchmarks/deepseek_v41/v41k/v41k.cu
+@@ -2531,6 +2531,13 @@ __global__ void __launch_bounds__(256)
+ 
+ }  // namespace v41k
+ 
++// DMV_X small-M Q5_K / Q8_0 dense (VLLM_V41_DMV_X); see gguf_dmv13_x.cuh.
++#include <cstdint>
++#include <vector>
++namespace v41k_dmvx {
++#include "sm70_turbomind/ops/gguf_dmv13_x.cuh"
++}  // namespace v41k_dmvx
++
+ torch::Tensor v41k_table(int64_t type, torch::Device device) {
+   int words = 0;
+   if (type == 16)
+@@ -3401,6 +3408,18 @@ void v41k_peer_gather(int64_t p0, int64_t p1, int64_t p2, int64_t p3,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++void v41k_dmv13_x(torch::Tensor x, std::vector<torch::Tensor> codes,
++                  std::vector<torch::Tensor> high,
++                  std::vector<torch::Tensor> scale,
++                  std::vector<torch::Tensor> out, std::vector<int64_t> x_off,
++                  int64_t fmt, int64_t K, int64_t split, int64_t warps,
++                  int64_t acc, torch::Tensor ws, torch::Tensor cnt,
++                  int64_t probe) {
++  const at::cuda::OptionalCUDAGuard guard(x.device());
++  v41k_dmvx::dmv13_x_run(x, codes, high, scale, out, x_off, fmt, K, split,
++                         warps, acc, ws, cnt, probe);
++}
++
+ void v41k_index_scores_decode(torch::Tensor out, torch::Tensor q,
+                               torch::Tensor w, torch::Tensor keys,
+                               torch::Tensor positions, int64_t heads,
+@@ -3431,6 +3450,11 @@ TORCH_LIBRARY(v41k, m) {
+       "flag_offset, "
+       "Tensor(a!) epoch) -> ()",
+       &v41k_peer_gather);
++  m.def(
++      "dmv13_x(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
++      "Tensor(a!)[] out, int[] x_off, int fmt, int K, int split, int warps, "
++      "int acc, Tensor(b!) ws, Tensor(c!) cnt, int probe) -> ()",
++      &v41k_dmv13_x);
+   m.def(
+       "gate_up7(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "
+       "ids32, Tensor prob, "
+diff --git a/csrc/sm70_turbomind/ops/gguf_dmv13_x.cuh b/csrc/sm70_turbomind/ops/gguf_dmv13_x.cuh
+new file mode 100644
+index 0000000000..fb9c2ceeff
+--- /dev/null
++++ b/csrc/sm70_turbomind/ops/gguf_dmv13_x.cuh
+@@ -0,0 +1,402 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#pragma once
++// DMV_X: small-M (M <= 8) Q5_K / Q8_0 dense projections over dmv13 segment
++// planes, for the DS-V4.1 decode path (built into v41k, VLLM_V41_DMV_X).
++//
++// Same planes, same per-warp math and same reduction order as dense_mv in
++// gguf_dmv13_core.cuh (TN = 1, no pair/ab/argmax/gate options), so with
++// ACC = 1 and the same (warps, split) its outputs are bit-identical. The
++// differences are scheduling only:
++//   - per-segment x column offsets: block-diagonal projections (V4.1 wo_a,
++//     one 1024-row O group per 4096-column input slice) run in one launch;
++//   - no shared-memory table area (Q5_K / Q8_0 need none) and a max-shared
++//     carveout, so the block count per SM is not cut by the L1 split;
++//   - ACC = 2 (opt-in, not bit-identical): steps 0/2 and 1/3 of every K group
++//     accumulate into two independent mma chains, summed as acc0 + acc1 at the
++//     end, halving the dependent HMMA chain per warp;
++//   - PROBE (benchmark only): the same loads, x staging and barriers with no
++//     decode or mma (output is garbage), to time the memory/structure floor.
++//
++// Include inside a namespace after <torch/all.h>, <ATen/cuda/CUDAContext.h>,
++// <cuda_fp16.h> and <cstdint>. The decode and load bodies below mirror
++// gguf_dmv13_core.cuh (Q5K / Q8 branches, DMV_FULLK = 1) instruction for
++// instruction; tests/kernels/quantization/test_dmv13_x_contract.py keeps them
++// in sync.
++
++namespace {
++
++constexpr int kXQ5K = 1;  // dmv13 Fmt::Q5K
++constexpr int kXQ8 = 4;   // dmv13 Fmt::Q8
++constexpr int kXMaxSeg = 4;
++
++struct XSeg {
++  const uint4* codes;
++  const uint4* high;
++  const uint4* scale;
++  half* out;
++  long long out_ld;
++  long long x_off;  // first input column of this segment
++  int n;
++  int tile0;
++};
++struct XSegs {
++  XSeg s[kXMaxSeg];
++  int nseg;
++};
++
++__device__ __forceinline__ void x_mma(float (&d)[8], uint32_t a0, uint32_t a1,
++                                      uint32_t b0, uint32_t b1) {
++  asm volatile(
++      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
++      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
++      "{%0,%1,%2,%3,%4,%5,%6,%7};"
++      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]),
++        "+f"(d[6]), "+f"(d[7])
++      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ uint32_t x_lop_or(uint32_t a, uint32_t mask,
++                                             uint32_t c) {
++  uint32_t r;  // (a & mask) | c
++  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(r) : "r"(a), "r"(mask), "r"(c));
++  return r;
++}
++__device__ __forceinline__ half2 x_h2(uint32_t v) {
++  return *reinterpret_cast<half2*>(&v);
++}
++__device__ __forceinline__ uint32_t x_u32(half2 v) {
++  return *reinterpret_cast<uint32_t*>(&v);
++}
++__device__ __forceinline__ half2 x_lo2(uint32_t v) {
++  return x_h2((v & 0xffffu) | (v << 16));
++}
++__device__ __forceinline__ half2 x_hi2(uint32_t v) {
++  return x_h2((v >> 16) | (v & 0xffff0000u));
++}
++__device__ __forceinline__ uint32_t x_word(const uint4& v, int i) {
++  return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
++}
++
++template <int FMT>
++struct XLd {
++  uint4 c[4][FMT == kXQ8 ? 2 : 1];
++  uint4 sc;
++  uint4 hi;
++};
++
++template <int FMT>
++__device__ __forceinline__ void x_load(XLd<FMT>& L, const XSeg& s, int t, int g,
++                                       int G, int lane) {
++  constexpr int CW = FMT == kXQ8 ? 2 : 1;
++  const size_t tg = static_cast<size_t>(t) * G + g;
++  L.sc = __ldcs(s.scale + tg * 32 + lane);
++  if constexpr (FMT == kXQ5K) L.hi = __ldcs(s.high + tg * 32 + lane);
++  const size_t Sp = static_cast<size_t>(G) * 4;
++#pragma unroll
++  for (int st = 0; st < 4; ++st) {
++    const int sidx = g * 4 + st;
++#pragma unroll
++    for (int j = 0; j < CW; ++j)
++      L.c[st][j] =
++          __ldcs(s.codes +
++                 ((static_cast<size_t>(t) * Sp + sidx) * CW + j) * 32 + lane);
++  }
++}
++
++// Decode one 32-weight step into 16 half2 in k order (dmv13 decode<Q5K/Q8>).
++template <int FMT>
++__device__ __forceinline__ void x_decode(const XLd<FMT>& L, int st,
++                                         uint32_t (&hw)[16]) {
++  const uint32_t MAGIC = 0x64006400u;
++  const uint32_t sc = x_word(L.sc, st);
++  if constexpr (FMT == kXQ5K) {
++    const half2 s2 = x_lo2(sc), m2 = x_hi2(sc);
++    const uint32_t hb = x_word(L.hi, st);
++    const uint32_t cr[4] = {L.c[st][0].x, L.c[st][0].y, L.c[st][0].z,
++                            L.c[st][0].w};
++#pragma unroll
++    for (int c = 0; c < 4; ++c) {
++#pragma unroll
++      for (int j = 0; j < 4; ++j) {
++        const int s = 4 * c + j - 4;
++        const uint32_t sh =
++            s >= 0 ? (hb >> (s >= 0 ? s : 0)) : (hb << (s < 0 ? -s : 0));
++        const uint32_t extra = x_lop_or(sh, 0x00100010u, MAGIC);
++        const uint32_t h = x_lop_or(cr[c] >> (4 * j), 0x000f000fu, extra);
++        hw[4 * c + j] = x_u32(__hfma2(__hsub2(x_h2(h), x_h2(MAGIC)), s2, m2));
++      }
++    }
++  } else {  // Q8: int8 codes, (x ^ 0x80) + 1024 trick, minus 1152.
++    const half2 s2 = x_lo2(sc);
++    const half2 bias = x_h2(0x64806480u);  // 1152
++#pragma unroll
++    for (int c = 0; c < 8; ++c) {
++      const uint32_t v = x_word(L.c[st][c >> 2], c & 3) ^ 0x80808080u;
++      uint32_t a, b;
++      asm("prmt.b32 %0, %1, %2, 0x4140;" : "=r"(a) : "r"(v), "r"(0x64646464u));
++      asm("prmt.b32 %0, %1, %2, 0x4342;" : "=r"(b) : "r"(v), "r"(0x64646464u));
++      hw[2 * c] = x_u32(__hmul2(__hsub2(x_h2(a), bias), s2));
++      hw[2 * c + 1] = x_u32(__hmul2(__hsub2(x_h2(b), bias), s2));
++    }
++  }
++}
++
++template <int FMT>
++__device__ __forceinline__ uint32_t x_fold(const XLd<FMT>& L) {
++  uint32_t f = L.sc.x ^ L.sc.y ^ L.sc.z ^ L.sc.w;
++  if constexpr (FMT == kXQ5K) f ^= L.hi.x ^ L.hi.y ^ L.hi.z ^ L.hi.w;
++#pragma unroll
++  for (int st = 0; st < 4; ++st)
++#pragma unroll
++    for (int j = 0; j < (FMT == kXQ8 ? 2 : 1); ++j)
++      f ^= L.c[st][j].x ^ L.c[st][j].y ^ L.c[st][j].z ^ L.c[st][j].w;
++  return f;
++}
++
++// One warp: groups g0 + kslot, g0 + kslot + KW, ... of tile t (body6, TN = 1).
++template <int FMT, int KW, int ACC, bool PROBE>
++__device__ __forceinline__ void x_body(const XSeg& sg, int t, int kslot, int g0,
++                                       int g1, int G,
++                                       const half* __restrict__ x, int ldx,
++                                       int M, uint4* xs, float (&acc)[ACC][8]) {
++  const int lane = threadIdx.x % 32;
++  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
++  XLd<FMT> A;
++  int g = g0 + kslot;
++  uint4* slot = xs + kslot * 256;
++  uint4 X[4];
++  auto xload = [&](int gg) {
++#pragma unroll
++    for (int jj = 0; jj < 4; ++jj) {
++      const int idx = lane + 32 * jj, c = idx >> 3, row = idx & 7;
++      X[jj] = make_uint4(0, 0, 0, 0);
++      if (row < M)
++        X[jj] = __ldg(
++            reinterpret_cast<const uint4*>(x + row * ldx + gg * 128 + c * 8));
++    }
++  };
++  auto xstore = [&](int b) {
++#pragma unroll
++    for (int jj = 0; jj < 4; ++jj) slot[b * 128 + lane + 32 * jj] = X[jj];
++  };
++  if (g >= g1) return;
++  x_load<FMT>(A, sg, t, g, G, lane);
++  xload(g);
++  xstore(0);
++  __syncwarp();
++  int cur = 0;
++  while (true) {
++    XLd<FMT> B;
++    const int gn = g + KW;
++    const bool more = gn < g1;
++    if (more) {
++      x_load<FMT>(B, sg, t, gn, G, lane);
++      xload(gn);
++    }
++    if constexpr (PROBE) {
++      const uint4 xv = slot[cur * 128 + r];
++      acc[0][0] += __uint_as_float((x_fold<FMT>(A) ^ xv.x) & 0x3fffffffu);
++    } else {
++#pragma unroll
++      for (int st = 0; st < 4; ++st) {
++        const uint4* xp = slot + cur * 128 + (st * 4) * 8 + r;
++        uint4 xa[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) xa[j] = xp[j * 8];
++        uint32_t hw[16];
++        x_decode<FMT>(A, st, hw);
++        float (&a)[8] = acc[st % ACC];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++          x_mma(a, xa[j].x, xa[j].y, hw[4 * j], hw[4 * j + 1]);
++          x_mma(a, xa[j].z, xa[j].w, hw[4 * j + 2], hw[4 * j + 3]);
++        }
++      }
++    }
++    if (!more) break;
++    cur ^= 1;
++    xstore(cur);
++    __syncwarp();
++    A = B;
++    g = gn;
++  }
++}
++
++// dense_mv's output mapping (write_out) of mma accumulator v = lane * 8 + e.
++__device__ __forceinline__ void x_write(const XSeg& sg, int t, int v, float val,
++                                        int M) {
++  const int lv = v >> 3, i = v & 7;
++  const int token = (i & 2) | ((lv & 16) ? 4 : 0) | (lv & 1);
++  const int col = (i & 1) | (((lv >> 1) & 1) << 1) | ((i >> 2) << 2);
++  const int row = t * 32 + ((lv >> 2) & 3) * 8 + col;
++  if (token < M && row < sg.n)
++    sg.out[token * sg.out_ld + row] = __float2half_rn(val);
++}
++
++template <int KW, int FMT, int ACC, bool PROBE>
++__global__ void __launch_bounds__(32 * KW)
++    dmv_x(XSegs segs, const half* __restrict__ x, int ldx, int M, int G,
++          int split, float* __restrict__ ws, int* __restrict__ cnt) {
++  extern __shared__ uint4 smem[];
++  __shared__ int last;
++  const int tg = blockIdx.x, sp = blockIdx.y;
++  int si = 0;
++#pragma unroll
++  for (int i = 1; i < kXMaxSeg; ++i)
++    if (i < segs.nseg && tg >= segs.s[i].tile0) si = i;
++  const XSeg& sg = segs.s[si];
++  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
++  const int t = tg - sg.tile0;
++  const int gps = (G + split - 1) / split;
++  const int g0 = min(G, sp * gps), g1 = min(G, g0 + gps);
++  float acc[ACC][8] = {};
++  x_body<FMT, KW, ACC, PROBE>(sg, t, warp, g0, g1, G, x + sg.x_off, ldx, M,
++                              smem, acc);
++  __syncthreads();
++  float* red = reinterpret_cast<float*>(smem);
++#pragma unroll
++  for (int e = 0; e < 8; ++e) {
++    float a = acc[0][e];
++    if constexpr (ACC == 2) a += acc[1][e];
++    red[warp * 256 + lane * 8 + e] = a;
++  }
++  __syncthreads();
++  for (int v = threadIdx.x; v < 256; v += 32 * KW) {
++    float s = 0.f;
++#pragma unroll
++    for (int k = 0; k < KW; ++k) s += red[k * 256 + v];
++    if (split == 1)
++      x_write(sg, t, v, s, M);
++    else
++      __stcg(ws + (static_cast<size_t>(tg) * split + sp) * 256 + v, s);
++  }
++  if (split == 1) return;
++  __syncthreads();
++  if (threadIdx.x == 0) {
++    __threadfence();
++    last = atomicAdd(cnt + tg, 1) == split - 1;
++    if (last) __threadfence();
++  }
++  __syncthreads();
++  if (!last) return;
++  for (int v = threadIdx.x; v < 256; v += 32 * KW) {
++    float pv[8];
++#pragma unroll
++    for (int p = 0; p < 8; ++p)
++      pv[p] = p < split
++                  ? __ldcg(ws + (static_cast<size_t>(tg) * split + p) * 256 + v)
++                  : 0.f;
++    float s = 0.f;
++#pragma unroll
++    for (int p = 0; p < 8; ++p) s += pv[p];
++    x_write(sg, t, v, s, M);
++  }
++  if (threadIdx.x == 0) cnt[tg] = 0;
++}
++
++template <int KW, int FMT, int ACC, bool PROBE>
++void x_launch(const XSegs& segs, const half* x, int ldx, int M, int G,
++              int split, float* ws, int* cnt, int tiles, cudaStream_t st) {
++  // x staging (two 2 KiB slots per warp) and the K-slot reduction share it.
++  const size_t smem = static_cast<size_t>(KW) * 256 * 16;
++  static bool init = false;
++  if (!init) {
++    // Shared-memory-heavy carveout: 96 KiB on SM70, so registers (not the
++    // L1 split) bound the blocks per SM. A hint; scheduling only.
++    cudaFuncSetAttribute(dmv_x<KW, FMT, ACC, PROBE>,
++                         cudaFuncAttributePreferredSharedMemoryCarveout,
++                         cudaSharedmemCarveoutMaxShared);
++    init = true;
++  }
++  dmv_x<KW, FMT, ACC, PROBE><<<dim3(tiles, split), 32 * KW, smem, st>>>(
++      segs, x, ldx, M, G, split, ws, cnt);
++  const cudaError_t e = cudaGetLastError();
++  TORCH_CHECK(e == cudaSuccess, "dmv13_x launch: ", cudaGetErrorString(e));
++}
++
++}  // namespace
++
++// x: [M, *] FP16 rows (stride ldx); segment i reads columns [x_off[i],
++// x_off[i] + K) and writes out[i] ([M, n_i] view, any row stride).
++inline void dmv13_x_run(torch::Tensor x, std::vector<torch::Tensor> codes,
++                        std::vector<torch::Tensor> high,
++                        std::vector<torch::Tensor> scale,
++                        std::vector<torch::Tensor> out,
++                        std::vector<int64_t> x_off, int64_t fmt, int64_t K,
++                        int64_t split, int64_t warps, int64_t accs,
++                        torch::Tensor ws, torch::Tensor cnt, int64_t probe) {
++  const int nseg = static_cast<int>(codes.size());
++  TORCH_CHECK(nseg >= 1 && nseg <= kXMaxSeg && high.size() == codes.size() &&
++                  scale.size() == codes.size() && out.size() == codes.size() &&
++                  x_off.size() == codes.size(),
++              "dmv13_x: 1..4 segments with codes/high/scale/out/x_off each");
++  TORCH_CHECK(fmt == kXQ5K || fmt == kXQ8, "dmv13_x: Q5_K or Q8_0 only");
++  TORCH_CHECK(K > 0 && K % 128 == 0, "dmv13_x: K must be a multiple of 128");
++  TORCH_CHECK(split >= 1 && split <= 8, "dmv13_x: split 1..8");
++  TORCH_CHECK(accs == 1 || accs == 2, "dmv13_x: acc 1 or 2");
++  TORCH_CHECK(x.scalar_type() == torch::kHalf && x.dim() == 2 &&
++                  x.stride(1) == 1 && x.size(0) >= 1 && x.size(0) <= 8,
++              "dmv13_x: x must be FP16 [1..8, *] with unit column stride");
++  const int M = static_cast<int>(x.size(0));
++  const int ldx = static_cast<int>(x.stride(0));
++  const int G = static_cast<int>(K / 128);
++  TORCH_CHECK(
++      ldx % 8 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
++      "dmv13_x: x rows must be 16-byte aligned");
++  const int cw = fmt == kXQ8 ? 2 : 1;
++  XSegs segs{};
++  segs.nseg = nseg;
++  int tiles = 0;
++  for (int i = 0; i < nseg; ++i) {
++    XSeg& s = segs.s[i];
++    const int64_t n = out[i].size(1);
++    const int64_t t = (n + 31) / 32;
++    TORCH_CHECK(out[i].scalar_type() == torch::kHalf && out[i].dim() == 2 &&
++                    out[i].size(0) == M && out[i].stride(1) == 1,
++                "dmv13_x: out views must be FP16 [M, n] with unit stride");
++    TORCH_CHECK(x_off[i] >= 0 && x_off[i] % 8 == 0 && x_off[i] + K <= x.size(1),
++                "dmv13_x: x_off out of range or misaligned");
++    TORCH_CHECK(codes[i].nbytes() >= static_cast<size_t>(t) * G * 2048 * cw &&
++                    scale[i].nbytes() >= static_cast<size_t>(t) * G * 512 &&
++                    (fmt != kXQ5K ||
++                     high[i].nbytes() >= static_cast<size_t>(t) * G * 512),
++                "dmv13_x: planes too small for n and K");
++    s.codes = reinterpret_cast<const uint4*>(codes[i].data_ptr());
++    s.high = fmt == kXQ5K ? reinterpret_cast<const uint4*>(high[i].data_ptr())
++                          : nullptr;
++    s.scale = reinterpret_cast<const uint4*>(scale[i].data_ptr());
++    s.out = reinterpret_cast<half*>(out[i].data_ptr());
++    s.out_ld = out[i].stride(0);
++    s.x_off = x_off[i];
++    s.n = static_cast<int>(n);
++    s.tile0 = tiles;
++    tiles += static_cast<int>(t);
++  }
++  TORCH_CHECK(
++      split == 1 || (ws.scalar_type() == torch::kFloat &&
++                     ws.numel() >= static_cast<int64_t>(tiles) * split * 256 &&
++                     cnt.scalar_type() == torch::kInt && cnt.numel() >= tiles),
++      "dmv13_x: workspace/counters too small for tiles x split");
++  auto st = at::cuda::getCurrentCUDAStream();
++  const half* xp = reinterpret_cast<const half*>(x.data_ptr());
++  float* wsp = split > 1 ? ws.data_ptr<float>() : nullptr;
++  int* cp = split > 1 ? cnt.data_ptr<int>() : nullptr;
++#define DMVX_GO(KWV, F, A, P)                                     \
++  if (warps == KWV && fmt == F && accs == A && (probe != 0) == P) \
++    return x_launch<KWV, F, A, P>(                                \
++        segs, xp, ldx, M, G, static_cast<int>(split), wsp, cp, tiles, st);
++#define DMVX_W(KWV)              \
++  DMVX_GO(KWV, kXQ5K, 1, false); \
++  DMVX_GO(KWV, kXQ5K, 2, false); \
++  DMVX_GO(KWV, kXQ8, 1, false);  \
++  DMVX_GO(KWV, kXQ8, 2, false);  \
++  DMVX_GO(KWV, kXQ5K, 1, true);  \
++  DMVX_GO(KWV, kXQ8, 1, true);
++  DMVX_W(2);
++  DMVX_W(4);
++  DMVX_W(8);
++#undef DMVX_W
++#undef DMVX_GO
++  TORCH_CHECK(false, "dmv13_x: warps must be 2, 4 or 8 (probe: acc 1)");
++}
+diff --git a/tests/kernels/quantization/test_dmv13_x_contract.py b/tests/kernels/quantization/test_dmv13_x_contract.py
+new file mode 100644
+index 0000000000..54f387a680
+--- /dev/null
++++ b/tests/kernels/quantization/test_dmv13_x_contract.py
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DMV_X: dmv13_x keeps dmv13's per-warp math and reduction order.
++
++Text-level contract (CPU only): the Q5_K / Q8_0 decode, plane loads, mma
++order, K-slot and split-K sums and output mapping in gguf_dmv13_x.cuh must
++match gguf_dmv13_core.cuh statement for statement, so ACC=1 outputs are
++bit-identical at the same (warps, split). The GPU check is
++benchmarks/deepseek_v41/v41k/bench_dmv_x.py (bitwise diff per shape).
++"""
++
++from pathlib import Path
++
++import pytest
++import regex as re
++
++ROOT = Path(__file__).resolve().parents[3]
++OPS = ROOT / "csrc" / "sm70_turbomind" / "ops"
++CORE = (OPS / "gguf_dmv13_core.cuh").read_text()
++X = (OPS / "gguf_dmv13_x.cuh").read_text()
++V41K = (ROOT / "benchmarks" / "deepseek_v41" / "v41k" / "v41k.cu").read_text()
++
++_HELPERS = r"\bx_(mma|lop_or|h2|u32|lo2|hi2|word|write)\b"
++
++
++def _norm(text):
++    """Strip comments, x_ helper prefixes and layout differences."""
++    text = re.sub(r"//[^\n]*", "", text)
++    text = re.sub(_HELPERS, r"\1", text)
++    text = text.replace("CW<FMT>::v", "CW").replace("L.hi[0]", "L.hi")
++    text = text.replace("acc[st % ACC]", "acc").replace("float(&a)[8] = acc;", "")
++    text = re.sub(r"\bmma\(a,", "mma(acc,", text)
++    text = text.replace("kXQ5K", "Q5K").replace("kXQ8", "Q8")
++    return re.sub(r"\s+", "", text)
++
++
++def _between(text, start, end):
++    i = text.index(start)
++    return text[i : text.index(end, i)]
++
++
++CORE_N, X_N = _norm(CORE), _norm(X)
++
++# Statements that carry the arithmetic; each must appear in both headers.
++STATEMENTS = [
++    # Q5_K decode (5th bit from the high plane, scale/min half2 FMA)
++    "consthalf2s2=lo2(sc),m2=hi2(sc);",
++    "constints=4*c+j-4;",
++    "s>=0?(hb>>(s>=0?s:0)):(hb<<(s<0?-s:0));",
++    "lop_or(sh,0x00100010u,MAGIC);",
++    "constuint32_th=lop_or(cr[c]>>(4*j),0x000f000fu,extra);",
++    "hw[4*c+j]=u32(__hfma2(__hsub2(h2(h),h2(MAGIC)),s2,m2));",
++    # Q8_0 decode
++    "consthalf2bias=h2(0x64806480u);",
++    "constuint32_tv=word(L.c[st][c>>2],c&3)^0x80808080u;",
++    'asm("prmt.b32%0,%1,%2,0x4140;":"=r"(a):"r"(v),"r"(0x64646464u));',
++    'asm("prmt.b32%0,%1,%2,0x4342;":"=r"(b):"r"(v),"r"(0x64646464u));',
++    "hw[2*c]=u32(__hmul2(__hsub2(h2(a),bias),s2));",
++    "hw[2*c+1]=u32(__hmul2(__hsub2(h2(b),bias),s2));",
++    # plane loads
++    "constsize_ttg=static_cast<size_t>(t)*G+g;",
++    "L.sc=__ldcs(s.scale+tg*32+lane);",
++    "L.hi=__ldcs(s.high+tg*32+lane);",
++    "constsize_tSp=static_cast<size_t>(G)*4;",
++    "__ldcs(s.codes+((static_cast<size_t>(t)*Sp+sidx)*CW+j)*32+lane);",
++    # x staging and the per-warp mma chain (k order within a step)
++    "constintr=(lane&3)+((lane&16)?4:0);",
++    "constuint4*xp=slot+cur*128+(st*4)*8+r;",
++    "for(intj=0;j<4;++j)xa[j]=xp[j*8];",
++    "mma(acc,xa[j].x,xa[j].y,hw[4*j],hw[4*j+1]);",
++    "mma(acc,xa[j].z,xa[j].w,hw[4*j+2],hw[4*j+3]);",
++    "constintgn=g+KW;",
++    # split ranges, output mapping
++    "constintgps=(G+split-1)/split;",
++    "constintg0=min(G,sp*gps),g1=min(G,g0+gps);",
++    "consttoken=(i&2)|((lv&16)?4:0)|(lv&1);",
++    "constintcol=(i&1)|(((lv>>1)&1)<<1)|((i>>2)<<2);",
++    "constintrow=t*32+((lv>>2)&3)*8+col;",
++    "sg.out[token*sg.out_ld+row]=__float2half_rn(val);",
++    # split-K epilogue: fixed 8-slot sum with zero fill, counter reset
++    "last=atomicAdd(cnt+tg,1)==split-1;",
++    "for(intp=0;p<8;++p)s+=pv[p];",
++    "if(threadIdx.x==0)cnt[tg]=0;",
++]
++
++
++@pytest.mark.parametrize("stmt", STATEMENTS)
++def test_statement_in_both(stmt):
++    stmt = stmt.replace("consttoken", "constinttoken")
++    assert stmt in CORE_N, f"core changed: {stmt}"
++    assert stmt in X_N, f"dmv13_x diverged: {stmt}"
++
++
++def test_q8_decode_branch_is_verbatim():
++    marker = "} else {  // Q8: int8 codes"
++    core = _norm(_between(CORE, marker, "__device__ __constant__ int8_t kIQ4"))
++    x = _norm(_between(X, marker, "template <int FMT>\n__device__ __forceinline__"))
++    assert core == x
++
++
++def test_reduction_order_matches():
++    # K-slot sum in warp order, then split slots 0..7 in order.
++    assert "for(intk=0;k<KW;++k)s+=red[(k*TN+i)*256+e];" in CORE_N
++    assert "for(intk=0;k<KW;++k)s+=red[k*256+v];" in X_N
++    pv = "pv[p]=p<split?__ldcg(ws+(static_cast<size_t>(tg)*split+p)*{}256+v):0.f;"
++    assert pv.format("TN*") in CORE_N
++    assert pv.format("") in X_N
++    assert "__stcg(ws+(static_cast<size_t>(tg)*split+sp)*256+v,s);" in X_N
++    # ACC=2 is the only order change, and it is a compile-time option.
++    assert "if constexpr (ACC == 2) a += acc[1][e];" in X
++
++
++def test_core_fmt_codes():
++    assert re.search(
++        r"Q4K\s*=\s*0,\s*Q5K\s*=\s*1,\s*Q6K\s*=\s*2,\s*LUT4\s*=\s*3,\s*Q8\s*=\s*4", CORE
++    )
++    assert "constexpr int kXQ5K = 1;" in X and "constexpr int kXQ8 = 4;" in X
++
++
++def test_schema_matches_binding():
++    block = _between(V41K, '"dmv13_x(', "&v41k_dmv13_x")
++    joined = "".join(re.findall(r'"([^"]*)"', block))  # adjacent literals
++    schema = re.fullmatch(r"dmv13_x\((.*)\) -> \(\)", joined).group(1)
++    names = [arg.split()[-1] for arg in schema.split(", ")]
++    assert names == [
++        "x", "codes", "high", "scale", "out", "x_off", "fmt", "K", "split",
++        "warps", "acc", "ws", "cnt", "probe",
++    ]  # fmt: skip
++    binding = _between(V41K, "void v41k_dmv13_x(", "{")
++    params = [p.split()[-1] for p in re.sub(r"\s+", " ", binding).split("(")[1]
++              .rstrip(") ").split(", ")]  # fmt: skip
++    assert params == names
++    assert 'm.impl("dmv13_x"' in V41K or "&v41k_dmv13_x" in V41K
++
++
++def test_dispatch_covers_warps_formats_acc():
++    for kw in (2, 4, 8):
++        assert f"DMVX_W({kw});" in X
++    for args in ("kXQ5K, 1, false", "kXQ5K, 2, false", "kXQ8, 1, false",
++                 "kXQ8, 2, false", "kXQ5K, 1, true", "kXQ8, 1, true"):  # fmt: skip
++        assert f"DMVX_GO(KWV, {args});" in X
+diff --git a/tests/models/test_deepseek_v41_dmv_x.py b/tests/models/test_deepseek_v41_dmv_x.py
+new file mode 100644
+index 0000000000..a88018c651
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_dmv_x.py
+@@ -0,0 +1,213 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DMV_X: dense small-M runners on v41k dmv13_x (CPU wiring, fake ops)."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v41 import dense_tm
++
++Q5K, Q6K, Q8 = 1, 2, 4
++
++
++def _planes(fmt, width, k):
++    tiles, groups = width // 32, k // 128
++    cw = 2 if fmt == Q8 else 1
++    return (
++        torch.zeros(tiles * groups * 2048 * cw, dtype=torch.uint8),
++        torch.zeros(tiles * groups * 512 if fmt == Q5K else 0, dtype=torch.uint8),
++        torch.zeros(tiles * groups * 512, dtype=torch.uint8),
++    )
++
++
++def _segments(fmt, widths, k):
++    return [(_planes(fmt, w, k), fmt, w) for w in widths]
++
++
++class _Ops:
++    def __init__(self):
++        self.calls = []
++
++    def old(self, x, codes, high, scale, out, fmts, widths, k, split, warps, *rest):
++        self.calls.append(("old", dict(k=k, split=split, warps=warps, tp=rest[2])))
++        for i, view in enumerate(out):
++            view.fill_(-(i + 1))
++
++    def new(self, x, codes, high, scale, out, x_off, fmt, k, split, warps, acc, *rest):
++        ws, cnt, probe = rest
++        self.calls.append(
++            ("x", dict(x=x, x_off=list(x_off), fmt=fmt, k=k, split=split))
++        )
++        self.calls[-1][1].update(warps=warps, acc=acc, probe=probe, ws=ws.numel())
++        # Stand-in math: segment i's output row r = sum of its K input columns.
++        for i, view in enumerate(out):
++            cols = x[:, x_off[i] : x_off[i] + k].float().sum(-1, keepdim=True)
++            view.copy_((cols + i).expand_as(view))
++
++
++@pytest.fixture
++def ops(monkeypatch):
++    fake = _Ops()
++    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace(sm70_dmv13_out=fake.old))
++    monkeypatch.setattr(torch.ops, "v41k", SimpleNamespace(dmv13_x=fake.new))
++    monkeypatch.setattr(dense_tm, "_TARGET_CTAS", 80)
++    monkeypatch.setattr(dense_tm, "_SMALL_M_CONFIG", {})
++    monkeypatch.setattr(dense_tm, "_X_CONFIG", {})
++    monkeypatch.setitem(dense_tm._X_READY, "ok", True)
++    return fake
++
++
++@pytest.fixture
++def knob(monkeypatch):
++    monkeypatch.setattr(dense_tm, "_DMV_X", True)
++
++
++# (k, widths) -> dmv13 grid observed in a decode profile (M=6, per rank).
++SHAPES = [
++    ("qkv", Q8, 5120, [1280, 512], (4, 1, 1)),
++    ("q_b", Q5K, 1280, [8192], (4, 1, 1)),
++    ("wo_a", Q5K, 4096, [1024], (8, 1, 2)),
++    ("wo_b", Q5K, 2048, [5120], (4, 1, 1)),
++    ("shared", Q5K, 5120, [576, 576], (8, 1, 2)),
++    ("head", Q5K, 5120, [32320], (4, 1, 1)),
++]
++
++
++@pytest.mark.parametrize("role,fmt,k,widths,grid", SHAPES)
++def test_default_config_matches_profiled_grids(ops, role, fmt, k, widths, grid):
++    assert dense_tm.default_config(k, widths) == grid
++
++
++@pytest.mark.parametrize("role,fmt,k,widths,grid", SHAPES)
++def test_knob_off_keeps_dmv13(ops, role, fmt, k, widths, grid):
++    runner = dense_tm.SmallM(_segments(fmt, widths, k), k, role=role)
++    assert not runner.use_x
++    outs = runner(torch.ones(6, k, dtype=torch.float16))
++    assert [o.shape for o in outs] == [(6, w) for w in widths]
++    assert ops.calls == [("old", dict(k=k, split=grid[2], warps=grid[0], tp=1))]
++
++
++@pytest.mark.parametrize("role,fmt,k,widths,grid", SHAPES)
++def test_knob_on_same_launch_config(ops, knob, role, fmt, k, widths, grid):
++    runner = dense_tm.SmallM(_segments(fmt, widths, k), k, role=role)
++    assert runner.use_x
++    x = torch.ones(6, k, dtype=torch.float16)
++    runner(x)
++    ((kind, args),) = ops.calls
++    assert kind == "x"
++    assert (args["warps"], 1, args["split"]) == grid
++    assert args["acc"] == 1 and args["probe"] == 0
++    assert args["fmt"] == fmt and args["k"] == k
++    assert args["x_off"] == [0] * len(widths)
++    assert args["ws"] == sum(w // 32 for w in widths) * grid[2] * 256
++
++
++def test_role_override_sets_warps_split_acc(ops, knob, monkeypatch):
++    monkeypatch.setattr(dense_tm, "_X_CONFIG", {"q_b": (8, 4, 2)})
++    runner = dense_tm.SmallM(_segments(Q5K, [8192], 1280), 1280, role="q_b")
++    assert (runner.warps, runner.tp, runner.split, runner.acc) == (8, 1, 4, 2)
++    assert runner.workspace.numel() == 256 * 4 * 256
++    assert runner.counters.numel() == 256
++    other = dense_tm.SmallM(_segments(Q5K, [5120], 2048), 2048, role="wo_b")
++    assert (other.warps, other.split, other.acc) == (4, 1, 1)
++
++
++@pytest.mark.parametrize("fmts", [[Q6K], [Q5K, Q8]], ids=["q6k", "mixed"])
++def test_unsupported_formats_stay_on_dmv13(ops, knob, fmts):
++    segments = [(_planes(f, 64, 1024), f, 64) for f in fmts]
++    assert not dense_tm.SmallM(segments, 1024, role="extra").use_x
++
++
++def test_missing_v41k_op_falls_back(ops, knob, monkeypatch):
++    monkeypatch.setitem(dense_tm._X_READY, "ok", False)
++    runner = dense_tm.SmallM(_segments(Q5K, [8192], 1280), 1280, role="q_b")
++    assert not runner.use_x
++
++
++def test_parse_x_config():
++    text = " q_b=8,4,2 ; head=4,1,1;; shared=2,8,1 "
++    assert dense_tm.parse_x_config(text) == {
++        "q_b": (8, 4, 2),
++        "head": (4, 1, 1),
++        "shared": (2, 8, 1),
++    }
++    assert dense_tm.parse_x_config("") == {}
++
++
++@pytest.mark.parametrize(
++    "text",
++    ["lm=4,1,1", "q_b=3,1,1", "q_b=4,9,1", "q_b=4,0,1", "q_b=4,1,3", "q_b=4,1", "q_b"],
++)
++def test_parse_x_config_rejects(text):
++    with pytest.raises(ValueError, match="VLLM_V41_DMV_X_CONFIG"):
++        dense_tm.parse_x_config(text)
++
++
++def _wo_a(groups, k, merged):
++    runners = [
++        dense_tm.SmallM(_segments(Q5K, [1024], k), k, role="wo_a")
++        for _ in range(groups)
++    ]
++    wo_a = SimpleNamespace(v41_group_runners=runners)
++    if merged:
++        wo_a.v41_group_merged = dense_tm.SmallM(
++            _segments(Q5K, [1024] * groups, k),
++            k,
++            role="wo_a",
++            config_widths=[1024],
++            x_offsets=[g * k for g in range(groups)],
++        )
++    return wo_a
++
++
++def test_merged_wo_a_is_one_block_diagonal_launch(ops, knob):
++    groups, k = 2, 4096
++    wo_a = _wo_a(groups, k, merged=True)
++    merged = wo_a.v41_group_merged
++    # The per-group config (8 warps, split 2) is kept, so each tile's FP32
++    # order is the per-group launch's.
++    assert (merged.warps, merged.tp, merged.split, merged.acc) == (8, 1, 2, 1)
++    assert merged.workspace.numel() == 64 * 2 * 256
++    output = torch.randn(6, groups, k).half()
++    result = dense_tm.grouped_wo_a(wo_a, output)
++    ((kind, args),) = ops.calls
++    assert kind == "x"
++    assert args["x_off"] == [0, k]
++    assert args["x"].shape == (6, groups * k)
++    assert args["x"].data_ptr() == output.data_ptr()
++    expected = torch.cat(
++        [
++            (output[:, g].float().sum(-1, keepdim=True) + g).expand(6, 1024)
++            for g in range(groups)
++        ],
++        dim=-1,
++    ).half()
++    assert torch.equal(result, expected)
++
++
++def test_grouped_wo_a_without_merge_keeps_per_group_launches(ops, monkeypatch):
++    monkeypatch.setattr(dense_tm, "_GROUP_VIEWS", True)
++    wo_a = _wo_a(2, 4096, merged=False)
++    result = dense_tm.grouped_wo_a(wo_a, torch.randn(6, 2, 4096).half())
++    assert result.shape == (6, 2048)
++    assert [c[0] for c in ops.calls] == ["old", "old"]
++    assert all(c[1]["split"] == 2 and c[1]["warps"] == 8 for c in ops.calls)
++
++
++def test_bench_shapes_and_config_match_dense_tm(ops):
++    import importlib.util
++    from pathlib import Path
++
++    path = Path(__file__).resolve().parents[2] / "benchmarks/deepseek_v41/v41k"
++    spec = importlib.util.spec_from_file_location(
++        "bench_dmv_x", path / "bench_dmv_x.py"
++    )
++    bench = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(bench)
++    for role, fmt, k, widths, grid in SHAPES:
++        b_fmt, b_k, b_widths, _ = bench.SHAPES[role]
++        assert (b_fmt, b_k, b_widths) == (fmt, k, widths)
++        warps, split = bench.default_config(k, widths)
++        assert dense_tm.default_config(k, widths) == (warps, 1, split)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..d74655379b 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -466,6 +466,8 @@
+     VLLM_V41_DMA_DEBUG: str | None = None
+     VLLM_V41_DMA_DEMAND: str | None = None
+     VLLM_V41_DMV_CTAS: str = "80"
++    VLLM_V41_DMV_X: str = "0"
++    VLLM_V41_DMV_X_CONFIG: str = ""
+     VLLM_V41_DOWN_ROWS: str = "0"
+     VLLM_V41_EM: str = "1"
+     VLLM_V41_EM5: str = "1"
+@@ -7287,6 +7289,37 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_DMV_X": env_var(
++        lambda: os.getenv("VLLM_V41_DMV_X", "0"),
++        description=(
++            "DS-V4.1 DMV_X: M<=8 Q5_K/Q8_0 dense projections on the v41k"
++            " dmv13_x kernel (same math and reduction order as dmv13 at the"
++            " same warps/split: bit-identical), with the two wo_a O groups in"
++            " one block-diagonal launch and a max-shared carveout. Needs a"
++            " v41k build with dmv13_x; otherwise the dmv13 path stays."
++        ),
++        category="tuning",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
++    "VLLM_V41_DMV_X_CONFIG": env_var(
++        lambda: os.getenv("VLLM_V41_DMV_X_CONFIG", ""),
++        description=(
++            "DS-V4.1 DMV_X: per-role dmv13_x launch overrides,"
++            " 'role=warps,split,acc;...' with role in qkv, q_b, wo_a, wo_b,"
++            " shared, head, engram, extra; warps 2/4/8, split 1-8, acc 1/2."
++            " Any override changes the FP32 summation order (near-tie gate)."
++        ),
++        category="tuning",
++        declared_default="''",
++        effective_default="''",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_DMV_CTAS": env_var(
+         lambda: os.getenv("VLLM_V41_DMV_CTAS", "80"),
+         description=("DS-V4.1 SM70 runtime switch (developer)."),
+diff --git a/vllm/models/deepseek_v41/dense_tm.py b/vllm/models/deepseek_v41/dense_tm.py
+index 1aaf044aba..80ab55e668 100644
+--- a/vllm/models/deepseek_v41/dense_tm.py
++++ b/vllm/models/deepseek_v41/dense_tm.py
+@@ -40,20 +40,30 @@ def _segment_shapes(model, extra=()):
+     return shapes
+ 
+ 
+-def _targets(model, extra=()):
+-    """Groups of linears per decoder layer; each group shares one input."""
+-    yield from extra
++def _roles(model, extra=()):
++    """(role, group) per decoder layer; each group of linears shares one input.
++
++    The role names key VLLM_V41_DMV_X_CONFIG overrides.
++    """
++    for group in extra:
++        yield "extra", group
+     for block in model.layers:
+         attn = block.attn
+-        yield (attn.wq_a, attn.wkv)
+-        yield (attn.wq_b,)
+-        yield (attn.wo_a,)
+-        yield (attn.wo_b,)
++        yield "qkv", (attn.wq_a, attn.wkv)
++        yield "q_b", (attn.wq_b,)
++        yield "wo_a", (attn.wo_a,)
++        yield "wo_b", (attn.wo_b,)
+         shared = block.ffn.shared_experts
+-        yield (shared.gate_proj, shared.up_proj)
++        yield "shared", (shared.gate_proj, shared.up_proj)
+         engram = getattr(block, "engram", None)
+         if engram is not None and hasattr(engram, "wkv"):
+-            yield (engram.wkv,)
++            yield "engram", (engram.wkv,)
++
++
++def _targets(model, extra=()):
++    """Groups of linears per decoder layer; each group shares one input."""
++    for _, group in _roles(model, extra):
++        yield group
+ 
+ 
+ def _convert(module) -> bool:
+@@ -115,11 +125,76 @@ def _planes(projection, tile0, tile1):
+ _SMALL_M_CONFIG: Any = {}
+ _GROUP_VIEWS = envs.VLLM_V41_WOA_VIEWS == "1"
+ 
++# DMV_X (VLLM_V41_DMV_X): run the runners on the v41k dmv13_x kernel. With
++# no VLLM_V41_DMV_X_CONFIG override the warps/split are dmv13's, so outputs
++# are bit-identical; an override (warps, split, acc) changes the FP32
++# summation order and needs the near-tie gate.
++_DMV_X = envs.VLLM_V41_DMV_X == "1"
++_X_ROLES = ("qkv", "q_b", "wo_a", "wo_b", "shared", "head", "engram", "extra")
++_X_FORMATS = (1, 4)  # gguf_dmv13_dense Q5K, Q8
++_X_READY: dict = {}
++
++
++def parse_x_config(text):
++    """'role=warps,split,acc;...' -> {role: (warps, split, acc)}."""
++    config = {}
++    for item in filter(None, (part.strip() for part in text.split(";"))):
++        role, _, values = item.partition("=")
++        role = role.strip()
++        try:
++            warps, split, acc = (int(v) for v in values.split(","))
++        except ValueError:
++            raise ValueError(f"VLLM_V41_DMV_X_CONFIG: bad entry {item!r}") from None
++        if role not in _X_ROLES or warps not in (2, 4, 8):
++            raise ValueError(f"VLLM_V41_DMV_X_CONFIG: bad entry {item!r}")
++        if not 1 <= split <= 8 or acc not in (1, 2):
++            raise ValueError(f"VLLM_V41_DMV_X_CONFIG: bad entry {item!r}")
++        config[role] = (warps, split, acc)
++    return config
++
++
++_X_CONFIG = parse_x_config(envs.VLLM_V41_DMV_X_CONFIG)
++
++
++def _x_ready():
++    if "ok" not in _X_READY:
++        from vllm.model_executor.layers.quantization.gguf_v41_moe import (
++            _expert_major_ready,
++        )
++
++        _X_READY["ok"] = bool(
++            _expert_major_ready() and hasattr(torch.ops.v41k, "dmv13_x")
++        )
++        if not _X_READY["ok"]:
++            logger.warning(
++                "VLLM_V41_DMV_X=1 but the loaded v41k library has no dmv13_x "
++                "(rebuild v41k); dense projections stay on dmv13"
++            )
++    return _X_READY["ok"]
++
++
++def default_config(k, widths):
++    """dmv13's (warps, tp, split) for one launch over `widths` rows at K=k."""
++    tiles = sum((w + 31) // 32 for w in widths)
++    groups = (k // 32 + 3) // 4
++    # Small outputs leave most SMs idle at split 1: split K so the launch
++    # covers about two CTAs per SM, keeping at least 4 K-groups per split.
++    split = max(1, min(8, round(_TARGET_CTAS / tiles), groups // 4))
++    split = max(c for c in (1, 2, 3, 4, 6, 8) if c <= split)
++    config = (8, 1, split) if split > 1 else (4, 1, 1)
++    return _SMALL_M_CONFIG.get((k, tuple(widths)), config)
++
+ 
+ class SmallM:
+-    """dmv13 over segment planes: one launch for 1..4 same-input outputs."""
++    """dmv13 over segment planes: one launch for 1..4 same-input outputs.
+ 
+-    def __init__(self, segments, k):
++    x_offsets (DMV_X only): first input column of each segment, for
++    block-diagonal launches (wo_a). config_widths: the widths whose dmv13
++    config this launch keeps (the per-group widths for a merged wo_a, so its
++    reduction order is the per-group launches').
++    """
++
++    def __init__(self, segments, k, role=None, config_widths=None, x_offsets=None):
+         # segments: [(planes, format, width)]
+         self.codes = [p[0] for p, _, _ in segments]
+         self.high = [p[1] for p, _, _ in segments]
+@@ -127,14 +202,29 @@ def __init__(self, segments, k):
+         self.formats = [f for _, f, _ in segments]
+         self.widths = [w for _, _, w in segments]
+         self.k = k
+-        tiles = sum((w + 31) // 32 for w in self.widths)
+-        groups = (k // 32 + 3) // 4
+-        # Small outputs leave most SMs idle at split 1: split K so the launch
+-        # covers about two CTAs per SM, keeping at least 4 K-groups per split.
+-        split = max(1, min(8, round(_TARGET_CTAS / tiles), groups // 4))
+-        split = max(c for c in (1, 2, 3, 4, 6, 8) if c <= split)
+-        config = (8, 1, split) if split > 1 else (4, 1, 1)
+-        self.configure(*_SMALL_M_CONFIG.get((k, tuple(self.widths)), config))
++        self.role = role
++        self.x_offsets = list(x_offsets) if x_offsets else [0] * len(segments)
++        self.acc = 1
++        self.use_x = False
++        self.configure(*default_config(k, config_widths or self.widths))
++        if _DMV_X:
++            self._enable_x()
++
++    def _enable_x(self):
++        if (
++            self.tp != 1
++            or len(self.widths) > 4
++            or len(set(self.formats)) != 1
++            or self.formats[0] not in _X_FORMATS
++            or not _x_ready()
++        ):
++            return
++        override = _X_CONFIG.get(self.role)
++        if override is not None:
++            warps, split, acc = override
++            self.configure(warps, 1, split)
++            self.acc = acc
++        self.use_x = True
+ 
+     def configure(self, warps, tp, split):
+         device = self.codes[0].device
+@@ -152,6 +242,24 @@ def __call__(self, x, out=None):
+             if out is not None
+             else [x.new_empty((x.shape[0], width)) for width in self.widths]
+         )
++        if self.use_x:
++            torch.ops.v41k.dmv13_x(
++                x if x.stride(-1) == 1 else x.contiguous(),
++                self.codes,
++                self.high,
++                self.scale,
++                views,
++                self.x_offsets,
++                self.formats[0],
++                self.k,
++                self.split,
++                self.warps,
++                self.acc,
++                self.workspace,
++                self.counters,
++                0,
++            )
++            return views
+         torch.ops._C.sm70_dmv13_out(
+             x if x.stride(-1) == 1 else x.contiguous(),
+             self.codes,
+@@ -193,6 +301,7 @@ def attach_lm_head(lm_head) -> bool:
+             )
+         ],
+         projection.k,
++        role="head",
+     )
+     lm_head._v41_dmv13_projection = projection  # keep plane storage alive
+     # Logits are only ever requested for a few rows; larger M runs in 8-row
+@@ -231,7 +340,7 @@ def prepare(model, extra_groups=()) -> dict:
+     except Exception as error:  # noqa: BLE001
+         print("V41 shared down diag failed", error)
+     gguf_dense_hmma.EXTRA_SEGMENT_SHAPES.update(_segment_shapes(model, extra))
+-    for group in _targets(model, extra):
++    for role, group in _roles(model, extra):
+         if not all(
+             _convert(m) or getattr(m, "gguf_tm_projections", None) for m in group
+         ):
+@@ -256,7 +365,7 @@ def prepare(model, extra_groups=()) -> dict:
+             )
+             for p in projections
+         ]
+-        group[0].v41_small_m = SmallM(segments, k)
++        group[0].v41_small_m = SmallM(segments, k, role=role)
+         if len(group) > 1:
+             report["fused_groups"] += 1  # type: ignore[operator]
+             for m in group[1:]:
+@@ -269,9 +378,29 @@ def prepare(model, extra_groups=()) -> dict:
+             k = p.kernel.config.partition_weight_shape[0]
+             groups = p.logical_output_size // 1024
+             wo_a.v41_group_runners = [
+-                SmallM([(_planes(p, g * 32, (g + 1) * 32), p.segment_format, 1024)], k)
++                SmallM(
++                    [(_planes(p, g * 32, (g + 1) * 32), p.segment_format, 1024)],
++                    k,
++                    role="wo_a",
++                )
+                 for g in range(groups)
+             ]
++            if _DMV_X and 1 < groups <= 4:
++                # One block-diagonal launch: group g reads input columns
++                # [g * k, (g + 1) * k) and writes its own 1024 rows, with the
++                # per-group launch config (same reduction order).
++                merged = SmallM(
++                    [
++                        (_planes(p, g * 32, (g + 1) * 32), p.segment_format, 1024)
++                        for g in range(groups)
++                    ],
++                    k,
++                    role="wo_a",
++                    config_widths=[1024],
++                    x_offsets=[g * k for g in range(groups)],
++                )
++                if merged.use_x:
++                    wo_a.v41_group_merged = merged
+     # Prefill restores a whole projection into the shared workspace; size it
+     # for the largest converted V4.1 shape (e.g. Engram wkv K6144/N6400).
+     need_w = need_s = 0
+@@ -318,6 +447,19 @@ def grouped_wo_a(wo_a, output):
+     runners = getattr(wo_a, "v41_group_runners", None)
+     if runners is None or not 1 <= output.shape[0] <= MAX_M:
+         return None
++    merged = getattr(wo_a, "v41_group_merged", None)
++    if merged is not None and output.shape[1] == len(merged.widths):
++        # DMV_X: every group in one launch over the [tokens, groups * k] rows.
++        width = merged.widths[0]
++        result = output.new_empty((output.shape[0], width * len(merged.widths)))
++        merged(
++            output.reshape(output.shape[0], -1),
++            out=[
++                result[:, g * width : (g + 1) * width]
++                for g in range(len(merged.widths))
++            ],
++        )
++        return result
+     if not _GROUP_VIEWS:
+         return torch.cat(
+             [r(output[:, g].contiguous())[0] for g, r in enumerate(runners)], dim=-1
