@@ -53,6 +53,10 @@ __all__ = ["CompressedTensorsW8A16Fp8"]
 logger = init_logger(__name__)
 
 
+_QPN8_ROW_BLOCK = 32
+_QPN8_ROW_BLOCKS_MAX = 4 * _QPN8_ROW_BLOCK
+
+
 def _sm70_ct_fp8_qpn8_dispatch(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -70,6 +74,28 @@ def _sm70_ct_fp8_qpn8_dispatch(
     workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
     if workspace is None:
         raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
+    rows = x.shape[0]
+    if _QPN8_ROW_BLOCK < rows <= _QPN8_ROW_BLOCKS_MAX:
+        # Without the batch TurboMind copy, 33..128 rows would take the dense
+        # prefill route (FP16 dequantization plus cuBLAS, about five bytes of
+        # traffic per weight). Up to four 32-row QPN8 launches read the FP8
+        # codes once each and give each row the same per-row arithmetic.
+        for begin in range(0, rows, _QPN8_ROW_BLOCK):
+            end = min(begin + _QPN8_ROW_BLOCK, rows)
+            call_native(
+                sm70_ops.fp8_qpn8_dispatch_sm70_out,
+                native_policy,
+                out[begin:end],
+                workspace.data_ptr(),
+                x[begin:end],
+                codes,
+                scales,
+                split_k,
+                accumulator_chains,
+                prefetch_codes,
+                gated_silu,
+            )
+        return
     call_native(
         sm70_ops.fp8_qpn8_dispatch_sm70_out,
         native_policy,

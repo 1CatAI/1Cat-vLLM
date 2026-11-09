@@ -100,12 +100,37 @@ def _any_participating_device_is_pre_ampere(cfg: VllmConfig) -> bool:
     ) or _any_participating_device_is_capability(cfg, (7, 5))
 
 
-def _apply_sm70_batch_gemm_defaults(*, is_sm70: bool, defaults) -> tuple[str, ...]:
+# Below this per-device capacity the second batch layout of each FP8 projection
+# (about 2.2 GiB per rank for the 27B at TP4) costs more KV capacity than its
+# M33..64 speed returns: a 16 GB card then admits only four short requests at
+# once. Those rows run as up to four 32-row QPN8 launches instead.
+_SM70_BATCH_LAYOUT_MIN_DEVICE_BYTES = 20 * 2**30
+
+
+def _min_participating_device_bytes(cfg: VllmConfig) -> int | None:
+    from vllm.platforms import current_platform
+
+    devices = _participating_cuda_device_ids(cfg)
+    try:
+        return min(current_platform.get_device_total_memory(d) for d in devices)
+    except Exception:
+        return None
+
+
+def _apply_sm70_batch_gemm_defaults(
+    *, is_sm70: bool, defaults, device_bytes: int | None = None
+) -> tuple[str, ...]:
     """Enable shared SM70 batch operators without overriding explicit settings."""
     if not is_sm70:
         return ()
     applied = []
     for env_name, env_value in _SM70_BATCH_GEMM_DEFAULTS.items():
+        if (
+            env_name == "VLLM_SM70_BATCH_GEMM_LAYOUTS"
+            and device_bytes is not None
+            and device_bytes < _SM70_BATCH_LAYOUT_MIN_DEVICE_BYTES
+        ):
+            env_value = "0"
         if env_name not in defaults:
             defaults[env_name] = env_value
             applied.append(env_name)
@@ -271,12 +296,13 @@ def apply_runtime_policy_defaults(self):
     from vllm.platforms import current_platform
 
     defaults = PolicyDefaults(self)
+    is_sm70 = current_platform.is_cuda() and _any_participating_device_is_capability(
+        self, (7, 0)
+    )
     for env_name in _apply_sm70_batch_gemm_defaults(
-        is_sm70=(
-            current_platform.is_cuda()
-            and _any_participating_device_is_capability(self, (7, 0))
-        ),
+        is_sm70=is_sm70,
         defaults=defaults,
+        device_bytes=_min_participating_device_bytes(self) if is_sm70 else None,
     ):
         logger.info_once(
             "Auto-setting %s=%s for SM70 batch GEMM. "

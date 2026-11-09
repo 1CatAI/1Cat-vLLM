@@ -146,3 +146,63 @@ def test_batch_fp8_dispatch_matches_qpn8_and_replays(
             assert torch.equal(actual, expected)
         else:
             torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
+
+
+@pytest.mark.parametrize(
+    ("device_gib", "expected"), [(16, "0"), (32, "1"), (None, "1")]
+)
+def test_batch_layouts_follow_device_capacity(monkeypatch, device_gib, expected):
+    for name in _SM70_BATCH_GEMM_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    defaults = make_policy_defaults()
+    _apply_sm70_batch_gemm_defaults(
+        is_sm70=True,
+        defaults=defaults,
+        device_bytes=None if device_gib is None else device_gib * 2**30,
+    )
+    assert defaults["VLLM_SM70_BATCH_GEMM_LAYOUTS"] == expected
+    # Only the duplicated layout follows capacity; tuning bounds do not.
+    for name, value in _SM70_BATCH_GEMM_DEFAULTS.items():
+        if name != "VLLM_SM70_BATCH_GEMM_LAYOUTS":
+            assert defaults[name] == value
+
+
+@pytest.mark.parametrize("m", [33, 40, 64, 128])
+@pytest.mark.parametrize("gated_silu", [False, True])
+def test_qpn8_dispatch_row_blocks_match_single_launches(m, gated_silu):
+    """Rows above 32 without a batch layout run as 32-row QPN8 launches and
+    equal launching each block on its own."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 CUDA required")
+    torch.manual_seed(20261109)
+    k, n = 5120, 1536
+    weight = torch.randn((n, k), device="cuda").mul_(0.25).to(torch.float8_e4m3fn)
+    scales = torch.full((n, 1), 0.125, device="cuda", dtype=torch.float32)
+    codes, q_scales = torch.ops._C.fp8_qpn8_prepare_sm70(weight, scales)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16).mul_(0.1)
+    width = n // 2 if gated_silu else n
+    actual = torch.empty((m, width), device="cuda", dtype=torch.float16)
+    torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
+        actual, x, codes, q_scales, 8, 2, False, gated_silu
+    )
+    workspace = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    for begin in range(0, m, 32):
+        end = min(begin + 32, m)
+        expected = torch.empty((end - begin, width), device="cuda", dtype=torch.float16)
+        torch.ops._C.fp8_qpn8_dispatch_sm70_out(
+            expected,
+            workspace.data_ptr(),
+            x[begin:end],
+            codes,
+            q_scales,
+            8,
+            2,
+            False,
+            gated_silu,
+        )
+        torch.testing.assert_close(actual[begin:end], expected, rtol=0, atol=0)
+    dense = x.float() @ (weight.float() * scales).t()
+    if gated_silu:
+        gate, up = dense.chunk(2, dim=-1)
+        dense = torch.nn.functional.silu(gate) * up
+    torch.testing.assert_close(actual.float(), dense, rtol=2e-2, atol=2e-2)
