@@ -1,0 +1,99 @@
+{
+  "initial_inventory": {
+    "number": 1319,
+    "title": "vllm: Skip the load-time split scope with expandable segments",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1319",
+    "isDraft": false,
+    "headRefOid": "8b7fb496a4e812f38a2ed7235a56937a92ceb662",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1319,
+    "title": "vllm: Skip the load-time split scope with expandable segments",
+    "body": "## Purpose\n\nI've been trying to run Qwen3.8-27B at its full 262K context on two 16 GB V100s. Tracking VRAM led me to reserved memory stranded by the temporary weight-loading allocator scope.\n\nThe load scope now follows the effective PyTorch allocator setting. It keeps the configured allocator settings when expandable segments are enabled and retains the temporary 20 MiB split limit otherwise. `VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE=0/1` forces either behavior. The SM70 warmup scope is unchanged.\n\n## Test Plan\n\nRun `pytest tests/v1/worker/test_gpu_worker_allocator.py` and `python -m tools.generate_env_reference --check`. Compare allocator state after loading and captured greedy output at 30K and 120K prompt depths.\n\n## Acceleration and benchmark contract\n\n- Default enabled or opt-in: automatic from the effective allocator configuration.\n- Required CLI options and environment switches: `VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE=0/1`; `PYTORCH_CUDA_ALLOC_CONF` takes precedence over `PYTORCH_ALLOC_CONF`.\n- KV cache dtype used for the benchmark: `fp8_e4m3`.\n- Wheel SHA or source commit: source commit `8b7fb496a`; no wheel.\n- PYTHONPATH, source overlays, or external native libraries: benchmark-only `upstream_probe_worker.ProbeWorker` on PYTHONPATH; native extensions reused from the pinned baseline build.\n- User-entry route-hit, speed, and output-quality evidence: the 30K request used the Flash-V100 FP8 prefix path; captured greedy text matched at 30K and 120K.\n- Existing kernel/backend registry and capability-rejection reasons: none changed.\n- Per-engine configuration and deprecated-variable compatibility: automatic policy preserves configured allocator settings with expandable segments; explicit scope override takes precedence.\n- New/changed environment metadata and generated reference check: registered `VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE`; generated reference check passed.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: not applicable; this is not an SM70-specific control.\n\n## Test Result\n\nAllocator state immediately after loading, per card, with expandable segments enabled:\n\n| Load scope | Allocated MiB | Reserved MiB | Reserved-unused MiB |\n|---|---:|---:|---:|\n| Enabled | 9405.1 | 10164 | 758.9 |\n| Disabled | 9405.1 | 9604 | 198.9 |\n\nDisabling the scope left 560 MiB less reserved-unused memory per card. With expandable segments disabled, the scope remained beneficial: reserved memory was 9,870 MiB with the scope and 10,576 MiB without it.\n\nThroughput: Qwen3.8-27B QUASAR NVFP4, TP2, dual V100 at 200 W/card; 30,063 cold prompt tokens, 128 generated tokens, three samples per state, prefix caching off. No sampled thermal-slowdown flags:\n\n| State | Prompt tok/s | Decode tok/s |\n|---|---:|---:|\n| Pinned upstream, before | 1587.6 | 17.31 |\n| Branch default | 1587.3 | 17.03 |\n| Pinned upstream, after | 1586.9 | 17.06 |\n\nThe 46 allocator regression cases passed. The generated environment reference check passed after rebase. Greedy response text matched at 30K and 120K.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1319",
+    "isDraft": false,
+    "headRefName": "upstream/load-max-split-scope",
+    "headRefOid": "8b7fb496a4e812f38a2ed7235a56937a92ceb662",
+    "baseRefName": "main",
+    "baseRefOid": "4d57473db67eb77a13018d179e4d95169e82044f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "andrewleech/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "andrewleech"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "andrewleech"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1319,
+    "id": "PR_kwDORjYFXs8AAAABLfZUAQ",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "8b7fb496a4e812f38a2ed7235a56937a92ceb662",
+    "title": "vllm: Skip the load-time split scope with expandable segments",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1319",
+    "body": "## Purpose\n\nI've been trying to run Qwen3.8-27B at its full 262K context on two 16 GB V100s. Tracking VRAM led me to reserved memory stranded by the temporary weight-loading allocator scope.\n\nThe load scope now follows the effective PyTorch allocator setting. It keeps the configured allocator settings when expandable segments are enabled and retains the temporary 20 MiB split limit otherwise. `VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE=0/1` forces either behavior. The SM70 warmup scope is unchanged.\n\n## Test Plan\n\nRun `pytest tests/v1/worker/test_gpu_worker_allocator.py` and `python -m tools.generate_env_reference --check`. Compare allocator state after loading and captured greedy output at 30K and 120K prompt depths.\n\n## Acceleration and benchmark contract\n\n- Default enabled or opt-in: automatic from the effective allocator configuration.\n- Required CLI options and environment switches: `VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE=0/1`; `PYTORCH_CUDA_ALLOC_CONF` takes precedence over `PYTORCH_ALLOC_CONF`.\n- KV cache dtype used for the benchmark: `fp8_e4m3`.\n- Wheel SHA or source commit: source commit `8b7fb496a`; no wheel.\n- PYTHONPATH, source overlays, or external native libraries: benchmark-only `upstream_probe_worker.ProbeWorker` on PYTHONPATH; native extensions reused from the pinned baseline build.\n- User-entry route-hit, speed, and output-quality evidence: the 30K request used the Flash-V100 FP8 prefix path; captured greedy text matched at 30K and 120K.\n- Existing kernel/backend registry and capability-rejection reasons: none changed.\n- Per-engine configuration and deprecated-variable compatibility: automatic policy preserves configured allocator settings with expandable segments; explicit scope override takes precedence.\n- New/changed environment metadata and generated reference check: registered `VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE`; generated reference check passed.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: not applicable; this is not an SM70-specific control.\n\n## Test Result\n\nAllocator state immediately after loading, per card, with expandable segments enabled:\n\n| Load scope | Allocated MiB | Reserved MiB | Reserved-unused MiB |\n|---|---:|---:|---:|\n| Enabled | 9405.1 | 10164 | 758.9 |\n| Disabled | 9405.1 | 9604 | 198.9 |\n\nDisabling the scope left 560 MiB less reserved-unused memory per card. With expandable segments disabled, the scope remained beneficial: reserved memory was 9,870 MiB with the scope and 10,576 MiB without it.\n\nThroughput: Qwen3.8-27B QUASAR NVFP4, TP2, dual V100 at 200 W/card; 30,063 cold prompt tokens, 128 generated tokens, three samples per state, prefix caching off. No sampled thermal-slowdown flags:\n\n| State | Prompt tok/s | Decode tok/s |\n|---|---:|---:|\n| Pinned upstream, before | 1587.6 | 17.31 |\n| Branch default | 1587.3 | 17.03 |\n| Pinned upstream, after | 1586.9 | 17.06 |\n\nThe 46 allocator regression cases passed. The generated environment reference check passed after rebase. Greedy response text matched at 30K and 120K.\n",
+    "author": {
+      "login": "andrewleech"
+    },
+    "headRepository": {
+      "nameWithOwner": "andrewleech/1Cat-vLLM"
+    },
+    "headRefName": "upstream/load-max-split-scope",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1319,
+    "title": "vllm: Skip the load-time split scope with expandable segments",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1319",
+    "isDraft": false,
+    "headRefOid": "8b7fb496a4e812f38a2ed7235a56937a92ceb662",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "docs/configuration/env_var_reference.md",
+      "docs/design/sm70_memory_workspace_tuning.md",
+      "tests/v1/worker/test_gpu_worker_allocator.py",
+      "vllm/envs.py",
+      "vllm/v1/worker/gpu_worker.py"
+    ],
+    "diff_bytes": 12990,
+    "diff_sha256": "2155b5873f8592af26766ad4a19e3055c373e6ef9cf95187750409a18a187bd3"
+  },
+  "full_tree_diff_proof": null
+}

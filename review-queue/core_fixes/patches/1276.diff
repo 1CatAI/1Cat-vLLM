@@ -1,0 +1,1128 @@
+diff --git a/docs/design/architecture/runtime_reference.md b/docs/design/architecture/runtime_reference.md
+index b7f2f8e0bd..c22727d555 100644
+--- a/docs/design/architecture/runtime_reference.md
++++ b/docs/design/architecture/runtime_reference.md
+@@ -83,7 +83,7 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.sm70_runtime.StepProfilerConfig` | observability_config.step_profiler | __post_init__: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L145); compile_ignored_aliases: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L151) | [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L130) |
+ | `vllm.config.sm70_sparse.Sm70SparseConfig` | kernel_config.sm70_sparse | compute_hash: [vllm/config/sm70_sparse.py](../../../vllm/config/sm70_sparse.py#L170); resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L57); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69) | [vllm/config/sm70_sparse.py](../../../vllm/config/sm70_sparse.py#L51) |
+ | `vllm.config.sm70_triton_attention.Sm70TritonAttentionPolicy` | attention_config.sm70_triton | resolve: [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L73); compute_hash: [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L110); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69) | [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L36) |
+-| `vllm.config.speculative.SpeculativeConfig` | speculative_config | compute_hash: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L432); __post_init__: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L774) | [vllm/config/speculative.py](../../../vllm/config/speculative.py#L157) |
++| `vllm.config.speculative.SpeculativeConfig` | speculative_config | compute_hash: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L437); __post_init__: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L779) | [vllm/config/speculative.py](../../../vllm/config/speculative.py#L157) |
+ | `vllm.config.speculative_sampling.SpeculativeSamplingPolicy` | speculative_config.sampling_policy | resolve_fields: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L109); resolve: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L142); compute_hash: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L181) | [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L16) |
+ | `vllm.config.structured_outputs.StructuredOutputsConfig` | structured_outputs_config | compute_hash: [vllm/config/structured_outputs.py](../../../vllm/config/structured_outputs.py#L44) | [vllm/config/structured_outputs.py](../../../vllm/config/structured_outputs.py#L18) |
+ | `vllm.config.turboquant_runtime.TurboQuantDiagnostics` | observability_config.runtime_trace.turboquant | compile_ignored_aliases: [vllm/config/turboquant_runtime.py](../../../vllm/config/turboquant_runtime.py#L106); resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L29); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/turboquant_runtime.py](../../../vllm/config/turboquant_runtime.py#L72) |
+diff --git a/tests/v1/core/test_async_scheduler.py b/tests/v1/core/test_async_scheduler.py
+index ebf71ee794..bbe2dfc17e 100644
+--- a/tests/v1/core/test_async_scheduler.py
++++ b/tests/v1/core/test_async_scheduler.py
+@@ -7,6 +7,7 @@
+ import pytest
+ 
+ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
++from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
+ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+ from vllm.v1.core.sched.scheduler import Scheduler
+ from vllm.v1.outputs import ModelRunnerOutput
+@@ -381,6 +382,10 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
+     scheduler.recompute_kv_load_failures = False
+     scheduler.make_stats = Mock(return_value=None)
+     scheduler.max_model_len = 128
++    # No latency target: update() ignores the step timing.
++    scheduler.mixed_prefill_budget = MixedPrefillBudget(1, 0.0)
++    # No speculative decoding, as __init__ derives without a speculative config.
++    scheduler.use_lookahead_block_hashes = False
+ 
+     def free_request(req, delay_free_blocks=False):
+         scheduler.finished_req_ids.add(req.request_id)
+diff --git a/tests/v1/core/test_lookahead_block_hashes.py b/tests/v1/core/test_lookahead_block_hashes.py
+new file mode 100644
+index 0000000000..8c73d43840
+--- /dev/null
++++ b/tests/v1/core/test_lookahead_block_hashes.py
+@@ -0,0 +1,493 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Lookahead block hashes for EAGLE-like drafters (port of vllm#61589).
++
++The EAGLE/MTP draft KV at a block's last position depends on the token after
++the block. Instead of dropping the last matched block on every hit, each hash
++also covers that token, so a block is reused only when it is proven equal.
++"""
++
++from types import SimpleNamespace
++from typing import Any, cast
++
++import pytest
++import torch
++
++import vllm.v1.core.kv_cache_utils as kv_cache_utils
++from vllm.config import VllmConfig
++from vllm.config.speculative import SpeculativeConfig
++from vllm.distributed.kv_events import BlockStored
++from vllm.sampling_params import SamplingParams
++from vllm.utils.hashing import sha256, sha256_cbor
++from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.kv_cache_utils import (
++    get_request_block_hasher,
++    init_none_hash,
++    is_lookahead_block_hashing_enabled,
++)
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++)
++from vllm.v1.outputs import ModelRunnerOutput
++from vllm.v1.request import Request
++
++from .utils import create_scheduler
++
++pytestmark = pytest.mark.cpu_test
++
++
++@pytest.fixture(autouse=True)
++def _none_hash():
++    init_none_hash(sha256)
++
++
++def make_request(
++    request_id: str,
++    prompt_token_ids: list[int],
++    block_size: int,
++    use_lookahead_hashes: bool,
++    hash_fn=sha256,
++    max_tokens: int = 17,
++) -> Request:
++    sampling_params = SamplingParams(max_tokens=max_tokens)
++    sampling_params.update_from_generation_config({}, eos_token_id=100)
++    return Request(
++        request_id=request_id,
++        prompt_token_ids=prompt_token_ids,
++        sampling_params=sampling_params,
++        pooling_params=None,
++        block_hasher=get_request_block_hasher(
++            block_size, hash_fn, use_lookahead_hashes
++        ),
++    )
++
++
++def full_attention_config(block_size: int, num_blocks: int) -> KVCacheConfig:
++    return KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["layer"],
++                FullAttentionSpec(
++                    block_size=block_size,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                ),
++            )
++        ],
++    )
++
++
++def hybrid_mamba_config(
++    hash_block_size: int,
++    mamba_block_size: int,
++    num_blocks: int,
++    num_speculative_blocks: int = 0,
++) -> KVCacheConfig:
++    return KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["full_attention"],
++                FullAttentionSpec(
++                    block_size=hash_block_size,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["mamba"],
++                MambaSpec(
++                    block_size=mamba_block_size,
++                    shapes=((1, 1),),
++                    dtypes=(torch.float32,),
++                    mamba_cache_mode="align",
++                    num_speculative_blocks=num_speculative_blocks,
++                ),
++            ),
++        ],
++    )
++
++
++@pytest.mark.parametrize(
++    ("lookahead", "num_prompt_tokens", "expected_blocks"),
++    [
++        # Legacy drop: pop the logits block, then drop one more.
++        (False, 48, 1),
++        (False, 37, 1),
++        # Lookahead hashes prove the boundary, so no extra block is dropped.
++        (True, 48, 2),
++        (True, 37, 2),
++    ],
++)
++def test_eagle_identical_prompt_hit(
++    lookahead: bool, num_prompt_tokens: int, expected_blocks: int
++):
++    block_size = 16
++    manager = KVCacheManager(
++        full_attention_config(block_size, num_blocks=10),
++        max_model_len=8192,
++        enable_caching=True,
++        use_eagle=not lookahead,
++        use_lookahead_block_hashes=lookahead,
++        hash_block_size=block_size,
++    )
++    token_ids = [0] * num_prompt_tokens
++
++    prime = make_request("prime", token_ids, block_size, lookahead)
++    computed_blocks, _ = manager.get_computed_blocks(prime)
++    manager.allocate_slots(
++        prime,
++        len(token_ids),
++        len(computed_blocks.blocks[0]) * block_size,
++        computed_blocks,
++    )
++    manager.free(prime)
++
++    resend = make_request("resend", token_ids, block_size, lookahead)
++    computed_blocks, num_tokens = manager.get_computed_blocks(resend)
++    assert len(computed_blocks.blocks[0]) == expected_blocks
++    assert num_tokens == expected_blocks * block_size
++
++
++def test_lookahead_token_controls_last_block_hit():
++    block_size = 2
++    manager = KVCacheManager(
++        full_attention_config(block_size, num_blocks=20),
++        max_model_len=8192,
++        enable_caching=True,
++        use_eagle=False,
++        use_lookahead_block_hashes=True,
++        hash_block_size=block_size,
++    )
++
++    first = make_request("first", [0, 1, 2, 3, 4, 5], block_size, True)
++    computed_blocks, _ = manager.get_computed_blocks(first)
++    manager.allocate_slots(first, first.num_tokens, 0, computed_blocks)
++    manager.free(first)
++
++    # Block [2, 4) was cached with lookahead token 4.
++    same_lookahead = make_request("same", [0, 1, 2, 3, 4, 6], block_size, True)
++    _, num_tokens = manager.get_computed_blocks(same_lookahead)
++    assert num_tokens == 2 * block_size
++
++    different_lookahead = make_request(
++        "different", [0, 1, 2, 3, 7, 6], block_size, True
++    )
++    _, num_tokens = manager.get_computed_blocks(different_lookahead)
++    assert num_tokens == block_size
++
++
++def test_kv_events_reconstruct_lookahead_block_hashes():
++    block_size = 2
++    manager = KVCacheManager(
++        full_attention_config(block_size, num_blocks=20),
++        max_model_len=8192,
++        enable_caching=True,
++        use_eagle=False,
++        use_lookahead_block_hashes=True,
++        hash_block_size=block_size,
++        enable_kv_cache_events=True,
++    )
++    request = make_request("request", [0, 1, 2, 3, 4], block_size, True)
++    computed_blocks, _ = manager.get_computed_blocks(request)
++    manager.allocate_slots(request, request.num_tokens, 0, computed_blocks)
++
++    events = manager.take_events()
++
++    assert len(events) == 1
++    assert isinstance(events[0], BlockStored)
++    assert events[0].block_hashes == [
++        kv_cache_utils.maybe_convert_block_hash(block_hash)
++        for block_hash in request.block_hashes
++    ]
++    assert events[0].extra_keys is not None
++    reconstructed_hashes = []
++    parent_hash = events[0].parent_block_hash
++    for block_start, extra_keys in zip(
++        range(0, len(events[0].token_ids), block_size),
++        events[0].extra_keys,
++        strict=True,
++    ):
++        parent_hash = kv_cache_utils.hash_block_tokens(
++            sha256,
++            parent_hash,
++            events[0].token_ids[block_start : block_start + block_size],
++            extra_keys,
++        )
++        reconstructed_hashes.append(parent_hash)
++    assert reconstructed_hashes == request.block_hashes
++
++
++@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
++def test_lookahead_hasher_waits_for_the_next_token(hash_fn):
++    """A lookahead hash is emitted once the token after its block exists, it
++    covers that token, and appending tokens one by one yields the same hashes
++    as hashing the full sequence at once."""
++    init_none_hash(hash_fn)
++    block_size = 4
++    incremental = make_request(
++        "incremental", list(range(8)), block_size, True, hash_fn=hash_fn
++    )
++    # Tokens 0..7: block [4, 8) waits for token 8.
++    assert len(incremental.block_hashes) == 1
++    incremental.append_output_token_ids(8)
++    assert len(incremental.block_hashes) == 2
++
++    expected_second_hash = hash_fn(
++        (incremental.block_hashes[0], (4, 5, 6, 7), (None, 8, None))
++    )
++    assert incremental.block_hashes[1] == expected_second_hash
++
++    fresh = make_request("fresh", list(range(9)), block_size, True, hash_fn=hash_fn)
++    assert incremental.block_hashes == fresh.block_hashes
++
++    plain = make_request("plain", list(range(9)), block_size, False, hash_fn=hash_fn)
++    assert plain.block_hashes[0] != fresh.block_hashes[0]
++
++
++@pytest.mark.parametrize(
++    ("use_eagle", "lookahead", "expected_hit"),
++    [
++        # No speculative decoding: the last aligned boundary below the final token.
++        (False, False, 1088),
++        # Legacy EAGLE drop: one alignment lower.
++        (True, False, 544),
++        # Lookahead hashes: as without speculative decoding.
++        (False, True, 1088),
++    ],
++)
++def test_eagle_hybrid_mamba_hits_partial_prompt_boundary(
++    use_eagle: bool, lookahead: bool, expected_hit: int
++):
++    """A resend of a 1249-token prompt on a hybrid model with 544-token Mamba
++    alignment. The prefill is chunked at the aligned boundaries, as the
++    scheduler does in Mamba ``align`` mode, so a state exists at 544 and 1088.
++    Upstream reaches 1248 through intra-block prefill checkpoints this tree
++    does not have; here hits are multiples of the alignment."""
++    hash_block_size = 16
++    mamba_block_size = 544
++    token_ids = list(range(1249))
++    manager = KVCacheManager(
++        hybrid_mamba_config(hash_block_size, mamba_block_size, num_blocks=200),
++        max_model_len=8192,
++        enable_caching=True,
++        use_eagle=use_eagle,
++        use_lookahead_block_hashes=lookahead,
++        hash_block_size=hash_block_size,
++    )
++
++    first = make_request("first", token_ids, hash_block_size, lookahead)
++    computed_blocks, num_computed = manager.get_computed_blocks(first)
++    manager.allocate_slots(first, 544, num_computed, computed_blocks)
++    first.num_computed_tokens = 544
++    manager.new_step_starts()
++    for chunk_end in (1088, 1248, 1249):
++        manager.allocate_slots(first, chunk_end - first.num_computed_tokens)
++        first.num_computed_tokens = chunk_end
++        manager.new_step_starts()
++    manager.free(first)
++
++    second = make_request("second", token_ids, hash_block_size, lookahead)
++    _, num_computed = manager.get_computed_blocks(second)
++
++    assert num_computed == expected_hit
++
++
++def test_hybrid_mamba_retention_lookahead_keeps_last_prompt_boundary():
++    """Lookahead block hashes need no EAGLE drop, so sparse retention keeps the
++    Mamba state at the prompt's last boundary below ``num_tokens - 1`` rather
++    than one alignment unit lower; otherwise a resend can only hit the lower
++    state."""
++    block_size = 32
++    manager = KVCacheManager(
++        hybrid_mamba_config(
++            block_size, block_size, num_blocks=100, num_speculative_blocks=1
++        ),
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=block_size,
++        prefix_cache_retention_interval=0,
++        use_eagle=False,
++        use_lookahead_block_hashes=True,
++    )
++
++    # 129 tokens: the last boundary below the logits token is 128.
++    token_ids = [i for i in range(4) for _ in range(block_size)] + [4]
++    req0 = make_request("0", token_ids, block_size, True)
++    for chunk_end in (32, 64, 96, 128, 129):
++        blocks = manager.allocate_slots(
++            req0,
++            chunk_end - req0.num_computed_tokens,
++            num_lookahead_tokens=1,
++        )
++        assert blocks is not None
++        req0.num_computed_tokens = chunk_end
++
++    pool = manager.block_pool
++    for i in range(4):
++        cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
++        if i == 3:
++            assert cached is not None, "mamba state at 128 should be retained"
++        else:
++            assert cached is None, f"mamba hash {i} should not be cached"
++    manager.free(req0)
++
++    req1 = make_request("1", token_ids, block_size, True)
++    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
++    assert num_computed_tokens == 4 * block_size
++    assert [len(blocks) for blocks in computed_blocks.blocks] == [4, 4]
++
++
++def _speculative_config(
++    method: str,
++    disable_lookahead_block_hashes: bool = False,
++    num_mtp_layers: int = 1,
++) -> SpeculativeConfig:
++    speculative_config = object.__new__(SpeculativeConfig)
++    object.__setattr__(speculative_config, "method", method)
++    object.__setattr__(
++        speculative_config,
++        "disable_lookahead_block_hashes",
++        disable_lookahead_block_hashes,
++    )
++    object.__setattr__(speculative_config, "num_speculative_tokens", 3)
++    object.__setattr__(
++        speculative_config,
++        "draft_model_config",
++        SimpleNamespace(
++            hf_config=SimpleNamespace(num_nextn_predict_layers=num_mtp_layers)
++        ),
++    )
++    return speculative_config
++
++
++@pytest.mark.parametrize(
++    ("overrides", "expected"),
++    [
++        *(
++            pytest.param({"method": method}, True, id=method)
++            for method in ("eagle", "eagle3", "mtp")
++        ),
++        # DFlash on the V2 runner keeps no trailing-block drop to begin with.
++        pytest.param({"method": "dflash"}, False, id="dflash"),
++        # DSpark keeps the drop: with lookahead hashes it drafted worse on DSv4.
++        pytest.param({"method": "dspark"}, False, id="dspark"),
++        pytest.param({"method": "ngram"}, False, id="not-eagle"),
++        pytest.param({"enable_prefix_caching": False}, False, id="no-prefix-caching"),
++        pytest.param({"num_mtp_layers": 2}, False, id="multi-module-mtp"),
++        pytest.param(
++            {"disable_lookahead_block_hashes": True}, False, id="disabled-by-config"
++        ),
++        pytest.param({"kv_connector": True}, False, id="kv-connector"),
++    ],
++)
++def test_lookahead_block_hashing_enabled(overrides: dict[str, Any], expected: bool):
++    vllm_config = cast(
++        VllmConfig,
++        SimpleNamespace(
++            cache_config=SimpleNamespace(
++                enable_prefix_caching=overrides.get("enable_prefix_caching", True)
++            ),
++            speculative_config=_speculative_config(
++                overrides.get("method", "mtp"),
++                overrides.get("disable_lookahead_block_hashes", False),
++                overrides.get("num_mtp_layers", 1),
++            ),
++            kv_transfer_config=object() if overrides.get("kv_connector") else None,
++        ),
++    )
++
++    assert is_lookahead_block_hashing_enabled(vllm_config) == expected
++
++
++def _enable_lookahead_block_hashes(scheduler) -> None:
++    scheduler.use_lookahead_block_hashes = True
++    scheduler.kv_cache_manager.block_pool.use_lookahead_block_hashes = True
++
++
++def _scheduler_request(
++    request_id: str, prompt_token_ids: list[int], block_size: int, max_tokens: int
++) -> Request:
++    return Request(
++        request_id=request_id,
++        prompt_token_ids=prompt_token_ids,
++        sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True),
++        pooling_params=None,
++        block_hasher=get_request_block_hasher(block_size, sha256, True),
++    )
++
++
++def test_scheduler_publishes_lookahead_blocks_at_allocation():
++    """A lookahead block is published once its lookahead token exists: prompt
++    blocks at their own allocation, the block ending at the first sampled
++    token at the allocation after it is sampled."""
++    block_size = 2
++    scheduler = create_scheduler(
++        enable_prefix_caching=True,
++        block_size=block_size,
++        max_num_batched_tokens=16,
++    )
++    _enable_lookahead_block_hashes(scheduler)
++
++    def num_cached_tokens(prompt_token_ids: list[int]) -> int:
++        probe = _scheduler_request("probe", prompt_token_ids, block_size, 3)
++        return scheduler.kv_cache_manager.get_computed_blocks(probe)[1]
++
++    request = _scheduler_request("first", [0, 1, 2, 3], block_size, 3)
++    scheduler.add_request(request)
++    scheduler_output = scheduler.schedule()
++    # Block [2, 4) waits for its lookahead token, the first sampled one.
++    assert num_cached_tokens([0, 1, 2, 3, 5, 7]) == block_size
++
++    scheduler.update_from_output(
++        scheduler_output,
++        ModelRunnerOutput(
++            req_ids=[request.request_id],
++            req_id_to_index={request.request_id: 0},
++            sampled_token_ids=[[5]],
++        ),
++    )
++    scheduler.schedule()
++    assert num_cached_tokens([0, 1, 2, 3, 5, 7]) == 2 * block_size
++    assert num_cached_tokens([0, 1, 2, 3, 6, 7]) == block_size
++
++
++def test_finished_request_publishes_block_ending_at_last_sampled_token():
++    """The last sampled token is never computed, but it is the lookahead token
++    of the block ending right before it, whose draft KV the finishing step
++    wrote. That block must be published before the request is freed."""
++    block_size = 2
++    scheduler = create_scheduler(
++        enable_prefix_caching=True,
++        block_size=block_size,
++        max_num_batched_tokens=16,
++    )
++    _enable_lookahead_block_hashes(scheduler)
++    request = _scheduler_request("request", [0, 1, 2], block_size, 2)
++    scheduler.add_request(request)
++
++    for token_id in (3, 4):
++        scheduler_output = scheduler.schedule()
++        scheduler.update_from_output(
++            scheduler_output,
++            ModelRunnerOutput(
++                req_ids=[request.request_id],
++                req_id_to_index={request.request_id: 0},
++                sampled_token_ids=[[token_id]],
++            ),
++        )
++    assert request.is_finished()
++    # Tokens 0-3 were computed; token 4 is the lookahead of block [2, 4).
++    assert request.num_computed_tokens == 4
++
++    probe = _scheduler_request("probe", [0, 1, 2, 3, 4, 5], block_size, 1)
++    _, num_tokens = scheduler.kv_cache_manager.get_computed_blocks(probe)
++    assert num_tokens == 4
+diff --git a/tests/v1/core/test_mamba_align_chunk_split.py b/tests/v1/core/test_mamba_align_chunk_split.py
+index 7aa2121f04..9f1facbb4d 100644
+--- a/tests/v1/core/test_mamba_align_chunk_split.py
++++ b/tests/v1/core/test_mamba_align_chunk_split.py
+@@ -26,7 +26,7 @@
+ def _split(
+     request, num_new_tokens: int, *, interval=None, eagle=False, tail=True
+ ) -> int:
+-    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
++    coordinator = SimpleNamespace(drop_eagle_group_ids={0} if eagle else set())
+     coordinator.get_replay_boundaries = lambda request, block: (
+         KVCacheCoordinator.get_replay_boundaries(coordinator, request, block)
+     )
+@@ -35,7 +35,7 @@ def _split(
+         mamba_state_block_size=MAMBA_BLOCK_SIZE,
+         max_num_scheduled_tokens=8192,
+         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+-        use_eagle=eagle,
++        use_eagle_block_drop=eagle,
+         mamba_state_retention_interval=interval,
+         kv_cache_manager=SimpleNamespace(coordinator=coordinator),
+     )
+@@ -103,7 +103,7 @@ def replay_boundaries(request, block):
+     scheduler = SimpleNamespace(
+         cache_config=SimpleNamespace(block_size=16),
+         mamba_state_block_size=8192,
+-        use_eagle=True,
++        use_eagle_block_drop=True,
+         mamba_state_retention_interval=0,
+         mamba_dense_boundaries_on_contention=True,
+         running=[request] * running,
+@@ -235,7 +235,7 @@ def test_sparse_mtp_preserves_fine_resend_boundary_with_bulk_prefill():
+ @pytest.mark.parametrize("length", [8160, 8161, 32768, 131040])
+ def test_sparse_keeps_both_replay_boundaries(eagle, length):
+     ends = _chunk_ends(length, eagle=eagle)
+-    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
++    coordinator = SimpleNamespace(drop_eagle_group_ids={0} if eagle else set())
+     boundaries = KVCacheCoordinator.get_replay_boundaries(
+         coordinator, SimpleNamespace(num_tokens=length), MAMBA_BLOCK_SIZE
+     )
+diff --git a/tests/v1/core/test_mamba_sparse_retention.py b/tests/v1/core/test_mamba_sparse_retention.py
+index 02f8a926b2..52d4baae9f 100644
+--- a/tests/v1/core/test_mamba_sparse_retention.py
++++ b/tests/v1/core/test_mamba_sparse_retention.py
+@@ -55,7 +55,7 @@ def _mamba(pool, block_size, group):
+ 
+ def _prefill(managers, request, block_size, alignment=None, interval=None, eagle=False):
+     boundaries = KVCacheCoordinator.get_replay_boundaries(
+-        SimpleNamespace(eagle_group_ids={0} if eagle else set()),
++        SimpleNamespace(drop_eagle_group_ids={0} if eagle else set()),
+         request,
+         alignment or block_size,
+     )
+@@ -371,7 +371,7 @@ def test_bulk_prefill_materializes_every_admitted_state(eagle, length, interval_
+         mamba_state_block_size=block_size,
+         mamba_state_retention_interval=interval,
+         kv_cache_manager=cm,
+-        use_eagle=eagle,
++        use_eagle_block_drop=eagle,
+     )
+     materialized = {}
+     ends = []
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 0c71ec5d29..f0e769f27a 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -2698,6 +2698,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
+     scheduler.vllm_config.model_config.enable_return_routed_experts = False
+     scheduler.enable_return_routed_experts = False
+     scheduler.recompute_kv_load_failures = False
++    scheduler.use_lookahead_block_hashes = False
+     scheduler.make_stats = Mock(return_value=None)
+     scheduler.max_model_len = 128
+     scheduler.mixed_prefill_budget = Mock()
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index a6e9f08659..831e440f22 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -239,6 +239,11 @@ class SpeculativeConfig:
+     non-tree speculation. ``None`` automatically enables the SM70
+     FP16 Qwen4Exp TP4 MTP route with greedy drafts. Explicit booleans override
+     automatic selection; other routes retain full-logits selection."""
++    disable_lookahead_block_hashes: bool = False
++    """Disable lookahead block hashes for EAGLE-like speculative methods and
++    fall back to dropping the trailing prefix-cache block. Lookahead hashes
++    also cover the token after each block, so engines sharing a KV store and
++    external consumers of KV cache events must use the same setting."""
+ 
+     # Ngram proposer configuration
+     prompt_lookup_max: int | None = Field(default=None, ge=1)
+@@ -1681,6 +1686,14 @@ def use_eagle_kv_cache(self) -> bool:
+             and not self.disable_eagle_block_drop
+         )
+ 
++    def use_multi_module_mtp(self) -> bool:
++        if self.method != "mtp" or self.draft_model_config is None:
++            return False
++        num_mtp_layers = getattr(
++            self.draft_model_config.hf_config, "num_nextn_predict_layers", 1
++        )
++        return min(num_mtp_layers, self.num_speculative_tokens) > 1
++
+     def use_dflash(self) -> bool:
+         return self.method == "dflash"
+ 
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index ff876ed0ea..aa3cbbcfbc 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -20,7 +20,7 @@
+     BlockHashWithGroupId,
+     FreeKVCacheBlockQueue,
+     KVCacheBlock,
+-    generate_block_hash_extra_keys,
++    generate_request_block_hash_extra_keys,
+     get_block_hash,
+     get_group_id,
+     make_block_hash_with_group_id,
+@@ -186,6 +186,8 @@ class BlockPool:
+             actual block size can be a multiple of hash_block_size.
+         enable_kv_cache_events: Whether to enable kv cache events.
+         metrics_collector: Optional metrics collector for tracking block residency.
++        use_lookahead_block_hashes: Whether block hashes also cover the token
++            after each block; KV cache events then carry that token.
+     """
+ 
+     def __init__(
+@@ -197,11 +199,13 @@ def __init__(
+         metrics_collector: KVCacheMetricsCollector | None = None,
+         device_state_blocks: int = 0,
+         device_state_group_ids: tuple[int, ...] = (),
++        use_lookahead_block_hashes: bool = False,
+     ):
+         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+         self.num_gpu_blocks = num_gpu_blocks
+         self.enable_caching = enable_caching
+         self.hash_block_size = hash_block_size
++        self.use_lookahead_block_hashes = use_lookahead_block_hashes
+         # All kv-cache blocks.
+         self.blocks: list[KVCacheBlock] = [
+             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+@@ -353,11 +357,12 @@ def cache_full_blocks(
+                 )
+                 extra_keys_list: list[tuple[Any, ...] | None] = []
+                 for block_idx in indices:
+-                    extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
++                    extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
+                         request,
+                         block_idx * block_size,
+                         (block_idx + 1) * block_size,
+                         curr_mm_idx,
++                        self.use_lookahead_block_hashes,
+                     )
+                     extra_keys_list.append(extra_keys)
+ 
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 94bea5c40c..a33075504c 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -46,6 +46,7 @@ def __init__(
+         pcp_world_size: int,
+         hash_block_size: int,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        use_lookahead_block_hashes: bool = False,
+     ):
+         self.kv_cache_config = kv_cache_config
+         self.max_model_len = max_model_len
+@@ -61,6 +62,7 @@ def __init__(
+             metrics_collector=metrics_collector,
+             device_state_blocks=kv_cache_config.device_state_blocks,
+             device_state_group_ids=kv_cache_config.device_state_group_ids,
++            use_lookahead_block_hashes=use_lookahead_block_hashes,
+         )
+ 
+         # KV cache group indices that get the EAGLE last-block drop.
+@@ -70,6 +72,8 @@ def __init__(
+         # Conservatively fall back to flag all groups when no group is flagged.
+         if use_eagle and not self.eagle_group_ids:
+             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
++        # Lookahead hashes clear ``use_eagle``: groups stay flagged, none drops.
++        self.drop_eagle_group_ids = self.eagle_group_ids if use_eagle else set()
+ 
+         self.single_type_managers = tuple(
+             get_manager_for_kv_cache_spec(
+@@ -101,7 +105,7 @@ def configure_prefix_cache_retention(self, interval: int | None) -> None:
+         alignment = getattr(self, "lcm_block_size", mamba[0].block_size)
+         # SWA must preserve the window at the checkpoint Mamba actually admits,
+         # rather than the prompt's final (unrestorable) alignment boundary.
+-        sparse_mamba = bool(self.eagle_group_ids) and any(
++        sparse_mamba = bool(self.drop_eagle_group_ids) and any(
+             isinstance(m.kv_cache_spec, MambaSpec)
+             and m.kv_cache_spec.mamba_cache_mode == "align"
+             and m.block_size == alignment
+@@ -127,7 +131,7 @@ def get_replay_boundaries(
+         """
+         resend = (request.num_tokens - 1) // alignment * alignment
+         extension = request.num_tokens // alignment * alignment
+-        if not self.eagle_group_ids:
++        if not self.drop_eagle_group_ids:
+             # At an exact boundary, retain the completed extension block now.
+             # Once the cache horizon advances, the next decode token cannot
+             # retroactively admit it. The preceding boundary serves a resend.
+@@ -384,6 +388,7 @@ def __init__(
+         pcp_world_size: int,
+         hash_block_size: int,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        use_lookahead_block_hashes: bool = False,
+     ):
+         super().__init__(
+             kv_cache_config,
+@@ -396,6 +401,7 @@ def __init__(
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            use_lookahead_block_hashes=use_lookahead_block_hashes,
+         )
+         self.num_single_type_manager = len(self.single_type_managers)
+ 
+@@ -432,6 +438,7 @@ def __init__(
+         pcp_world_size: int,
+         hash_block_size: int,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        use_lookahead_block_hashes: bool = False,
+     ):
+         super().__init__(
+             kv_cache_config,
+@@ -444,6 +451,7 @@ def __init__(
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            use_lookahead_block_hashes=use_lookahead_block_hashes,
+         )
+         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+         self.block_size = self.kv_cache_spec.global_block_size(
+@@ -460,7 +468,7 @@ def __init__(
+             "UnitaryKVCacheCoordinator assumes only one kv cache group"
+         )
+         # Single group; useless but just set ``use_eagle`` for consistency regardless.
+-        self.single_type_managers[0].use_eagle = 0 in self.eagle_group_ids
++        self.single_type_managers[0].use_eagle = 0 in self.drop_eagle_group_ids
+ 
+     def find_longest_cache_hit(
+         self,
+@@ -473,7 +481,7 @@ def find_longest_cache_hit(
+             kv_cache_group_ids=[0],
+             block_pool=self.block_pool,
+             kv_cache_spec=self.kv_cache_spec,
+-            drop_eagle_block=0 in self.eagle_group_ids,
++            drop_eagle_block=0 in self.drop_eagle_group_ids,
+             alignment_tokens=self.block_size,
+             dcp_world_size=self.dcp_world_size,
+             pcp_world_size=self.pcp_world_size,
+@@ -514,6 +522,7 @@ def __init__(
+         pcp_world_size: int,
+         hash_block_size: int,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        use_lookahead_block_hashes: bool = False,
+     ):
+         super().__init__(
+             kv_cache_config,
+@@ -526,6 +535,7 @@ def __init__(
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            use_lookahead_block_hashes=use_lookahead_block_hashes,
+         )
+         # hash_block_size: the block size used to compute block hashes.
+         # The actual block size usually equals hash_block_size, but in cases where
+@@ -566,7 +576,7 @@ def verify_and_split_kv_cache_groups(self) -> None:
+                 continue
+             manager_cls = self.single_type_managers[i].__class__
+             spec = g.kv_cache_spec
+-            use_eagle = i in self.eagle_group_ids
++            use_eagle = i in self.drop_eagle_group_ids
+             if self.single_type_managers[i].block_size != spec.block_size:
+                 # Prefix lookup operates in global tokens; keep worker specs
+                 # local so their physical cache strides are unchanged.
+@@ -768,6 +778,7 @@ def get_kv_cache_coordinator(
+     pcp_world_size: int,
+     hash_block_size: int,
+     metrics_collector: KVCacheMetricsCollector | None = None,
++    use_lookahead_block_hashes: bool = False,
+ ) -> KVCacheCoordinator:
+     if not enable_caching:
+         return KVCacheCoordinatorNoPrefixCache(
+@@ -780,6 +791,7 @@ def get_kv_cache_coordinator(
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            use_lookahead_block_hashes=use_lookahead_block_hashes,
+         )
+     if len(kv_cache_config.kv_cache_groups) == 1:
+         return UnitaryKVCacheCoordinator(
+@@ -793,6 +805,7 @@ def get_kv_cache_coordinator(
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            use_lookahead_block_hashes=use_lookahead_block_hashes,
+         )
+     return HybridKVCacheCoordinator(
+         kv_cache_config,
+@@ -805,4 +818,5 @@ def get_kv_cache_coordinator(
+         pcp_world_size=pcp_world_size,
+         hash_block_size=hash_block_size,
+         metrics_collector=metrics_collector,
++        use_lookahead_block_hashes=use_lookahead_block_hashes,
+     )
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index e3e90cf09f..3369e3f49f 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -126,6 +126,7 @@ def __init__(
+         max_in_flight_tokens: int | None = None,
+         enable_caching: bool = True,
+         use_eagle: bool = False,
++        use_lookahead_block_hashes: bool = False,
+         log_stats: bool = False,
+         enable_kv_cache_events: bool = False,
+         dcp_world_size: int = 1,
+@@ -160,6 +161,7 @@ def __init__(
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=self.metrics_collector,
++            use_lookahead_block_hashes=use_lookahead_block_hashes,
+         )
+         self.coordinator.configure_prefix_cache_retention(
+             prefix_cache_retention_interval
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index eef76511d6..531b8ab6ce 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -563,6 +563,83 @@ def generate_block_hash_extra_keys(
+     return tuple(extra_keys), new_start_mm_idx
+ 
+ 
++def generate_lookahead_block_hash_extra_keys(
++    request: Request,
++    start_token_idx: int,
++    end_token_idx: int,
++    start_mm_idx: int,
++) -> tuple[tuple[Any, ...], int]:
++    """Extra keys of a block plus the token right after it and that token's
++    own extra keys, which the EAGLE draft KV at the block's last position
++    depends on."""
++    block_extra_keys, next_block_mm_idx = generate_block_hash_extra_keys(
++        request,
++        start_token_idx,
++        end_token_idx,
++        start_mm_idx,
++    )
++    lookahead_extra_keys, _ = generate_block_hash_extra_keys(
++        request,
++        end_token_idx,
++        end_token_idx + 1,
++        next_block_mm_idx,
++    )
++    return (
++        (
++            block_extra_keys,
++            request.all_token_ids[end_token_idx],
++            lookahead_extra_keys,
++        ),
++        next_block_mm_idx,
++    )
++
++
++def generate_request_block_hash_extra_keys(
++    request: Request,
++    start_token_idx: int,
++    end_token_idx: int,
++    start_mm_idx: int,
++    use_lookahead_block_hashes: bool,
++) -> tuple[tuple[Any, ...] | None, int]:
++    if use_lookahead_block_hashes:
++        return generate_lookahead_block_hash_extra_keys(
++            request,
++            start_token_idx,
++            end_token_idx,
++            start_mm_idx,
++        )
++    return generate_block_hash_extra_keys(
++        request,
++        start_token_idx,
++        end_token_idx,
++        start_mm_idx,
++    )
++
++
++def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
++    """Whether block hashes also cover the token after each block, so EAGLE
++    and MTP prefix hits need no trailing block drop."""
++    speculative_config = vllm_config.speculative_config
++    if (
++        speculative_config is None
++        or not speculative_config.use_eagle_kv_cache()
++        or speculative_config.disable_lookahead_block_hashes
++    ):
++        return False
++    # The hash covers only the next token; multi-module MTP reads further ahead.
++    if speculative_config.use_multi_module_mtp():
++        return False
++    # DSpark keeps the trailing-block drop: with lookahead hashes it drafted
++    # measurably worse on DSv4, also without a prefix hit (edit 5.69 -> 5.66
++    # to 5.67 accepted tokens per round), and gained no first-token time.
++    if speculative_config.use_dspark():
++        return False
++    # KV connectors keep the legacy hashes.
++    if vllm_config.kv_transfer_config is not None:
++        return False
++    return vllm_config.cache_config.enable_prefix_caching
++
++
+ def hash_block_tokens(
+     hash_function: Callable[[Any], bytes],
+     parent_block_hash: BlockHash | None,
+@@ -676,14 +753,19 @@ def resolve_kv_cache_block_sizes(
+ def get_request_block_hasher(
+     block_size: int,
+     caching_hash_fn: Callable[[Any], bytes],
++    use_lookahead_block_hashes: bool = False,
+ ) -> Callable[[Request], list[BlockHash]]:
+     """
+     Returns a function which computes the list of un-computed block hashes
+-    of a request."""
++    of a request.
++
++    With ``use_lookahead_block_hashes``, each hash also covers the token right
++    after its block, which the EAGLE draft KV at the block's last position
++    depends on, so it is emitted only once that token exists."""
+ 
+     def request_block_hasher(request: Request) -> list[BlockHash]:
+         start_token_idx = len(request.block_hashes) * block_size
+-        num_tokens = request.num_tokens
++        num_tokens = request.num_tokens - int(use_lookahead_block_hashes)
+ 
+         if start_token_idx + block_size > num_tokens:
+             # Early stop when there no new full blocks created.
+@@ -708,8 +790,12 @@ def request_block_hasher(request: Request) -> list[BlockHash]:
+                 break
+ 
+             # MM and LoRA requests need extra keys for block-hash computation.
+-            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+-                request, start_token_idx, end_token_idx, curr_mm_idx
++            extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
++                request,
++                start_token_idx,
++                end_token_idx,
++                curr_mm_idx,
++                use_lookahead_block_hashes,
+             )
+ 
+             # Compute the hash of the current block
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 24b199deb2..dce97c8962 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -39,6 +39,7 @@
+ )
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
++from vllm.v1.core.kv_cache_utils import is_lookahead_block_hashing_enabled
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
+ from vllm.v1.core.sched.output import (
+@@ -264,16 +265,25 @@ def __init__(
+         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+         if speculative_config and speculative_config.use_eagle_kv_cache():
+             self.use_eagle = True
++        self.use_lookahead_block_hashes = is_lookahead_block_hashing_enabled(
++            vllm_config
++        )
++        # Lookahead hashes prove the boundary token, so EAGLE needs no drop.
++        self.use_eagle_block_drop = (
++            self.use_eagle and not self.use_lookahead_block_hashes
++        )
+ 
+         # Create the KV cache manager.
+         if hash_block_size is None:
+             hash_block_size = block_size
++        self.hash_block_size = hash_block_size
+         self.kv_cache_manager = KVCacheManager(
+             kv_cache_config=kv_cache_config,
+             max_model_len=self.max_model_len,
+             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+             enable_caching=self.cache_config.enable_prefix_caching,
+-            use_eagle=self.use_eagle,
++            use_eagle=self.use_eagle_block_drop,
++            use_lookahead_block_hashes=self.use_lookahead_block_hashes,
+             log_stats=self.log_stats,
+             enable_kv_cache_events=self.enable_kv_cache_events,
+             dcp_world_size=self.dcp_world_size,
+@@ -502,7 +512,7 @@ def _mamba_block_aligned_split(
+         # unreachable state whenever the request length is block aligned.
+         last_token = request.num_tokens - 1
+         last_cache_position = last_token - last_token % block_size
+-        if self.use_eagle:
++        if self.use_eagle_block_drop:
+             last_cache_position = max(last_cache_position - block_size, 0)
+ 
+         end = start + num_new_tokens
+@@ -1476,6 +1486,10 @@ def _update_request_as_session(
+             session.num_prompt_tokens : num_computed_tokens
+         ]
+         del session._all_token_ids[num_computed_tokens:]
++        # A block hash covering a discarded token is stale; a lookahead hash
++        # also covers the token after its block.
++        num_hashed_tokens = num_computed_tokens - int(self.use_lookahead_block_hashes)
++        del session.block_hashes[max(num_hashed_tokens, 0) // self.hash_block_size :]
+         session._output_token_ids.clear()
+         assert session.prompt_token_ids is not None
+         # Extend prompt with kept output tokens.
+@@ -1892,6 +1906,18 @@ def update_from_output(
+                 request.status = RequestStatus.FINISHED_STOPPED
+                 stopped = True
+ 
++            if (
++                self.use_lookahead_block_hashes
++                and stopped
++                and status_before_stop == RequestStatus.RUNNING
++            ):
++                # The last sampled token is the lookahead token of the block
++                # before it, which no later allocation will publish.
++                self.kv_cache_manager.cache_blocks(
++                    request,
++                    request.num_computed_tokens - request.num_in_flight_tokens,
++                )
++
+             if new_token_ids and self.structured_output_manager.should_advance(
+                 request, new_token_ids=new_token_ids
+             ):
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index a27331bcbb..421beee4e7 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -322,6 +322,17 @@ def take_new_block_ids(self) -> list[int]:
+         self.new_block_ids = []
+         return ids
+ 
++    def num_hashed_full_blocks(self, request: Request, num_tokens: int) -> int:
++        """Full blocks within ``num_tokens`` whose block hash exists. Lookahead
++        hashes trail the tokens by one, so the block ending at the last token
++        has no hash until the next token arrives."""
++        num_hashed_blocks = (
++            len(request.block_hashes)
++            * self.block_pool.hash_block_size
++            // self.block_size
++        )
++        return min(num_tokens // self.block_size, num_hashed_blocks)
++
+     def cache_blocks(
+         self,
+         request: Request,
+@@ -343,7 +354,7 @@ def cache_blocks(
+                 future cache hit.
+         """
+         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+-        num_full_blocks = num_tokens // self.block_size
++        num_full_blocks = self.num_hashed_full_blocks(request, num_tokens)
+ 
+         if num_cached_blocks >= num_full_blocks:
+             return
+@@ -1578,7 +1589,7 @@ def cache_blocks(
+         replay_boundaries: Sequence[int] = (),
+     ) -> None:
+         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+-        num_full_blocks = num_tokens // self.block_size
++        num_full_blocks = self.num_hashed_full_blocks(request, num_tokens)
+         if num_cached_blocks_before >= num_full_blocks:
+             return
+         boundaries = list(replay_boundaries)
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 2927a7e076..5a4417a5bd 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -48,6 +48,7 @@
+     get_kv_cache_configs,
+     get_request_block_hasher,
+     init_none_hash,
++    is_lookahead_block_hashing_enabled,
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+@@ -216,7 +217,9 @@ def __init__(
+             init_none_hash(caching_hash_fn)
+ 
+             self.request_block_hasher = get_request_block_hasher(
+-                hash_block_size, caching_hash_fn
++                hash_block_size,
++                caching_hash_fn,
++                is_lookahead_block_hashing_enabled(vllm_config),
+             )
+ 
+         self.step_fn = (
