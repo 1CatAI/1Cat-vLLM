@@ -1,0 +1,109 @@
+{
+  "group": "glm53",
+  "title": "GLM-5.3 model and KDA kernel integration queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1286,
+      "title": "[Model][SM70][SM75] GLM-5.3-Flash-FP4-Local: compressed expert scales, 8-bit QPN8 projections",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1286",
+      "head": "75fd75d70817ad50d9e1aa5436faee9b9e6c9b06",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "163a947e464f9b6f79abbc9e6c9ee75a1a3162ceac180e5ebc2b6b8dfb10a7c3",
+      "files": 116,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1348,
+      "title": "[Perf][SM70][SM75] GLM-5.3-Flash: tune the KDA prefill kernels in the profile run, serve the MXFP8 LM head through QPN8",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1348",
+      "head": "ceceb328eb4a816f4963ad30af80ed3bcf7a1ac1",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "3ec2c01d0acd82ba4881d03d74dcb5edd7b2a0a80a27ef7867507210acc53d63",
+      "files": 117,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1410,
+      "title": "[Bugfix][GLM-5.3-Flash] Backport vllm-project/vllm#57477, #58454: seed the kpool tail through its padded stride, size the tail ring for speculative drafts",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1410",
+      "head": "f03e254d782a6ad9d8ae724cd3685b689e430385",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "1e85ebe0492485b4404da43e5b8c44f2703511861cd0af9e8350ec497e46f374",
+      "files": 8,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1125,
+      "title": "[Perf][SM70] GLM-5.3: FP32 tensor-core sparse MLA for FP8-KV prefill",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1125",
+      "head": "da13d2d9ca4bba2cf7757442afde63c38b407d78",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "1224c8aebaa3990aab97fe73159639aad56efc22bab59dbac62499b5fb2c8f2a",
+      "files": 8,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1159,
+      "title": "[Perf][SM70] GLM-5.3: native mHC final stage for 2-8 tokens, cuBLAS KDA projection above one token",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1159",
+      "head": "44d292046a7b206fe3504315fd1de505aea89c3c",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "316f05ed9d0c10c5dd673aed57dcf4b7393886823ce5ae09b28c4521c169ccde",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1165,
+      "title": "[Perf][SM70] GLM-5.3 KDA: Triton gated RMSNorm on the FP32 recurrent output",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1165",
+      "head": "60dd820a7cba6a3388934e791ac72cbfe50606a1",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "9b881a8b610c4cce502822fa796546ec05cc7805d18c1fa937ac44884efea0fc",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1166,
+      "title": "[Perf][SM70] GLM-5.3: fused native mHC post+dot for 1-8 tokens",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1166",
+      "head": "74d2cf6da8412fa0a6bc98da0c02b36686be2b84",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "467ee392afbec84c4259985d3b9e258486333b1e1dc9ac32e1c5682368e5e14f",
+      "files": 3,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1228,
+      "title": "[Perf][GDN] Run the FlashQLA TileLang prefill kernel on Turing",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1228",
+      "head": "593fd096604900f59cc09a0279d5101dbfc570f7",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "307a9942913494a7c12579a50f6de9ab2d34d521729b97dbf1f8fea30c48c944",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1092,
+      "title": "[Kernel][SM70] GLM-5.3: FP32-softmax sparse MLA for FP8-KV decode/verify",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1092",
+      "head": "587fac6eb37b8aee1cd42df76f4af284d30f503d",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "856208561c54c1f9249dccdb7944ef7543688cc2a97a658ac0d14557ee3df9c9",
+      "files": 8,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    }
+  ],
+  "validation_gaps": "GLM-5.3-Flash checkpoints and KDA recurrent/tail-ring state are not qualified by Qwen runs. Require speculative-width, padded-stride, recurrent-state, prompt/decode and image-independent model tests with matched precision. SM75 TileLang admission needs an SM75 device. Overlapping base-model stacks remain unapplied proposals until reconciled.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

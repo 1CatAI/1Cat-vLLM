@@ -1,0 +1,135 @@
+{
+  "initial_inventory": {
+    "number": 1092,
+    "title": "[Kernel][SM70] GLM-5.3: FP32-softmax sparse MLA for FP8-KV decode/verify",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1092",
+    "isDraft": true,
+    "headRefOid": "587fac6eb37b8aee1cd42df76f4af284d30f503d",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1092,
+    "title": "[Kernel][SM70] GLM-5.3: FP32-softmax sparse MLA for FP8-KV decode/verify",
+    "body": "## Purpose\n\nFor FP8 (packed E4M3) KV, GLM-5.3-Flash decode and speculative verify (1-8 tokens) run `sm70_glm5_sparse_attention_paged_fp8_gemm` / `_batched_gemm`. Both gather and dequantize the selected latents, then write raw, unscaled QK^T scores into fp16 buffers before the softmax. Storing raw scores in fp16 costs precision at moderate logits, and once a raw score passes the fp16 range the output is wrong but still finite. This is the same class as #210, #219 and #905 for the XQA and grouped routes.\n\n## Change\n\n- New op `sm70_glm53_sparse_mla_fp8_out` (`csrc/sm70_turbomind/ops/glm53_sparse_mla_fp8_sm70.cu`, registered in `_C` next to `sm70_glm53_fp16_gemv_out`). One CTA handles 16 query heads of one token for one split of the selected keys:\n  - dequantization bit-exact with the existing gather;\n  - QK^T and PV on tensor cores with FP32 accumulation;\n  - scores scaled in FP32 and never stored in fp16, FP32 online softmax with exact running maxima;\n  - FP32 log-sum-exp combine across splits.\n  It allocates nothing and does not sync, so it is CUDA-graph capturable. The numerical contract and admission rules are in the file header.\n- `vllm/models/glm5next/sm70/sparse.py` uses it for every FP8-KV call of up to 8 tokens when heads per rank are a multiple of 16 (16 at TP4). Split count follows the token count (about 64 CTAs per head group).\n- The GEMM routes stay only as the fallback for other head counts, with a warning at startup. Their fp16 workspaces are reserved only in that case. Prefill (more than 8 tokens) is unchanged; it already keeps FP32 softmax state.\n- No environment variable and no new knob. The startup route log names the path.\n\n## Not a duplicate\n\nNo open or closed PR changes the GLM-5.3 FP8-KV decode/verify path (searched: \"sparse MLA\", \"glm5next sparse\", \"FP8 KV decode GLM\", \"fp32 softmax\"). #171/#816 target DeepSeek-V4 sparse MLA, not this backend.\n\n## Test Plan\n\n- Kernel vs an FP64 reference over an independent dequantization of a cache packed by the real `sm70_glm5_fp8_kv_insert`: T in {1, 2, 5, 8}, 16 and 32 heads, 1, 3 and heuristic splits, skipped (-1) indices, partial and empty rows.\n- Raw scores past the fp16 range: the real GEMM route vs the new op against the FP64 reference.\n- CUDA-graph replay vs eager.\n- Mutation check: storing scores in fp16, and dropping the split rescale, must fail the suite.\n- The existing `tests/models/glm5next/test_sm70_sparse.py` must still pass.\n- E2E on 4x V100-SXM2-32GB TP4: route log, greedy identity vs the GEMM route, gsm8k / factual / fabrication battery, 84K needle, decode speed.\n\n## Test Result\n\nOperator results on one V100-SXM2-32GB, not model throughput:\n\n- `pytest tests/models/glm5next/test_sm70_sparse.py`: 36 passed (10 existing + 26 new).\n- Mutations: fp16 score storage fails 1 test; a broken split combine fails 17.\n- Relative L2 error vs FP64 at 16 heads, T=1:\n\n  | max raw score | new op | GEMM route |\n  |---:|---:|---:|\n  | 24 | 2.5e-4 | 3.5e-4 |\n  | 2,424 | 9.4e-5 | 1.3e-3 |\n  | 14,546 | 4.8e-5 | 5.8e-5 |\n  | 96,966 | 1e-15 | 0.93 (wrong, finite) |\n\n- Latency at 16 heads, 2048 selected keys: T=1 46 us vs 121 us for the GEMM route; T=4 87 us; T=8 161 us.\n- Graph replay matches eager bitwise.\n- pre-commit: all hooks pass, including clang-format. Layering ratchet: no growth.\n- E2E: pending, results will be attached in a comment.\n\nWe have not seen raw scores past the fp16 range in real GLM-5.3 traffic. The overflow is a latent hazard; the measured gains are precision at moderate logits and per-call latency.\n\nGates before review:\n\n- [x] Kernel reference, overflow, graph and mutation tests\n- [x] Existing GLM sparse tests\n- [x] pre-commit and layering ratchet\n- [ ] Full CMake build of `_C` with the new op\n- [ ] E2E route, greedy identity, quality battery and long context on 4x V100 TP4\n- [ ] E2E on `LibertAIDAI/GLM-5.3-Flash-NVFP4` @ `9e0d74e3` (8x V100, TP4/PP2)\n\n## AI assistance\n\nThis change was developed with AI assistance (Claude). The submitting human (@philbert440) is accountable for it and reviews every changed line before this leaves draft.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1092",
+    "isDraft": true,
+    "headRefName": "sm70-glm53-fp32-sparse-mla",
+    "headRefOid": "587fac6eb37b8aee1cd42df76f4af284d30f503d",
+    "baseRefName": "main",
+    "baseRefOid": "16628e2f0a70761ba6525bf46e5e844c04b3e66f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "rivetphilbot"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1092,
+    "id": "PR_kwDORjYFXs8AAAABHahn5A",
+    "state": "CLOSED",
+    "isDraft": true,
+    "headRefOid": "587fac6eb37b8aee1cd42df76f4af284d30f503d",
+    "title": "[Kernel][SM70] GLM-5.3: FP32-softmax sparse MLA for FP8-KV decode/verify",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1092",
+    "body": "## Purpose\n\nFor FP8 (packed E4M3) KV, GLM-5.3-Flash decode and speculative verify (1-8 tokens) run `sm70_glm5_sparse_attention_paged_fp8_gemm` / `_batched_gemm`. Both gather and dequantize the selected latents, then write raw, unscaled QK^T scores into fp16 buffers before the softmax. Storing raw scores in fp16 costs precision at moderate logits, and once a raw score passes the fp16 range the output is wrong but still finite. This is the same class as #210, #219 and #905 for the XQA and grouped routes.\n\n## Change\n\n- New op `sm70_glm53_sparse_mla_fp8_out` (`csrc/sm70_turbomind/ops/glm53_sparse_mla_fp8_sm70.cu`, registered in `_C` next to `sm70_glm53_fp16_gemv_out`). One CTA handles 16 query heads of one token for one split of the selected keys:\n  - dequantization bit-exact with the existing gather;\n  - QK^T and PV on tensor cores with FP32 accumulation;\n  - scores scaled in FP32 and never stored in fp16, FP32 online softmax with exact running maxima;\n  - FP32 log-sum-exp combine across splits.\n  It allocates nothing and does not sync, so it is CUDA-graph capturable. The numerical contract and admission rules are in the file header.\n- `vllm/models/glm5next/sm70/sparse.py` uses it for every FP8-KV call of up to 8 tokens when heads per rank are a multiple of 16 (16 at TP4). Split count follows the token count (about 64 CTAs per head group).\n- The GEMM routes stay only as the fallback for other head counts, with a warning at startup. Their fp16 workspaces are reserved only in that case. Prefill (more than 8 tokens) is unchanged; it already keeps FP32 softmax state.\n- No environment variable and no new knob. The startup route log names the path.\n\n## Not a duplicate\n\nNo open or closed PR changes the GLM-5.3 FP8-KV decode/verify path (searched: \"sparse MLA\", \"glm5next sparse\", \"FP8 KV decode GLM\", \"fp32 softmax\"). #171/#816 target DeepSeek-V4 sparse MLA, not this backend.\n\n## Test Plan\n\n- Kernel vs an FP64 reference over an independent dequantization of a cache packed by the real `sm70_glm5_fp8_kv_insert`: T in {1, 2, 5, 8}, 16 and 32 heads, 1, 3 and heuristic splits, skipped (-1) indices, partial and empty rows.\n- Raw scores past the fp16 range: the real GEMM route vs the new op against the FP64 reference.\n- CUDA-graph replay vs eager.\n- Mutation check: storing scores in fp16, and dropping the split rescale, must fail the suite.\n- The existing `tests/models/glm5next/test_sm70_sparse.py` must still pass.\n- E2E on 4x V100-SXM2-32GB TP4: route log, greedy identity vs the GEMM route, gsm8k / factual / fabrication battery, 84K needle, decode speed.\n\n## Test Result\n\nOperator results on one V100-SXM2-32GB, not model throughput:\n\n- `pytest tests/models/glm5next/test_sm70_sparse.py`: 36 passed (10 existing + 26 new).\n- Mutations: fp16 score storage fails 1 test; a broken split combine fails 17.\n- Relative L2 error vs FP64 at 16 heads, T=1:\n\n  | max raw score | new op | GEMM route |\n  |---:|---:|---:|\n  | 24 | 2.5e-4 | 3.5e-4 |\n  | 2,424 | 9.4e-5 | 1.3e-3 |\n  | 14,546 | 4.8e-5 | 5.8e-5 |\n  | 96,966 | 1e-15 | 0.93 (wrong, finite) |\n\n- Latency at 16 heads, 2048 selected keys: T=1 46 us vs 121 us for the GEMM route; T=4 87 us; T=8 161 us.\n- Graph replay matches eager bitwise.\n- pre-commit: all hooks pass, including clang-format. Layering ratchet: no growth.\n- E2E: pending, results will be attached in a comment.\n\nWe have not seen raw scores past the fp16 range in real GLM-5.3 traffic. The overflow is a latent hazard; the measured gains are precision at moderate logits and per-call latency.\n\nGates before review:\n\n- [x] Kernel reference, overflow, graph and mutation tests\n- [x] Existing GLM sparse tests\n- [x] pre-commit and layering ratchet\n- [ ] Full CMake build of `_C` with the new op\n- [ ] E2E route, greedy identity, quality battery and long context on 4x V100 TP4\n- [ ] E2E on `LibertAIDAI/GLM-5.3-Flash-NVFP4` @ `9e0d74e3` (8x V100, TP4/PP2)\n\n## AI assistance\n\nThis change was developed with AI assistance (Claude). The submitting human (@philbert440) is accountable for it and reviews every changed line before this leaves draft.\n",
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRefName": "sm70-glm53-fp32-sparse-mla",
+    "comments": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWtYiVM="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABa1iJUw",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "### Rebased on current `main` (4e5357b59)\n\n`main` reorganized `vllm/_sm70_ops.py` into a re-export shim over `vllm/_sm70/*` (c9d825d5c), which made this branch stop merging. The commit is replayed on top of that as `587fac6eb`: the `sm70_glm53_sparse_mla_fp8_out` wrapper and its fake now live in `vllm/_sm70/auxiliary.py` and are exported from the shim; nothing else changed.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1092#issuecomment-6095931731",
+          "createdAt": "2026-10-10T09:02:50Z",
+          "updatedAt": "2026-10-10T09:02:50Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wOVQxMjo1MTo1NVq0MjAyNi0xMS0wOVQxMjo1MTo1NVrPAAAAAVtDAO0="
+      },
+      "nodes": [
+        {
+          "id": "PRR_kwDORjYFXs8AAAABW0MA7Q",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "state": "COMMENTED",
+          "body": "Ancestry audit verified this live head 587fac6eb37b8aee1cd42df76f4af284d30f503d is retained in #1125 at da13d2d9ca4bba2cf7757442afde63c38b407d78. Closing this earlier stack entry as superseded and tracking review/validation in #1125; source commits, authorship and the original discussion remain intact. This closure is not a main merge and does not qualify outstanding hardware/model/quality cases. Audit assisted by Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1092#pullrequestreview-5826085101",
+          "submittedAt": "2026-11-09T12:51:55Z",
+          "commit": {
+            "oid": "587fac6eb37b8aee1cd42df76f4af284d30f503d"
+          },
+          "comments": {
+            "totalCount": 0,
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            },
+            "nodes": []
+          }
+        }
+      ]
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1092,
+    "title": "[Kernel][SM70] GLM-5.3: FP32-softmax sparse MLA for FP8-KV decode/verify",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1092",
+    "isDraft": true,
+    "headRefOid": "587fac6eb37b8aee1cd42df76f4af284d30f503d",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "CMakeLists.txt",
+      "csrc/ops.h",
+      "csrc/sm70_turbomind/ops/glm53_sparse_mla_fp8_sm70.cu",
+      "csrc/torch_bindings.cpp",
+      "tests/models/glm5next/test_sm70_sparse.py",
+      "vllm/_sm70/auxiliary.py",
+      "vllm/_sm70_ops.py",
+      "vllm/models/glm5next/sm70/sparse.py"
+    ],
+    "diff_bytes": 33690,
+    "diff_sha256": "856208561c54c1f9249dccdb7944ef7543688cc2a97a658ac0d14557ee3df9c9"
+  },
+  "full_tree_diff_proof": null
+}
