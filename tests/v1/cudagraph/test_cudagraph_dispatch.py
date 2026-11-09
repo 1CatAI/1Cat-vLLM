@@ -1005,8 +1005,11 @@ class TestCUDAGraphWrapper:
     def capture_stream(self):
         # Earlier CUDA tests may restore the default stream. Capture owns a
         # non-default stream instead of relying on process-wide test order.
-        with torch.cuda.stream(torch.cuda.Stream()):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
             yield
+            stream.synchronize()
 
     def setup_method(self):
         self.vllm_config = _create_vllm_config(CompilationConfig())
