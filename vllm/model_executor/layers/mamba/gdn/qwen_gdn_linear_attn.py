@@ -4528,8 +4528,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_non_spec, _last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a_non_spec,
+                    b=b_non_spec,
                     dt_bias=self.dt_bias,
                     q=query_non_spec,
                     k=key_non_spec,

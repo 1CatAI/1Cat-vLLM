@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DFlash2 packed GDN verification beside a prefill chunk in one batch."""
 
+from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -31,7 +32,7 @@ QKV_DIM = 2560
 TP = 4
 
 
-@pytest.mark.parametrize("prefill_len", [40, 300])
+@pytest.mark.parametrize("prefill_len", [1, 40, 300])
 @pytest.mark.parametrize("prefill_first", [True, False])
 @pytest.mark.parametrize("num_spec", [1, 3])
 def test_packed_verify_beside_prefill_matches_generic_route(
@@ -74,10 +75,10 @@ def test_packed_verify_beside_prefill_matches_generic_route(
         non_spec_cu_cpu, device=torch.device(device)
     )
     metadata = GDNAttentionMetadata(
-        num_prefills=1,
-        num_prefill_tokens=prefill_len,
-        num_decodes=0,
-        num_decode_tokens=0,
+        num_prefills=int(prefill_len > 1),
+        num_prefill_tokens=prefill_len if prefill_len > 1 else 0,
+        num_decodes=int(prefill_len == 1),
+        num_decode_tokens=int(prefill_len == 1),
         num_spec_decodes=num_spec,
         num_spec_decode_tokens=spec_tokens,
         num_actual_tokens=tokens,
@@ -124,6 +125,7 @@ def test_packed_verify_beside_prefill_matches_generic_route(
         profiler,
     )
     common = dict(
+        _spec_replay=False,
         gdn_policy=policy,
         gdn_heads=heads,
         gdn_preparation=GdnPreparation(heads),
@@ -209,3 +211,45 @@ def test_packed_verify_beside_prefill_matches_generic_route(
     assert torch.isfinite(outputs[1][:tokens]).all()
     assert torch.equal(convs[0], convs[1])
     torch.testing.assert_close(ssms[1], ssms[0], atol=2e-4, rtol=2e-3)
+
+    if prefill_len == 1:
+        # The ordinary decode must see the same gates and state when it runs
+        # alone or next to speculative rows, in either request order.
+        standalone_metadata = replace(
+            metadata,
+            num_actual_tokens=1,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            spec_query_start_loc=None,
+            spec_state_indices_tensor=None,
+            spec_state_slot_selectors=None,
+            num_accepted_tokens=None,
+        )
+        monkeypatch.setattr(
+            mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(attn_metadata={"test": standalone_metadata}),
+        )
+        conv_state = conv_seed.clone()
+        ssm_state = ssm_seed.clone()
+        standalone_out = torch.empty(1, 12, 128, device=device, dtype=dtype)
+        mod.QwenGatedDeltaNetAttention._forward_core(
+            generic,
+            mixed[non_spec_token_indx].clone(),
+            b[non_spec_token_indx].clone(),
+            a[non_spec_token_indx].clone(),
+            standalone_out,
+            (conv_state, ssm_state),
+        )
+        torch.accelerator.synchronize()
+        for output, conv_result, state_result in zip(outputs, convs, ssms):
+            torch.testing.assert_close(
+                output[non_spec_token_indx], standalone_out, atol=2e-3, rtol=2e-3
+            )
+            assert torch.equal(conv_result[15], conv_state[15])
+            torch.testing.assert_close(
+                state_result[15], ssm_state[15], atol=2e-4, rtol=2e-3
+            )
