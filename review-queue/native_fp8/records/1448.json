@@ -1,0 +1,476 @@
+{
+  "initial_inventory": {
+    "number": 1448,
+    "title": "[SM70] Integrate QPN8 block chunking and architecture-safe activation builds",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1448",
+    "isDraft": true,
+    "headRefOid": "f165b6ac47eeea932d6c7b482d7c45a144f97693",
+    "reviews": {
+      "totalCount": 1,
+      "nodes": [
+        {
+          "state": "COMMENTED",
+          "author": {
+            "login": "yangzhuxinyzx"
+          }
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls/1448",
+    "id": 5223581585,
+    "node_id": "PR_kwDORjYFXs8AAAABN1mHkQ",
+    "html_url": "https://github.com/1CatAI/1Cat-vLLM/pull/1448",
+    "diff_url": "https://github.com/1CatAI/1Cat-vLLM/pull/1448.diff",
+    "patch_url": "https://github.com/1CatAI/1Cat-vLLM/pull/1448.patch",
+    "issue_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues/1448",
+    "commits_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls/1448/commits",
+    "review_comments_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls/1448/comments",
+    "review_comment_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls/comments{/number}",
+    "comments_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues/1448/comments",
+    "statuses_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/statuses/f165b6ac47eeea932d6c7b482d7c45a144f97693",
+    "number": 1448,
+    "state": "open",
+    "locked": false,
+    "title": "[SM70] Integrate QPN8 block chunking and architecture-safe activation builds",
+    "user": {
+      "login": "yangzhuxinyzx",
+      "id": 153831768,
+      "node_id": "U_kgDOCStJWA",
+      "avatar_url": "https://avatars.githubusercontent.com/u/153831768?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/yangzhuxinyzx",
+      "html_url": "https://github.com/yangzhuxinyzx",
+      "followers_url": "https://api.github.com/users/yangzhuxinyzx/followers",
+      "following_url": "https://api.github.com/users/yangzhuxinyzx/following{/other_user}",
+      "gists_url": "https://api.github.com/users/yangzhuxinyzx/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/yangzhuxinyzx/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/yangzhuxinyzx/subscriptions",
+      "organizations_url": "https://api.github.com/users/yangzhuxinyzx/orgs",
+      "repos_url": "https://api.github.com/users/yangzhuxinyzx/repos",
+      "events_url": "https://api.github.com/users/yangzhuxinyzx/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/yangzhuxinyzx/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "Block-scaled FP8 inputs with 9–32 rows could reconstruct the full weight matrix, while the standard no-copy provider bypassed the proposed chunked dispatcher. This integration connects the compiled provider, preserves the small-row reduction order and retains policy-controlled rollback/configuration fallback. It also corrects requested-architecture selection and running-device gating for activation quantization builds.\n\nValidation on host 54633: the isolated full SM70 _C build passed without replacing the installed runtime; 186 native GPU checks and five real-provider dynamic-compile/CUDA Graph checks passed. The CMake architecture matrix, fusion selector tests, changed-file pre-commit and GitHub CI passed.\n\n**End-to-end qualification failed; do not merge.** With the original default tuning, 67-request workload-before-GSM ordering, seed and 768-token limit, GSM8K-200 scored 192/200 versus the 193/200 release-native baseline and 194/200 accepted Python integration. The additional baseline-correct failure is question 153, which ended with finish_reason=length. Raw results, full responses and comparison are preserved under /home/ymzx/pr-audit-20261109 on 54633. The fixed 2K probe was stable within the boot but its text differed across the release/new-DSO comparison; accepted drafts increased 373→377 and rounds changed 141→136. NVFP4 runtime tuning remained enabled, so this does not isolate the cause or establish a speedup.\n\nThis draft deliberately preserves the failing gate rather than promoting component checks to whole-model acceptance. Before promotion, isolate complete-build/native/tuning differences using matched controls and pass the original quality and acceptance gates. Original #1069 and #1322 heads are parents; #1187 tuning-default changes are excluded. Prepared and audited with Codex.",
+    "labels": [],
+    "milestone": null,
+    "active_lock_reason": null,
+    "created_at": "2026-11-09T12:06:38Z",
+    "updated_at": "2026-11-09T12:24:00Z",
+    "closed_at": null,
+    "merged_at": null,
+    "merge_commit_sha": "fd44e74f2087be0e0bd946e9298bd5d1c579e5ed",
+    "assignee": null,
+    "assignees": [],
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "head": {
+      "label": "1CatAI:codex/pr-sm70-native-resolution-20261109",
+      "ref": "codex/pr-sm70-native-resolution-20261109",
+      "repo": {
+        "id": 1177945438,
+        "node_id": "R_kgDORjYFXg",
+        "name": "1Cat-vLLM",
+        "full_name": "1CatAI/1Cat-vLLM",
+        "owner": {
+          "login": "1CatAI",
+          "id": 263160036,
+          "node_id": "O_kgDOD6-A5A",
+          "avatar_url": "https://avatars.githubusercontent.com/u/263160036?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/1CatAI",
+          "html_url": "https://github.com/1CatAI",
+          "followers_url": "https://api.github.com/users/1CatAI/followers",
+          "following_url": "https://api.github.com/users/1CatAI/following{/other_user}",
+          "gists_url": "https://api.github.com/users/1CatAI/gists{/gist_id}",
+          "starred_url": "https://api.github.com/users/1CatAI/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/1CatAI/subscriptions",
+          "organizations_url": "https://api.github.com/users/1CatAI/orgs",
+          "repos_url": "https://api.github.com/users/1CatAI/repos",
+          "events_url": "https://api.github.com/users/1CatAI/events{/privacy}",
+          "received_events_url": "https://api.github.com/users/1CatAI/received_events",
+          "type": "Organization",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "private": false,
+        "fork": false,
+        "archived": false,
+        "disabled": false,
+        "description": "V100 / SM70-focused vLLM engineering fork for modern LLM inference.",
+        "homepage": null,
+        "language": "Python",
+        "visibility": "public",
+        "is_template": false,
+        "topics": [],
+        "forks_count": 285,
+        "forks": 285,
+        "stargazers_count": 1484,
+        "watchers_count": 1484,
+        "watchers": 1484,
+        "open_issues_count": 239,
+        "open_issues": 239,
+        "size": 378915,
+        "default_branch": "main",
+        "has_issues": true,
+        "has_projects": true,
+        "has_wiki": true,
+        "has_pages": false,
+        "has_downloads": false,
+        "has_discussions": true,
+        "has_pull_requests": true,
+        "pushed_at": "2026-11-09T12:24:16Z",
+        "created_at": "2026-03-10T14:31:44Z",
+        "updated_at": "2026-11-09T12:24:24Z",
+        "allow_forking": true,
+        "web_commit_signoff_required": false,
+        "pull_request_creation_policy": "all",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "spdx_id": "Apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        },
+        "url": "https://api.github.com/repos/1CatAI/1Cat-vLLM",
+        "html_url": "https://github.com/1CatAI/1Cat-vLLM",
+        "archive_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/{archive_format}{/ref}",
+        "assignees_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/branches{/branch}",
+        "collaborators_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/contributors",
+        "deployments_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/deployments",
+        "downloads_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/downloads",
+        "events_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/events",
+        "forks_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/forks",
+        "git_commits_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/tags{/sha}",
+        "git_url": "git://github.com/1CatAI/1Cat-vLLM.git",
+        "issue_comment_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/labels{/name}",
+        "languages_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/languages",
+        "merges_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/merges",
+        "milestones_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/milestones{/number}",
+        "notifications_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/notifications{?since,all,participating}",
+        "pulls_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls{/number}",
+        "releases_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/releases{/id}",
+        "ssh_url": "git@github.com:1CatAI/1Cat-vLLM.git",
+        "stargazers_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/stargazers",
+        "statuses_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/subscribers",
+        "subscription_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/subscription",
+        "tags_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/tags",
+        "teams_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/teams",
+        "trees_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/trees{/sha}",
+        "clone_url": "https://github.com/1CatAI/1Cat-vLLM.git",
+        "mirror_url": null,
+        "hooks_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/hooks",
+        "svn_url": "https://github.com/1CatAI/1Cat-vLLM"
+      },
+      "sha": "f165b6ac47eeea932d6c7b482d7c45a144f97693",
+      "user": {
+        "login": "1CatAI",
+        "id": 263160036,
+        "node_id": "O_kgDOD6-A5A",
+        "avatar_url": "https://avatars.githubusercontent.com/u/263160036?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/1CatAI",
+        "html_url": "https://github.com/1CatAI",
+        "followers_url": "https://api.github.com/users/1CatAI/followers",
+        "following_url": "https://api.github.com/users/1CatAI/following{/other_user}",
+        "gists_url": "https://api.github.com/users/1CatAI/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/1CatAI/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/1CatAI/subscriptions",
+        "organizations_url": "https://api.github.com/users/1CatAI/orgs",
+        "repos_url": "https://api.github.com/users/1CatAI/repos",
+        "events_url": "https://api.github.com/users/1CatAI/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/1CatAI/received_events",
+        "type": "Organization",
+        "user_view_type": "public",
+        "site_admin": false
+      }
+    },
+    "base": {
+      "label": "1CatAI:main",
+      "ref": "main",
+      "repo": {
+        "id": 1177945438,
+        "node_id": "R_kgDORjYFXg",
+        "name": "1Cat-vLLM",
+        "full_name": "1CatAI/1Cat-vLLM",
+        "owner": {
+          "login": "1CatAI",
+          "id": 263160036,
+          "node_id": "O_kgDOD6-A5A",
+          "avatar_url": "https://avatars.githubusercontent.com/u/263160036?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/1CatAI",
+          "html_url": "https://github.com/1CatAI",
+          "followers_url": "https://api.github.com/users/1CatAI/followers",
+          "following_url": "https://api.github.com/users/1CatAI/following{/other_user}",
+          "gists_url": "https://api.github.com/users/1CatAI/gists{/gist_id}",
+          "starred_url": "https://api.github.com/users/1CatAI/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/1CatAI/subscriptions",
+          "organizations_url": "https://api.github.com/users/1CatAI/orgs",
+          "repos_url": "https://api.github.com/users/1CatAI/repos",
+          "events_url": "https://api.github.com/users/1CatAI/events{/privacy}",
+          "received_events_url": "https://api.github.com/users/1CatAI/received_events",
+          "type": "Organization",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "private": false,
+        "fork": false,
+        "archived": false,
+        "disabled": false,
+        "description": "V100 / SM70-focused vLLM engineering fork for modern LLM inference.",
+        "homepage": null,
+        "language": "Python",
+        "visibility": "public",
+        "is_template": false,
+        "topics": [],
+        "forks_count": 285,
+        "forks": 285,
+        "stargazers_count": 1484,
+        "watchers_count": 1484,
+        "watchers": 1484,
+        "open_issues_count": 239,
+        "open_issues": 239,
+        "size": 378915,
+        "default_branch": "main",
+        "has_issues": true,
+        "has_projects": true,
+        "has_wiki": true,
+        "has_pages": false,
+        "has_downloads": false,
+        "has_discussions": true,
+        "has_pull_requests": true,
+        "pushed_at": "2026-11-09T12:24:16Z",
+        "created_at": "2026-03-10T14:31:44Z",
+        "updated_at": "2026-11-09T12:24:24Z",
+        "allow_forking": true,
+        "web_commit_signoff_required": false,
+        "pull_request_creation_policy": "all",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "spdx_id": "Apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        },
+        "url": "https://api.github.com/repos/1CatAI/1Cat-vLLM",
+        "html_url": "https://github.com/1CatAI/1Cat-vLLM",
+        "archive_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/{archive_format}{/ref}",
+        "assignees_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/branches{/branch}",
+        "collaborators_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/contributors",
+        "deployments_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/deployments",
+        "downloads_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/downloads",
+        "events_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/events",
+        "forks_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/forks",
+        "git_commits_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/tags{/sha}",
+        "git_url": "git://github.com/1CatAI/1Cat-vLLM.git",
+        "issue_comment_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/labels{/name}",
+        "languages_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/languages",
+        "merges_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/merges",
+        "milestones_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/milestones{/number}",
+        "notifications_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/notifications{?since,all,participating}",
+        "pulls_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls{/number}",
+        "releases_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/releases{/id}",
+        "ssh_url": "git@github.com:1CatAI/1Cat-vLLM.git",
+        "stargazers_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/stargazers",
+        "statuses_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/subscribers",
+        "subscription_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/subscription",
+        "tags_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/tags",
+        "teams_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/teams",
+        "trees_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/git/trees{/sha}",
+        "clone_url": "https://github.com/1CatAI/1Cat-vLLM.git",
+        "mirror_url": null,
+        "hooks_url": "https://api.github.com/repos/1CatAI/1Cat-vLLM/hooks",
+        "svn_url": "https://github.com/1CatAI/1Cat-vLLM"
+      },
+      "sha": "d125e12f29ee0e221d150fedc72500d2ae7d321e",
+      "user": {
+        "login": "1CatAI",
+        "id": 263160036,
+        "node_id": "O_kgDOD6-A5A",
+        "avatar_url": "https://avatars.githubusercontent.com/u/263160036?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/1CatAI",
+        "html_url": "https://github.com/1CatAI",
+        "followers_url": "https://api.github.com/users/1CatAI/followers",
+        "following_url": "https://api.github.com/users/1CatAI/following{/other_user}",
+        "gists_url": "https://api.github.com/users/1CatAI/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/1CatAI/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/1CatAI/subscriptions",
+        "organizations_url": "https://api.github.com/users/1CatAI/orgs",
+        "repos_url": "https://api.github.com/users/1CatAI/repos",
+        "events_url": "https://api.github.com/users/1CatAI/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/1CatAI/received_events",
+        "type": "Organization",
+        "user_view_type": "public",
+        "site_admin": false
+      }
+    },
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues/1448/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls/1448/commits"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/1CatAI/1Cat-vLLM/statuses/f165b6ac47eeea932d6c7b482d7c45a144f97693"
+      },
+      "html": {
+        "href": "https://github.com/1CatAI/1Cat-vLLM/pull/1448"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/1CatAI/1Cat-vLLM/issues/1448"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls/1448/comments"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls/comments{/number}"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/1CatAI/1Cat-vLLM/pulls/1448"
+      }
+    },
+    "author_association": "MEMBER",
+    "auto_merge": null,
+    "draft": true,
+    "merged": false,
+    "mergeable": null,
+    "rebaseable": null,
+    "mergeable_state": "unknown",
+    "merged_by": null,
+    "comments": 0,
+    "review_comments": 0,
+    "maintainer_can_modify": false,
+    "commits": 4,
+    "additions": 336,
+    "deletions": 8,
+    "changed_files": 8
+  },
+  "discussion": {
+    "number": 1448,
+    "id": "PR_kwDORjYFXs8AAAABN1mHkQ",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "f165b6ac47eeea932d6c7b482d7c45a144f97693",
+    "title": "[SM70] Integrate QPN8 block chunking and architecture-safe activation builds",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1448",
+    "body": "Block-scaled FP8 inputs with 9–32 rows could reconstruct the full weight matrix, while the standard no-copy provider bypassed the proposed chunked dispatcher. This integration connects the compiled provider, preserves the small-row reduction order and retains policy-controlled rollback/configuration fallback. It also corrects requested-architecture selection and running-device gating for activation quantization builds.\n\nValidation on host 54633: the isolated full SM70 _C build passed without replacing the installed runtime; 186 native GPU checks and five real-provider dynamic-compile/CUDA Graph checks passed. The CMake architecture matrix, fusion selector tests, changed-file pre-commit and GitHub CI passed.\n\n**End-to-end qualification failed; do not merge.** With the original default tuning, 67-request workload-before-GSM ordering, seed and 768-token limit, GSM8K-200 scored 192/200 versus the 193/200 release-native baseline and 194/200 accepted Python integration. The additional baseline-correct failure is question 153, which ended with finish_reason=length. Raw results, full responses and comparison are preserved under /home/ymzx/pr-audit-20261109 on 54633. The fixed 2K probe was stable within the boot but its text differed across the release/new-DSO comparison; accepted drafts increased 373→377 and rounds changed 141→136. NVFP4 runtime tuning remained enabled, so this does not isolate the cause or establish a speedup.\n\nThis draft deliberately preserves the failing gate rather than promoting component checks to whole-model acceptance. Before promotion, isolate complete-build/native/tuning differences using matched controls and pass the original quality and acceptance gates. Original #1069 and #1322 heads are parents; #1187 tuning-default changes are excluded. Prepared and audited with Codex.",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/pr-sm70-native-resolution-20261109",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wOVQxMjoyNDowMFq0MjAyNi0xMS0wOVQxMjoyNDowMFrPAAAAAVs-byE="
+      },
+      "nodes": [
+        {
+          "id": "PRR_kwDORjYFXs8AAAABWz5vIQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "state": "COMMENTED",
+          "body": "Qualification remains blocked. Component coverage and GitHub CI pass, but the exact original 768-token GSM8K-200 protocol scored 192/200 versus the 193/200 release-DSO baseline. Question153 is the sole newly lost baseline-correct item and terminates at the length limit. The direct fixed-input output hash also differs across the installed/new-complete-DSO comparison, with NVFP4 tuning still enabled. Do not promote this draft until a matched native-build/tuning control isolates that difference and the original quality/acceptance gates pass. The installed runtime was not replaced, audit processes were stopped and raw responses/manifests were retained on54633. Review assisted by Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1448#pullrequestreview-5825785633",
+          "submittedAt": "2026-11-09T12:24:00Z",
+          "commit": {
+            "oid": "f165b6ac47eeea932d6c7b482d7c45a144f97693"
+          },
+          "comments": {
+            "totalCount": 0,
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            },
+            "nodes": []
+          }
+        }
+      ]
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1448,
+    "title": "[SM70] Integrate QPN8 block chunking and architecture-safe activation builds",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1448",
+    "isDraft": true,
+    "headRefOid": "f165b6ac47eeea932d6c7b482d7c45a144f97693",
+    "reviews": {
+      "totalCount": 1,
+      "nodes": [
+        {
+          "state": "COMMENTED",
+          "author": {
+            "login": "yangzhuxinyzx"
+          }
+        }
+      ]
+    },
+    "files": [
+      "CMakeLists.txt",
+      "csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu",
+      "csrc/torch_bindings.cpp",
+      "tests/compile/passes/test_act_quant_fusion_registration.py",
+      "tests/kernels/quantization/test_sm70_qpn8_block_chunked.py",
+      "tests/kernels/quantization/test_sm70_qpn8_block_fp8.py",
+      "vllm/compilation/passes/fusion/act_quant_fusion.py",
+      "vllm/model_executor/kernels/linear/qpn/fp8_block.py"
+    ],
+    "diff_bytes": 19136,
+    "diff_sha256": "57eb754b0fc09dcca4b1156ca2e63a54455e6ec4abadcff8782427fec1d06568"
+  },
+  "full_tree_diff_proof": null
+}

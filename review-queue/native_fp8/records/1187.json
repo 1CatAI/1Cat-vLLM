@@ -1,0 +1,134 @@
+{
+  "initial_inventory": {
+    "number": 1187,
+    "title": "[SM70] Default the FP8 small-shape runtime tuning to off",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1187",
+    "isDraft": false,
+    "headRefOid": "739083e52cf3f3871d6e1eb91eda814d66f2f943",
+    "reviews": {
+      "totalCount": 1,
+      "nodes": [
+        {
+          "state": "COMMENTED",
+          "author": {
+            "login": "yangzhuxinyzx"
+          }
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "number": 1187,
+    "title": "[SM70] Default the FP8 small-shape runtime tuning to off",
+    "body": "## Purpose\n\nWith `fp8_tune_small_shapes` unset, the native FP8 dense and MoE selectors time the kernel candidates for each new small shape and keep the fastest. This PR makes fixed dispatch the default again in the three places that define it: the native policy reader (csrc/sm70_turbomind/ops/gemm_runtime.cpp), the SM70 warmup (vllm/model_executor/warmup/awq_sm70_warmup.py) and the env registry (vllm/envs.py). Tuning stays available through `kernel_config.sm70_fp8.native.fp8_tune_small_shapes` and its alias `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=1`. A new test, `test_fp8_small_shape_tuning_defaults_to_fixed_dispatch`, pins the unset default: the env registry reads it as off, the warmup does not disable the LUT cache for FP8 dense layers, and it runs the plain instead of the coordinated FP8 warmup.\n\nWhy, measured on DeepSeek-V4-Flash PP5 (3x Tesla V100 + 2x Quadro RTX 8000, DSpark, greedy), main be3722bc0 with #1183 applied (without #1183 DSpark accepts almost no drafts there), one build, two boots per setting:\n- With tuning on, four of the six distinct short prompts took 2.27-4.54 s to the first token on their first request, in both boots. With tuning off, every request took 0.41-0.57 s. Prompts sent a second time took 0.45-0.49 s in both settings.\n- Timing noise picks the winner, and the winner sets the summation order. Compared with a greedy reference recorded on our fork with fixed dispatch, one tuning-on boot produced different text for 2 of 3 prompts and the other matched all 3. Both tuning-off boots matched all 3.\n- Decode of the three 200-token greedy prompts: the first ran at 45.6-45.8 tok/s with tuning on and 44.5-44.8 tok/s with it off, the second and third at 30.4-38.9 vs 50.3-51.7 tok/s.\n\nThe migration notes already treat fixed dispatch as the quality-safe setting: item 285 records that the source default was fixed dispatch because earlier FP8 MoE exactness work found dynamic tuning could produce nonzero Type-A diffs, and item 396 pins `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0` as the quality-safe dense selector.\n\nTrade-off: the notes also record Qwen3.6-27B-FP8 TP2 at 42.22 tok/s fixed vs 44.41 tok/s dynamic with an identical token hash. Users who want that can still enable tuning per engine; this PR only changes what an unset value means, so runs are reproducible from boot to boot by default.\n\nThis replaces #1006, which made the same default change together with a KernelConfig field and a native binding for it. Main has since added the typed field itself and moved the native reader into gemm_runtime.cpp, so only the default is left.\n\nNot a duplicate: gh pr list --state all --search \"FP8_TUNE_SMALL_SHAPES\", \"fp8_tune_small_shapes\", \"FP8 tuning default\", \"small-shape tuning\": the only PR changing this default is #1006, which this replaces. #903 edits tests/quantization/test_sm70_warmup.py and vllm/envs.py but does not change this default; the two branches merge without conflicts in those files.\n\nAI assistance was used for this change. I reviewed every line and ran the tests and measurements below.\n\n## Test Plan\n\n```bash\npytest tests/quantization/test_sm70_warmup.py tests/quantization/test_sm70_fp8_kernel_selection.py tests/config/test_sm70_provider_lifecycle.py tests/tools/test_check_env_metadata.py\npython -m tools.generate_env_reference --check\npre-commit run --from-ref origin/main --to-ref HEAD\n```\n\nDeepSeek-V4-Flash PP5 with DSpark, two boots per setting; per boot the first-token time of eight short requests (six distinct prompts, two of them sent twice) and three 200-token greedy prompts compared with the stored reference.\n\n## Test Result\n\n- On a Tesla V100 and a Quadro RTX 8000, each: test_sm70_warmup 12 passed, 14 failed (main: 11 passed, 14 failed; the new test fails without this change); test_sm70_fp8_kernel_selection 14 passed, 1 failed (same on main); test_sm70_provider_lifecycle 20 passed; test_check_env_metadata 21 passed.\n- The 14 warmup failures are the same cases on main and this branch: four still call `warmup.envs.disable_envs_cache()`, which no longer exists, and ten replace native ops with fakes that do not accept the `native_policy` argument the warmup passes once the native policy ABI is built. #903 already rewrites both groups (the `warmup.envs` calls and the native-op fakes), so this PR leaves them alone. test_legacy_dispatch_snapshot compares route hashes with tests/quantization/data/sm70_fp8_routes.json and fails the same way on main.\n- generate_env_reference --check: 998 environment registrations documented. pre-commit passes.\n- This default change on top of #1183, without any env, two boots: first token 0.41-0.58 s for all requests, greedy identical to the reference for 3 of 3 prompts in both boots, decode 44.2-44.5 tok/s for the first greedy prompt and 50.2-51.8 tok/s for the second and third.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1187",
+    "isDraft": false,
+    "headRefName": "pr-sm70-fp8-tune-default-off",
+    "headRefOid": "739083e52cf3f3871d6e1eb91eda814d66f2f943",
+    "baseRefName": "main",
+    "baseRefOid": "be3722bc095b9792bf9833068595f0b1ef70ad37",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "Peuqui/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "Peuqui"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "Peuqui"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1187,
+    "id": "PR_kwDORjYFXs8AAAABH2ZJHw",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "739083e52cf3f3871d6e1eb91eda814d66f2f943",
+    "title": "[SM70] Default the FP8 small-shape runtime tuning to off",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1187",
+    "body": "## Purpose\n\nWith `fp8_tune_small_shapes` unset, the native FP8 dense and MoE selectors time the kernel candidates for each new small shape and keep the fastest. This PR makes fixed dispatch the default again in the three places that define it: the native policy reader (csrc/sm70_turbomind/ops/gemm_runtime.cpp), the SM70 warmup (vllm/model_executor/warmup/awq_sm70_warmup.py) and the env registry (vllm/envs.py). Tuning stays available through `kernel_config.sm70_fp8.native.fp8_tune_small_shapes` and its alias `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=1`. A new test, `test_fp8_small_shape_tuning_defaults_to_fixed_dispatch`, pins the unset default: the env registry reads it as off, the warmup does not disable the LUT cache for FP8 dense layers, and it runs the plain instead of the coordinated FP8 warmup.\n\nWhy, measured on DeepSeek-V4-Flash PP5 (3x Tesla V100 + 2x Quadro RTX 8000, DSpark, greedy), main be3722bc0 with #1183 applied (without #1183 DSpark accepts almost no drafts there), one build, two boots per setting:\n- With tuning on, four of the six distinct short prompts took 2.27-4.54 s to the first token on their first request, in both boots. With tuning off, every request took 0.41-0.57 s. Prompts sent a second time took 0.45-0.49 s in both settings.\n- Timing noise picks the winner, and the winner sets the summation order. Compared with a greedy reference recorded on our fork with fixed dispatch, one tuning-on boot produced different text for 2 of 3 prompts and the other matched all 3. Both tuning-off boots matched all 3.\n- Decode of the three 200-token greedy prompts: the first ran at 45.6-45.8 tok/s with tuning on and 44.5-44.8 tok/s with it off, the second and third at 30.4-38.9 vs 50.3-51.7 tok/s.\n\nThe migration notes already treat fixed dispatch as the quality-safe setting: item 285 records that the source default was fixed dispatch because earlier FP8 MoE exactness work found dynamic tuning could produce nonzero Type-A diffs, and item 396 pins `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0` as the quality-safe dense selector.\n\nTrade-off: the notes also record Qwen3.6-27B-FP8 TP2 at 42.22 tok/s fixed vs 44.41 tok/s dynamic with an identical token hash. Users who want that can still enable tuning per engine; this PR only changes what an unset value means, so runs are reproducible from boot to boot by default.\n\nThis replaces #1006, which made the same default change together with a KernelConfig field and a native binding for it. Main has since added the typed field itself and moved the native reader into gemm_runtime.cpp, so only the default is left.\n\nNot a duplicate: gh pr list --state all --search \"FP8_TUNE_SMALL_SHAPES\", \"fp8_tune_small_shapes\", \"FP8 tuning default\", \"small-shape tuning\": the only PR changing this default is #1006, which this replaces. #903 edits tests/quantization/test_sm70_warmup.py and vllm/envs.py but does not change this default; the two branches merge without conflicts in those files.\n\nAI assistance was used for this change. I reviewed every line and ran the tests and measurements below.\n\n## Test Plan\n\n```bash\npytest tests/quantization/test_sm70_warmup.py tests/quantization/test_sm70_fp8_kernel_selection.py tests/config/test_sm70_provider_lifecycle.py tests/tools/test_check_env_metadata.py\npython -m tools.generate_env_reference --check\npre-commit run --from-ref origin/main --to-ref HEAD\n```\n\nDeepSeek-V4-Flash PP5 with DSpark, two boots per setting; per boot the first-token time of eight short requests (six distinct prompts, two of them sent twice) and three 200-token greedy prompts compared with the stored reference.\n\n## Test Result\n\n- On a Tesla V100 and a Quadro RTX 8000, each: test_sm70_warmup 12 passed, 14 failed (main: 11 passed, 14 failed; the new test fails without this change); test_sm70_fp8_kernel_selection 14 passed, 1 failed (same on main); test_sm70_provider_lifecycle 20 passed; test_check_env_metadata 21 passed.\n- The 14 warmup failures are the same cases on main and this branch: four still call `warmup.envs.disable_envs_cache()`, which no longer exists, and ten replace native ops with fakes that do not accept the `native_policy` argument the warmup passes once the native policy ABI is built. #903 already rewrites both groups (the `warmup.envs` calls and the native-op fakes), so this PR leaves them alone. test_legacy_dispatch_snapshot compares route hashes with tests/quantization/data/sm70_fp8_routes.json and fails the same way on main.\n- generate_env_reference --check: 998 environment registrations documented. pre-commit passes.\n- This default change on top of #1183, without any env, two boots: first token 0.41-0.58 s for all requests, greedy identical to the reference for 3 of 3 prompts in both boots, decode 44.2-44.5 tok/s for the first greedy prompt and 50.2-51.8 tok/s for the second and third.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "author": {
+      "login": "Peuqui"
+    },
+    "headRepository": {
+      "nameWithOwner": "Peuqui/1Cat-vLLM"
+    },
+    "headRefName": "pr-sm70-fp8-tune-default-off",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wOVQxMjoxMjoyOVq0MjAyNi0xMS0wOVQxMjoxMjoyOVrPAAAAAVs8lFo="
+      },
+      "nodes": [
+        {
+          "id": "PRR_kwDORjYFXs8AAAABWzyUWg",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "state": "COMMENTED",
+          "body": "Reviewed during the 54633 acceptance audit. This changes the default FP8 dispatch/tuning policy in addition to startup behavior, so it is intentionally excluded from the build and block-chunking integration #1448. The environment-reference checker passes, but the available end-to-end checkpoint on this host is NVFP4, which cannot qualify the default FP8 dense-layer policy or its throughput/quality tradeoff. Please retain this PR until a matched FP8-checkpoint comparison covers cold startup, decode/prefill latency, output quality and speculative acceptance. This is a qualification gap, not a demonstrated correctness failure. Audit assisted by Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1187#pullrequestreview-5825664090",
+          "submittedAt": "2026-11-09T12:12:29Z",
+          "commit": {
+            "oid": "739083e52cf3f3871d6e1eb91eda814d66f2f943"
+          },
+          "comments": {
+            "totalCount": 0,
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            },
+            "nodes": []
+          }
+        }
+      ]
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1187,
+    "title": "[SM70] Default the FP8 small-shape runtime tuning to off",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1187",
+    "isDraft": false,
+    "headRefOid": "739083e52cf3f3871d6e1eb91eda814d66f2f943",
+    "reviews": {
+      "totalCount": 1,
+      "nodes": [
+        {
+          "state": "COMMENTED",
+          "author": {
+            "login": "yangzhuxinyzx"
+          }
+        }
+      ]
+    },
+    "files": [
+      "csrc/sm70_turbomind/ops/gemm_runtime.cpp",
+      "tests/quantization/test_sm70_warmup.py",
+      "vllm/envs.py",
+      "vllm/model_executor/warmup/awq_sm70_warmup.py"
+    ],
+    "diff_bytes": 4492,
+    "diff_sha256": "7fea79c849a4fb1b76886cd775271eb4e190fd3945738f229a50cf585a2644cc"
+  },
+  "full_tree_diff_proof": null
+}

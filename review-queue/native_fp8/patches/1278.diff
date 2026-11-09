@@ -1,0 +1,2500 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3745a9cb92..b8b7179100 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -449,6 +449,20 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+     set_gencode_flags_for_srcs(
+       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
+       CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
++    # Turing runs this family through binary compatibility. Kernels built on
++    # the m16n8k8 MMA, which Volta lacks, ship sm_75 code even in a 7.0-only
++    # build; the dispatch reaches them only on SM75 devices.
++    set(VLLM_SM75_TURBOMIND_SRCS
++      "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_mma_sm75.cu")
++    set_gencode_flags_for_srcs(
++      SRCS "${VLLM_SM75_TURBOMIND_SRCS}"
++      CUDA_ARCHS "7.5")
++    list(APPEND VLLM_SM70_TURBOMIND_SRCS "${VLLM_SM75_TURBOMIND_SRCS}")
++    # The grouped skinny MoE runs m16n8k8 fragments on SM75; its sm_75 image
++    # comes next to the sm_70 one (the flags append).
++    set_gencode_flags_for_srcs(
++      SRCS "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
++      CUDA_ARCHS "7.5")
+     set_source_files_properties(
+       csrc/torch_bindings.cpp
+       PROPERTIES COMPILE_DEFINITIONS ENABLE_SM70_TURBOMIND=1)
+diff --git a/csrc/ops.h b/csrc/ops.h
+index 2200318819..bf892a0241 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -226,6 +226,9 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             int64_t split_k, int64_t accumulator_chains,
+                             bool fast_decoder, bool prefetch_codes);
+ 
++void fp8_qpn8_mma_sm75_out(torch::Tensor out, torch::Tensor input,
++                           torch::Tensor codes, torch::Tensor group_scales);
++
+ void fp8_qpn8_gemm_ba_split_sm70_out(torch::Tensor qkv_out, torch::Tensor z_out,
+                                      torch::Tensor b_out, torch::Tensor a_out,
+                                      torch::Tensor input, torch::Tensor codes,
+@@ -321,8 +324,8 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+                          torch::Tensor perm, torch::Tensor gids,
+                          torch::Tensor goff, int64_t topk,
+                          torch::Tensor y_slots, bool x_slot_major,
+-                         int64_t num_tokens, int64_t splitk, int64_t nacc,
+-                         int64_t scale_mode);
++                         int64_t num_tokens, int64_t splitk, int64_t scale_mode,
++                         int64_t fragment_order);
+ 
+ void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor codes, torch::Tensor scales,
+diff --git a/csrc/sm70_turbomind/ops/fp8_qpn8_codes_sm70.cuh b/csrc/sm70_turbomind/ops/fp8_qpn8_codes_sm70.cuh
+new file mode 100644
+index 0000000000..78b8cadfef
+--- /dev/null
++++ b/csrc/sm70_turbomind/ops/fp8_qpn8_codes_sm70.cuh
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// QPN8 code layout shared by the SM70 packed GEMMs and the SM75 MMA GEMM.
++// Each 32-column tile and 16-deep K group is stored as 32 lanes x 16 bytes:
++// lane l holds column qpn8_col_from_lane(l), its 16 K values reordered so the
++// fast decoder yields the half2 pairs (k, k + 1) for k = 0, 2, ..., 14.
++// The layout derives from dnv2003/v100-skinny (MIT); see LICENSE.v100-skinny.
++#pragma once
++
++#include <cuda_fp16.h>
++
++namespace vllm::sm70 {
++
++// E4M3 bits placed into FP16 positions; the 2^8 exponent offset lives in the
++// prescaled group scales.
++__device__ __forceinline__ void fp8x8_to_half2x4_fast(uint2 q, half2 out[4]) {
++  constexpr unsigned kSign = 0x80008000u;
++  constexpr unsigned kExponentMantissa = 0x3f803f80u;
++  unsigned permuted[4];
++  permuted[0] = __byte_perm(q.x, q.y, 0x0400);
++  permuted[1] = __byte_perm(q.x, q.y, 0x0501);
++  permuted[2] = __byte_perm(q.x, q.y, 0x0602);
++  permuted[3] = __byte_perm(q.x, q.y, 0x0703);
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    const unsigned value =
++        ((permuted[i] << 8) & kSign) | ((permuted[i] << 7) & kExponentMantissa);
++    out[i] = *reinterpret_cast<const half2*>(&value);
++  }
++}
++
++__device__ __forceinline__ int qpn8_col_from_lane(int lane) {
++  return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
++}
++
++}  // namespace vllm::sm70
+diff --git a/csrc/sm70_turbomind/ops/fp8_qpn8_mma_sm75.cu b/csrc/sm70_turbomind/ops/fp8_qpn8_mma_sm75.cu
+new file mode 100644
+index 0000000000..6f09a9eb5b
+--- /dev/null
++++ b/csrc/sm70_turbomind/ops/fp8_qpn8_mma_sm75.cu
+@@ -0,0 +1,411 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// Block-FP8 GEMM on the QPN8 packed codes with Turing's m16n8k8 tensor-core
++// MMA. Turing executes the Volta m8n8k4 MMA of the packed GEMMs at half its
++// tensor rate, and above M=8 the block-FP8 route otherwise reconstructs the
++// whole FP16 weight on every call. Here each CTA decodes and block-scales its
++// codes once while staging them into shared memory, exactly as the dense
++// reconstruction rounds them, and feeds both operands through ldmatrix.
++// No second weight layout is held. Split-K across CTAs writes FP32 partials
++// that a second kernel sums in fixed split order.
++
++#include <torch/all.h>
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++
++#include <algorithm>
++
++#include "fp8_qpn8_codes_sm70.cuh"
++#include "mma_fragments_sm70.cuh"
++
++namespace {
++
++using vllm::sm70::fp8x8_to_half2x4_fast;
++using vllm::sm70::ldmatrix_x4;
++using vllm::sm70::mma_m16n8k8;
++using vllm::sm70::qpn8_col_from_lane;
++using vllm::sm70::shared_address;
++
++constexpr int kBlockN = 128;
++constexpr int kBlockK = 32;
++constexpr int kThreads = 256;
++constexpr int kChunks = kBlockK / 8;  // 16-byte chunks per shared-memory row
++// Row tiles per raster group: concurrent CTAs share these A rows and a few B
++// column tiles, so both operands are reused from L2 instead of re-reading
++// every weight once per row tile.
++constexpr int kGroupRowTiles = 16;
++
++// 64-byte rows: XOR the chunk with (row / 2) so the eight rows one ldmatrix
++// phase reads land in distinct bank quads.
++__device__ __forceinline__ int swizzled(int row, int chunk) {
++  return row * kChunks + (chunk ^ ((row >> 1) & 3));
++}
++
++template <int BlockM, int WarpsM, int MinBlocks>
++__global__ __launch_bounds__(kThreads, MinBlocks) void fp8_qpn8_mma_sm75_kernel(
++    const half* __restrict__ input, const uint4* __restrict__ codes,
++    const half* __restrict__ group_scales, half* __restrict__ output,
++    float* __restrict__ partials, int m, int n, int k, int splits) {
++  constexpr int WarpsN = kThreads / 32 / WarpsM;
++  constexpr int WarpM = BlockM / WarpsM;
++  constexpr int WarpN = kBlockN / WarpsN;
++  constexpr int RowFrags = WarpM / 16;
++  constexpr int ColFrags = WarpN / 8;
++  constexpr int AChunks = BlockM * kChunks;
++  constexpr int ALoads = (AChunks + kThreads - 1) / kThreads;
++  static_assert(RowFrags >= 1 && ColFrags >= 2 && ColFrags % 2 == 0,
++                "warp tile must hold whole m16 rows and n8 column pairs");
++
++  __shared__ __align__(16) uint4 a_shared[2][BlockM * kChunks];
++  __shared__ __align__(16) uint4 b_shared[2][kBlockN * kChunks];
++
++  const int tid = threadIdx.x;
++  const int lane = tid & 31;
++  const int warp = tid >> 5;
++  const int warp_m = warp % WarpsM;
++  const int warp_n = warp / WarpsM;
++
++  const int row_tiles = (m + BlockM - 1) / BlockM;
++  const int per_group = kGroupRowTiles * (n / kBlockN);
++  const int first_row_tile = (blockIdx.x / per_group) * kGroupRowTiles;
++  const int group_rows = min(row_tiles - first_row_tile, kGroupRowTiles);
++  const int in_group = blockIdx.x % per_group;
++  const int m0 = (first_row_tile + in_group % group_rows) * BlockM;
++  const int n0 = (in_group / group_rows) * kBlockN;
++
++  // Split-K boundaries stay on 128-deep scale blocks.
++  const int k_blocks = k / 128;
++  const int split = blockIdx.z;
++  const int block_begin = split * k_blocks / splits;
++  const int block_end = (split + 1) * k_blocks / splits;
++  const int k_begin = block_begin * 128;
++  const int steps = (block_end - block_begin) * (128 / kBlockK);
++
++  // B staging: one 16-byte code word (16 K of one column) per thread.
++  const int b_tile = tid >> 6;
++  const int b_group = (tid >> 5) & 1;
++  const int b_row = b_tile * 32 + qpn8_col_from_lane(lane);
++  const uint4* b_source = codes +
++                          (static_cast<size_t>(n0 / 32 + b_tile) * (k >> 4) +
++                           k_begin / 16 + b_group) *
++                              32 +
++                          lane;
++  const half* scale_source = group_scales + n0 / 32 + b_tile;
++  const int tiles_n32 = n >> 5;
++
++  // One K step held in registers on its way into shared memory. The scale is
++  // read together with the codes, so no global load sits between the MMAs and
++  // the shared-memory store. Two steps in flight measured slower for every
++  // tile height (more registers, fewer resident blocks).
++  struct Staged {
++    uint4 a[ALoads];
++    uint4 b;
++    half scale;
++  };
++
++  auto load_global = [&](int step, Staged& staged) {
++    const int k0 = k_begin + step * kBlockK;
++#pragma unroll
++    for (int i = 0; i < ALoads; ++i) {
++      const int index = tid + i * kThreads;
++      staged.a[i] = make_uint4(0, 0, 0, 0);
++      if (index < AChunks && m0 + index / kChunks < m) {
++        staged.a[i] = *reinterpret_cast<const uint4*>(
++            input + static_cast<size_t>(m0 + index / kChunks) * k + k0 +
++            (index % kChunks) * 8);
++      }
++    }
++    staged.b =
++        __ldcs(b_source + static_cast<size_t>(step) * (kBlockK / 16) * 32);
++    staged.scale = scale_source[static_cast<size_t>(k0 / 128) * tiles_n32];
++  };
++
++  auto store_shared = [&](const Staged& staged, int stage) {
++#pragma unroll
++    for (int i = 0; i < ALoads; ++i) {
++      const int index = tid + i * kThreads;
++      if (index < AChunks) {
++        a_shared[stage][swizzled(index / kChunks, index % kChunks)] =
++            staged.a[i];
++      }
++    }
++    const half2 scale2 = __halves2half2(staged.scale, staged.scale);
++    half2 weights[8];
++    fp8x8_to_half2x4_fast(make_uint2(staged.b.x, staged.b.y), weights);
++    fp8x8_to_half2x4_fast(make_uint2(staged.b.z, staged.b.w), weights + 4);
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++      weights[i] = __hmul2(weights[i], scale2);
++    }
++    const uint4* packed = reinterpret_cast<const uint4*>(weights);
++    b_shared[stage][swizzled(b_row, b_group * 2)] = packed[0];
++    b_shared[stage][swizzled(b_row, b_group * 2 + 1)] = packed[1];
++  };
++
++  float accum[RowFrags][ColFrags][4];
++#pragma unroll
++  for (int i = 0; i < RowFrags; ++i) {
++#pragma unroll
++    for (int j = 0; j < ColFrags; ++j) {
++#pragma unroll
++      for (int e = 0; e < 4; ++e) {
++        accum[i][j][e] = 0.0f;
++      }
++    }
++  }
++
++  Staged next;
++  load_global(0, next);
++  store_shared(next, 0);
++  __syncthreads();
++
++  for (int step = 0; step < steps; ++step) {
++    const int stage = step & 1;
++    if (step + 1 < steps) {
++      load_global(step + 1, next);
++    }
++#pragma unroll
++    for (int half_k = 0; half_k < kBlockK / 16; ++half_k) {
++      uint32_t a[RowFrags][4];
++#pragma unroll
++      for (int i = 0; i < RowFrags; ++i) {
++        const int row = warp_m * WarpM + i * 16 + (lane & 15);
++        const int chunk = half_k * 2 + (lane >> 4);
++        ldmatrix_x4(a[i],
++                    shared_address(&a_shared[stage][swizzled(row, chunk)]));
++      }
++      uint32_t b[ColFrags][2];
++#pragma unroll
++      for (int j = 0; j < ColFrags; j += 2) {
++        const int row =
++            warp_n * WarpN + j * 8 + (lane & 7) + ((lane >> 4) << 3);
++        const int chunk = half_k * 2 + ((lane >> 3) & 1);
++        uint32_t r[4];
++        ldmatrix_x4(r, shared_address(&b_shared[stage][swizzled(row, chunk)]));
++        b[j][0] = r[0];
++        b[j][1] = r[1];
++        b[j + 1][0] = r[2];
++        b[j + 1][1] = r[3];
++      }
++#pragma unroll
++      for (int i = 0; i < RowFrags; ++i) {
++#pragma unroll
++        for (int j = 0; j < ColFrags; ++j) {
++          mma_m16n8k8(accum[i][j], a[i][0], a[i][1], b[j][0]);
++          mma_m16n8k8(accum[i][j], a[i][2], a[i][3], b[j][1]);
++        }
++      }
++    }
++    if (step + 1 < steps) {
++      store_shared(next, stage ^ 1);
++    }
++    __syncthreads();
++  }
++
++  const int group = lane >> 2;
++  const int pair = lane & 3;
++#pragma unroll
++  for (int i = 0; i < RowFrags; ++i) {
++#pragma unroll
++    for (int half_row = 0; half_row < 2; ++half_row) {
++      const int row = m0 + warp_m * WarpM + i * 16 + group + half_row * 8;
++      if (row >= m) {
++        continue;
++      }
++#pragma unroll
++      for (int j = 0; j < ColFrags; ++j) {
++        const int col = n0 + warp_n * WarpN + j * 8 + pair * 2;
++        const float x = accum[i][j][half_row * 2];
++        const float y = accum[i][j][half_row * 2 + 1];
++        if (splits == 1) {
++          *reinterpret_cast<half2*>(output + static_cast<size_t>(row) * n +
++                                    col) = __floats2half2_rn(x, y);
++        } else {
++          *reinterpret_cast<float2*>(
++              partials + (static_cast<size_t>(split) * m + row) * n + col) =
++              make_float2(x, y);
++        }
++      }
++    }
++  }
++}
++
++__global__ void fp8_qpn8_split_reduce_sm75_kernel(
++    const float2* __restrict__ partials, half2* __restrict__ output, int pairs,
++    int splits) {
++  const int index = blockIdx.x * blockDim.x + threadIdx.x;
++  if (index >= pairs) {
++    return;
++  }
++  float2 sum = partials[index];
++  for (int s = 1; s < splits; ++s) {
++    const float2 value = partials[static_cast<size_t>(s) * pairs + index];
++    sum.x += value.x;
++    sum.y += value.y;
++  }
++  output[index] = __floats2half2_rn(sum.x, sum.y);
++}
++
++template <int BlockM, int WarpsM, int MinBlocks>
++void launch_fp8_qpn8_mma_sm75(torch::Tensor& out, const torch::Tensor& input,
++                              const torch::Tensor& codes,
++                              const torch::Tensor& group_scales, int splits,
++                              cudaStream_t stream) {
++  const int m = static_cast<int>(input.size(0));
++  const int k = static_cast<int>(input.size(1));
++  const int n = static_cast<int>(codes.size(1));
++  torch::Tensor partials;
++  if (splits > 1) {
++    partials =
++        torch::empty({splits, m, n}, input.options().dtype(torch::kFloat32));
++  }
++  const dim3 grid((n / kBlockN) * ((m + BlockM - 1) / BlockM), 1, splits);
++  fp8_qpn8_mma_sm75_kernel<BlockM, WarpsM, MinBlocks>
++      <<<grid, kThreads, 0, stream>>>(
++          reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
++          reinterpret_cast<const uint4*>(codes.data_ptr<uint8_t>()),
++          reinterpret_cast<const half*>(group_scales.data_ptr<at::Half>()),
++          reinterpret_cast<half*>(out.data_ptr<at::Half>()),
++          splits > 1 ? partials.data_ptr<float>() : nullptr, m, n, k, splits);
++  if (splits > 1) {
++    const int pairs = m * n / 2;
++    constexpr int kReduceThreads = 256;
++    fp8_qpn8_split_reduce_sm75_kernel<<<(pairs + kReduceThreads - 1) /
++                                            kReduceThreads,
++                                        kReduceThreads, 0, stream>>>(
++        reinterpret_cast<const float2*>(partials.data_ptr<float>()),
++        reinterpret_cast<half2*>(out.data_ptr<at::Half>()), pairs, splits);
++  }
++}
++
++// Resident CTAs per SM of one kernel instance. Every SM75 device has the same
++// register file, shared memory and thread limits, so one answer per process
++// holds for all of them.
++template <int BlockM, int WarpsM, int MinBlocks>
++int resident_ctas_per_sm() {
++  static const int ctas = [] {
++    int blocks = 0;
++    AT_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
++        &blocks, fp8_qpn8_mma_sm75_kernel<BlockM, WarpsM, MinBlocks>, kThreads,
++        0));
++    return blocks;
++  }();
++  return ctas;
++}
++
++struct TileChoice {
++  int block_m;
++  int splits;
++};
++
++// Wave model: resident waves x K blocks per CTA x per-slot cost of one 128-deep
++// K block, plus the split-K partials' traffic. Per-tile costs (relative to
++// 16 rows) and the reduction weight were fitted on a Quadro RTX 8000 over the
++// Qwen3.8-27B TP2 projections at M=1..512 (2026-10-20): the choice is 1.9 %
++// behind the measured best tile and split on average, 15.7 % at worst. Ties
++// keep fewer splits, then fewer rows.
++TileChoice choose_tile(int64_t m, int64_t n, int64_t k, int sms) {
++  constexpr int kBlockMs[] = {16, 32, 64, 128};
++  constexpr double kSlotBlockCost[] = {1.0, 1.1, 1.5, 2.6};
++  constexpr double kReductionCost = 2.4;
++  const int resident[] = {
++      resident_ctas_per_sm<16, 1, 2>(), resident_ctas_per_sm<32, 2, 2>(),
++      resident_ctas_per_sm<64, 2, 2>(), resident_ctas_per_sm<128, 2, 2>()};
++  const int64_t k_blocks = k / 128;
++  const int64_t max_splits = std::min<int64_t>(16, k_blocks);
++  TileChoice best{16, 1};
++  double best_cost = -1.0;
++  for (int splits = 1; splits <= max_splits; ++splits) {
++    for (int i = 0; i < 4; ++i) {
++      const int block_m = kBlockMs[i];
++      if (block_m > std::max<int64_t>(16, 2 * m)) {
++        continue;
++      }
++      const int64_t slots = int64_t{resident[i]} * sms;
++      const int64_t ctas =
++          (n / kBlockN) * ((m + block_m - 1) / block_m) * splits;
++      const int64_t waves = (ctas + slots - 1) / slots;
++      const int64_t blocks_per_cta = (k_blocks + splits - 1) / splits;
++      double cost = static_cast<double>(waves * blocks_per_cta) *
++                    kSlotBlockCost[i] * static_cast<double>(slots) /
++                    resident[0];
++      if (splits > 1) {
++        cost += kReductionCost * (splits + 1) * static_cast<double>(m * n) /
++                (128.0 * 128.0);
++      }
++      if (best_cost < 0.0 || cost < best_cost) {
++        best_cost = cost;
++        best = TileChoice{block_m, splits};
++      }
++    }
++  }
++  return best;
++}
++
++}  // namespace
++
++void fp8_qpn8_mma_sm75_out(torch::Tensor out, torch::Tensor input,
++                           torch::Tensor codes, torch::Tensor group_scales) {
++  TORCH_CHECK(input.is_cuda() && out.is_cuda() && codes.is_cuda() &&
++                  group_scales.is_cuda(),
++              "fp8_qpn8_mma_sm75_out: tensors must be CUDA tensors");
++  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
++                  out.scalar_type() == torch::kFloat16,
++              "fp8_qpn8_mma_sm75_out: input and output must be float16");
++  TORCH_CHECK(codes.scalar_type() == torch::kUInt8 &&
++                  group_scales.scalar_type() == torch::kFloat16,
++              "fp8_qpn8_mma_sm75_out: expected uint8 codes and float16 "
++              "group scales");
++  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && codes.dim() == 2 &&
++                  group_scales.dim() == 2,
++              "fp8_qpn8_mma_sm75_out: expected 2D tensors");
++  TORCH_CHECK(input.is_contiguous() && out.is_contiguous() &&
++                  codes.is_contiguous() && group_scales.is_contiguous(),
++              "fp8_qpn8_mma_sm75_out: tensors must be contiguous");
++  const int64_t m = input.size(0);
++  const int64_t k = input.size(1);
++  const int64_t n = codes.size(1);
++  TORCH_CHECK(codes.size(0) == k && out.size(0) == m && out.size(1) == n,
++              "fp8_qpn8_mma_sm75_out: shape mismatch");
++  TORCH_CHECK(n > 0 && n % kBlockN == 0 && k > 0 && k % 128 == 0,
++              "fp8_qpn8_mma_sm75_out: requires N%128=K%128=0");
++  TORCH_CHECK(group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32,
++              "fp8_qpn8_mma_sm75_out: expected 128 x 128 block scales");
++  TORCH_CHECK(m * n < (int64_t{1} << 31),
++              "fp8_qpn8_mma_sm75_out: output too large");
++  if (m == 0) {
++    return;
++  }
++  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
++  const cudaDeviceProp* properties = at::cuda::getCurrentDeviceProperties();
++  TORCH_CHECK(properties->major == 7 && properties->minor == 5,
++              "fp8_qpn8_mma_sm75_out: requires an SM75 device");
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++
++  const TileChoice tile = choose_tile(m, n, k, properties->multiProcessorCount);
++  const int splits = tile.splits;
++
++  switch (tile.block_m) {
++    case 16:
++      launch_fp8_qpn8_mma_sm75<16, 1, 2>(out, input, codes, group_scales,
++                                         splits, stream);
++      break;
++    case 32:
++      launch_fp8_qpn8_mma_sm75<32, 2, 2>(out, input, codes, group_scales,
++                                         splits, stream);
++      break;
++    case 64:
++      launch_fp8_qpn8_mma_sm75<64, 2, 2>(out, input, codes, group_scales,
++                                         splits, stream);
++      break;
++    default:
++      launch_fp8_qpn8_mma_sm75<128, 2, 2>(out, input, codes, group_scales,
++                                          splits, stream);
++      break;
++  }
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git a/csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu b/csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu
+index 0bb6e7d559..94ee7bc827 100644
+--- a/csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu
++++ b/csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu
+@@ -23,10 +23,14 @@
+ 
+ #include "sm70_policy.h"
+ #include "activation_pack_sm70.cuh"
++#include "fp8_qpn8_codes_sm70.cuh"
+ #include "qpn_pair_sm70.cuh"
+ 
+ namespace {
+ 
++using vllm::sm70::fp8x8_to_half2x4_fast;
++using vllm::sm70::qpn8_col_from_lane;
++
+ __device__ __forceinline__ void fp8x8_to_half2x4(uint2 q, half2 out[4]) {
+ #pragma unroll
+   for (int i = 0; i < 4; ++i) {
+@@ -39,28 +43,8 @@ __device__ __forceinline__ void fp8x8_to_half2x4(uint2 q, half2 out[4]) {
+   }
+ }
+ 
+-__device__ __forceinline__ void fp8x8_to_half2x4_fast(uint2 q, half2 out[4]) {
+-  constexpr unsigned kSign = 0x80008000u;
+-  constexpr unsigned kExponentMantissa = 0x3f803f80u;
+-  unsigned permuted[4];
+-  permuted[0] = __byte_perm(q.x, q.y, 0x0400);
+-  permuted[1] = __byte_perm(q.x, q.y, 0x0501);
+-  permuted[2] = __byte_perm(q.x, q.y, 0x0602);
+-  permuted[3] = __byte_perm(q.x, q.y, 0x0703);
+-#pragma unroll
+-  for (int i = 0; i < 4; ++i) {
+-    const unsigned value =
+-        ((permuted[i] << 8) & kSign) | ((permuted[i] << 7) & kExponentMantissa);
+-    out[i] = *reinterpret_cast<const half2*>(&value);
+-  }
+-}
+-
+ constexpr int kQpn8PrepareThreads = 256;
+ 
+-__device__ __forceinline__ int qpn8_col_from_lane(int lane) {
+-  return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+-}
+-
+ __device__ __forceinline__ int qpn8_lane_from_col(int col) {
+   return (col & 3) | (((col >> 3) & 3) << 2) | (((col >> 2) & 1) << 4);
+ }
+diff --git a/csrc/sm70_turbomind/ops/mma_fragments_sm70.cuh b/csrc/sm70_turbomind/ops/mma_fragments_sm70.cuh
+new file mode 100644
+index 0000000000..928f8b4997
+--- /dev/null
++++ b/csrc/sm70_turbomind/ops/mma_fragments_sm70.cuh
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// Register-level building blocks shared by the packed SM70-family GEMMs: the
++// e2m1 code decoder, and Turing's m16n8k8 tensor-core MMA with the ldmatrix
++// load that feeds it. Volta runs mma.m8n8k4 at full rate; Turing executes it
++// at half its tensor rate and gets its full rate only from m16n8k8, which
++// every later generation also runs. The m16n8k8 helpers trap below SM75, so
++// the SM70 build of a file that also holds an SM75 kernel compiles and fails
++// loudly if that kernel ever runs without its sm_75 code.
++#pragma once
++
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace vllm::sm70 {
++
++// Derived from TurboMind's cvt_f16x8_e2m1 (lmdeploy, Apache-2.0;
++// csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/attention/quantization.h).
++// Eight e2m1 codes (one 32-bit word, low nibble first) to fp16 bit patterns:
++// sign and exponent/mantissa bits move into fp16 positions, and the 2^14
++// exponent re-bias is left to the caller's scale. out[i] pairs codes
++// (i, i + 4) of the word; the weight layouts place their nibbles so that
++// these pairs are the operand registers the MMA reads.
++__device__ __forceinline__ void fp4x8_to_half2x4(unsigned x, half2 out[4]) {
++  constexpr unsigned kSign = 0x80008000U;
++  constexpr unsigned kExponentMantissa = 0x0E000E00U;
++  unsigned values[4];
++  values[0] = ((x << 12) & kSign) | ((x << 9) & kExponentMantissa);
++  values[1] = ((x << 8) & kSign) | ((x << 5) & kExponentMantissa);
++  values[2] = ((x << 4) & kSign) | ((x << 1) & kExponentMantissa);
++  values[3] = ((x << 0) & kSign) | ((x >> 3) & kExponentMantissa);
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    out[i] = *reinterpret_cast<const half2*>(&values[i]);
++  }
++}
++
++__device__ __forceinline__ uint32_t shared_address(const void* pointer) {
++  return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
++}
++
++__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4],
++                                            uint32_t address) {
++#if __CUDA_ARCH__ >= 750
++  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++               : "r"(address));
++#else
++  // Below SM75 a missing sm_75 cubin would otherwise return garbage silently.
++  __trap();
++#endif
++}
++
++// D (16x8, fp32) += A (16x8, row) * B (8x8, col). Lane l holds A rows l / 4
++// and l / 4 + 8 at k (l % 4) * 2 + {0, 1} in a0 / a1, B column l / 4 at the
++// same k in b0, and D rows l / 4 (d[0], d[1]) and l / 4 + 8 (d[2], d[3]) at
++// columns (l % 4) * 2 + {0, 1}.
++__device__ __forceinline__ void mma_m16n8k8(float (&d)[4], uint32_t a0,
++                                            uint32_t a1, uint32_t b0) {
++#if __CUDA_ARCH__ >= 750
++  asm volatile(
++      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
++      "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
++      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++      : "r"(a0), "r"(a1), "r"(b0));
++#else
++  __trap();
++#endif
++}
++
++// m16n8k8 fragment order of a packed FP4 weight tile (32 output columns x 16
++// K per code group, 8 bytes per lane, the same tile shape as the m8n8k4
++// order). The weights are the 16-row A operand and the activation rows the
++// 8-column B operand, so a skinny batch fills whole MMAs: eight rows are one
++// B tile. Inside a code group the K order is permuted identically on both
++// operands, which leaves the dot product unchanged: lane l (row group
++// l / 4, quad position t = l % 4) holds K 4t .. 4t + 3, the first pair for
++// MMA step 0 and the second for step 1, so one 8-byte load of an activation
++// row feeds both steps.
++//
++// Code word w (w = 0, 1) of a lane covers A tile w (columns 16w .. 16w + 15);
++// nibble n of the word is the weight at column m16n8k8_fp4_column(l, w, n)
++// and K 4t + m16n8k8_fp4_k(n). After fp4x8_to_half2x4, out[2s] and
++// out[2s + 1] are A registers a0 / a1 of MMA step s. The scale table holds
++// four bytes per row group and scale group, for columns l / 4 + 8j
++// (j = 0 .. 3); qpn_prepack in
++// vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py writes
++// this order.
++__host__ __device__ constexpr int m16n8k8_fp4_column(int lane, int word,
++                                                     int nibble) {
++  return 16 * word + (lane >> 2) + 8 * (nibble & 1);
++}
++
++__host__ __device__ constexpr int m16n8k8_fp4_k(int nibble) {
++  return ((nibble >> 1) & 1) * 2 + (nibble >> 2);
++}
++
++}  // namespace vllm::sm70
+diff --git a/csrc/sm70_turbomind/ops/nvfp4_qpn4_sm70.cu b/csrc/sm70_turbomind/ops/nvfp4_qpn4_sm70.cu
+index eb128a9e2a..48ed0050f4 100644
+--- a/csrc/sm70_turbomind/ops/nvfp4_qpn4_sm70.cu
++++ b/csrc/sm70_turbomind/ops/nvfp4_qpn4_sm70.cu
+@@ -17,10 +17,13 @@
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+ 
++#include "mma_fragments_sm70.cuh"
+ #include "nvfp4_qpn2_layout.cuh"
+ 
+ namespace {
+ 
++using vllm::sm70::fp4x8_to_half2x4;
++
+ constexpr int kPrepareThreads = 256;
+ constexpr float kFp4Bias = 16384.0f;
+ 
+@@ -109,20 +112,6 @@ __global__ void nvfp4_qpn4_prepack_scale_codes_kernel(
+   packed_scale_codes[index] = scale_codes[static_cast<size_t>(group) * n + col];
+ }
+ 
+-__device__ __forceinline__ void fp4x8_to_half2x4(unsigned x, half2 out[4]) {
+-  constexpr unsigned kSign = 0x80008000U;
+-  constexpr unsigned kExponentMantissa = 0x0E000E00U;
+-  unsigned values[4];
+-  values[0] = ((x << 12) & kSign) | ((x << 9) & kExponentMantissa);
+-  values[1] = ((x << 8) & kSign) | ((x << 5) & kExponentMantissa);
+-  values[2] = ((x << 4) & kSign) | ((x << 1) & kExponentMantissa);
+-  values[3] = ((x << 0) & kSign) | ((x >> 3) & kExponentMantissa);
+-#pragma unroll
+-  for (int i = 0; i < 4; ++i) {
+-    out[i] = *reinterpret_cast<const half2*>(&values[i]);
+-  }
+-}
+-
+ __device__ __forceinline__ void fp4x16_to_half2x8(uint2 packed, half2 out[8]) {
+   fp4x8_to_half2x4(packed.x, out);
+   fp4x8_to_half2x4(packed.y, out + 4);
+diff --git a/csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu b/csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu
+index 4ec4203d34..0b74520b15 100644
+--- a/csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu
++++ b/csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu
+@@ -6,9 +6,10 @@
+ // mode added by its contributors. See LICENSE.v100-skinny in this directory
+ // for the retained MIT notice.
+ //
+-// Weights are prepacked once at load into mma.m8n8k4 fragment order
+-// ([tile N/32][group K/16][lane 32] x 8B codes, one scale byte per lane and
+-// scale group); the permutation lives in
++// Weights are prepacked once at load into the fragment order of the card's
++// tensor-core MMA ([tile N/32][group K/16][lane 32] x 8B codes plus 32 scale
++// bytes per tile and scale group): mma.m8n8k4 on SM70, mma.m16n8k8 from SM75
++// on (mma_fragments_sm70.cuh). The permutation lives in
+ // vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py.
+ 
+ #include <torch/all.h>
+@@ -18,8 +19,17 @@
+ #include <c10/cuda/CUDAGuard.h>
+ #include <cuda_fp16.h>
+ 
++#include "mma_fragments_sm70.cuh"
++
+ namespace {
+ 
++using vllm::sm70::fp4x8_to_half2x4;
++using vllm::sm70::mma_m16n8k8;
++
++// Register order the expert weights were packed in (QpnFragmentOrder in
++// skinny_sm70_moe.py).
++enum FragmentOrder { ORDER_M8N8K4 = 0, ORDER_M16N8K8 = 1 };
++
+ __device__ __forceinline__ half2 fp8e4m3_to_half2(unsigned char b) {
+   const unsigned short hb =
+       (((unsigned short)b & 0x80u) << 8) | (((unsigned short)b & 0x7Fu) << 7);
+@@ -63,25 +73,13 @@ __device__ __forceinline__ half2 group_scale(const uint8_t* sb, int g) {
+   return decode_scale<MODE>(group_scale_byte<MODE>(sb, g));
+ }
+ 
+-// XOR swizzle on the low 3 bits of a k-pair index; conflict-free for the
+-
+-// Alternative e2m1 decoder derived from TurboMind's cvt_f16x8_e2m1
+-// (Apache-2.0; 1Cat-vLLM csrc/sm70_turbomind/lmdeploy/src/turbomind/
+-// kernels/attention/quantization.h). Shifts sign/EM bits into fp16
+-// positions; the 2^14 exponent re-bias is folded into the caller's
+-// scale, so no extra multiply. Output half2 pairing is INTERLEAVED:
+-// out[i] holds codes (i, i+4) of the 8-code word.
++// Eight e2m1 codes times one scale (the 2^14 decoder re-bias is folded into
++// the caller's scale). out[i] holds codes (i, i+4) of the 8-code word.
+ __device__ __forceinline__ void dequant8_tm(unsigned q, half2 sc2p,
+                                             half2 out[4]) {
+-  constexpr unsigned S = 0x80008000u, EM = 0x0E000E00u;
+-  unsigned v0 = ((q << 12) & S) | ((q << 9) & EM);
+-  unsigned v1 = ((q << 8) & S) | ((q << 5) & EM);
+-  unsigned v2 = ((q << 4) & S) | ((q << 1) & EM);
+-  unsigned v3 = (q & S) | ((q >> 3) & EM);
+-  out[0] = __hmul2(*reinterpret_cast<half2*>(&v0), sc2p);
+-  out[1] = __hmul2(*reinterpret_cast<half2*>(&v1), sc2p);
+-  out[2] = __hmul2(*reinterpret_cast<half2*>(&v2), sc2p);
+-  out[3] = __hmul2(*reinterpret_cast<half2*>(&v3), sc2p);
++  fp4x8_to_half2x4(q, out);
++#pragma unroll
++  for (int i = 0; i < 4; ++i) out[i] = __hmul2(out[i], sc2p);
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -185,24 +183,25 @@ __global__ void skinny_nvfp4_qpn(const uint8_t* __restrict__ qcodes,
+ // offsets on the device, inactive experts exit before touching their
+ // weights, CUDA-graph safe) around the QPN tensor-core dataflow (mma.m8n8k4
+ // on fragment-order prepacked weights, SPLITK warps splitting K on one N=32
+-// tile, NACC independent accumulator fragments). Weights are prepacked per
++// tile). Weights are prepacked per
+ // expert by qpn_prepack: [E][tile N/32][group K/16][lane 32] x 8B codes plus
+ // the scale bytes. A rows come through the slot indirection (token-major x
+ // for w13, slot-major for w2).
+-// Routing arrives COMPACT: grid.y spans slot-count-many group slots (a
+-// static bound, so it captures into CUDA graphs), `gids[grp]` names the
+-// group's expert and `goff[grp]..goff[grp+1]` its slot range; padding
+-// groups carry an empty range and exit. This keeps the launch independent
+-// of the expert count -- with a per-expert grid, many-expert models
+-// (E=512, top-k 10, T=1) schedule thousands of empty blocks that cost
+-// more than the actual work.
++// Routing arrives COMPACT: grid.y spans min(slots, experts) group slots (a
++// static bound, so it captures into CUDA graphs; no batch has more groups),
++// `gids[grp]` names the group's expert and `goff[grp]..goff[grp+1]` its slot
++// range; padding groups carry an empty range and exit. Either bound alone
++// schedules a flood of empty blocks: per expert at decode with many experts
++// (E=512, top-k 10, T=1), per slot in prefill (T=512, top-k 6: 3072 rows for
++// at most 256 groups, 8-47 % of the GEMM time on V100 and Turing).
+ // ---------------------------------------------------------------------------
+ // RB row blocks share one weight load: each group's codes are fetched and
+ // dequantized once and feed the MMAs of up to RB x 8 rows, instead of one
+-// re-read per 8-row pass. Every row keeps its own accumulators and the same
+-// K order, so the result does not depend on RB.
++// re-read per 8-row pass. NT adjacent 32-column tiles share each staged
++// activation fragment. Every row keeps its own accumulators and the same K
++// order, so the result depends on neither RB nor NT.
+ 
+-template <int SPLITK, int NACC, int SCALE_MODE = SCALE_NVFP4_FP8_16, int RB = 1>
++template <int SPLITK, int SCALE_MODE, int RB, int NT>
+ __global__ void __launch_bounds__(32 * SPLITK)
+     skinny_nvfp4_moe_qpn(const uint8_t* __restrict__ qcodes,
+                          const uint8_t* __restrict__ qscales,
+@@ -227,11 +226,11 @@ __global__ void __launch_bounds__(32 * SPLITK)
+   // share one allocation, which keeps two 512-thread blocks resident on a
+   // 64 KiB-shared Turing SM.
+   constexpr int XS_BYTES = (RB == 1 ? 1 : SPLITK) * RB * MMAX * XROW * 2;
+-  constexpr int CS_BYTES = SPLITK * 256 * 4;
++  constexpr int CS_BYTES = SPLITK * NT * 256 * 4;
+   __shared__ __align__(
+       16) unsigned char smem[XS_BYTES > CS_BYTES ? XS_BYTES : CS_BYTES];
+   auto xs = reinterpret_cast<half(*)[RB][MMAX][XROW]>(smem);
+-  auto cs = reinterpret_cast<float (*)[256]>(smem);
++  auto cs = reinterpret_cast<float (*)[NT][256]>(smem);
+ 
+   const int grp = blockIdx.y;
+   const int beg = goff[grp];
+@@ -240,16 +239,17 @@ __global__ void __launch_bounds__(32 * SPLITK)
+   const int e = gids[grp];
+ 
+   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+-  const int tile = blockIdx.x;
++  const int tile0 = blockIdx.x * NT;
+   const int qp = (lane >> 2) & 3;
+   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+   const int G = K >> 4, Gq = G / SPLITK;
+   const int g0 = warp * Gq;
++  // Tile nt of the CTA starts nt * G * 32 codes / nt * SG * 32 scales on.
+   const uint2* cb = reinterpret_cast<const uint2*>(qcodes) +
+-                    ((size_t)e * (N >> 5) + tile) * G * 32 + lane;
++                    ((size_t)e * (N >> 5) + tile0) * G * 32 + lane;
+   // MXFP4 keeps one scale per 32 codes, so its table is half as long.
+   const int SG = (SCALE_MODE == SCALE_MXFP4_E8M0_32) ? (G >> 1) : G;
+-  const uint8_t* sb = qscales + ((size_t)e * (N >> 5) + tile) * SG * 32 + lane;
++  const uint8_t* sb = qscales + ((size_t)e * (N >> 5) + tile0) * SG * 32 + lane;
+   const half2 gm2 = __float2half2_rn(gscales[e] * 16384.f);
+ 
+   // An expert with more than ROWS slots (hash routing at decode, large
+@@ -266,13 +266,13 @@ __global__ void __launch_bounds__(32 * SPLITK)
+       xrows[m] = x + (size_t)(x_slot_major ? slot : slot / topk) * K;
+     }
+     __syncthreads();
+-    float c[RB][NACC][8];
++    float c[NT][RB][8];
+ #pragma unroll
+-    for (int bl = 0; bl < RB; bl++)
++    for (int nt = 0; nt < NT; nt++)
+ #pragma unroll
+-      for (int a = 0; a < NACC; a++)
++      for (int bl = 0; bl < RB; bl++)
+ #pragma unroll
+-        for (int i = 0; i < 8; i++) c[bl][a][i] = 0.f;
++        for (int i = 0; i < 8; i++) c[nt][bl][i] = 0.f;
+ 
+     if constexpr (RB == 1) {
+       // Decode (at most 8 rows per expert): staging costs more than the
+@@ -280,12 +280,18 @@ __global__ void __launch_bounds__(32 * SPLITK)
+       const half* xr = r < rows ? xrows[r] : nullptr;
+ #pragma unroll 4
+       for (int g = g0; g < g0 + Gq; g++) {
+-        const uint2 q2 = __ldcs(cb + (size_t)g * 32);
+-        const half2 sc2 = __hmul2(group_scale<SCALE_MODE>(sb, g), gm2);
+-        half2 bq[8];
+-        dequant8_tm(q2.x, sc2, bq + 0);
+-        dequant8_tm(q2.y, sc2, bq + 4);
+-        const unsigned* B = reinterpret_cast<const unsigned*>(bq);
++        // Weights first, then the activation row: this order keeps the
++        // unrolled iterations' code loads ahead of their use (the reverse
++        // measured 18 % slower at decode on V100).
++        half2 bq[NT][8];
++#pragma unroll
++        for (int nt = 0; nt < NT; nt++) {
++          const uint2 q2 = __ldcs(cb + ((size_t)nt * G + g) * 32);
++          const half2 sc2 = __hmul2(
++              group_scale<SCALE_MODE>(sb + (size_t)nt * SG * 32, g), gm2);
++          dequant8_tm(q2.x, sc2, bq[nt] + 0);
++          dequant8_tm(q2.y, sc2, bq[nt] + 4);
++        }
+         uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+         if (xr) {
+           a01 = *reinterpret_cast<const uint4*>(xr + g * 16);
+@@ -293,10 +299,14 @@ __global__ void __launch_bounds__(32 * SPLITK)
+         }
+         const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+         const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+-        SKINNY_MMA_8N8K4(c[0][0], A0[0], A0[1], B[0], B[1]);
+-        SKINNY_MMA_8N8K4(c[0][1 % NACC], A0[2], A0[3], B[2], B[3]);
+-        SKINNY_MMA_8N8K4(c[0][2 % NACC], A1[0], A1[1], B[4], B[5]);
+-        SKINNY_MMA_8N8K4(c[0][3 % NACC], A1[2], A1[3], B[6], B[7]);
++#pragma unroll
++        for (int nt = 0; nt < NT; nt++) {
++          const unsigned* B = reinterpret_cast<const unsigned*>(bq[nt]);
++          SKINNY_MMA_8N8K4(c[nt][0], A0[0], A0[1], B[0], B[1]);
++          SKINNY_MMA_8N8K4(c[nt][0], A0[2], A0[3], B[2], B[3]);
++          SKINNY_MMA_8N8K4(c[nt][0], A1[0], A1[1], B[4], B[5]);
++          SKINNY_MMA_8N8K4(c[nt][0], A1[2], A1[3], B[6], B[7]);
++        }
+       }
+     } else {
+       // Lane l stages 16 B of row (l >> 2) of each row block per chunk. The
+@@ -309,14 +319,18 @@ __global__ void __launch_bounds__(32 * SPLITK)
+       // A warp's slice may end on an odd group (K/16 = splitk, for instance),
+       // so every read of a chunk's second group is bounded by gend. The guards
+       // are uniform across the warp and fall away when Gq is even.
+-      uint2 qv[XCH];
+-      uint8_t sv[XCH];
++      uint2 qv[XCH][NT];
++      uint8_t sv[XCH][NT];
+       auto load_weights = [&](int gc) {
+ #pragma unroll
+         for (int gi = 0; gi < XCH; gi++) {
+           if (gi > 0 && gc + gi >= gend) break;
+-          qv[gi] = __ldcs(cb + (size_t)(gc + gi) * 32);
+-          sv[gi] = group_scale_byte<SCALE_MODE>(sb, gc + gi);
++#pragma unroll
++          for (int nt = 0; nt < NT; nt++) {
++            qv[gi][nt] = __ldcs(cb + ((size_t)nt * G + gc + gi) * 32);
++            sv[gi][nt] = group_scale_byte<SCALE_MODE>(sb + (size_t)nt * SG * 32,
++                                                      gc + gi);
++          }
+         }
+       };
+       load_weights(g0);
+@@ -333,41 +347,47 @@ __global__ void __launch_bounds__(32 * SPLITK)
+             v = *reinterpret_cast<const uint4*>(xrows[row] + gc * 16 + scol);
+           *reinterpret_cast<uint4*>(&xs[warp][bl][srow][scol]) = v;
+         }
+-        uint2 q[XCH];
+-        uint8_t s[XCH];
++        uint2 q[XCH][NT];
++        uint8_t s[XCH][NT];
+ #pragma unroll
+         for (int gi = 0; gi < XCH; gi++) {
+           if (gi > 0 && gi >= gcnt) break;
+-          q[gi] = qv[gi];
+-          s[gi] = sv[gi];
++#pragma unroll
++          for (int nt = 0; nt < NT; nt++) {
++            q[gi][nt] = qv[gi][nt];
++            s[gi][nt] = sv[gi][nt];
++          }
+         }
+         __syncwarp();
+         if (gc + XCH < gend) load_weights(gc + XCH);
+ #pragma unroll
+         for (int gi = 0; gi < XCH; gi++) {
+           if (gi > 0 && gi >= gcnt) break;
+-          const uint2 q2 = q[gi];
+-          const half2 sc2 = __hmul2(decode_scale<SCALE_MODE>(s[gi]), gm2);
+-          half2 bq[8];
+-          dequant8_tm(q2.x, sc2, bq + 0);
+-          dequant8_tm(q2.y, sc2, bq + 4);
+-          const unsigned* B = reinterpret_cast<const unsigned*>(bq);
+ #pragma unroll
+-          for (int bl = 0; bl < RB; bl++) {
+-            // Block 0 always has rows; only later blocks can be empty (block-
+-            // uniform), and keeping block 0 unguarded leaves RB = 1
+-            // branch-free.
+-            if (bl > 0 && bl >= blocks) break;
+-            const uint4 a01 =
+-                *reinterpret_cast<const uint4*>(&xs[warp][bl][r][gi * 16]);
+-            const uint4 a23 =
+-                *reinterpret_cast<const uint4*>(&xs[warp][bl][r][gi * 16 + 8]);
+-            const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+-            const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+-            SKINNY_MMA_8N8K4(c[bl][0], A0[0], A0[1], B[0], B[1]);
+-            SKINNY_MMA_8N8K4(c[bl][1 % NACC], A0[2], A0[3], B[2], B[3]);
+-            SKINNY_MMA_8N8K4(c[bl][2 % NACC], A1[0], A1[1], B[4], B[5]);
+-            SKINNY_MMA_8N8K4(c[bl][3 % NACC], A1[2], A1[3], B[6], B[7]);
++          for (int nt = 0; nt < NT; nt++) {
++            const uint2 q2 = q[gi][nt];
++            const half2 sc2 = __hmul2(decode_scale<SCALE_MODE>(s[gi][nt]), gm2);
++            half2 bq[8];
++            dequant8_tm(q2.x, sc2, bq + 0);
++            dequant8_tm(q2.y, sc2, bq + 4);
++            const unsigned* B = reinterpret_cast<const unsigned*>(bq);
++#pragma unroll
++            for (int bl = 0; bl < RB; bl++) {
++              // Block 0 always has rows; only later blocks can be empty
++              // (block-uniform), and keeping block 0 unguarded leaves RB = 1
++              // branch-free.
++              if (bl > 0 && bl >= blocks) break;
++              const uint4 a01 =
++                  *reinterpret_cast<const uint4*>(&xs[warp][bl][r][gi * 16]);
++              const uint4 a23 = *reinterpret_cast<const uint4*>(
++                  &xs[warp][bl][r][gi * 16 + 8]);
++              const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
++              const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
++              SKINNY_MMA_8N8K4(c[nt][bl], A0[0], A0[1], B[0], B[1]);
++              SKINNY_MMA_8N8K4(c[nt][bl], A0[2], A0[3], B[2], B[3]);
++              SKINNY_MMA_8N8K4(c[nt][bl], A1[0], A1[1], B[4], B[5]);
++              SKINNY_MMA_8N8K4(c[nt][bl], A1[2], A1[3], B[6], B[7]);
++            }
+           }
+         }
+         __syncwarp();  // chunk consumed before the next one overwrites xs
+@@ -380,31 +400,193 @@ __global__ void __launch_bounds__(32 * SPLITK)
+ #pragma unroll
+     for (int bl = 0; bl < RB; bl++) {
+       if (bl > 0 && bl >= blocks) break;  // block-uniform: barriers match
++      if (bl > 0) __syncthreads();        // previous block done reading cs
+ #pragma unroll
+-      for (int a = 1; a < NACC; a++)
+-#pragma unroll
+-        for (int i = 0; i < 8; i++) c[bl][0][i] += c[bl][a][i];
+-      if (bl > 0) __syncthreads();  // previous block done reading cs
++      for (int nt = 0; nt < NT; nt++)
+ #pragma unroll
+-      for (int i = 0; i < 8; i++) {
+-        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+-        const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+-        cs[warp][row * 32 + qp * 8 + col] = c[bl][0][i];
+-      }
++        for (int i = 0; i < 8; i++) {
++          const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
++          const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
++          cs[warp][nt][row * 32 + qp * 8 + col] = c[nt][bl][i];
++        }
+       __syncthreads();
+-      for (int t = threadIdx.x; t < 256; t += blockDim.x) {
++      for (int t = threadIdx.x; t < NT * 256; t += blockDim.x) {
++        const int nt = t >> 8, e2 = t & 255;
+         float v = 0.f;
+ #pragma unroll
+-        for (int w = 0; w < SPLITK; w++) v += cs[w][t];
+-        const int row = bl * MMAX + (t >> 5), col = t & 31;
++        for (int w = 0; w < SPLITK; w++) v += cs[w][nt][e2];
++        const int row = bl * MMAX + (e2 >> 5), col = e2 & 31;
+         if (row < rows)
+-          y_slots[(size_t)slots[row] * N + (size_t)tile * 32 + col] =
++          y_slots[(size_t)slots[row] * N + (size_t)(tile0 + nt) * 32 + col] =
+               __float2half(v);
+       }
+     }
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Grouped MoE kernel on m16n8k8 fragment-order weights (SM75 and later): the
++// routing, grid rows, split-K warps and output of skinny_nvfp4_moe_qpn, with
++// the weights as the 16-row A operand and the expert's rows as the 8-column B
++// operand (mma_fragments_sm70.cuh). A lane's activation fragment is 8 bytes
++// of its own row, so a warp reads each row slice exactly once and needs no
++// shared-memory stage. The next group's codes, scales and activations load
++// while the current group computes (deeper rings measured slower); RB tiles
++// of 8 rows share each weight decode, and NT adjacent 32-column tiles share
++// each activation load. The decoded weights equal the m8n8k4 path's bit for
++// bit; only the tensor core's summation order differs.
++// ---------------------------------------------------------------------------
++
++template <int SPLITK, int SCALE_MODE, int RB, int NT>
++__global__ void __launch_bounds__(32 * SPLITK) skinny_nvfp4_moe_m16n8k8(
++    const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
++    const float* __restrict__ gscales, const half* __restrict__ x,
++    half* __restrict__ y_slots, const int* __restrict__ perm,
++    const int* __restrict__ gids, const int* __restrict__ goff, int N, int K,
++    int topk, int x_slot_major) {
++  constexpr int ROWS = RB * 8;
++  // 36-float rows put the C fragment stores of a warp into 32 distinct banks.
++  constexpr int CS_ROW = 36;
++  __shared__ const half* xrows[ROWS];
++  __shared__ int slots[ROWS];
++  __shared__ float cs[SPLITK][NT][8 * CS_ROW];
++
++  const int grp = blockIdx.y;
++  const int beg = goff[grp];
++  const int cnt = goff[grp + 1] - beg;
++  if (cnt <= 0) return;  // block-uniform: padding group, no weight read
++  const int e = gids[grp];
++
++  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  const int tile0 = blockIdx.x * NT;
++  const int row_group = lane >> 2;
++  const int k_offset = (lane & 3) * 4;
++  const int G = K >> 4, Gq = G / SPLITK;
++  const int g0 = warp * Gq, gend = g0 + Gq;
++  const size_t tile_index = (size_t)e * (N >> 5) + tile0;
++  const uint2* cb =
++      reinterpret_cast<const uint2*>(qcodes) + tile_index * G * 32 + lane;
++  // Four scale bytes per row group: columns row_group + 8j, j = 0..3.
++  const int SG = (SCALE_MODE == SCALE_MXFP4_E8M0_32) ? (G >> 1) : G;
++  const uint32_t* sb = reinterpret_cast<const uint32_t*>(qscales) +
++                       tile_index * SG * 8 + row_group;
++  const half2 gm2 = __float2half2_rn(gscales[e] * 16384.f);
++
++  for (int base = 0; base < cnt; base += ROWS) {
++    const int rows = min(ROWS, cnt - base);
++    const int blocks = (rows + 7) / 8;
++    __syncthreads();  // previous pass done with slots/xrows/cs
++    if (threadIdx.x < ROWS) {
++      const int m = threadIdx.x;
++      const int slot = m < rows ? perm[beg + base + m] : 0;
++      slots[m] = slot;
++      xrows[m] = m < rows ? x + (size_t)(x_slot_major ? slot : slot / topk) * K
++                          : nullptr;
++    }
++    __syncthreads();
++    const half* xr[RB];
++#pragma unroll
++    for (int bl = 0; bl < RB; bl++) xr[bl] = xrows[bl * 8 + row_group];
++
++    float c[NT][RB][2][4];
++#pragma unroll
++    for (int nt = 0; nt < NT; nt++)
++#pragma unroll
++      for (int bl = 0; bl < RB; bl++)
++#pragma unroll
++        for (int t = 0; t < 2; t++)
++#pragma unroll
++          for (int i = 0; i < 4; i++) c[nt][bl][t][i] = 0.f;
++
++    uint2 q_next[NT], a_next[RB];
++    uint32_t s_next[NT];
++    auto load_group = [&](int g) {
++#pragma unroll
++      for (int nt = 0; nt < NT; nt++) {
++        q_next[nt] = __ldcs(cb + ((size_t)nt * G + g) * 32);
++        s_next[nt] =
++            __ldg(sb + ((size_t)nt * SG +
++                        (SCALE_MODE == SCALE_MXFP4_E8M0_32 ? g >> 1 : g)) *
++                           8);
++      }
++#pragma unroll
++      for (int bl = 0; bl < RB; bl++)
++        a_next[bl] =
++            xr[bl] ? *reinterpret_cast<const uint2*>(xr[bl] + g * 16 + k_offset)
++                   : make_uint2(0, 0);
++    };
++    load_group(g0);
++    for (int g = g0; g < gend; g++) {
++      uint2 q[NT], a[RB];
++      uint32_t s[NT];
++#pragma unroll
++      for (int nt = 0; nt < NT; nt++) {
++        q[nt] = q_next[nt];
++        s[nt] = s_next[nt];
++      }
++#pragma unroll
++      for (int bl = 0; bl < RB; bl++) a[bl] = a_next[bl];
++      if (g + 1 < gend) load_group(g + 1);
++
++#pragma unroll
++      for (int nt = 0; nt < NT; nt++) {
++        // Word t holds A tile t: columns 16t + row_group (scale byte 2t) and
++        // 16t + row_group + 8 (scale byte 2t + 1), interleaved per MMA step.
++#pragma unroll
++        for (int t = 0; t < 2; t++) {
++          const half2 s_lo = __hmul2(
++              decode_scale<SCALE_MODE>((uint8_t)(s[nt] >> (16 * t))), gm2);
++          const half2 s_hi = __hmul2(
++              decode_scale<SCALE_MODE>((uint8_t)(s[nt] >> (16 * t + 8))), gm2);
++          half2 v[4];
++          fp4x8_to_half2x4(t ? q[nt].y : q[nt].x, v);
++          v[0] = __hmul2(v[0], s_lo);
++          v[1] = __hmul2(v[1], s_hi);
++          v[2] = __hmul2(v[2], s_lo);
++          v[3] = __hmul2(v[3], s_hi);
++          const uint32_t* w = reinterpret_cast<const uint32_t*>(v);
++#pragma unroll
++          for (int bl = 0; bl < RB; bl++) {
++            if (bl > 0 && bl >= blocks) break;  // block-uniform
++            mma_m16n8k8(c[nt][bl][t], w[0], w[1], a[bl].x);
++            mma_m16n8k8(c[nt][bl][t], w[2], w[3], a[bl].y);
++          }
++        }
++      }
++    }
++
++#pragma unroll
++    for (int bl = 0; bl < RB; bl++) {
++      if (bl > 0 && bl >= blocks) break;  // block-uniform: barriers match
++      if (bl > 0) __syncthreads();        // previous block done reading cs
++      // C of A tile t: column 16t + row_group (+8 for i >= 2), row
++      // (lane & 3) * 2 + (i & 1) of this 8-row block.
++#pragma unroll
++      for (int nt = 0; nt < NT; nt++)
++#pragma unroll
++        for (int t = 0; t < 2; t++)
++#pragma unroll
++          for (int i = 0; i < 4; i++) {
++            const int col = 16 * t + row_group + ((i & 2) ? 8 : 0);
++            const int row = (lane & 3) * 2 + (i & 1);
++            cs[warp][nt][row * CS_ROW + col] = c[nt][bl][t][i];
++          }
++      __syncthreads();
++      for (int idx = threadIdx.x; idx < NT * 256; idx += blockDim.x) {
++        const int nt = idx >> 8, row = (idx >> 5) & 7, col = idx & 31;
++        float v = 0.f;
++#pragma unroll
++        for (int split = 0; split < SPLITK; split++)
++          v += cs[split][nt][row * CS_ROW + col];
++        const int out_row = bl * 8 + row;
++        if (out_row < rows)
++          y_slots[(size_t)slots[out_row] * N + (size_t)(tile0 + nt) * 32 +
++                  col] = __float2half(v);
++      }
++    }
++  }
++}
++
+ // y_slots[S, N] (S = tokens*topk, slot-major) = x[row(slot)] @ W[expert(slot)]
+ // with W in per-expert QPN fragment order (see qpn_prepack).
+ 
+@@ -449,10 +631,17 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+                          torch::Tensor perm, torch::Tensor gids,
+                          torch::Tensor goff, int64_t topk,
+                          torch::Tensor y_slots, bool x_slot_major,
+-                         int64_t num_tokens, int64_t splitk, int64_t nacc,
+-                         int64_t scale_mode) {
++                         int64_t num_tokens, int64_t splitk, int64_t scale_mode,
++                         int64_t fragment_order) {
+   TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
+   const c10::cuda::CUDAGuard device_guard(x.device());
++  TORCH_CHECK(fragment_order == ORDER_M8N8K4 || fragment_order == ORDER_M16N8K8,
++              "fragment_order 0 (m8n8k4) or 1 (m16n8k8)");
++  if (fragment_order == ORDER_M16N8K8) {
++    const cudaDeviceProp* props = at::cuda::getDeviceProperties(x.get_device());
++    TORCH_CHECK(props->major * 10 + props->minor >= 75,
++                "m16n8k8 fragment order needs SM75 or later");
++  }
+   TORCH_CHECK(x.dim() == 2 && y_slots.dim() == 2,
+               "x and output must be matrices");
+   for (const auto& tensor :
+@@ -463,10 +652,6 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+   TORCH_CHECK(num_tokens > 0 && topk > 0 && topk <= 65535,
+               "positive token count and supported routing width are required");
+   TORCH_CHECK(num_tokens <= 65535 / topk, "routing slots exceed CUDA grid-y");
+-  TORCH_CHECK(splitk == 8 || splitk == 10 || splitk == 16,
+-              "unsupported split-K specialization");
+-  TORCH_CHECK(nacc == 1 || (nacc == 2 && splitk != 10),
+-              "unsupported accumulator specialization");
+   TORCH_CHECK(gscales.dim() == 1 && gscales.numel() > 0,
+               "expert scales must be nonempty");
+   TORCH_CHECK(qcodes.is_cuda() && qcodes.dtype() == torch::kUInt8 &&
+@@ -501,18 +686,24 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+               " exceeds the CUDA grid y limit");
+   TORCH_CHECK(K % 64 == 0 && (K / 16) % splitk == 0,
+               "K/16 must split into splitk equal slices");
+-  TORCH_CHECK(N % 32 == 0, "N % 32");
+-  const dim3 grid((unsigned)(N / 32), (unsigned)S);
++  // Both kernels give a CTA two 32-column tiles that share each activation
++  // load (tuning sweeps 2026-10-21: RTX 8000 and V100, DSv4, GLM-5.3 and
++  // Flash-Next expert shapes); four tiles gained at most 4 % in prefill and
++  // lost 3-5 % in decode.
++  constexpr int kColumnTiles = 2;
++  TORCH_CHECK(N % (32 * kColumnTiles) == 0, "skinny MoE needs N % 64");
++  const dim3 grid((unsigned)(N / (32 * kColumnTiles)),
++                  (unsigned)std::min(S, E));
+   auto stream = at::cuda::getCurrentCUDAStream();
+-  // Row blocks per weight load, from the mean rows per expert: one block
+-  // while experts see at most 8 rows (decode), two for prefill chunks. Four
+-  // need ~80 registers (halving the resident blocks per SM) and more shared
+-  // memory than the static 48 KiB for SPLITK 16.
+-  const int64_t mean_rows = (S + E - 1) / E;
+-  const int rb = mean_rows > 8 ? 2 : 1;
+-
+-#define LAUNCH_MOE_QPN_R(SPv, NAv, SMv, RBv)                                \
+-  skinny_nvfp4_moe_qpn<SPv, NAv, SMv, RBv>                                  \
++  // Experts average more than one 8-row tile in prefill chunks.
++  const bool prefill = (S + E - 1) / E > 8;
++
++  if (fragment_order == ORDER_M16N8K8) {
++    // RTX 8000: four 8-row tiles per weight decode in prefill cut the GEMMs
++    // to 0.59-0.68 of the m8n8k4 kernel on the same card; decode (one row
++    // tile) stays at parity. Deeper load rings measured slower.
++#define LAUNCH_MOE_M16N8K8_R(SPv, SMv, RBv)                                 \
++  skinny_nvfp4_moe_m16n8k8<SPv, SMv, RBv, kColumnTiles>                     \
+       <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
+           qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),          \
+           gscales.data_ptr<float>(),                                        \
+@@ -521,48 +712,87 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+           perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
+           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
+ 
+-#define LAUNCH_MOE_QPN_S(SPv, NAv, SMv)   \
+-  do {                                    \
+-    if (rb == 2)                          \
+-      LAUNCH_MOE_QPN_R(SPv, NAv, SMv, 2); \
+-    else                                  \
+-      LAUNCH_MOE_QPN_R(SPv, NAv, SMv, 1); \
++#define LAUNCH_MOE_M16N8K8_S(SPv, SMv)   \
++  do {                                   \
++    if (prefill)                         \
++      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 4); \
++    else                                 \
++      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 1); \
+   } while (0)
+ 
+-#define LAUNCH_MOE_QPN(SPv, NAv)                       \
+-  do {                                                 \
+-    if (scale_mode == SCALE_MXFP4_E8M0_32)             \
+-      LAUNCH_MOE_QPN_S(SPv, NAv, SCALE_MXFP4_E8M0_32); \
+-    else                                               \
+-      LAUNCH_MOE_QPN_S(SPv, NAv, SCALE_NVFP4_FP8_16);  \
++#define LAUNCH_MOE_M16N8K8(SPv)                       \
++  do {                                                \
++    if (scale_mode == SCALE_MXFP4_E8M0_32)            \
++      LAUNCH_MOE_M16N8K8_S(SPv, SCALE_MXFP4_E8M0_32); \
++    else                                              \
++      LAUNCH_MOE_M16N8K8_S(SPv, SCALE_NVFP4_FP8_16);  \
+   } while (0)
+ 
+-  const int key = (int)(splitk * 10 + nacc);
+-  switch (key) {
+-    case 81:
+-      LAUNCH_MOE_QPN(8, 1);
+-      break;
+-    case 82:
+-      LAUNCH_MOE_QPN(8, 2);
++    switch (splitk) {
++      // 4 serves short reductions (K < 2048), whose warps would otherwise get
++      // fewer than 16 groups (grouped_splitk in skinny_sm70_moe.py).
++      case 4:
++        LAUNCH_MOE_M16N8K8(4);
++        break;
++      case 8:
++        LAUNCH_MOE_M16N8K8(8);
++        break;
++      default:
++        TORCH_CHECK(false, "m16n8k8 MoE splitk in {4, 8}");
++    }
++#undef LAUNCH_MOE_M16N8K8
++#undef LAUNCH_MOE_M16N8K8_S
++#undef LAUNCH_MOE_M16N8K8_R
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return;
++  }
++
++  // V100: two 8-row blocks per weight load in prefill (four helped DSv4 by 1 %
++  // and slowed GLM-5.3 by 6 %), with two column tiles 0.87-0.98 of the
++  // one-tile kernel in prefill and 0.80-0.97 in decode.
++#define LAUNCH_MOE_QPN_R(SPv, SMv, RBv)                                     \
++  skinny_nvfp4_moe_qpn<SPv, SMv, RBv, kColumnTiles>                         \
++      <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
++          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),          \
++          gscales.data_ptr<float>(),                                        \
++          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
++          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
++          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
++          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
++
++#define LAUNCH_MOE_QPN_S(SPv, SMv)   \
++  do {                               \
++    if (prefill)                     \
++      LAUNCH_MOE_QPN_R(SPv, SMv, 2); \
++    else                             \
++      LAUNCH_MOE_QPN_R(SPv, SMv, 1); \
++  } while (0)
++
++#define LAUNCH_MOE_QPN(SPv)                       \
++  do {                                            \
++    if (scale_mode == SCALE_MXFP4_E8M0_32)        \
++      LAUNCH_MOE_QPN_S(SPv, SCALE_MXFP4_E8M0_32); \
++    else                                          \
++      LAUNCH_MOE_QPN_S(SPv, SCALE_NVFP4_FP8_16);  \
++  } while (0)
++
++  switch (splitk) {
++    case 8:
++      LAUNCH_MOE_QPN(8);
+       break;
+     // SPLITK 10 serves K = 320 (K/16 = 20 = 10 slices of one 2-group chunk),
+     // e.g. a 640-wide expert intermediate split over TP2, which 8 and 16
+     // cannot divide.
+-    case 101:
+-      LAUNCH_MOE_QPN(10, 1);
+-      break;
+-    case 161:
+-      LAUNCH_MOE_QPN(16, 1);
++    case 10:
++      LAUNCH_MOE_QPN(10);
+       break;
+-    case 162:
+-      LAUNCH_MOE_QPN(16, 2);
++    case 16:
++      LAUNCH_MOE_QPN(16);
+       break;
+     // SPLITK 32 would need more than the 48 KiB of static shared memory for
+     // the per-warp activation stage plus the split-K reduction.
+     default:
+-      TORCH_CHECK(
+-          false,
+-          "moe_qpn (splitk, nacc) in {(8,1), (8,2), (10,1), (16,1), (16,2)}");
++      TORCH_CHECK(false, "m8n8k4 MoE splitk in {8, 10, 16}");
+   }
+ #undef LAUNCH_MOE_QPN
+ #undef LAUNCH_MOE_QPN_S
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index 5751c1eba8..e68a3ef21a 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -757,6 +757,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+   ops.impl("fp8_qpn8_gemm_sm70_out", torch::kCUDA,
+            vllm::sm70::with_policy(&fp8_qpn8_gemm_sm70_out));
+ 
++  ops.def(
++      "fp8_qpn8_mma_sm75_out(Tensor(a!) out, Tensor input, Tensor codes, "
++      "Tensor group_scales, str? native_policy=None ) -> ()");
++  ops.impl("fp8_qpn8_mma_sm75_out", torch::kCUDA,
++           vllm::sm70::with_policy(&fp8_qpn8_mma_sm75_out));
++
+   ops.def(
+       "fp8_qpn8_gemm_ba_split_sm70_out(Tensor(a!) qkv_out, Tensor(b!) "
+       "z_out, Tensor(c!) b_out, Tensor(d!) a_out, Tensor input, Tensor codes, "
+@@ -891,7 +897,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+            vllm::sm70::with_policy(&nvfp4_qpn2_gemm_sm70_out));
+ 
+   // Skinny QPN GEMM and grouped NVFP4/MXFP4 MoE (SM70/SM75), weights
+-  // prepacked in mma.m8n8k4 fragment order.
++  // prepacked in mma.m8n8k4 fragment order; the grouped MoE also runs on
++  // mma.m16n8k8 order (SM75 and later).
+   ops.def(
+       "skinny_qpn_gemm_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
+       "float gscale, int n) -> Tensor");
+@@ -901,7 +908,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "skinny_moe_qpn_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
+       "Tensor gscales, Tensor perm, Tensor gids, Tensor goff, int topk, "
+       "Tensor(a!) y_slots, bool x_slot_major, int num_tokens, int splitk, "
+-      "int nacc, int scale_mode) -> ()");
++      "int scale_mode, int fragment_order) -> ()");
+   ops.impl("skinny_moe_qpn_sm70", torch::kCUDA, &skinny_moe_qpn_sm70);
+ 
+   ops.def(
+diff --git a/tests/kernels/moe/test_skinny_sm70_moe.py b/tests/kernels/moe/test_skinny_sm70_moe.py
+index f96e9e32ef..94d2d186a8 100644
+--- a/tests/kernels/moe/test_skinny_sm70_moe.py
++++ b/tests/kernels/moe/test_skinny_sm70_moe.py
+@@ -12,6 +12,8 @@
+ from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+     Mxfp4SkinnySm70Experts,
+     Nvfp4SkinnySm70Experts,
++    QpnFragmentOrder,
++    _fragment_tables,
+     _ScaleCaches,
+     grouped_splitk,
+     nvfp4_skinny_scale_reason,
+@@ -180,15 +182,16 @@ def test_nvfp4_gate_and_up_require_the_same_global_factor():
+     assert "shared factor" in nvfp4_skinny_scale_reason(g1, torch.ones(2))
+ 
+ 
++@pytest.mark.parametrize("order", list(QpnFragmentOrder))
+ @pytest.mark.parametrize("scale_group", [16, 32])
+-def test_qpn_prepack_only_permutes_the_checkpoint_bytes(scale_group):
++def test_qpn_prepack_only_permutes_the_checkpoint_bytes(scale_group, order):
+     generator = torch.Generator().manual_seed(2)
+     codes = torch.randint(0, 256, (64, 128), generator=generator).to(torch.uint8)
+     scales = torch.randint(0, 256, (64, 256 // scale_group), generator=generator).to(
+         torch.uint8
+     )
+ 
+-    qc, qs = qpn_prepack(codes, scales, scale_group)
++    qc, qs = qpn_prepack(codes, scales, scale_group, order)
+ 
+     nibbles = torch.cat([codes & 0xF, codes >> 4]).flatten()
+     packed_nibbles = torch.cat([qc & 0xF, qc >> 4])
+@@ -196,11 +199,32 @@ def test_qpn_prepack_only_permutes_the_checkpoint_bytes(scale_group):
+     assert torch.equal(torch.sort(qs).values, torch.sort(scales.flatten()).values)
+ 
+ 
++@pytest.mark.parametrize("order", list(QpnFragmentOrder))
++def test_fragment_tables_place_every_code_and_scale_once(order):
++    code_col, code_k, scale_col = _fragment_tables(order, torch.device("cpu"))
++    positions = (code_col * 16 + code_k).flatten()
++    assert torch.equal(torch.sort(positions).values, torch.arange(512))
++    assert torch.equal(torch.sort(scale_col).values, torch.arange(32))
++
++
++def test_m16n8k8_scale_bytes_follow_their_lanes_columns():
++    # A lane reads the four scale bytes of its row group, which must belong to
++    # the columns its code words hold.
++    code_col, _, scale_col = _fragment_tables(
++        QpnFragmentOrder.M16N8K8, torch.device("cpu")
++    )
++    for lane in range(32):
++        row_group = scale_col[(lane >> 2) * 4 : (lane >> 2) * 4 + 4]
++        assert set(code_col[lane].tolist()) == set(row_group.tolist())
++
++
+ def test_qpn_prepack_refuses_shapes_the_kernels_do_not_tile():
+     with pytest.raises(ValueError, match="N % 32"):
+         qpn_prepack(
+             torch.zeros(48, 64, dtype=torch.uint8),
+             torch.zeros(48, 8, dtype=torch.uint8),
++            16,
++            QpnFragmentOrder.M8N8K4,
+         )
+ 
+ 
+@@ -210,16 +234,39 @@ def test_backend_is_registered_for_automatic_selection():
+     assert Mxfp4MoeBackend.SM70_SKINNY in _get_priority_backends()
+ 
+ 
+-@pytest.mark.parametrize("k", [128, 256, 320, 512, 640, 1024, 4096, 5120])
+-def test_grouped_launch_uses_actual_alignment(k):
+-    split = grouped_splitk(k, 16)
++@pytest.mark.parametrize("order", list(QpnFragmentOrder))
++@pytest.mark.parametrize("k", [128, 256, 320, 512, 640, 1024, 2048, 4096, 5120])
++def test_grouped_launch_uses_actual_alignment(k, order):
++    split = grouped_splitk(k, order)
+     assert (k // 16) % split == 0
+ 
+ 
+-@pytest.mark.parametrize("k", [0, 64, 192, 319])
+-def test_grouped_launch_rejects_unsupported_alignment(k):
++def test_m16n8k8_split_keeps_sixteen_groups_per_warp_where_it_can():
++    order = QpnFragmentOrder.M16N8K8
++    assert grouped_splitk(4096, order) == 8
++    assert grouped_splitk(2048, order) == 8
++    assert grouped_splitk(640, order) == 4
++    assert grouped_splitk(320, order) == 4
++
++
++def test_m8n8k4_split_prefers_eight_warps():
++    order = QpnFragmentOrder.M8N8K4
++    assert grouped_splitk(4096, order) == 8
++    assert grouped_splitk(2048, order) == 8
++    assert grouped_splitk(640, order) == 8
++    # K/16 = 20: 8 does not divide, 16 neither, 10 does
++    assert grouped_splitk(320, order) == 10
++
++
++@pytest.mark.parametrize(
++    "order,k",
++    [(order, k) for order in QpnFragmentOrder for k in (0, 319)]
++    # Volta's 8, 10 and 16 warps cannot split 4 or 12 groups; Turing's 4 can.
++    + [(QpnFragmentOrder.M8N8K4, 64), (QpnFragmentOrder.M8N8K4, 192)],
++)
++def test_grouped_launch_rejects_unsupported_alignment(k, order):
+     with pytest.raises(ValueError):
+-        grouped_splitk(k, 16)
++        grouped_splitk(k, order)
+ 
+ 
+ @pytest.mark.parametrize("scale_mode", [0, 1])
+@@ -263,8 +310,9 @@ def grouped(output, hidden_states, *args):
+     [
+         ({}, None),
+         ({"hidden_dim": 320, "intermediate_size_per_partition": 640}, None),
+-        ({"hidden_dim": 192}, "hidden dimension"),
+-        ({"intermediate_size_per_partition": 64}, "intermediate dimension"),
++        # Not a multiple of 64: no fragment order can tile these.
++        ({"hidden_dim": 160}, "hidden dimension"),
++        ({"intermediate_size_per_partition": 96}, "intermediate dimension"),
+         ({"in_dtype": torch.bfloat16}, "FP16"),
+         ({"has_bias": True}, "expert bias"),
+         ({"swiglu_limit": 7.0}, None),
+@@ -343,6 +391,15 @@ def device(request) -> torch.device:
+     return torch.device("cuda", devices[0])
+ 
+ 
++@pytest.fixture(params=list(QpnFragmentOrder), ids=lambda o: o.name.lower())
++def order(request, device) -> QpnFragmentOrder:
++    if request.param == QpnFragmentOrder.M16N8K8 and not (
++        current_platform.has_device_capability(75, device_id=device.index)
++    ):
++        pytest.skip("the m16n8k8 MMA needs SM75 or later")
++    return request.param
++
++
+ def _nvfp4_expert(generator, rows, cols):
+     codes = torch.randint(0, 256, (rows, cols // 2), generator=generator)
+     scales = (torch.rand(rows, cols // 16, generator=generator) * 1.5 + 0.25).to(
+@@ -365,15 +422,19 @@ def test_qpn_gemm_matches_the_dequantized_weights(device, m):
+     x = torch.randn(m, cols, generator=generator).to(torch.float16) * 0.1
+     reference = x.float() @ _nvfp4_weight(codes, scales, global_scale).T
+ 
+-    qc, qs = qpn_prepack(codes.to(device), scales.to(device))
++    qc, qs = qpn_prepack(
++        codes.to(device), scales.to(device), 16, QpnFragmentOrder.M8N8K4
++    )
+     out = torch.ops._C.skinny_qpn_gemm_sm70(x.to(device), qc, qs, global_scale, rows)
+ 
+     torch.testing.assert_close(out.float().cpu(), reference, rtol=2e-2, atol=2e-3)
+ 
+ 
+-def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device):
++@pytest.mark.parametrize("tokens", [5, 40])
++@pytest.mark.parametrize("cols", [256, 320, 4096])
++def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device, order, cols, tokens):
+     generator = torch.Generator().manual_seed(1)
+-    experts, rows, cols, tokens = 2, 64, 256, 5
++    experts, rows = 2, 64
+     codes = torch.randint(0, 256, (experts, rows, cols // 2), generator=generator)
+     codes = codes.to(torch.uint8)
+     scales = (
+@@ -392,7 +453,7 @@ def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device):
+     w = codes.to(device)
+     s = rebased.to(device)
+     for e in range(experts):
+-        qc, qs = qpn_prepack(w[e], s[e], 32)
++        qc, qs = qpn_prepack(w[e], s[e], 32, order)
+         w[e].view(-1).copy_(qc)
+         s[e].view(-1).copy_(qs)
+ 
+@@ -415,9 +476,9 @@ def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device):
+             out,
+             False,
+             tokens,
+-            16,
+-            1,
++            grouped_splitk(cols, order),
+             1,
++            order,
+         )
+         torch.testing.assert_close(
+             out.float().cpu(), reference[e], rtol=2e-2, atol=2e-2
+@@ -451,10 +512,11 @@ def _reference_moe(x, w13, s13, w2, s2, g1, g2, topk_weights, topk_ids):
+     return out
+ 
+ 
+-def _skinny_experts(device, w13, s13, w2, s2, g1, g2):
++def _skinny_experts(device, order, w13, s13, w2, s2, g1, g2):
+     experts = Nvfp4SkinnySm70Experts.__new__(Nvfp4SkinnySm70Experts)
+     experts.quant_config = SimpleNamespace(gemm1_clamp_limit=None)
+     experts._scale_mode = 0
++    experts._fragment_order = order
+     experts._w1_block_scales = s13
+     experts._w2_block_scales = s2
+     experts._scale_caches = _ScaleCaches(
+@@ -470,7 +532,7 @@ def _skinny_experts(device, w13, s13, w2, s2, g1, g2):
+ 
+ @pytest.mark.parametrize("path", ["grouped", "dispatch"])
+ @pytest.mark.parametrize("num_tokens", [1, 6, 40])
+-def test_both_serving_paths_match_the_reference(device, path, num_tokens):
++def test_both_serving_paths_match_the_reference(device, order, path, num_tokens):
+     generator = torch.Generator().manual_seed(4)
+     num_experts, hidden_size, intermediate, top_k = 8, 256, 128, 3
+     w13, s13, w2, s2, g1, g2 = _nvfp4_moe(
+@@ -487,10 +549,10 @@ def test_both_serving_paths_match_the_reference(device, path, num_tokens):
+     w13_d, s13_d, w2_d, s2_d = (t.to(device) for t in (w13, s13, w2, s2))
+     for e in range(num_experts):
+         for w, s in ((w13_d, s13_d), (w2_d, s2_d)):
+-            qc, qs = qpn_prepack(w[e], s[e])
++            qc, qs = qpn_prepack(w[e], s[e], 16, order)
+             w[e].view(-1).copy_(qc)
+             s[e].view(-1).copy_(qs)
+-    experts = _skinny_experts(device, w13_d, s13_d, w2_d, s2_d, g1, g2)
++    experts = _skinny_experts(device, order, w13_d, s13_d, w2_d, s2_d, g1, g2)
+     output = torch.empty(num_tokens, hidden_size, dtype=torch.float16, device=device)
+     args = dict(
+         output=output,
+@@ -525,7 +587,8 @@ def test_both_serving_paths_match_the_reference(device, path, num_tokens):
+     )
+ 
+ 
+-def test_large_mxfp4_dispatch_matches_reference(device):
++@pytest.mark.parametrize("skewed", [False, True], ids=["uniform", "skewed"])
++def test_large_mxfp4_dispatch_matches_reference(device, order, skewed):
+     generator = torch.Generator().manual_seed(42)
+     tokens, experts_count, hidden, intermediate, top_k = 513, 4, 256, 128, 2
+     w13 = torch.randint(
+@@ -562,7 +625,17 @@ def test_large_mxfp4_dispatch_matches_reference(device):
+     nv_s2 = _pow2(s2).repeat_interleave(2, -1).to(torch.float8_e4m3fn).view(torch.uint8)
+     global_scales = torch.ones(experts_count)
+     x = (torch.randn(tokens, hidden, generator=generator) * 0.1).half()
+-    ids = torch.randint(experts_count, (tokens, top_k), generator=generator)
++    if skewed:
++        # A popular expert spread over many prefill row blocks next to a rare
++        # one in a single partial block, as real routers skew.
++        popularity = torch.tensor([0.85, 0.12, 0.027, 0.003])
++        ids = torch.multinomial(
++            popularity.expand(tokens, -1), top_k, generator=generator
++        )
++        rows = torch.bincount(ids.reshape(-1), minlength=experts_count)
++        assert rows.max() > 4 * 32 and 0 < rows.min() < 16
++    else:
++        ids = torch.randint(experts_count, (tokens, top_k), generator=generator)
+     weights = torch.rand(tokens, top_k, generator=generator)
+     reference = _reference_moe(
+         x, w13, nv_s13, w2, nv_s2, global_scales, global_scales, weights, ids
+@@ -570,10 +643,12 @@ def test_large_mxfp4_dispatch_matches_reference(device):
+     w13, s13, w2, s2 = (t.to(device) for t in (w13, s13, w2, s2))
+     for e in range(experts_count):
+         for w, s in ((w13, s13), (w2, s2)):
+-            qc, qs = qpn_prepack(w[e], s[e], 32)
++            qc, qs = qpn_prepack(w[e], s[e], 32, order)
+             w[e].view(-1).copy_(qc)
+             s[e].view(-1).copy_(qs)
+-    experts = _skinny_experts(device, w13, s13, w2, s2, global_scales, global_scales)
++    experts = _skinny_experts(
++        device, order, w13, s13, w2, s2, global_scales, global_scales
++    )
+     experts._scale_mode = 1
+     output = torch.empty_like(x, device=device)
+     experts.apply(
+diff --git a/tests/kernels/quantization/test_sm70_qpn8_block_fp8.py b/tests/kernels/quantization/test_sm70_qpn8_block_fp8.py
+index a9a7484340..0cdbcb9c3e 100644
+--- a/tests/kernels/quantization/test_sm70_qpn8_block_fp8.py
++++ b/tests/kernels/quantization/test_sm70_qpn8_block_fp8.py
+@@ -220,3 +220,58 @@ def test_volta_turbomind_copy_follows_decode_rows(
+         layer
+     )
+     assert hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight") == copy
++
++
++@pytest.mark.parametrize("m", [1, 6, 8])
++def test_turing_decode_keeps_the_packed_gemm(default_vllm_config, m):
++    # Up to M=8 the packed m8n8k4 GEMM is faster than the tensor-core GEMM on
++    # most projection shapes, so Turing decode keeps it, bit for bit.
++    if torch.cuda.get_device_capability()[0:2] != (7, 5):
++        pytest.skip("the tensor-core GEMM runs on Turing only")
++    from vllm import _sm70_ops as ops
++
++    layer, _ = _layer(1536, 4096)
++    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096))
++    kernel.process_weights_after_loading(layer)
++    assert layer._qpn8_sm75_mma
++    x = torch.randn(m, 4096, device="cuda", dtype=torch.float16) * 0.1
++    expected = torch.empty((m, 1536), device="cuda", dtype=torch.float16)
++    split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
++    ops.fp8_qpn8_gemm_sm70_out(
++        expected,
++        x,
++        layer._sm70_block_fp8_qpn8_packed_codes,
++        layer._sm70_block_fp8_qpn8_packed_scales,
++        split_k,
++        accumulator_chains,
++        True,
++        prefetch_codes,
++    )
++    torch.testing.assert_close(kernel.apply_weights(layer, x), expected, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize(("n", "k"), [(1536, 4096), (5120, 3072), (17408, 5120)])
++@pytest.mark.parametrize("m", [9, 16, 17, 40, 64, 100, 300, 2048])
++def test_turing_large_m_runs_the_tensor_core_gemm(default_vllm_config, n, k, m):
++    # Above M=8 Turing decodes the packed codes inside an m16n8k8 GEMM instead
++    # of reconstructing the whole FP16 weight on every call. Its B operand is
++    # the dense reconstruction bit for bit; only the FP32 summation differs.
++    if torch.cuda.get_device_capability()[0:2] != (7, 5):
++        pytest.skip("the tensor-core GEMM runs on Turing only")
++    from vllm import _sm70_ops as ops
++
++    layer, _ = _layer(n, k)
++    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(n, k))
++    kernel.process_weights_after_loading(layer)
++    assert layer._qpn8_sm75_mma
++    codes = layer._sm70_block_fp8_qpn8_packed_codes
++    dense = torch.empty(codes.shape, device="cuda", dtype=torch.float16)
++    ops.fp8_qpn8_dequantize_sm70_out(
++        dense, codes, layer._sm70_block_fp8_qpn8_packed_scales
++    )
++    x = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.1
++    y = kernel.apply_weights(layer, x)
++    expected = x.double() @ dense.double()
++    error = ((y.double() - expected).norm() / expected.norm()).item()
++    cublas_error = (torch.mm(x, dense).double() - expected).norm() / expected.norm()
++    assert error < 2 * cublas_error.item() + 1e-6
+diff --git a/tests/quantization/test_block_fp8_qpn8_capabilities.py b/tests/quantization/test_block_fp8_qpn8_capabilities.py
+index c1bf1025dd..7de1fed5cc 100644
+--- a/tests/quantization/test_block_fp8_qpn8_capabilities.py
++++ b/tests/quantization/test_block_fp8_qpn8_capabilities.py
+@@ -28,8 +28,12 @@
+ def native_contract(monkeypatch):
+     monkeypatch.setattr(linear.current_platform, "_enum", PlatformEnum.CUDA)
+     monkeypatch.setattr(linear.current_platform, "is_cuda", lambda: True)
++    # can_implement asks the capability of the worker's own device.
++    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+     monkeypatch.setattr(
+-        linear.current_platform, "get_device_capability", lambda: DeviceCapability(7, 0)
++        linear.current_platform,
++        "get_device_capability",
++        lambda device_id=0: DeviceCapability(7, 0),
+     )
+     ops = SimpleNamespace(
+         fp8_qpn8_prepare_sm70=lambda: None,
+diff --git a/tests/quantization/test_turing_qpn_kernel_selection.py b/tests/quantization/test_turing_qpn_kernel_selection.py
+index 40020afc0d..d85f547c83 100644
+--- a/tests/quantization/test_turing_qpn_kernel_selection.py
++++ b/tests/quantization/test_turing_qpn_kernel_selection.py
+@@ -313,13 +313,80 @@ def allocate(tensor, shape, **kwargs):
+     )
+     x = torch.empty(9, 128, dtype=torch.float16)
+     for _ in range(2):
+-        qpn._turing_fp8_qpn8_linear(x, torch.empty(0), torch.empty(0), 32, 8, 2, False)
++        qpn._turing_fp8_qpn8_linear(
++            x, torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
++        )
+     workspaces = [tensor for tensor in allocations if tensor.shape == (128, 32)]
+     assert len(workspaces) == 2
+     assert dispatched == [tensor.data_ptr() for tensor in workspaces]
+     assert dispatched[0] != dispatched[1]
+     dispatched.clear()
+     assert qpn._turing_fp8_qpn8_linear(
+-        x[:0], torch.empty(0), torch.empty(0), 32, 8, 2, False
++        x[:0], torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
+     ).shape == (0, 32)
+     assert dispatched == []
++
++
++@pytest.mark.parametrize(
++    ("sms", "threads", "k", "n", "split_k", "expected"),
++    [
++        # RTX 8000, 160 CTAs spill 16 past the 144 split-16 slots: one wave at
++        # split 8.
++        (72, 1024, 3072, 5120, 16, 8),
++        (72, 1024, 8704, 5120, 16, 8),
++        # 224 CTAs keep 80 in the second wave, so split 16 stays.
++        (72, 1024, 5120, 7168, 16, 16),
++        # Grids within one wave keep their split, small ones included.
++        (72, 1024, 4096, 512, 16, 16),
++        (72, 1024, 4096, 1024, 16, 16),
++        (72, 1024, 1024, 4096, 16, 16),
++        # Only split 16 is narrowed.
++        (72, 1024, 1536, 5376, 12, 12),
++        # V100: 320 split-16 slots hold 160 CTAs, split 8 loses on spills.
++        (80, 2048, 3072, 5120, 16, 16),
++        (80, 2048, 4096, 10752, 16, 16),
++        (80, 2048, 4096, 1024, 16, 16),
++    ],
++)
++def test_qpn8_split_k_follows_device_occupancy(
++    monkeypatch, sms, threads, k, n, split_k, expected
++):
++    from vllm.model_executor.layers.quantization import sm70_turbomind as tm
++
++    properties = NS(multi_processor_count=sms, max_threads_per_multi_processor=threads)
++    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: properties)
++    device = torch.device("cuda", 0)
++    assert tm.fp8_qpn8_occupancy_split_k(k, n, split_k, device) == expected
++
++
++def test_qpn8_per_tensor_launch_config_is_the_table_split():
++    from vllm.model_executor.layers.quantization import sm70_turbomind as tm
++
++    assert tm.fp8_qpn8_launch_config(4096) == (16, 2, False)
++    assert tm.fp8_qpn8_launch_config(576) == (12, 2, False)
++
++
++def test_qpn8_per_tensor_op_picks_the_split_by_m(monkeypatch):
++    from vllm import _sm70_ops as ops
++
++    # RTX 8000, K 3072 / N 5120: split 8 fits the M <= 8 grid into one wave;
++    # the M16 and M32 bodies keep the table split (M=17..32 takes 12 or 16).
++    splits = []
++    monkeypatch.setattr(
++        ops,
++        "fp8_qpn8_dispatch_sm70_out",
++        lambda out, ptr, x, codes, scales, split_k, *rest: splits.append(split_k),
++    )
++    for m in (1, 8, 9, 16, 17, 32):
++        x = torch.empty(m, 128, dtype=torch.float16)
++        qpn._turing_fp8_qpn8_linear(
++            x, torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
++        )
++    assert splits == [
++        8,
++        8,
++        16,
++        16,
++        16,
++        16,
++    ]
+diff --git a/vllm/_sm70/linear.py b/vllm/_sm70/linear.py
+index 9acd33fd4b..fa3677c31f 100644
+--- a/vllm/_sm70/linear.py
++++ b/vllm/_sm70/linear.py
+@@ -893,6 +893,41 @@ def _fp8_qpn8_gemm_sm70_out_fake(
+         return None
+ 
+ 
++def fp8_qpn8_mma_sm75_out(
++    out: torch.Tensor,
++    input: torch.Tensor,
++    codes: torch.Tensor,
++    group_scales: torch.Tensor,
++    native_policy: tuple[str, ...] = (),
++) -> None:
++    """Run the SM75 tensor-core GEMM on QPN8 block-FP8 codes into ``out``.
++
++    Turing only; the operator picks its tile and split-K from M, N, K and
++    the device's SM count.
++    """
++    call_native(
++        _op("fp8_qpn8_mma_sm75_out"),
++        native_policy,
++        out,
++        input,
++        codes,
++        group_scales,
++    )
++
++
++if hasattr(torch.ops._C, "fp8_qpn8_mma_sm75_out"):
++
++    @register_fake("_C::fp8_qpn8_mma_sm75_out")
++    def _fp8_qpn8_mma_sm75_out_fake(
++        out: torch.Tensor,
++        input: torch.Tensor,
++        codes: torch.Tensor,
++        group_scales: torch.Tensor,
++        native_policy: tuple[str, ...] = (),
++    ) -> None:
++        return None
++
++
+ def fp8_qpn8_gemm_ba_split_sm70_out(
+     qkv_out: torch.Tensor,
+     z_out: torch.Tensor,
+diff --git a/vllm/_sm70/policy.py b/vllm/_sm70/policy.py
+index 6d5150912c..038f0e1543 100644
+--- a/vllm/_sm70/policy.py
++++ b/vllm/_sm70/policy.py
+@@ -61,6 +61,7 @@
+     "fp8_qpn8_gemm_ba_split_sm70_out",
+     "fp8_qpn8_gemm_sm70_out",
+     "fp8_qpn8_hc_dispatch_sm70_out",
++    "fp8_qpn8_mma_sm75_out",
+     "fp8_qpn8_prefill_sm70_out",
+     "fp8_qpn8_prepare_sm70",
+     "fp8_sm70_dequantize_out",
+diff --git a/vllm/_sm70_ops.py b/vllm/_sm70_ops.py
+index 07485bc7e4..faa0645172 100644
+--- a/vllm/_sm70_ops.py
++++ b/vllm/_sm70_ops.py
+@@ -62,6 +62,7 @@
+     fp8_qpn8_gemm_ba_split_sm70_out,
+     fp8_qpn8_gemm_sm70_out,
+     fp8_qpn8_hc_dispatch_sm70_out,
++    fp8_qpn8_mma_sm75_out,
+     fp8_qpn8_prefill_sm70_out,
+     fp8_qpn8_prepare_sm70,
+     fp8_sm70_dequantize_out,
+@@ -221,6 +222,7 @@
+     "fp8_qpn8_gemm_ba_split_sm70_out",
+     "fp8_qpn8_gemm_sm70_out",
+     "fp8_qpn8_hc_dispatch_sm70_out",
++    "fp8_qpn8_mma_sm75_out",
+     "fp8_qpn8_prefill_sm70_out",
+     "fp8_qpn8_prepare_sm70",
+     "fp8_sm70_dequantize_out",
+diff --git a/vllm/model_executor/kernels/linear/qpn/fp8_block.py b/vllm/model_executor/kernels/linear/qpn/fp8_block.py
+index 2eb76437f2..5fc735c313 100644
+--- a/vllm/model_executor/kernels/linear/qpn/fp8_block.py
++++ b/vllm/model_executor/kernels/linear/qpn/fp8_block.py
+@@ -7,13 +7,13 @@
+ N/K, and FP16 activations/output on Volta and Turing. KernelConfig owns the
+ policy; no model identity or parallel layout limits this admission.
+ 
+-M=0 returns an empty output. M=1..8 uses packed GEMM. Volta retains its
+-TurboMind layout for larger M, avoiding a full dense reconstruction on short
+-prefills, when decode can exceed M=8 or
+-kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill asks for it.
+-Turing, and Volta without that second layout, use invocation-private
+-dense scratch for the existing FP16 prefill operator. Native arithmetic is
+-unchanged.
++M=0 returns an empty output. M=1..8 runs through the packed m8n8k4 GEMM;
++Turing runs M=9..512 through an m16n8k8 tensor-core GEMM that decodes the
++packed codes on the fly. Volta retains its TurboMind layout for
++larger M, avoiding a full dense reconstruction on short prefills, when decode
++can exceed M=8 or kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill
++asks for it. Larger M otherwise uses invocation-private dense scratch for the
++FP16 prefill operator.
+ """
+ 
+ from collections.abc import Sequence
+@@ -37,6 +37,9 @@
+     flatten_linear_input,
+     restore_linear_output,
+ )
++from vllm.model_executor.layers.quantization.sm70_turbomind import (
++    fp8_qpn8_occupancy_split_k,
++)
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     kFp8Static128BlockSym,
+ )
+@@ -44,6 +47,13 @@
+ 
+ # Block-scale QPN8 GEMM supports M up to this bound; larger M uses a fallback.
+ _QPN8_MAX_M = 8
++# Turing's tensor-core GEMM on the packed codes runs M above _QPN8_MAX_M up to
++# this bound. Up to M=8 the packed m8n8k4 GEMM is faster on most projection
++# shapes (CUDA-graph replay, Quadro RTX 8000, 2026-10-20: the tensor-core GEMM
++# took 1.01-1.28x its time on 10 of 13 DeepSeek-V4 and Qwen3.8-27B shapes,
++# 0.78-1.02x on the other three, and 0.16-0.60x at M=16..64); above this bound
++# the dense reconstruction + cuBLAS is faster (1.15-1.75x at M>=1024).
++_SM75_MMA_MAX_M = 512
+ logger = init_logger(__name__)
+ 
+ 
+@@ -53,7 +63,7 @@
+     schema="(Tensor x, Tensor codes, Tensor group_scales, int split_k, "
+     "int accumulator_chains, bool prefetch_codes, Tensor? fallback_weight=None, "
+     "Tensor? fallback_scales=None, int fallback_k_ld=0, int fallback_q_ld=0, "
+-    "str[]? native_policy=None) -> Tensor",
++    "str[]? native_policy=None, bool sm75_mma=False) -> Tensor",
+ )
+ def _qpn8_native_linear(
+     x: torch.Tensor,
+@@ -67,6 +77,7 @@ def _qpn8_native_linear(
+     fallback_k_ld: int = 0,
+     fallback_q_ld: int = 0,
+     native_policy: list[str] | None = None,
++    sm75_mma: bool = False,
+ ) -> torch.Tensor:
+     # The M decision stays inside the opaque op: a compiled graph covers a
+     # dynamic M range, so a Python branch traced at small M would be reused
+@@ -89,6 +100,16 @@ def _qpn8_native_linear(
+             prefetch_codes,
+         )
+         return out
++    if sm75_mma and x.shape[0] <= _SM75_MMA_MAX_M:
++        call_native(
++            sm70_ops.fp8_qpn8_mma_sm75_out,
++            native_policy,
++            out,
++            x,
++            codes,
++            group_scales,
++        )
++        return out
+     if fallback_weight is not None:
+         call_native(
+             sm70_ops.fp8_gemm_sm70_out,
+@@ -130,6 +151,7 @@ def _qpn8_native_linear_fake(
+     fallback_k_ld=0,
+     fallback_q_ld=0,
+     native_policy=None,
++    sm75_mma=False,
+ ):
+     return x.new_empty((x.shape[0], codes.shape[1]))
+ 
+@@ -181,15 +203,19 @@ def can_implement(cls, config):
+         n, k = config.weight_shape
+         if n <= 0 or k <= 0 or n % 128 or k % 128:
+             return False, f"requires positive N,K divisible by 128, got ({n},{k})"
+-        missing = [
+-            name
+-            for name in (
+-                "fp8_qpn8_prepare_sm70",
+-                "fp8_qpn8_gemm_sm70_out",
+-                "fp8_qpn8_prefill_sm70_out",
+-            )
+-            if not hasattr(torch.ops._C, name)
++        required = [
++            "fp8_qpn8_prepare_sm70",
++            "fp8_qpn8_gemm_sm70_out",
++            "fp8_qpn8_prefill_sm70_out",
+         ]
++        # The worker's own device: on a node that mixes card generations,
++        # device 0 answers for another card.
++        capability = current_platform.get_device_capability(
++            torch.accelerator.current_device_index()
++        )
++        if capability is not None and capability.to_int() == 75:
++            required.append("fp8_qpn8_mma_sm75_out")
++        missing = [name for name in required if not hasattr(torch.ops._C, name)]
+         if missing:
+             return False, f"missing native operators: {missing}"
+         return True, None
+@@ -238,7 +264,8 @@ def process_weights_after_loading(self, layer: torch.nn.Module):
+         layer.register_buffer(
+             "_sm70_block_fp8_qpn8_packed_scales", group_scales, persistent=False
+         )
+-        capability = current_platform.get_device_capability()
++        capability = current_platform.get_device_capability(codes.device.index)
++        layer._qpn8_sm75_mma = capability is not None and capability.to_int() == 75
+         if (
+             capability is not None
+             and capability.to_int() in (70, 72)
+@@ -255,7 +282,13 @@ def process_weights_after_loading(self, layer: torch.nn.Module):
+             )
+             layer._qpn8_fallback_k_ld = int(metadata[0].item())
+             layer._qpn8_fallback_q_ld = int(metadata[1].item())
+-        if hasattr(layer, "_qpn8_fallback_k_ld"):
++        if layer._qpn8_sm75_mma:
++            logger.info_once(
++                "Block FP8 QPN8 on SM75: M=1..8 uses the packed decode GEMM, "
++                "M=9..512 the tensor-core GEMM on the packed codes, larger M "
++                "the FP16 prefill."
++            )
++        elif hasattr(layer, "_qpn8_fallback_k_ld"):
+             logger.info_once(
+                 "Block FP8 QPN8 native GEMM supports M=1..8; larger M uses a "
+                 "second, TurboMind-packed copy of each weight. Set "
+@@ -268,7 +301,14 @@ def process_weights_after_loading(self, layer: torch.nn.Module):
+                 "FP16 prefill, which needs no second copy of the weights."
+             )
+         layer._qpn8_out_features = n
+-        layer._qpn8_cfg = _sm70_fp8_qpn8_config(k_dim, n_dim, False)
++        split_k, accumulator_chains, prefetch_codes = _sm70_fp8_qpn8_config(
++            k_dim, n_dim, False
++        )
++        layer._qpn8_cfg = (
++            fp8_qpn8_occupancy_split_k(k_dim, n_dim, split_k, codes.device),
++            accumulator_chains,
++            prefetch_codes,
++        )
+         layer.sm70_fp8_turbomind = True
+         # The startup memory profile accounts for both packed layouts on
+         # Volta. Raw checkpoint weights are no longer resident.
+@@ -303,6 +343,7 @@ def apply_weights(
+             getattr(layer, "_qpn8_fallback_k_ld", 0),
+             getattr(layer, "_qpn8_fallback_q_ld", 0),
+             self.native_ops.arguments,
++            layer._qpn8_sm75_mma,
+         )
+         if bias is not None:
+             y = y + bias
+diff --git a/vllm/model_executor/kernels/linear/qpn/pre_ampere.py b/vllm/model_executor/kernels/linear/qpn/pre_ampere.py
+index eb1ac14611..1399d9a80d 100644
+--- a/vllm/model_executor/kernels/linear/qpn/pre_ampere.py
++++ b/vllm/model_executor/kernels/linear/qpn/pre_ampere.py
+@@ -150,6 +150,7 @@ def _turing_fp8_qpn8_linear(
+     scales: torch.Tensor,
+     n: int,
+     split_k: int,
++    decode_split_k: int,
+     chains: int,
+     prefetch: bool,
+ ) -> torch.Tensor:
+@@ -167,7 +168,12 @@ def _turing_fp8_qpn8_linear(
+         x,
+         codes,
+         scales,
+-        split_k,
++        # Chosen here, inside the opaque operation: a shape test in the caller
++        # would be traced once under torch.compile and kept for every M. The
++        # occupancy-fitted split was measured for the M <= 8 launch only; the
++        # M16 and M32 bodies take the table split (the native M=17..32
++        # candidate admits split-K 12 or 16).
++        decode_split_k if x.shape[0] <= tm.QPN8_OCCUPANCY_MAX_M else split_k,
+         chains,
+         prefetch,
+         False,
+@@ -181,6 +187,7 @@ def _turing_fp8_qpn8_linear_fake(
+     scales: torch.Tensor,
+     n: int,
+     split_k: int,
++    decode_split_k: int,
+     chains: int,
+     prefetch: bool,
+ ) -> torch.Tensor:
+diff --git a/vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py b/vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py
+index aef7157d20..317539ba33 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py
+@@ -3,7 +3,10 @@
+ """Grouped NVFP4 and MXFP4 MoE over the skinny QPN kernels (SM70/SM75).
+ 
+ The backend oracle admits compatible configurations by default. Expert weights
+-are permuted in place into mma.m8n8k4 fragment order at load time. Device-side
++are permuted in place at load time into the fragment order of the card's
++tensor-core MMA: mma.m8n8k4 on SM70, mma.m16n8k8 from SM75 on, which Turing
++runs at twice its m8n8k4 rate. Each layer's weights live on one card, so one
++order per card covers every serving path. Device-side
+ routing handles both scale formats; chunking bounds native CUDA grid dimensions
+ and temporary bytes without a fixed token or concurrency admission limit.
+ 
+@@ -13,6 +16,7 @@
+ """
+ 
+ from dataclasses import dataclass
++from enum import IntEnum
+ 
+ import torch
+ 
+@@ -40,14 +44,72 @@
+ _QPN_MAX_M = 16
+ 
+ 
+-def grouped_splitk(k: int, preferred: int) -> int:
+-    """Choose only launch specializations that divide the actual K groups."""
+-    for split in dict.fromkeys((preferred, 16, 8, 10)):
++class QpnFragmentOrder(IntEnum):
++    """Register order of the packed expert weights, one per MMA shape.
++
++    The values are the native operator's ``fragment_order`` argument.
++    """
++
++    M8N8K4 = 0
++    M16N8K8 = 1
++
++
++def qpn_fragment_order(device_id: int) -> QpnFragmentOrder:
++    """The order the given card's kernels read: m16n8k8 where the card has it."""
++    if current_platform.has_device_capability(75, device_id=device_id):
++        return QpnFragmentOrder.M16N8K8
++    return QpnFragmentOrder.M8N8K4
++
++
++def grouped_splitk(k: int, order: QpnFragmentOrder) -> int:
++    """Split-K warps per CTA for a GEMM that reduces over ``k``.
++
++    Picks the most preferred specialization the native kernel instantiates
++    that divides the actual K groups. Both kernels prefer 8 warps (tuning
++    sweeps 2026-10-21); Turing's m16n8k8 kernel takes 4 where 8 would leave a
++    warp fewer than 16 groups, Volta's m8n8k4 kernel 16 or 10 where 8 does
++    not divide K.
++    """
++    if order == QpnFragmentOrder.M8N8K4:
++        preference: tuple[int, ...] = (8, 16, 10)
++    else:
++        preference = (8, 4) if k >= 2048 else (4, 8)
++    for split in preference:
+         if k > 0 and k % 64 == 0 and (k // 16) % split == 0:
+             return split
+     raise ValueError(f"skinny grouped MoE has no split-K specialization for K={k}")
+ 
+ 
++def _fragment_tables(
++    order: QpnFragmentOrder, device: torch.device
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Where each packed code and scale byte of a tile comes from.
++
++    Returns the output column [32 lanes, 16 codes] and the K offset inside the
++    16-code group [32, 16] of every code a lane holds (codes in nibble order,
++    low nibble first), and the column [32] of each of a scale group's 32
++    scale bytes. The m16n8k8 tables mirror m16n8k8_fp4_column and
++    m16n8k8_fp4_k in csrc/sm70_turbomind/ops/mma_fragments_sm70.cuh.
++    """
++    lane = torch.arange(32, device=device).view(32, 1)
++    if order == QpnFragmentOrder.M8N8K4:
++        # Lane holds one column; its 16 K values interleaved so the decoder's
++        # (i, i + 4) output is the adjacent-k B register pair.
++        col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
++        korder = torch.tensor(
++            [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15], device=device
++        )
++        return col.expand(32, 16), korder.view(1, 16).expand(32, 16), col.view(32)
++    # Code word w covers A tile w; nibble n sits at column 16w + l/4 + 8(n&1)
++    # and K 4(l%4) + 2((n>>1)&1) + (n>>2). Scale byte r is column r/4 + 8(r%4).
++    position = torch.arange(16, device=device).view(1, 16)
++    word, nibble = position >> 3, position & 7
++    col = 16 * word + (lane >> 2) + 8 * (nibble & 1)
++    k = 4 * (lane & 3) + 2 * ((nibble >> 1) & 1) + (nibble >> 2)
++    entry = torch.arange(32, device=device)
++    return col, k, (entry >> 2) + 8 * (entry & 3)
++
++
+ def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
+     """Check the actual FP16 rebiased global factors before weight mutation."""
+     if g1.ndim == 2 and g1.shape[1] == 2 and not torch.equal(g1[:, 0], g1[:, 1]):
+@@ -61,14 +123,17 @@ def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
+ 
+ 
+ def qpn_prepack(
+-    codes: torch.Tensor, scales: torch.Tensor, scale_group: int = 16
++    codes: torch.Tensor,
++    scales: torch.Tensor,
++    scale_group: int,
++    order: QpnFragmentOrder,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Permute one weight matrix into the fragment order the QPN kernels read.
+ 
+     Codes become [tile N/32][group K/16][lane 32] x 8 bytes, with the nibbles
+-    interleaved so that the decoder's (i, i + 4) output pair is exactly the
+-    adjacent-k B fragment register pair; scales become
+-    [tile N/32][group K/scale_group][lane 32]. A pure permutation of the
++    placed so that the decoder's (i, i + 4) output pairs are exactly the MMA
++    operand registers of the given order; scales become
++    [tile N/32][group K/scale_group][32 bytes]. A pure permutation of the
+     checkpoint bytes.
+ 
+     Args:
+@@ -77,6 +142,7 @@ def qpn_prepack(
+         scale_group: codes per scale, 16 for NVFP4 (fp8-e4m3) and 32 for
+             MXFP4 (E8M0). The code layout is the same for both: a 32-code
+             MXFP4 block is two adjacent 16-code groups sharing one scale.
++        order: the MMA fragment order of the card the weights serve on.
+ 
+     Returns:
+         The permuted codes and scales, both flat and contiguous.
+@@ -89,16 +155,12 @@ def qpn_prepack(
+         )
+     dev = codes.device
+     tiles, groups = n // 32, k // scale_group
+-    lane = torch.arange(32, device=dev)
+-    col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
+-    korder = torch.tensor(
+-        [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15], device=dev
+-    )
++    code_col, code_k, scale_col = _fragment_tables(order, dev)
+     nib = torch.stack([codes & 0xF, codes >> 4], dim=-1).view(n, k)
+     cgroups = k // 16  # code groups: always 16 codes per fragment pair
+     g = torch.arange(groups, device=dev)
+     cg = torch.arange(cgroups, device=dev)
+-    kidx = cg.view(cgroups, 1) * 16 + korder.view(1, 16)
++    kidx = cg.view(cgroups, 1, 1) * 16 + code_k.view(1, 32, 16)
+     qc = torch.empty(tiles, cgroups, 32, 8, dtype=torch.uint8, device=dev)
+     qs = torch.empty(tiles, groups, 32, dtype=torch.uint8, device=dev)
+     # Chunk the gather: the int64 index intermediates are 16x the payload,
+@@ -107,14 +169,16 @@ def qpn_prepack(
+     for t0 in range(0, tiles, chunk):
+         t1 = min(t0 + chunk, tiles)
+         tt = t1 - t0
+-        ncol = torch.arange(t0, t1, device=dev).view(tt, 1) * 32 + col.view(1, 32)
++        tile_col = torch.arange(t0, t1, device=dev).view(tt, 1, 1) * 32
++        ncol = tile_col + code_col.view(1, 32, 16)
+         nb = nib[
+-            ncol.view(tt, 1, 32, 1).expand(tt, cgroups, 32, 16),
+-            kidx.view(1, cgroups, 1, 16).expand(tt, cgroups, 32, 16),
++            ncol.view(tt, 1, 32, 16).expand(tt, cgroups, 32, 16),
++            kidx.view(1, cgroups, 32, 16).expand(tt, cgroups, 32, 16),
+         ]
+         qc[t0:t1] = nb[..., 0::2] | (nb[..., 1::2] << 4)
++        scol = tile_col.view(tt, 1) + scale_col.view(1, 32)
+         qs[t0:t1] = scales[
+-            ncol.view(tt, 1, 32).expand(tt, groups, 32),
++            scol.view(tt, 1, 32).expand(tt, groups, 32),
+             g.view(1, groups, 1).expand(tt, groups, 32),
+         ]
+     del nib
+@@ -298,6 +362,10 @@ def __init__(self, moe_config, quant_config):
+         self._w2_block_scales: torch.Tensor = w2_scale
+         # 0 = NVFP4 (fp8-e4m3 per 16 codes), 1 = MXFP4 (E8M0 per 32)
+         self._scale_mode: int = 0
++        # From this worker's own card: a node may mix card generations.
++        self._fragment_order = qpn_fragment_order(
++            torch.accelerator.current_device_index()
++        )
+         self.quant_config._w1.scale = None
+         self.quant_config._w2.scale = None
+         self.quantization_emulation = False
+@@ -393,11 +461,12 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+                     f"K={w.size(2) * 2}"
+                 )
+         s13, s2, sg = self._scale_rasters(layer)
++        order = self._fragment_order
+         for e in range(w13.size(0)):
+-            qc, qs = qpn_prepack(w13[e], s13[e], sg)
++            qc, qs = qpn_prepack(w13[e], s13[e], sg, order)
+             w13[e].view(-1).copy_(qc)
+             s13[e].view(-1).copy_(qs)
+-            qc, qs = qpn_prepack(w2[e], s2[e], sg)
++            qc, qs = qpn_prepack(w2[e], s2[e], sg, order)
+             w2[e].view(-1).copy_(qc)
+             s2[e].view(-1).copy_(qs)
+         if sg == 32:
+@@ -405,8 +474,9 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+             self._w2_block_scales = s2
+             self._scale_mode = 1
+         logger.info_once(
+-            "Skinny MoE: expert weights re-permuted to QPN fragment order in "
++            "Skinny MoE: expert weights re-permuted to %s fragment order in "
+             "place (%d experts, one scale per %d codes)",
++            order.name.lower(),
+             w13.size(0),
+             sg,
+         )
+@@ -442,8 +512,8 @@ def _scale_rasters(
+ 
+     @staticmethod
+     def _supports_current_device() -> bool:
+-        # The kernels are written for SM70 (mma.m8n8k4) and tested on SM70 and
+-        # SM75. The capability comes from this worker's own device: on a node
++        # The kernels run mma.m8n8k4 on SM70 and m16n8k8 on SM75, tested on
++        # both. The capability comes from this worker's own device: on a node
+         # that mixes card generations, device 0 answers for another card.
+         if not current_platform.is_cuda() or not torch.accelerator.is_available():
+             return False
+@@ -471,12 +541,13 @@ def is_supported_config(
+         kernel_config.sm70_skinny_moe_applicable = True
+         if not kernel_config.sm70_skinny_moe:
+             return False, "disabled by kernel_config.sm70_skinny_moe"
++        order = qpn_fragment_order(torch.accelerator.current_device_index())
+         for name, k in (
+             ("hidden", moe_config.hidden_dim),
+             ("intermediate", moe_config.intermediate_size_per_partition),
+         ):
+             try:
+-                grouped_splitk(k, 16)
++                grouped_splitk(k, order)
+             except ValueError as exc:
+                 return False, f"{name} dimension: {exc}"
+         if moe_config.in_dtype != torch.float16:
+@@ -608,8 +679,8 @@ def _apply_grouped(
+         # Compact device-side routing (all fixed shapes, CUDA-graph safe):
+         # slots sorted by expert; consecutive equal experts form a group.
+         # gids[g] = group's expert, goff[g]..goff[g+1] = its slot range;
+-        # unused group slots stay empty (goff = S) and the kernel skips
+-        # them -- the launch never scales with the expert count.
++        # unused group slots stay empty (goff = S); the kernel launches
++        # min(S, experts) group rows and skips the empty ones.
+         flat = topk_ids.reshape(-1).to(torch.int64)
+         num_slots = flat.numel()
+         perm = torch.argsort(flat, stable=True).to(torch.int32)
+@@ -642,9 +713,9 @@ def _apply_grouped(
+             y13,
+             False,
+             num_tokens,
+-            grouped_splitk(hidden_states.size(1), 16),
+-            1,
++            grouped_splitk(hidden_states.size(1), self._fragment_order),
+             self._scale_mode,
++            self._fragment_order,
+         )
+         inter = torch.empty((num_slots, inter_dim), dtype=y13.dtype, device=device)
+         self.activation(activation, inter, y13)
+@@ -661,9 +732,9 @@ def _apply_grouped(
+             y2,
+             True,
+             num_tokens,
+-            grouped_splitk(inter_dim, 8),
+-            1,
++            grouped_splitk(inter_dim, self._fragment_order),
+             self._scale_mode,
++            self._fragment_order,
+         )
+         output.copy_(
+             weighted_reduce_rows(
+diff --git a/vllm/model_executor/layers/quantization/sm70_turbomind.py b/vllm/model_executor/layers/quantization/sm70_turbomind.py
+index f2cc6f303e..d429ba711f 100644
+--- a/vllm/model_executor/layers/quantization/sm70_turbomind.py
++++ b/vllm/model_executor/layers/quantization/sm70_turbomind.py
+@@ -660,6 +660,7 @@ def __init__(
+         group_scales: torch.Tensor,
+         output_size: int,
+         split_k: int,
++        decode_split_k: int,
+         accumulator_chains: int,
+         prefetch_codes: bool,
+     ) -> None:
+@@ -667,6 +668,7 @@ def __init__(
+         self.group_scales = group_scales
+         self.output_size = output_size
+         self.split_k = split_k
++        self.decode_split_k = decode_split_k
+         self.accumulator_chains = accumulator_chains
+         self.prefetch_codes = prefetch_codes
+ 
+@@ -674,8 +676,9 @@ def __init__(
+ def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
+     """Split-K, accumulator chains and code prefetch for a QPN8 GEMM.
+ 
+-    The dispatcher admits split-K up to 16; the measured Qwen3.8 shapes use
+-    16 (K = 5120) and 12 (K = 1536) with two accumulator chains.
++    The dispatcher admits split-K up to 16; the table takes the largest of
++    16, 12 and 8 that divides K's 16-element code groups, with two
++    accumulator chains.
+     """
+     groups = k // QPN2_GROUP_SIZE
+     for split_k in (16, 12, 8):
+@@ -684,6 +687,46 @@ def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
+     raise RuntimeError(f"no QPN8 launch configuration for K={k}")
+ 
+ 
++# One CTA of the M <= 8 QPN8 GEMM covers this many output columns.
++_QPN8_COLUMNS_PER_CTA = 32
++# fp8_qpn8_occupancy_split_k was measured for the M <= 8 QPN8 GEMM only.
++QPN8_OCCUPANCY_MAX_M = 8
++
++
++def fp8_qpn8_occupancy_split_k(
++    k: int, n: int, split_k: int, device: torch.device
++) -> int:
++    """Fit the split-K of the M <= 8 QPN8 GEMM to the device's occupancy.
++
++    A CTA runs ``split_k`` warps along K (32 * split_k threads). Where a
++    split-16 CTA fills half an SM (Turing, 1024 threads per SM) and the grid
++    spills into a second wave that keeps fewer than half the SMs busy,
++    split-K 8 fits it into one wave (3-27 % faster in CUDA graphs on RTX 8000
++    at M = 1..8); with 2048 threads per SM (Volta) split-K 8 is slower there.
++    Split-K 32 for grids with no more CTAs than SMs was faster in isolation as
++    well, but on DeepSeek-V4 it gave no measurable step gain and lowered the
++    sampled draft acceptance in all eight comparisons, so it is not used.
++    """
++    properties = torch.cuda.get_device_properties(device)
++    sms = properties.multi_processor_count
++    ctas_per_sm_at = {
++        split: properties.max_threads_per_multi_processor // (32 * split)
++        for split in (8, 16)
++    }
++    ctas = n // _QPN8_COLUMNS_PER_CTA
++    groups = k // QPN2_GROUP_SIZE
++    spill = ctas - sms * ctas_per_sm_at[16]
++    if (
++        split_k == 16
++        and ctas_per_sm_at[16] <= 2
++        and 0 < spill < sms // 2
++        and ctas <= sms * ctas_per_sm_at[8]
++        and groups % 8 == 0
++    ):
++        return 8
++    return split_k
++
++
+ def prepare_fp8_qpn8_dense_linear(
+     layer: torch.nn.Module, weight: torch.Tensor, weight_scale: torch.Tensor
+ ) -> None:
+@@ -723,6 +766,7 @@ def prepare_fp8_qpn8_dense_linear(
+             group_scales,
+             n,
+             split_k,
++            fp8_qpn8_occupancy_split_k(k, n, split_k, codes.device),
+             accumulator_chains,
+             prefetch_codes,
+         ),
+@@ -752,6 +796,7 @@ def apply_prepared_fp8_qpn8_linear(
+         state.group_scales,
+         state.output_size,
+         state.split_k,
++        state.decode_split_k,
+         state.accumulator_chains,
+         state.prefetch_codes,
+     )
