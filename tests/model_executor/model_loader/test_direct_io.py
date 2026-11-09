@@ -10,16 +10,19 @@ from torch import nn
 
 from vllm.model_executor.model_loader import direct_io
 from vllm.model_executor.model_loader.default_loader import (
+    _missing_module_filter,
     _pipeline_stage_layer_range,
 )
 from vllm.model_executor.model_loader.direct_io import (
     decoder_layer_filter,
     direct_io_weights,
+    missing_module_filter,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
 
 
 def _checkpoint(path) -> dict[str, torch.Tensor]:
@@ -28,6 +31,13 @@ def _checkpoint(path) -> dict[str, torch.Tensor]:
         "model.language_model.layers.0.w": torch.randn(33, 17),
         "model.language_model.layers.1.w": torch.randn(64, 64).half(),
         "model.language_model.layers.2.w": torch.randn(5, 7).bfloat16(),
+        # csf_32x2_v1 page bases and offsets (GLM-5.3-Flash-FP4-Local)
+        "model.language_model.layers.1.page_bases": torch.arange(
+            -7, 9, dtype=torch.int32
+        ).view(torch.uint32),
+        "model.language_model.layers.2.offsets": torch.arange(
+            -5, 13, dtype=torch.int16
+        ).view(torch.uint16),
         "layers.3.ffn.w": torch.randn(9, 11).to(torch.float8_e4m3fn),
         "layers.3.ffn.scale": torch.randn(3, 4).to(torch.float8_e8m0fnu),
         "mtp.layers.0.w": torch.randint(0, 255, (129,), dtype=torch.uint8),
@@ -317,6 +327,112 @@ def test_ambiguous_stage_ranges_raise():
     model = nn.Sequential(_Encoder(), _Stack(14, 28, 28))
     with pytest.raises(ValueError, match="several pipeline-partial"):
         _pipeline_stage_layer_range(model)
+
+
+def test_missing_module_filter_matches_only_the_named_modules():
+    missing = missing_module_filter({"embed_tokens", "norm"}, {"lm_head"}, set())
+    # Multimodal (GLM-5.3), Llama-style and DeepSeek-V4 checkpoint layouts.
+    assert missing("lm_head.weight")
+    assert missing("lm_head.weight_scale")
+    assert missing("language_model.lm_head.weight")
+    assert missing("model.language_model.embed_tokens.weight")
+    assert missing("model.embed_tokens.weight")
+    assert missing("language_model.model.norm.weight")
+    assert missing("norm.weight")
+    # Decoder layers, MTP heads, vision towers and look-alike names stay.
+    assert not missing("model.language_model.layers.0.input_layernorm.weight")
+    assert not missing("model.layers.3.self_attn.o_proj.weight")
+    assert not missing("mtp.0.norm.weight")
+    assert not missing("model.visual.merger.norm.weight")
+    assert not missing("model.norm_out.weight")
+    assert not missing("embed.weight")
+
+
+def test_missing_module_filter_needs_a_module():
+    with pytest.raises(ValueError, match="at least one module"):
+        missing_module_filter(set(), set(), set())
+
+
+def test_missing_module_filter_matches_encoder_towers():
+    missing = missing_module_filter(set(), set(), {"visual"})
+    # GLM-5.3 / Qwen-VL layouts with and without the outer `model.`.
+    assert missing("model.visual.blocks.0.attn.qkv.weight")
+    assert missing("visual.merger.proj.weight")
+    assert not missing("model.language_model.layers.0.mlp.weight")
+    assert not missing("lm_head.weight")
+    assert not missing("model.visual_proj.weight")
+
+
+class _StageStack(_Stack):
+    def __init__(self, start: int, end: int, embedding: bool, last: bool):
+        super().__init__(start, end, 12)
+        self.embed_tokens = nn.Embedding(4, 2) if embedding else PPMissingLayer()
+        self.norm = nn.LayerNorm(2) if last else PPMissingLayer()
+
+
+class _StageLanguageModel(nn.Module):
+    def __init__(self, start: int, end: int, embedding: bool):
+        super().__init__()
+        last = end == 12
+        self.model = _StageStack(start, end, embedding, last)
+        self.lm_head = nn.Linear(2, 4) if last else PPMissingLayer()
+
+
+class _StageMultimodal(nn.Module, SupportsMultiModal):
+    def __init__(self, start: int, end: int, embedding: bool, tower: bool = True):
+        super().__init__()
+        tower_module = nn.Sequential(nn.LayerNorm(2))
+        self.visual = (
+            tower_module if tower else StageMissingLayer("vision_tower", tower_module)
+        )
+        self.language_model = _StageLanguageModel(start, end, embedding)
+
+    def get_language_model(self):
+        return self.language_model
+
+
+_EMBED = "model.language_model.embed_tokens.weight"
+_NORM = "model.language_model.norm.weight"
+_HEAD = "lm_head.weight"
+_TOWER = "model.visual.0.weight"
+
+
+@pytest.mark.parametrize(
+    "start,end,embedding,tower,skipped",
+    [
+        (0, 4, True, True, {_NORM, _HEAD}),
+        (4, 8, False, True, {_EMBED, _NORM, _HEAD}),
+        (8, 12, False, True, {_EMBED}),
+        # A last stage that keeps a replica of the embedding (DFlash drafts
+        # on GLM-5.3) reads it.
+        (8, 12, True, True, set()),
+        # Stages that do not run the encoder build no tower (Model Runner V2,
+        # or --limit-mm-per-prompt 0).
+        (4, 8, False, False, {_EMBED, _NORM, _HEAD, _TOWER}),
+        (0, 12, True, False, {_TOWER}),
+    ],
+    ids=[
+        "first",
+        "middle",
+        "last",
+        "last_with_embedding",
+        "middle_without_tower",
+        "single_stage_without_tower",
+    ],
+)
+def test_missing_module_filter_follows_the_stage(start, end, embedding, tower, skipped):
+    names = {
+        _EMBED,
+        _NORM,
+        _HEAD,
+        _TOWER,
+        "model.language_model.layers.5.mlp.weight",
+    }
+    missing = _missing_module_filter(_StageMultimodal(start, end, embedding, tower))
+    if missing is None:
+        assert skipped == set()
+    else:
+        assert {name for name in names if missing(name)} == skipped
 
 
 @pytest.mark.parametrize("failure", [None, "storage", "dtype"])

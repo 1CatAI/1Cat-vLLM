@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.runtime.input_transfer import InputTransferSession
 
 
 class _Buffer:
@@ -29,7 +30,7 @@ def _runner() -> GPUModelRunner:
     runner.ngram_context_len = 2
     runner.ngram_eos_token_id = 99
     runner.enable_prompt_embeds = False
-    runner._sm70_async_staged_input_prep_active = False
+    runner._input_transfer = InputTransferSession()
     runner.ngram_context = _Buffer((4, 2))
     runner.query_start_loc = _Buffer((5,))
     runner.input_batch = SimpleNamespace(

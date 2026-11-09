@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vllm.distributed.parallel_state as parallel_state
+from vllm.config.observability import ObservabilityConfig
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -16,25 +17,33 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.spec_decode.profiling import create_step_profiler
 from vllm.v1.worker.gpu import model_runner as mrv2
 
 
+def _profile(role="runner_v2", method="mtp", last=True):
+    return create_step_profiler(
+        SimpleNamespace(
+            observability_config=ObservabilityConfig(),
+            speculative_config=SimpleNamespace(method=method),
+        ),
+        torch.device("cuda"),
+        role=role,
+        logger=mrv2.logger,
+        is_last_pp_rank=last,
+    )
+
+
 def test_sm70_v2_mtp_profile_gate(monkeypatch):
-    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
-    runner.speculative_config = SimpleNamespace(method="mtp")
-    runner.is_last_pp_rank = True
-    runner.device = torch.device("cuda")
-
     monkeypatch.setenv("VLLM_SM70_MTP_PROFILE", "1")
-    assert runner._sm70_v2_mtp_profile_enabled()
-
-    runner.speculative_config = SimpleNamespace(method="dflash")
-    assert runner._sm70_v2_mtp_profile_enabled()
-    runner.speculative_config = SimpleNamespace(method="dspark")
-    assert runner._sm70_v2_mtp_profile_enabled()
-    runner.speculative_config = SimpleNamespace(method="mtp")
-    runner.is_last_pp_rank = False
-    assert not runner._sm70_v2_mtp_profile_enabled()
+    for method in ("mtp", "dflash", "dspark"):
+        assert _profile(method=method).enabled
+    assert not _profile(last=False).enabled
+    assert not _profile(method="eagle").enabled
+    captured = _profile()
+    monkeypatch.setenv("VLLM_SM70_MTP_PROFILE", "0")
+    assert captured.enabled
+    assert not _profile().enabled
 
 
 def test_sm70_v2_mtp_profile_composes_target_verifier(monkeypatch):
@@ -67,27 +76,30 @@ def test_sm70_v2_mtp_profile_composes_target_verifier(monkeypatch):
         "total_wall_start": time.perf_counter(),
     }
 
-    runner._sm70_v2_mtp_profile_report(ctx)
+    runner._step_profiler = _profile()
+    runner._step_profiler.report(ctx)
 
-    assert runner._sm70_v2_mtp_profile_totals["target_verifier_gpu"] == 13.0
-    assert runner._sm70_v2_mtp_profile_totals["target_verifier_wall_cpu"] == 14.0
-    assert runner._sm70_v2_mtp_profile_totals["draft_total"] == 5.0
-    assert runner._sm70_v2_mtp_profile_totals["total_gpu"] == 20.0
+    assert runner._step_profiler.totals["target_verifier_gpu"] == 13.0
+    assert runner._step_profiler.totals["target_verifier_wall_cpu"] == 14.0
+    assert runner._step_profiler.totals["draft_total"] == 5.0
+    assert runner._step_profiler.totals["total_gpu"] == 20.0
 
 
 @pytest.mark.parametrize(
-    ("global_first", "pp_last", "tp_rank", "expected"),
+    ("global_first", "pp_last", "tp_rank"),
     [
-        pytest.param(False, True, 0, True, id="pp2-last-stage-leader"),
-        pytest.param(False, True, 1, False, id="pp2-last-stage-tp1"),
-        pytest.param(True, False, 0, False, id="pp2-first-stage"),
+        pytest.param(False, True, 0, id="pp2-last-stage-leader"),
+        pytest.param(False, True, 1, id="pp2-last-stage-tp1"),
+        pytest.param(True, False, 0, id="pp2-first-stage"),
     ],
 )
-def test_sm70_v2_mtp_profile_reports_from_last_pp_stage(
-    monkeypatch, global_first, pp_last, tp_rank, expected
+def test_sm70_v2_mtp_profile_reports_on_every_rank(
+    monkeypatch, global_first, pp_last, tp_rank
 ):
-    """Regression for #414: profiling is enabled on the last PP stage only,
-    so the report must not be gated on the global first rank."""
+    """Regression for #414: the report must not be gated on the global first
+    rank. Profiling is enabled on the last PP stage only (see
+    test_sm70_v2_mtp_profile_gate), and an enabled V2 profiler reports from
+    every TP rank so TP stragglers stay visible."""
 
     class FakeEvent:
         def elapsed_time(self, end: "FakeEvent") -> float:
@@ -116,10 +128,11 @@ def test_sm70_v2_mtp_profile_reports_from_last_pp_stage(
         "total_wall_start": time.perf_counter(),
     }
 
-    runner._sm70_v2_mtp_profile_report(ctx)
+    runner._step_profiler = _profile()
+    runner._step_profiler.report(ctx)
 
-    assert runner._sm70_v2_mtp_profile_totals["target_forward"] == 1.0
-    assert bool(messages) is expected
+    assert runner._step_profiler.totals["target_forward"] == 1.0
+    assert messages
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

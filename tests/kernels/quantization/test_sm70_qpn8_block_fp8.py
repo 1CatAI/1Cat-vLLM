@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Block-FP8 linears on SM70/SM75 through the native QPN8 operators."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -140,3 +142,81 @@ def test_volta_medium_prefill_keeps_original_turbomind_output(default_vllm_confi
         False,
     )
     torch.testing.assert_close(kernel.apply_weights(layer, x), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m", [9, 64, 512])
+def test_volta_without_turbomind_copy_keeps_one_layout(default_vllm_config, m):
+    # A 32 GiB V100 pipeline stage of DeepSeek-V4 runs out of memory when every
+    # block FP8 weight is held twice; without the copy, rows beyond M=8 take
+    # the dense prefill operator that Turing uses.
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        False
+    )
+    layer, reference = _layer(1536, 4096)
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096))
+    kernel.process_weights_after_loading(layer)
+    assert not hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight")
+    assert not hasattr(layer, "_qpn8_fallback_k_ld")
+    x = torch.randn(m, 4096, device="cuda", dtype=torch.float16) * 0.1
+    y = kernel.apply_weights(layer, x)
+    expected = x.float() @ reference.t()
+    assert ((y.float() - expected).norm() / expected.norm()).item() < 1e-3
+
+
+@pytest.mark.parametrize("turbomind_copy", [True, False])
+def test_volta_warmup_follows_the_held_layout(default_vllm_config, turbomind_copy):
+    # The coordinated Volta warmup used to read TurboMind attributes that block
+    # QPN8 layers never carry and failed the engine start.
+    if torch.cuda.get_device_capability()[0:2] not in ((7, 0), (7, 2)):
+        pytest.skip("the coordinated dense warmup runs on Volta only")
+    from vllm.model_executor.warmup.awq_sm70_warmup import (
+        _iter_unique_fp8_dense_layers,
+        _warmup_fp8_dense_layers,
+    )
+
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        turbomind_copy
+    )
+    layer, _ = _layer(1536, 4096)
+    QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096)).process_weights_after_loading(
+        layer
+    )
+    model = torch.nn.Module()
+    model.proj = layer
+    layers = list(_iter_unique_fp8_dense_layers(model))
+    assert layers == ([(layer, False)] if turbomind_copy else [])
+    # Only rows beyond the native QPN8 bound use the TurboMind copy.
+    assert _warmup_fp8_dense_layers(layers, [1, 8, 9, 64]) == (
+        2 if turbomind_copy else 0
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "speculative_tokens", "explicit", "copy"),
+    [
+        (1, 5, None, False),  # one request verifying six rows stays on QPN8
+        (8, 0, None, False),
+        (9, 0, None, True),
+        (2, 5, None, True),  # twelve decode rows reach the TurboMind copy
+        (1, 5, True, True),
+        (4, 5, False, False),
+    ],
+)
+def test_volta_turbomind_copy_follows_decode_rows(
+    default_vllm_config, max_num_seqs, speculative_tokens, explicit, copy
+):
+    if torch.cuda.get_device_capability()[0:2] not in ((7, 0), (7, 2)):
+        pytest.skip("only Volta holds the TurboMind copy")
+    default_vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    if speculative_tokens:
+        default_vllm_config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=speculative_tokens
+        )
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        explicit
+    )
+    layer, _ = _layer(1536, 4096)
+    QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096)).process_weights_after_loading(
+        layer
+    )
+    assert hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight") == copy

@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import time
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
@@ -54,6 +55,7 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
     clamp_prompt_logprobs,
+    drop_misaligned_logprobs,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
@@ -80,6 +82,140 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+
+def _token_list(rendered: Any) -> list[int]:
+    if isinstance(rendered, dict) or hasattr(rendered, "keys"):
+        rendered = rendered["input_ids"]
+    return list(rendered)
+
+
+class _PrefixCacheBoundaries:
+    """Prompt positions worth a partial prefix-cache entry.
+
+    A follow-up chat turn repeats the conversation up to the end of the last
+    message, but not necessarily the generation prompt after it: reasoning
+    templates render a finished assistant turn differently from the prompt
+    that started it. The end of the shared system prompt is also where
+    concurrent conversations diverge. Both positions are derived by rendering
+    small probes with the same template and accepted only when they reproduce
+    the actual prompt tokens.
+    """
+
+    def __init__(self, max_entries: int = 256) -> None:
+        self._generation: dict[str, tuple[int, ...] | None] = {}
+        self._system: OrderedDict[str, tuple[int, ...] | None] = OrderedDict()
+        self._max_entries = max_entries
+
+    # Rendering arguments this helper sets itself.
+    _OWN_ARGS = (
+        "add_generation_prompt",
+        "continue_final_message",
+        "tokenize",
+        "tools",
+        "chat_template",
+        "conversation",
+        "messages",
+    )
+
+    @staticmethod
+    def _render(tokenizer, messages, chat_template, kwargs, tools, generation):
+        kwargs = {
+            k: v for k, v in kwargs.items() if k not in _PrefixCacheBoundaries._OWN_ARGS
+        }
+        try:
+            return _token_list(
+                tokenizer.apply_chat_template(
+                    messages,
+                    tools=tools,
+                    chat_template=chat_template,
+                    add_generation_prompt=generation,
+                    tokenize=True,
+                    **kwargs,
+                )
+            )
+        except Exception:
+            return None
+
+    def _generation_prompt(self, tokenizer, chat_template, kwargs):
+        key = json.dumps([chat_template, kwargs], sort_keys=True, default=str)
+        if key not in self._generation:
+            probe = [{"role": "user", "content": "x"}]
+            with_prompt = self._render(
+                tokenizer, probe, chat_template, kwargs, None, True
+            )
+            without = self._render(tokenizer, probe, chat_template, kwargs, None, False)
+            suffix = None
+            if (
+                with_prompt is not None
+                and without is not None
+                and len(with_prompt) > len(without)
+                and with_prompt[: len(without)] == without
+            ):
+                suffix = tuple(with_prompt[len(without) :])
+            self._generation[key] = suffix
+        return self._generation[key]
+
+    def _system_prompt(self, tokenizer, message, chat_template, kwargs, tools):
+        key = json.dumps(
+            [message, tools, chat_template, kwargs], sort_keys=True, default=str
+        )
+        if key in self._system:
+            self._system.move_to_end(key)
+            return self._system[key]
+        tokens = self._render(tokenizer, [message], chat_template, kwargs, tools, False)
+        value = tuple(tokens) if tokens else None
+        self._system[key] = value
+        if len(self._system) > self._max_entries:
+            self._system.popitem(last=False)
+        return value
+
+    def __call__(
+        self,
+        tokenizer,
+        request: ChatCompletionRequest,
+        prompt_token_ids: list[int] | None,
+        chat_template: str | None,
+        kwargs: dict[str, Any],
+    ) -> list[int]:
+        if not prompt_token_ids or not hasattr(tokenizer, "apply_chat_template"):
+            return []
+        n = len(prompt_token_ids)
+        boundaries = []
+        suffix = self._generation_prompt(tokenizer, chat_template, kwargs)
+        if (
+            suffix
+            and n > len(suffix)
+            and tuple(prompt_token_ids[-len(suffix) :]) == suffix
+        ):
+            boundaries.append(n - len(suffix))
+        messages = request.messages
+        first = messages[0] if messages else None
+        if (
+            len(messages) > 1
+            and isinstance(first, dict)
+            and first.get("role") in ("system", "developer")
+            and isinstance(first.get("content"), str)
+        ):
+            tools = (
+                [tool.model_dump(exclude_none=True) for tool in request.tools]
+                if request.tools
+                else None
+            )
+            system = self._system_prompt(
+                tokenizer,
+                {"role": first["role"], "content": first["content"]},
+                chat_template,
+                kwargs,
+                tools,
+            )
+            if (
+                system
+                and len(system) < n
+                and tuple(prompt_token_ids[: len(system)]) == system
+            ):
+                boundaries.append(len(system))
+        return sorted(set(boundaries))
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -115,6 +251,7 @@ class OpenAIServingChat(OpenAIServing):
         self.openai_serving_render = openai_serving_render
         self.response_role = response_role
         self.chat_template = chat_template
+        self._prefix_cache_boundaries = _PrefixCacheBoundaries()
         self.chat_template_content_format: Final = chat_template_content_format
         self.trust_request_chat_template = trust_request_chat_template
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
@@ -310,6 +447,20 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                boundaries = self._prefix_cache_boundaries(
+                    tokenizer,
+                    request,
+                    list(prompt_token_ids) if prompt_token_ids else None,
+                    request.chat_template
+                    if (request.chat_template and self.trust_request_chat_template)
+                    else self.chat_template,
+                    chat_template_kwargs,
+                )
+                if boundaries:
+                    sampling_params.extra_args = {
+                        **(sampling_params.extra_args or {}),
+                        "prefix_cache_boundaries": boundaries,
+                    }
 
             self._log_inputs(
                 sub_request_id,
@@ -592,6 +743,7 @@ class OpenAIServingChat(OpenAIServing):
 
                 for output in res.outputs:
                     i = output.index
+                    self._raise_if_error(output.finish_reason, request_id)
                     parser = parsers[i]
                     tool_parser = parser.tool_parser if parser is not None else None
 
@@ -608,13 +760,13 @@ class OpenAIServingChat(OpenAIServing):
                     if finish_reason_sent[i]:
                         continue
 
-                    if request.logprobs and request.top_logprobs is not None:
+                    if request.logprobs:
                         assert output.logprobs is not None, "Did not output logprobs"
                         logprobs = self._create_chat_logprobs(
                             token_ids=output.token_ids,
                             top_logprobs=output.logprobs,
                             tokenizer=tokenizer,
-                            num_output_top_logprobs=request.top_logprobs,
+                            num_output_top_logprobs=request.top_logprobs or 0,
                             return_as_token_id=request.return_tokens_as_token_ids,
                         )
                     else:
@@ -761,6 +913,7 @@ class OpenAIServingChat(OpenAIServing):
                         if (
                             output.finish_reason is None
                             and not request.return_token_ids
+                            and logprobs is None
                         ):
                             continue
                         delta_message = DeltaMessage()
@@ -884,7 +1037,7 @@ class OpenAIServingChat(OpenAIServing):
                         # finish_reason is:
                         # "tool_calls" for "auto" or "required" tool calls,
                         # and "stop" for named tool calls.
-                        if (
+                        if output.finish_reason == "stop" and (
                             auto_tools_called
                             or (tools_streamed[i] and not tool_choice_function_name)
                             or (self.use_harmony and harmony_tools_streamed[i])
@@ -949,7 +1102,7 @@ class OpenAIServingChat(OpenAIServing):
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
                 )
-                if self.enable_prompt_tokens_details and num_cached_tokens:
+                if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens
                     )
@@ -1045,12 +1198,12 @@ class OpenAIServingChat(OpenAIServing):
             out_logprobs = output.logprobs
             tool_call_info = None
 
-            if request.logprobs and request.top_logprobs is not None:
+            if request.logprobs:
                 assert out_logprobs is not None, "Did not output logprobs"
                 logprobs = self._create_chat_logprobs(
                     token_ids=token_ids,
                     top_logprobs=out_logprobs,
-                    num_output_top_logprobs=request.top_logprobs,
+                    num_output_top_logprobs=request.top_logprobs or 0,
                     tokenizer=tokenizer,
                     return_as_token_id=request.return_tokens_as_token_ids,
                 )
@@ -1107,7 +1260,11 @@ class OpenAIServingChat(OpenAIServing):
                     logprobs=logprobs,
                     finish_reason=(
                         "tool_calls"
-                        if (tool_call_info is not None and tool_call_info.tools_called)
+                        if (
+                            output.finish_reason == "stop"
+                            and tool_call_info is not None
+                            and tool_call_info.tools_called
+                        )
                         else output.finish_reason
                         if output.finish_reason
                         else "stop"
@@ -1319,10 +1476,8 @@ class OpenAIServingChat(OpenAIServing):
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice
-                and request.tool_choice == "required"
-                and output.finish_reason == "stop"
+            is_finish_reason_tool_calls = output.finish_reason == "stop" and (
+                auto_tools_called or request.tool_choice == "required"
             )
 
             # Encode routed_experts for transport. JSON can't carry raw
@@ -1381,7 +1536,10 @@ class OpenAIServingChat(OpenAIServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
-        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
+        if (
+            self.enable_prompt_tokens_details
+            and final_res.num_cached_tokens is not None
+        ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
             )
@@ -1480,6 +1638,7 @@ class OpenAIServingChat(OpenAIServing):
             if return_as_token_id is not None
             else self.return_tokens_as_token_ids
         )
+        top_logprobs = drop_misaligned_logprobs(token_ids, top_logprobs)
         for i, token_id in enumerate(token_ids):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None or step_top_logprobs.get(token_id) is None:

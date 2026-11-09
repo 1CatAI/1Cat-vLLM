@@ -1,0 +1,72 @@
+{
+  "source": "2e02630d6ddce4aa56206a00e14a3d4f829b2952",
+  "wheel_sha256": "96b018f4ed543042e7e82cfe2e21d8ace22234e9234b9f22597a948bfb6b20ce",
+  "fa2_sha256": "fcb6ea9a412d06a4a0fa0f9daeb64dc9918b53f36ce8e12297786b1ac40ab8f0",
+  "environment": {
+    "gpu": "Tesla V100-SXM2-32GB",
+    "cuda": "12.8",
+    "torch": "2.10.0+cu128",
+    "sm_mhz": 1290,
+    "memory_mhz": 877,
+    "page_tokens": 832,
+    "query_rows": 8,
+    "requests": 1,
+    "q_kv_heads": [
+      6,
+      1
+    ],
+    "head_dim": 256
+  },
+  "installed_tests_passed": 65,
+  "measurement": "Cold rotating 16 KV banks; same installed normal wheel; external-event CUDA graph ABBA; no private extensions. Operator timing, no model speed claim.",
+  "cases": [
+    {
+      "context": 640,
+      "legacy_us": 41.96087896823883,
+      "short_policy_us": 28.226320147514343,
+      "max_relative_l2": 0.0002076182863675058,
+      "graph_bits_stable": true,
+      "zero_lengths": true
+    },
+    {
+      "context": 1091,
+      "legacy_us": 42.921921610832214,
+      "short_policy_us": 30.86327999830246,
+      "max_relative_l2": 0.0002094290975946933,
+      "graph_bits_stable": true,
+      "zero_lengths": true
+    },
+    {
+      "context": 2048,
+      "legacy_us": 44.68183934688568,
+      "short_policy_us": 37.18040019273758,
+      "max_relative_l2": 0.00020879501244053245,
+      "graph_bits_stable": true,
+      "zero_lengths": true
+    },
+    {
+      "context": 2049,
+      "legacy_us": 44.76719915866852,
+      "short_policy_us": 44.70640003681183,
+      "max_relative_l2": 0.00020800204947590828,
+      "graph_bits_stable": true,
+      "zero_lengths": true
+    },
+    {
+      "context": 8192,
+      "legacy_us": 84.9777615070343,
+      "short_policy_us": 84.81328010559082,
+      "max_relative_l2": 0.0002111613139277324,
+      "graph_bits_stable": true,
+      "zero_lengths": true
+    },
+    {
+      "context": 32768,
+      "legacy_us": 221.90368175506592,
+      "short_policy_us": 221.48688077926636,
+      "max_relative_l2": 0.00020978394604753703,
+      "graph_bits_stable": true,
+      "zero_lengths": true
+    }
+  ]
+}

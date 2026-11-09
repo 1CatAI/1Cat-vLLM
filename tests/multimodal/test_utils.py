@@ -10,7 +10,11 @@ from vllm.multimodal.inputs import (
     MultiModalSharedField,
     PlaceholderRange,
 )
-from vllm.multimodal.utils import argsort_mm_positions, group_and_batch_mm_items
+from vllm.multimodal.utils import (
+    argsort_mm_positions,
+    group_and_batch_mm_items,
+    group_and_batch_mm_kwargs,
+)
 
 
 @pytest.mark.parametrize(
@@ -216,3 +220,40 @@ def test_group_and_batch_mm_items_split_by_shared_data():
 
     res = group_and_batch_mm_items([item1, item2, item3, item4, item5])
     assert [num_items for num_items, _ in res] == [2, 1, 1, 1]
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2, 3, 7, 8])
+def test_encoder_microbatch_preserves_order_and_fields(limit):
+    modalities = ["image"] * 7 + ["audio"] * 2 + ["image"] * 3
+    items = [
+        (
+            modality,
+            MultiModalKwargsItem(
+                {
+                    "x": MultiModalFieldElem(
+                        torch.tensor([i]), MultiModalBatchedField()
+                    ),
+                    "shared": MultiModalFieldElem(
+                        torch.tensor([i // 3]), MultiModalSharedField(batch_size=1)
+                    ),
+                }
+            ),
+        )
+        for i, modality in enumerate(modalities)
+    ]
+    seen: list[tuple[str, int]] = []
+    for modality, count, kwargs in group_and_batch_mm_kwargs(
+        items, device="cpu", max_batch_size=limit
+    ):
+        assert not limit or count <= limit
+        values = kwargs["x"].flatten().tolist()
+        assert count == len(values)
+        assert all(i // 3 == kwargs["shared"].item() for i in values)
+        seen.extend((modality, i) for i in values)
+    assert seen == list(zip(modalities, range(len(items))))
+    assert list(group_and_batch_mm_kwargs([], max_batch_size=limit)) == []
+
+
+def test_encoder_microbatch_rejects_negative_limit():
+    with pytest.raises(ValueError, match="nonnegative"):
+        list(group_and_batch_mm_kwargs([], max_batch_size=-1))

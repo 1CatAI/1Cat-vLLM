@@ -185,17 +185,34 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         Uses a depth counter so nested spans are handled safely and stray end
         tokens do not drive the counter negative.
+
+        A template may place the reasoning *start* marker in the prompt instead
+        of letting the model generate it (Qwen3.5+ does exactly this: only the
+        end marker reaches the generated ids). The depth counter never opens in
+        that case, so every such response would report zero reasoning tokens.
+        When no span opened but an end marker is present, everything generated
+        before it is reasoning.
         """
         count = 0
         depth = 0
-        for token_id in token_ids:
+        end_index: int | None = None
+        saw_start = False
+        for index, token_id in enumerate(token_ids):
             if token_id == self.start_token_id:
+                saw_start = True
                 depth += 1
                 continue
             if token_id == self.end_token_id:
                 if depth > 0:
                     depth -= 1
+                elif end_index is None:
+                    end_index = index
                 continue
             if depth > 0:
                 count += 1
+        if not saw_start and end_index is not None:
+            # Prompt-opened reasoning: everything before the first end marker.
+            count = sum(
+                1 for tid in token_ids[:end_index] if tid != self.start_token_id
+            )
         return count

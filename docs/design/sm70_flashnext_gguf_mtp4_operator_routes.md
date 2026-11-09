@@ -1,0 +1,328 @@
+# Flash-Next GGUF MTP4 operator integration
+
+The target verifier dominates the original Flash-Next IQ3_S speculative
+round. Floating projection restoration, batched FP32 HC, packed vocabulary
+projection and small-batch expert alignment are measured as separate
+operators before complete-model integration. Operator service savings do not
+predict emitted-token throughput when speculative acceptance changes.
+
+Latest combined measurement: C1 26.072 ms/round and 92.267 decode tokens/s;
+C4 52.059 ms/round and 280.441 aggregate decode tokens/s. All four natural
+EOS outputs match the original token IDs. This version repeats deterministically,
+while fixed-length trajectories differ from prior versions. The 15–17 ms goal
+is still open. The combined measurement section records exact provenance.
+
+## Workload
+
+Flash-Next GSQ-RCO IQ3_S, FP16 MTP4, TP4 on four V100 SXM2 32 GB cards.
+Driver 580.173.02, Torch 2.10 CUDA 12.8, Python 3.12.3. Activations and KV
+are FP16; SSM state and kernel accumulation are FP32. The TP topology has
+direct NVLink edges 0–1, 0–2, 1–3 and 2–3; diagonals use SYS.
+
+The engine uses maximum length 8704, four sequence slots, batch budget 512,
+memory utilization 0.9 and ring policy auto. Decode graphs are FULL; mixed
+prefill/decode uses the independently resolved PIECEWISE policy. C1 uses 8192
+input tokens and 256 output tokens. C4 uses 128 input tokens and 1024 output
+tokens per request. Timing cohorts use greedy sampling and ignore EOS for
+fixed output length. Separate natural greedy prompts respect EOS. Each
+candidate is measured three times; the original C1 has one repeat and the
+original C4 has three. No profiler is attached to these measurements.
+
+## Earlier complete-round comparisons
+
+The first candidate, source `39442cce7b`, combines floating restoration,
+packed FP32 router, replicated batched FP32 HC and the merged GGUF runtime
+dispatch correction. It retains dense FP16 vocabulary weights and legacy
+expert alignment. The later candidate, source `5fb07b92b8`, additionally
+extends GDN a/b row dispatch through M=32, prepares Q6_K packed vocabulary
+projection and uses fused expert alignment/restoration. It retains the
+existing expert GEMM implementations.
+
+| Candidate | C1 round (ms) | C1 tokens/s | C1 full acceptance length | C4 round (ms) | C4 tokens/s | C4 full acceptance length |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original ring auto | 41.499 | 75.212 | 3.036 | 65.624 | 262.269 | 3.830 |
+| Floating/HC integration | 36.747 | 93.788 | 3.459 | 66.061 | 202.019 | 3.055 |
+| Packed head and fused routing | 30.932 | 78.803 | 2.643 | 56.924 | 258.219 | 3.403 |
+
+Round time is total measured engine time divided by steady intervals;
+throughput is total emitted tokens divided by that same time. Full acceptance
+length comes from the complete request's speculative counters and includes
+the bonus token. These populations differ. The latest steady emitted tokens
+per request and round are 2.4375 at C1 and 3.674745 at C4.
+
+The latest C1 repeats each contain 80 steady intervals and 195 emitted tokens,
+with 98 draft rounds, 392 drafted tokens and 161 accepted draft tokens.
+C4 repeats each contain 196 steady intervals and 2881 emitted tokens across
+four requests, with 1205 draft rounds, 4820 drafted tokens and 2896 accepted
+draft tokens. Token IDs and speculative counters are identical within each
+candidate workload across repeats.
+
+The latest candidate reduces C1 round time by 10.567 ms, but reduced
+acceptance limits the throughput improvement over the original to 4.8%.
+C4 round time falls by 8.699 ms; throughput is still 1.5% below the original.
+The first candidate's C4 regression is substantially reduced but the
+nonregression check has not passed. This result does not isolate individual
+operator effects or confirm a cause of the acceptance differences.
+
+All four natural prompts have the same token IDs as the original ring-enabled
+runtime and finish normally at EOS, with lengths 2, 2, 2 and 63 tokens.
+The longer Chinese response gives a coherent explanation of Rayleigh
+scattering. Fixed-length timing trajectories differ between candidates;
+natural-output agreement must not be claimed for all ignored-EOS tokens.
+
+## Route and artifact checks
+
+The latest ordinary package is `1.5.2.dev538` from `5fb07b92b8`. Its wheel
+SHA256 is `df4b0bc86258d594f8ef0806cff9722d59a8a653636929f083b8ca05fd075a07`.
+The packaged core SHA256 is
+`0a8f4f3a2cfd4153cbfff09ff009f0be1745f1fa9f8fc437250742894ca113e1`.
+Native source matches the separately built batched HC artifact; the ordinary
+wheel contains the Python route changes. Fresh-process provenance and
+standard Torch/CUDA linkage were checked before launching the model.
+
+Worker records admit `GGUFLMHeadMethod` for the Q6_K vocabulary shard
+`[62080, 2560]`. Logs confirm FP32 replicated HC, a/b row GEMV at M=5/10/15/20,
+router top-k and fused expert alignment at those batch sizes. The target
+and MTP proposer share the packed vocabulary head. No new model trace has
+been captured for these candidates.
+
+## Follow-up recorded before joint experts
+
+The next step at that stage was to check the fused output reduction against the original Torch FP32
+operation on the admitted geometry. Its initial sequential sum differs from
+Torch's four-accumulator ordering; a local operator comparison can remove
+that discrepancy without another complete-model restart. This is an
+implementation difference, not a demonstrated cause of acceptance loss.
+
+The expert grouped-vector work reuses original-block decoders from #897.
+The checkpoint's gate/up tensors include IQ3_XXS in 17 layers, IQ2_S in 20,
+IQ3_S in 10 and IQ4_XS in one; filename alone cannot select a decoder.
+Dense quantized projection tuning remains separate. Further model profiling
+follows qualified floating-route integration.
+
+## Joint experts and PLE integration
+
+The next source-containing installed wheel is `1.5.2.dev560+g22e3ff90d`,
+with the same Flash-Next IQ3_S, FP16 MTP4, TP4, KV/state dtypes, batch budget,
+sampling and C1/C4 request lengths as the previous operator integration.
+It adds joint original-block IQ2_S/IQ3_S gate/up, calibrated canonical
+IQ4_NL/Q2_0 down vectors, exact Torch-order unroute reduction and batched
+PLE n-gram IDs. Unmeasured points retain canonical dispatch; the slower
+IQ2_S gate/up and down-vector M=20 points remain excluded.
+
+| Candidate | C1 round ms | C1 tokens/s | C1 full acceptance length | C4 round ms | C4 tokens/s | C4 full acceptance length |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Previous operator integration | 30.932 | 78.803 | 2.643 | 56.924 | 258.219 | 3.403 |
+| Joint experts and PLE | 26.668 | 90.544 | 2.560 | 54.748 | 258.709 | 3.485 |
+
+C1 saves 4.264 ms per round and improves throughput by 14.9% against the
+previous integration; against the original ring-enabled model it saves
+14.831 ms and improves throughput by 20.4%. The 26.668 ms round is below
+the separately recorded 27.4 ms NVFP4 MTP4 reference, but that comparison
+alone does not establish equivalent emitted-token throughput or quality.
+C4 saves 2.176 ms against the previous integration while throughput changes
+by +0.19%. C4 remains 1.36% below the original ring-enabled throughput; this
+result does not establish a strict C4 non-regression gate. The 15–17 ms round
+target is not reached.
+
+Each of the three C1 repeats records 82 steady intervals and 198 emitted
+tokens, or 2.414634 emitted tokens per interval. Full-request speculative
+counters contain 100 drafts, 400 drafted tokens and 156 accepted tokens.
+Each C4 repeat records 257 steady intervals and 3640 emitted tokens across
+four requests, or 3.540856 per request and interval. Full-request counters
+contain 1177 drafts, 4708 drafted tokens and 2925 accepted tokens. Token IDs
+and speculative counters match across all three repeats in each cohort.
+Acceptance counters cover the full request rather than only the steady
+interval window and must not replace its emitted-token denominator.
+
+Four natural greedy prompts finish normally: Paris, arithmetic, Chinese
+translation and a 63-token explanation of Rayleigh scattering. All four
+match original model token IDs. These are text-health checks, not a broad
+quality-set result. Timing cohorts use fixed output lengths with EOS ignored;
+natural prompts honor EOS.
+
+Runtime logs confirm joint original-block type21/type22 at M=5, type21 at
+M=20, both down formats at 50 routed rows, fused small expert alignment,
+FP32 replicated HC, a/b row GEMV at M=5/10/15/20, router and QSA top-k,
+and batched PLE n-gram IDs. The ordinary installed artifact passes 46 CPU
+checks plus 42 GPU/mixed-bank cases, all 211 dependency checks and fresh
+native import. No private DSO, preload or library override is needed.
+
+Model storage is 24.18 GiB per rank. The profiler leaves 2.75 GiB for KV,
+69,360 tokens; captured graphs add about 0.38 GiB. The additional original
+expert banks are retained only for type21/type22; type18's measured M=5 gain
+does not justify another 2.55 GiB per rank in this integration. There is no
+new model trace in this measurement.
+
+Whole wheel SHA256:
+`50f9c856415b3ccbdf428d678bd7664c57ad523b1bc78112f2958aa8b100dc63`.
+Loaded native `_C` SHA256:
+`2259d5e8591b06c8fa58aa274cbaf3293f05e9c477fdd86b146ca10e9504589f`.
+
+## Node trace after operator integration
+
+Nsight Systems 2024.6.2 captures the already qualified
+`1.5.2.dev560+g22e3ff90d` package. Graph 14 is the target verifier;
+graphs 26 and 38 are draft graphs. Each of four workers has 75 complete
+target launches with 2175 nodes, versus 3194 nodes in the original trace.
+Analysis uses the middle 59 target-to-next-target intervals per worker,
+excluding eight transitions on either end. The immutable raw SQLite is
+retained separately from the derived target-replay selection.
+
+| Target category | Calls per rank/round | Mean rank service (ms) |
+| --- | ---: | ---: |
+| HC combine and gates | 386 | 3.580 |
+| TP ring, including readiness waits | 98 | 3.415 |
+| Bitplane projections | 131 | 3.026 |
+| Canonical down vectors | 48 | 2.002 |
+| Joint original-block gate/up | 30 | 1.973 |
+| Remaining lattice projections | 34 | 1.870 |
+| LUT4 projections | 87 | 1.622 |
+| QSA/indexer | 72 | 1.609 |
+| Router/shared gate | 144 | 1.145 |
+| Copy/cast | 273 | 0.931 |
+| Index/reduce/scatter | 145 | 0.727 |
+| Fused expert route/unroute | 96 | 0.553 |
+| FP16 row GEMV | 36 | 0.122 |
+| Packed PLE UVA gather | 1 | 0.100 |
+| PLE n-gram IDs | 1 | 0.003 |
+
+Original-block type22/type21 gate/up, canonical type20/type42 down vectors,
+fused expert route/unroute, row GEMV, FP32 batch HC, router top-k, QSA and
+packed PLE UVA are present in actual nodes. Remaining type18 gate/up uses
+34 canonical vector launches per target round. It was excluded from dual
+original storage because that adds 2.55 GiB per rank for a smaller measured
+M5 benefit.
+
+The target activity envelope averages 29.800 ms per rank and draft graph
+service averages 4.226 ms in this capture. These values include profiler
+perturbation and cannot replace the unprofiled 26.668 ms complete-round
+baseline. Category service can overlap and readiness waits are embedded in
+collectives; neither the category table nor per-rank maxima form an additive
+wall-clock decomposition.
+
+The remaining copy/scatter work and HC/QSA/router calls merit targeted
+operator checks. The packed PLE gather is already using pinned host UVA;
+its 0.100 ms service does not establish that it causes host replay skew or
+first-collective waiting. Dense quantized GEMV tuning remains in the separate
+GGUF kernel work.
+
+The updated first-ring analysis finds only about 3.0–3.3 us of target GPU
+work before the collective. Its residual after the last rank arrives is
+5.533 us. Arrival spread has median 674.758 us; its mean is 1255.998 us
+because one transition has a 37.617 ms outlier. Excluding that one point
+reduces the mean to 629.091 us. CPU replay-entry spread has median
+653.734 us, consistent with skew before target graph entry. The profiler's
+4.4–6.0 ms graph-launch API durations are instrumented values and do not
+establish ordinary host cost. PLE causality remains unproven.
+
+Rank0 is last to enter the target graph in 56 of the 59 captured rounds.
+CUDA API overlap between the earliest worker's entry and rank0's entry has
+median 319.470 us; excluding the one skew outlier gives mean 300.385 us.
+The remaining 58 windows contain about 8.88 APIs each, primarily elementwise
+and indexed launches plus asynchronous copies. These instrumented APIs
+account for part of the observed entry spread rather than an isolated PLE
+wait. Their durations are not ordinary host-time savings. Attribution below
+the Python/driver boundary requires further evidence before changing
+collective synchronization or assigning the wait to the offloader.
+
+## GDN copy follow-up
+
+Projection-tail materialization is merged in #927 and row-strided mixed-QKV
+verification in #928. The former writes Z/b/a in one launch while retaining
+the QKV view; the latter consumes that physical row stride and avoids the
+split/concatenate preparation. Both are restricted to the measured M5/M20
+model geometry and preserve FP32 recurrence and state snapshots.
+
+| Local chain, 36 layers | M5 saving ms | M20 saving ms |
+| --- | ---: | ---: |
+| Projection tails | 0.225 | 0.202 |
+| Strided recurrent input | 0.494 | 0.545 |
+| Direct recurrent output | 0.080 | 0.060 |
+
+The direct output path merged in #929 passes changed-input graph comparisons for output,
+convolution state and all FP32 SSM snapshots, including destination canaries.
+These synthetic exact-layout chain timings are separate operator measurements
+and cannot be summed into a complete-model result. The qualified model remains
+the 26.668 ms C1 / 54.748 ms C4 composition above until the next combined run.
+
+A launch-geometry screen of HC combine/norm finds no faster bitwise M5 choice;
+the current tile and warp policy is retained. Changing tile width produces
+some FP16 output bit differences. The existing rejected QSA score-tile screen
+is also retained as a negative result rather than repeated. A replicated HC
+up counter sample motivated a next-group weight-lookahead screen. The
+candidate preserves intermediate bits but does not improve M5 and regresses
+M20; it is reverted in #930. Its counter and ordinary operator timings are
+recorded in `sm70_hc_weight_prefetch_screen.md` without model admission.
+
+## Combined GDN copy measurement
+
+Source `3b07077f7318f5947e8771080beeee9d6f4830e5`, ordinary package
+`1.5.2.dev915+g3b07077f7`, includes default projection-tail materialization
+(#936), row-strided recurrent input (#928), direct recurrent output (#929),
+and the existing joint experts. The worker reports actual FULL decode and
+PIECEWISE mixed graphs independently; all four ranks captured 5/10/15/20
+token FULL graphs. KV pages are 816 tokens, FP16 KV and FP32 SSM state;
+MTP weights remain FP16. Hardware and timing lengths match the earlier
+TP4 composition: C1 I8192/O256 and C4 I128/O1024, three repetitions.
+
+| Metric | Previous joint experts | Combined GDN copies | Change |
+| --- | ---: | ---: | ---: |
+| C1 round ms | 26.668 | 26.072 | -0.596 |
+| C1 aggregate decode tokens/s | 90.544 | 92.267 | +1.90% |
+| C1 steady emitted/request/round | 2.415 | 2.405 | |
+| C4 round ms | 54.748 | 52.059 | -2.689 |
+| C4 aggregate decode tokens/s | 258.709 | 280.441 | +8.40% |
+| C4 steady emitted/request/round | 3.541 | 3.650 | |
+
+C1 repetitions are 25.782/26.314/26.120 ms; C4 repetitions are
+51.658/52.070/52.450 ms. Full-run acceptance length is 2.783 at C1
+(92 drafts, 368 proposed tokens, 164 accepted) and 3.020 at C4
+(1357 drafts, 5428 proposed tokens, 2741 accepted). These counters include
+request tails and are distinct from steady-cohort emitted/request/round.
+Within this version, all three repeated output token sequences and acceptance
+counters agree exactly. Fixed-length timing sequences differ from the prior
+composition, so the full latency difference cannot be attributed entirely to
+copy operators. No activation or accumulation precision was reduced.
+
+The four natural EOS prompts retain all original token IDs, including the
+63-token Chinese explanation. They finish normally. Against the initial
+GGUF MTP4 baseline, C1 throughput increases 22.68% and C4 6.93%; the previous
+small C4 regression is removed. C1 round duration is 1.328 ms below the
+separately recorded 27.4 ms NVFP4 reference, which is not a matched throughput
+or quality comparison. The 15–17 ms target remains unachieved.
+
+Whole wheel SHA256:
+`5b862ec1771891b6ed4a448488e9bbf6775af36b945f0fdd729d1f929db9c726`.
+Packaged core SHA256:
+`6ee54f6fe296eb6a68f027b6e6611243914bccc7140508829d1132a6b1aac527`.
+All 213 package dependencies and six installed worker/RPC serializer checks
+pass. The actual standard string RPC records worker graph modes without
+allowing insecure callable deserialization.
+
+Two preceding model attempts produced no natural or timing results: one
+lacked the worker graph-report field, the other used a callable rejected by
+the default Msgpack serializer. Their logs are retained separately; neither
+is counted as a benchmark. No additional trace was collected for this run.
+
+## Reproduce the matched composition
+
+Use a normal installed wheel containing the measured operators, with the
+shared GPU lock and task-owned compile/JIT caches. Respect EOS for the natural
+prompts; ignore it only in the explicitly fixed-length timing cohorts.
+
+```bash
+python benchmarks/benchmark_gguf_model.py MODEL.gguf \
+  --mtp-draft MTP_MODEL --ring auto --require-installed \
+  --prompts-json PROMPTS.json --kv-cache-dtype float16 \
+  --ssm-state-dtype float32 --widths 1 4 \
+  --input-len 8192 --output-len 256 --concurrent-input-len 128 \
+  --concurrent-output-len 1024 --prefill --max-model-len 8704 \
+  --max-seqs 4 --max-batch 512 --repeats 3 \
+  --gpu-memory-utilization 0.9 --output RESULT.json
+```
+
+Fixed-length first-different output positions against the prior joint-expert
+artifact are 50 at C1, and 123/46/530/669 for the four C4 requests
+(zero-based). This does not alter the observed natural EOS agreement and is
+not recorded as strict long-output equivalence.

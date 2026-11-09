@@ -8,6 +8,9 @@ try:
 
     if not hasattr(_T, "gemm_v1") and hasattr(_T, "gemm"):
         _T.gemm_v1 = _T.gemm
+    from flash_qla.compiler import register_sm70_runtime_compiler
+
+    register_sm70_runtime_compiler()
 except ImportError:
     pass
 

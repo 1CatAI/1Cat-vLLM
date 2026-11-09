@@ -20,9 +20,10 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
 
 @pytest.mark.parametrize("top_p", [1.0, 0.95, 0.6])
 @pytest.mark.parametrize("case", ["k_tie", "p_tie", "uniform", "unique"])
+@pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_tied_cutoffs_match_full_vocabulary_reference(case, top_p):
-    x = torch.full((8, 32768), -20.0, device="cuda")
+def test_tied_cutoffs_match_full_vocabulary_reference(case, top_p, rows):
+    x = torch.full((rows, 32768), -20.0, device="cuda")
     if case == "k_tie":
         x[:, :24] = 1.0
         x[:, :18] = 2.0
@@ -33,10 +34,66 @@ def test_tied_cutoffs_match_full_vocabulary_reference(case, top_p):
         x.fill_(1.0)
     else:
         x[:, :32] = torch.arange(32, 0, -1, device="cuda") / 8
-    k = torch.full((8,), 20, dtype=torch.int32, device="cuda")
-    p = torch.full((8,), top_p, device="cuda")
+    k = torch.full((rows,), 20, dtype=torch.int32, device="cuda")
+    p = torch.full((rows,), top_p, device="cuda")
     expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
     actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [1, 19, 20])
+@pytest.mark.parametrize("top_k,top_p", [(20, 0.95), (50, 0.9)])
+def test_compact_fallback_bounds_full_vocabulary_sort_workspace(
+    monkeypatch, rows, top_k, top_p
+):
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    # MTP4 at C4 has 20 target rows. Uniform logits force the ambiguous tie
+    # fallback, which previously sorted the entire expanded batch together.
+    logits = torch.ones((rows, 248320), device="cuda")
+    k = torch.full((rows,), top_k, dtype=torch.int32, device="cuda")
+    p = torch.full((rows,), top_p, device="cuda")
+    expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    reference_rows = []
+
+    def bounded_reference(x, k, p, **kwargs):
+        reference_rows.append(x.shape[0])
+        if rows > 1:
+            assert kwargs["rowwise_sort"]
+        return apply_top_k_top_p_pytorch(x, k, p, **kwargs)
+
+    monkeypatch.setattr(
+        topk_topp_sampler, "apply_top_k_top_p_pytorch", bounded_reference
+    )
+    actual = apply_top_k_top_p_triton(logits, k, p)
+    assert reference_rows == ([1] if rows == 1 else [2] * ((rows + 1) // 2))
+    assert torch.equal(actual, expected)
+    # Both the compact route and singleton reference permit in-place masking.
+    assert actual.data_ptr() == logits.data_ptr()
+
+
+@pytest.mark.parametrize("mask_value", [-float("inf"), -123.0])
+@pytest.mark.parametrize("use_top_k", [False, True])
+def test_single_row_direct_entry_keeps_grammar_ties_on_reference(
+    monkeypatch, mask_value, use_top_k
+):
+    from vllm.v1.sample.ops import topk_topp_triton
+
+    def unsafe_pivot(*args):
+        raise AssertionError("Single-row call reached the unsafe pivot kernel")
+
+    monkeypatch.setattr(topk_topp_triton, "num_compute_units", unsafe_pivot)
+    # A strided row with masked vocabulary and a nucleus split inside a tie.
+    x = torch.full((1, 65536), -float("inf"))[:, ::2]
+    x[:, :24] = 1.0
+    x[:, :2] = 2.0
+    k = torch.tensor([20], dtype=torch.int32) if use_top_k else None
+    p = torch.tensor([0.8])
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    if mask_value != -float("inf"):
+        expected.masked_fill_(torch.isneginf(expected), mask_value)
+    actual = apply_top_k_top_p_triton(x, k, p, mask_value=mask_value)
     assert torch.equal(actual, expected)
 
 
@@ -113,16 +170,17 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
     monkeypatch, temperatures, top_ps
 ):
     class Speculator:
+        _sm70_dflash2_policy = SimpleNamespace(
+            resolved=True, sparse_target_rejection=True
+        )
+
         def get_sparse_draft_logits(self):
             return None, None
 
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
-    monkeypatch.setattr(
-        sparse_rejection.envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True
-    )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
     monkeypatch.setattr(
-        sparse_rejection, "_supports_sparse_sampling_contract", lambda *args: True
+        sparse_rejection, "_supports_sparse_sampling_contract", lambda *a, **k: True
     )
     probe = torch.ones(3, 21)
     probe[:, :2] = 2.0
@@ -141,10 +199,16 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
     result = sparse_rejection.try_dflash2_sparse_target_rejection(
         SimpleNamespace(get_topk_tokens_and_logits=lambda *args: (None, probe)),
         Speculator(),
-        SimpleNamespace(sampler=SimpleNamespace(sampling_states=states)),
+        SimpleNamespace(
+            sampler=SimpleNamespace(
+                sampling_states=states,
+                penalties_state=SimpleNamespace(use_penalty=np.zeros(3, dtype=bool)),
+            )
+        ),
         SimpleNamespace(device=SimpleNamespace(type="cuda")),
         batch,
         None,
+        allow_graph=False,
     )
     assert result is None
 
@@ -188,6 +252,37 @@ def test_compact_top_p_rounding_boundary(direction):
     expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
     actual = apply_top_k_top_p_triton(x.clone(), k, p)
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("rows", [33, 64])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compact_dense_fallback_bounds_temporary_rows(monkeypatch, rows):
+    from vllm.v1.sample.ops import topk_topp_sampler
+    from vllm.v1.sample.ops.topk_topp_triton import _apply_top_k_top_p_compact
+
+    # Every row exceeds the shortlist at its top-k cutoff. Different top-p
+    # parameters exercise row mapping across complete and partial chunks.
+    logits = torch.ones((rows, 248320), device="cuda")
+    logits[:, :2] = 2.0
+    k = torch.full((rows,), 20, dtype=torch.int32, device="cuda")
+    p = torch.linspace(0.6, 1.0, rows, device="cuda")
+    expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    dense_batch_sizes = []
+
+    def reference(chunk, chunk_k, chunk_p, *, rowwise_sort=False):
+        dense_batch_sizes.append(chunk.shape[0])
+        assert rowwise_sort
+        return apply_top_k_top_p_pytorch(
+            chunk, chunk_k, chunk_p, rowwise_sort=rowwise_sort
+        )
+
+    monkeypatch.setattr(topk_topp_sampler, "apply_top_k_top_p_pytorch", reference)
+    actual = _apply_top_k_top_p_compact(logits, k, p, -float("inf"))
+    assert torch.equal(actual, expected)
+    assert actual.data_ptr() == logits.data_ptr()
+    # An odd final chunk repeats one row to retain the batched softmax scan.
+    assert sum(dense_batch_sizes) == rows + rows % 2
+    assert max(dense_batch_sizes) <= 2
 
 
 @pytest.mark.parametrize("rows", [2, 8, 32])
@@ -267,3 +362,43 @@ def test_shortlist_order_preserves_radix_ties_and_value_bits(width, descending):
         assert torch.equal(
             output[0].view(torch.int32), ordered_values.view(torch.int32)
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compact_classifies_rows_without_rejecting_the_batch(monkeypatch):
+    from vllm.v1.sample.ops import topk_topp_sampler
+    from vllm.v1.sample.ops.topk_topp_triton import _apply_top_k_top_p_compact
+
+    # One batch mixing greedy-style rows (top-k disabled, top_p=1), top-k-only
+    # rows, sampled rows and rows whose k exceeds the shortlist. Admission is
+    # decided on the device (no per-step sync), and only the out-of-shortlist
+    # rows that still need top-p take the dense reference route.
+    vocab = 248320
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    logits = torch.randn((8, vocab), device="cuda", generator=generator) * 3
+    logits[:, :4] += 12.0
+    k = torch.tensor(
+        [vocab, vocab, 20, 50, 20, 200, vocab, 127], dtype=torch.int32, device="cuda"
+    )
+    p = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.95, 0.9, 0.8, 0.95], device="cuda")
+    expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    dense_settings: set[tuple[int, float]] = set()
+
+    def counting_reference(x, k, p, **kwargs):
+        dense_settings.update(zip(k.tolist(), p.tolist()))
+        return apply_top_k_top_p_pytorch(x, k, p, **kwargs)
+
+    monkeypatch.setattr(
+        topk_topp_sampler, "apply_top_k_top_p_pytorch", counting_reference
+    )
+    actual = _apply_top_k_top_p_compact(logits.clone(), k, p, -float("inf"))
+    assert actual is not None
+    assert torch.equal(actual, expected)
+    # Each row has its own (k, top_p) pair, except the two identical greedy rows.
+    settings = list(zip(k.tolist(), p.tolist()))
+    dense = {row for row, setting in enumerate(settings) if setting in dense_settings}
+    # Rows 5 (k=200, top_p=0.9) and 6 (top-k disabled, top_p=0.8) need the dense
+    # route; greedy-style and top-k-only rows (0-3) never take it. The sampled
+    # rows 4 and 7 may, when their nucleus boundary falls inside the FP32 margin
+    # (row 7 does with torch 2.10 on a V100).
+    assert {5, 6} <= dense <= {4, 5, 6, 7}

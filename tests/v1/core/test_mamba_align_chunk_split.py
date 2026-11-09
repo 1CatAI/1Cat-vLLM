@@ -23,17 +23,19 @@ pytestmark = pytest.mark.cpu_test
 MAMBA_BLOCK_SIZE = 816
 
 
-def _split(request, num_new_tokens: int, *, interval=None, eagle=False) -> int:
-    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
+def _split(
+    request, num_new_tokens: int, *, interval=None, eagle=False, tail=True
+) -> int:
+    coordinator = SimpleNamespace(drop_eagle_group_ids={0} if eagle else set())
     coordinator.get_replay_boundaries = lambda request, block: (
         KVCacheCoordinator.get_replay_boundaries(coordinator, request, block)
     )
     scheduler = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=16),
+        cache_config=SimpleNamespace(block_size=16, mamba_tail_checkpoint=tail),
         mamba_state_block_size=MAMBA_BLOCK_SIZE,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        use_eagle=eagle,
+        use_eagle_block_drop=eagle,
         mamba_state_retention_interval=interval,
         kv_cache_manager=SimpleNamespace(coordinator=coordinator),
     )
@@ -101,7 +103,7 @@ def test_contention_switch_keeps_single_request_sparse(running, waiting):
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
         mamba_state_block_size=8192,
-        use_eagle=True,
+        use_eagle_block_drop=True,
         mamba_state_retention_interval=0,
         mamba_dense_boundaries_on_contention=True,
         running=[request] * running,
@@ -206,7 +208,7 @@ def test_repeated_sub_block_chunks_preserve_state_boundaries() -> None:
     assert boundaries == [816, 1632]
 
 
-def _chunk_ends(length, *, interval=0, eagle=False, shared=0):
+def _chunk_ends(length, *, interval=0, eagle=False, shared=0, tail=True):
     request = SimpleNamespace(
         num_computed_tokens=0,
         num_prompt_tokens=length,
@@ -216,7 +218,9 @@ def _chunk_ends(length, *, interval=0, eagle=False, shared=0):
     ends = []
     while request.num_computed_tokens < length:
         remaining = length - request.num_computed_tokens
-        chunk = _split(request, min(8192, remaining), interval=interval, eagle=eagle)
+        chunk = _split(
+            request, min(8192, remaining), interval=interval, eagle=eagle, tail=tail
+        )
         assert 0 < chunk <= min(8192, remaining)
         request.num_computed_tokens += chunk
         ends.append(request.num_computed_tokens)
@@ -231,7 +235,7 @@ def test_sparse_mtp_preserves_fine_resend_boundary_with_bulk_prefill():
 @pytest.mark.parametrize("length", [8160, 8161, 32768, 131040])
 def test_sparse_keeps_both_replay_boundaries(eagle, length):
     ends = _chunk_ends(length, eagle=eagle)
-    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
+    coordinator = SimpleNamespace(drop_eagle_group_ids={0} if eagle else set())
     boundaries = KVCacheCoordinator.get_replay_boundaries(
         coordinator, SimpleNamespace(num_tokens=length), MAMBA_BLOCK_SIZE
     )
@@ -240,6 +244,18 @@ def test_sparse_keeps_both_replay_boundaries(eagle, length):
         if aligned:
             assert aligned in ends
     assert len(ends) <= length // 8000 + 3
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+@pytest.mark.parametrize(
+    "length", [50, MAMBA_BLOCK_SIZE - 1, 2 * MAMBA_BLOCK_SIZE + 30]
+)
+def test_sparse_does_not_split_at_unaligned_last_token(eagle, length):
+    # A state ending at the unaligned position length - 1 is never cacheable;
+    # stopping there only adds a step and changes the prefill chunking.
+    ends = _chunk_ends(length, eagle=eagle)
+    assert length - 1 not in ends
+    assert all(end == length or end % MAMBA_BLOCK_SIZE == 0 for end in ends), ends
 
 
 def test_sparse_keeps_detected_shared_prefix_boundary():
@@ -256,3 +272,14 @@ def test_periodic_retention_stops_at_all_retained_checkpoints():
 def test_dense_retention_still_materializes_every_checkpoint():
     length = 3 * MAMBA_BLOCK_SIZE + 30
     assert _chunk_ends(length, interval=None) == [816, 1632, 2448, length]
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+def test_without_tail_checkpoint_the_last_step_is_not_split(eagle):
+    # 34711 tokens: four full chunks, then a 2071-token remainder.
+    with_tail = _chunk_ends(34711, eagle=eagle)
+    without = _chunk_ends(34711, eagle=eagle, tail=False)
+    assert without == [8160, 16320, 24480, 32640, 34711]
+    assert len(with_tail) > len(without)
+    # Earlier chunks keep their aligned checkpoints.
+    assert without[:-1] == with_tail[: len(without) - 1]

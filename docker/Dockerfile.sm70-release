@@ -1,0 +1,56 @@
+# 1Cat-vLLM release image for 4x V100-32GB (SM70). One image serves both release models;
+# choose with -e MODEL=27b or -e MODEL=flashnext.
+#
+# Build context: a directory with the 1cat_vllm wheel and docker/sm70_release/serve.sh.
+# Run:
+#   docker run --runtime=nvidia --gpus all --network host --ipc=host --ulimit memlock=-1 \
+#     -e MODEL=27b -v /path/to/models:/models:ro -v vllm-cache:/cache 1cat/vllm-v100:<version>
+#
+# --ipc=host and memlock are required: KV history and all-reduce buffers use shared, pinned memory.
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
+
+# python3.12 for the wheel; gcc for torch.compile and Triton host stubs; curl for the healthcheck.
+ARG APT_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ubuntu
+RUN sed -i "s|http://archive.ubuntu.com/ubuntu|$APT_MIRROR|g; s|http://security.ubuntu.com/ubuntu|$APT_MIRROR|g" \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev gcc g++ curl ca-certificates libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+COPY 1cat_vllm-*.whl /tmp/
+RUN pip install -U pip -i "$PIP_INDEX_URL" \
+    && pip install /tmp/1cat_vllm-*.whl -i "$PIP_INDEX_URL" \
+    && rm /tmp/1cat_vllm-*.whl
+# TileLang kernels (FlashQLA GDN prefill) compile with nvcc at first use; pip's
+# nvidia-cuda-nvcc-cu12 ships only ptxas. Install the CUDA 12.8 compiler and
+# runtime headers matching the wheel's toolkit.
+ARG CUDA_REPO=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64
+RUN curl -fsSL -o /tmp/cuda-keyring.deb "$CUDA_REPO/cuda-keyring_1.1-1_all.deb" \
+    && dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb \
+    && apt-get update && apt-get install -y --no-install-recommends cuda-nvcc-12-8 cuda-cudart-dev-12-8 \
+    && rm -rf /var/lib/apt/lists/*
+ENV CUDA_HOME=/usr/local/cuda-12.8
+ENV PATH=$CUDA_HOME/bin:$PATH
+
+# No GPU driver at build time: check the install without importing CUDA modules.
+RUN python -c "import importlib.metadata as m; print(m.version('1cat-vllm'))"
+
+WORKDIR /app
+COPY serve.sh /app/serve.sh
+RUN chmod +x /app/serve.sh
+
+# Mount points: models read-only, cache persistent (the compile cache makes restarts fast).
+ENV MODEL=27b MODEL_DIR=/models CACHE_DIR=/cache PORT=8000 HOST=0.0.0.0
+VOLUME ["/cache"]
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=1200s --retries=3 \
+    CMD curl -sf -o /dev/null -H "Authorization: Bearer ${VLLM_API_KEY:-none}" http://127.0.0.1:${PORT}/health || exit 1
+ENTRYPOINT ["/app/serve.sh"]

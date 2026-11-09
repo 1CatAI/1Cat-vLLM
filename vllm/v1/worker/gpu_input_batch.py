@@ -8,8 +8,8 @@ from typing import cast
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm.config.reasoning import ReasoningConfig
+from vllm.config.sm70_runtime import Sm70RuntimeConfig, bind_output_token_repair
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -108,7 +108,9 @@ class InputBatch:
         cp_kv_cache_interleave_size: int = 1,
         reasoning_config: ReasoningConfig | None = None,
         dcp_sharded: list[bool] | None = None,
+        runtime_policy: Sm70RuntimeConfig | None = None,
     ):
+        self._output_token_repair = bind_output_token_repair(runtime_policy)
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
             reasoning_config,
             max_num_reqs,
@@ -1092,7 +1094,7 @@ class InputBatch:
                 ),
                 len(sampled_ids),
             )
-            if envs.VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR:
+            if self._output_token_repair():
                 first_placeholder = req_output_token_ids.index(-1)
                 num_placeholders = len(req_output_token_ids) - first_placeholder
                 num_to_replace = min(num_sampled_ids, num_placeholders)

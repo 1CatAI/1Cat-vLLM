@@ -51,7 +51,7 @@ def test_delayed_producer_changing_width_captured_bytes(dtype):
                 hidden = torch.zeros(1, 1, dtype=torch.float16, device=device)
                 by_width = {}
                 capture_stream = torch.cuda.Stream(device=device)
-                for count in (1, 2, 4, 8, 16):
+                for count in (1, 2, 4, 5, 8, 10, 16):
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, stream=capture_stream):
                         torch.ops.vllm.ple_offload_wait(
@@ -74,7 +74,9 @@ def test_delayed_producer_changing_width_captured_bytes(dtype):
         assert acknowledgements.get(timeout=60) == "ready"
         for region in regions:
             region.validate_registration()
-        for step, count in enumerate([1, 2, 4, 8, 16, 16, 8, 4, 2, 1] * 4):
+        for step, count in enumerate(
+            [1, 2, 4, 5, 8, 10, 16, 16, 10, 8, 5, 4, 2, 1] * 4
+        ):
             queue.put((count, step))
             for rank, by_width in enumerate(graphs):
                 with torch.accelerator.device_index(rank):

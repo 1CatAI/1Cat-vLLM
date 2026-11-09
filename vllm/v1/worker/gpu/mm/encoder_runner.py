@@ -19,6 +19,7 @@ class EncoderRunner:
         encoder_cache: EncoderCache,
         dtype: torch.dtype,
         device: torch.device,
+        max_batch_size: int = 0,
     ):
         self.model = model
         self.max_num_tokens = max_num_tokens
@@ -26,6 +27,7 @@ class EncoderRunner:
         self.encoder_cache = encoder_cache
         self.dtype = dtype
         self.device = device
+        self.max_batch_size = max_batch_size
 
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
@@ -54,7 +56,10 @@ class EncoderRunner:
     ) -> list[torch.Tensor]:
         encoder_outputs: list[torch.Tensor] = []
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs, device=self.device, pin_memory=False
+            mm_kwargs,
+            device=self.device,
+            pin_memory=False,
+            max_batch_size=self.max_batch_size,
         ):
             batch_outputs = self.model.embed_multimodal(**mm_kwargs_batch)
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)

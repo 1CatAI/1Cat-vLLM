@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -11,6 +10,7 @@ import torch
 import vllm.distributed.parallel_state as parallel_state
 import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer_module
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
+from vllm.config.observability import ObservabilityConfig
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.llm_base_proposer import (
@@ -18,6 +18,7 @@ from vllm.v1.spec_decode.llm_base_proposer import (
     _clone_drafter_mutable_metadata,
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.profiling import create_step_profiler
 from vllm.v1.spec_decode.utils import (
     eagle_prepare_next_token_padded_kernel,
     next_power_of_2,
@@ -37,19 +38,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_dspark_uses_sm70_mtp_profile_timing() -> None:
-    runner = SimpleNamespace(
-        speculative_config=SimpleNamespace(
-            method="dspark",
-            use_dflash_ddtree=lambda: False,
+def _profile(role, logger):
+    return create_step_profiler(
+        SimpleNamespace(
+            observability_config=ObservabilityConfig(),
+            speculative_config=SimpleNamespace(method="dspark"),
         ),
-        device=torch.device("cuda"),
+        torch.device("cuda"),
+        role=role,
+        logger=logger,
     )
-    with patch(
-        "vllm.v1.worker.gpu_model_runner._sm70_mtp_profile_env_enabled",
-        return_value=True,
-    ):
-        assert GPUModelRunner._sm70_mtp_profile_enabled(runner)
+
+
+def test_dspark_uses_sm70_mtp_profile_timing(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SM70_MTP_PROFILE", "1")
+    assert _profile("runner", gpu_model_runner_module.logger).enabled
+    assert _profile("proposer", llm_base_proposer_module.logger).enabled
 
 
 def test_prepare_next_token_padded_counts_only_contiguous_prefix():
@@ -412,10 +416,11 @@ def test_runner_mtp_profile_reports_from_last_pp_stage(
         "num_reqs": 1,
     }
 
-    runner._sm70_mtp_profile_report(ctx)
+    runner._step_profiler = _profile("runner", gpu_model_runner_module.logger)
+    runner._step_profiler.report(ctx)
 
     # Totals accumulate on every rank; only the report rank logs them.
-    assert runner._sm70_mtp_runner_profile_totals["draft_total"] == 83.9
+    assert runner._step_profiler.totals["draft_total"] == 83.9
     assert any("SM70 spec runner profile" in m for m in messages) is expected
 
 
@@ -430,12 +435,13 @@ def test_proposer_mtp_profile_reports_from_last_pp_stage(
     messages = _record_info(monkeypatch, llm_base_proposer_module)
     proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
 
-    proposer._sm70_mtp_profile_report(
+    proposer._step_profiler = _profile("proposer", llm_base_proposer_module.logger)
+    proposer._step_profiler.report_proposal(
         events=[("total_gpu", _FakeEvent(83.9), _FakeEvent())],
         cpu_ms={"total_wall_cpu": 90.0},
         batch_size=1,
         num_tokens=6,
     )
 
-    assert proposer._sm70_mtp_profile_totals["total_gpu"] == 83.9
+    assert proposer._step_profiler.totals["total_gpu"] == 83.9
     assert bool(messages) is expected

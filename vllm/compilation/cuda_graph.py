@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -15,6 +16,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.diagnostics import bind_event_tracer
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
     BatchDescriptor,
@@ -24,10 +26,11 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
-from vllm.sm70_decode_trace import sm70_trace_call
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
+# Diagnostics: log graph-pool growth per captured graph.
+_GRAPH_MEMLOG = bool(os.environ.get("GRAPH_POOL_MEMLOG"))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -186,6 +189,7 @@ class CUDAGraphWrapper:
     ) -> None:
         self.runnable = runnable
         self.vllm_config = vllm_config
+        self._trace_call = bind_event_tracer(vllm_config).call
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
 
@@ -330,6 +334,9 @@ class CUDAGraphWrapper:
             if self.check_input_addresses:
                 entry.input_debug = self._collect_tensor_debug(args, kwargs)
             cudagraph = torch.cuda.CUDAGraph()
+            reserved_before = (
+                torch.accelerator.memory_reserved() if _GRAPH_MEMLOG else 0
+            )
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -385,6 +392,23 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            if _GRAPH_MEMLOG:
+                outputs = output if isinstance(output, (tuple, list)) else [output]
+                logger.info(
+                    "Graph pool capture %s %s: reserved %.1f MiB (+%.1f), "
+                    "output %.1f MiB, weak_ref_output=%s",
+                    self.runtime_mode.name,
+                    entry.batch_descriptor.num_tokens,
+                    torch.accelerator.memory_reserved() / 2**20,
+                    (torch.accelerator.memory_reserved() - reserved_before) / 2**20,
+                    sum(
+                        t.numel() * t.element_size()
+                        for t in outputs
+                        if isinstance(t, torch.Tensor)
+                    )
+                    / 2**20,
+                    self.cudagraph_options.weak_ref_output,
+                )
 
             compilation_counter.num_cudagraph_captured += 1
 
@@ -410,11 +434,11 @@ class CUDAGraphWrapper:
 
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
-        sm70_trace_call(
+        self._trace_call(
             f"cudagraph.{self.runtime_mode.name}.sync_prev_onload",
             get_offloader().sync_prev_onload,
         )
-        sm70_trace_call(
+        self._trace_call(
             f"cudagraph.{self.runtime_mode.name}.replay",
             entry.cudagraph.replay,
         )

@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from tests.models.qwen4_exp.qsa_policy_utils import set_qsa_option
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
@@ -31,11 +32,11 @@ def test_request_segments(query_start_loc, expected):
 
 
 def _enable_cublas(monkeypatch):
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS_MIN_ROWS", 512)
+    set_qsa_option(monkeypatch, "qsa_indexer_cublas", True)
+    set_qsa_option(monkeypatch, "qsa_cublas_min_rows", 512)
     monkeypatch.setattr(
         qsa_ops.current_platform,
-        "is_device_capability",
+        "is_device_capability_family",
         lambda capability: capability == 70,
     )
 
@@ -145,7 +146,9 @@ def test_padded_rows_keep_the_batched_path(monkeypatch):
 def test_other_platforms_keep_the_batched_path(monkeypatch):
     _enable_cublas(monkeypatch)
     monkeypatch.setattr(
-        qsa_ops.current_platform, "is_device_capability", lambda capability: False
+        qsa_ops.current_platform,
+        "is_device_capability_family",
+        lambda capability: False,
     )
     query_start_loc = [0, 5, 1029]
     q, cache, page_table, token_to_req, positions, seq_lens = _inputs(query_start_loc)
@@ -167,9 +170,46 @@ def test_other_platforms_keep_the_batched_path(monkeypatch):
 requires_sm70 = pytest.mark.skipif(
     not current_platform.is_cuda()
     or not HAS_TRITON
-    or not current_platform.is_device_capability(70),
-    reason="the SM70 cuBLAS indexer path requires a V100",
+    or not current_platform.is_device_capability_family(70),
+    reason="the cuBLAS indexer path requires a Volta or Turing GPU",
 )
+
+
+@requires_sm70
+@pytest.mark.parametrize("page", [64, 204])
+def test_long_context_score_budget_keeps_exact_selected_indices(
+    monkeypatch, workspace_init, page
+):
+    torch.manual_seed(1167)
+    _enable_cublas(monkeypatch)
+    columns, rows = page * 1024, 512
+    cache = torch.randn(
+        columns // page, page, 1, 128, dtype=torch.float16, device="cuda"
+    )
+    query = torch.randn(rows, 4, 128, dtype=torch.float16, device="cuda")
+    table = torch.arange(columns // page, dtype=torch.int32, device="cuda")[None]
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    positions = torch.full((rows,), 262143, dtype=torch.int64, device="cuda")
+    lengths = torch.full((1,), 262144, dtype=torch.int32, device="cuda")
+    chunks = []
+    original = qsa_ops._qsa_mqa_cublas
+
+    def record(q, *args):
+        chunks.append(q.shape[0])
+        return original(q, *args)
+
+    monkeypatch.setattr(qsa_ops, "_qsa_mqa_cublas", record)
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 64)
+    reference = qsa_ops.qsa_select_paged_tokens(
+        query, cache, table, requests, positions, lengths, 2048, 4
+    )
+    chunks.clear()
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 8)
+    actual = qsa_ops.qsa_select_paged_tokens(
+        query, cache, table, requests, positions, lengths, 2048, 4
+    )
+    assert len(chunks) > 1
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @requires_sm70
@@ -248,3 +288,70 @@ def test_mixed_batch_selection_matches_each_request_alone(monkeypatch, workspace
     assert torch.equal(split[5:1029], alone)
     assert torch.equal(split[:5], batched[:5])
     assert torch.equal(split[1029:], batched[1029:])
+
+
+@requires_sm70
+@pytest.mark.parametrize("page", [64, 204])
+@pytest.mark.parametrize("context", [7800, 65536])
+def test_paged_score_budget_keeps_exact_selected_indices(
+    monkeypatch, workspace_init, context, page
+):
+    """The paged (non-cuBLAS) scorer selects identically under a small tile."""
+    torch.manual_seed(context)
+    set_qsa_option(monkeypatch, "qsa_indexer_cublas", False)
+    rows = 512
+    pages = 65536 // page + 1
+    cache = torch.randn(pages, page, 1, 128, dtype=torch.float16, device="cuda")
+    query = torch.randn(rows, 4, 128, dtype=torch.float16, device="cuda")
+    table = torch.randperm(pages, device="cuda").to(torch.int32)[None]
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    positions = torch.arange(context - rows, context, dtype=torch.int64, device="cuda")
+    lengths = torch.full((1,), context, dtype=torch.int32, device="cuda")
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 64)
+    reference = qsa_ops.qsa_select_paged_tokens(
+        query, cache, table, requests, positions, lengths, 2048, 4
+    )
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 8)
+    actual = qsa_ops.qsa_select_paged_tokens(
+        query, cache, table, requests, positions, lengths, 2048, 4
+    )
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@requires_sm70
+@pytest.mark.parametrize("rows", [68, 69, 74])
+def test_score_tile_tails_keep_exact_selected_indices(
+    monkeypatch, workspace_init, rows
+):
+    """Tail chunks of 4/5/10 rows reach the verify-sized scorer and selector."""
+    torch.manual_seed(rows)
+    set_qsa_option(monkeypatch, "qsa_indexer_cublas", False)
+    set_qsa_option(monkeypatch, "qsa_mtp_topk", True)
+    page, pages, context = 204, 322, 7800
+    cache = torch.randn(pages, page, 1, 128, dtype=torch.float16, device="cuda")
+    query = torch.randn(rows, 4, 128, dtype=torch.float16, device="cuda")
+    table = torch.randperm(pages, device="cuda").to(torch.int32)[None]
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    positions = torch.arange(
+        context - 600, context - 600 + rows, dtype=torch.int64, device="cuda"
+    )
+    lengths = torch.full((1,), context, dtype=torch.int32, device="cuda")
+
+    def select(tile_mb):
+        set_qsa_option(monkeypatch, "qsa_score_tile_mb", tile_mb)
+        return qsa_ops.qsa_select_paged_tokens(
+            query,
+            cache,
+            table,
+            requests,
+            positions,
+            lengths,
+            2048,
+            4,
+            shared_key_scoring=True,
+        )
+
+    reference = select(64)  # one chunk: no verify-sized tail
+    actual = select(8)  # 64-row chunks, then a 4/5/10-row tail
+    for row in range(rows):
+        assert torch.equal(actual[row], reference[row]), f"row {row} differs"

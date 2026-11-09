@@ -1,3 +1,4 @@
+#include "flash_v100_policy.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -352,7 +353,7 @@ template <int D, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
           bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32, bool SPLIT_KV,
           bool IS_CAUSAL, int KV_DTYPE, bool D256_OUTPUT_STRIDE_268 = false,
           bool D256_SW_PIPELINE_QK = false, bool D256_SW_PIPELINE_PV = false,
-          bool ANCHORED_SWA = false>
+          bool ANCHORED_SWA = false, bool BMHD_LAYOUT = false>
 __global__ void __launch_bounds__(
     KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
                  D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
@@ -379,6 +380,8 @@ __global__ void __launch_bounds__(
   static_assert(!ANCHORED_SWA ||
                     (IS_CAUSAL && KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16),
                 "ANCHORED_SWA requires causal attention and an fp16 KV cache");
+  static_assert(!BMHD_LAYOUT || (D == 128 && !IS_CAUSAL && !SPLIT_KV &&
+                                 KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16));
   using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
                               D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
                               D256_SW_PIPELINE_PV>;
@@ -451,8 +454,12 @@ __global__ void __launch_bounds__(
   const int lane_id = tid % MAX_THREADS_PER_WARP;
 
   const size_t q_head_linear = (size_t)batch_id * H + q_head_id;
-  const __half* q_ptr = Q + q_head_linear * M * D + start_row * D;
-  __half* out_ptr = Out + q_head_linear * M * D + start_row * D;
+  const size_t dense_base =
+      BMHD_LAYOUT ? ((size_t(batch_id) * M + start_row) * H + q_head_id) * D
+                  : q_head_linear * M * D + start_row * D;
+  const __half* q_ptr = Q + dense_base;
+  __half* out_ptr = Out + dense_base;
+  const int dense_row_stride = BMHD_LAYOUT ? H * D : D;
   float* softmax_lse_ptr = softmax_lse + q_head_linear * M + start_row;
 
   const int max_num_blocks_per_seq =
@@ -508,7 +515,7 @@ __global__ void __launch_bounds__(
     const int vec_col = idx % d_stride_uint4;
     uint4 q_val = make_uint4(0, 0, 0, 0);
     if (row < valid_q_rows && vec_col < d_stride_uint4) {
-      q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
+      q_val = __ldg(&q_vec[row * (dense_row_stride / PER_UINT4) + vec_col]);
     }
     if constexpr (Config::PIPELINE_SWIZZLED_Q) {
       const int k_tile = vec_col >> 1;
@@ -1767,9 +1774,9 @@ __global__ void __launch_bounds__(
 
     asm volatile("st.global.v4.u16 [%0], {%1, %2, %3, %4};"
                  :
-                 : "l"(out_ptr + row * D + col), "h"(__half_as_ushort(h0)),
-                   "h"(__half_as_ushort(h1)), "h"(__half_as_ushort(h2)),
-                   "h"(__half_as_ushort(h3))
+                 : "l"(out_ptr + row * dense_row_stride + col),
+                   "h"(__half_as_ushort(h0)), "h"(__half_as_ushort(h1)),
+                   "h"(__half_as_ushort(h2)), "h"(__half_as_ushort(h3))
                  : "memory");
   }
 
@@ -1777,16 +1784,6 @@ __global__ void __launch_bounds__(
     const float sum = fmaxf(sRowSum[tid], 1e-24f);
     softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
   }
-}
-
-inline bool env_flag_enabled(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw != nullptr && std::strcmp(raw, "0") != 0;
-}
-
-inline bool env_flag_default_enabled(const char* name) {
-  const char* raw = std::getenv(name);
-  return raw == nullptr || std::strcmp(raw, "0") != 0;
 }
 
 template <int D, int KV_DTYPE, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
@@ -3121,11 +3118,12 @@ void launcher_flash_attention_forward_paged_d256_bm32_phase(
     torch::Tensor& softmax_lse, const torch::Tensor& block_table,
     const torch::Tensor& seq_lens, float softmax_scale, bool is_causal,
     cudaStream_t stream) {
-  const bool use_all_p =
-      env_flag_default_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P");
+  const bool use_all_p = flash_v100::policy::value(
+      flash_v100::policy::Field::prefill_d256_bm32_all_p_default_on);
   const bool use_pair_scratch =
-      use_all_p && env_flag_default_enabled(
-                       "VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH");
+      use_all_p &&
+      flash_v100::policy::value(
+          flash_v100::policy::Field::prefill_d256_bm32_pair_scratch_default_on);
 
   if (is_causal) {
     if (use_all_p) {
@@ -3205,10 +3203,12 @@ void launcher_flash_attention_forward_paged(
     const int page_block_size = K_cache.size(1);
     const bool use_low_smem =
         M > 1 && page_block_size >= 16 && (page_block_size % 16) == 0 &&
-        env_flag_default_enabled("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM");
+        flash_v100::policy::value(
+            flash_v100::policy::Field::prefill_d256_low_smem_default_on);
     if (use_low_smem) {
       const bool use_d256_bm32_phase =
-          env_flag_default_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE") &&
+          flash_v100::policy::value(
+              flash_v100::policy::Field::prefill_d256_bm32_phase_default_on) &&
           page_block_size % D256_BM32_PHASE_PAGE_SIZE == 0 &&
           M >= D256_BM32_PHASE_BLOCK_M && bfla_mask_ptr == nullptr &&
           window_size_left < 0 && window_size_right < 0;
@@ -3220,32 +3220,36 @@ void launcher_flash_attention_forward_paged(
       }
       const bool use_low_smem_contig_fast =
           page_block_size == 16 ||
-          env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST");
-      const bool use_low_smem_scalar_qk =
-          env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
-      const bool use_low_smem_bm32 =
-          env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32");
+          flash_v100::policy::value(
+              flash_v100::policy::Field::prefill_contig_fast_off);
+      const bool use_low_smem_scalar_qk = flash_v100::policy::value(
+          flash_v100::policy::Field::prefill_d256_scalar_qk_off);
+      const bool use_low_smem_bm32 = flash_v100::policy::value(
+          flash_v100::policy::Field::prefill_d256_bm32_off);
       // Default only for the measured hybrid-cache page size. Other
       // page sizes retain the prior layout unless explicitly enabled.
       const bool use_low_smem_output_stride_268 =
           page_block_size == 784
-              ? env_flag_default_enabled(
-                    "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268")
-              : env_flag_enabled(
-                    "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268");
+              ? flash_v100::policy::value(
+                    flash_v100::policy::Field::
+                        prefill_d256_output_stride_268_default_on)
+              : flash_v100::policy::value(
+                    flash_v100::policy::Field::
+                        prefill_d256_output_stride_268_off);
       const bool use_sw_pipeline =
           page_block_size == 784 &&
-          env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE");
+          flash_v100::policy::value(
+              flash_v100::policy::Field::prefill_d256_software_pipeline_off);
       const bool use_sw_pipeline_qk =
           page_block_size == 784 &&
-          (use_sw_pipeline ||
-           env_flag_default_enabled(
-               "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK"));
+          (use_sw_pipeline || flash_v100::policy::value(
+                                  flash_v100::policy::Field::
+                                      prefill_d256_sw_pipeline_qk_default_on));
       const bool use_sw_pipeline_pv =
           page_block_size == 784 &&
-          (use_sw_pipeline ||
-           env_flag_default_enabled(
-               "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV"));
+          (use_sw_pipeline || flash_v100::policy::value(
+                                  flash_v100::policy::Field::
+                                      prefill_d256_sw_pipeline_pv_default_on));
       if (use_low_smem_contig_fast) {
         if (use_low_smem_scalar_qk) {
           if (use_low_smem_bm32) {
@@ -3449,9 +3453,11 @@ at::Tensor flash_attention_prefill_paged_splitkv(
   const bool fp16_kv = kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16;
   const bool use_low_smem_contig_fast =
       fp16_kv && (page_block_size == 16 ||
-                  env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST"));
+                  flash_v100::policy::value(
+                      flash_v100::policy::Field::prefill_contig_fast_off));
   const bool use_low_smem_scalar_qk =
-      fp16_kv && env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
+      fp16_kv && flash_v100::policy::value(
+                     flash_v100::policy::Field::prefill_d256_scalar_qk_off);
   const int block_n =
       fp16_kv ? (use_low_smem_scalar_qk ? BLOCK_N_256_LOW_SMEM_SCALAR_QK
                                         : BLOCK_N_256_LOW_SMEM)
@@ -4090,4 +4096,55 @@ at::Tensor flash_attention_decode_paged_wmma(
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out_fp16;
+}
+
+// Direct BMHD transport for the small non-causal DFlash2 draft. The WMMA
+// arithmetic and sliding-window mask are identical to the legacy path.
+at::Tensor flash_attention_dflash2_paged_bmhd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    std::optional<at::Tensor>& output, const at::Tensor& table,
+    const at::Tensor& lengths, const float scale) {
+  const c10::cuda::CUDAGuard guard(q.device());
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.is_contiguous());
+  TORCH_CHECK(q.dim() == 4 && q.size(0) >= 1 && q.size(0) <= 4 &&
+              q.size(1) == 8 && q.size(2) == 8 && q.size(3) == 128);
+  TORCH_CHECK(k.is_cuda() && v.is_cuda() && k.device() == q.device() &&
+              v.device() == q.device() && k.scalar_type() == at::kHalf &&
+              v.scalar_type() == at::kHalf && k.dim() == 4 &&
+              k.sizes() == v.sizes() &&
+              (k.size(1) == 1024 || k.size(1) == 2048) && k.size(2) == 2 &&
+              k.size(3) == 128 && k.stride(3) == 1 && v.stride(3) == 1);
+  TORCH_CHECK(table.is_cuda() && lengths.is_cuda() &&
+              table.device() == q.device() && lengths.device() == q.device() &&
+              table.scalar_type() == at::kInt &&
+              lengths.scalar_type() == at::kInt && table.is_contiguous() &&
+              lengths.is_contiguous() && table.dim() == 2 &&
+              table.size(0) == q.size(0) && table.size(1) > 0 &&
+              lengths.numel() == q.size(0));
+  const auto* props = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(props->major == 7 && props->minor == 0);
+  at::Tensor out = output.has_value() ? output.value() : torch::empty_like(q);
+  TORCH_CHECK(out.device() == q.device() && out.scalar_type() == at::kHalf &&
+              out.sizes() == q.sizes() && out.is_contiguous());
+  auto lse = torch::empty({q.size(0), q.size(2), q.size(1)},
+                          q.options().dtype(at::kFloat));
+  using Config = KernelConfig<128>;
+  auto kernel = flash_attention_forward_kernel_paged<
+      128, false, false, false, false, false, false,
+      flash_v100::KV_CACHE_DTYPE_FP16, false, false, false, false, true>;
+  AT_CUDA_CHECK(cudaFuncSetAttribute(
+      (void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      Config::TOTAL_SMEM));
+  const dim3 grid(1, 1, q.size(0) * q.size(2));
+  kernel<<<grid, Config::THREADS_PER_BLOCK, Config::TOTAL_SMEM,
+           at::cuda::getCurrentCUDAStream().stream()>>>(
+      reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
+      reinterpret_cast<__half*>(out.data_ptr()), lse.data_ptr<float>(),
+      table.data_ptr<int>(), lengths.data_ptr<int>(), q.size(0), q.size(2),
+      q.size(1), table.size(1) * k.size(1), nullptr, 0, 0, 0, 0, 0, k.size(1),
+      k.size(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
+      v.stride(1), v.stride(2), scale, 1.f, 1.f, 2047, 2047, nullptr, nullptr,
+      nullptr, 0, nullptr, 0);
+  AT_CUDA_CHECK(cudaGetLastError());
+  return out;
 }

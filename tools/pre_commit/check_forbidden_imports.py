@@ -45,6 +45,10 @@ CHECK_IMPORTS = {
             "tests/tokenizers_/test_hf.py",
             "tests/utils_/test_hashing.py",
             "tests/compile/test_aot_compile.py",
+            # Round-trip trusted, test-owned worker configuration.
+            "tests/v1/worker/test_step_profiler.py",
+            # Trusted worker-output IPC round trip is the subject of this test.
+            "tests/v1/engine/test_pp_spec_decode_cadence.py",
             "tests/compile/test_aot_triton_side_table.py",
             "benchmarks/kernels/graph_machete_bench.py",
             "benchmarks/kernels/benchmark_lora.py",
@@ -52,6 +56,9 @@ CHECK_IMPORTS = {
             "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
             "benchmarks/cutlass_benchmarks/w8a8_benchmarks.py",
             "benchmarks/cutlass_benchmarks/sparse_benchmarks.py",
+            # Pickling round trips are the subject of these tests.
+            "tests/tokenizers_/test_gguf_bpe_encode.py",
+            "tests/config/test_gguf_prefill_prepare.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",

@@ -143,8 +143,9 @@ def test_passing_observed_parity_accepts_result(extra):
 
 
 @pytest.mark.parametrize("checks", [[], [True, False]])
-def test_nomtp_timing_completion_does_not_accept_quality(checks):
-    report = {"mode": "nomtp", "cases": [{"tokens_match_first_repeat": checks}]}
+@pytest.mark.parametrize("mode", ["nomtp", "mtp"])
+def test_timing_completion_does_not_accept_quality(checks, mode):
+    report = {"mode": mode, "cases": [{"tokens_match_first_repeat": checks}]}
     finalize_measurements(report)
     assert report["complete"]
     assert report["measurements_complete"]

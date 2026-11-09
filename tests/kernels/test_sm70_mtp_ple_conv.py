@@ -77,3 +77,66 @@ def test_changed_metadata_and_successive_state(
             )
     finally:
         envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize("nreq", [2, 4, 8])
+def test_concurrent_requests_match_reference(nreq, monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Requires SM70")
+    if not hasattr(torch.ops._C, "qwen38_ple_spec_sm70_out"):
+        pytest.skip("Requires source-built PLE MTP4 kernel")
+    torch.manual_seed(1009 + nreq)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.conv_state_len = 9
+    layer.short_conv_dilation = 3
+    rows = 5 * nreq
+    initial = torch.randn(nreq + 2, 10240, 13, device="cuda", dtype=torch.float16)
+    states = [initial.clone(), initial.clone()]
+    x = torch.randn(rows, 10240, device="cuda", dtype=torch.float16)
+    weight = torch.randn(10240, 4, device="cuda", dtype=torch.float16) * 0.1
+    ids = torch.zeros(nreq, device="cuda", dtype=torch.int32)
+    starts = torch.zeros(nreq + 1, device="cuda", dtype=torch.int32)
+    accepted = torch.ones(nreq, device="cuda", dtype=torch.int32)
+    graphs, outputs = [], []
+    try:
+        for arm in range(2):
+            monkeypatch.setenv("VLLM_SM70_MTP_PLE_CONV", str(arm))
+            envs.disable_envs_cache()
+
+            def run(arm=arm):
+                return layer._short_conv_dilated_spec_batched(
+                    x, states[arm], weight, ids, starts, accepted, 5
+                )
+
+            run()
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = run()
+            graphs.append(graph)
+            outputs.append(output)
+        for state in states:
+            state.copy_(initial)
+        for step in range(20):
+            counts = [(5, 5, 3, 1, 0)[(step + j) % 5] for j in range(nreq)]
+            # Padded graph requests trail the live ones with empty ranges.
+            live = nreq - (step % 3 == 2)
+            counts = [c if j < live else 0 for j, c in enumerate(counts)]
+            ends = torch.tensor(counts).cumsum(0)
+            starts[1:] = ends.to(starts)
+            perm = torch.randperm(nreq + 1)[:nreq] + 1
+            ids.copy_(torch.where(torch.arange(nreq) < live, perm, 0).to(ids))
+            accepted.copy_(torch.randint(0, 7, (nreq,)).to(accepted))
+            x.normal_()
+            for graph in graphs:
+                graph.replay()
+            total = int(ends[-1])
+            assert torch.equal(
+                outputs[0][:total].view(torch.int16),
+                outputs[1][:total].view(torch.int16),
+            )
+            assert torch.count_nonzero(outputs[1][total:]) == 0
+            assert torch.equal(states[0].view(torch.int16), states[1].view(torch.int16))
+    finally:
+        envs.disable_envs_cache()

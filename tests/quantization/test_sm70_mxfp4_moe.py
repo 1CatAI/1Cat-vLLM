@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
     FusedMoEConfig,
     FusedMoEParallelConfig,
     MoEActivation,
@@ -74,6 +77,41 @@ def test_mxfp4_sm70_contract_accepts_v4_flash_tp_shapes(
         intermediate_size_per_partition=intermediate_size_per_partition,
         tp_size=tp_size,
     )
+
+
+def test_mxfp4_sm70_contract_accepts_v41_dspark_tp4_only():
+    values = dict(
+        global_num_experts=128,
+        top_k=3,
+        hidden_size=5120,
+        intermediate_size_per_partition=576,
+        tp_size=4,
+    )
+    validate_mxfp4_sm70_moe_contract(**values)
+    for field, incompatible in (("tp_size", 8), ("top_k", 6), ("hidden_size", 4096)):
+        with pytest.raises(NotImplementedError):
+            validate_mxfp4_sm70_moe_contract(**(values | {field: incompatible}))
+
+
+def test_mxfp4_sm70_draft_dispatch_uses_fifteen_slots(monkeypatch):
+    buffers = {
+        "compact_expert_offsets": torch.arange(16, dtype=torch.int32),
+        "active_expert_ids": torch.arange(15, dtype=torch.int32),
+    }
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda _: 8)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_verifier_for_tokens", lambda *_: False
+    )
+    offsets, ids, count = _select_mxfp4_stage_dispatch(
+        buffers,
+        num_tokens=5,
+        num_experts=128,
+        fully_replicated_experts=True,
+        top_k=3,
+    )
+    assert count == 15
+    assert offsets is buffers["compact_expert_offsets"]
+    assert ids is buffers["active_expert_ids"]
 
 
 @pytest.mark.parametrize(
@@ -171,20 +209,34 @@ def test_mxfp4_sm70_platform_gate_is_exact(monkeypatch):
 
 
 def test_mxfp4_sm70_factory_selects_native_route(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.experts import skinny_sm70_moe
+
+    monkeypatch.setattr(
+        skinny_sm70_moe, "skinny_backend_admitted", lambda *a, **k: False
+    )
     monkeypatch.setattr(sm70_tm, "is_exact_sm70_cuda_platform", lambda: True)
     monkeypatch.setattr(sm70_tm, "should_use_mxfp4_moe_turbomind", lambda: True)
 
-    method = make_deepseek_v4_mxfp4_moe_method(_v4_flash_moe_config())
+    with set_current_vllm_config(VllmConfig()):
+        method = make_deepseek_v4_mxfp4_moe_method(_v4_flash_moe_config())
 
     assert isinstance(method, Mxfp4SM70MoEMethod)
     assert not method.skip_forward_padding
 
 
 def test_mxfp4_sm70_factory_rejects_marlin_or_emulation(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.experts import skinny_sm70_moe
+
+    monkeypatch.setattr(
+        skinny_sm70_moe, "skinny_backend_admitted", lambda *a, **k: False
+    )
     monkeypatch.setattr(sm70_tm, "is_exact_sm70_cuda_platform", lambda: True)
     monkeypatch.setattr(sm70_tm, "should_use_mxfp4_moe_turbomind", lambda: False)
 
-    with pytest.raises(NotImplementedError, match="Marlin"):
+    with (
+        set_current_vllm_config(VllmConfig()),
+        pytest.raises(NotImplementedError, match="Marlin"),
+    ):
         make_deepseek_v4_mxfp4_moe_method(_v4_flash_moe_config())
 
 
@@ -198,8 +250,12 @@ def test_mxfp4_sm70_b1_dispatch_selects_six_runtime_experts(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda: True)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 1)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda policy=None: True
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 1
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -274,13 +330,13 @@ def test_mxfp4_sm70_qpn_m1_requires_exact_tp4_tensor_contract(monkeypatch):
         w2_tm_scales=torch.empty((256, 16, 4096), device="meta"),
     )
 
-    assert _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
-    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=False)
+    assert _mxfp4_qpn_m1_decode_contract(cast(FusedMoE, layer), direct_order=True)
+    assert not _mxfp4_qpn_m1_decode_contract(cast(FusedMoE, layer), direct_order=False)
     layer.sm70_mxfp4_qpn_m1_available = False
-    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
+    assert not _mxfp4_qpn_m1_decode_contract(cast(FusedMoE, layer), direct_order=True)
     layer.sm70_mxfp4_qpn_m1_available = True
     layer.moe_config.tp_size = 8
-    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
+    assert not _mxfp4_qpn_m1_decode_contract(cast(FusedMoE, layer), direct_order=True)
 
 
 def test_mxfp4_sm70_b1_dispatch_rejects_incompatible_permute_fastpath(
@@ -309,8 +365,12 @@ def test_mxfp4_sm70_b1_dispatch_rejects_expert_parallel_metadata(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda: True)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 1)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda policy=None: True
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 1
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -333,7 +393,9 @@ def test_mxfp4_sm70_dispatch_retains_dense_fallback(monkeypatch, num_tokens):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 0)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 0
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -356,8 +418,12 @@ def test_mxfp4_sm70_m8_dispatch_selects_fixed_active_slots(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: False)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 8
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda policy=None: False
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -380,10 +446,14 @@ def test_mxfp4_sm70_m8_grouped_dispatch_keeps_one_row_slots(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: True)
     monkeypatch.setattr(
-        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda: False
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 8
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda policy=None: True
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda policy=None: False
     )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
@@ -407,10 +477,14 @@ def test_mxfp4_sm70_m8_expert_grouped_dispatch_keeps_real_segments(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: True)
     monkeypatch.setattr(
-        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda: True
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 8
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda policy=None: True
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda policy=None: True
     )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
@@ -435,13 +509,19 @@ def test_mxfp4_sm70_m5_grouped_dispatch(expert_rows, monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: False)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_verifier_enabled", lambda: True)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 8
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda policy=None: False
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_verifier_enabled", lambda policy=None: True
+    )
     monkeypatch.setattr(
         mxfp4_moe,
         "_mxfp4_grouped_m8_expert_rows_enabled",
-        lambda: expert_rows,
+        lambda policy=None: expert_rows,
     )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
@@ -680,7 +760,7 @@ def test_mxfp4_sm70_post_load_repacks_without_a_second_expert_copy():
     torch.accelerator.synchronize()
     baseline = torch.accelerator.memory_allocated()
     torch.accelerator.reset_peak_memory_stats()
-    Mxfp4SM70MoEMethod(config).process_weights_after_loading(layer)
+    Mxfp4SM70MoEMethod(config).process_weights_after_loading(cast(FusedMoE, layer))
     peak_growth = torch.accelerator.max_memory_allocated() - baseline
 
     for projection, stacks in expected.items():
@@ -706,9 +786,12 @@ def test_mxfp4_sm70_post_load_reads_bias_from_method_config(monkeypatch):
         "mxfp4_moe_single_token_prepare_w13_sm70_out",
         "awq_moe_single_token_weighted_reduce_out",
     ):
-        monkeypatch.setattr(torch.ops._C, op_name, object(), raising=False)
+        monkeypatch.setattr(torch.ops._C, op_name, lambda *a, **k: None, raising=False)
     monkeypatch.setattr(
-        torch.ops._moe_C, "moe_permute_with_scratch", object(), raising=False
+        torch.ops._moe_C,
+        "moe_permute_with_scratch",
+        lambda *a, **k: None,
+        raising=False,
     )
     method = Mxfp4SM70MoEMethod(_v4_flash_moe_config())
     layer = SimpleNamespace(
@@ -717,4 +800,4 @@ def test_mxfp4_sm70_post_load_reads_bias_from_method_config(monkeypatch):
     )
 
     with pytest.raises(NotImplementedError, match="SwiGLU"):
-        method.process_weights_after_loading(layer)
+        method.process_weights_after_loading(cast(FusedMoE, layer))

@@ -1,0 +1,1775 @@
+{
+  "runtime_source": "6d11576ee927166c36d52f37c560a426c2713949",
+  "runtime": "dev59",
+  "cuda": "12.8",
+  "torch": "2.10.0+cu128",
+  "python": "3.12.14",
+  "gpu": "V100-SXM2-32GB",
+  "tp": 4,
+  "power_w": 300,
+  "sm_clock_mhz": 1290,
+  "memory_clock_mhz": 877,
+  "matched_e2e": {
+    "scope": "Unprofiled matched sixteen prompts; first twenty output rounds per prompt omitted; full-round means equal-weighted by prompt, output-token latency pooled; C4 smoke includes first-use setup, no throughput claim",
+    "baseline_runtime": "1.5.2.dev53+g49ac1c58ff",
+    "candidate_runtime": "1.5.2.dev59+g6d11576ee9",
+    "cohorts": [
+      {
+        "input_tokens": 1024,
+        "baseline": {
+          "prompts": 8,
+          "prompt_mean_full_round_ms": 20.63931425042916,
+          "prompt_mean_tokens_per_round": 2.9141695165100487,
+          "steady_intervals": 1490,
+          "steady_emitted_tokens": 4331,
+          "pooled_ms_per_output_token": 7.10028308105903,
+          "pooled_output_tokens_per_second": 140.83945507294433,
+          "mean_ttft_ms": 345.71853280067444
+        },
+        "candidate": {
+          "prompts": 8,
+          "prompt_mean_full_round_ms": 19.512083330393562,
+          "prompt_mean_tokens_per_round": 2.902693205956156,
+          "steady_intervals": 1495,
+          "steady_emitted_tokens": 4331,
+          "pooled_ms_per_output_token": 6.735139785330597,
+          "pooled_output_tokens_per_second": 148.4750178723892,
+          "mean_ttft_ms": 345.0181186199188
+        },
+        "round_saving_ms": 1.127230920035597,
+        "round_speedup": 1.0577709156397326
+      },
+      {
+        "input_tokens": 8192,
+        "baseline": {
+          "prompts": 8,
+          "prompt_mean_full_round_ms": 21.734425415596988,
+          "prompt_mean_tokens_per_round": 2.9939108054008714,
+          "steady_intervals": 1462,
+          "steady_emitted_tokens": 4353,
+          "pooled_ms_per_output_token": 7.299747720308124,
+          "pooled_output_tokens_per_second": 136.99103562414479,
+          "mean_ttft_ms": 2692.7095353603363
+        },
+        "candidate": {
+          "prompts": 8,
+          "prompt_mean_full_round_ms": 20.55705372991077,
+          "prompt_mean_tokens_per_round": 2.9954669717270126,
+          "steady_intervals": 1465,
+          "steady_emitted_tokens": 4353,
+          "pooled_ms_per_output_token": 6.918202280943031,
+          "pooled_output_tokens_per_second": 144.54622160364013,
+          "mean_ttft_ms": 2692.8881406784058
+        },
+        "round_saving_ms": 1.177371685686218,
+        "round_speedup": 1.0572733671446861
+      }
+    ],
+    "route_admission": {
+      "pair_admission": [
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        }
+      ],
+      "projection_admission": [
+        {
+          "down": 37,
+          "qkvz": 48,
+          "qkv": 16,
+          "output": 55
+        },
+        {
+          "down": 37,
+          "qkvz": 48,
+          "qkv": 16,
+          "output": 55
+        },
+        {
+          "down": 37,
+          "qkvz": 48,
+          "qkv": 16,
+          "output": 55
+        },
+        {
+          "down": 37,
+          "qkvz": 48,
+          "qkv": 16,
+          "output": 55
+        }
+      ]
+    },
+    "natural_health": [
+      {
+        "prompt": "请只回答17乘以23的数值。",
+        "text": "391",
+        "ids": [
+          18,
+          24,
+          16,
+          248046
+        ],
+        "finish_reason": "stop"
+      },
+      {
+        "prompt": "Reply with one brief sentence explaining what a unit test does.",
+        "text": "A unit test verifies that a specific, isolated piece of code (such as a function or method) behaves as expected under given conditions.",
+        "ids": [
+          32,
+          4821,
+          1228,
+          84828,
+          421,
+          264,
+          3050,
+          11,
+          23443,
+          6365,
+          314,
+          1970,
+          318,
+          20171,
+          430,
+          264,
+          709,
+          466,
+          1654,
+          8,
+          70573,
+          430,
+          3481,
+          1172,
+          2574,
+          4530,
+          13,
+          248046
+        ],
+        "finish_reason": "stop"
+      }
+    ],
+    "c4_smoke": {
+      "wall_seconds": 7.702574092894793,
+      "requests": 4,
+      "outputs": [
+        {
+          "text": "Software testing is not just a \"checklist\" step at the end of a project; it is a fundamental pillar of software engineering that ensures quality, reliability, and business value. Here’s why it matters, broken down into key categories:\n\n### 1. **Ensures Correctness and Quality**\n- **Detects Defects Early:** Testing identifies bugs before they reach production. Catching a bug during development is significantly cheaper and faster than fixing it after release.\n",
+          "token_ids": [
+            18668,
+            7262,
+            369,
+            524,
+            1066,
+            264,
+            328,
+            1960,
+            1551,
+            1,
+            2923,
+            506,
+            279,
+            809,
+            314,
+            264,
+            2313,
+            26,
+            424,
+            369,
+            264,
+            15346,
+            59142,
+            314,
+            3061,
+            14246,
+            421,
+            24546,
+            4131,
+            11,
+            29541,
+            11,
+            321,
+            2478,
+            869,
+            13,
+            5514,
+            725,
+            3069,
+            424,
+            12482,
+            11,
+            10548,
+            1441,
+            1083,
+            1328,
+            10736,
+            25,
+            271,
+            13962,
+            220,
+            16,
+            13,
+            2972,
+            92870,
+            1365,
+            38643,
+            2022,
+            321,
+            17391,
+            332,
+            198,
+            12,
+            2972,
+            55278,
+            82,
+            3761,
+            177884,
+            22044,
+            64700,
+            25914,
+            34337,
+            21851,
+            1518,
+            781,
+            5372,
+            5492,
+            13,
+            20290,
+            286,
+            264,
+            9584,
+            2261,
+            4257,
+            369,
+            11602,
+            22330,
+            321,
+            10281,
+            1056,
+            34082,
+            424,
+            1238,
+            4722,
+            13,
+            198
+          ],
+          "finish_reason": "length"
+        },
+        {
+          "text": "要计算 $17 \\times 23$，我们可以使用多种方法。下面我将展示最常用且直观的**拆分法（分配律）**以及**竖式计算法**。\n\n### 方法一：拆分法（分配律）\n\n将其中一个数拆分为整十数和个位数，使计算更简单。这里我们将 $23$ 拆分为 $20 + 3$。\n\n$$\n17 \\times 23 = ",
+          "token_ids": [
+            95822,
+            97792,
+            393,
+            16,
+            22,
+            1088,
+            14695,
+            220,
+            17,
+            18,
+            3,
+            3709,
+            103988,
+            96402,
+            99163,
+            96845,
+            1710,
+            99133,
+            110931,
+            98845,
+            96019,
+            108997,
+            97447,
+            142716,
+            332,
+            129005,
+            95892,
+            9616,
+            100679,
+            96516,
+            203309,
+            98404,
+            332,
+            100413,
+            96102,
+            97792,
+            95892,
+            221794,
+            271,
+            13962,
+            220,
+            96845,
+            95744,
+            4960,
+            129005,
+            95892,
+            9616,
+            100679,
+            96516,
+            7313,
+            271,
+            96123,
+            115780,
+            96089,
+            98513,
+            99968,
+            96330,
+            96075,
+            128562,
+            95840,
+            117761,
+            3709,
+            96137,
+            97792,
+            96017,
+            97561,
+            1710,
+            97490,
+            108752,
+            393,
+            17,
+            18,
+            3,
+            220,
+            98513,
+            99968,
+            393,
+            17,
+            15,
+            478,
+            220,
+            18,
+            3,
+            1710,
+            271,
+            13682,
+            198,
+            16,
+            22,
+            1088,
+            14695,
+            220,
+            17,
+            18,
+            283,
+            220
+          ],
+          "finish_reason": "length"
+        },
+        {
+          "text": "Here are three practical and effective ways to save water:\n\n1. **Fix Leaks Promptly**\n   A dripping faucet or a running toilet can waste hundreds of gallons of water per month. Check under sinks and in your bathroom for signs of moisture or slow drips. If you hear a toilet running when it shouldn’t, replace the flapper or fill valve. Even a small leak can add up to significant savings over time.\n\n2. **Use Water-Eff",
+          "token_ids": [
+            8160,
+            513,
+            2250,
+            14542,
+            321,
+            7139,
+            5337,
+            310,
+            3462,
+            2919,
+            25,
+            271,
+            16,
+            13,
+            2972,
+            25128,
+            1900,
+            9518,
+            57491,
+            391,
+            332,
+            198,
+            256,
+            357,
+            73607,
+            69029,
+            466,
+            264,
+            4162,
+            25378,
+            628,
+            11939,
+            11168,
+            314,
+            48436,
+            314,
+            2919,
+            791,
+            2182,
+            13,
+            4109,
+            1172,
+            55047,
+            321,
+            303,
+            678,
+            14422,
+            364,
+            11590,
+            314,
+            30137,
+            466,
+            6103,
+            47749,
+            1630,
+            13,
+            1368,
+            488,
+            6512,
+            264,
+            25378,
+            4162,
+            948,
+            424,
+            12752,
+            1357,
+            11,
+            8032,
+            279,
+            1274,
+            3006,
+            466,
+            4990,
+            30396,
+            13,
+            7183,
+            264,
+            2526,
+            22627,
+            628,
+            884,
+            685,
+            310,
+            4927,
+            18413,
+            888,
+            854,
+            13,
+            271,
+            17,
+            13,
+            2972,
+            9947,
+            9664,
+            13044,
+            529
+          ],
+          "finish_reason": "length"
+        },
+        {
+          "text": "晨光透过薄雾，轻柔地洒在刚刚苏醒的大地上。昨夜的雨洗去了尘世的喧嚣，空气里弥漫着泥土与青草混合的清新气息，每一口呼吸都像是被过滤过般纯净。\n\n屋檐下，最后几滴雨水还在不知疲倦地坠落，“滴答”声清脆悦耳，敲打着青石板路，泛起层层涟漪。树叶上的水珠晶莹剔透，折射着初升的太阳，像无数颗散落的钻石，在",
+          "token_ids": [
+            133349,
+            110355,
+            97865,
+            98554,
+            3709,
+            123764,
+            95852,
+            99091,
+            95772,
+            101740,
+            130283,
+            97796,
+            100741,
+            1710,
+            98991,
+            121033,
+            96948,
+            96894,
+            100557,
+            97688,
+            113076,
+            120949,
+            3709,
+            98035,
+            96067,
+            139154,
+            114654,
+            95999,
+            141284,
+            101742,
+            95726,
+            104644,
+            109508,
+            3709,
+            98443,
+            96116,
+            99209,
+            95983,
+            104132,
+            96147,
+            104075,
+            95922,
+            96965,
+            114454,
+            1710,
+            271,
+            135290,
+            95849,
+            3709,
+            97790,
+            96370,
+            98086,
+            111492,
+            103779,
+            99179,
+            122802,
+            95852,
+            124994,
+            40131,
+            98086,
+            96517,
+            828,
+            96429,
+            121788,
+            127496,
+            3709,
+            99096,
+            114946,
+            96556,
+            128698,
+            96112,
+            3709,
+            132638,
+            111713,
+            131978,
+            1710,
+            112941,
+            97015,
+            95936,
+            97744,
+            140706,
+            3709,
+            117824,
+            95966,
+            96677,
+            96492,
+            142484,
+            3709,
+            96647,
+            101879,
+            97966,
+            97058,
+            111493,
+            110573,
+            3709,
+            95772
+          ],
+          "finish_reason": "length"
+        }
+      ],
+      "throughput_gate": "smoke only; no matching old C4 baseline recorded"
+    }
+  },
+  "comparison_with_984": {
+    "scope": "Unprofiled matched sixteen prompts; first twenty output rounds per prompt omitted; full-round means equal-weighted by prompt, output-token latency pooled; C4 smoke includes first-use setup, no throughput claim",
+    "baseline_runtime": "1.5.2.dev41+g5620850f81",
+    "candidate_runtime": "1.5.2.dev59+g6d11576ee9",
+    "cohorts": [
+      {
+        "input_tokens": 1024,
+        "baseline": {
+          "prompts": 8,
+          "prompt_mean_full_round_ms": 22.219657063718866,
+          "prompt_mean_tokens_per_round": 2.919854746840921,
+          "steady_intervals": 1488,
+          "steady_emitted_tokens": 4327,
+          "pooled_ms_per_output_token": 7.641069016152244,
+          "pooled_output_tokens_per_second": 130.87174031357756,
+          "mean_ttft_ms": 344.45053339004517
+        },
+        "candidate": {
+          "prompts": 8,
+          "prompt_mean_full_round_ms": 19.512083330393562,
+          "prompt_mean_tokens_per_round": 2.902693205956156,
+          "steady_intervals": 1495,
+          "steady_emitted_tokens": 4331,
+          "pooled_ms_per_output_token": 6.735139785330597,
+          "pooled_output_tokens_per_second": 148.4750178723892,
+          "mean_ttft_ms": 345.0181186199188
+        },
+        "round_saving_ms": 2.7075737333253045,
+        "round_speedup": 1.1387639488556187
+      },
+      {
+        "input_tokens": 8192,
+        "baseline": {
+          "prompts": 8,
+          "prompt_mean_full_round_ms": 23.316529274392988,
+          "prompt_mean_tokens_per_round": 2.9390156879509024,
+          "steady_intervals": 1488,
+          "steady_emitted_tokens": 4353,
+          "pooled_ms_per_output_token": 7.970144795322336,
+          "pooled_output_tokens_per_second": 125.4682349794822,
+          "mean_ttft_ms": 2687.072217464447
+        },
+        "candidate": {
+          "prompts": 8,
+          "prompt_mean_full_round_ms": 20.55705372991077,
+          "prompt_mean_tokens_per_round": 2.9954669717270126,
+          "steady_intervals": 1465,
+          "steady_emitted_tokens": 4353,
+          "pooled_ms_per_output_token": 6.918202280943031,
+          "pooled_output_tokens_per_second": 144.54622160364013,
+          "mean_ttft_ms": 2692.8881406784058
+        },
+        "round_saving_ms": 2.7594755444822177,
+        "round_speedup": 1.1342349726151246
+      }
+    ],
+    "route_admission": {
+      "pair_admission": [
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        }
+      ],
+      "projection_admission": [
+        {
+          "down": 37,
+          "qkvz": 48,
+          "qkv": 16,
+          "output": 55
+        },
+        {
+          "down": 37,
+          "qkvz": 48,
+          "qkv": 16,
+          "output": 55
+        },
+        {
+          "down": 37,
+          "qkvz": 48,
+          "qkv": 16,
+          "output": 55
+        },
+        {
+          "down": 37,
+          "qkvz": 48,
+          "qkv": 16,
+          "output": 55
+        }
+      ]
+    },
+    "natural_health": [
+      {
+        "prompt": "请只回答17乘以23的数值。",
+        "text": "391",
+        "ids": [
+          18,
+          24,
+          16,
+          248046
+        ],
+        "finish_reason": "stop"
+      },
+      {
+        "prompt": "Reply with one brief sentence explaining what a unit test does.",
+        "text": "A unit test verifies that a specific, isolated piece of code (such as a function or method) behaves as expected under given conditions.",
+        "ids": [
+          32,
+          4821,
+          1228,
+          84828,
+          421,
+          264,
+          3050,
+          11,
+          23443,
+          6365,
+          314,
+          1970,
+          318,
+          20171,
+          430,
+          264,
+          709,
+          466,
+          1654,
+          8,
+          70573,
+          430,
+          3481,
+          1172,
+          2574,
+          4530,
+          13,
+          248046
+        ],
+        "finish_reason": "stop"
+      }
+    ],
+    "c4_smoke": {
+      "wall_seconds": 7.702574092894793,
+      "requests": 4,
+      "outputs": [
+        {
+          "text": "Software testing is not just a \"checklist\" step at the end of a project; it is a fundamental pillar of software engineering that ensures quality, reliability, and business value. Here’s why it matters, broken down into key categories:\n\n### 1. **Ensures Correctness and Quality**\n- **Detects Defects Early:** Testing identifies bugs before they reach production. Catching a bug during development is significantly cheaper and faster than fixing it after release.\n",
+          "token_ids": [
+            18668,
+            7262,
+            369,
+            524,
+            1066,
+            264,
+            328,
+            1960,
+            1551,
+            1,
+            2923,
+            506,
+            279,
+            809,
+            314,
+            264,
+            2313,
+            26,
+            424,
+            369,
+            264,
+            15346,
+            59142,
+            314,
+            3061,
+            14246,
+            421,
+            24546,
+            4131,
+            11,
+            29541,
+            11,
+            321,
+            2478,
+            869,
+            13,
+            5514,
+            725,
+            3069,
+            424,
+            12482,
+            11,
+            10548,
+            1441,
+            1083,
+            1328,
+            10736,
+            25,
+            271,
+            13962,
+            220,
+            16,
+            13,
+            2972,
+            92870,
+            1365,
+            38643,
+            2022,
+            321,
+            17391,
+            332,
+            198,
+            12,
+            2972,
+            55278,
+            82,
+            3761,
+            177884,
+            22044,
+            64700,
+            25914,
+            34337,
+            21851,
+            1518,
+            781,
+            5372,
+            5492,
+            13,
+            20290,
+            286,
+            264,
+            9584,
+            2261,
+            4257,
+            369,
+            11602,
+            22330,
+            321,
+            10281,
+            1056,
+            34082,
+            424,
+            1238,
+            4722,
+            13,
+            198
+          ],
+          "finish_reason": "length"
+        },
+        {
+          "text": "要计算 $17 \\times 23$，我们可以使用多种方法。下面我将展示最常用且直观的**拆分法（分配律）**以及**竖式计算法**。\n\n### 方法一：拆分法（分配律）\n\n将其中一个数拆分为整十数和个位数，使计算更简单。这里我们将 $23$ 拆分为 $20 + 3$。\n\n$$\n17 \\times 23 = ",
+          "token_ids": [
+            95822,
+            97792,
+            393,
+            16,
+            22,
+            1088,
+            14695,
+            220,
+            17,
+            18,
+            3,
+            3709,
+            103988,
+            96402,
+            99163,
+            96845,
+            1710,
+            99133,
+            110931,
+            98845,
+            96019,
+            108997,
+            97447,
+            142716,
+            332,
+            129005,
+            95892,
+            9616,
+            100679,
+            96516,
+            203309,
+            98404,
+            332,
+            100413,
+            96102,
+            97792,
+            95892,
+            221794,
+            271,
+            13962,
+            220,
+            96845,
+            95744,
+            4960,
+            129005,
+            95892,
+            9616,
+            100679,
+            96516,
+            7313,
+            271,
+            96123,
+            115780,
+            96089,
+            98513,
+            99968,
+            96330,
+            96075,
+            128562,
+            95840,
+            117761,
+            3709,
+            96137,
+            97792,
+            96017,
+            97561,
+            1710,
+            97490,
+            108752,
+            393,
+            17,
+            18,
+            3,
+            220,
+            98513,
+            99968,
+            393,
+            17,
+            15,
+            478,
+            220,
+            18,
+            3,
+            1710,
+            271,
+            13682,
+            198,
+            16,
+            22,
+            1088,
+            14695,
+            220,
+            17,
+            18,
+            283,
+            220
+          ],
+          "finish_reason": "length"
+        },
+        {
+          "text": "Here are three practical and effective ways to save water:\n\n1. **Fix Leaks Promptly**\n   A dripping faucet or a running toilet can waste hundreds of gallons of water per month. Check under sinks and in your bathroom for signs of moisture or slow drips. If you hear a toilet running when it shouldn’t, replace the flapper or fill valve. Even a small leak can add up to significant savings over time.\n\n2. **Use Water-Eff",
+          "token_ids": [
+            8160,
+            513,
+            2250,
+            14542,
+            321,
+            7139,
+            5337,
+            310,
+            3462,
+            2919,
+            25,
+            271,
+            16,
+            13,
+            2972,
+            25128,
+            1900,
+            9518,
+            57491,
+            391,
+            332,
+            198,
+            256,
+            357,
+            73607,
+            69029,
+            466,
+            264,
+            4162,
+            25378,
+            628,
+            11939,
+            11168,
+            314,
+            48436,
+            314,
+            2919,
+            791,
+            2182,
+            13,
+            4109,
+            1172,
+            55047,
+            321,
+            303,
+            678,
+            14422,
+            364,
+            11590,
+            314,
+            30137,
+            466,
+            6103,
+            47749,
+            1630,
+            13,
+            1368,
+            488,
+            6512,
+            264,
+            25378,
+            4162,
+            948,
+            424,
+            12752,
+            1357,
+            11,
+            8032,
+            279,
+            1274,
+            3006,
+            466,
+            4990,
+            30396,
+            13,
+            7183,
+            264,
+            2526,
+            22627,
+            628,
+            884,
+            685,
+            310,
+            4927,
+            18413,
+            888,
+            854,
+            13,
+            271,
+            17,
+            13,
+            2972,
+            9947,
+            9664,
+            13044,
+            529
+          ],
+          "finish_reason": "length"
+        },
+        {
+          "text": "晨光透过薄雾，轻柔地洒在刚刚苏醒的大地上。昨夜的雨洗去了尘世的喧嚣，空气里弥漫着泥土与青草混合的清新气息，每一口呼吸都像是被过滤过般纯净。\n\n屋檐下，最后几滴雨水还在不知疲倦地坠落，“滴答”声清脆悦耳，敲打着青石板路，泛起层层涟漪。树叶上的水珠晶莹剔透，折射着初升的太阳，像无数颗散落的钻石，在",
+          "token_ids": [
+            133349,
+            110355,
+            97865,
+            98554,
+            3709,
+            123764,
+            95852,
+            99091,
+            95772,
+            101740,
+            130283,
+            97796,
+            100741,
+            1710,
+            98991,
+            121033,
+            96948,
+            96894,
+            100557,
+            97688,
+            113076,
+            120949,
+            3709,
+            98035,
+            96067,
+            139154,
+            114654,
+            95999,
+            141284,
+            101742,
+            95726,
+            104644,
+            109508,
+            3709,
+            98443,
+            96116,
+            99209,
+            95983,
+            104132,
+            96147,
+            104075,
+            95922,
+            96965,
+            114454,
+            1710,
+            271,
+            135290,
+            95849,
+            3709,
+            97790,
+            96370,
+            98086,
+            111492,
+            103779,
+            99179,
+            122802,
+            95852,
+            124994,
+            40131,
+            98086,
+            96517,
+            828,
+            96429,
+            121788,
+            127496,
+            3709,
+            99096,
+            114946,
+            96556,
+            128698,
+            96112,
+            3709,
+            132638,
+            111713,
+            131978,
+            1710,
+            112941,
+            97015,
+            95936,
+            97744,
+            140706,
+            3709,
+            117824,
+            95966,
+            96677,
+            96492,
+            142484,
+            3709,
+            96647,
+            101879,
+            97966,
+            97058,
+            111493,
+            110573,
+            3709,
+            95772
+          ],
+          "finish_reason": "length"
+        }
+      ],
+      "throughput_gate": "smoke only; no matching old C4 baseline recorded"
+    }
+  },
+  "prompt_token_sha256": [
+    {
+      "prompt_id": "nv-1024-0",
+      "input_tokens": 1024,
+      "sha256": "dc5ae38e5e3a0b9bacbbb5c4ebbec94ad585bc8448b5d5768ec4887e828ff561"
+    },
+    {
+      "prompt_id": "nv-1024-1",
+      "input_tokens": 1024,
+      "sha256": "644a420a4b52a1780dd63821479bdbb492be2a83f4566ed1ea889d5ace743d0d"
+    },
+    {
+      "prompt_id": "nv-1024-2",
+      "input_tokens": 1024,
+      "sha256": "1a8bc6ecf0b8295ab4cf867e234f0a76f00e0a3d7a051fda416c9c9f0ddcf946"
+    },
+    {
+      "prompt_id": "nv-1024-3",
+      "input_tokens": 1024,
+      "sha256": "5ef26e70e460ac436b6fa24ab2cc4cf4485fda39adc13503d638a3d7dc60c9ae"
+    },
+    {
+      "prompt_id": "nv-1024-4",
+      "input_tokens": 1024,
+      "sha256": "a382079d72aec4c08a1de5fc99a40faf3ec63fd838a05219dd4ebb9283eca7ab"
+    },
+    {
+      "prompt_id": "nv-1024-5",
+      "input_tokens": 1024,
+      "sha256": "c47c8079efebc7c9e455e072e8316ef274b5164ddaf4e74eefe0640a7e71e3eb"
+    },
+    {
+      "prompt_id": "nv-1024-6",
+      "input_tokens": 1024,
+      "sha256": "cbfba6b28e813e32ec4afd57ea09353bd1db04cbce8937f0ef77ae1883f612d2"
+    },
+    {
+      "prompt_id": "nv-1024-7",
+      "input_tokens": 1024,
+      "sha256": "a3ff28e02932117d8c608989787e6744a1c3fdfebe003bccc002444cf8257968"
+    },
+    {
+      "prompt_id": "nv-8192-0",
+      "input_tokens": 8192,
+      "sha256": "2ecb5995539a6fcf26d8eef2ad84d93773c05fc64492d8db68478c2fd67fb712"
+    },
+    {
+      "prompt_id": "nv-8192-1",
+      "input_tokens": 8192,
+      "sha256": "6f87243cf96cb920b27401c01affc6be5502ef38abb15547a4e6aedf8128f797"
+    },
+    {
+      "prompt_id": "nv-8192-2",
+      "input_tokens": 8192,
+      "sha256": "9f8eb5819bdfcc8944eadebee1393b5aad3f29e9d1e2b81cd680736e9abcf96b"
+    },
+    {
+      "prompt_id": "nv-8192-3",
+      "input_tokens": 8192,
+      "sha256": "71c15b0f7f0319e59bc0e8d88fe275055066e78704257b09a5fd8c25761974e0"
+    },
+    {
+      "prompt_id": "nv-8192-4",
+      "input_tokens": 8192,
+      "sha256": "4ecbce342378e9dfcb50f1f87208b1d6e3dc269d66782ecddea70e174bcaa144"
+    },
+    {
+      "prompt_id": "nv-8192-5",
+      "input_tokens": 8192,
+      "sha256": "63b50dd8b945672df140c2227cf4e621271b3b48355f076474796663d48c0029"
+    },
+    {
+      "prompt_id": "nv-8192-6",
+      "input_tokens": 8192,
+      "sha256": "f5486ecefa3a62add3d49c11ab18ad6f719d6a712aadb684008835531c631a5e"
+    },
+    {
+      "prompt_id": "nv-8192-7",
+      "input_tokens": 8192,
+      "sha256": "0c2eae8e348b459ed18b03cf31672dd0ba6deff0af9b1e2a9edc4c49c86aee87"
+    }
+  ],
+  "trace_contract": {
+    "input_tokens": 1024,
+    "output_tokens": 64,
+    "max_length": 32768,
+    "sampling": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 20,
+      "seed": 123
+    },
+    "boundary": "first target graph-linked GPU node to the next; one successful capture"
+  },
+  "trace_rank_means": [
+    {
+      "rank": 0,
+      "retained_rounds": 13,
+      "round_ms": 21.043222692307694,
+      "target_graph_ms": 17.128622,
+      "target_kernel_union_ms": 15.766467153846154,
+      "target_inter_kernel_gap_ms": 1.3621548461538462,
+      "after_target_ms": 3.914600692307692,
+      "after_target_kernel_union_ms": 3.2977805384615384,
+      "after_target_inter_kernel_gap_ms": 0.6168201538461539,
+      "tail_kernel_count": 210,
+      "tail_last_kernel_to_next_target_us": 10.569846153846154,
+      "graph_boundary_idle_us": 357.80315384615386,
+      "draft_graph_end_to_next_target_us": 216.07807692307694,
+      "last_tail_graph_to_next_target_us": 216.07807692307694
+    },
+    {
+      "rank": 1,
+      "retained_rounds": 13,
+      "round_ms": 21.090526384615384,
+      "target_graph_ms": 17.175171307692306,
+      "target_kernel_union_ms": 15.720770230769231,
+      "target_inter_kernel_gap_ms": 1.4544010769230769,
+      "after_target_ms": 3.9153550769230767,
+      "after_target_kernel_union_ms": 3.290934076923077,
+      "after_target_inter_kernel_gap_ms": 0.624421,
+      "tail_kernel_count": 210,
+      "tail_last_kernel_to_next_target_us": 11.367384615384616,
+      "graph_boundary_idle_us": 364.3433076923077,
+      "draft_graph_end_to_next_target_us": 216.597,
+      "last_tail_graph_to_next_target_us": 216.597
+    },
+    {
+      "rank": 2,
+      "retained_rounds": 13,
+      "round_ms": 21.082971846153846,
+      "target_graph_ms": 17.165003923076924,
+      "target_kernel_union_ms": 15.696188846153845,
+      "target_inter_kernel_gap_ms": 1.468815076923077,
+      "after_target_ms": 3.917967923076923,
+      "after_target_kernel_union_ms": 3.2784144615384614,
+      "after_target_inter_kernel_gap_ms": 0.6395534615384615,
+      "tail_kernel_count": 210,
+      "tail_last_kernel_to_next_target_us": 11.596230769230768,
+      "graph_boundary_idle_us": 373.73853846153844,
+      "draft_graph_end_to_next_target_us": 219.19876923076924,
+      "last_tail_graph_to_next_target_us": 219.19876923076924
+    },
+    {
+      "rank": 3,
+      "retained_rounds": 13,
+      "round_ms": 21.10212523076923,
+      "target_graph_ms": 17.184784076923076,
+      "target_kernel_union_ms": 15.726993076923076,
+      "target_inter_kernel_gap_ms": 1.457791,
+      "after_target_ms": 3.917341153846154,
+      "after_target_kernel_union_ms": 3.2890576153846154,
+      "after_target_inter_kernel_gap_ms": 0.6282835384615384,
+      "tail_kernel_count": 210,
+      "tail_last_kernel_to_next_target_us": 12.24853846153846,
+      "graph_boundary_idle_us": 362.88953846153845,
+      "draft_graph_end_to_next_target_us": 219.24276923076923,
+      "last_tail_graph_to_next_target_us": 219.24276923076923
+    }
+  ],
+  "rank0_projection_roles": {
+    "qkvz+a_b": {
+      "calls_per_round": 48.0,
+      "us_per_call": 43.86096794871795,
+      "service_ms_per_round": 2.1053264615384615,
+      "weight_stream_bytes_per_call": 9973760.0,
+      "effective_weight_gbps": 227.39489041056453
+    },
+    "gdn_out": {
+      "calls_per_round": 48.0,
+      "us_per_call": 23.333341346153844,
+      "service_ms_per_round": 1.1200003846153845,
+      "weight_stream_bytes_per_call": 3806720.0,
+      "effective_weight_gbps": 163.14508683204434
+    },
+    "gate_up.native": {
+      "calls_per_round": 60.0,
+      "us_per_call": 61.73546666666666,
+      "service_ms_per_round": 3.704128,
+      "weight_stream_bytes_per_call": 18423466.666666668,
+      "effective_weight_gbps": 298.4259723206109
+    },
+    "down": {
+      "calls_per_round": 64.0,
+      "us_per_call": 37.138776442307694,
+      "service_ms_per_round": 2.3768816923076925,
+      "weight_stream_bytes_per_call": 10564480.0,
+      "effective_weight_gbps": 284.45955984605814
+    },
+    "attention.q+k+v": {
+      "calls_per_round": 16.0,
+      "us_per_call": 40.094307692307694,
+      "service_ms_per_round": 0.6415089230769231,
+      "weight_stream_bytes_per_call": 8650240.0,
+      "effective_weight_gbps": 215.7473341698227
+    },
+    "attention.o": {
+      "calls_per_round": 16.0,
+      "us_per_call": 21.704394230769232,
+      "service_ms_per_round": 0.3472703076923077,
+      "weight_stream_bytes_per_call": 3744000.0,
+      "effective_weight_gbps": 172.49963118953667
+    },
+    "gate_up.canonical": {
+      "calls_per_round": 4.0,
+      "us_per_call": 61.67051923076924,
+      "service_ms_per_round": 0.24668207692307695,
+      "weight_stream_bytes_per_call": 25067520.0,
+      "effective_weight_gbps": 406.47493020446433
+    }
+  },
+  "rank0_target_aux": {
+    "communication_or_reduction": {
+      "calls_per_round": 130.0,
+      "us_per_call": 11.95116449704142,
+      "service_ms_per_round": 1.5536513846153845
+    },
+    "rms_norm": {
+      "calls_per_round": 129.0,
+      "us_per_call": 6.191058437686345,
+      "service_ms_per_round": 0.7986465384615385
+    },
+    "GDN_state_or_gating": {
+      "calls_per_round": 144.0,
+      "us_per_call": 8.454830128205128,
+      "service_ms_per_round": 1.2174955384615385
+    },
+    "other_target": {
+      "calls_per_round": 128.0,
+      "us_per_call": 3.885520432692308,
+      "service_ms_per_round": 0.4973466153846154
+    },
+    "layout_or_copy": {
+      "calls_per_round": 37.0,
+      "us_per_call": 3.480072765072765,
+      "service_ms_per_round": 0.1287626923076923
+    },
+    "attention": {
+      "calls_per_round": 32.0,
+      "us_per_call": 32.150415865384616,
+      "service_ms_per_round": 1.0288133076923076
+    },
+    "unfused_FFN_epilogue": {
+      "calls_per_round": 4.0,
+      "us_per_call": 3.694153846153846,
+      "service_ms_per_round": 0.014776615384615385
+    }
+  },
+  "rank0_tail": {
+    "other_tail": {
+      "calls_per_round": 139.0,
+      "us_per_call": 5.770466519092419,
+      "service_ms_per_round": 0.8020948461538462
+    },
+    "draft_GEMM": {
+      "calls_per_round": 23.0,
+      "us_per_call": 43.31426086956522,
+      "service_ms_per_round": 0.996228
+    },
+    "communication_or_reduction": {
+      "calls_per_round": 18.0,
+      "us_per_call": 14.223380341880342,
+      "service_ms_per_round": 0.2560208461538461
+    },
+    "target_head": {
+      "calls_per_round": 1.0,
+      "us_per_call": 271.6814615384615,
+      "service_ms_per_round": 0.2716814615384615
+    },
+    "sampling_and_sorting": {
+      "calls_per_round": 23.0,
+      "us_per_call": 7.373675585284281,
+      "service_ms_per_round": 0.16959453846153844
+    },
+    "draft_attention": {
+      "calls_per_round": 5.0,
+      "us_per_call": 105.0772923076923,
+      "service_ms_per_round": 0.5253864615384616
+    },
+    "draft_shared_head": {
+      "calls_per_round": 1.0,
+      "us_per_call": 277.0796153846154,
+      "service_ms_per_round": 0.27707961538461534
+    }
+  },
+  "counterparts": [
+    {
+      "role": "gate_up",
+      "m": 8,
+      "n": 4352,
+      "k": 5120,
+      "weight_stream_bytes": 25067520,
+      "parameters": {
+        "operator": "nvfp4_qpn2_gated_sm70_out",
+        "split_k": 8,
+        "accumulator_chains": 2
+      },
+      "timings": [
+        {
+          "median_us": 53.247999399900436,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 50.175998359918594,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "down",
+      "m": 8,
+      "n": 5120,
+      "k": 4352,
+      "weight_stream_bytes": 12533760,
+      "parameters": {
+        "operator": "nvfp4_qpn2_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2
+      },
+      "timings": [
+        {
+          "median_us": 26.623999699950218,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 26.623999699950218,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "qkvz",
+      "m": 8,
+      "n": 4096,
+      "k": 5120,
+      "weight_stream_bytes": 20979712,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2,
+        "fast_decoder": true,
+        "relative_l2": 0.00020872967434115708
+      },
+      "timings": [
+        {
+          "median_us": 38.91199827194214,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 35.840000957250595,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "GDN_out",
+      "m": 8,
+      "n": 5120,
+      "k": 1536,
+      "weight_stream_bytes": 7874560,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 1,
+        "fast_decoder": true,
+        "relative_l2": 0.00019928715482819825
+      },
+      "timings": [
+        {
+          "median_us": 18.432000651955605,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 18.432000651955605,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "attention_qkv",
+      "m": 8,
+      "n": 3584,
+      "k": 5120,
+      "weight_stream_bytes": 18357248,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2,
+        "fast_decoder": true,
+        "relative_l2": 0.00020985465380363166
+      },
+      "timings": [
+        {
+          "median_us": 34.81600061058998,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 31.74399957060814,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "attention_q",
+      "m": 8,
+      "n": 3072,
+      "k": 5120,
+      "weight_stream_bytes": 15734784,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2,
+        "fast_decoder": true,
+        "relative_l2": 0.00020705357019323856
+      },
+      "timings": [
+        {
+          "median_us": 31.74399957060814,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 30.719999223947525,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "attention_k",
+      "m": 8,
+      "n": 256,
+      "k": 5120,
+      "weight_stream_bytes": 1311232,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2,
+        "fast_decoder": true,
+        "relative_l2": 0.00020819861674681306
+      },
+      "timings": [
+        {
+          "median_us": 20.479999482631683,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 20.479999482631683,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "attention_v",
+      "m": 8,
+      "n": 256,
+      "k": 5120,
+      "weight_stream_bytes": 1311232,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2,
+        "fast_decoder": true,
+        "relative_l2": 0.00020196763216517866
+      },
+      "timings": [
+        {
+          "median_us": 20.479999482631683,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 19.967999309301376,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "attention_kv",
+      "m": 8,
+      "n": 512,
+      "k": 5120,
+      "weight_stream_bytes": 2622464,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2,
+        "fast_decoder": true,
+        "relative_l2": 0.00020581770513672382
+      },
+      "timings": [
+        {
+          "median_us": 20.479999482631683,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 20.479999482631683,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "attention_qk",
+      "m": 8,
+      "n": 3328,
+      "k": 5120,
+      "weight_stream_bytes": 17046016,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 2,
+        "fast_decoder": true,
+        "relative_l2": 0.00020763601060025394
+      },
+      "timings": [
+        {
+          "median_us": 33.28000009059906,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 31.74399957060814,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "attention_o",
+      "m": 8,
+      "n": 5120,
+      "k": 1536,
+      "weight_stream_bytes": 7874560,
+      "parameters": {
+        "operator": "fp8_qpn8_gemm_sm70_out",
+        "split_k": 16,
+        "accumulator_chains": 1,
+        "fast_decoder": true,
+        "relative_l2": 0.00020659450092352927
+      },
+      "timings": [
+        {
+          "median_us": 19.45599913597107,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 18.432000651955605,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    },
+    {
+      "role": "qkvz_ab",
+      "m": 8,
+      "n": 2560,
+      "k": 5120,
+      "weight_stream_bytes": 21225472,
+      "parameters": {
+        "operator": "fp8_qpn8_dispatch_ba_split_sm70_out",
+        "output_n": 4120
+      },
+      "timings": [
+        {
+          "median_us": 35.840000957250595,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        },
+        {
+          "median_us": 35.840000957250595,
+          "clock_before": "1290, 877, 300.00",
+          "clock_after": "1290, 877, 300.00"
+        }
+      ]
+    }
+  ],
+  "head_operator_counterpart": {
+    "complete": true,
+    "model": "Qwen3.8-27B-NVFP4",
+    "runtime": "1.5.2.dev59+g6d11576ee9",
+    "role": "head_full_vocab",
+    "m": 8,
+    "n": 62080,
+    "k": 5120,
+    "weight_stream_bytes": 317973760,
+    "operator": "fp8_qpn8_gemm_sm70_out",
+    "split_k": 16,
+    "accumulator_chains": 2,
+    "out_dtype": "float16",
+    "activation_dtype": "float16",
+    "accumulation": "float32",
+    "relative_l2": 0.0002079766127280891,
+    "graph_replays": 1000,
+    "timings": [
+      {
+        "median_us": 412.6720130443573,
+        "clock_before": "1290, 877, 300.00",
+        "clock_after": "1290, 877, 300.00"
+      },
+      {
+        "median_us": 412.6720130443573,
+        "clock_before": "1290, 877, 300.00",
+        "clock_after": "1290, 877, 300.00"
+      }
+    ],
+    "scope": "Full-vocabulary same-shape channel-FP8 QPN counterpart; no cross-checkpoint numerical equivalence or model-dispatch claim"
+  },
+  "report_change_validation": {
+    "source": "5cbe3aea29ebf4933ea917aaaebaa43f2439e03a",
+    "runtime": "dev60",
+    "native_build_input_differences": [],
+    "existing_checks_passed": 86,
+    "corrected_added_admission_check_passed": true,
+    "execution_changes": false
+  }
+}

@@ -13,6 +13,7 @@ import vllm.envs as envs
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.runtime_resources import activate_runtime_resources, runtime_resources_for
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ubatch_utils import UBatchSlices
@@ -198,6 +199,8 @@ class ForwardContext:
     moe_layer_index: int = 0
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Borrowed engine-owned buffers/caches, bound after worker config transfer.
+    runtime_resources: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
@@ -250,6 +253,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         is_dummy_run=is_dummy_run,
         additional_kwargs=additional_kwargs or {},
+        runtime_resources=runtime_resources_for(vllm_config),
     )
 
 
@@ -263,7 +267,11 @@ def override_forward_context(forward_context: ForwardContext | None):
     prev_context = _forward_context
     _forward_context = forward_context
     try:
-        yield
+        resources = (
+            forward_context.runtime_resources if forward_context is not None else {}
+        )
+        with activate_runtime_resources(resources):
+            yield
     finally:
         _forward_context = prev_context
 

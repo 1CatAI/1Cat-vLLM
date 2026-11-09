@@ -23,7 +23,16 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 FLASH_V100_ROOT = Path(
     os.environ.get("SM70_FLASH_V100_ROOT", SOURCE_ROOT / "flash-attention-v100")
 )
-for source_path in (FLASH_V100_ROOT, SOURCE_ROOT):
+loaded_vllm = sys.modules.get("vllm")
+installed_vllm = (
+    "site-packages" in Path(getattr(loaded_vllm, "__file__", "") or "").parts
+)
+source_paths = []
+if not installed_vllm or "SM70_FLASH_V100_ROOT" in os.environ:
+    source_paths.append(FLASH_V100_ROOT)
+if not installed_vllm:
+    source_paths.append(SOURCE_ROOT)
+for source_path in source_paths:
     source_path_str = str(source_path)
     if source_path_str not in sys.path:
         sys.path.insert(0, source_path_str)

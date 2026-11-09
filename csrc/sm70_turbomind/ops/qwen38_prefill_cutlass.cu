@@ -1,3 +1,4 @@
+#include "sm70_policy.h"
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -38,8 +39,7 @@ using Sm70Fp8PrefillCutlassGemm =
     cutlass::gemm::device::GemmUniversalAdapter<Sm70Fp8PrefillCutlassKernel>;
 
 void maybe_log_sm70_fp8_prefill_cutlass_route(int64_t m, int64_t n, int64_t k) {
-  const char* raw = std::getenv("VLLM_SM70_PROFILE_TRACE");
-  if (raw == nullptr || std::strcmp(raw, "1") != 0) {
+  if (!vllm::sm70::policy_exact_one(vllm::sm70::PolicyField::profile_trace)) {
     return;
   }
   const unsigned bit = n == 8704   ? 1u
@@ -47,7 +47,8 @@ void maybe_log_sm70_fp8_prefill_cutlass_route(int64_t m, int64_t n, int64_t k) {
                        : k == 1536 ? 4u
                        : n == 4096 ? 8u
                                    : 16u;
-  static std::atomic<unsigned> logged_shapes{0};
+  auto& logged_shapes =
+      vllm::sm70::diagnostic_counter("fp8_prefill_cutlass_shapes");
   const unsigned previous =
       logged_shapes.fetch_or(bit, std::memory_order_relaxed);
   if ((previous & bit) == 0u) {
@@ -60,9 +61,9 @@ void maybe_log_sm70_fp8_prefill_cutlass_route(int64_t m, int64_t n, int64_t k) {
 
 bool sm70_fp8_prefill_cutlass_out(torch::Tensor out, torch::Tensor in_feats,
                                   torch::Tensor dense_weight, bool gated_silu) {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
-  if ((raw != nullptr && std::atoi(raw) == 0) || gated_silu ||
-      in_feats.dim() != 2 || dense_weight.dim() != 2) {
+  if (vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_prefill_cutlass,
+                              1) == 0 ||
+      gated_silu || in_feats.dim() != 2 || dense_weight.dim() != 2) {
     return false;
   }
   const int64_t k = in_feats.size(1);

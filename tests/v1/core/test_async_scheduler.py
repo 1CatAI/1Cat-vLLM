@@ -7,13 +7,14 @@ from unittest.mock import Mock
 import pytest
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.utils import ConstantList
 
-from .utils import create_requests, create_scheduler
+from .utils import create_requests, create_scheduler, pretend_gpu_count
 
 pytestmark = pytest.mark.cpu_test
 
@@ -106,7 +107,7 @@ def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
 
 def test_v2_pp_spec_decode_respects_pipeline_cadence(monkeypatch):
     # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
-    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
+    pretend_gpu_count(monkeypatch, 2)
     scheduler = create_scheduler(
         async_scheduling=True,
         pipeline_parallel_size=2,
@@ -127,6 +128,33 @@ def test_v2_pp_spec_decode_respects_pipeline_cadence(monkeypatch):
     decode_output = scheduler.schedule()
     assert decode_output.num_scheduled_tokens[request.request_id] == 8
     assert len(decode_output.scheduled_spec_decode_tokens[request.request_id]) == 7
+
+
+@pytest.mark.parametrize(
+    ("use_v2_model_runner", "history_is_sent"), [(True, False), (False, True)]
+)
+def test_cached_request_history_is_only_sent_to_the_runner_that_reads_it(
+    use_v2_model_runner: bool, history_is_sent: bool
+):
+    scheduler = create_scheduler(async_scheduling=True)
+    scheduler.use_v2_model_runner = use_v2_model_runner
+    (request,) = create_requests(num_requests=1, num_tokens=1000)
+    scheduler.add_request(request)
+    scheduler.schedule()  # prefill: the request is now running
+
+    # A step that does not schedule the request (the PP cadence leaves such steps in
+    # between): the next decode step finds it missing from the previous step.
+    scheduler.prev_step_scheduled_req_ids.clear()
+    cached = scheduler._make_cached_request_data(
+        [request],
+        [],
+        {request.request_id: 1},
+        {},
+        {request.request_id: scheduler.kv_cache_manager.empty_kv_cache_blocks},
+    )
+
+    assert cached.req_ids == [request.request_id]
+    assert (request.request_id in cached.all_token_ids) is history_is_sent
 
 
 def test_abort():
@@ -337,6 +365,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     request.num_in_flight_tokens = 1
 
     scheduler.perf_metrics = None
+    scheduler.mixed_prefill_budget = Mock()
     scheduler.connector = None
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True
@@ -354,6 +383,10 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.recompute_kv_load_failures = False
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
+    # No latency target: update() ignores the step timing.
+    scheduler.mixed_prefill_budget = MixedPrefillBudget(1, 0.0)
+    # No speculative decoding, as __init__ derives without a speculative config.
+    scheduler.use_lookahead_block_hashes = False
 
     def free_request(req, delay_free_blocks=False):
         scheduler.finished_req_ids.add(req.request_id)

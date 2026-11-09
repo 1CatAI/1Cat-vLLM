@@ -8,42 +8,12 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-import os
-
 import torch
 
+from vllm.config.gdn_schedule import resolve_schedule
 from vllm.triton_utils import tl, triton
 
 from .op import exp
-
-
-def _parse_positive_int_env(name: str) -> int | None:
-    value = os.getenv(name)
-    if value is None:
-        return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _parse_positive_int_list_env(name: str, default: list[int]) -> list[int]:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    out: list[int] = []
-    for token in value.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            parsed = int(token)
-        except ValueError:
-            continue
-        if parsed > 0:
-            out.append(parsed)
-    return out or default
 
 
 def _round_num_warps(value: int) -> int:
@@ -56,26 +26,6 @@ def _round_num_warps(value: int) -> int:
     return 8
 
 
-_SM70_FLA_RECURRENT_SCHEDULE = os.getenv("VLLM_SM70_FLA_RECURRENT_SCHEDULE", "1") == "1"
-_SM70_FLA_BV_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_BV")
-_SM70_FLA_WARPS_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_WARPS")
-_SM70_FLA_STAGES_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_STAGES")
-_SM70_FLA_TARGET_WAVES = _parse_positive_int_env("VLLM_SM70_FLA_TARGET_WAVES") or 2
-_SM70_FLA_BV_CANDIDATES = _parse_positive_int_list_env(
-    "VLLM_SM70_FLA_BV_CANDIDATES", [32, 16, 8]
-)
-_SM70_FLA_HAS_LEGACY_OVERRIDE = any(
-    os.getenv(name) not in (None, "")
-    for name in (
-        "VLLM_SM70_FLA_BV",
-        "VLLM_SM70_FLA_WARPS",
-        "VLLM_SM70_FLA_STAGES",
-        "VLLM_SM70_FLA_TARGET_WAVES",
-        "VLLM_SM70_FLA_BV_CANDIDATES",
-    )
-)
-
-
 def _is_sm70_device(device: torch.device) -> bool:
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
@@ -86,19 +36,26 @@ def _is_sm70_device(device: torch.device) -> bool:
     return major == 7 and minor == 0
 
 
-def _use_sm70_fla_recurrent_schedule(device: torch.device) -> bool:
+def _use_sm70_fla_recurrent_schedule(device: torch.device, schedule=None) -> bool:
+    schedule = resolve_schedule(schedule)
     return _is_sm70_device(device) and (
-        _SM70_FLA_RECURRENT_SCHEDULE or _SM70_FLA_HAS_LEGACY_OVERRIDE
+        schedule.recurrent_enabled or schedule.recurrent_override
     )
 
 
-def _select_sm70_bv(V: int, N: int, HV: int, device: torch.device) -> int:
+def _select_sm70_bv(
+    V: int, N: int, HV: int, device: torch.device, schedule=None
+) -> int:
+    schedule = resolve_schedule(schedule)
     v_pow2 = triton.next_power_of_2(V)
-    if _SM70_FLA_BV_OVERRIDE is not None:
-        return min(v_pow2, triton.next_power_of_2(_SM70_FLA_BV_OVERRIDE))
+    if schedule.recurrent_bv is not None:
+        return min(
+            v_pow2,
+            triton.next_power_of_2(schedule.recurrent_bv),
+        )
 
     candidates: list[int] = []
-    for candidate in _SM70_FLA_BV_CANDIDATES:
+    for candidate in schedule.recurrent_bv_candidates:
         candidate_pow2 = min(v_pow2, triton.next_power_of_2(candidate))
         if candidate_pow2 not in candidates:
             candidates.append(candidate_pow2)
@@ -110,7 +67,7 @@ def _select_sm70_bv(V: int, N: int, HV: int, device: torch.device) -> int:
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
-    target_ctas = sm_count * _SM70_FLA_TARGET_WAVES
+    target_ctas = sm_count * schedule.recurrent_target_waves
     fallback = candidates[-1]
     for candidate in candidates:
         ctas = triton.cdiv(V, candidate) * N * HV
@@ -119,15 +76,17 @@ def _select_sm70_bv(V: int, N: int, HV: int, device: torch.device) -> int:
     return fallback
 
 
-def _select_sm70_num_warps(BV: int, N: int, HV: int) -> int:
-    if _SM70_FLA_WARPS_OVERRIDE is not None:
-        return _round_num_warps(_SM70_FLA_WARPS_OVERRIDE)
+def _select_sm70_num_warps(BV: int, N: int, HV: int, schedule=None) -> int:
+    schedule = resolve_schedule(schedule)
+    if schedule.recurrent_warps is not None:
+        return _round_num_warps(schedule.recurrent_warps)
     return 1
 
 
-def _select_sm70_num_stages(T: int) -> int:
-    if _SM70_FLA_STAGES_OVERRIDE is not None:
-        return _SM70_FLA_STAGES_OVERRIDE
+def _select_sm70_num_stages(T: int, schedule=None) -> int:
+    schedule = resolve_schedule(schedule)
+    if schedule.recurrent_stages is not None:
+        return schedule.recurrent_stages
     return 3
 
 
@@ -321,21 +280,25 @@ def fused_recurrent_gated_delta_rule_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    schedule=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    schedule = resolve_schedule(schedule)
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    sm70_schedule = _use_sm70_fla_recurrent_schedule(q.device)
+    sm70_schedule = _use_sm70_fla_recurrent_schedule(q.device, schedule=schedule)
     BK = triton.next_power_of_2(K)
     BV = (
-        _select_sm70_bv(V, N, HV, q.device)
+        _select_sm70_bv(V, N, HV, q.device, schedule=schedule)
         if sm70_schedule
         else min(triton.next_power_of_2(V), 32)
     )
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = _select_sm70_num_stages(T) if sm70_schedule else 3
-    num_warps = _select_sm70_num_warps(BV, N, HV) if sm70_schedule else 1
+    num_stages = _select_sm70_num_stages(T, schedule=schedule) if sm70_schedule else 3
+    num_warps = (
+        _select_sm70_num_warps(BV, N, HV, schedule=schedule) if sm70_schedule else 1
+    )
 
     o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
@@ -498,7 +461,9 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    schedule=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    schedule = resolve_schedule(schedule)
     if mixed_qkv.ndim != 2:
         raise ValueError(
             f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
@@ -585,14 +550,18 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    sm70_schedule = _use_sm70_fla_recurrent_schedule(mixed_qkv.device)
+    sm70_schedule = _use_sm70_fla_recurrent_schedule(
+        mixed_qkv.device, schedule=schedule
+    )
     BV = (
-        _select_sm70_bv(V, B, HV, mixed_qkv.device)
+        _select_sm70_bv(V, B, HV, mixed_qkv.device, schedule=schedule)
         if sm70_schedule
         else min(triton.next_power_of_2(V), 32)
     )
-    num_stages = _select_sm70_num_stages(1) if sm70_schedule else 3
-    num_warps = _select_sm70_num_warps(BV, B, HV) if sm70_schedule else 1
+    num_stages = _select_sm70_num_stages(1, schedule=schedule) if sm70_schedule else 3
+    num_warps = (
+        _select_sm70_num_warps(BV, B, HV, schedule=schedule) if sm70_schedule else 1
+    )
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)
@@ -650,7 +619,9 @@ class FusedRecurrentFunction(torch.autograd.Function):
         ssm_state_indices: torch.Tensor | None = None,
         num_accepted_tokens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        schedule=None,
     ):
+        schedule = resolve_schedule(schedule)
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q.contiguous(),
             k=k.contiguous(),
@@ -664,6 +635,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             ssm_state_indices=ssm_state_indices,
             num_accepted_tokens=num_accepted_tokens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            schedule=schedule,
         )
 
         return o, final_state
@@ -682,6 +654,7 @@ def fused_recurrent_gated_delta_rule(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    schedule=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -747,6 +720,7 @@ def fused_recurrent_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
+    schedule = resolve_schedule(schedule)
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(
             f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
@@ -771,5 +745,6 @@ def fused_recurrent_gated_delta_rule(
         ssm_state_indices,
         num_accepted_tokens,
         use_qk_l2norm_in_kernel,
+        schedule,
     )
     return o, final_state

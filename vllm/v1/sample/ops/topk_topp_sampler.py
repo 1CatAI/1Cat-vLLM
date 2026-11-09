@@ -12,6 +12,7 @@ from vllm.config.model import LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
+from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
@@ -30,6 +31,7 @@ class TopKTopPSampler(nn.Module):
     def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs") -> None:
         super().__init__()
         self.logprobs_mode = logprobs_mode
+        self.runtime = bind_topk_topp_runtime()
         # flashinfer optimization does not apply if intermediate
         # logprobs/logits after top_k/top_p need to be returned
         if (
@@ -136,7 +138,7 @@ class TopKTopPSampler(nn.Module):
 
         The logits tensor may be updated in-place.
         """
-        logits = apply_top_k_top_p(logits, k, p)
+        logits = apply_top_k_top_p(logits, k, p, runtime=self.runtime)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
@@ -184,7 +186,7 @@ class TopKTopPSampler(nn.Module):
 
         The logits tensor may be updated in-place.
         """
-        logits = apply_top_k_top_p(logits, k, p)
+        logits = apply_top_k_top_p(logits, k, p, runtime=self.runtime)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
@@ -321,14 +323,18 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    *,
+    runtime=None,
 ) -> torch.Tensor:
     if p is None and k is None:
         return logits
 
     if current_platform.is_cpu():
         if HAS_TRITON:
-            return apply_top_k_top_p_triton(logits, k, p)
+            return apply_top_k_top_p_triton(logits, k, p, runtime=runtime)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
 
     if (
@@ -338,10 +344,10 @@ def apply_top_k_top_p(
         and logits.shape[0] >= 2
         and logits.shape[1] >= 32768
     ):
-        return apply_top_k_top_p_triton(logits, k, p)
+        return apply_top_k_top_p_triton(logits, k, p, runtime=runtime)
 
     if HAS_TRITON and logits.shape[0] >= 8:
-        return apply_top_k_top_p_triton(logits, k, p)
+        return apply_top_k_top_p_triton(logits, k, p, runtime=runtime)
 
     # Use pytorch sort implementation for small batch sizes.
     return apply_top_k_top_p_pytorch(logits, k, p)
@@ -352,6 +358,8 @@ def apply_top_k_top_p_pytorch(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     allow_cpu_sync: bool = False,
+    *,
+    rowwise_sort: bool = False,
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits.
 
@@ -368,7 +376,20 @@ def apply_top_k_top_p_pytorch(
             # Avoid sorting vocab for top-k only case.
             return apply_top_k_only(logits, k)
 
-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+    if rowwise_sort and logits.shape[0] > 1:
+        # Bound radix-sort scratch while retaining the original batch shape
+        # for the softmax and cumulative sum below.
+        logits_sort = torch.empty_like(logits)
+        logits_idx = torch.empty_like(logits, dtype=torch.int64)
+        for row in range(logits.shape[0]):
+            torch.sort(
+                logits[row : row + 1],
+                dim=-1,
+                descending=False,
+                out=(logits_sort[row : row + 1], logits_idx[row : row + 1]),
+            )
+    else:
+        logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
         # Apply top-k.

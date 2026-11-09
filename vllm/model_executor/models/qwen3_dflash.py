@@ -3,6 +3,7 @@
 
 import io
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -10,9 +11,9 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -61,6 +62,16 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+
+
+def _dflash_context_projection_dtype(projection: nn.Module) -> torch.dtype | None:
+    weight = getattr(projection, "weight", None)
+    if weight is not None and weight.is_floating_point():
+        return weight.dtype
+    # Packed weights have no floating weight parameter. Their quantization
+    # method declares the projection operand dtype independently of storage.
+    dtype = getattr(getattr(projection, "quant_method", None), "params_dtype", None)
+    return dtype if dtype in (torch.float16, torch.bfloat16, torch.float32) else None
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -271,18 +282,33 @@ class DFlashQwen3Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Per-head RMSNorm
-        q_shape, k_shape = q.shape, k.shape
-        q = self.q_norm(
-            q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
-        ).view(q_shape)
-        k = self.k_norm(
-            k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
-        ).view(k_shape)
+        fused_prep = getattr(self, "_sm70_dflash2_qk_rope", False)
+        if fused_prep:
+            q = torch.empty_like(q)
+            k = torch.empty_like(k)
+            torch.ops.vllm.sm70_dflash2_qk_norm_rope_cache(
+                qkv,
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                self.attn.layer_name,
+            )
+        else:
+            # Per-head RMSNorm
+            q_shape, k_shape = q.shape, k.shape
+            q = self.q_norm(
+                q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
+            ).view(q_shape)
+            k = self.k_norm(
+                k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
+            ).view(k_shape)
 
-        q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = self.attn(q, k, v)
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, kv_cache_updated=fused_prep)
         output_input_scale = getattr(self, "output_input_scale", 1.0)
         if output_input_scale != 1.0:
             attn_output = attn_output / output_input_scale
@@ -531,7 +557,10 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
-        if envs.VLLM_DFLASH_DEBUG_CONTEXT_KV and get_tensor_model_parallel_rank() == 0:
+        if (
+            capture_runtime_trace().dflash.value("context_kv")
+            and get_tensor_model_parallel_rank() == 0
+        ):
             row_diffs = (
                 self._k_norm_weights.float()
                 .sub(self._k_norm_weights[0].float())
@@ -700,7 +729,7 @@ class DFlashQwen3Model(nn.Module):
                 all_k, self._k_norm_weights, self._rms_norm_eps
             )
             if (
-                envs.VLLM_DFLASH_DEBUG_CONTEXT_KV
+                capture_runtime_trace().dflash.value("context_kv")
                 and not self._sm70_context_k_debugged
                 and get_tensor_model_parallel_rank() == 0
                 and bool(torch.count_nonzero(all_k).item())
@@ -752,7 +781,9 @@ class DFlashQwen3Model(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ) = None,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -815,19 +846,24 @@ class DFlashQwen3Model(nn.Module):
         self,
         all_k: torch.Tensor,
         all_v: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ),
     ) -> None:
         """Write only the accepted, resident context slots."""
         if context_slot_mapping is None:
             return
         per_layer = isinstance(context_slot_mapping, (list, tuple))
         for i in range(self._num_attn_layers):
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
-            )
+            attn = self._attn_layers[i]
+            if isinstance(context_slot_mapping, dict):
+                slot_mapping = context_slot_mapping[attn.layer_name]
+            else:
+                slot_mapping = (
+                    context_slot_mapping[i] if per_layer else context_slot_mapping
+                )
             if slot_mapping is None:
                 continue  # dummy run: skip cache ops
-            attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,
@@ -926,6 +962,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
+        self._sampling_policy = vllm_config.speculative_config.sampling_policy
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
@@ -1021,7 +1058,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: (
+            torch.Tensor | list[torch.Tensor | None] | dict[str, torch.Tensor] | None
+        ) = None,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(
@@ -1030,14 +1069,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def get_aux_hidden_state_dtype(self) -> torch.dtype | None:
         if (
-            not envs.VLLM_DFLASH_COMPACT_AUX_HIDDEN
+            not self._sampling_policy.compact_aux_hidden
             or not self.model.use_aux_hidden_state
         ):
             return None
-        weight = getattr(self.model.fc, "weight", None)
-        return (
-            weight.dtype if weight is not None and weight.is_floating_point() else None
-        )
+        return _dflash_context_projection_dtype(self.model.fc)
 
     def combine_aux_hidden_states(
         self, aux_hidden_states: list[torch.Tensor]
@@ -1080,9 +1116,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         # AWQ target paths can surface fp32 auxiliary states even when the
         # draft projection is initialized in fp16. Match the FC weight dtype
         # before dispatching the linear kernel.
-        fc_weight = getattr(self.model.fc, "weight", None)
-        if fc_weight is not None and hidden_states.dtype != fc_weight.dtype:
-            hidden_states = hidden_states.to(dtype=fc_weight.dtype)
+        projection_dtype = _dflash_context_projection_dtype(self.model.fc)
+        if projection_dtype is not None and hidden_states.dtype != projection_dtype:
+            hidden_states = hidden_states.to(dtype=projection_dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
@@ -1156,11 +1192,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             return None
 
         MASK_EMBEDDING_FILENAME = "mask_embedding.pt"
-        data = get_hf_file_bytes(
-            MASK_EMBEDDING_FILENAME,
-            self.draft_model_config.model,
-            self.draft_model_config.revision,
-        )
+        source = Path(getattr(self, "_gguf_model_path", self.draft_model_config.model))
+        if source.is_file() or source.is_dir():
+            directory = source.parent if source.is_file() else source
+            override = directory / MASK_EMBEDDING_FILENAME
+            data = override.read_bytes() if override.is_file() else None
+        else:
+            data = get_hf_file_bytes(
+                MASK_EMBEDDING_FILENAME,
+                self.draft_model_config.model,
+                self.draft_model_config.revision,
+            )
         if data is None:
             return None
 

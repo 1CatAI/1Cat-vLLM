@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <mutex>
 
+#include "sm70_policy.h"
 #include "activation_pack_sm70.cuh"
 #include "qpn_pair_sm70.cuh"
 
@@ -231,13 +232,16 @@ __global__ void fp8_qpn8_sm70_kernel(
     if (tile >= qpn_tiles) {
       constexpr int kBARowsPerBlock = 2;
       constexpr int kBAThreadsPerRow = 256;
-      const int ba_block = tile - qpn_tiles;
+      const int ba_blocks_per_token = (ba_n + 1) / kBARowsPerBlock;
+      const int token = M1Only ? 0 : (tile - qpn_tiles) / ba_blocks_per_token;
+      const int ba_block = (tile - qpn_tiles) % ba_blocks_per_token;
       const int ba_group = threadIdx.x / kBAThreadsPerRow;
       const int ba_thread = threadIdx.x % kBAThreadsPerRow;
       const int ba_warp = ba_thread >> 5;
       const int ba_row = ba_block * kBARowsPerBlock + ba_group;
       float value = 0.0f;
-      const half2* input2 = reinterpret_cast<const half2*>(input);
+      const half2* input2 = reinterpret_cast<const half2*>(
+          input + static_cast<size_t>(token) * k);
       const half2* weight2 = reinterpret_cast<const half2*>(
           ba_weight + static_cast<size_t>(ba_row) * k);
       for (int pair = ba_thread; pair < k / 2; pair += kBAThreadsPerRow) {
@@ -263,12 +267,15 @@ __global__ void fp8_qpn8_sm70_kernel(
         if (lane == 0 && ba_row < ba_n) {
           if constexpr (SplitOutputs) {
             if (ba_row < ba_n / 2) {
-              b_output[ba_row] = __float2half(value);
+              b_output[static_cast<size_t>(token) * (ba_n / 2) + ba_row] =
+                  __float2half(value);
             } else {
-              a_output[ba_row - ba_n / 2] = __float2half(value);
+              a_output[static_cast<size_t>(token) * (ba_n / 2) + ba_row -
+                       ba_n / 2] = __float2half(value);
             }
           } else {
-            ba_output[ba_row] = __float2half(value);
+            ba_output[static_cast<size_t>(token) * ba_n + ba_row] =
+                __float2half(value);
           }
         }
       }
@@ -427,8 +434,19 @@ __global__ void fp8_qpn8_sm70_kernel(
       const int output_row = element >> 5;
       const int output_col = element & 31;
       if (output_row < m) {
-        output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
-            __float2half(value);
+        const int col = tile * 32 + output_col;
+        if constexpr (SplitOutputs) {
+          if (col < qkv_n) {
+            output[static_cast<size_t>(output_row) * qkv_n + col] =
+                __float2half(value);
+          } else {
+            z_output[static_cast<size_t>(output_row) * (n - qkv_n) + col -
+                     qkv_n] = __float2half(value);
+          }
+        } else {
+          output[static_cast<size_t>(output_row) * n + col] =
+              __float2half(value);
+        }
       }
     }
   }
@@ -475,7 +493,7 @@ struct Fp8PairReader {
 // reduction retain the exact p0 + ... + p(SplitK-1) order. Each projection uses
 // (SplitK / 2 + 1) * 4 KiB of reduction storage and reuses B over all 32 rows.
 template <int SplitK, bool PackedInput = false, bool Gated = false,
-          bool FullRows = false>
+          bool FullRows = false, bool FusedBA = false>
 __global__ __launch_bounds__(
     32 * (SplitK / 2) * (Gated ? 2 : 1),
     FullRows
@@ -484,7 +502,10 @@ __global__ __launch_bounds__(
                                                     const half* __restrict__ channel_scales,
                                                     const half* __restrict__ input,
                                                     half* __restrict__ output,
-                                                    int n, int k, int m) {
+                                                    half* __restrict__ k16_output,
+                                                    int n, int k, int m,
+                                                    vllm::sm70::Sm70FusedBa
+                                                        fused_ba) {
   static_assert(SplitK == 8 || SplitK == 12 || SplitK == 16,
                 "M32 two-phase QPN8 supports split-8, split-12 or split-16");
   if constexpr (FullRows) m = 32;
@@ -499,6 +520,15 @@ __global__ __launch_bounds__(
   constexpr int kProjections = Gated ? 2 : 1;
   __shared__ float reduction_storage[kProjections][kPhysicalWarps + 1]
                                     [kOutputElements];
+  if constexpr (FusedBA) {
+    const int tiles = n / 32;
+    if (blockIdx.x >= tiles) {
+      vllm::sm70::fused_ba_tile<kPhysicalWarps>(input, fused_ba,
+                                                &reduction_storage[0][0][0],
+                                                (blockIdx.x - tiles) * 8, k, m);
+      return;
+    }
+  }
 
   const int lane = threadIdx.x & 31;
   const int warp =
@@ -615,8 +645,20 @@ __global__ __launch_bounds__(
         const int output_col = element & 31;
         if (output_row < m) {
           if constexpr (Gated) value = (value / (1.0f + __expf(-value))) * up;
-          output[static_cast<size_t>(output_row) * n + blockIdx.x * 32 +
-                 output_col] = __float2half(value);
+          const half result = __float2half(value);
+          if constexpr (FusedBA) {
+            vllm::sm70::fused_ba_store(output, fused_ba, n, output_row,
+                                       blockIdx.x * 32 + output_col, result);
+          } else {
+            output[static_cast<size_t>(output_row) * n + blockIdx.x * 32 +
+                   output_col] = result;
+          }
+          if constexpr (Gated) {
+            if (k16_output != nullptr) {
+              k16_output[vllm::sm70::k16_half_index(
+                  output_row, blockIdx.x * 32 + output_col, m)] = result;
+            }
+          }
         }
       }
     }
@@ -627,7 +669,8 @@ template <int SplitK, bool PackedInput = false, bool Gated = false>
 void launch_fp8_qpn8_m32_twophase_sm70(const uint8_t* codes,
                                        const half* channel_scales,
                                        const half* input, half* output, int n,
-                                       int k, int m, cudaStream_t stream) {
+                                       int k, int m, cudaStream_t stream,
+                                       half* k16_output = nullptr) {
   constexpr int kPhysicalWarps = SplitK / 2;
   auto kernel = fp8_qpn8_m32_twophase_sm70_kernel<SplitK, PackedInput, Gated>;
   if constexpr (PackedInput) {
@@ -636,7 +679,8 @@ void launch_fp8_qpn8_m32_twophase_sm70(const uint8_t* codes,
     }
   }
   kernel<<<(n / 32), (32 * kPhysicalWarps * (Gated ? 2 : 1)), 0, stream>>>(
-      codes, channel_scales, input, output, n, k, m);
+      codes, channel_scales, input, output, k16_output, n, k, m,
+      vllm::sm70::Sm70FusedBa{});
 }
 
 void launch_fp8_qpn8_ba_split_sm70(const uint8_t* codes,
@@ -1498,13 +1542,9 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
     // row tiles retain their established unroll tradeoff.
     if (n >= 2048 && ((split_k == 16 && k >= 4096) ||
                       (m == 32 && split_k == 12 && k >= 1536))) {
-      auto packed_input = torch::empty_like(input);
+      torch::Tensor packed_input;
       auto* packed_ptr =
-          reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
-      constexpr int kThreads = 256;
-      vllm::sm70::pack_k16_input<<<
-          (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-          input_ptr, packed_ptr, static_cast<int>(m), static_cast<int>(k));
+          vllm::sm70::k16_packed_input(input, packed_input, stream);
       if (split_k == 12) {
         launch_fp8_qpn8_m32_twophase_sm70<12, true>(
             code_ptr, scale_ptr, packed_ptr, output_ptr, static_cast<int>(n),
@@ -1754,7 +1794,8 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
   TORCH_CHECK(ba_weight.dim() == 2 && ba_weight.size(0) == ba_n &&
                   ba_weight.size(1) == k,
               "fp8_qpn8_dispatch_ba_split_sm70_out: b/a weight mismatch");
-  TORCH_CHECK(m <= 8 || dense_weight_ptr != 0,
+  const bool fused_batch = m > 8 && m <= 32 && k == 5120;
+  TORCH_CHECK(m <= 8 || fused_batch || dense_weight_ptr != 0,
               "fp8_qpn8_dispatch_ba_split_sm70_out: large-M requires the "
               "dense QPN8 workspace");
 
@@ -1768,6 +1809,62 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
     });
     fp8_qpn8_gemm_ba_split_sm70_out(qkv_out, z_out, b_out, a_out, input, codes,
                                     group_scales, ba_weight);
+    return;
+  }
+
+  if (m == 8 && k == 5120) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    // Preserve the ordinary M8 QPN8 accumulation order. The appended CTAs
+    // compute b/a and write contiguous split outputs in the same launch.
+    fp8_qpn8_sm70_kernel<16, 2, true, false, false, true, true>
+        <<<(n / 32 + m * ba_n / 2), 512, 0, at::cuda::getCurrentCUDAStream()>>>(
+            codes.data_ptr<uint8_t>(),
+            reinterpret_cast<const half*>(group_scales.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(qkv_out.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(z_out.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(ba_weight.data_ptr<at::Half>()),
+            nullptr, reinterpret_cast<half*>(b_out.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(a_out.data_ptr<at::Half>()),
+            static_cast<int>(ba_n), static_cast<int>(qkv_n),
+            static_cast<int>(n), static_cast<int>(k), static_cast<int>(m),
+            true);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+
+  if (fused_batch) {
+    // Verify batches: b/a runs in appended CTAs of the QKVZ launch, which also
+    // writes z directly. This drops the GEMM, its reduction and the tail copy.
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const vllm::sm70::Sm70FusedBa fused{
+        reinterpret_cast<half*>(z_out.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(ba_weight.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(b_out.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(a_out.data_ptr<at::Half>()),
+        static_cast<int>(qkv_n),
+        static_cast<int>(ba_n)};
+    if (m <= 16) {
+      vllm::sm70::launch_qpn_pair_m16_fused_ba<Fp8PairReader, 16>(
+          qkv_out, input, codes, group_scales, static_cast<int>(n), fused,
+          stream);
+      return;
+    }
+    torch::Tensor packed_input;
+    auto* packed_ptr =
+        vllm::sm70::k16_packed_input(input, packed_input, stream);
+    auto kernel =
+        m == 32
+            ? fp8_qpn8_m32_twophase_sm70_kernel<16, true, false, true, true>
+            : fp8_qpn8_m32_twophase_sm70_kernel<16, true, false, false, true>;
+    kernel<<<static_cast<int>(n / 32 + (m + 7) / 8), 256, 0, stream>>>(
+        codes.data_ptr<uint8_t>(),
+        reinterpret_cast<const half*>(group_scales.data_ptr<at::Half>()),
+        packed_ptr, reinterpret_cast<half*>(qkv_out.data_ptr<at::Half>()),
+        nullptr, static_cast<int>(n), static_cast<int>(k), static_cast<int>(m),
+        fused);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
 
@@ -1871,19 +1968,17 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
   }
 
   if (native_m32) {
-    auto packed_input = torch::empty_like(input);
+    torch::Tensor packed_input, twin;
     auto* packed_ptr =
-        reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
-    constexpr int kThreads = 256;
-    vllm::sm70::pack_k16_input<<<(input.numel() / 2 + kThreads - 1) / kThreads,
-                                 kThreads, 0, stream>>>(
-        input_ptr, packed_ptr, static_cast<int>(m), static_cast<int>(k));
+        vllm::sm70::k16_packed_input(input, packed_input, stream);
+    half* k16_output = vllm::sm70::k16_twin_for(out, twin);
     // Keep FP8 gate/up's FP32 SiLU and final FP16 rounding. FP4 has its
     // own established intermediate FP16 rounding and does not share this.
     launch_fp8_qpn8_m32_twophase_sm70<8, true, true>(
         code_ptr, scale_ptr, packed_ptr, output_ptr, static_cast<int>(hidden),
-        static_cast<int>(k), static_cast<int>(m), stream);
+        static_cast<int>(k), static_cast<int>(m), stream, k16_output);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (k16_output != nullptr) vllm::sm70::k16_publish(out, twin);
     return;
   }
 
@@ -1982,15 +2077,13 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   // M=16. The old path reconstructed the complete channel-FP8 weight before
   // every GEMM. Enable the measured two-row-tile and two-phase kernels for
   // compatible projection geometry, independent of checkpoint identity.
-  const auto env_enabled = [](const char* name) {
-    const char* value = std::getenv(name);
-    return value == nullptr || (value[0] == '1' && value[1] == '\0');
-  };
-  const bool qpn8_m16_enabled = env_enabled("VLLM_SM70_FP8_QPN8_M16");
-  const bool qpn8_m32_chunked_enabled =
-      env_enabled("VLLM_SM70_FP8_QPN8_M32_CHUNKED");
-  const bool qpn8_m32_native_enabled =
-      env_enabled("VLLM_SM70_FP8_QPN8_M32_NATIVE");
+  using vllm::sm70::PolicyField;
+  const bool qpn8_m16_enabled =
+      vllm::sm70::policy_exact_one(PolicyField::fp8_qpn8_m16, true, true);
+  const bool qpn8_m32_chunked_enabled = vllm::sm70::policy_exact_one(
+      PolicyField::fp8_qpn8_m32_chunked, true, true);
+  const bool qpn8_m32_native_enabled = vllm::sm70::policy_exact_one(
+      PolicyField::fp8_qpn8_m32_native, true, true);
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   const int64_t packed_n = codes.size(1);

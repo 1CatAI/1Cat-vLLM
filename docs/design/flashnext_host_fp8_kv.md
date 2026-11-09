@@ -1,0 +1,280 @@
+# Flash-Next active host KV on SM70
+
+QSA attention history uses pinned host E4M3 bytes with one FP32 scale per
+token, local KV head and K/V vector. This format does not require checkpoint
+calibration scales. Encoding uses round-to-nearest division and E4M3 conversion.
+The GPU retains a bounded per-layer page-slot cache. Attention reads protected
+FP16 hot entries; unresolved host misses are decoded into shared FP16 scratch
+before entering the existing FP32 accumulation and softmax loop. Indexer history and active GDN/PLE
+states retain their existing storage and arithmetic.
+
+`KernelConfig.qsa_host_kv` selects this route. It is disabled while model-level
+quality and latency are being measured. Host storage's default format is
+E4M3; the generic cache dtype remains independent. This permits preserving
+FP16 on other attention owners. Admission requires SM70, FP16 activations,
+one local KV head, D256 and DCP1/PCP1. The startup report includes the reason
+when the requested route is unavailable. No environment variable is added.
+
+`qsa_host_kv_dtype` defaults to `fp8_e4m3` for target history. Draft history
+uses the independent `qsa_host_kv_draft_dtype`, initially `float16`; this
+preserves speculative precision while target quantization is evaluated.
+Selecting FP16 for both isolates placement and allocator changes from FP8
+rounding. Both host formats reconstruct identical FP16 hot/staging layouts.
+
+The default hot capacity is 8,192 tokens per owner, configurable through
+`qsa_host_kv_hot_tokens`. At D256 this costs 8 MiB of reconstructed FP16 K/V,
+plus tags and metadata. FP8 decoding occurs on misses, rather than every hot
+read. Thirty-two query rows share bounded resolution maps and approximately
+64 MiB of FP16 miss scratch across owners. Hot hits do not copy into that
+scratch. Prefill is processed in bounded query tiles. Exact
+selected positions and causal masks are retained; no new sparsity heuristic
+or draft attention window is introduced.
+
+## Storage and replay
+
+The hybrid allocator separates host attention from device recurrent pools.
+Recurrent pages retain the original scheduler block IDs, but no longer inherit
+the larger attention page's padding solely to share its allocation. Prefix
+and speculative ownership remain under the existing cache managers.
+Without prefix caching, the scheduler pool is bounded by admitted concurrency
+at maximum context, including recurrent speculative pages and alignment slack.
+Freed memory remains available instead of being consumed by unused state pages.
+An explicit block-count override retains precedence.
+
+New and tentative K/V writes update authoritative host storage and any resident
+hot entry from the encoded representation. A GPU epoch and protection pass keep
+every current-call cache hit immutable during gathering. A physical-page-to-slot map deduplicates misses and a bounded clock sweep
+reserves unprotected slots. Pending copies and capacity overflow use decoded
+host data in miss scratch, with no waiting between CTAs. This bounds storage without dropping selected positions or
+overflowing a miss queue. Fixed workspaces and mapped pointers are initialized
+before graph capture. Each CTA owns its diagnostic counters, avoiding global
+counter contention on the replay path.
+
+The page-pool approach is informed by
+[Strata](https://github.com/Niko1221/Strata/blob/82f46a8c8f475f001ad76d92f58f4a4f8ffb0253/include/strata/kernels/kv_stream.hpp).
+No Strata kernel source is copied. Its published single-GPU INT8 measurements
+are not FP8 TP4 performance evidence.
+
+## Validation
+
+CPU tests check mixed host/resident allocation, unique owners, unchanged
+scheduler capacity, and reduced device pool bytes at the same block count.
+GPU tests compare encoded bytes and scales with the PyTorch E4M3 oracle,
+then compare every gathered value after eviction, contention, tentative-token
+rewrites and captured replay. M1/M5/M20 are covered.
+
+Model promotion requires a normal packaged runtime, matched host-on/off
+C1/C4 measurements, teacher-forcing KL/top-1, natural completion checks and
+eight-prompt acceptance intervals. Read actual host/device pool sizes, hot
+cache bytes, staging bytes and hit/miss counters from workers outside timed
+replay. A successful allocator test alone is not a model-level result.
+
+The restored control uses Flash-Next IQ3_S, FP16 MTP4, TP4 on four
+V100-SXM2-32GB GPUs, Torch 2.10.0+cu128 and CUDA 12.8. Cache is FP16 and
+recurrent state is FP32, FULL decode graph, maximum context 9,216,
+prefill budget 512, maximum concurrency four and greedy sampling. The wheel
+source is `3577384357caac62f9822246b8a140dc552c24cf`. Eight natural prompts use
+up to 600 output tokens with EOS enabled; timing probes use the unchanged
+acceptance benchmark's fixed cohorts.
+
+| Control | C1 ms/round | C1 tokens/round | C4 ms/round |
+| --- | --- | --- | --- |
+| Historical | 17.406 | 4.886 | 45.025 |
+| Restored | 17.387 | 4.886 | 46.047 |
+
+The restored eight-prompt mean draft acceptance is 45.59%; both short natural
+completion checks end normally. Historical and restored natural token IDs
+differ, so the historical transcript is not a bitwise oracle for a new run.
+Use a fresh matched control and teacher conditions for host-cache qualification.
+These numbers are resident-KV controls. The matched host experiment follows.
+
+## First matched host experiment
+
+A packaged source integrates the qualified HCX implementation with the current
+main Python paths. Both runs use the same wheel and declared native provider.
+Only host storage is enabled in the candidate; in this first experiment both
+target and draft history use per-vector E4M3. The configured 9,216 context and
+four requests are unchanged. The actual attention page is 816 tokens.
+
+| Storage | C1 ms/round | C1 tokens/round | C4 ms/round | Mean draft acceptance |
+| --- | --- | --- | --- | --- |
+| Resident FP16 | 17.396 | 4.886 | 46.009 | 46.32% |
+| Host E4M3, target and draft | 18.825 | 4.886 | 47.389 | 43.46% |
+
+The eight-prompt paired acceptance difference is -2.86 percentage points;
+bootstrap 95% CI [-4.63, -0.79]. This rejects default promotion. On 64 equally
+conditioned target positions, mean/max KL is 0.002121/0.029512 and top-1 agrees
+at 62/64 positions. Every logit is finite; both short completion checks produce
+the same answers and stop normally. Coherent text alone does not meet the
+acceptance requirement.
+
+Device pools fall from 2.9344 to 1.5420 GiB per rank. The candidate additionally
+retains 105.48 MiB of hot-cache buffers/metadata and 64.125 MiB of shared staging.
+Total Torch allocation falls by 1.229 GiB per rank. Authoritative host pools
+occupy 0.7942 GiB per rank, with per-vector scale arrays accounted separately.
+Indexer and recurrent storage remains on device. The physical scheduler pool
+contains 157 blocks rather than 273; it still admits the declared concurrency.
+
+The next precision ablation preserves FP16 in the draft and provides an FP16
+host reference. Direct reading removes query-private copying from the hot
+path while retaining the staged reference for isolated comparisons. Eight
+FP8/FP16 direct-reader tests cover M1/M5/M20/M32, misses, causal padding,
+output gating and graph replay; the first source-only run agrees exactly with
+the staged reader. Model latency and acceptance for this change remain pending.
+On a separate V100-SXM2-16GB, 19 packaged GPU tests pass, including the 816-token
+page, empty padded rows and captured replay. This is operator validation, not
+four-card model capacity evidence.
+
+## Precision ablation and cache experiments
+
+Keeping the draft in FP16 measures C1 18.735 ms/round with 4.886 tokens/round
+and C4 47.558 ms/round. Target top-1 agrees at all 64 equally conditioned
+positions; mean/max KL is 0.002124/0.036558. Both short completions end normally.
+Eight-prompt acceptance is 44.14% versus 46.32%; paired difference -2.19
+percentage points, 95% CI [-4.07, +0.11]. This does not establish equivalence,
+so FP8 remains unqualified for default promotion. Device pools remain 1.542
+GiB/rank; target-FP8/draft-FP16 host pools occupy 0.855 GiB/rank.
+
+Inlining host FP8 reconstruction in the attention loop is rejected: the
+packaged M5 experiment takes about 196 microseconds versus 107 for the staged
+reader at 8K. Four-way hashing also reaches only 75% hits for the fixed
+four-request selection despite sufficient aggregate capacity. Changing the
+hash alone does not resolve that structural conflict.
+
+The page-slot prototype passes 38 GPU tests, including physical-page aliases,
+tentative rewrites and captured replay. The initial direct/staged tests used artificial fixed tail columns and missed
+a real selector boundary: the causal tail is compacted immediately after the
+selected complete blocks. A fixed-tail loop drops live tokens at boundaries
+such as 257 and 513. The corrected loop keeps the original split assignment
+and truncates only the empty suffix. Regression tests use the actual QSA
+expansion kernel at contexts 14, 255, 256, 257, 511, 512, 513 and 2050, for
+M1/M5/M20/M32 and FP8/FP16 storage. A conditional around tensor-core arithmetic
+is slower and is rejected.
+
+Same-card synthetic graph timings for the current source prototype:
+
+| Context | Rows | Hot tokens | Resident us | Staged us | Hot/miss reader us | Hit rate |
+| --- | --- | --- | --- | --- | --- | --- |
+| 128 | 5 | 8192 | 57.9 | 68.2 | 41.0 | 100% |
+| 128 | 20 | 8192 | 294.1 | 309.7 | 71.0 | 100% |
+| 8192 | 5 | 8192 | 55.0 | 85.6 | 61.3 | 100% |
+| 8192 | 20 | 8192 | 274.3 | 360.6 | 302.1 | approximately 100% |
+| 32768 | 5 | 32768 | 51.0 | 81.8 | 58.1 | 100% |
+| 32768 | 20 | 32768 | 259.0 | 344.5 | 281.8 | 100% |
+
+These selections are fixed and shared by five queries per request. They do
+not prove model hit rates or endpoint gains. Packaged qualification and an
+FP16 host model reference are the next checks. Teacher capture additionally
+saves small post-RoPE KV samples outside the timed replay for format analysis;
+resident controls do not change their capture behavior.
+
+## Rejected FP16 host model reference
+
+The first slot-cache FP16 model run, before the compact-tail correction, measures
+C1 18.608 ms/round, 4.886 tokens/round and C4 44.332 ms/round. Mean acceptance
+is 45.53%, with paired difference -0.79 percentage points and 95% CI
+[-1.77, +0.29] against the resident control. However, 64 target teacher positions
+show mean/max KL 0.012746/0.222238 and top-1 agreement 62/64. These results
+reject the implementation even with unquantized host storage; the compact-tail
+bug must be corrected before assessing format-induced quality loss.
+
+The reported C1 is the benchmark's arithmetic mean of its before/after probes,
+including the after probe's large outlier. The approximately 18.14 ms median
+is diagnostic only. Whole-workload cache hits are about 98.97–99.11% for target
+owners and 99.02% for the draft; these include prefill and generation rather than
+an isolated C1 cohort. High hit rate does not establish correct attention.
+
+## Compact-tail packaged control
+
+The corrected source is `4348f58103d92b7bc24aa473259fe817d4f8c50f`, packaged
+with the unchanged declared native provider. All 16 native members match the
+provider hashes. Ninety-four packaged GPU tests pass, including the real
+selector's compact tail at tile boundaries. The fresh resident control measures
+C1 17.402 ms/round with 4.886 tokens/round and C4 43.932 ms/round. Eight-prompt
+mean acceptance is 47.11%. Device pools remain 2.9344 GiB/rank and total Torch
+allocation 29.1419 GiB/rank.
+
+This resident control itself differs from the older resident teacher record:
+64 equally conditioned positions have mean/max KL 0.000659/0.006215 and
+62/64 top-1 agreement. The paired natural acceptance difference is +0.79
+percentage points, 95% CI [-0.32, +1.93]. This is observed control variation;
+its cause is not yet established. A placement candidate must compare against
+the fresh same-wheel control. Do not describe the older transcript as a bitwise
+oracle, or interpret a confidence interval spanning zero as equivalence.
+
+## Same-format placement diagnostic
+
+The compact-tail FP16 host control measures C1 18.192 ms/round, C4 44.156
+ms/round and acceptance 46.75%. Against the fresh FP16 resident control,
+64 teacher positions have mean/max KL 0.000725/0.008530 and top-1 agreement
+63/64. This does not pass the strict diagnostic gate.
+
+Target E4M3 with an FP16 draft measures C1 18.063 ms/round and C4 44.663
+ms/round. Acceptance is 44.83%, a paired difference of -2.28 percentage points
+against the FP16 resident control, 95% CI [-3.04, -1.54]. Teacher mean/max KL
+is 0.001692/0.025182 and top-1 agreement 63/64. This rejects default promotion.
+
+A device-reference mode retains exactly the encoded history layout, per-vector
+FP32 scales, FP16 hot cache, attention arithmetic and allocation geometry of
+the host path. Only the history and scale backing changes to device memory.
+The unused CPU allocator backing is retained to avoid changing block geometry;
+this mode is a placement diagnostic, not a production memory optimization.
+Four new GPU tests verify identical codes, scales and outputs across both
+placements, including misses, M5/M20, compact tails and captured rewrites.
+All 98 source and packaged GPU tests pass. Optional repeated
+teacher conditions measure variation within the same process, outside timing
+probes. Both matched model arms use E4M3 target storage and an FP16 draft.
+
+## Matched E4M3 placement results
+
+Source `c1ebacb677` is packaged as `1.5.2.dev1190+gc1ebacb67`, wheel SHA256
+`61d8cb81983ba332e886a60508d8e5a58289b72ce53baa5686e014ded2a81b9c`.
+Both arms use the same wheel and SM70 native members, target per-vector E4M3
+history, FP16 draft history, 8192-token FP16 hot caches and 157 allocator
+blocks on each of four V100-SXM2-32GB GPUs. TP4, FP16 activations, FP32 recurrent
+state, FULL decode graphs, maximum length 9216, prefill batch 512 and maximum
+concurrency four are fixed. Torch is 2.10.0+cu128 with CUDA 12.8.
+
+| History backing | C1 ms/round | Tokens/round | C4 ms/round | Natural acceptance |
+| --- | --- | --- | --- | --- |
+| Device reference | 17.849 | 4.886 | 42.417 | 46.66% |
+| Pinned host | 18.320 | 4.886 | 44.565 | 46.03% |
+
+The host C1 value includes an after-probe outlier: before/after means are
+18.053/18.587 ms, with medians 18.041/18.065 ms. The reported endpoint follows
+the benchmark's unchanged arithmetic-mean contract. Device means are
+17.847/17.852 ms. Host overhead is 0.471 ms for C1 and 2.148 ms for C4; the
+C4 difference is 5.1%, so the performance qualification remains unmet.
+
+Eight prompts with up to 600 output tokens and EOS enabled have a paired
+acceptance difference of -0.63 percentage points, 95% CI [-3.15, +1.86].
+This does not establish equivalence, but the previous significant loss does
+not reproduce in this matched pair. Both short completions terminate normally
+and agree. Sixty-four equally conditioned target positions have mean/max KL
+0.000930/0.009896, top-1 agreement 63/64 and zero bitwise-identical logits.
+Within each process, repeating all 64 conditions produces bitwise-identical
+logits, zero KL and 64/64 top-1 agreement. Placement is therefore not yet
+cleared of model differences; repeated within-process conditions do not
+explain cross-process variation.
+
+The device E4M3 control versus the prior resident FP16 control has acceptance
+46.66% versus 47.11%, paired difference -0.45 percentage points, 95% CI
+[-1.56, +0.82]. Mean/max teacher KL is 0.001681/0.025192, top-1 63/64. This
+comparison also changes reader, geometry and source version, so it is not a
+pure precision ablation. Do not attribute the old host acceptance loss solely
+to E4M3, or attribute the new residual solely to host placement.
+
+The device reference uses 0.867 GiB/rank for complete history and scales,
+with total Torch allocation 28.782 GiB/rank. Host storage removes that device
+history while retaining the same device pools, hot caches and scratch.
+Both arms retain the host allocator backing by design. This diagnostic does
+not measure the minimum achievable resident-memory footprint. Host mode
+remains opt-in pending model correctness and C4 qualification.
+
+A matched-wheel KV sample screen compares the first equally conditioned
+verification row at each owner. The first QSA layer already differs: its
+encoded-history sample is exact at 2/64 conditions, with mean/max relative L2
+0.008739/0.017876. These are reconstructed quantized values, not the original
+FP16 projections or complete prefix history. The screen motivates tracing the
+first divergent input before QSA and checking cross-process upstream variation;
+it does not prove an encoding, backing or projection bug.

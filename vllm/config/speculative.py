@@ -14,6 +14,7 @@ from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -123,6 +124,35 @@ def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
     )
 
 
+def match_target_rope_scaling(target, draft) -> bool:
+    """Rotate MTP draft positions exactly like a window-extended target.
+
+    The stock MTP checkpoint ships its target's native RoPE. When the target
+    serves a longer window with scaled RoPE (YaRN), the draft attends over the
+    same positions and must use the same scaling and position range. Returns
+    whether the draft config was changed.
+    """
+    if target is None or draft is None:
+        return False
+    target_text, draft_text = target.hf_text_config, draft.hf_text_config
+    target_rope = dict(getattr(target_text, "rope_parameters", None) or {})
+    draft_rope = dict(getattr(draft_text, "rope_parameters", None) or {})
+    if target_rope.get("rope_type", "default") == "default":
+        return False
+    if draft_rope.get("rope_type", "default") != "default":
+        return False
+    if target_rope.get("rope_theta") != draft_rope.get("rope_theta"):
+        return False
+    draft_text.rope_parameters = target_rope
+    draft_text.max_position_embeddings = target_text.max_position_embeddings
+    logger.info(
+        "MTP draft RoPE follows the target's %s scaling over %d positions.",
+        target_rope.get("rope_type"),
+        target_text.max_position_embeddings,
+    )
+    return True
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
@@ -197,6 +227,11 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
+    disable_eagle_block_drop: bool = False
+    """Keep the trailing hashed prefix-cache page on an EAGLE/MTP hit.
+    Backport of vllm-project/vllm#53388. Default ``False`` matches current
+    1Cat behavior. Hybrid-model MTP pages can be thousands of tokens, so the
+    stock drop recomputes a full page on every prefix hit."""
     use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -204,6 +239,11 @@ class SpeculativeConfig:
     non-tree speculation. ``None`` automatically enables the SM70
     FP16 Qwen4Exp TP4 MTP route with greedy drafts. Explicit booleans override
     automatic selection; other routes retain full-logits selection."""
+    disable_lookahead_block_hashes: bool = False
+    """Disable lookahead block hashes for EAGLE-like speculative methods and
+    fall back to dropping the trailing prefix-cache block. Lookahead hashes
+    also cover the token after each block, so engines sharing a KV store and
+    external consumers of KV cache events must use the same setting."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -369,8 +409,30 @@ class SpeculativeConfig:
     DSpark still generates the checkpoint's complete block; only a prefix is
     scheduled, so values below the checkpoint block size remain lossless."""
 
+    sampling_policy: SpeculativeSamplingPolicy = Field(
+        default_factory=SpeculativeSamplingPolicy
+    )
+    """Per-engine proposal/rejection policy captured before worker transfer."""
+
     sm70_dflash2: Sm70DFlash2Config = Field(default_factory=Sm70DFlash2Config)
     """Per-engine SM70 DFlash2 verifier policy; automatic when not specified."""
+
+    def resolve_execution_policy(self) -> None:
+        """Bind sampling and enabled assistance before worker serialization."""
+        self.sampling_policy.resolve(
+            draft=self.draft_sample_method == "probabilistic",
+            vocab=True,
+            vocab_default=self.method == "mtp",
+        )
+        self.sm70_dflash2.resolve_lookup(self)
+
+    diagnostic_confidence_logits: bool = Field(default=False, init=False)
+    """Bound extra confidence output contract; only affects DSpark compilation."""
+
+    def bind_diagnostic_output(self, alignment: bool | None) -> None:
+        self.diagnostic_confidence_logits = self.method == "dspark" and bool(
+            self.dspark_confidence_threshold > 0.0 or alignment
+        )
 
     def compute_hash(self) -> str:
         """
@@ -387,10 +449,25 @@ class SpeculativeConfig:
         factors: list[Any] = [
             ("use_local_argmax_reduction", self.use_local_argmax_reduction)
         ]
+        if self.method == "dspark":
+            factors.append(
+                ("diagnostic_confidence_logits", self.diagnostic_confidence_logits)
+            )
         if self.sm70_dflash2.resolved and (
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):
             factors.append(("sm70_dflash2", self.sm70_dflash2.graph_options()))
+        if self.sampling_policy.sources:
+            factors.append(
+                (
+                    "sampling_policy",
+                    self.sampling_policy.compute_hash(
+                        draft=self.draft_sample_method == "probabilistic",
+                        vocab=self.method == "mtp",
+                        aux_hidden=self.use_dflash_family(),
+                    ),
+                )
+            )
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (
@@ -410,8 +487,10 @@ class SpeculativeConfig:
         if self.method == "mtp":
             factors.append(("mtp_expert_quantization", self.mtp_expert_quantization))
 
-        # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
+            factors.append(self.draft_model_config.compute_hash())
+
+            # The specific layers used also affect the computation graph.
             layer_ids = getattr(
                 self.draft_model_config.hf_config,
                 "eagle_aux_hidden_state_layer_ids",
@@ -452,6 +531,10 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        # Configs that define their own MTP draft form rewrite themselves.
+        get_mtp_draft_config = getattr(hf_config, "get_mtp_draft_config", None)
+        if callable(get_mtp_draft_config):
+            return get_mtp_draft_config()
         initial_architecture = hf_config.architectures[0]
         if hf_config.model_type in (
             "deepseek_v3",
@@ -912,7 +995,7 @@ class SpeculativeConfig:
                     self.method = "mlp_speculator"
                 elif self.draft_model_config.hf_config.model_type in get_args(
                     MTPModelTypes
-                ):
+                ) or getattr(self.draft_model_config.hf_config, "is_mtp_draft", False):
                     self.method = "mtp"
                     self._inherit_target_rope_for_extended_native_mtp()
                     if (
@@ -958,8 +1041,11 @@ class SpeculativeConfig:
 
                 if self.use_dspark():
                     draft_hf_config = self.draft_model_config.hf_config
-                    draft_hf_config.model_type = "deepseek_v4"
-                    draft_hf_config.architectures = ["DSparkDraftModel"]
+                    if draft_hf_config.model_type == "deepseek_v41_text":
+                        draft_hf_config.architectures = ["DSparkDeepseekV41ForCausalLM"]
+                    else:
+                        draft_hf_config.model_type = "deepseek_v4"
+                        draft_hf_config.architectures = ["DSparkDraftModel"]
                     self.update_arch_()
 
                 if self.use_dflash_family() or self.use_dspark():
@@ -1061,6 +1147,24 @@ class SpeculativeConfig:
                     )
                 )
 
+                if self.method == "mtp" and match_target_rope_scaling(
+                    self.target_model_config, self.draft_model_config
+                ):
+                    # The draft now covers the target's extended positions.
+                    self.draft_model_config.max_model_len = max(
+                        self.draft_model_config.max_model_len,
+                        self.target_model_config.max_model_len,
+                    )
+                if (
+                    self.method == "dspark"
+                    and __import__("os").environ.get("VLLM_V41_PACKED_KV", "0") == "1"
+                ):
+                    # V4.1 DSpark attends only its sliding window and rotates
+                    # RoPE on the fly past its table: it covers the target length.
+                    self.draft_model_config.max_model_len = max(
+                        self.draft_model_config.max_model_len,
+                        self.target_model_config.max_model_len,
+                    )
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,
@@ -1119,7 +1223,12 @@ class SpeculativeConfig:
 
         pp_size = self.target_parallel_config.pipeline_parallel_size
         num_layers = self.target_model_config.get_total_num_hidden_layers()
-        last_start, last_end = get_pp_indices(num_layers, pp_size - 1, pp_size)
+        last_start, last_end = get_pp_indices(
+            num_layers,
+            pp_size - 1,
+            pp_size,
+            partition=self.target_parallel_config.communication.pp_layer_partition,
+        )
         layer_ids = tuple(
             getattr(
                 self.draft_model_config.hf_config,
@@ -1571,7 +1680,21 @@ class SpeculativeConfig:
         # so dropping an additional target block is both unnecessary and can
         # eliminate all prefix hits when hybrid page unification makes blocks
         # large. Keep DDTree and DSpark on their established V1 semantics.
-        return self.use_eagle() and not self.use_dflash()
+        # disable_eagle_block_drop is the #53388 opt-in: keep the trailing
+        # hashed page (hybrid-model MTP pages can be 2048+ tokens).
+        return (
+            self.use_eagle()
+            and not self.use_dflash()
+            and not self.disable_eagle_block_drop
+        )
+
+    def use_multi_module_mtp(self) -> bool:
+        if self.method != "mtp" or self.draft_model_config is None:
+            return False
+        num_mtp_layers = getattr(
+            self.draft_model_config.hf_config, "num_nextn_predict_layers", 1
+        )
+        return min(num_mtp_layers, self.num_speculative_tokens) > 1
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

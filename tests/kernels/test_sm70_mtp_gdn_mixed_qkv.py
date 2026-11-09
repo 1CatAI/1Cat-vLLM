@@ -7,22 +7,33 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
+from vllm.config.gdn import GdnConfig, GdnProfileConfig
+from vllm.model_executor.layers.fla.ops.gdn_preparation import GdnPreparation
+from vllm.model_executor.layers.fla.ops.gdn_profiling import GdnPrefillProfiler
+from vllm.model_executor.layers.fla.ops.gdn_stages import GdnHeadContract
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as mod
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 
-@pytest.mark.parametrize("batch,width", [(1, 2), (1, 5), (2, 5), (4, 4)])
+@pytest.mark.parametrize("batch,width", [(1, 2), (1, 5), (2, 5), (4, 4), (4, 5)])
 @pytest.mark.parametrize("dim_first", [False, True])
+@pytest.mark.parametrize("row_stride", [2560, 4096])
 def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
-    monkeypatch, batch, width, dim_first
+    monkeypatch, batch, width, dim_first, row_stride
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 required")
 
+    if row_stride != 2560 and (batch, width) not in ((1, 5), (4, 5)):
+        pytest.skip("Only measured M5/M20 row-strided verifier batches")
+
     torch.manual_seed(20260927)
     device, dtype = "cuda", torch.float16
     tokens, slots = batch * width, batch * 8
-    inputs = [torch.empty(tokens, 2560, device=device, dtype=dtype) for _ in range(2)]
+    inputs = [
+        torch.empty(tokens, row_stride, device=device, dtype=dtype)[:, :2560]
+        for _ in range(2)
+    ]
     outputs = [
         torch.empty(tokens + 2, 12, 128, device=device, dtype=dtype) for _ in range(2)
     ]
@@ -63,7 +74,16 @@ def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
     conv = SimpleNamespace(
         weight=torch.randn(2560, 1, 4, device=device, dtype=dtype), bias=None
     )
+    policy = GdnConfig()
+    policy.resolve()
+    profiling = GdnProfileConfig(enabled=False)
+    profiling.resolve()
     common = dict(
+        gdn_policy=policy,
+        gdn_heads=GdnHeadContract(16, 48, 128, 128, 4),
+        gdn_preparation=GdnPreparation(GdnHeadContract(16, 48, 128, 128, 4)),
+        _gdn_profiler=GdnPrefillProfiler(profiling),
+        verification_update=None,
         prefix="test",
         tp_size=4,
         num_k_heads=16,
@@ -79,6 +99,7 @@ def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
         A_log=torch.randn(12, device=device, dtype=torch.float32),
         dt_bias=torch.randn(12, device=device, dtype=dtype),
         _can_use_dflash2_packed_gdn_verify=lambda **kwargs: False,
+        _can_use_sm70_gdn_preprocess=lambda *args: False,
     )
     layers = [
         SimpleNamespace(**common, enable_sm70_fused_sigmoid_mixed_qkv=enabled)
@@ -100,6 +121,8 @@ def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
 
         def record(*args, _arm=arm, _original=original, **kwargs):
             calls[_arm] += 1
+            if _arm == 1 and tokens in (5, 20):
+                assert kwargs["out"].data_ptr() == outputs[1].data_ptr()
             return _original(*args, **kwargs)
 
         monkeypatch.setattr(mod, name, record)

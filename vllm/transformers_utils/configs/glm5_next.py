@@ -339,6 +339,26 @@ class Glm5NextConfig(PretrainedConfig):
         # Mirror attention implementation recursively onto sub-configs.
         self._attn_implementation = kwargs.pop("attn_implementation", None)
 
+    def get_mtp_draft_config(self) -> PretrainedConfig:
+        """Rewrite this config in place for the built-in NextN (MTP) draft head.
+
+        The draft head reads the collapsed post-norm trunk state, not the
+        multi-stream hyper-connection residual, so it runs with ``hc_mult=1``.
+        """
+        if getattr(self, "is_mtp_draft", False):
+            return self
+        arch = self.architectures[0]
+        self.model_type = f"{self.model_type}_mtp"
+        self.update(
+            {
+                "architectures": [arch[: arch.index("For")] + "MTPModel"],
+                "n_predict": self.num_nextn_predict_layers,
+                "hc_mult": 1,
+                "is_mtp_draft": True,
+            }
+        )
+        return self
+
     # Config-metadata fields that belong to the top-level (multimodal) config
     # and must NOT be mirrored onto text_config: ``architectures`` /
     # ``torch_dtype`` differ between the top-level config and the text

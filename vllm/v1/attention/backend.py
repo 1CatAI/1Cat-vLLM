@@ -582,6 +582,22 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # that set this retain the original logical/storage block geometry.
     uses_physical_block_table: ClassVar[bool] = False
 
+    accepts_speculative_state_metadata: bool = False
+    """Consume accepted counts and draft counts from a hybrid model state."""
+
+    def get_model_state_kwargs(self, metadata: Any, num_reqs: int) -> dict[str, Any]:
+        """Backend-owned inputs at the existing model-state metadata boundary."""
+        if not self.accepts_speculative_state_metadata:
+            return {}
+        return {
+            "num_accepted_tokens": None
+            if metadata.num_accepted_tokens is None
+            else metadata.num_accepted_tokens[:num_reqs],
+            "num_decode_draft_tokens_cpu": None
+            if metadata.num_decode_draft_tokens_cpu is None
+            else metadata.num_decode_draft_tokens_cpu[:num_reqs],
+        }
+
     @abstractmethod
     def __init__(
         self,

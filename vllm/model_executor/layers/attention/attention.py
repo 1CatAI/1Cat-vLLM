@@ -8,6 +8,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.config.execution_policy import flash_v100_policy
 from vllm.config.vllm import VllmConfig, checkpoint_kv_quant_allowed
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -171,7 +172,7 @@ def _init_kv_cache_quant(
                 current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and envs.VLLM_SM70_FLASH_ATTN_V100
+                and flash_v100_policy().enabled
             )
             # Lazy import: the quantization package imports Attention at module
             # scope, so importing it here avoids a circular import.
@@ -531,6 +532,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
+        kv_cache_updated: bool = False,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -578,7 +580,8 @@ class Attention(nn.Module, AttentionLayerBase):
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                not kv_cache_updated
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
@@ -598,7 +601,8 @@ class Attention(nn.Module, AttentionLayerBase):
             # Skip this if sharing KV cache with an earlier attention layer.
             encoded = _encode_layer_name(self.layer_name)
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                not kv_cache_updated
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None

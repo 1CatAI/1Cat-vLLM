@@ -297,8 +297,20 @@ def get_device_indices(
     if local_world_size is None:
         local_world_size = world_size
     try:
+        # Keep GPU-<uuid> mask entries verbatim: CUDA and NVML index spaces
+        # diverge when a card is faulted, and only the UUID selects the same
+        # device in both.
+        visible_tokens = [
+            t.strip() for t in os.environ.get(device_control_env_var, "").split(",")
+        ]
+
+        def _token(i: int) -> str:
+            if i < len(visible_tokens) and visible_tokens[i].startswith("GPU-"):
+                return visible_tokens[i]
+            return str(current_platform.device_id_to_physical_device_id(i))
+
         value = ",".join(
-            str(current_platform.device_id_to_physical_device_id(i))
+            _token(i)
             for i in range(
                 local_dp_rank * world_size,
                 local_dp_rank * world_size + local_world_size,

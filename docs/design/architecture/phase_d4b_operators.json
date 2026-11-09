@@ -1,0 +1,475 @@
+{
+  "baseline": "d4ce513991b79a9cac2a4d72fbe8bcac5f566d5e",
+  "candidate_source_commit": "e512249d05d9753d4079150f43e2e395532165f2",
+  "contract": {
+    "gpu": "V100 SXM2 32GB, physical GPU 2 on 54633",
+    "tp": 1,
+    "driver": "580.173.02",
+    "models_loaded": false,
+    "queries": [
+      8000,
+      8192
+    ],
+    "kv_length": 32768,
+    "heads_q": 6,
+    "heads_kv": 1,
+    "head_dim": 256,
+    "dtype": "float16",
+    "causal": true,
+    "scale": 0.0625,
+    "policy": "defaults; serial tail, build-default block_n",
+    "order": [
+      "baseline/candidate",
+      "candidate/baseline",
+      "baseline/candidate"
+    ],
+    "gpu_measurement": "9 event samples of 5 calls per captured graph, median per process then median of 3 processes",
+    "host_measurement": "7 enqueue timings, each after a device synchronize; median per process",
+    "temporary_allocation": "peak allocated minus starting allocation after warmup"
+  },
+  "native_artifact": {
+    "library_sha256": "1db518c172d28e319336e072c5a19b0b97254927d5f1eda5a7b6518af0b33620",
+    "policy_abi": 1,
+    "precision_bits": 32,
+    "values": [
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0
+    ],
+    "observations": [
+      0,
+      0
+    ],
+    "ld_preload": null,
+    "native_source_sha256": {
+      "shared_workspace.h": "659a1495c58114b44de6cbfafd8c2ecc3324fa83a458339a76464b3585703502",
+      "prefill.cu": "4da93e3e769b0618a1b18118bc4ff223c348fce6f292766c3168b7eaf513ec41",
+      "runtime_owner.h": "f75809fa65edcf5da6d02999870d89dbdc1466de510c7efda230ffc10dd67295",
+      "register.cpp": "1a1be084f7ea9d57054fba6d7d202ce1aea6c2fbe1cdad4622b7541c7d0a8fa9"
+    },
+    "torch_version": "2.10.0+cu128",
+    "cuda_version": "12.8"
+  },
+  "validation": {
+    "focused_cpu": 63,
+    "remote_operator_route_metadata": 203,
+    "native_parser_projections": 11,
+    "numerics": "Output SHA256 identical across all six processes for each query shape; synthetic state/lifetime assertions passed",
+    "limitations": "No model throughput or TTFT claim; two GPU streams on one SM70 device; other topologies not GPU-validated"
+  },
+  "rounds": [
+    {
+      "variant": "baseline",
+      "round": 1,
+      "bound": false,
+      "library_sha256": "091e2037440791433768fd05e50048e320b0303a0dfed63446e6a40cdd079e81",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "device": "Tesla V100-SXM2-32GB",
+      "cases": [
+        {
+          "query": 8000,
+          "kv": 32768,
+          "gpu_us": 28906.497192382812,
+          "gpu_samples": [
+            27152.615356445312,
+            29180.722045898438,
+            28928.61328125,
+            28906.497192382812,
+            28677.529907226562,
+            28966.708374023438,
+            28843.417358398438,
+            28836.248779296875,
+            29009.50927734375
+          ],
+          "host_us": 331.494,
+          "host_samples": [
+            348.545,
+            343.964,
+            321.639,
+            331.494,
+            293.937,
+            333.882,
+            295.038
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "4c5fd4a1118e33481b1633569688967f94f9668dffcbe3595a812cb1042e4160"
+        },
+        {
+          "query": 8192,
+          "kv": 32768,
+          "gpu_us": 28972.647094726562,
+          "gpu_samples": [
+            27846.066284179688,
+            29744.12841796875,
+            28959.539794921875,
+            28895.64208984375,
+            28972.647094726562,
+            29066.033935546875,
+            28954.4189453125,
+            29127.474975585938,
+            29138.330078125
+          ],
+          "host_us": 304.986,
+          "host_samples": [
+            395.473,
+            304.986,
+            358.831,
+            296.945,
+            291.597,
+            281.988,
+            324.257
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "8a94a803c875c4988cf4314d2d411a861dab212e1ba22dbb6b551cba5be32c41"
+        }
+      ]
+    },
+    {
+      "variant": "candidate",
+      "round": 1,
+      "bound": true,
+      "library_sha256": "1db518c172d28e319336e072c5a19b0b97254927d5f1eda5a7b6518af0b33620",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "device": "Tesla V100-SXM2-32GB",
+      "cases": [
+        {
+          "query": 8000,
+          "kv": 32768,
+          "gpu_us": 28980.838012695312,
+          "gpu_samples": [
+            26503.909301757812,
+            29418.496704101562,
+            28880.89599609375,
+            28980.838012695312,
+            29016.473388671875,
+            28847.308349609375,
+            28968.344116210938,
+            29025.28076171875,
+            29035.928344726562
+          ],
+          "host_us": 309.052,
+          "host_samples": [
+            369.438,
+            317.348,
+            314.311,
+            303.591,
+            309.052,
+            302.316,
+            305.656
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "4c5fd4a1118e33481b1633569688967f94f9668dffcbe3595a812cb1042e4160"
+        },
+        {
+          "query": 8192,
+          "kv": 32768,
+          "gpu_us": 28930.45654296875,
+          "gpu_samples": [
+            23224.49951171875,
+            28790.170288085938,
+            29025.28076171875,
+            28893.389892578125,
+            29039.00146484375,
+            28930.45654296875,
+            28927.182006835938,
+            28993.331909179688,
+            28952.371215820312
+          ],
+          "host_us": 298.516,
+          "host_samples": [
+            372.258,
+            314.274,
+            298.516,
+            290.209,
+            287.205,
+            301.971,
+            289.608
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "8a94a803c875c4988cf4314d2d411a861dab212e1ba22dbb6b551cba5be32c41"
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "round": 2,
+      "bound": false,
+      "library_sha256": "091e2037440791433768fd05e50048e320b0303a0dfed63446e6a40cdd079e81",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "device": "Tesla V100-SXM2-32GB",
+      "cases": [
+        {
+          "query": 8000,
+          "kv": 32768,
+          "gpu_us": 28920.831298828125,
+          "gpu_samples": [
+            26817.28515625,
+            29076.480102539062,
+            29064.398193359375,
+            28920.831298828125,
+            28796.109008789062,
+            28830.718994140625,
+            28701.080322265625,
+            29000.50048828125,
+            29227.4169921875
+          ],
+          "host_us": 306.647,
+          "host_samples": [
+            443.836,
+            310.668,
+            307.723,
+            306.647,
+            298.236,
+            300.884,
+            295.964
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "4c5fd4a1118e33481b1633569688967f94f9668dffcbe3595a812cb1042e4160"
+        },
+        {
+          "query": 8192,
+          "kv": 32768,
+          "gpu_us": 28930.868530273438,
+          "gpu_samples": [
+            27645.98388671875,
+            28930.868530273438,
+            28877.20947265625,
+            29026.919555664062,
+            28889.498901367188,
+            28933.3251953125,
+            29042.279052734375,
+            29116.006469726562,
+            28844.851684570312
+          ],
+          "host_us": 293.983,
+          "host_samples": [
+            382.304,
+            299.759,
+            293.983,
+            300.511,
+            286.085,
+            286.346,
+            283.29
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "8a94a803c875c4988cf4314d2d411a861dab212e1ba22dbb6b551cba5be32c41"
+        }
+      ]
+    },
+    {
+      "variant": "candidate",
+      "round": 2,
+      "bound": true,
+      "library_sha256": "1db518c172d28e319336e072c5a19b0b97254927d5f1eda5a7b6518af0b33620",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "device": "Tesla V100-SXM2-32GB",
+      "cases": [
+        {
+          "query": 8000,
+          "kv": 32768,
+          "gpu_us": 29040.02685546875,
+          "gpu_samples": [
+            26902.880859375,
+            29637.4267578125,
+            29040.02685546875,
+            28998.44970703125,
+            28893.389892578125,
+            29090.4052734375,
+            29026.507568359375,
+            29088.973999023438,
+            29087.744140625
+          ],
+          "host_us": 332.394,
+          "host_samples": [
+            437.323,
+            328.155,
+            332.394,
+            351.95,
+            300.667,
+            371.68,
+            308.616
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "4c5fd4a1118e33481b1633569688967f94f9668dffcbe3595a812cb1042e4160"
+        },
+        {
+          "query": 8192,
+          "kv": 32768,
+          "gpu_us": 28950.119018554688,
+          "gpu_samples": [
+            27336.36474609375,
+            29014.22119140625,
+            28950.119018554688,
+            28896.664428710938,
+            28985.75439453125,
+            28864.715576171875,
+            28908.544921875,
+            29093.27392578125,
+            29040.8447265625
+          ],
+          "host_us": 302.407,
+          "host_samples": [
+            431.911,
+            302.407,
+            290.813,
+            339.263,
+            305.062,
+            302.357,
+            295.283
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "8a94a803c875c4988cf4314d2d411a861dab212e1ba22dbb6b551cba5be32c41"
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "round": 3,
+      "bound": false,
+      "library_sha256": "091e2037440791433768fd05e50048e320b0303a0dfed63446e6a40cdd079e81",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "device": "Tesla V100-SXM2-32GB",
+      "cases": [
+        {
+          "query": 8000,
+          "kv": 32768,
+          "gpu_us": 28932.916259765625,
+          "gpu_samples": [
+            26556.851196289062,
+            29121.74072265625,
+            28834.201049804688,
+            28932.916259765625,
+            28990.667724609375,
+            28927.590942382812,
+            28899.942016601562,
+            28991.079711914062,
+            29018.7255859375
+          ],
+          "host_us": 300.558,
+          "host_samples": [
+            428.111,
+            305.144,
+            302.696,
+            297.007,
+            300.558,
+            293.363,
+            294.911
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "4c5fd4a1118e33481b1633569688967f94f9668dffcbe3595a812cb1042e4160"
+        },
+        {
+          "query": 8192,
+          "kv": 32768,
+          "gpu_us": 28982.8857421875,
+          "gpu_samples": [
+            27939.706420898438,
+            28832.974243164062,
+            28983.294677734375,
+            29031.62841796875,
+            28906.085205078125,
+            29062.142944335938,
+            28982.8857421875,
+            28856.11572265625,
+            29008.486938476562
+          ],
+          "host_us": 293.188,
+          "host_samples": [
+            397.797,
+            292.731,
+            293.188,
+            359.561,
+            286.904,
+            369.429,
+            286.163
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "8a94a803c875c4988cf4314d2d411a861dab212e1ba22dbb6b551cba5be32c41"
+        }
+      ]
+    },
+    {
+      "variant": "candidate",
+      "round": 3,
+      "bound": true,
+      "library_sha256": "1db518c172d28e319336e072c5a19b0b97254927d5f1eda5a7b6518af0b33620",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "device": "Tesla V100-SXM2-32GB",
+      "cases": [
+        {
+          "query": 8000,
+          "kv": 32768,
+          "gpu_us": 28923.699951171875,
+          "gpu_samples": [
+            27153.005981445312,
+            29127.066040039062,
+            28903.01513671875,
+            29074.84130859375,
+            28923.699951171875,
+            28727.706909179688,
+            29067.46826171875,
+            29021.389770507812,
+            28907.110595703125
+          ],
+          "host_us": 303.275,
+          "host_samples": [
+            459.554,
+            310.616,
+            303.275,
+            300.966,
+            351.103,
+            299.243,
+            296.464
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "4c5fd4a1118e33481b1633569688967f94f9668dffcbe3595a812cb1042e4160"
+        },
+        {
+          "query": 8192,
+          "kv": 32768,
+          "gpu_us": 29002.548217773438,
+          "gpu_samples": [
+            27652.737426757812,
+            29158.60595703125,
+            29012.991333007812,
+            28940.081787109375,
+            28923.699951171875,
+            28976.5380859375,
+            29012.991333007812,
+            29026.507568359375,
+            29002.548217773438
+          ],
+          "host_us": 298.126,
+          "host_samples": [
+            394.05,
+            300.163,
+            286.62,
+            290.089,
+            307.193,
+            298.126,
+            283.813
+          ],
+          "temporary_bytes": 0,
+          "output_sha256": "8a94a803c875c4988cf4314d2d411a861dab212e1ba22dbb6b551cba5be32c41"
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "Native sources were clang-formatted after the normal target build; whitespace only. No numerical kernel changes.",
+    "Original schemas remain independently callable; configured engine path uses ABI 1 owner.",
+    "Physical-device execution gate remains shared because unchanged kernels bind device-global pointers.",
+    "Rejected initial baseline build reused objects due to old archive timestamps; corrected build recompiles source, with distinct artifact SHA.",
+    "Initial candidate benchmark used Python truthiness on Torch custom class; harness corrected to explicit None comparison before accepted alternating rounds."
+  ]
+}

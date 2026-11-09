@@ -71,6 +71,7 @@ from vllm.config.cache import (
     PrefixCachingHashAlgo,
 )
 from vllm.config.device import Device
+from vllm.config.execution_policy import flash_v100_policy, graph_policy
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
 from vllm.config.lora import MaxLoRARanks
 from vllm.config.mamba import MambaBackendEnum
@@ -146,7 +147,7 @@ def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     if (
         requested_dtype != "fp8"
         or resolved_dtype != "fp8"
-        or not envs.VLLM_SM70_FLASH_ATTN_V100
+        or not flash_v100_policy().enabled
         or not current_platform.is_cuda()
     ):
         return resolved_dtype
@@ -538,6 +539,8 @@ class EngineArgs:
     prefix_cache_retention_interval: int | None = (
         CacheConfig.prefix_cache_retention_interval
     )
+    mamba_tail_checkpoint: bool = CacheConfig.mamba_tail_checkpoint
+    partial_prefix_cache: bool = CacheConfig.partial_prefix_cache
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -558,6 +561,8 @@ class EngineArgs:
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
     mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+    short_prompt_chunk_tokens: int = SchedulerConfig.short_prompt_chunk_tokens
+    short_prompt_threshold: int = SchedulerConfig.short_prompt_threshold
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
@@ -601,6 +606,7 @@ class EngineArgs:
     )
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
+    mm_encoder_batch_size: int = MultiModalConfig.mm_encoder_batch_size
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
     )
@@ -1187,6 +1193,12 @@ class EngineArgs:
             **cache_kwargs["prefix_cache_retention_interval"],
         )
         cache_group.add_argument(
+            "--mamba-tail-checkpoint", **cache_kwargs["mamba_tail_checkpoint"]
+        )
+        cache_group.add_argument(
+            "--partial-prefix-cache", **cache_kwargs["partial_prefix_cache"]
+        )
+        cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
         )
         cache_group.add_argument(
@@ -1281,6 +1293,9 @@ class EngineArgs:
         )
         multimodal_group.add_argument(
             "--mm-encoder-tp-mode", **multimodal_kwargs["mm_encoder_tp_mode"]
+        )
+        multimodal_group.add_argument(
+            "--mm-encoder-batch-size", **multimodal_kwargs["mm_encoder_batch_size"]
         )
         multimodal_group.add_argument(
             "--mm-encoder-attn-backend",
@@ -1444,6 +1459,14 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--mixed-prefill-min-tokens",
             **scheduler_kwargs["mixed_prefill_min_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--short-prompt-chunk-tokens",
+            **scheduler_kwargs["short_prompt_chunk_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--short-prompt-threshold",
+            **scheduler_kwargs["short_prompt_threshold"],
         )
         # are no longer supported.
         scheduler_group.add_argument(
@@ -1665,6 +1688,7 @@ class EngineArgs:
             mm_shm_cache_max_object_size_mb=self.mm_shm_cache_max_object_size_mb,
             mm_encoder_only=self.mm_encoder_only,
             mm_encoder_tp_mode=self.mm_encoder_tp_mode,
+            mm_encoder_batch_size=self.mm_encoder_batch_size,
             mm_encoder_attn_backend=self.mm_encoder_attn_backend,
             mm_encoder_attn_dtype=self.mm_encoder_attn_dtype,
             mm_encoder_fp8_scale_path=self.mm_encoder_fp8_scale_path,
@@ -1910,7 +1934,7 @@ class EngineArgs:
                 # graph sizing to that stage instead of turning a graph policy
                 # into a service-capacity limit.
                 profile_updates.append("mtp_cudagraph_shapes=deferred_to_scheduler")
-            elif envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
+            elif graph_policy().split_draft_graphs and spec_method == "mtp":
                 cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
                     self.max_num_seqs,
                     decode_query_len,
@@ -1930,8 +1954,11 @@ class EngineArgs:
                 self.compilation_config.cudagraph_capture_sizes = (
                     cudagraph_capture_sizes
                 )
+                max_tokens = self.max_num_batched_tokens
                 self.compilation_config.max_cudagraph_capture_size = max(
-                    cudagraph_capture_sizes
+                    size
+                    for size in cudagraph_capture_sizes
+                    if max_tokens is None or size <= max_tokens
                 )
                 profile_updates.append(
                     "cudagraph_capture_sizes="
@@ -2020,6 +2047,8 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            mamba_tail_checkpoint=self.mamba_tail_checkpoint,
+            partial_prefix_cache=self.partial_prefix_cache,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
@@ -2304,6 +2333,8 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+            short_prompt_chunk_tokens=self.short_prompt_chunk_tokens,
+            short_prompt_threshold=self.short_prompt_threshold,
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),
@@ -2523,7 +2554,9 @@ class EngineArgs:
         from vllm.models.qwen4_exp.common.ple import check_ple_host_share
 
         check_ple_host_share(
-            model_config.hf_text_config, parallel_config.tensor_parallel_size
+            model_config.hf_text_config,
+            parallel_config.tensor_parallel_size,
+            policy=config.offload_config.ple,
         )
 
         return config
