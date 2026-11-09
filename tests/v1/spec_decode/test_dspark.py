@@ -347,3 +347,16 @@ def test_alignment_output_contract_is_hashed(tmp_path, monkeypatch):
     spec.dspark_confidence_threshold = 0.5
     spec.bind_diagnostic_output(False)
     assert spec.compute_hash() == alignment
+
+
+def test_draft_model_config_is_hashed(tmp_path, monkeypatch):
+    # The drafter compiles into the target's cache directory, so a drafter
+    # with other weights (here: quantized) must not hit the old artifacts
+    # (vllm-project/vllm#47911).
+    _, spec = _make_dspark_speculative_config(
+        tmp_path, monkeypatch, pp_size=1, tp_size=1
+    )
+    assert spec.draft_model_config is not None
+    before = spec.compute_hash()
+    spec.draft_model_config.quantization = "fp8"
+    assert spec.compute_hash() != before

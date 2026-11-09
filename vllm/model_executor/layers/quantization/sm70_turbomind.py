@@ -552,9 +552,9 @@ def prepare_nvfp4_linear(
     )
 
 
-# Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu: rows up to this
-# take the QPN2 decode kernels, larger M takes the dense prefill.
-QPN2_DISPATCH_MAX_ROWS = 32
+# Compatibility export for the Python QPN2 dispatch range. Each native
+# launch remains bounded at 32 rows; the no-copy provider chunks up to 128.
+QPN2_DISPATCH_MAX_ROWS = 128
 QPN2_GROUP_SIZE = 16
 
 # Launch configurations (split-K, accumulator chains) measured on the

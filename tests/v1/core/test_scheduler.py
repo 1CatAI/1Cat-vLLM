@@ -2706,6 +2706,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.vllm_config.model_config.enable_return_routed_experts = False
     scheduler.enable_return_routed_experts = False
     scheduler.recompute_kv_load_failures = False
+    scheduler.use_lookahead_block_hashes = False
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
     scheduler.mixed_prefill_budget = Mock()
@@ -4513,3 +4514,20 @@ def test_kv_connector_honors_skip_reading_prefix_cache(is_async):
         assert output.num_scheduled_tokens[plain.request_id] == BLOCK_SIZE * 2
     assert output.num_scheduled_tokens[scoring.request_id] == BLOCK_SIZE * 4
     assert scoring.status == RequestStatus.RUNNING
+
+
+def test_new_block_ids_drained_without_kv_cache_zeroing():
+    """Without Mamba layers nothing zeroes new blocks, but the managers still
+    record them; the scheduler must drain the list every step or it grows for
+    the lifetime of the engine (vllm-project/vllm#44490)."""
+    scheduler = create_scheduler(max_num_batched_tokens=64)
+    assert not scheduler.needs_kv_cache_zeroing
+    (request,) = create_requests(num_requests=1, num_tokens=100)
+    scheduler.add_request(request)
+
+    # Two prefill chunks, each allocating blocks.
+    for _ in range(2):
+        output = scheduler.schedule()
+        assert output.new_block_ids_to_zero is None
+        managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+        assert all(not manager.new_block_ids for manager in managers)

@@ -8,11 +8,13 @@ import pytest
 import torch
 
 from vllm.config.scheduler import SchedulerConfig
+from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 from vllm.config.speculative import (
     SpeculativeConfig,
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -103,7 +105,8 @@ def test_dflash_embedding_buffer_covers_expanded_query_capacity(
         "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
         lambda config: False,
     )
-    config = SimpleNamespace(speculative_config=SimpleNamespace())
+    config = VllmConfig()
+    config.speculative_config = SimpleNamespace()
     speculator = module.DFlashSpeculator(config, torch.device("cpu"))
     capacity = max(target_capacity, 4 * 8)
     assert speculator.max_num_tokens == capacity
@@ -208,6 +211,8 @@ def test_draft_token_handler_exposes_only_selected_verify_width() -> None:
 
 def _adaptive_lookup_config() -> SpeculativeConfig:
     config = object.__new__(SpeculativeConfig)
+    config.sm70_dflash2 = Sm70DFlash2Config()
+    config.sampling_policy = SpeculativeSamplingPolicy()
     config.method = "dflash"
     config.ngram_assist = True
     config.num_speculative_tokens = 15
@@ -328,6 +333,25 @@ def test_dflash_aux_projection_matches_fc_weight_dtype() -> None:
     output = DFlashQwen3ForCausalLM.combine_hidden_states(model, hidden_states)
 
     assert output.dtype == torch.float16
+
+
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_packed_fc_storage_does_not_choose_activation_dtype(empty, dtype):
+    class FC:
+        input_size = 4
+        weight = torch.empty(0 if empty else 16, dtype=torch.uint8)
+        quant_method = SimpleNamespace(params_dtype=dtype)
+
+        def __call__(self, hidden_states):
+            assert hidden_states.dtype == dtype
+            return hidden_states
+
+    model = SimpleNamespace(model=SimpleNamespace(use_aux_hidden_state=True, fc=FC()))
+    output = DFlashQwen3ForCausalLM.combine_hidden_states(
+        model, torch.ones(2, 4, dtype=torch.float32)
+    )
+    assert output.dtype == dtype
 
 
 def test_draft_kv_dtype_is_public_and_defaults_to_inherit() -> None:
