@@ -1,0 +1,21 @@
+{
+  "group": "hetero_pp7",
+  "title": "Heterogeneous seven-GPU serving qualification",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1260,
+      "title": "Serve GLM 5.3 Flash and Qwen3.8 Flash Next GGUF across seven heterogeneous GPUs",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1260",
+      "head": "53c88a5ba55bbd9f5b148226801881bd871bec40",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "d6d7c320df0dec9d12abb639e84669e4477358956c86b75dff47ad4de6a44ee7",
+      "files": 215,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "Original #1260 requires seven heterogeneous GPUs and matching GGUF checkpoints.54633 has4xV100. Its complete215-file merge-base/head diff was reconstructed and replay-verified. Need the intended heterogeneous PP/TP mapping, transport failure/slow-rank, memory and model-quality acceptance before integration.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
