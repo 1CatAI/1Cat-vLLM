@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Device-side compact/reference dispatch for uniform DFlash2 verifier batches."""
 
+from copy import copy
 from typing import Any
 
 import numpy as np
@@ -144,6 +145,34 @@ def _all_ranks_support(status: int) -> bool:
     return unsupported.item() == 0
 
 
+def _snapshot_sampling_inputs(
+    sampler: Any,
+) -> tuple[Any, list[tuple[Any, torch.Tensor]]]:
+    """Give this graph fixed addresses without changing eager sampling state."""
+    view = copy(sampler)
+    copies: list[tuple[Any, torch.Tensor]] = []
+    for state_name, names in (
+        ("sampling_states", ("temperature", "top_k", "top_p", "min_p", "seeds")),
+        (
+            "penalties_state",
+            ("repetition_penalty", "frequency_penalty", "presence_penalty"),
+        ),
+    ):
+        source_state = getattr(sampler, state_name)
+        state = copy(source_state)
+        for name in names:
+            source = getattr(source_state, name, None)
+            if source is None:
+                continue
+            tensor = source.gpu.clone()
+            field = copy(source)
+            field.gpu = tensor
+            setattr(state, name, field)
+            copies.append((source, tensor))
+        setattr(view, state_name, state)
+    return view, copies
+
+
 class _RejectionGraph:
     def __init__(self, model, speculator, rejection, hidden, batch, sparse, penalties):
         self.requests = batch.num_reqs
@@ -165,6 +194,9 @@ class _RejectionGraph:
         self.cu = batch.cu_num_logits[: self.requests + 1].clone()
         self.request_indices = batch.idx_mapping_np.copy()
         self.rejection = rejection
+        self.sampler, self._parameter_copies = _snapshot_sampling_inputs(
+            rejection.sampler
+        )
         self.model = model
         self.speculator = speculator
         self.sparse = tuple(torch.empty_like(t) for t in sparse)
@@ -195,6 +227,11 @@ class _RejectionGraph:
         self.prepare(hidden, batch, sparse)
 
     def prepare(self, hidden, batch, sparse):
+        # UVA pools rotate their GPU aliases. Refresh fixed graph-owned tensors
+        # on the consumer stream, including parameters indexed by high slots.
+        for source, tensor in self._parameter_copies:
+            tensor.copy_(source.gpu)
+        self.cu.copy_(batch.cu_num_logits[: self.requests + 1])
         ids, values = sparse
         fixed_ids, fixed_values = self.sparse
         _prepare_hidden[(triton.cdiv(hidden.numel(), 1024),)](
@@ -240,7 +277,7 @@ class _RejectionGraph:
         self.ids, self.values, self.fallback = probe(self.hidden, 64)
         if self.fallback is None:
             return False
-        sampler = self.rejection.sampler
+        sampler = self.sampler
         states = sampler.sampling_states
         floors = None
         if self.penalties:
@@ -274,7 +311,7 @@ class _RejectionGraph:
         logits = self.fallback()
         if logits is None:
             raise RuntimeError("DFlash2 graph rejection requires replicated logits")
-        sampler = self.rejection.sampler
+        sampler = self.sampler
         states = sampler.sampling_states
         processed = sampler.apply_sampling_params(
             logits,
@@ -302,7 +339,7 @@ class _RejectionGraph:
         self.count.copy_(count)
 
     def _compact(self):
-        sampler = self.rejection.sampler
+        sampler = self.sampler
         states = sampler.sampling_states
         ids, values = self.sparse
         output, count = dflash2_sparse_topk_rejection_sample(

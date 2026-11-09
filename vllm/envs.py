@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from vllm.envs_metadata import bind_env_names, env_var, warn_deprecated_once
 
 if TYPE_CHECKING:
+    VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 32
+    VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES: int = 64 * 1024 * 1024
     VLLM_SM70_DEBUG: set[str] = set()
     VLLM_SM70_E4M3_LONG_ATTENTION: str | None = None
     VLLM_CPU_CI_ENV: str | None = None
@@ -1048,6 +1050,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+    VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE: bool = True
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1436,7 +1439,46 @@ def _resolve_rust_frontend_path() -> str | None:
     return raw
 
 
+def _get_weight_load_max_split_scope() -> bool:
+    override = os.getenv("VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE")
+    if override is not None:
+        return override != "0"
+    config = os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+    )
+    expandable = False
+    for option in config.split(","):
+        name, _, value = option.partition(":")
+        if name.strip() == "expandable_segments":
+            expandable = value.strip() == "True"
+    return not expandable
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "32")),
+        description=(
+            "MRv2 prompt logprobs rows per logits chunk. Default 32 bounds "
+            "temporary logits; raise only after memory acceptance. Use the "
+            "same value on all TP ranks."
+        ),
+        category="configuration",
+        declared_default="32",
+        effective_default="32; prompt logprobs only, valid range 1 through 1024.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES": env_var(
+        lambda: int(os.getenv("VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES", "67108864")),
+        description="MRv2 per-request prompt logprobs tensor output limit in bytes.",
+        category="configuration",
+        declared_default="67108864",
+        effective_default="67108864; 64 MiB of tensor output per MRv2 request.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_SM70_E4M3_LONG_ATTENTION": env_var(
         lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION"),
         description=(
@@ -16455,6 +16497,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE": env_var(
+        _get_weight_load_max_split_scope,
+        description=(
+            "Temporarily set the CUDA allocator max_split_size_mb to 20 during "
+            "model loading, preserving the other allocator options. Disabled "
+            "by default with expandable_segments:True, enabled otherwise. "
+            "Set 0 or 1 to override. Does not change SM70 warmup scoping."
+        ),
+        category="configuration",
+        declared_default="auto",
+        effective_default="False with expandable_segments:True, otherwise True",
+        automatic_conditions=(
+            "Disabled when the effective allocator enables expandable segments.",
+        ),
         acceleration_paths=(),
         user_visible=True,
     ),

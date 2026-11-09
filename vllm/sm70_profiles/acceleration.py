@@ -708,7 +708,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         report["linear_kernel_policy"] = {
             "scope": "ct_nvfp4_linear",
             "status": "runtime_guarded",
-            "configuration": json.loads(json.dumps(asdict(policy))),
+            "configuration": json.loads(
+                json.dumps(asdict(policy), default=_json_default)
+            ),
             "qpn2_reason": (
                 "configuration_not_resolved"
                 if not policy.resolved

@@ -7,6 +7,7 @@ import torch
 from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
@@ -80,6 +81,7 @@ def create_scheduler(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    device_config: DeviceConfig | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -167,6 +169,7 @@ def create_scheduler(
     )
 
     vllm_config = VllmConfig(
+        device_config=device_config or DeviceConfig(),
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,

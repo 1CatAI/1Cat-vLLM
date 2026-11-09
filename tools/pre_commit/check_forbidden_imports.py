@@ -47,6 +47,8 @@ CHECK_IMPORTS = {
             "tests/compile/test_aot_compile.py",
             # Round-trip trusted, test-owned worker configuration.
             "tests/v1/worker/test_step_profiler.py",
+            # Trusted worker-output IPC round trip is the subject of this test.
+            "tests/v1/engine/test_pp_spec_decode_cadence.py",
             "tests/compile/test_aot_triton_side_table.py",
             "benchmarks/kernels/graph_machete_bench.py",
             "benchmarks/kernels/benchmark_lora.py",
