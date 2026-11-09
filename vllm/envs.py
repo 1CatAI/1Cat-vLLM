@@ -5407,6 +5407,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MoE AWQ",),
         user_visible=False,
     ),
+    # Selects the implementation behind qwen3_coder / qwen3_xml.
+    #
+    #   '120' (default) = the alternative implementation in *_120_tool_parser.py
+    #                     (incremental streaming, streaming anchors, a 0-5 fix
+    #                     ladder -- see VLLM_QWEN3X_TOOL_FIX)
+    #   '150'           = the upstream implementation
+    #
+    # The two are independent modules and do not overwrite each other; this
+    # switch only picks a class in the tool_parsers registry. Requiring an
+    # engine restart because a module cannot be swapped once imported.
+    "VLLM_TOOL_PARSER_IMPL": env_var(
+        lambda: str(os.getenv("VLLM_TOOL_PARSER_IMPL", "120")).strip().lower(),
+        description=(
+            "Which tool-parser implementation to register for qwen3_coder / "
+            "qwen3_xml: '120' (default, alternative implementation) or '150' "
+            "(upstream). Requires an engine restart."
+        ),
+        category="tuning",
+        declared_default="120",
+        effective_default="120",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    # Fix ladder (0-5) inside the alternative implementation. Only meaningful
+    # when VLLM_TOOL_PARSER_IMPL=120; never read otherwise.
+    #   0   all off; behaves like upstream
+    #   1   default: XML routing + incremental streaming for
+    #       Write/Edit/WebFetch
+    #   2   force the JSON incremental streaming route
+    #   3/4 force the XML route
+    #   5   incremental streaming without the special routes from 2/3
+    # The older name VLLM_QWEN3CODER_STREAMING_FIX is still read as a fallback.
+    "VLLM_QWEN3X_TOOL_FIX": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_QWEN3X_TOOL_FIX",
+                os.getenv("VLLM_QWEN3CODER_STREAMING_FIX", "1"),
+            )
+        ),
+        description=(
+            "Tool-call fix level (0-5) for the alternative implementation. "
+            "Only read when VLLM_TOOL_PARSER_IMPL=120."
+        ),
+        category="tuning",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_SM70_AUX_KERNEL_WARMUP": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AUX_KERNEL_WARMUP", "1"))),
         description=(
@@ -20265,6 +20316,15 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_SM70_PHASE_LOG_INTERVAL",
+        "VLLM_SM70_PHASE_MAX_WAIT_MS",
+        "VLLM_SM70_PHASE_DECODE_SHARE",
+        "VLLM_SM70_PHASE_SEPARATION",
+        # The parser implementation switch and its fix ladder are pure Python
+        # and change no build artefact.
+        "VLLM_QWEN3CODER_STREAMING_FIX",
+        "VLLM_QWEN3X_TOOL_FIX",
+        "VLLM_TOOL_PARSER_IMPL",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",
