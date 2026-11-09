@@ -336,6 +336,9 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
+    # Startup self-cleanup master switch (on by default).
+    VLLM_SM70_STARTUP_CACHE_CLEANUP: bool = True
+    VLLM_STARTUP_LOG_FILE: str | None = None
     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = True
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
@@ -4409,6 +4412,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
+    ),
+    "VLLM_STARTUP_LOG_FILE": env_var(
+        lambda: os.getenv("VLLM_STARTUP_LOG_FILE"),
+        description=(
+            "Path for the separate startup log file. Startup lines are "
+            "mirrored here until 'Application startup complete' is seen, then "
+            "the handler detaches. Defaults to "
+            "/tmp/log/vllm-starting-log.txt when unset."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_SM70_STARTUP_CACHE_CLEANUP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_STARTUP_CACHE_CLEANUP", "1"))),
+        description=(
+            "opt21 infrastructure: at engine startup, when compile-cache "
+            "reuse is disabled (VLLM_DISABLE_COMPILE_CACHE=1), reclaim the "
+            "early compile cache and stale /dev/shm offload leftovers. Only "
+            "acts while every GPU is quiet; set 0 to opt out."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
         user_visible=True,
     ),
     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": env_var(
@@ -20265,6 +20298,11 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        # One-shot startup cleanup switch: it does not affect any build
+        # artefact, so it must stay out of the cache key -- otherwise toggling
+        # it would invalidate the whole compile cache.
+        "VLLM_SM70_STARTUP_CACHE_CLEANUP",
+        "VLLM_STARTUP_LOG_FILE",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",

@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import State
+from starlette.responses import Response
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
@@ -178,6 +179,15 @@ def build_app(
     else:
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
+
+    # Global HEAD probe. Load balancers and K8s readiness probes commonly use
+    # HEAD / to check liveness; without a route vLLM answers 405, the probe
+    # declares the pod dead and traffic is drained. Answer 200 on every path
+    # without running any request logic.
+    @app.head("/")
+    @app.head("/{path:path}")
+    async def _head_probe(path: str = "") -> Response:  # noqa: ARG001
+        return Response(status_code=200)
 
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
@@ -670,6 +680,14 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     decorate_logs("APIServer", skip_if_decorated=True)
 
+    # Reclaim stale compile cache and /dev/shm offload leftovers **before any
+    # worker starts**. Triple-gated: this switch x VLLM_DISABLE_COMPILE_CACHE=1
+    # (reuse off) x every GPU idle. Inert under the default configuration
+    # (reuse on); files that are still mapped are never removed.
+    from vllm._sm70_startup_cleanup import sm70_startup_cleanup
+
+    sm70_startup_cleanup()
+
     # Interrupt initialization if SIGTERM arrives before uvicorn installs its
     # own signal handlers. Once uvicorn is running it replaces this.
     def _interrupt_init(*_) -> None:
@@ -710,6 +728,12 @@ if __name__ == "__main__":
     # NOTE(simon):
     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
     # entrypoints.
+    # Mirror startup logs to a separate file. The handler detaches itself once
+    # "Application startup complete" is seen, so there is no runtime cost.
+    from vllm.logger import _StartupLogHandler
+
+    _StartupLogHandler.truncate()
+    _StartupLogHandler.install()
     cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server."

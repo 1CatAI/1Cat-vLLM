@@ -342,6 +342,63 @@ def _trace_calls(log_path, root_dir, frame, event, arg=None):
     return partial(_trace_calls, log_path, root_dir)
 
 
+class _StartupLogHandler(logging.Handler):
+    """Mirror vLLM's startup logs into a dedicated file.
+
+    A cold start can take several minutes, and its log lines end up interleaved
+    with runtime traffic in one large file. Diagnosing a failed start then means
+    scrolling through tens of thousands of lines. This handler writes a copy of
+    the vLLM logger's messages to its own file and detaches itself as soon as
+    "Application startup complete" is seen, so there is no runtime cost.
+
+    The path defaults to `/tmp/log/vllm-starting-log.txt` and can be overridden
+    with `VLLM_STARTUP_LOG_FILE`.
+    """
+
+    _default_log_file = "/tmp/log/vllm-starting-log.txt"
+    _installed = False
+
+    @staticmethod
+    def _path() -> str:
+        import vllm.envs as envs
+
+        return envs.VLLM_STARTUP_LOG_FILE or _StartupLogHandler._default_log_file
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with open(self._path(), "a") as f:
+                f.write(msg + "\n")
+            if "Application startup complete" in msg:
+                self._remove()
+        except Exception:
+            self.handleError(record)
+
+    def _remove(self) -> None:
+        logging.getLogger("vllm").removeHandler(self)
+        _StartupLogHandler._installed = False
+
+    @staticmethod
+    def install() -> None:
+        if _StartupLogHandler._installed:
+            return
+        logging.getLogger("vllm").addHandler(_StartupLogHandler())
+        _StartupLogHandler._installed = True
+
+    @staticmethod
+    def truncate() -> None:
+        try:
+            os.makedirs(os.path.dirname(_StartupLogHandler._path()), exist_ok=True)
+            with open(_StartupLogHandler._path(), "w"):
+                pass
+        except Exception:
+            pass
+
+
 def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     """
     Enable tracing of every function call in code under `root_dir`.
