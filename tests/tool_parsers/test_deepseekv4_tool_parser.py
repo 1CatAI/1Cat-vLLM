@@ -610,3 +610,23 @@ def test_integer_schema_accepts_whole_number_float(streaming):
     precision = json.loads(args)["precision"]
     assert precision == 3
     assert isinstance(precision, int)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "<｜DSML｜function_calls>example</｜DSML｜function_calls>",
+        "an unclosed literal <｜DSML｜function_calls>",
+    ],
+)
+def test_foreign_wrapper_literal_in_argument_is_preserved(streaming, literal):
+    parser = make_parser()
+    model_output = build_tool_call("get_weather", {"location": literal})
+    if streaming:
+        arguments = reconstruct_args(stream(parser, model_output))
+    else:
+        result = parser.extract_tool_calls(model_output, make_request())
+        assert result.tools_called
+        arguments = result.tool_calls[0].function.arguments
+    assert json.loads(arguments) == {"location": literal}

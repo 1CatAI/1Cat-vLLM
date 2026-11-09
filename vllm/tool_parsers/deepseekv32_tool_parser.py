@@ -225,14 +225,26 @@ class DeepSeekV32ToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         """Extract tool calls from complete model output (non-streaming)."""
         searchable = model_output
+        invoke_ranges = []
+        if any(start in model_output for start in self._ignored_tool_call_blocks):
+            invoke_ranges = [
+                match.span()
+                for match in self.invoke_complete_regex.finditer(model_output)
+            ]
         for start, end in self._ignored_tool_call_blocks.items():
             # Bare invokes are valid only outside another dialect's wrapper.
-            searchable = re.sub(
-                re.escape(start) + r"(?:.*?" + re.escape(end) + r"|.*\Z)",
-                lambda match: " " * len(match.group()),
-                searchable,
-                flags=re.DOTALL,
-            )
+            position = 0
+            while (index := searchable.find(start, position)) != -1:
+                position = index + len(start)
+                if any(left <= index < right for left, right in invoke_ranges):
+                    # Foreign markup inside a legitimate argument is text.
+                    continue
+                stop = searchable.find(end, position)
+                stop = len(searchable) if stop == -1 else stop + len(end)
+                searchable = (
+                    searchable[:index] + " " * (stop - index) + searchable[stop:]
+                )
+                position = stop
         first_tool_idx = self._find_first_marker(
             searchable, self._tool_calls_start_markers()
         )
