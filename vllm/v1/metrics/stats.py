@@ -182,6 +182,16 @@ class SchedulerStats:
 
     kv_cache_usage: float = 0.0
 
+    # Warm-block retention accounting. `kv_cache_usage` already counts warm
+    # blocks as used, so without these two numbers high usage looks like an
+    # unexplained leak: the pool can sit at, say, 25% with no requests running
+    # and there is no way to tell whether freed-but-retained prefixes are
+    # holding the blocks or something is actually stuck.
+    # warm_block_cap is the point at which retention starts evicting, so the
+    # pair also shows how much headroom the retention policy has left.
+    warm_blocks: int = 0
+    warm_block_cap: int = 0
+
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
 

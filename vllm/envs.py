@@ -15900,6 +15900,127 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    "VLLM_KV_RETENTION_ABS_CAP": env_var(
+        lambda: float(os.getenv("VLLM_KV_RETENTION_ABS_CAP", "0.60")),
+        description=(
+            "Ceiling the grace window cannot cross, as a fraction of the "
+            "history blocks. Bounds how much of the pool retention may hold "
+            "during a sustained burst of freshly released blocks."
+        ),
+        category="performance",
+        declared_default=0.60,
+        effective_default=0.60,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_ENABLED": env_var(
+        lambda: os.getenv("VLLM_KV_RETENTION_ENABLED", "1").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Retain freed-but-hashed KV blocks in a warm list so repeated "
+            "prefixes keep hitting instead of being re-prefilled. "
+            "Default ON; set 0 to restore the stock free-queue behaviour."
+        ),
+        category="performance",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 warm-block KV retention",),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_GRACE": env_var(
+        lambda: float(os.getenv("VLLM_KV_RETENTION_GRACE", "60")),
+        description=(
+            "Seconds a warm block is protected from trimming after it was last "
+            "touched, regardless of hit count. Prevents a block that a request "
+            "used moments ago from being evicted for being new to the pool."
+        ),
+        category="performance",
+        declared_default=60.0,
+        effective_default=60.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_HARD_CAP": env_var(
+        lambda: float(os.getenv("VLLM_KV_RETENTION_HARD_CAP", "0.35")),
+        description=(
+            "Warm-table hard ceiling as a fraction of the history blocks. Above "
+            "it, entries are trimmed oldest-first down to the soft cap "
+            "regardless of age."
+        ),
+        category="performance",
+        declared_default=0.35,
+        effective_default=0.35,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P25": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P25", "21600")),
+        description="Warm-block retention seconds while KV usage < 25%.",
+        category="performance",
+        declared_default=21600,
+        effective_default=21600,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P35": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P35", "7200")),
+        description="Warm-block retention seconds while KV usage < 35%.",
+        category="performance",
+        declared_default=7200,
+        effective_default=7200,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P50": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P50", "3600")),
+        description="Warm-block retention seconds while KV usage < 50%.",
+        category="performance",
+        declared_default=3600,
+        effective_default=3600,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P65": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P65", "1800")),
+        description="Warm-block retention seconds while KV usage < 65%.",
+        category="performance",
+        declared_default=1800,
+        effective_default=1800,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P80": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P80", "600")),
+        description="Warm-block retention seconds while KV usage < 80%.",
+        category="performance",
+        declared_default=600,
+        effective_default=600,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_SOFT_CAP": env_var(
+        lambda: float(os.getenv("VLLM_KV_RETENTION_SOFT_CAP", "0.25")),
+        description=(
+            "Warm-table target size as a fraction of the history blocks. Above "
+            "it, entries that have outlived the current retention tier are "
+            "trimmed; entries still inside their window are kept."
+        ),
+        category="performance",
+        declared_default=0.25,
+        effective_default=0.25,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     # Name of the shared memory buffer used for object storage.
     # Only effective when mm_config.mm_processor_cache_type == "shm".
     # Automatically generates a unique UUID-based name per process tree
@@ -20265,6 +20386,17 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        # Warm-table watermarks and tiers are block-management policy and
+        # change no build artefact.
+        "VLLM_KV_RETENTION_ABS_CAP",
+        "VLLM_KV_RETENTION_GRACE",
+        "VLLM_KV_RETENTION_HARD_CAP",
+        "VLLM_KV_RETENTION_P25",
+        "VLLM_KV_RETENTION_P35",
+        "VLLM_KV_RETENTION_P50",
+        "VLLM_KV_RETENTION_P65",
+        "VLLM_KV_RETENTION_P80",
+        "VLLM_KV_RETENTION_SOFT_CAP",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",

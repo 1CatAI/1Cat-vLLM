@@ -2593,6 +2593,10 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            # Warm blocks are already inside kv_cache_usage; reporting them
+            # separately is what makes that usage explainable.
+            warm_blocks=self.kv_cache_manager.block_pool.warm_block_count,
+            warm_block_cap=self.kv_cache_manager.block_pool.warm_block_cap,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
