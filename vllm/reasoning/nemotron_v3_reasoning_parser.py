@@ -44,12 +44,9 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
         chat_template_kwargs = self._resolved_switches(request)
 
         if (
-            (
-                chat_template_kwargs.get("enable_thinking") is False
-                or chat_template_kwargs.get("force_nonempty_content") is True
-            )
-            and (final_content is None or not final_content.strip())
-        ):
+            chat_template_kwargs.get("enable_thinking") is False
+            or chat_template_kwargs.get("force_nonempty_content") is True
+        ) and (final_content is None or not final_content.strip()):
             reasoning, final_content = final_content, reasoning
 
         return reasoning, final_content
