@@ -47,6 +47,19 @@ def _get_hasher_factory(algorithm: str) -> Callable[[], "hashlib._Hash"]:
         raise ValueError(f"Unsupported hash algorithm: {algorithm}")
 
 
+def _get_image_id_bytes(image: Image.Image) -> bytes | None:
+    try:
+        exif = image.getexif()
+        image_id = exif.get(Image.ExifTags.Base.ImageID)
+        if isinstance(image_id, uuid.UUID):
+            return image_id.bytes
+    except Exception:
+        # Tolerate malformed EXIF metadata (e.g. invalid TIFF header)
+        # and fall back to serializing raw image data or bytes.
+        pass
+    return None
+
+
 class MultiModalHasher:
     @classmethod
     def serialize_item(cls, obj: object) -> Iterable[bytes | memoryview]:
@@ -59,11 +72,9 @@ class MultiModalHasher:
             return (np.array(obj).tobytes(),)
 
         if isinstance(obj, Image.Image):
-            exif = obj.getexif()
-            if Image.ExifTags.Base.ImageID in exif and isinstance(
-                exif[Image.ExifTags.Base.ImageID], uuid.UUID
-            ):
-                return (exif[Image.ExifTags.Base.ImageID].bytes,)
+            image_id = _get_image_id_bytes(obj)
+            if image_id is not None:
+                return (image_id,)
 
             data = {"mode": obj.mode, "data": np.asarray(obj)}
             palette = obj.palette
@@ -75,11 +86,9 @@ class MultiModalHasher:
             return cls.iter_item_to_bytes("image", data)
 
         if isinstance(obj, MediaWithBytes) and isinstance(obj.media, Image.Image):
-            exif = obj.media.getexif()
-            if Image.ExifTags.Base.ImageID in exif and isinstance(
-                exif[Image.ExifTags.Base.ImageID], uuid.UUID
-            ):
-                return (exif[Image.ExifTags.Base.ImageID].bytes,)
+            image_id = _get_image_id_bytes(obj.media)
+            if image_id is not None:
+                return (image_id,)
 
             return cls.iter_item_to_bytes("image", obj.original_bytes)
 
