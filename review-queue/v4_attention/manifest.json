@@ -1,0 +1,131 @@
+{
+  "group": "v4_attention",
+  "title": "DeepSeek-V4 attention and indexing qualification queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1411,
+      "title": "[Bugfix][Kernel] Backport vllm-project/vllm#63475, #62936, #62467, #49139: persistent_topk radix CTA syncs, float4 tail lanes, radix histogram ring",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1411",
+      "head": "efc21383c0247990387132ab4ea81c505a618286",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "62462fce94a29ab1052114f9430f159a9c79d81a15081204edb243e463908e55",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1347,
+      "title": "[Perf][SM70][SM75][DeepSeek-V4] Long context: score decode index keys in one fused kernel, halve the sparse prefill workspace",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1347",
+      "head": "6968a8b40e7f859f63d16cff26497316f05f7d06",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "ea829089e25188847381df07fce1aa566a03973c628a0141e1d95e76321af853",
+      "files": 74,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1344,
+      "title": "[Perf][SM70][SM75][DeepSeek-V4] Keep the fused KV compress kernel off the stack",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1344",
+      "head": "5e76f22ed4339bf373c55271eb9b50e4e4a5105f",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "e6e5bcd2fb16f60d9364f6215ee0ec074b577c980131d5536911916614cf45f9",
+      "files": 1,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1328,
+      "title": "[Bugfix][SM70] Indexer: write the cuBLAS prefill score tile in fp32",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1328",
+      "head": "bfc5bcf30c088577237f290fe6dbac480dca7839",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "bbfae3310e0a7bd1f54111dddbd4376325d12183578505846b7f888b9cb83d6b",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1325,
+      "title": "[Perf][SM70] mHC prenorm staging: load each row once for prefill-sized batches",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1325",
+      "head": "24c5ede84ca62a32a76f8dc5e1375deb1a6cb353",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "68887db81836877bedf1ae365085445e044e0733649b1da0d1d334549f6dd5a5",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1417,
+      "title": "[Perf][SM70][SM75][DeepSeek-V4] Finer automatic decode context buckets for long contexts",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1417",
+      "head": "c1cd04d9d694e38f49b35211f67836f529279002",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "1356d204be78035f45cfd1191e4e3d21b89de9fa09598adbd578e13240007f0e",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1282,
+      "title": "[Perf][SM70][SM75] Opt-in tensor-core Triton routes for DeepSeek-V4 prefill on Volta and Turing",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1282",
+      "head": "b9fbe637c823635d583c0dceaac9abf8475d08c2",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "431adb055b24ddecfac3296be8dc4fd028f58710ea5dfe781c410288e1453414",
+      "files": 76,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1321,
+      "title": "flash-v100: Budget FP8 bridge workspace by KV-head group",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1321",
+      "head": "7110faceace926ce92d6187bf996f5e1c666a3b2",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "431a0c3e57cc3e8a00b2046505311844c9c7c5e763f1337857478f4837592239",
+      "files": 11,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1425,
+      "title": "[Kernel][SM70] Extend E4M3 grouped attention to the served context window",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1425",
+      "head": "bf2d1e24cf4b07a8bd6f927adf06df8dda97fc3c",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "5cbc8de227ad9399da95953dba265582d2f52a09491b76578287ade1b7fb0610",
+      "files": 10,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1279,
+      "title": "[Perf][SM75] Turing prefill attention; overlap TP prefill all-reduces on GPUs without P2P",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1279",
+      "head": "4a95e6beaff7f5e3882e8fed5a05d15e0fb4276a",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "33cd5dde2262636c81ed3ad7e2b574d78d961ba6edaf81c76c89ea4b80020d31",
+      "files": 48,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    },
+    {
+      "number": 1280,
+      "title": "[Perf][SM70][DeepSeek-V4] Long-prefill indexer and sparse attention: vectorized epilogue, fused softmax, Turing scorer",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1280",
+      "head": "61dddbfa0b0935342b59c8c9e60d1d85cfd08d4f",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "5b1479e43b4f1e9e17947eec2984e34fd0a8331cfdece2452eccf654fab93b85",
+      "files": 60,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    }
+  ],
+  "validation_gaps": "Persistent top-k CTA synchronization, float4 tails, FP32 scoring, compressed KV and context buckets require rebuilt native kernels and threshold/tail/context coverage. Validate both SM70 and SM75 paths where claimed, TP/DCP layouts, FP8 KV, graph replay and target-checkpoint quality before selecting new defaults. #1344/#1417 small diffs are not automatically safe without path qualification.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

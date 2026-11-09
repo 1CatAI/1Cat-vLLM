@@ -1,0 +1,35 @@
+diff --git a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+index 5ea59d278..8b89c678c 100644
+--- a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+@@ -205,13 +205,21 @@ def compress_norm_rope_store_triton(
+     """
+     if head_dim == 512:
+         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
+-        num_warps = 4
++        # The driver reserves the biggest stack of any kernel for every thread
++        # of the card. With 4 warps this kernel gets 32 registers from ptxas on
++        # Volta and spills 11.7 KB per thread: 2 GiB on a Tesla V100, 0.7 GiB on
++        # a Quadro RTX 8000. 16 warps spread the tiles over more threads, and
++        # 128 registers is what 512 threads may hold (1.4 KB of stack).
++        num_warps = 16
++        maxnreg = 128
+     elif use_fp4_cache:
+         kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
+         num_warps = 1
++        maxnreg = None
+     else:
+         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
+         num_warps = 1
++        maxnreg = None
+ 
+     kernel[(num_actual,)](
+         # state cache
+@@ -259,6 +267,7 @@ def compress_norm_rope_store_triton(
+         RING_SIZE=ring_size,
+         PRIVATE_HISTORY_SIZE=private_history_size,
+         num_warps=num_warps,
++        maxnreg=maxnreg,
+         **pdl_kwargs,
+     )
+ 

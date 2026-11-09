@@ -1,0 +1,105 @@
+{
+  "initial_inventory": {
+    "number": 1321,
+    "title": "flash-v100: Budget FP8 bridge workspace by KV-head group",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1321",
+    "isDraft": false,
+    "headRefOid": "7110faceace926ce92d6187bf996f5e1c666a3b2",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1321,
+    "title": "flash-v100: Budget FP8 bridge workspace by KV-head group",
+    "body": "## Purpose\n\nI've been fitting Qwen3.8-27B's 262K context on two 16 GB V100s and found the FP8 prefill bridge's conversion workspace taking memory needed by the KV cache.\n\nThe bridge converts cached K/V to FP16 before attention. It now groups KV heads so the conversion, query and output scratch fit within 1/32 of the worker's configured GPU-memory allowance. The plan uses final KV page geometry before cache sizing; if no group fits, the request uses native FP8 paged attention.\n\n```mermaid\nflowchart LR\n    A[Worker memory allowance] --> C[Per-layer workspace plan]\n    B[Final KV-group page geometry] --> C\n    C --> D[Profile selected scratch]\n    D --> E[Size KV memory]\n```\n\nExplicit head groups override the automatic budget. `fp8_bridge_workspace_bytes` sets the automatic cap; zero selects native FP8 when groups are not explicit. The matching environment inputs are `VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS` and `VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES`.\n\nGroups process whole KV heads and their contiguous query-head ranges. More groups add attention passes and query/output copies. Invalid explicit groups retain unsplit execution. Allocation failure releases partial scratch and falls back to native FP8 paged attention. The native ABI, bridge eligibility and FP8 scale behavior are unchanged.\n\n## Test Plan\n\nRun the Flash-V100 layout and bridge numerical, automatic-budget and allocation-fallback tests on SM70; run lifecycle, hybrid-page and workspace-boundary tests without a GPU. Compare memory use and branch-default throughput at 30K.\n\n## Acceleration and benchmark contract\n\n- Default enabled or opt-in: automatic smallest valid group under 1/32 of the worker memory allowance; native FP8 paged attention if no group fits.\n- Required CLI options and environment switches: `--attention-config '{\"flash_v100\":{\"options\":{\"fp8_bridge_head_groups\":2}}}'`; `fp8_bridge_workspace_bytes` and the two `VLLM_FLASH_V100_FP8_BRIDGE_*` environment inputs override the budget.\n- KV cache dtype used for the benchmark: `fp8_e4m3`.\n- Wheel SHA or source commit: source commit `7110facea`; no wheel.\n- PYTHONPATH, source overlays, or external native libraries: benchmark-only `upstream_probe_worker.ProbeWorker` on PYTHONPATH; native extensions reused from the pinned baseline build.\n- User-entry route-hit, speed, and output-quality evidence: the 30K request hit the Flash-V100 FP8 prefix bridge; captured greedy text matched at 30K and 120K.\n- Existing kernel/backend registry and capability-rejection reasons: no backend registry change; existing bridge eligibility and native FP8 fallback remain.\n- Per-engine configuration and deprecated-variable compatibility: `fp8_bridge_head_groups` and `fp8_bridge_workspace_bytes` are per-engine options; explicit groups override the budget.\n- New/changed environment metadata and generated reference check: both environment controls are documented in the Flash-V100 design; generated reference check passed.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: controls remain in the Flash-V100 option parser; bridge remains limited to its existing FP8 KV-cache and head-dimension eligibility.\n\n## Test Result\n\nQwen3.8-27B QUASAR NVFP4, TP2, dual V100-SXM2-16GB. Memory after the same cold 30K/120K request sequence:\n\n| KV-head groups | Used MiB/card | Free MiB/card |\n|---|---:|---:|\n| 1 | 15533 | 612 |\n| 2 | 15373 | 772 |\n\nTwo groups saved 160 MiB per card in this measurement.\n\nThroughput: Qwen3.8-27B QUASAR NVFP4, dual V100 at 200 W/card; 30,063 cold prompt tokens, 128 generated tokens, three samples per state, prefix caching off. No sampled thermal-slowdown flags:\n\n| State | Prompt tok/s | Decode tok/s |\n|---|---:|---:|\n| Pinned upstream, before | 1587.6 | 17.31 |\n| Branch default | 1580.9 | 17.05 |\n| Pinned upstream, after | 1586.9 | 17.06 |\n\nThe 122 GPU cases and 46 CPU cases passed.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1321",
+    "isDraft": false,
+    "headRefName": "upstream/fp8-bridge-head-groups",
+    "headRefOid": "7110faceace926ce92d6187bf996f5e1c666a3b2",
+    "baseRefName": "main",
+    "baseRefOid": "4d57473db67eb77a13018d179e4d95169e82044f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "andrewleech/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "andrewleech"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "andrewleech"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1321,
+    "id": "PR_kwDORjYFXs8AAAABLfalQA",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "7110faceace926ce92d6187bf996f5e1c666a3b2",
+    "title": "flash-v100: Budget FP8 bridge workspace by KV-head group",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1321",
+    "body": "## Purpose\n\nI've been fitting Qwen3.8-27B's 262K context on two 16 GB V100s and found the FP8 prefill bridge's conversion workspace taking memory needed by the KV cache.\n\nThe bridge converts cached K/V to FP16 before attention. It now groups KV heads so the conversion, query and output scratch fit within 1/32 of the worker's configured GPU-memory allowance. The plan uses final KV page geometry before cache sizing; if no group fits, the request uses native FP8 paged attention.\n\n```mermaid\nflowchart LR\n    A[Worker memory allowance] --> C[Per-layer workspace plan]\n    B[Final KV-group page geometry] --> C\n    C --> D[Profile selected scratch]\n    D --> E[Size KV memory]\n```\n\nExplicit head groups override the automatic budget. `fp8_bridge_workspace_bytes` sets the automatic cap; zero selects native FP8 when groups are not explicit. The matching environment inputs are `VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS` and `VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES`.\n\nGroups process whole KV heads and their contiguous query-head ranges. More groups add attention passes and query/output copies. Invalid explicit groups retain unsplit execution. Allocation failure releases partial scratch and falls back to native FP8 paged attention. The native ABI, bridge eligibility and FP8 scale behavior are unchanged.\n\n## Test Plan\n\nRun the Flash-V100 layout and bridge numerical, automatic-budget and allocation-fallback tests on SM70; run lifecycle, hybrid-page and workspace-boundary tests without a GPU. Compare memory use and branch-default throughput at 30K.\n\n## Acceleration and benchmark contract\n\n- Default enabled or opt-in: automatic smallest valid group under 1/32 of the worker memory allowance; native FP8 paged attention if no group fits.\n- Required CLI options and environment switches: `--attention-config '{\"flash_v100\":{\"options\":{\"fp8_bridge_head_groups\":2}}}'`; `fp8_bridge_workspace_bytes` and the two `VLLM_FLASH_V100_FP8_BRIDGE_*` environment inputs override the budget.\n- KV cache dtype used for the benchmark: `fp8_e4m3`.\n- Wheel SHA or source commit: source commit `7110facea`; no wheel.\n- PYTHONPATH, source overlays, or external native libraries: benchmark-only `upstream_probe_worker.ProbeWorker` on PYTHONPATH; native extensions reused from the pinned baseline build.\n- User-entry route-hit, speed, and output-quality evidence: the 30K request hit the Flash-V100 FP8 prefix bridge; captured greedy text matched at 30K and 120K.\n- Existing kernel/backend registry and capability-rejection reasons: no backend registry change; existing bridge eligibility and native FP8 fallback remain.\n- Per-engine configuration and deprecated-variable compatibility: `fp8_bridge_head_groups` and `fp8_bridge_workspace_bytes` are per-engine options; explicit groups override the budget.\n- New/changed environment metadata and generated reference check: both environment controls are documented in the Flash-V100 design; generated reference check passed.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: controls remain in the Flash-V100 option parser; bridge remains limited to its existing FP8 KV-cache and head-dimension eligibility.\n\n## Test Result\n\nQwen3.8-27B QUASAR NVFP4, TP2, dual V100-SXM2-16GB. Memory after the same cold 30K/120K request sequence:\n\n| KV-head groups | Used MiB/card | Free MiB/card |\n|---|---:|---:|\n| 1 | 15533 | 612 |\n| 2 | 15373 | 772 |\n\nTwo groups saved 160 MiB per card in this measurement.\n\nThroughput: Qwen3.8-27B QUASAR NVFP4, dual V100 at 200 W/card; 30,063 cold prompt tokens, 128 generated tokens, three samples per state, prefix caching off. No sampled thermal-slowdown flags:\n\n| State | Prompt tok/s | Decode tok/s |\n|---|---:|---:|\n| Pinned upstream, before | 1587.6 | 17.31 |\n| Branch default | 1580.9 | 17.05 |\n| Pinned upstream, after | 1586.9 | 17.06 |\n\nThe 122 GPU cases and 46 CPU cases passed.\n",
+    "author": {
+      "login": "andrewleech"
+    },
+    "headRepository": {
+      "nameWithOwner": "andrewleech/1Cat-vLLM"
+    },
+    "headRefName": "upstream/fp8-bridge-head-groups",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1321,
+    "title": "flash-v100: Budget FP8 bridge workspace by KV-head group",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1321",
+    "isDraft": false,
+    "headRefOid": "7110faceace926ce92d6187bf996f5e1c666a3b2",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "docs/design/sm70_flash_v100_fp8_kv_long_context.md",
+      "tests/config/test_flash_v100_lifecycle.py",
+      "tests/kernels/attention/test_sm70_flash_v100_varlen_layout.py",
+      "tests/v1/attention/test_sm70_flash_v100_policy.py",
+      "vllm/config/flash_v100.py",
+      "vllm/v1/attention/backends/flash_v100/config.py",
+      "vllm/v1/attention/backends/flash_v100/dense_prefill.py",
+      "vllm/v1/attention/backends/flash_v100/impl.py",
+      "vllm/v1/attention/backends/flash_v100/prefill.py",
+      "vllm/v1/worker/gpu_model_runner.py",
+      "vllm/v1/worker/gpu_worker.py"
+    ],
+    "diff_bytes": 63801,
+    "diff_sha256": "431a0c3e57cc3e8a00b2046505311844c9c7c5e763f1337857478f4837592239"
+  },
+  "full_tree_diff_proof": null
+}
