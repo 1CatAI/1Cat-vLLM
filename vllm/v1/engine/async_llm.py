@@ -25,7 +25,12 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
+from vllm.outputs import (
+    STREAM_FINISHED,
+    STREAM_KEEPALIVE,
+    PoolingRequestOutput,
+    RequestOutput,
+)
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
@@ -538,6 +543,7 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        keepalive: bool = False,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -573,10 +579,31 @@ class AsyncLLM(EngineClient):
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
             finished = False
+            # Idle keep-alive: while the engine produces no token (long
+            # thinking / long prefill), emit a STREAM_KEEPALIVE sentinel every
+            # 15s so the API layer can keep the SSE stream alive instead of
+            # being cut off by an intermediary's idle timeout.
+            #
+            # The sentinel is visible to every consumer of this generator
+            # (chat/completion/responses/disagg/speech, 11 call sites), so it is
+            # opt-in: only callers that pass keepalive=True -- and therefore
+            # know how to skip it -- ever see it.
+            _KEEPALIVE_INTERVAL = 15.0
             while not finished:
                 # Note: drain queue without await if possible (avoids
                 # task switching under load which helps performance).
-                out = q.get_nowait() or await q.get()
+                out = q.get_nowait()
+                if out is None:
+                    if not keepalive:
+                        out = await q.get()
+                    else:
+                        try:
+                            out = await asyncio.wait_for(
+                                q.get(), timeout=_KEEPALIVE_INTERVAL
+                            )
+                        except asyncio.TimeoutError:
+                            yield STREAM_KEEPALIVE
+                            continue
 
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.

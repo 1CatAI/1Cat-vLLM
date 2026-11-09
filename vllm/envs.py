@@ -238,7 +238,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
     VLLM_RPC_TIMEOUT: int = 10000  # ms
-    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
+    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 600  # seconds
     VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_PLUGINS: list[str] | None = None
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
@@ -3100,13 +3100,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": env_var(
-        lambda: int(os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")),
+        # Default raised from 5s to 600s: during long thinking or code
+        # generation an intermediary's 5s idle timeout drops the connection,
+        # which surfaces as a streaming 502 or a reset. 600s covers long
+        # sessions.
+        lambda: int(os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "600")),
         description=(
             "Timeout in seconds for keeping HTTP connections alive in API server"
         ),
         category="configuration",
-        declared_default="5",
-        effective_default="5",
+        declared_default="600",
+        effective_default="600",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
