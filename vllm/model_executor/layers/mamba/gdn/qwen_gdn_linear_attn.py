@@ -3925,12 +3925,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
+                # Non-spec rows must read the **gathered** gate so they stay
+                # in step with their QKV rows. The gather used to happen only in
+                # the prefill branch below, so a pure-decode batch consumed the
+                # un-gathered gate -> misaligned gating -> wrong mamba state
+                # recurrence -> degenerate output (repetition loops) and draft
+                # tokens that never match.
+                a_non_spec, b_non_spec = None, None
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+                a_non_spec = a.index_select(0, non_spec_token_indx)
+                b_non_spec = b.index_select(0, non_spec_token_indx)
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+            a_non_spec, b_non_spec = a, b
 
         if mixed_qkv_non_spec is not None:
             _sm70_gdn_graph_buffer_copy(
@@ -4234,12 +4244,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
-            if spec_sequence_masks is not None:
-                a_non_spec = a.index_select(0, non_spec_token_indx)
-                b_non_spec = b.index_select(0, non_spec_token_indx)
-            else:
-                a_non_spec = a
-                b_non_spec = b
+            # a_non_spec / b_non_spec are gathered once at the spec/non-spec
+            # split above; do not re-derive them here.
 
             prefill_l2norm_in_kernel = self.gdn_preparation.legacy
             prefill_gate_is_exp = self.gdn_preparation.gate_is_exp
@@ -4522,8 +4528,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_non_spec, _last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a_non_spec,
+                    b=b_non_spec,
                     dt_bias=self.dt_bias,
                     q=query_non_spec,
                     k=key_non_spec,
