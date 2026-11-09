@@ -158,6 +158,9 @@ _TOOL_PARSERS_TO_REGISTER = {
         "pythonic_tool_parser",
         "PythonicToolParser",
     ),
+    # The two entries below are rewritten after this dict is defined, based on
+    # VLLM_TOOL_PARSER_IMPL. The upstream default is kept here so behaviour
+    # stays predictable if the variable cannot be read.
     "qwen3_coder": (
         "qwen3coder_tool_parser",
         "Qwen3CoderToolParser",
@@ -199,6 +202,36 @@ _TOOL_PARSERS_TO_REGISTER = {
         "ApertusToolParser",
     ),
 }
+
+
+# Selects the implementation behind qwen3_coder / qwen3_xml.
+#
+#   VLLM_TOOL_PARSER_IMPL=120 (default) -> the alternative implementation
+#                                         in *_120_tool_parser.py
+#   VLLM_TOOL_PARSER_IMPL=150           -> the upstream implementation below
+#
+# The two are independent modules and do not overwrite each other. Switching
+# requires an engine restart: once a module is imported it cannot be swapped.
+# To take only the switch mechanism without the alternative implementation,
+# delete the *_120_*.py modules and leave this default at "150".
+def _select_qwen3_parser_impl() -> str:
+    import os
+
+    impl = os.getenv("VLLM_TOOL_PARSER_IMPL", "120").strip().lower()
+    if impl not in ("120", "150"):
+        impl = "120"
+    return impl
+
+
+if _select_qwen3_parser_impl() == "120":
+    _TOOL_PARSERS_TO_REGISTER["qwen3_coder"] = (
+        "qwen3coder_120_tool_parser",
+        "Qwen3CoderToolParser",
+    )
+    _TOOL_PARSERS_TO_REGISTER["qwen3_xml"] = (
+        "qwen3xml_120_tool_parser",
+        "Qwen3XMLToolParser",
+    )
 
 
 def register_lazy_tool_parsers():
