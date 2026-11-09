@@ -13,6 +13,7 @@ from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
     GGUFOperatorCapability,
     admit_moe_fallback,
+    compact_expert_storage_capabilities,
     decoder_family,
     lattice_grouped_capabilities,
     raw_grouped_gate_up_capabilities,
@@ -182,7 +183,15 @@ direct_register_custom_op(
 
 
 class GGUFExpertBank(torch.nn.Module):
-    def __init__(self, source_type, experts, device, dtype, retain_raw=False):
+    def __init__(
+        self,
+        source_type,
+        experts,
+        device,
+        dtype,
+        retain_raw=False,
+        prefer_compact=False,
+    ):
         super().__init__()
         self.source_type = source_type
         self.experts = experts
@@ -192,6 +201,10 @@ class GGUFExpertBank(torch.nn.Module):
         self.pending: dict[int, Any] = {}
         self.capabilities: tuple[GGUFOperatorCapability, ...] = ()
         self.retain_raw = retain_raw
+        self.prefer_compact = prefer_compact
+        self.storage_layout = "canonical"
+        self.compact_rejection_reason: str | None = None
+        self.down_vector_batches: list[int] = []
         self.raw_pending: dict[int, torch.Tensor] = {}
         self.raw_capabilities: tuple[GGUFOperatorCapability, ...] = ()
 
@@ -208,6 +221,34 @@ class GGUFExpertBank(torch.nn.Module):
             self.pending[index] = local.to(self.device).contiguous()
             return
         source = weight.detach().cpu().numpy()
+        if self.prefer_compact:
+            raw = RawGGUFProjection.from_rows(source, self.source_type).tp_slice(
+                rank, size, axis=axis
+            )
+            n, k = raw.shape
+            capabilities = compact_expert_storage_capabilities(
+                self.source_type,
+                k,
+                n,
+                self.experts,
+                self.dtype,
+                is_sm70=current_platform.is_device_capability(70),
+            )
+            self.compact_rejection_reason = capabilities[0].reason
+            if self.compact_rejection_reason is None:
+                payload = n * raw.payload_bytes_per_row
+                encoded = torch.empty(payload, device=self.device, dtype=torch.uint8)
+                torch.ops._C.gguf_lattice_compact_reorder_sm70_out(
+                    encoded,
+                    torch.from_numpy(raw.data).to(self.device),
+                    self.source_type,
+                    k,
+                )
+                self.n, self.k, self.group = n, k, 32
+                self.storage_layout = "compact_original"
+                self.capabilities = capabilities
+                self.pending[index] = encoded
+                return
         canonical: LatticeGGUFProjection | Lut4GGUFProjection | AffineGGUFProjection
         if self.source_type in LATTICE_TYPES:
             canonical = transcode_lattice(source, self.source_type)
@@ -271,6 +312,11 @@ class GGUFExpertBank(torch.nn.Module):
         if set(self.pending) != set(range(self.experts)):
             raise ValueError("Incomplete canonical GGUF expert bank")
         prepared = [self.pending[i] for i in range(self.experts)]
+        if self.storage_layout == "compact_original":
+            self.register_buffer("weights", torch.stack(prepared), persistent=False)
+            self.pending.clear()
+            self.down_vector_batches = []
+            return
         if self.family == GGUFDecoderFamily.FLOAT:
             weights = pad_weight_tail(torch.stack(prepared), self.source_type)
             self.register_buffer("weights", weights, persistent=False)
@@ -311,7 +357,7 @@ class GGUFExpertBank(torch.nn.Module):
                         else f"operator_missing:{name}",
                     ),
                 )
-        self.down_vector_batches: list[int] = []
+        self.down_vector_batches = []
         if self.source_type in (20, 42):
             vector = small_grouped_vector_capabilities(
                 self.source_type,
@@ -338,6 +384,12 @@ class GGUFExpertBank(torch.nn.Module):
 
     def forward(self, x, offsets, ids):
         output = torch.empty((x.shape[0], self.n), dtype=x.dtype, device=x.device)
+        if self.storage_layout == "compact_original":
+            prefix = torch.empty_like(offsets)
+            getattr(torch.ops._C, self.capabilities[0].operator)(
+                output, x, self.weights, offsets, prefix, self.source_type
+            )
+            return output
         if self.family == GGUFDecoderFamily.FLOAT:
             op = getattr(torch.ops._C_gguf, self.capabilities[0].operator)
             return op(
@@ -407,6 +459,10 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 self.num_experts,
                 param.device,
                 self.params_dtype,
+                prefer_compact=self.native_enabled
+                and shard_id in ("w1", "w3")
+                and self.weight_types[shard_id] == 18
+                and layer.ep_size == 1,
                 retain_raw=self.native_enabled
                 and shard_id in ("w1", "w3")
                 and self.weight_types[shard_id] in (18, 21, 22),
@@ -490,6 +546,11 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             "projections": {
                 name: {
                     "source_type": quant_type_name(bank.source_type),
+                    "storage_layout": bank.storage_layout,
+                    "storage_bytes": sum(
+                        b.numel() * b.element_size() for b in bank.buffers()
+                    ),
+                    "compact_storage_reason": bank.compact_rejection_reason,
                     "shape": [bank.experts, bank.n, bank.k],
                     "operators": [asdict(c) for c in bank.capabilities],
                     "raw_gate_up_operators": [asdict(c) for c in bank.raw_capabilities],

@@ -358,6 +358,37 @@ def compact_lattice_grouped_capabilities(
     )
 
 
+def compact_expert_storage_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Measured IQ3_XXS expert geometry for one original-byte stored bank."""
+    capabilities = compact_lattice_grouped_capabilities(
+        source_type, k, n, num_experts, dtype, enabled
+    )
+    reason = capabilities[0].reason
+    if reason is None and not is_sm70:
+        reason = "requires_sm70"
+    if reason is None and (source_type, k, n, num_experts) != (18, 2560, 160, 512):
+        reason = "compact_expert_storage_shape_has_no_calibration"
+    if reason is None and not hasattr(
+        torch.ops._C, "gguf_lattice_compact_reorder_sm70_out"
+    ):
+        reason = "compact_reorder_operator_unavailable"
+    return tuple(
+        GGUFOperatorCapability(
+            c.family, c.source_type, c.operator, c.graph_safe, c.min_m, c.max_m, reason
+        )
+        for c in capabilities
+    )
+
+
 def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
     reason = None
     if not enabled:
