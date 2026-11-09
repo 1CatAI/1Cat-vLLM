@@ -199,5 +199,20 @@ def test_prepare_weights_fails_when_an_indexed_shard_is_missing(tmp_path) -> Non
         {"main.weight": "model.safetensors", "gone.weight": "model-00002.safetensors"},
     )
 
+    with pytest.raises(FileNotFoundError, match="model-00002.safetensors"):
+        _prepare(tmp_path, load_format="safetensors")
+
+
+def test_prepare_weights_fails_when_an_indexed_shard_is_not_selected(
+    tmp_path,
+) -> None:
+    # The shard exists but no allow pattern reaches it.
+    save_file({"main.weight": torch.tensor([1.0])}, tmp_path / "model.safetensors")
+    save_file({"gone.weight": torch.tensor([2.0])}, tmp_path / "extra.bin.st")
+    _write_index(
+        tmp_path,
+        {"main.weight": "model.safetensors", "gone.weight": "extra.bin.st"},
+    )
+
     with pytest.raises(RuntimeError, match="would not be loaded"):
         _prepare(tmp_path, load_format="safetensors")

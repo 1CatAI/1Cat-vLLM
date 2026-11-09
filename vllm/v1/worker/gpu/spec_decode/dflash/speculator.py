@@ -15,6 +15,7 @@ from vllm.diagnostics import diagnostic_channel, diagnostics_for
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.runtime_resources import share_runtime_resources
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -270,7 +271,7 @@ class DFlashSpeculator(DraftModelSpeculator):
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
-        return replace(
+        derived = replace(
             self.vllm_config,
             is_speculative_draft=True,
             model_config=self.draft_model_config,
@@ -280,6 +281,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 use_non_causal=self.requires_non_causal,
             ),
         )
+        return share_runtime_resources(derived, self.vllm_config)
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL

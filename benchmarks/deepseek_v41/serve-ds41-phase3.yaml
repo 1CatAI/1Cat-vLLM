@@ -61,4 +61,4 @@ kernel-config:
     embedding_storage: original
     prefill_min_m: 1
     dequant_workspace_bytes: 33554432
-api-key: sk-ds41-dNCMTcG1OUSl
+# Set an API key at launch: --api-key <key> or the VLLM_API_KEY environment variable.

@@ -78,6 +78,7 @@ repos:
         --no-emit-package, cupy-cuda12x,
         # nvidia packages (unsuffixed / unified naming)
         --no-emit-package, nvidia-cublas,
+        --no-emit-package, nvidia-cuda-cccl,
         --no-emit-package, nvidia-cuda-cupti,
         --no-emit-package, nvidia-cuda-nvrtc,
         --no-emit-package, nvidia-cuda-runtime,
@@ -357,6 +358,19 @@ repos:
     require_serial: true
     stages: [pre-commit] # Only run locally as Buildkite will cover this
     files: ^rust/.*(\.rs|Cargo\.toml|rustfmt\.toml)$
+  - id: check-expert-cache-resolve
+    name: Keep every routed-expert cache call-compatible with the MoE dispatch
+    entry: python tools/pre_commit/check_expert_cache_resolve.py
+    language: python
+    pass_filenames: false
+    always_run: true
+  - id: test-expert-cache-resolve
+    name: Test the routed-expert cache resolve check
+    entry: python -m pytest --confcutdir=tests/tools -q tests/tools/test_expert_cache_resolve.py
+    language: python
+    pass_filenames: false
+    always_run: true
+    additional_dependencies: [pytest]
   # Keep `suggestion` last
   - id: suggestion
     name: Suggestion

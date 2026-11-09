@@ -31,6 +31,9 @@ __global__ void qwen38_shared_gate_exact_kernel(
   constexpr int kValuesPerThread =
       kQwen38SharedGateHidden / kQwen38SharedGateThreads;
   const int tid = threadIdx.x;
+  // One block per row: every verification row reproduces the M1 gate.
+  output += blockIdx.x * kQwen38SharedGateHidden;
+  input += blockIdx.x * kQwen38SharedGateHidden;
   float value = 0.0f;
 #pragma unroll
   for (int item = 0; item < kValuesPerThread; ++item) {
@@ -1418,16 +1421,16 @@ void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
   TORCH_CHECK(
       out.is_contiguous() && input.is_contiguous() && weight.is_contiguous(),
       "qwen38_shared_gate_exact_out: tensors must be contiguous");
-  TORCH_CHECK(out.sizes() == torch::IntArrayRef({1, 2560}) &&
-                  input.sizes() == torch::IntArrayRef({1, 2560}) &&
+  TORCH_CHECK(out.dim() == 2 && out.size(0) >= 1 && out.size(0) <= 80 &&
+                  out.size(1) == 2560 && input.sizes() == out.sizes() &&
                   weight.sizes() == torch::IntArrayRef({1, 2560}),
-              "qwen38_shared_gate_exact_out: expected M1/N1/K2560 tensors");
+              "qwen38_shared_gate_exact_out: expected M1-80/N1/K2560 tensors");
   TORCH_CHECK(out.get_device() == input.get_device() &&
                   out.get_device() == weight.get_device(),
               "qwen38_shared_gate_exact_out: device mismatch");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  qwen38_shared_gate_exact_kernel<<<1, kQwen38SharedGateThreads, 0,
+  qwen38_shared_gate_exact_kernel<<<out.size(0), kQwen38SharedGateThreads, 0,
                                     at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(input.data_ptr<at::Half>()),

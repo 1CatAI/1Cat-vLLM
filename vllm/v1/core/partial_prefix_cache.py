@@ -32,12 +32,36 @@ order, or when the block pool runs short.
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 
-# (parent full-block hash or None, tail tokens, cache salt, LoRA id)
-PartialKey = tuple[BlockHash | None, tuple[int, ...], str | None, int]
+# (parent full-block hash or None, tail tokens, cache salt, LoRA id, tail
+# multimodal items)
+PartialKey = tuple[
+    BlockHash | None,
+    tuple[int, ...],
+    str | None,
+    int,
+    tuple[tuple[str, int], ...],
+]
+
+
+def tail_mm_items(
+    mm_features: Sequence[Any] | None, start: int, end: int
+) -> tuple[tuple[str, int], ...]:
+    """``(identifier, offset)`` of the multimodal items overlapping ``[start, end)``.
+
+    Placeholder tokens are the same for every image of a given size, so the
+    tail tokens alone do not identify what a request's tail contains.
+    """
+    return tuple(
+        (feature.identifier, feature.mm_position.offset - start)
+        for feature in mm_features or ()
+        if feature.mm_position.offset < end
+        and start < feature.mm_position.offset + feature.mm_position.length
+    )
 
 
 @dataclass
@@ -107,6 +131,7 @@ class PartialPrefixCache:
         cache_salt: str | None,
         lora_id: int,
         current_step: int,
+        mm_features: Sequence[Any] | None = None,
     ) -> PartialEntry | None:
         """Longest ready entry under ``parent`` whose tail matches ``tokens``.
 
@@ -125,7 +150,10 @@ class PartialPrefixCache:
             ):
                 continue
             tail = key[1]
-            if tuple(tokens[block_start : block_start + len(tail)]) == tail:
+            if tuple(tokens[block_start : block_start + len(tail)]) == tail and (
+                key[4]
+                == tail_mm_items(mm_features, block_start, block_start + len(tail))
+            ):
                 best = entry
         if best is not None:
             self.entries.move_to_end(best.key)

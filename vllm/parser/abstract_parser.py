@@ -587,6 +587,18 @@ class DelegatingParser(Parser):
         tool_call_id_type: str = "random",
         function_name_returned: bool = False,
     ) -> tuple[DeltaMessage | None, bool]:
+        if request.tool_choice == "none":
+            # Like the non-streaming path, return tool-call markup as content
+            # instead of parsing calls the request does not allow
+            # (vllm-project/vllm#42752). An empty delta after some text keeps
+            # the empty content that qwen3_coder returns for plain text, so
+            # content-only streams keep their final chunk.
+            if delta_text:
+                return DeltaMessage(content=delta_text), False
+            if delta_token_ids and current_text:
+                return DeltaMessage(content=""), False
+            return None, False
+
         assert self._tool_parser is not None
         supports_required_and_named = self._tool_parser.supports_required_and_named
         if (
@@ -731,9 +743,11 @@ class DelegatingParser(Parser):
             if (
                 delta_message
                 and delta_message.tool_calls
-                and delta_message.tool_calls[0].id is not None
+                and any(tc.id is not None for tc in delta_message.tool_calls)
             ):
-                state.history_tool_call_cnt += 1
+                state.history_tool_call_cnt += sum(
+                    tc.id is not None for tc in delta_message.tool_calls
+                )
 
         # No phase active: pass through as content
         if (

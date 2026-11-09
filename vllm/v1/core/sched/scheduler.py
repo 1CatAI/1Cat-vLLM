@@ -39,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import is_lookahead_block_hashing_enabled
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import (
@@ -264,16 +265,25 @@ class Scheduler(SchedulerInterface):
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
+        self.use_lookahead_block_hashes = is_lookahead_block_hashing_enabled(
+            vllm_config
+        )
+        # Lookahead hashes prove the boundary token, so EAGLE needs no drop.
+        self.use_eagle_block_drop = (
+            self.use_eagle and not self.use_lookahead_block_hashes
+        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
+        self.hash_block_size = hash_block_size
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.use_eagle_block_drop,
+            use_lookahead_block_hashes=self.use_lookahead_block_hashes,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -449,6 +459,17 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _short_prompt_chunk_cap(self, num_uncached_tokens: int) -> int:
+        """Chunk cap for a request taken from the waiting queue.
+
+        Its uncached prompt part decides: below short_prompt_threshold the
+        prefill runs in short_prompt_chunk_tokens chunks, which shorten the
+        pipeline fill and drain; longer prefills keep the whole budget.
+        """
+        if 0 < num_uncached_tokens < self.scheduler_config.short_prompt_threshold:
+            return self.scheduler_config.short_prompt_chunk_tokens
+        return 0
+
     def _balanced_prefill_chunk(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
@@ -503,7 +524,7 @@ class Scheduler(SchedulerInterface):
         # unreachable state whenever the request length is block aligned.
         last_token = request.num_tokens - 1
         last_cache_position = last_token - last_token % block_size
-        if self.use_eagle:
+        if self.use_eagle_block_drop:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -712,6 +733,17 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if (
+                num_new_tokens < 0
+                and self.use_pp
+                and not self.scheduler_config.async_scheduling
+            ):
+                # PP>1 without async scheduling: a verify step of this request
+                # is still in flight. Scheduling counted its draft rows as
+                # computed, but its sampled tokens are not appended yet, so the
+                # count goes negative. Same case as 1.(1) below: wait for it.
+                req_index += 1
+                continue
             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
                 request
             )
@@ -761,6 +793,8 @@ class Scheduler(SchedulerInterface):
                     )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if 0 < request.prefill_chunk_cap < num_new_tokens:
+                num_new_tokens = request.prefill_chunk_cap
             num_new_tokens = min(num_new_tokens, token_budget)
             num_new_tokens = self._balanced_prefill_chunk(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1034,6 +1068,8 @@ class Scheduler(SchedulerInterface):
                                 request, num_new_local_computed_tokens
                             )
                         )
+                        if request.skip_reading_prefix_cache:
+                            ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -1085,8 +1121,13 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    request.prefill_chunk_cap = self._short_prompt_chunk_cap(
+                        num_new_tokens
+                    )
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    if 0 < request.prefill_chunk_cap < num_new_tokens:
+                        num_new_tokens = request.prefill_chunk_cap
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1323,10 +1364,11 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
+        # Drain new attention block ids every step so the manager-side list
+        # does not grow unbounded; only kv-cache zeroing consumes them.
+        new_attn_block_ids = self.kv_cache_manager.take_new_block_ids()
         new_block_ids_to_zero = (
-            (self.kv_cache_manager.take_new_block_ids() or None)
-            if self.needs_kv_cache_zeroing
-            else None
+            (new_attn_block_ids or None) if self.needs_kv_cache_zeroing else None
         )
         # A Mamba ``align`` table is not append-only. Drain exact committed
         # boundary-state block IDs before the connector builds store jobs.
@@ -1483,6 +1525,10 @@ class Scheduler(SchedulerInterface):
             session.num_prompt_tokens : num_computed_tokens
         ]
         del session._all_token_ids[num_computed_tokens:]
+        # A block hash covering a discarded token is stale; a lookahead hash
+        # also covers the token after its block.
+        num_hashed_tokens = num_computed_tokens - int(self.use_lookahead_block_hashes)
+        del session.block_hashes[max(num_hashed_tokens, 0) // self.hash_block_size :]
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
@@ -1898,6 +1944,18 @@ class Scheduler(SchedulerInterface):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            if (
+                self.use_lookahead_block_hashes
+                and stopped
+                and status_before_stop == RequestStatus.RUNNING
+            ):
+                # The last sampled token is the lookahead token of the block
+                # before it, which no later allocation will publish.
+                self.kv_cache_manager.cache_blocks(
+                    request,
+                    request.num_computed_tokens - request.num_in_flight_tokens,
+                )
 
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids

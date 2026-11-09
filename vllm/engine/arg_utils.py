@@ -561,6 +561,8 @@ class EngineArgs:
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
     mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+    short_prompt_chunk_tokens: int = SchedulerConfig.short_prompt_chunk_tokens
+    short_prompt_threshold: int = SchedulerConfig.short_prompt_threshold
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
@@ -1458,6 +1460,14 @@ class EngineArgs:
             "--mixed-prefill-min-tokens",
             **scheduler_kwargs["mixed_prefill_min_tokens"],
         )
+        scheduler_group.add_argument(
+            "--short-prompt-chunk-tokens",
+            **scheduler_kwargs["short_prompt_chunk_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--short-prompt-threshold",
+            **scheduler_kwargs["short_prompt_threshold"],
+        )
         # are no longer supported.
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
@@ -2323,6 +2333,8 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+            short_prompt_chunk_tokens=self.short_prompt_chunk_tokens,
+            short_prompt_threshold=self.short_prompt_threshold,
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),

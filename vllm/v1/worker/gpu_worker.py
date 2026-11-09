@@ -489,7 +489,11 @@ class Worker(WorkerBase):
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
+            (
+                self._scoped_allocator_max_split(max_split_size_mb=20)
+                if envs.VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE
+                else nullcontext()
+            ),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
@@ -515,7 +519,6 @@ class Worker(WorkerBase):
             )
         self.model_runner.reload_weights(*args, **kwargs)
 
-    @torch.inference_mode()
     def _prefill_graph_reserve(self, activation_peak: int) -> int:
         """Graph pool bytes to keep out of the KV budget without the estimator.
 
@@ -546,6 +549,7 @@ class Worker(WorkerBase):
         )
         return max(0, activation_peak)
 
+    @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.

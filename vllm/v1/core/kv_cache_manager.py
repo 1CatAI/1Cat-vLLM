@@ -13,7 +13,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize, KVCacheBlock
-from vllm.v1.core.partial_prefix_cache import PartialEntry, PartialPrefixCache
+from vllm.v1.core.partial_prefix_cache import (
+    PartialEntry,
+    PartialPrefixCache,
+    tail_mm_items,
+)
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     MambaManager,
@@ -132,6 +136,7 @@ class KVCacheManager:
         max_in_flight_tokens: int | None = None,
         enable_caching: bool = True,
         use_eagle: bool = False,
+        use_lookahead_block_hashes: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
@@ -167,6 +172,7 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            use_lookahead_block_hashes=use_lookahead_block_hashes,
         )
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
@@ -282,6 +288,7 @@ class KVCacheManager:
             tuple(request.all_token_ids[block_start:boundary]),
             request.cache_salt,
             lora_id,
+            tail_mm_items(request.mm_features, block_start, boundary),
         )
 
     def _partial_block_range(self, manager, boundary: int) -> tuple[int, int]:
@@ -336,6 +343,7 @@ class KVCacheManager:
                 request.cache_salt,
                 lora_id,
                 self._step,
+                request.mm_features,
             )
             if entry is not None and entry.length > hit_length:
                 break
@@ -733,9 +741,7 @@ class KVCacheManager:
         # "finalized" tokens are cached.
         num_tokens_to_cache = min(
             total_computed_tokens + num_new_tokens,
-            request.num_tokens
-            if request.cache_output_tokens
-            else request.num_prompt_tokens,
+            request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 

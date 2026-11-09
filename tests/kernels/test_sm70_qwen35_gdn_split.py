@@ -9,7 +9,35 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 )
 from vllm.model_executor.models.qwen3_5 import (
     _sm70_materialize_qwen35_gdn_splits,
+    _sm70_qwen35_gdn_split_kernel,
 )
+
+
+def test_qwen35_gdn_split_new_lengths_reuse_the_compiled_kernel():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the Qwen3.5 GDN split kernel")
+
+    qkv_size, z_size, ba_size = 2560, 1536, 12
+    qkvz = torch.randn((1403, qkv_size + z_size), dtype=torch.float16, device="cuda")
+    ba = torch.randn((1403, 2 * ba_size), dtype=torch.float16, device="cuda")
+
+    def compiled():
+        return sum(
+            len(kernels)
+            for kernels, *_ in _sm70_qwen35_gdn_split_kernel.device_caches.values()
+        )
+
+    _sm70_materialize_qwen35_gdn_splits(qkvz[:5], ba[:5], qkv_size, z_size, ba_size)
+    before = compiled()
+    for rows in (7, 16, 758, 1403):
+        z, b, a = _sm70_materialize_qwen35_gdn_splits(
+            qkvz[:rows], ba[:rows], qkv_size, z_size, ba_size
+        )
+        torch.accelerator.synchronize()
+        assert torch.equal(z, qkvz[:rows, qkv_size:])
+        assert torch.equal(b, ba[:rows, :ba_size])
+        assert torch.equal(a, ba[:rows, ba_size:])
+    assert compiled() == before
 
 
 @pytest.mark.parametrize("num_rows", [1, 8, 32])

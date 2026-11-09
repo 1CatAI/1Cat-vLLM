@@ -154,6 +154,11 @@ class Request:
         # optimistically.
         self.num_in_flight_tokens = 0
 
+        # Prefill chunk cap the scheduler sets when it takes the request from
+        # the waiting queue (SchedulerConfig.short_prompt_chunk_tokens); zero
+        # leaves the whole token budget.
+        self.prefill_chunk_cap = 0
+
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
@@ -174,10 +179,6 @@ class Request:
         )
         # Partial prefix-cache entry selected by the last cache lookup.
         self.partial_prefix_entry: Any = None
-        # A request that starts in reasoning (thinking) mode: chat templates
-        # drop the reasoning from later turns, so its output blocks can never
-        # be a prefix of another request and are not cached.
-        self.cache_output_tokens = reasoning_ended is not False
 
         # Multi-modal related
         self.mm_features = mm_features or []

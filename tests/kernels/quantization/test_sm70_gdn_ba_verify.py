@@ -83,6 +83,10 @@ def test_verify_fusion_reaches_qwen35_override(monkeypatch):
         num_v_heads=48,
         head_v_dim=128,
         prefix="test.layer",
+        # Keep the fused projection's QKV view: the recurrent stub checks its identity.
+        gdn_policy=SimpleNamespace(
+            projection=SimpleNamespace(mixed_qkv_contiguous=False)
+        ),
     )
     calls = []
 
@@ -103,6 +107,9 @@ def test_verify_fusion_reaches_qwen35_override(monkeypatch):
         return core
 
     layer._output_projection = project
+    layer._allocate_core_attn_out = lambda mixed_qkv, a, b, hidden: x.new_zeros(
+        8, 12, 128
+    )
     monkeypatch.setattr(ba, "apply_gdn_ba_verify", fused)
     monkeypatch.setattr(qwen3_5, "_qwen_gdn_run_recurrent_core", recurrent)
     result = qwen3_5.Qwen3_5GatedDeltaNet.forward_cuda(layer, x, None)

@@ -16,6 +16,14 @@ import struct
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+# Linux ABI values. Standalone CPython builds compiled against old kernel headers
+# leave these out of ``fcntl`` even though the kernel supports them.
+_F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+_F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+_F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+_F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+_F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+
 _HANDLE = struct.Struct("!IQQQ")
 _VERSION = 1
 
@@ -43,8 +51,8 @@ class SharedHostArena:
                 raise ValueError("Shared host file identity does not match its handle")
             if info.st_size <= 0 or info.st_size % mmap.PAGESIZE:
                 raise ValueError("Shared host arena must have a page-aligned size")
-            required = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK
-            if fcntl.fcntl(fd, fcntl.F_GET_SEALS) & required != required:
+            required = _F_SEAL_GROW | _F_SEAL_SHRINK
+            if fcntl.fcntl(fd, _F_GET_SEALS) & required != required:
                 raise ValueError("Shared host arena size is not sealed")
             self.buffer = mmap.mmap(
                 fd,
@@ -69,8 +77,8 @@ class SharedHostArena:
             os.ftruncate(fd, size)
             fcntl.fcntl(
                 fd,
-                fcntl.F_ADD_SEALS,
-                fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL,
+                _F_ADD_SEALS,
+                _F_SEAL_GROW | _F_SEAL_SHRINK | _F_SEAL_SEAL,
             )
         except BaseException:
             os.close(fd)

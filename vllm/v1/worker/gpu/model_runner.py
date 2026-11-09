@@ -437,7 +437,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     torch.accelerator.memory_allocated(),
                     torch.accelerator.memory_reserved(),
                 )
-                logger.info(
+                logger.debug(
                     "Target CUDA storage before speculative loading: %s",
                     loaded_cuda_model_storage({"target": self.model}),
                 )
@@ -1259,9 +1259,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if num_reqs_padded > num_reqs:
                 prefix_anchor_lens[num_reqs:].zero_()
 
-        max_seq_len_np = (
-            self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None
-        )
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -1284,7 +1281,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefill_len_np=prefill_len_np,
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
-            max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             logits_indices=logits_indices,
@@ -2004,6 +2000,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.use_async_scheduling:
             return async_output
+        if self.use_pp and self.num_speculative_steps:
+            model_runner_output.set_draft_token_ids(self.take_draft_token_ids())
         return async_output.get_output()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

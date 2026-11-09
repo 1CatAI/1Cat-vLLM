@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from PIL import Image
+import contextlib
+
+from PIL import Image, ImageOps
+
+
+def normalize_image(image: Image.Image) -> Image.Image:
+    """Apply EXIF orientation, tolerating malformed optional metadata."""
+    with contextlib.suppress(Exception):
+        image = ImageOps.exif_transpose(image)
+    return image
 
 
 def rescale_image_size(
@@ -27,10 +36,16 @@ def rgba_to_rgb(
     return converted
 
 
-def convert_image_mode(image: Image.Image, to_mode: str):
+def convert_image_mode(
+    image: Image.Image,
+    to_mode: str,
+    background_color: tuple[int, int, int] | list[int] = (255, 255, 255),
+) -> Image.Image:
+    # Test transparency before the same-mode shortcut: RGB PNGs can carry tRNS.
+    if to_mode == "RGB" and (
+        image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info
+    ):
+        return rgba_to_rgb(image.convert("RGBA"), background_color)
     if image.mode == to_mode:
         return image
-    elif image.mode == "RGBA" and to_mode == "RGB":
-        return rgba_to_rgb(image)
-    else:
-        return image.convert(to_mode)
+    return image.convert(to_mode)

@@ -731,6 +731,75 @@ def indexed_shards_not_selected(
     )
 
 
+_SHARD_NAME = re.compile(r"^(?P<stem>.+)-(?P<idx>\d+)-of-(?P<total>\d+)\.safetensors$")
+
+
+def raise_on_missing_safetensors_shards(
+    hf_folder: str,
+    index_file: str,
+    hf_weights_files: list[str],
+    ignore_patterns: list[str] | str | None = None,
+    check_index: bool = True,
+) -> None:
+    """Fail before loading when a sharded safetensors checkpoint is incomplete.
+
+    With a checkpoint index, every file its ``weight_map`` names must exist
+    (``check_index=False`` skips this, for callers that load a deliberate
+    subset). Without an index, each ``<stem>-NNNNN-of-MMMMM.safetensors``
+    family among ``hf_weights_files`` must have all ``MMMMM`` members. Files
+    that match ``ignore_patterns`` may be absent. Only file names are checked;
+    no tensor data is read.
+    """
+    if isinstance(ignore_patterns, str):
+        ignore_patterns = [ignore_patterns]
+    ignore_patterns = ignore_patterns or []
+
+    def ignored(rel_path: str) -> bool:
+        return any(fnmatch.fnmatch(rel_path, pat) for pat in ignore_patterns)
+
+    shards = _index_shards(hf_folder, index_file)
+    if shards is not None:
+        if not check_index:
+            return
+        missing = sorted(
+            shard
+            for shard in shards
+            if not ignored(shard) and not os.path.isfile(os.path.join(hf_folder, shard))
+        )
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing)} safetensors shard(s) named by "
+                f"{os.path.join(hf_folder, index_file)} are missing: {missing[:8]}"
+            )
+        return
+
+    families: dict[tuple[str, str, int, int], set[int]] = defaultdict(set)
+    for path in hf_weights_files:
+        match = _SHARD_NAME.match(os.path.basename(path))
+        if match is None:
+            continue
+        total = int(match["total"])
+        key = (os.path.dirname(path), match["stem"], len(match["idx"]), total)
+        families[key].add(int(match["idx"]))
+    missing = []
+    for (folder, stem, width, total), present in sorted(families.items()):
+        for idx in range(1, total + 1):
+            if idx in present:
+                continue
+            name = f"{stem}-{idx:0{width}d}-of-{total:0{width}d}.safetensors"
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                continue
+            if ignored(os.path.relpath(path, hf_folder)):
+                continue
+            missing.append(path)
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} safetensors shard(s) missing from {hf_folder} "
+            f"(no {index_file}): {[os.path.basename(m) for m in missing[:8]]}"
+        )
+
+
 def get_safetensors_index_weights_by_file(
     hf_folder: str, index_file: str, hf_weights_files: list[str]
 ) -> dict[str, set[str]] | None:

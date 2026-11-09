@@ -8,7 +8,11 @@ from vllm.entrypoints.openai.chat_completion.serving import _PrefixCacheBoundari
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.core.partial_prefix_cache import PartialEntry, PartialPrefixCache
+from vllm.v1.core.partial_prefix_cache import (
+    PartialEntry,
+    PartialPrefixCache,
+    tail_mm_items,
+)
 from vllm.v1.request import PREFIX_CACHE_BOUNDARY_ALIGNMENT, Request
 
 pytestmark = pytest.mark.cpu_test
@@ -29,9 +33,9 @@ def test_lookup_returns_longest_ready_matching_tail():
     pool = BlockPool(num_gpu_blocks=16, enable_caching=True, hash_block_size=4)
     cache = PartialPrefixCache(block_pool=pool, max_blocks=16)
     parent = BlockHash(b"parent")
-    cache.insert(_entry(pool, (parent, (1, 2), None, 0), 6, ready_step=1))
-    cache.insert(_entry(pool, (parent, (1, 2, 3), None, 0), 7, ready_step=1))
-    cache.insert(_entry(pool, (parent, (1, 9), None, 0), 6, ready_step=1))
+    cache.insert(_entry(pool, (parent, (1, 2), None, 0, ()), 6, ready_step=1))
+    cache.insert(_entry(pool, (parent, (1, 2, 3), None, 0, ()), 7, ready_step=1))
+    cache.insert(_entry(pool, (parent, (1, 9), None, 0, ()), 6, ready_step=1))
     tokens = [0, 0, 0, 0, 1, 2, 3, 4]
     hit = cache.lookup(parent, tokens, 4, 7, None, 0, current_step=2)
     assert hit is not None and hit.length == 7
@@ -46,7 +50,7 @@ def test_lookup_returns_longest_ready_matching_tail():
 def test_entry_is_not_used_in_the_step_whose_copy_fills_it():
     pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=4)
     cache = PartialPrefixCache(block_pool=pool, max_blocks=8)
-    cache.insert(_entry(pool, (None, (5,), None, 0), 1, ready_step=3))
+    cache.insert(_entry(pool, (None, (5,), None, 0, ()), 1, ready_step=3))
     assert cache.lookup(None, [5, 6], 0, 1, None, 0, current_step=3) is None
     assert cache.lookup(None, [5, 6], 0, 1, None, 0, current_step=4) is not None
 
@@ -55,11 +59,11 @@ def test_eviction_releases_block_references():
     pool = BlockPool(num_gpu_blocks=9, enable_caching=True, hash_block_size=4)
     free_before = pool.get_num_free_blocks()
     cache = PartialPrefixCache(block_pool=pool, max_blocks=4)
-    cache.insert(_entry(pool, (None, (1,), None, 0), 1, ready_step=0))
-    cache.insert(_entry(pool, (None, (2,), None, 0), 1, ready_step=0))
-    cache.insert(_entry(pool, (None, (3,), None, 0), 1, ready_step=0))
+    cache.insert(_entry(pool, (None, (1,), None, 0, ()), 1, ready_step=0))
+    cache.insert(_entry(pool, (None, (2,), None, 0, ()), 1, ready_step=0))
+    cache.insert(_entry(pool, (None, (3,), None, 0, ()), 1, ready_step=0))
     # Bounded by max_blocks: the oldest entry is gone and its blocks are free.
-    assert not cache.contains((None, (1,), None, 0))
+    assert not cache.contains((None, (1,), None, 0, ()))
     assert cache.num_blocks == 4
     assert pool.get_num_free_blocks() == free_before - 4
     cache.clear()
@@ -67,7 +71,7 @@ def test_eviction_releases_block_references():
     assert pool.get_num_free_blocks() == free_before
 
 
-def _request(boundaries, reasoning_ended=None):
+def _request(boundaries):
     return Request(
         request_id="r",
         prompt_token_ids=list(range(1000)),
@@ -75,7 +79,6 @@ def _request(boundaries, reasoning_ended=None):
             max_tokens=4, extra_args={"prefix_cache_boundaries": boundaries}
         ),
         pooling_params=None,
-        reasoning_ended=reasoning_ended,
     )
 
 
@@ -83,12 +86,6 @@ def test_request_boundaries_align_to_recurrent_chunks():
     align = PREFIX_CACHE_BOUNDARY_ALIGNMENT
     request = _request([align - 1, align + 5, 3 * align, 999, 1000, 5000])
     assert request.prefix_cache_boundaries == (align, 3 * align, 999 // align * align)
-
-
-def test_reasoning_requests_do_not_cache_output_tokens():
-    assert not _request([], reasoning_ended=False).cache_output_tokens
-    assert _request([], reasoning_ended=True).cache_output_tokens
-    assert _request([]).cache_output_tokens
 
 
 class _Tokenizer:
@@ -137,3 +134,32 @@ def test_chat_boundaries_skip_prompts_that_do_not_match():
     tokenizer = _Tokenizer()
     request = SimpleNamespace(messages=[{"role": "user", "content": "hi"}], tools=None)
     assert _PrefixCacheBoundaries()(tokenizer, request, [1, 2, 3], None, {}) == []
+
+
+def _image(identifier, offset, length):
+    return SimpleNamespace(
+        identifier=identifier,
+        mm_position=SimpleNamespace(offset=offset, length=length),
+    )
+
+
+def test_tail_mm_items_only_reports_items_overlapping_the_tail():
+    features = [_image("a", 0, 4), _image("b", 6, 4), _image("c", 20, 4)]
+    assert tail_mm_items(features, 4, 12) == (("b", 2),)
+    assert tail_mm_items(features, 2, 8) == (("a", -2), ("b", 4))
+    assert tail_mm_items(None, 0, 8) == ()
+
+
+def test_same_placeholder_tokens_with_another_image_do_not_hit():
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=4)
+    cache = PartialPrefixCache(pool, max_blocks=8)
+    tokens = [5, 9, 9, 9, 6]
+    tail = tuple(tokens)
+    first = [_image("first", 1, 3)]
+    key = (None, tail, None, 0, tail_mm_items(first, 0, len(tail)))
+    cache.insert(_entry(pool, key, len(tail), 1))
+    assert cache.lookup(None, tokens, 0, 5, None, 0, 2, first) is not None
+    assert (
+        cache.lookup(None, tokens, 0, 5, None, 0, 2, [_image("second", 1, 3)]) is None
+    )
+    assert cache.lookup(None, tokens, 0, 5, None, 0, 2) is None
