@@ -1,0 +1,104 @@
+{
+  "initial_inventory": {
+    "number": 1176,
+    "title": "[Kernel] Share QSA scoring and tile query rows",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1176",
+    "isDraft": true,
+    "headRefOid": "f0a3f3c91e91afb1bbfcef28858d97231a901463",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1176,
+    "title": "[Kernel] Share QSA scoring and tile query rows",
+    "body": "## Purpose\n\nCompatible QSA inputs lost shared-key acceleration above eight query rows, and the provider was owned by a model module. Move tensor admission/loading into the common attention provider, retain the former model import as a forwarding facade, and tile the existing eight-row CUDA kernel over query rows. Arithmetic, causal masking, FP16/H4/D128 and the single-request contract remain unchanged. Older binaries retain their M<=8 fallback.\n\nThe existing benchmark now separates query count, actual live length and capacity, observes native calls, and checks numerical/selection semantics with explicit bounds. The architecture map provides an eight-family consolidation queue through existing owners. Related rules PR #1174 covers development policy; this PR supplies the first implementation and GPU evidence.\n\nBase: `be3722bc095b9792bf9833068595f0b1ef70ad37`. Native source: `6d3c789a1f8370e5c4ba71bbe17d093e20c23810`; subsequent changes cover benchmarks and evidence.\n\n**Keep Draft:** the measured operator/caller range is qualified. Full-model task quality, startup parity, production decode speed and 35B AWQ/FP8 parity remain unmeasured. Installing the new native binary expands the existing default switch's eligible range; wider default promotion requires that remaining evidence. The native maximum is a launch bound, not a measured performance envelope.\n\n## Test Plan and Result\n\n- CPU admission and old-binary metadata compatibility: **22 passed** (`--confcutdir=tests/v1/attention`, `test_sm70_qsa_shared_key_admission.py`).\n- GPU suite: **all 19 distinct cases passed**. The initial `--confcutdir=tests/kernels -q -x tests/kernels/test_sm70_qsa_shared_key.py` run passed 14 controls and stopped because the partial build lacked the standard Top-K extension. After completing that build, the selector case passed; the four remaining negative-position/query-tile cases passed separately. Completed controls were not rerun.\n- Normal packaged `_sm70_qsa_indexer_C`, `_C` and `_C_stable_libtorch` CMake builds/installations: **passed**. Fresh GPU processes load these owned modules and preserve legacy/public function identity; resolved dependency paths are recorded. No sidecar, private native-library overlay or platform patch is used.\n- Ten scorer comparisons: M8/9/17/33/65 at real 32K and 256K prefixes, one request, 12 synthetic layers, 204-key pages. All observe 12 native dispatcher calls. All **116,767,152** compared scores meet `rtol=2e-6, atol=1e-5`; maximum absolute difference is `9.5367431640625e-6`.\n- Two full existing score-to-selection comparisons at M17: measured below. A focused negative-control check rejects corrupted tails and a non-Top-K block while admitting the observed rounding-boundary exchange.\n- Applicable final commit hooks and whitespace checks: **passed** at qualification commit `f0a3f3c91e91afb1bbfcef28858d97231a901463`; no hooks bypassed.\n\n## Measured range\n\nSingle Tesla V100-SXM2-32GB; Python 3.12.13, Torch 2.10.0+cu128, Triton 3.6.0, CUDA toolkit 12.8.93, NVIDIA 580.178.04. FP16 compressed keys and queries, H4/D128, compression ratio four; capacities 33,456/262,752 tokens, live lengths 32,768/262,144. Same-process ABBA CUDA Graph medians for **12 synthetic layers**, compared with the existing Triton scorer. These are component timings, not TTFT, TPOT or model throughput.\n\n| Query rows | 32K control / candidate (ms) | Speedup | 256K control / candidate (ms) | Speedup |\n| --- | --- | --- | --- | --- |\n| 8 | 1.0400 / 0.2031 | 5.12x | 7.1105 / 0.8767 | 8.11x |\n| 9 | 1.0493 / 0.2132 | 4.92x | 7.8844 / 1.2821 | 6.15x |\n| 17 | 1.8990 / 0.3072 | 6.18x | 14.5061 / 2.1606 | 6.71x |\n| 33 | 4.1338 / 0.5105 | 8.10x | 27.4684 / 3.9022 | 7.04x |\n| 65 | 7.2345 / 0.8989 | 8.05x | 53.3764 / 7.4229 | 7.19x |\n\n| Existing score-to-selection chain, M17 | Control / candidate (ms) | Speedup | Output evidence |\n| --- | --- | --- | --- |\n| 32K live tokens | 2.3442 / 0.7777 | 3.01x | All output index arrays identical |\n| 256K live tokens | 15.7132 / 3.4242 | 4.59x | One of 204 rows exchanges one of 512 selected blocks at a rounding boundary |\n\nBoth chain cases observe 12 native scorer calls. The 256K row retains 511/512 blocks; all other rows are unchanged. Each changed arm selects the exact stable Top-K set for its own scores; expanded groups, causal tails and padding remain exact. The reference boundary gap is `4.76837158203125e-7`, and the FP64 score gap is about `2.90e-7`.\n\n## Numerical admission\n\nThe first wider sweep exposed one comparison failure among 1,670,904 M8/M9 scores. Native and Triton differ by `2.2798776626586914e-6` at that point, while their errors against FP64 are `1.4826840482734527e-6` and `7.971936143852387e-7`. Both FP32 reductions round; treating the Triton result as exact caused a false rejection. Independent native tiles remain identical, and all top-512 sets in that diagnostic match.\n\nThe benchmark records a bounded `1e-5` absolute floor while retaining `rtol=2e-6`. Selection exchanges must lie within the two score-error budgets, and each arm must preserve exact selection semantics for its supplied scores. Overlap and boundary gaps are reported. This changes benchmark admission, not CUDA arithmetic. Existing unit fixtures retain their tighter comparison. It does not substitute for model task-quality evidence or impose identical generated tokens as a universal gate.\n\n## Coverage and retained work\n\n- Shared ownership and native query tiling are implemented; actual caller execution is observed at the measured points. Those points are not a new runtime whitelist.\n- Unsupported metadata/layout and multi-request inputs retain caller fallback. CPU legacy-binary admission checks pass; a real older-wheel GPU smoke is not claimed.\n- The configured acceleration report remains `configured_native_capability`; observed profiler counts are separate evidence.\n- Other head geometries, multi-request native scoring, the separate Top-K capacity gap and the rest of the eight-family queue remain follow-up work. Full-model, quantization, TP, sampling/MTP and startup combinations were not benchmarked here.\n\nNormal native SHA256 values:\n\n- QSA: `1e8160781fadb3a679ef13018b6f24a18c564e2cd46153dd60c34224bf85068f`\n- Core: `37ae3c4d09459a87d98a97375b3e5dd5a862a36a510ffae08d1641df57c4f772`\n- Stable: `5cb29547d7f3d62e6e0d1e9fe2d44a798e20ab4afaead8352416ffd324dd0c26`\n\nThe migration control log records commands, numerical decisions and retained limits. Raw evidence is saved in `runtime-path-generalization-20261011`, including JUnit results, ABBA samples, FP64 diagnostics, rejection controls and loaded-library records. The driver mismatch was resolved by the observed host reboot; completed binaries were reused.\n\nAI assistance: OpenAI Codex. Work uses an owned branch/worktree from `onecat/main`; canonical-checkout modifications are untouched. Human review and remaining model qualification are required before promotion from Draft.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1176",
+    "isDraft": true,
+    "headRefName": "agent/v100-qsa-shared-path-20261011-053652",
+    "headRefOid": "f0a3f3c91e91afb1bbfcef28858d97231a901463",
+    "baseRefName": "main",
+    "baseRefOid": "be3722bc095b9792bf9833068595f0b1ef70ad37",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1176,
+    "id": "PR_kwDORjYFXs8AAAABHxxesA",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "f0a3f3c91e91afb1bbfcef28858d97231a901463",
+    "title": "[Kernel] Share QSA scoring and tile query rows",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1176",
+    "body": "## Purpose\n\nCompatible QSA inputs lost shared-key acceleration above eight query rows, and the provider was owned by a model module. Move tensor admission/loading into the common attention provider, retain the former model import as a forwarding facade, and tile the existing eight-row CUDA kernel over query rows. Arithmetic, causal masking, FP16/H4/D128 and the single-request contract remain unchanged. Older binaries retain their M<=8 fallback.\n\nThe existing benchmark now separates query count, actual live length and capacity, observes native calls, and checks numerical/selection semantics with explicit bounds. The architecture map provides an eight-family consolidation queue through existing owners. Related rules PR #1174 covers development policy; this PR supplies the first implementation and GPU evidence.\n\nBase: `be3722bc095b9792bf9833068595f0b1ef70ad37`. Native source: `6d3c789a1f8370e5c4ba71bbe17d093e20c23810`; subsequent changes cover benchmarks and evidence.\n\n**Keep Draft:** the measured operator/caller range is qualified. Full-model task quality, startup parity, production decode speed and 35B AWQ/FP8 parity remain unmeasured. Installing the new native binary expands the existing default switch's eligible range; wider default promotion requires that remaining evidence. The native maximum is a launch bound, not a measured performance envelope.\n\n## Test Plan and Result\n\n- CPU admission and old-binary metadata compatibility: **22 passed** (`--confcutdir=tests/v1/attention`, `test_sm70_qsa_shared_key_admission.py`).\n- GPU suite: **all 19 distinct cases passed**. The initial `--confcutdir=tests/kernels -q -x tests/kernels/test_sm70_qsa_shared_key.py` run passed 14 controls and stopped because the partial build lacked the standard Top-K extension. After completing that build, the selector case passed; the four remaining negative-position/query-tile cases passed separately. Completed controls were not rerun.\n- Normal packaged `_sm70_qsa_indexer_C`, `_C` and `_C_stable_libtorch` CMake builds/installations: **passed**. Fresh GPU processes load these owned modules and preserve legacy/public function identity; resolved dependency paths are recorded. No sidecar, private native-library overlay or platform patch is used.\n- Ten scorer comparisons: M8/9/17/33/65 at real 32K and 256K prefixes, one request, 12 synthetic layers, 204-key pages. All observe 12 native dispatcher calls. All **116,767,152** compared scores meet `rtol=2e-6, atol=1e-5`; maximum absolute difference is `9.5367431640625e-6`.\n- Two full existing score-to-selection comparisons at M17: measured below. A focused negative-control check rejects corrupted tails and a non-Top-K block while admitting the observed rounding-boundary exchange.\n- Applicable final commit hooks and whitespace checks: **passed** at qualification commit `f0a3f3c91e91afb1bbfcef28858d97231a901463`; no hooks bypassed.\n\n## Measured range\n\nSingle Tesla V100-SXM2-32GB; Python 3.12.13, Torch 2.10.0+cu128, Triton 3.6.0, CUDA toolkit 12.8.93, NVIDIA 580.178.04. FP16 compressed keys and queries, H4/D128, compression ratio four; capacities 33,456/262,752 tokens, live lengths 32,768/262,144. Same-process ABBA CUDA Graph medians for **12 synthetic layers**, compared with the existing Triton scorer. These are component timings, not TTFT, TPOT or model throughput.\n\n| Query rows | 32K control / candidate (ms) | Speedup | 256K control / candidate (ms) | Speedup |\n| --- | --- | --- | --- | --- |\n| 8 | 1.0400 / 0.2031 | 5.12x | 7.1105 / 0.8767 | 8.11x |\n| 9 | 1.0493 / 0.2132 | 4.92x | 7.8844 / 1.2821 | 6.15x |\n| 17 | 1.8990 / 0.3072 | 6.18x | 14.5061 / 2.1606 | 6.71x |\n| 33 | 4.1338 / 0.5105 | 8.10x | 27.4684 / 3.9022 | 7.04x |\n| 65 | 7.2345 / 0.8989 | 8.05x | 53.3764 / 7.4229 | 7.19x |\n\n| Existing score-to-selection chain, M17 | Control / candidate (ms) | Speedup | Output evidence |\n| --- | --- | --- | --- |\n| 32K live tokens | 2.3442 / 0.7777 | 3.01x | All output index arrays identical |\n| 256K live tokens | 15.7132 / 3.4242 | 4.59x | One of 204 rows exchanges one of 512 selected blocks at a rounding boundary |\n\nBoth chain cases observe 12 native scorer calls. The 256K row retains 511/512 blocks; all other rows are unchanged. Each changed arm selects the exact stable Top-K set for its own scores; expanded groups, causal tails and padding remain exact. The reference boundary gap is `4.76837158203125e-7`, and the FP64 score gap is about `2.90e-7`.\n\n## Numerical admission\n\nThe first wider sweep exposed one comparison failure among 1,670,904 M8/M9 scores. Native and Triton differ by `2.2798776626586914e-6` at that point, while their errors against FP64 are `1.4826840482734527e-6` and `7.971936143852387e-7`. Both FP32 reductions round; treating the Triton result as exact caused a false rejection. Independent native tiles remain identical, and all top-512 sets in that diagnostic match.\n\nThe benchmark records a bounded `1e-5` absolute floor while retaining `rtol=2e-6`. Selection exchanges must lie within the two score-error budgets, and each arm must preserve exact selection semantics for its supplied scores. Overlap and boundary gaps are reported. This changes benchmark admission, not CUDA arithmetic. Existing unit fixtures retain their tighter comparison. It does not substitute for model task-quality evidence or impose identical generated tokens as a universal gate.\n\n## Coverage and retained work\n\n- Shared ownership and native query tiling are implemented; actual caller execution is observed at the measured points. Those points are not a new runtime whitelist.\n- Unsupported metadata/layout and multi-request inputs retain caller fallback. CPU legacy-binary admission checks pass; a real older-wheel GPU smoke is not claimed.\n- The configured acceleration report remains `configured_native_capability`; observed profiler counts are separate evidence.\n- Other head geometries, multi-request native scoring, the separate Top-K capacity gap and the rest of the eight-family queue remain follow-up work. Full-model, quantization, TP, sampling/MTP and startup combinations were not benchmarked here.\n\nNormal native SHA256 values:\n\n- QSA: `1e8160781fadb3a679ef13018b6f24a18c564e2cd46153dd60c34224bf85068f`\n- Core: `37ae3c4d09459a87d98a97375b3e5dd5a862a36a510ffae08d1641df57c4f772`\n- Stable: `5cb29547d7f3d62e6e0d1e9fe2d44a798e20ab4afaead8352416ffd324dd0c26`\n\nThe migration control log records commands, numerical decisions and retained limits. Raw evidence is saved in `runtime-path-generalization-20261011`, including JUnit results, ABBA samples, FP64 diagnostics, rejection controls and loaded-library records. The driver mismatch was resolved by the observed host reboot; completed binaries were reused.\n\nAI assistance: OpenAI Codex. Work uses an owned branch/worktree from `onecat/main`; canonical-checkout modifications are untouched. Human review and remaining model qualification are required before promotion from Draft.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "agent/v100-qsa-shared-path-20261011-053652",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1176,
+    "title": "[Kernel] Share QSA scoring and tile query rows",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1176",
+    "isDraft": true,
+    "headRefOid": "f0a3f3c91e91afb1bbfcef28858d97231a901463",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/kernels/benchmark_sm70_qsa_shared_key.py",
+      "csrc/sm70_turbomind/ops/qsa_indexer_sm70.cu",
+      "docs/design/architecture/README.md",
+      "docs/design/sm70_v100_migration_control.md",
+      "tests/kernels/test_sm70_qsa_shared_key.py",
+      "tests/v1/attention/test_sm70_qsa_shared_key_admission.py",
+      "vllm/models/qwen4_exp/nvidia/ops/qsa.py",
+      "vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py",
+      "vllm/sm70_profiles/acceleration.py",
+      "vllm/v1/attention/ops/sm70_qsa_shared_key.py"
+    ],
+    "diff_bytes": 50681,
+    "diff_sha256": "4f7ff54bc0bfaacf0732a14e844e81674e532cdd9f84b64428a16d273c0140c3"
+  },
+  "full_tree_diff_proof": null
+}

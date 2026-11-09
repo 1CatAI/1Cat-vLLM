@@ -1,0 +1,568 @@
+diff --git a/tests/models/qwen4_exp/test_qsa_dcp_grouped_page4.py b/tests/models/qwen4_exp/test_qsa_dcp_grouped_page4.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb296906e3a8933310bbbc025b1822825852db4a
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_qsa_dcp_grouped_page4.py
+@@ -0,0 +1,202 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import sys
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
++from vllm.models.qwen4_exp.nvidia.ops.qsa import (
++    qsa_dcp_sparse_paged_attention_sm70_grouped_page4,
++    qsa_sparse_paged_attention,
++)
++from vllm.models.qwen4_exp.nvidia.ops.qsa_dcp import (
++    qsa_dcp_local_selection_width,
++    qsa_localize_dcp_indices,
++)
++from vllm.platforms import current_platform
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++TOPK, RATIO, WORLD, INTERLEAVE = 2048, 4, 2, 1
++WIDTH = TOPK + RATIO - 1
++
++
++@pytest.mark.parametrize("heads", [6, 12, 18])
++@pytest.mark.parametrize("cache", ["auto", "fp8_e4m3"])
++def test_startup_capability_admits_native_head_groups(monkeypatch, heads, cache):
++    monkeypatch.setattr(current_platform, "is_device_capability", lambda _: True)
++    monkeypatch.setattr(qsa_ops, "_qsa_grouped_page4_supported", lambda *_: True)
++    monkeypatch.setitem(
++        sys.modules,
++        "flash_attn_v100.flash_attn_interface",
++        SimpleNamespace(flash_attn_v100_cuda=object()),
++    )
++    assert (
++        qsa_ops.qsa_dcp_grouped_page4_config_reason(
++            sharded=True,
++            query_heads=heads,
++            kv_heads=1,
++            head_dim=256,
++            dtype=torch.float16,
++            kv_cache_dtype=cache,
++            selection_width=2051,
++            max_rows=8192,
++        )
++        is None
++    )
++
++
++@pytest.mark.parametrize(
++    "change,reason",
++    [
++        ({"sharded": False}, "cache_not_dcp_sharded"),
++        ({"query_heads": 8}, "requires_six_head_groups_one_kv_head_and_dim256"),
++        ({"kv_heads": 2}, "requires_six_head_groups_one_kv_head_and_dim256"),
++        ({"head_dim": 128}, "requires_six_head_groups_one_kv_head_and_dim256"),
++        ({"dtype": torch.bfloat16}, "requires_fp16_queries_and_fp16_or_e4m3_cache"),
++        ({"selection_width": 1027}, "requires_grouped_page4_selection_width2051"),
++        ({"max_rows": 255}, "prefill_budget_below_grouped_route_threshold"),
++    ],
++)
++def test_startup_capability_reports_rejection(monkeypatch, change, reason):
++    monkeypatch.setattr(current_platform, "is_device_capability", lambda _: True)
++    config = dict(
++        sharded=True,
++        query_heads=12,
++        kv_heads=1,
++        head_dim=256,
++        dtype=torch.float16,
++        kv_cache_dtype="auto",
++        selection_width=2051,
++        max_rows=8192,
++    )
++    assert qsa_ops.qsa_dcp_grouped_page4_config_reason(**(config | change)) == reason
++
++
++def test_small_batches_stay_on_triton():
++    # Decode-sized batches never reach the grouped route, on any platform.
++    rows = qsa_ops._SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS - 1
++    q = torch.zeros((rows, 12, 256), dtype=torch.float16)
++    written = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
++        q,
++        torch.zeros((4, 16, 1, 256), dtype=torch.uint8),
++        torch.zeros((4, 16, 1, 256), dtype=torch.uint8),
++        torch.full((rows, WIDTH), -1, dtype=torch.int32),
++        torch.zeros((1, 4), dtype=torch.int32),
++        torch.zeros(rows, dtype=torch.int32),
++        torch.zeros(q.shape, dtype=torch.float32),
++        torch.zeros(q.shape[:2], dtype=torch.float32),
++        "fp8_e4m3",
++        1.0,
++        1.0,
++    )
++    assert written == 0
++
++
++def _selection(positions, generator):
++    """Model-format global selection: score-ordered blocks plus the open tail."""
++    rows = []
++    for position in positions.tolist():
++        visible = (position + 1) // RATIO
++        blocks = torch.randperm(visible, generator=generator)[: TOPK // RATIO]
++        tokens = (blocks[:, None] * RATIO + torch.arange(RATIO)).flatten().tolist()
++        tail_start = visible * RATIO
++        tokens += list(range(tail_start, position + 1))
++        rows.append(tokens + [-1] * (WIDTH - len(tokens)))
++    return torch.tensor(rows, dtype=torch.int32)
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available() or not current_platform.is_device_capability(70),
++    reason="SM70 grouped page4 route",
++)
++@pytest.mark.parametrize("packed", [False, True])
++@pytest.mark.parametrize("e4m3", [False, True])
++def test_grouped_route_matches_triton_lse_route(e4m3, packed, monkeypatch):
++    flash = pytest.importorskip("flash_attn_v100.flash_attn_interface")
++    # Keep the batch small; the row gate is a speed choice, not a contract.
++    monkeypatch.setattr(qsa_ops, "_SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS", 64)
++    kv_dtype = "fp8_e4m3" if e4m3 else "auto"
++    if not qsa_ops._qsa_grouped_page4_supported(flash.flash_attn_v100_cuda, kv_dtype):
++        pytest.skip("Flash-V100 build has no grouped page4 route for this cache")
++    generator = torch.Generator().manual_seed(816)
++    page, pages, heads, dim = 16, 96, 12, 256
++    # Request 0 selects 512 of its visible blocks; request 1 is short enough
++    # to select every visible position. 77 rows leave a five-row remainder.
++    positions = torch.cat([torch.arange(2400, 2440), torch.arange(100, 137)])
++    token_to_req = torch.tensor([0] * 40 + [1] * 37, dtype=torch.int32)
++    indices = _selection(positions, generator)
++    indices[3] = -1  # A row without any selected position.
++    indices, token_to_req = indices.cuda(), token_to_req.cuda()
++    q = (torch.randn((77, heads, dim), generator=generator) * 0.3).half().cuda()
++    # Interleaved K/V blocks, as the model's cache ABI stores them. A sharded
++    # DCP cache packs one page of each member layer into every physical block.
++    members = 2 if packed else 1
++    cache = torch.randn((2 * pages + 3, members, 2, page, 1, dim), generator=generator)
++    cache *= 0.5
++    k_scale, v_scale = (0.25, 0.5) if e4m3 else (1.0, 1.0)
++    if e4m3:
++        cache[:, :, 0] /= k_scale
++        cache[:, :, 1] /= v_scale
++        cache = cache.to(torch.float8_e4m3fn).view(torch.uint8)
++    else:
++        cache = cache.half()
++    k_cache, v_cache = cache.cuda()[:, members - 1].unbind(1)
++    assert k_cache.stride(0) == members * 2 * page * dim
++    block_table = (
++        torch.randperm(2 * pages + 3, generator=generator)[: 2 * pages]
++        .view(2, pages)
++        .to(torch.int32)
++        .cuda()
++    )
++    local_width = qsa_dcp_local_selection_width(TOPK, RATIO, WORLD, INTERLEAVE, WIDTH)
++
++    for rank in range(WORLD):
++        local = torch.empty_like(indices)
++        qsa_localize_dcp_indices(
++            indices,
++            local,
++            dcp_world_size=WORLD,
++            dcp_rank=rank,
++            interleave_size=INTERLEAVE,
++            local_block_size=page,
++        )
++        expected_out = torch.empty(q.shape, dtype=torch.float32, device="cuda")
++        expected_lse = torch.empty(q.shape[:2], dtype=torch.float32, device="cuda")
++        qsa_sparse_paged_attention(
++            q,
++            k_cache,
++            v_cache,
++            local[:, :local_width],
++            block_table,
++            token_to_req,
++            expected_out,
++            kv_cache_dtype=kv_dtype,
++            k_scale=k_scale,
++            v_scale=v_scale,
++            lse=expected_lse,
++        )
++        out = torch.full_like(expected_out, torch.nan)
++        lse = torch.full_like(expected_lse, torch.nan)
++        rows = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
++            q,
++            k_cache,
++            v_cache,
++            local,
++            block_table,
++            token_to_req,
++            out,
++            lse,
++            kv_dtype,
++            k_scale,
++            v_scale,
++        )
++        assert rows == 72
++        assert torch.isnan(out[rows:]).all() and torch.isnan(lse[rows:]).all()
++        assert torch.isneginf(lse[3]).all() and not out[3].any()
++        torch.testing.assert_close(lse[:rows], expected_lse[:rows], rtol=0, atol=1e-3)
++        torch.testing.assert_close(
++            out[:rows], expected_out[:rows], rtol=1e-2, atol=3e-3
++        )
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 247a15592b91eb76fb3874684765089a5243ac93..1c0b0c5d7c783f8899e087eda2f2ae4deb00619b 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -77,6 +77,9 @@ _SM70_QSA_XQA_PAGE4_MARKER = 1 << 30
+ _SM70_QSA_GROUPED_PAGE4 = os.getenv("VLLM_SM70_QSA_GROUPED_PAGE4", "1") == "1"
+ _SM70_QSA_GROUPED_PAD_FIX = os.getenv("VLLM_SM70_QSA_GROUPED_PAD_FIX", "1") == "1"
+ _SM70_QSA_GROUPED_PAGE4_QUERIES = 8
++# DCP-local attention: the grouped route costs a near-constant 1-2 ms up to
++# about 512 rows on V100 and overtakes the Triton LSE route at 128-256 rows.
++_SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS = 256
+ _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES = (
+     _SM70_QSA_XQA_PAGE4_PAGES * _SM70_QSA_GROUPED_PAGE4_QUERIES + 56
+ )
+@@ -1684,7 +1687,17 @@ def _qsa_xqa_page4_shape_supported(
+     token_to_req: torch.Tensor,
+     query_positions: torch.Tensor | None,
+     sequence_lengths: torch.Tensor | None,
++    allow_packed_pages: bool = False,
+ ) -> bool:
++    # DCP-sharded caches interleave the pages of several layers, so a layer's
++    # page stride is a multiple of its own page. Page4 microblock addressing
++    # only needs that stride in whole microblocks.
++    page_numel = k_cache.shape[1] * 256 if k_cache.ndim == 4 else 0
++    page_stride_supported = k_cache.stride(0) in (page_numel, 2 * page_numel) or (
++        allow_packed_pages
++        and k_cache.stride(0) >= 2 * page_numel
++        and k_cache.stride(0) % (4 * 256) == 0
++    )
+     return (
+         query_positions is not None
+         and sequence_lengths is not None
+@@ -1709,7 +1722,7 @@ def _qsa_xqa_page4_shape_supported(
+         and k_cache.stride(3) == v_cache.stride(3) == 1
+         and k_cache.stride(1) == v_cache.stride(1) == 256
+         and k_cache.stride(0) == v_cache.stride(0)
+-        and k_cache.stride(0) in (k_cache.shape[1] * 256, 2 * k_cache.shape[1] * 256)
++        and page_stride_supported
+         and logical_indices.shape == (q.shape[0], 2051)
+         and logical_indices.dtype == torch.int32
+         and logical_indices.stride(1) == 1
+@@ -1985,21 +1998,17 @@ def _qsa_grouped_page4_forward(
+     flash_attn_v100_cuda.grouped_sparse_page4_fwd(*forward_args)
+ 
+ 
+-def _qsa_sparse_paged_attention_sm70_grouped_page4(
++def _qsa_grouped_page4_plan(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+-    v_cache: torch.Tensor,
+     logical_indices: torch.Tensor,
+     block_table: torch.Tensor,
+     token_to_req: torch.Tensor,
+     query_positions: torch.Tensor,
+     sequence_lengths: torch.Tensor,
+-    out: torch.Tensor,
+-    kv_cache_dtype: str,
+-    k_scale: float,
+-    v_scale: float,
+     flash_attn_v100_cuda,
+-) -> torch.Tensor:
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Plan grouped page4 microblocks; the plan does not depend on Q's values."""
+     grouped_pages, token_masks, grouped_sequence_lengths, lse = (
+         _qsa_grouped_page4_workspace(q)
+     )
+@@ -2029,6 +2038,34 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
+         grouped_pages.copy_(
+             torch.where(token_masks == 0, grouped_pages[:, :1], grouped_pages)
+         )
++    return grouped_pages, token_masks, grouped_sequence_lengths, lse
++
++
++def _qsa_sparse_paged_attention_sm70_grouped_page4(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    logical_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    token_to_req: torch.Tensor,
++    query_positions: torch.Tensor,
++    sequence_lengths: torch.Tensor,
++    out: torch.Tensor,
++    kv_cache_dtype: str,
++    k_scale: float,
++    v_scale: float,
++    flash_attn_v100_cuda,
++) -> torch.Tensor:
++    grouped_pages, token_masks, grouped_sequence_lengths, lse = _qsa_grouped_page4_plan(
++        q,
++        k_cache,
++        logical_indices,
++        block_table,
++        token_to_req,
++        query_positions,
++        sequence_lengths,
++        flash_attn_v100_cuda,
++    )
+     physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
+     _qsa_grouped_page4_forward(
+         flash_attn_v100_cuda,
+@@ -2053,6 +2090,168 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
+     return out
+ 
+ 
++def qsa_dcp_grouped_page4_config_reason(
++    *,
++    sharded: bool,
++    query_heads: int,
++    kv_heads: int,
++    head_dim: int,
++    dtype: torch.dtype,
++    kv_cache_dtype: str,
++    selection_width: int,
++    max_rows: int,
++) -> str | None:
++    """Explain static admission; tensor layout remains a runtime guard."""
++    if not sharded:
++        return "cache_not_dcp_sharded"
++    if not current_platform.is_device_capability(70):
++        return "requires_sm70"
++    if not (_SM70_QSA_XQA_PAGE4 and _SM70_QSA_GROUPED_PAGE4):
++        return "disabled_by_configuration"
++    if dtype != torch.float16 or kv_cache_dtype not in (
++        "auto",
++        "float16",
++        "fp8",
++        "fp8_e4m3",
++    ):
++        return "requires_fp16_queries_and_fp16_or_e4m3_cache"
++    if query_heads <= 0 or query_heads % 6 or kv_heads != 1 or head_dim != 256:
++        return "requires_six_head_groups_one_kv_head_and_dim256"
++    if selection_width != 2051:
++        return "requires_grouped_page4_selection_width2051"
++    if max_rows < _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS:
++        return "prefill_budget_below_grouped_route_threshold"
++    try:
++        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
++    except ImportError:
++        return "grouped_page4_operator_missing"
++    cache = "fp8_e4m3" if kv_cache_dtype in ("fp8", "fp8_e4m3") else "auto"
++    if not _qsa_grouped_page4_supported(flash_attn_v100_cuda, cache):
++        return "grouped_page4_operator_or_cache_abi_missing"
++    return None
++
++
++def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    local_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    token_to_req: torch.Tensor,
++    out: torch.Tensor,
++    lse: torch.Tensor,
++    kv_cache_dtype: str,
++    k_scale: float,
++    v_scale: float,
++) -> int:
++    """Run the leading rows of a QSA DCP batch through the grouped page4 route.
++
++    ``q`` holds the gathered heads of every DCP rank and ``local_indices`` this
++    rank's compacted selection at the full 2051-column width. The grouped
++    kernels take six heads, so every six-head slice reuses one plan. Localized
++    IDs are causal by construction but are not ordered against positions in
++    the local token space, so every query position and sequence length is set
++    to the local capacity and the planner reads every column.
++
++    Writes FP32 ``out`` and base-2 ``lse`` (-inf for rows without a local
++    token), as the Triton route does. Returns the number of rows written: a
++    multiple of eight, or 0 when the route does not apply. The caller runs the
++    remaining rows through ``qsa_sparse_paged_attention``.
++    """
++    heads = 6
++    group = _SM70_QSA_GROUPED_PAGE4_QUERIES
++    rows = q.shape[0] // group * group
++    if not (
++        _SM70_QSA_XQA_PAGE4
++        and _SM70_QSA_GROUPED_PAGE4
++        and rows >= _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS
++        and q.ndim == 3
++        and q.shape[1] % heads == 0
++        and out.shape == q.shape
++        and out.dtype == torch.float32
++        and lse.shape == q.shape[:2]
++        # The planner rejects strided metadata; fall back instead.
++        and local_indices.is_contiguous()
++        and block_table.is_contiguous()
++        and current_platform.is_device_capability(70)
++    ):
++        return 0
++    try:
++        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
++    except ImportError:
++        return 0
++    kv_cache_dtype = "fp8_e4m3" if kv_cache_dtype in ("fp8", "fp8_e4m3") else "auto"
++    if not _qsa_grouped_page4_supported(flash_attn_v100_cuda, kv_cache_dtype):
++        return 0
++    capacity = block_table.shape[1] * k_cache.shape[1]
++    query_positions = torch.full(
++        (rows,), capacity - 1, dtype=torch.int64, device=q.device
++    )
++    sequence_lengths = torch.full(
++        (block_table.shape[0],), capacity, dtype=torch.int32, device=q.device
++    )
++    q_slice = q[:rows, :heads]
++    if not _qsa_xqa_page4_shape_supported(
++        q_slice,
++        k_cache,
++        v_cache,
++        local_indices[:rows],
++        block_table,
++        token_to_req[:rows],
++        query_positions,
++        sequence_lengths,
++        allow_packed_pages=True,
++    ):
++        return 0
++
++    grouped_pages, token_masks, grouped_sequence_lengths, slice_lse = (
++        _qsa_grouped_page4_plan(
++            q_slice,
++            k_cache,
++            local_indices[:rows],
++            block_table,
++            token_to_req[:rows],
++            query_positions,
++            sequence_lengths,
++            flash_attn_v100_cuda,
++        )
++    )
++    physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(
++        q_slice, k_cache, v_cache
++    )
++    slice_out = torch.empty(q_slice.shape, dtype=torch.float16, device=q.device)
++    for head in range(0, q.shape[1], heads):
++        _qsa_grouped_page4_forward(
++            flash_attn_v100_cuda,
++            q[:rows, head : head + heads].contiguous(),
++            physical_k_cache,
++            physical_v_cache,
++            slice_out,
++            grouped_pages,
++            token_masks,
++            grouped_sequence_lengths,
++            slice_lse,
++            q.shape[2] ** -0.5,
++            kv_cache_dtype,
++            k_scale,
++            v_scale,
++        )
++        out[:rows, head : head + heads].copy_(slice_out)
++        # The kernel writes natural-log LSE and -1e30 for rows without keys.
++        lse[:rows, head : head + heads].copy_(
++            (slice_lse * math.log2(math.e)).masked_fill_(
++                slice_lse <= -1.0e29, -math.inf
++            )
++        )
++    logger.info_once(
++        "Using SM70 grouped QSA Flash-V100 page4 route for DCP-local attention "
++        "(rows=%d, heads=%d).",
++        rows,
++        q.shape[1],
++    )
++    return rows
++
++
+ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 9dacaedafa4fdb047a60f8d0cfd6466dcd3b0a4f..05cca9b90c96dbb09206d717617a57f2f2684e45 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -341,7 +341,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+     ) -> None:
+         from vllm.distributed import get_dcp_group
+ 
+-        from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
++        from .ops.qsa import (
++            _qsa_output_gate,
++            qsa_dcp_sparse_paged_attention_sm70_grouped_page4,
++            qsa_sparse_paged_attention,
++        )
+         from .ops.qsa_dcp import (
+             qsa_dcp_local_selection_width,
+             qsa_localize_dcp_indices,
+@@ -381,19 +385,35 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+             layer.cp_kv_cache_interleave_size,
+             local_indices.shape[1],
+         )
+-        qsa_sparse_paged_attention(
++        # Prefill-sized batches use the grouped page4 route for their leading
++        # multiple of eight rows; decode batches and the rest stay on Triton.
++        grouped_rows = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
+             gathered_query,
+             key_cache,
+             value_cache,
+-            local_indices[:, :local_width],
++            local_indices,
+             block_table,
+             token_to_req,
+             partial_output,
+-            kv_cache_dtype=self.kv_cache_dtype,
+-            k_scale=layer._k_scale_float,
+-            v_scale=layer._v_scale_float,
+-            lse=partial_lse,
++            partial_lse,
++            self.kv_cache_dtype,
++            layer._k_scale_float,
++            layer._v_scale_float,
+         )
++        if grouped_rows < query.shape[0]:
++            qsa_sparse_paged_attention(
++                gathered_query[grouped_rows:],
++                key_cache,
++                value_cache,
++                local_indices[grouped_rows:, :local_width],
++                block_table,
++                token_to_req[grouped_rows:],
++                partial_output[grouped_rows:],
++                kv_cache_dtype=self.kv_cache_dtype,
++                k_scale=layer._k_scale_float,
++                v_scale=layer._v_scale_float,
++                lse=partial_lse[grouped_rows:],
++            )
+         merged = cast(
+             torch.Tensor,
+             self.dcp_combine(
+@@ -621,6 +641,30 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             max_tokens=max_tokens,
+             topk_indices_buffer=topk_indices_buffer,
+         )
++        from .ops import qsa as qsa_ops
++
++        self._sm70_qsa_dcp_grouped_page4_reason = (
++            qsa_ops.qsa_dcp_grouped_page4_config_reason(
++                sharded=self.qsa_dcp_sharded,
++                query_heads=(
++                    self.num_heads * parallel_config.decode_context_parallel_size
++                ),
++                kv_heads=self.num_kv_heads,
++                head_dim=self.head_dim,
++                dtype=model_config.dtype,
++                kv_cache_dtype=self.kv_cache_dtype,
++                selection_width=self.topk_indices_buffer.shape[1],
++                max_rows=max_tokens,
++            )
++        )
++        self._sm70_qsa_dcp_grouped_page4 = (
++            self._sm70_qsa_dcp_grouped_page4_reason is None
++        )
++        qsa_ops.logger.info_once(
++            "SM70 QSA DCP grouped page4 capability: %s; row alignment, "
++            "batch size and tensor strides are checked at execution.",
++            self._sm70_qsa_dcp_grouped_page4_reason or "available",
++        )
+ 
+         static_context = vllm_config.compilation_config.static_forward_context
+         if self.layer_name in static_context:
