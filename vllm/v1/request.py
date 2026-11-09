@@ -154,6 +154,11 @@ class Request:
         # optimistically.
         self.num_in_flight_tokens = 0
 
+        # Prefill chunk cap the scheduler sets when it takes the request from
+        # the waiting queue (SchedulerConfig.short_prompt_chunk_tokens); zero
+        # leaves the whole token budget.
+        self.prefill_chunk_cap = 0
+
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
