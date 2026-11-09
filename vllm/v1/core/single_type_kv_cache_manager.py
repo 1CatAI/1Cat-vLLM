@@ -1456,13 +1456,19 @@ class MambaManager(SingleTypeKVCacheManager):
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            if num_required_blocks == len(req_blocks):
+            if num_required_blocks <= len(req_blocks):
+                # Rejected draft tokens can roll num_computed_tokens back across
+                # a block boundary (the scheduler subtracts num_rejected), so the
+                # cdiv below can come out one block short while req_blocks still
+                # holds the over-allocation from the previous step. Keep the extra
+                # blocks and allocate nothing this step; once the run grows past
+                # the boundary the requirement catches up on its own.
+                #
+                # Previously this tripped the assert below and killed the
+                # EngineCore (observed 63 < 64).
+                self._allocated_block_reqs.add(request_id)
                 return []
             else:
-                assert num_required_blocks > len(req_blocks), (
-                    "num_required_blocks "
-                    f"{num_required_blocks} < len(req_blocks) {len(req_blocks)}"
-                )
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # Record the last state block
