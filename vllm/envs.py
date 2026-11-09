@@ -785,6 +785,11 @@ if TYPE_CHECKING:
     VLLM_SPEC_DUMP_ALIGNMENT_LIMIT: int = 3
     VLLM_SPEC_DUMP_ALIGNMENT_STEPS: str | None = None
     VLLM_DEBUG_MTP_LOAD: bool = False
+    VLLM_DECODE_STEP_PROFILE: bool = False
+    VLLM_DECODE_STEP_PROFILE_EVERY: int = 20
+    VLLM_DECODE_STEP_PROFILE_WARMUP: int = 5
+    VLLM_DECODE_STEP_PROFILE_PHASE: str = "decode"
+    VLLM_DECODE_STEP_PROFILE_RANK: int = -1
     VLLM_DEBUG_MTP_LOAD_VERBOSE: bool = False
     VLLM_DFLASH_PROFILE: bool = False
     VLLM_DFLASH_PROFILE_LOG_INTERVAL: int = 32
@@ -11825,6 +11830,60 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    "VLLM_DECODE_STEP_PROFILE": env_var(
+        lambda: bool(int(os.getenv("VLLM_DECODE_STEP_PROFILE", "0"))),
+        description=(
+            "vLLM: split each decode round into per-segment timings and report "
+            "both CPU and GPU timelines. Diagnostic only; off by default."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        user_visible=True,
+    ),
+    "VLLM_DECODE_STEP_PROFILE_EVERY": env_var(
+        lambda: int(os.getenv("VLLM_DECODE_STEP_PROFILE_EVERY", "20")),
+        description="vLLM: sample and print the decode step profile every N steps.",
+        category="debug",
+        declared_default="20",
+        effective_default="20",
+        automatic_conditions=(),
+        user_visible=True,
+    ),
+    "VLLM_DECODE_STEP_PROFILE_WARMUP": env_var(
+        lambda: int(os.getenv("VLLM_DECODE_STEP_PROFILE_WARMUP", "5")),
+        description="vLLM: skip the first N steps before profiling decode steps.",
+        category="debug",
+        declared_default="5",
+        effective_default="5",
+        automatic_conditions=(),
+        user_visible=True,
+    ),
+    "VLLM_DECODE_STEP_PROFILE_PHASE": env_var(
+        lambda: os.getenv("VLLM_DECODE_STEP_PROFILE_PHASE", "decode").lower(),
+        description=(
+            "vLLM: which steps to profile -- 'all', 'decode' (default) or "
+            "'prefill'."
+        ),
+        category="debug",
+        declared_default="decode",
+        effective_default="decode",
+        automatic_conditions=(),
+        user_visible=True,
+    ),
+    "VLLM_DECODE_STEP_PROFILE_RANK": env_var(
+        lambda: int(os.getenv("VLLM_DECODE_STEP_PROFILE_RANK", "-1")),
+        description=(
+            "vLLM: print the decode step profile only on this TP rank. -1 "
+            "(default) prints on every rank."
+        ),
+        category="debug",
+        declared_default="-1",
+        effective_default="-1",
+        automatic_conditions=(),
+        user_visible=True,
+    ),
     "VLLM_DEBUG_MTP_LOAD": env_var(
         lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))),
         description=(
@@ -20265,6 +20324,11 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_DECODE_STEP_PROFILE",
+        "VLLM_DECODE_STEP_PROFILE_EVERY",
+        "VLLM_DECODE_STEP_PROFILE_WARMUP",
+        "VLLM_DECODE_STEP_PROFILE_PHASE",
+        "VLLM_DECODE_STEP_PROFILE_RANK",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",
