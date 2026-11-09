@@ -1896,11 +1896,11 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
-            if request.async_tokens_to_discard > 0:
+            if request.num_kv_load_outputs_to_discard > 0:
                 # Recovery can overlap already dispatched decode steps. Drop
                 # their entire output before applying speculative rejection or
                 # changing the new replay's placeholder/computed-token state.
-                request.async_tokens_to_discard -= 1
+                request.num_kv_load_outputs_to_discard -= 1
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -3013,10 +3013,13 @@ class Scheduler(SchedulerInterface):
                 # This failed output is skipped by update_from_output. Other
                 # dispatched frames still return, but all depend on the failed
                 # prefix. Count frames rather than speculative token slots.
-                request.async_tokens_to_discard = max(
+                request.num_kv_load_outputs_to_discard = max(
                     0,
                     request.num_in_flight_steps - int(req_id in num_scheduled_tokens),
                 )
+                # The failed prefix invalidates every older frame, including
+                # frames already marked by a forced prefix-cache reset.
+                request.async_tokens_to_discard = 0
                 request.num_output_placeholders = 0
                 request.spec_token_ids = []
         # Return sync affected IDs to skip in update_from_output

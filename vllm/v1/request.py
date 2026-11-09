@@ -154,6 +154,9 @@ class Request:
         # optimistically.
         self.num_in_flight_tokens = 0
         self.num_in_flight_steps = 0
+        # Failed remote KV loads invalidate whole scheduled output frames.
+        # Keep this separate from AsyncScheduler's prefix-reset bookkeeping.
+        self.num_kv_load_outputs_to_discard = 0
 
         # Prefill chunk cap the scheduler sets when it takes the request from
         # the waiting queue (SchedulerConfig.short_prompt_chunk_tokens); zero
