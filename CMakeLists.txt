@@ -310,10 +310,25 @@ endif()
 # _C extension
 #
 
+# CUDA activation quantization needs SM80+; use the requested Torch archs,
+# not CMake's independently detected/default architecture. Other backends
+# retain their existing source and operator registrations.
+set(VLLM_ACT_QUANT_ARCHS "")
+set(VLLM_REGISTER_DEEPGEMM_MOE_OPS ON)
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  foreach(_arch IN LISTS CUDA_ARCHS)
+    if(_arch VERSION_GREATER_EQUAL "8.0")
+      list(APPEND VLLM_ACT_QUANT_ARCHS "${_arch}")
+    endif()
+  endforeach()
+  if(NOT VLLM_ACT_QUANT_ARCHS)
+    set(VLLM_REGISTER_DEEPGEMM_MOE_OPS OFF)
+  endif()
+endif()
+
 set(VLLM_EXT_SRC
   "csrc/cuda_view.cu"
   "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
-  "csrc/quantization/activation_kernels.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
   "csrc/torch_bindings.cpp"
@@ -321,6 +336,9 @@ set(VLLM_EXT_SRC
   "csrc/ple_fast_lane.cpp"
   "csrc/gguf_dmv13_pack.cpp"
   "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+if(NOT VLLM_GPU_LANG STREQUAL "CUDA")
+  list(APPEND VLLM_EXT_SRC "csrc/quantization/activation_kernels.cu")
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_EXT_SRC
@@ -364,6 +382,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_EXT_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
+  if(VLLM_ACT_QUANT_ARCHS)
+    list(APPEND VLLM_EXT_SRC "csrc/quantization/activation_kernels.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "csrc/quantization/activation_kernels.cu"
+      CUDA_ARCHS "${VLLM_ACT_QUANT_ARCHS}")
+  endif()
 
   set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS "")
   cuda_archs_loose_intersection(SM70_TURBOMIND_ARCHS "7.0" "${CUDA_ARCHS}")
@@ -754,6 +778,9 @@ define_extension_target(
 # driver API. This causes problems when linking with earlier versions of CUDA.
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+if(VLLM_REGISTER_DEEPGEMM_MOE_OPS)
+  target_compile_definitions(_C PRIVATE VLLM_REGISTER_DEEPGEMM_MOE_OPS=1)
+endif()
 if(VLLM_REGISTER_BASIC_ACTIVATION_IN_C)
   target_compile_definitions(_C PRIVATE VLLM_REGISTER_BASIC_ACTIVATION_IN_C=1)
 endif()

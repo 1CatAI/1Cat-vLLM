@@ -2145,6 +2145,48 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
     }
     return;
   }
+  // Block-scaled checkpoints (e.g. Qwen3.8-27B-FP8, weight_block_size
+  // 128x128) never satisfy the channel_scales gate above, so every M=9..32
+  // decode step falls through to the full weight reconstruction below,
+  // measured at ~50 ms/step extra on V100 TP4 with DFlash2 q8 and 2-4
+  // concurrent requests (target_forward 65 ms at M=16 vs 20 ms at M=8).
+  // Chunk through the accepted M=1..8 route instead: each output row is an
+  // independent dot product over the same packed weight, so per-row
+  // reduction order (and therefore numerics) match the single-stream M<=8
+  // path exactly. Reuse the per-engine chunked-decode policy, including its
+  // explicit rollback, rather than consulting a new process-global env flag.
+  const bool chunked_small_split =
+      split_k == 4 || split_k == 8 || split_k == 16 ||
+      (!gated_silu && (split_k == 12 || split_k == 32));
+  const bool chunked_small_config =
+      chunked_small_split &&
+      (accumulator_chains == 1 || accumulator_chains == 2) &&
+      (split_k != 12 || (accumulator_chains == 2 && !prefetch_codes));
+  if (m > 8 && m <= 32 && !channel_scales && qpn8_m32_chunked_enabled &&
+      chunked_small_config && (dense_shape || gated_shape)) {
+    static std::once_flag block_chunked_log_once;
+    std::call_once(block_chunked_log_once, []() {
+      std::fprintf(stderr,
+                   "INFO SM70 block-FP8 QPN8 M=9..32 chunked decode route "
+                   "engaged (set VLLM_SM70_FP8_QPN8_M32_CHUNKED=0 to "
+                   "restore the per-step dequant fallback).\n");
+    });
+    for (int64_t row = 0; row < m; row += 8) {
+      const int64_t rows = std::min<int64_t>(8, m - row);
+      auto input_chunk = input.narrow(0, row, rows);
+      auto out_chunk = out.narrow(0, row, rows);
+      if (gated_silu) {
+        fp8_qpn8_gated_pair_sm70_out(out_chunk, input_chunk, codes,
+                                     group_scales, split_k, accumulator_chains,
+                                     true, prefetch_codes);
+      } else {
+        fp8_qpn8_gemm_sm70_out(out_chunk, input_chunk, codes, group_scales,
+                               split_k, accumulator_chains, true,
+                               prefetch_codes);
+      }
+    }
+    return;
+  }
   fp8_qpn8_prefill_sm70_out(out, dense_weight_ptr, input, codes, group_scales,
                             gated_silu);
 }
