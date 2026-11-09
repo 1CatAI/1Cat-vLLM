@@ -58,11 +58,25 @@ def wrap_data_with_event(data: str, event: str):
 
 
 def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
+    """Anthropic `cache_read_input_tokens`, when the engine measured a hit."""
     if usage is not None and usage.prompt_tokens_details is not None:
         cached_tokens = usage.prompt_tokens_details.cached_tokens
         if cached_tokens is not None:
             return {"cache_read_input_tokens": cached_tokens}
     return {}
+
+
+def _anthropic_input_tokens(usage: UsageInfo | None) -> int:
+    """Report fresh prompt tokens, subtracting measured cache reads.
+
+    Without a cache breakdown, preserve the engine's prompt count. This also
+    covers deployments that do not enable prompt token details. Streaming
+    updates can refine the count when cache details become available.
+    """
+    if usage is None:
+        return 0
+    cached = _cache_usage_fields(usage).get("cache_read_input_tokens", 0)
+    return max(0, usage.prompt_tokens - cached)
 
 
 class AnthropicServingMessages(OpenAIServingChat):
@@ -512,10 +526,20 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> AnthropicMessagesResponse:
         result = AnthropicMessagesResponse(
             id=generator.id,
+            # Explicit, not relying on the pydantic field defaults in
+            # `protocol.py`: the response is serialized with
+            # `exclude_unset=True`, which drops any field that was never
+            # assigned — defaults included. A `message_start` without
+            # `type`/`role` is not a recognizable message to the Anthropic
+            # SDK, which silently discards it, so the assistant turn never
+            # reaches the client and the conversation history looks lost
+            # after a reload.
+            type="message",
+            role="assistant",
             content=[],
             model=generator.model,
             usage=AnthropicUsage(
-                input_tokens=generator.usage.prompt_tokens,
+                input_tokens=_anthropic_input_tokens(generator.usage),
                 output_tokens=generator.usage.completion_tokens,
                 **_cache_usage_fields(generator.usage),
             ),
@@ -665,14 +689,21 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_start",
                                 message=AnthropicMessagesResponse(
                                     id=origin_chunk.id,
+                                    # Same reason as `messages_full_converter`:
+                                    # `exclude_unset=True` on the way out drops
+                                    # any field not explicitly assigned, and a
+                                    # `message_start` missing `type`/`role` is
+                                    # discarded by the Anthropic SDK.
+                                    type="message",
+                                    role="assistant",
                                     content=[],
                                     model=origin_chunk.model,
                                     stop_reason=None,
                                     stop_sequence=None,
                                     usage=AnthropicUsage(
-                                        input_tokens=origin_chunk.usage.prompt_tokens
-                                        if origin_chunk.usage
-                                        else 0,
+                                        input_tokens=_anthropic_input_tokens(
+                                            origin_chunk.usage
+                                        ),
                                         output_tokens=0,
                                         **_cache_usage_fields(origin_chunk.usage),
                                     ),
@@ -694,9 +725,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_delta",
                                 delta=AnthropicDelta(stop_reason=stop_reason),
                                 usage=AnthropicUsage(
-                                    input_tokens=origin_chunk.usage.prompt_tokens
-                                    if origin_chunk.usage
-                                    else 0,
+                                    # By the time `message_delta` arrives the
+                                    # chunk carries `prompt_tokens_details`, so
+                                    # this is the authoritative fresh count.
+                                    input_tokens=_anthropic_input_tokens(
+                                        origin_chunk.usage
+                                    ),
                                     output_tokens=origin_chunk.usage.completion_tokens
                                     if origin_chunk.usage
                                     else 0,
