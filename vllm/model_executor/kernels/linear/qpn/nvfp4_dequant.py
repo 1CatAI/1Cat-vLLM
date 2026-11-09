@@ -215,7 +215,12 @@ def nvfp4_qpn2_dense_linear(
 
 
 # Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu.
-QPN2_DISPATCH_MAX_ROWS = 32
+# Keep this in step with the C++ mirror (``nvfp4_qpn2_sm70.cu``, which uses
+# 128). The DFlash2 verifier issues num_reqs * 8 rows, so 4 concurrent requests
+# already sit exactly on the old limit of 32. One row past it silently falls
+# back to the dense path, which interleaves with the sampling graph's
+# collectives and shows up as a hot-load deadlock at 4-way concurrency.
+QPN2_DISPATCH_MAX_ROWS = 128
 
 
 def _nvfp4_qpn2_dispatch_linear(

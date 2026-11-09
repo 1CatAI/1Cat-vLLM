@@ -1116,7 +1116,22 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         # AWQ target paths can surface fp32 auxiliary states even when the
         # draft projection is initialized in fp16. Match the FC weight dtype
         # before dispatching the linear kernel.
-        projection_dtype = _dflash_context_projection_dtype(self.model.fc)
+        #
+        # A quantized fc (compressed-tensors NVFP4 on SM70 TurboMind) exposes
+        # only an **empty uint8 weight stub** after prepare_nvfp4_linear, whose
+        # dtype is not the activation dtype the kernel wants.
+        # _dflash_context_projection_dtype() therefore falls back to
+        # quant_method.params_dtype (= model_config.dtype), while the SM70
+        # NVFP4 GEMM requires float16 activations and fails warmup with
+        # "nvfp4_gemm_sm70: input must be float16.". Test for the empty stub
+        # instead: empty means force float16.
+        fc_weight = getattr(self.model.fc, "weight", None)
+        if fc_weight is not None and fc_weight.numel() == 0:
+            projection_dtype = torch.float16
+        elif fc_weight is not None:
+            projection_dtype = fc_weight.dtype
+        else:
+            projection_dtype = None
         if projection_dtype is not None and hidden_states.dtype != projection_dtype:
             hidden_states = hidden_states.to(dtype=projection_dtype)
         result = self.model.fc(hidden_states)

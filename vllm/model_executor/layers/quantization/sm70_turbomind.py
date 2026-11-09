@@ -554,7 +554,18 @@ def prepare_nvfp4_linear(
 
 # Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu: rows up to this
 # take the QPN2 decode kernels, larger M takes the dense prefill.
-QPN2_DISPATCH_MAX_ROWS = 32
+# Keep this in step with the C++ mirror, which already uses 128
+# (csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu:55).
+#
+# The DFlash2 verifier issues num_reqs * (1 + nst) = num_reqs * 8 rows, so 4
+# concurrent requests is 32 rows and 8 is 64. The old limit of 32 put 4-way
+# concurrency exactly on the boundary; one row past it silently switched to
+# the dequant-to-fp16-then-cuBLAS dense fallback, which interleaves with the
+# device-side sampling graph's collectives and deadlocks under hot load --
+# observed as unbalanced GPU power (some cards idling at 160W+, others stuck
+# near 70W) alongside "No available shared memory broadcast block found in 60
+# seconds".
+QPN2_DISPATCH_MAX_ROWS = 128
 QPN2_GROUP_SIZE = 16
 
 # Launch configurations (split-K, accumulator chains) measured on the
