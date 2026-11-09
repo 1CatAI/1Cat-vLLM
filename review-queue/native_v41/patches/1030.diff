@@ -1,0 +1,1024 @@
+diff --git a/csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu b/csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu
+index 4ec4203d34..2ee206798c 100644
+--- a/csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu
++++ b/csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu
+@@ -463,9 +463,14 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+   TORCH_CHECK(num_tokens > 0 && topk > 0 && topk <= 65535,
+               "positive token count and supported routing width are required");
+   TORCH_CHECK(num_tokens <= 65535 / topk, "routing slots exceed CUDA grid-y");
+-  TORCH_CHECK(splitk == 8 || splitk == 10 || splitk == 16,
++  // 4, 6, 9, 12 and 18 serve K/16 = 36 and 18 (DeepSeek-V4.1 W2 at TP4,
++  // K = 576, and TP8, K = 288), which 8, 10 and 16 cannot divide. They are
++  // instantiated with one accumulator only.
++  TORCH_CHECK(splitk == 4 || splitk == 6 || splitk == 8 || splitk == 9 ||
++                  splitk == 10 || splitk == 12 || splitk == 16 ||
++                  splitk == 18,
+               "unsupported split-K specialization");
+-  TORCH_CHECK(nacc == 1 || (nacc == 2 && splitk != 10),
++  TORCH_CHECK(nacc == 1 || (nacc == 2 && (splitk == 8 || splitk == 16)),
+               "unsupported accumulator specialization");
+   TORCH_CHECK(gscales.dim() == 1 && gscales.numel() > 0,
+               "expert scales must be nonempty");
+@@ -499,7 +504,10 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+   TORCH_CHECK(perm.size(0) == S && y_slots.size(0) == S);
+   TORCH_CHECK(S <= 65535, "grouped qpn MoE: tokens * topk = ", S,
+               " exceeds the CUDA grid y limit");
+-  TORCH_CHECK(K % 64 == 0 && (K / 16) % splitk == 0,
++  // The grouped kernel walks K in 16-code groups and reads MXFP4 scales per
++  // pair of groups, so K % 32 is its real requirement (the dense QPN kernel
++  // above keeps K % 64 for its fixed four-warp split).
++  TORCH_CHECK(K % 32 == 0 && (K / 16) % splitk == 0,
+               "K/16 must split into splitk equal slices");
+   TORCH_CHECK(N % 32 == 0, "N % 32");
+   const dim3 grid((unsigned)(N / 32), (unsigned)S);
+@@ -559,10 +567,25 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+       break;
+     // SPLITK 32 would need more than the 48 KiB of static shared memory for
+     // the per-warp activation stage plus the split-K reduction.
++    case 41:
++      LAUNCH_MOE_QPN(4, 1);
++      break;
++    case 61:
++      LAUNCH_MOE_QPN(6, 1);
++      break;
++    case 91:
++      LAUNCH_MOE_QPN(9, 1);
++      break;
++    case 121:
++      LAUNCH_MOE_QPN(12, 1);
++      break;
++    case 181:
++      LAUNCH_MOE_QPN(18, 1);
++      break;
+     default:
+-      TORCH_CHECK(
+-          false,
+-          "moe_qpn (splitk, nacc) in {(8,1), (8,2), (10,1), (16,1), (16,2)}");
++      TORCH_CHECK(false,
++                  "moe_qpn (splitk, nacc) in {(4,1), (6,1), (8,1), (8,2), "
++                  "(9,1), (10,1), (12,1), (16,1), (16,2), (18,1)}");
+   }
+ #undef LAUNCH_MOE_QPN
+ #undef LAUNCH_MOE_QPN_S
+diff --git a/tests/kernels/moe/test_sm70_mxfp4_moe_geometry.py b/tests/kernels/moe/test_sm70_mxfp4_moe_geometry.py
+new file mode 100644
+index 0000000000..1d6876ed88
+--- /dev/null
++++ b/tests/kernels/moe/test_sm70_mxfp4_moe_geometry.py
+@@ -0,0 +1,378 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SM70 MXFP4 MoE beyond the DeepSeek-V4-Flash geometry.
++
++* ``validate_mxfp4_sm70_moe_contract`` admits the V4-Flash and V4.1-Flash
++  expert geometries and nothing else (CPU only).
++* ``Mxfp4SM70MoEMethod.apply`` on V4-Flash TP4/TP8 still takes its fused
++  decode paths and matches an FP32 dequantised reference; ``apply_slots``
++  agrees with ``apply``.
++* The generic grouped stages serve the V4.1 geometries (hidden 5120,
++  intermediate 2304 at TP4; 384 experts top-6 and 128 experts top-3).
++* The skinny split-K admission is unchanged for existing callers, and the new
++  4/6/9/12/18 specialisations agree with the old ones and with the reference.
++"""
++
++from __future__ import annotations
++
++import pytest
++import torch
++from torch import nn
++
++from vllm.model_executor.layers.fused_moe import (
++    FusedMoEConfig,
++    FusedMoEParallelConfig,
++    MoEActivation,
++    RoutingMethodType,
++)
++from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
++    grouped_splitk,
++    qpn_prepack,
++    rebase_e8m0_for_fp16,
++)
++from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
++    Mxfp4SM70MoEMethod,
++    _v4_flash_fast_paths,
++    validate_mxfp4_sm70_moe_contract,
++)
++
++_E2M1 = (
++    0.0,
++    0.5,
++    1.0,
++    1.5,
++    2.0,
++    3.0,
++    4.0,
++    6.0,
++    -0.0,
++    -0.5,
++    -1.0,
++    -1.5,
++    -2.0,
++    -3.0,
++    -4.0,
++    -6.0,
++)
++
++requires_sm70 = pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
++    reason="requires NVIDIA V100/SM70",
++)
++
++
++def _dequant_mxfp4(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
++    """codes [N, K/2] (low nibble = even k), E8M0 scales [N, K/32] -> FP32 [N, K]."""
++    lut = torch.tensor(_E2M1, dtype=torch.float32, device=codes.device)
++    values = torch.stack(
++        [lut[(codes & 0xF).long()], lut[(codes >> 4).long()]], dim=-1
++    ).flatten(-2)
++    return values * torch.exp2(scales.float() - 127.0).repeat_interleave(32, dim=-1)
++
++
++def _route_tables(topk_ids: torch.Tensor):
++    """Routing tables: perm (slots sorted by expert), gids, goff (group offsets)."""
++    key = topk_ids.reshape(-1).to(torch.int64)
++    num_slots = key.numel()
++    perm = torch.sort(key, stable=True)[1]
++    skey = key[perm]
++    first = torch.ones(num_slots, dtype=torch.bool, device=key.device)
++    first[1:] = skey[1:] != skey[:-1]
++    group = torch.cumsum(first.to(torch.int64), 0) - 1
++    slots = torch.arange(num_slots, dtype=torch.int64, device=key.device)
++    goff = torch.full((num_slots + 1,), num_slots, dtype=torch.int64, device=key.device)
++    goff.scatter_reduce_(0, group, slots, reduce="amin")
++    gids = torch.zeros(num_slots, dtype=torch.int64, device=key.device)
++    gids.scatter_(0, group, skey)
++    return perm.to(torch.int32), gids.to(torch.int32), goff.to(torch.int32)
++
++
++# ---- contract (CPU) ----------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "experts,top_k,hidden,inter_full,tp",
++    [
++        (256, 6, 4096, 2048, 4),  # DeepSeek-V4-Flash
++        (256, 6, 4096, 2048, 8),
++        (384, 6, 5120, 2304, 4),  # DeepSeek-V4.1-Flash backbone
++        (128, 3, 5120, 2304, 4),  # DeepSeek-V4.1-Flash DSpark draft layers
++    ],
++)
++def test_contract_admits_qualified_geometries(experts, top_k, hidden, inter_full, tp):
++    validate_mxfp4_sm70_moe_contract(
++        global_num_experts=experts,
++        top_k=top_k,
++        hidden_size=hidden,
++        intermediate_size_per_partition=inter_full // tp,
++        tp_size=tp,
++    )
++
++
++@pytest.mark.parametrize(
++    "experts,top_k,hidden,inter_full,tp,match",
++    [
++        (128, 6, 4096, 2048, 4, "256 global experts"),
++        (256, 8, 4096, 2048, 4, "top-k=6"),
++        (256, 6, 5120, 2304, 4, "128/384 global experts"),
++        (384, 3, 5120, 2304, 4, "top-k=6 for 384"),
++        (128, 6, 5120, 2304, 4, "top-k=3 for 128"),
++        (384, 6, 5120, 2048, 4, "intermediate size 2304"),
++        (32, 4, 2880, 2880, 1, "hidden size"),
++    ],
++)
++def test_contract_refuses_other_geometries(
++    experts, top_k, hidden, inter_full, tp, match
++):
++    with pytest.raises(NotImplementedError, match=match):
++        validate_mxfp4_sm70_moe_contract(
++            global_num_experts=experts,
++            top_k=top_k,
++            hidden_size=hidden,
++            intermediate_size_per_partition=inter_full // tp,
++            tp_size=tp,
++        )
++
++
++# ---- TurboMind path (GPU) ----------------------------------------------------
++
++
++def _config(
++    experts: int, top_k: int, hidden: int, inter_full: int, tp_size: int
++) -> FusedMoEConfig:
++    return FusedMoEConfig(
++        num_experts=experts,
++        experts_per_token=top_k,
++        hidden_dim=hidden,
++        intermediate_size_per_partition=inter_full // tp_size,
++        num_local_experts=experts,
++        num_logical_experts=experts,
++        activation=MoEActivation.SILU,
++        device=torch.device("cuda"),
++        routing_method=RoutingMethodType.DeepseekV4,
++        moe_parallel_config=FusedMoEParallelConfig(
++            tp_size=tp_size,
++            pcp_size=1,
++            dp_size=1,
++            ep_size=1,
++            tp_rank=0,
++            pcp_rank=0,
++            dp_rank=0,
++            ep_rank=0,
++            sp_size=1,
++            use_ep=False,
++            all2all_backend="allgather_reducescatter",
++            enable_eplb=False,
++        ),
++        in_dtype=torch.float16,
++        swiglu_limit=7.0,
++    )
++
++
++def _layer(
++    experts: int, top_k: int, hidden: int, inter_full: int, tp_size: int, seed: int
++) -> tuple[nn.Module, dict[str, torch.Tensor]]:
++    cfg = _config(experts, top_k, hidden, inter_full, tp_size)
++    inter = inter_full // tp_size
++    g = torch.Generator(device="cuda").manual_seed(seed)
++
++    def rnd(n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
++        codes = torch.randint(
++            0, 256, (experts, n, k // 2), dtype=torch.uint8, device="cuda", generator=g
++        )
++        scales = torch.randint(
++            116,
++            126,
++            (experts, n, k // 32),
++            dtype=torch.uint8,
++            device="cuda",
++            generator=g,
++        )
++        return codes, scales
++
++    w13, s13 = rnd(2 * inter, hidden)
++    w2, s2 = rnd(hidden, inter)
++    ref = {"w13": w13.clone(), "s13": s13.clone(), "w2": w2.clone(), "s2": s2.clone()}
++    layer = nn.Module()
++    layer.local_num_experts = layer.global_num_experts = experts
++    layer.top_k = top_k
++    layer.moe_config = cfg
++    layer.activation = MoEActivation.SILU
++    layer.apply_router_weight_on_input = False
++    layer.swiglu_limit = 7.0
++    layer.expert_map = None
++    for name, t in (
++        ("w13_weight", w13),
++        ("w13_weight_scale", s13),
++        ("w2_weight", w2),
++        ("w2_weight_scale", s2),
++    ):
++        layer.register_parameter(name, nn.Parameter(t, requires_grad=False))
++    Mxfp4SM70MoEMethod(cfg).process_weights_after_loading(layer)
++    return layer, ref
++
++
++def _reference(
++    ref: dict[str, torch.Tensor],
++    x: torch.Tensor,
++    ids: torch.Tensor,
++    w: torch.Tensor,
++    limit: float,
++) -> torch.Tensor:
++    out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device="cuda")
++    for t in range(ids.shape[0]):
++        for j, e in enumerate(ids[t].tolist()):
++            h = _dequant_mxfp4(ref["w13"][e], ref["s13"][e]) @ x[t].float()
++            inter = h.shape[0] // 2
++            gate = h[:inter].half().float().clamp(max=limit)
++            up = h[inter:].half().float().clamp(-limit, limit)
++            act = (torch.nn.functional.silu(gate) * up).half().float()
++            out[t] += (
++                w[t, j]
++                * (_dequant_mxfp4(ref["w2"][e], ref["s2"][e]) @ act).half().float()
++            )
++    return out
++
++
++def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
++    return ((a - b).pow(2).mean().sqrt() / b.pow(2).mean().sqrt()).item()
++
++
++def _check_apply(
++    layer, ref, experts: int, top_k: int, hidden: int, token_counts: tuple[int, ...]
++) -> None:
++    method = Mxfp4SM70MoEMethod(layer.moe_config)
++    for num_tokens in token_counts:
++        g = torch.Generator(device="cuda").manual_seed(num_tokens)
++        x = (torch.randn(num_tokens, hidden, device="cuda", generator=g) * 0.5).half()
++        ids = (
++            torch.rand(num_tokens, experts, device="cuda", generator=g)
++            .topk(top_k, -1)[1]
++            .to(torch.int32)
++            .contiguous()
++        )
++        w = torch.rand(num_tokens, top_k, device="cuda", generator=g)
++        out = method.apply(layer, x, w, ids, None, None).float()
++        expect = _reference(ref, x, ids, w, 7.0)
++        assert _rel(out, expect) < 2e-3, (num_tokens, _rel(out, expect))
++        slots = method.apply_slots(layer, x, ids).float().view(num_tokens, top_k, -1)
++        combined = (slots * w[..., None]).sum(1)
++        assert _rel(combined, out) < 2e-3, (num_tokens, _rel(combined, out))
++
++
++@requires_sm70
++@pytest.mark.parametrize("tp_size", [4, 8])
++def test_v4_flash_keeps_fast_paths_and_matches_reference(tp_size):
++    layer, ref = _layer(256, 6, 4096, 2048, tp_size, seed=tp_size)
++    assert _v4_flash_fast_paths(layer)
++    _check_apply(layer, ref, 256, 6, 4096, (1, 2, 8, 33))
++
++
++@requires_sm70
++@pytest.mark.parametrize("experts,top_k", [(384, 6), (128, 3)])
++def test_v41_geometry_runs_generic_stages(experts, top_k):
++    layer, ref = _layer(experts, top_k, 5120, 2304, 4, seed=experts)
++    assert not _v4_flash_fast_paths(layer)
++    _check_apply(layer, ref, experts, top_k, 5120, (1, 3, 17))
++
++
++# ---- skinny grouped kernel (GPU) --------------------------------------------
++
++
++def test_skinny_admission_unchanged_for_existing_callers():
++    assert grouped_splitk(4096, 16) == 16
++    assert grouped_splitk(512, 8) == 8
++    assert grouped_splitk(256, 8) == 8
++    assert grouped_splitk(320, 8) == 10
++    for k in (576, 288, 192):
++        with pytest.raises(ValueError):
++            grouped_splitk(k, 8)
++    assert grouped_splitk(576, 8, extended=True) == 12
++    assert grouped_splitk(288, 8, extended=True) == 9
++    assert grouped_splitk(5120, 16, extended=True) == 16
++
++
++@requires_sm70
++def test_qpn_prepack_k_align():
++    codes = torch.zeros(32, 144, dtype=torch.uint8, device="cuda")
++    scales = torch.full((32, 9), 127, dtype=torch.uint8, device="cuda")
++    with pytest.raises(ValueError, match="K % 64"):
++        qpn_prepack(codes, scales, 32)
++    qpn_prepack(codes, scales, 32, k_align=32)
++    with pytest.raises(ValueError, match="k_align"):
++        qpn_prepack(codes, scales, 32, k_align=16)
++
++
++def _grouped_run(k: int, splits: tuple[int, ...], k_align: int):
++    n, experts, num_tokens, top_k = 1024, 8, 5, 3
++    g = torch.Generator(device="cuda").manual_seed(k)
++    codes = torch.randint(
++        0, 256, (experts, n, k // 2), dtype=torch.uint8, device="cuda", generator=g
++    )
++    scales = torch.randint(
++        116, 126, (experts, n, k // 32), dtype=torch.uint8, device="cuda", generator=g
++    )
++    weights = [_dequant_mxfp4(codes[e], scales[e]) for e in range(experts)]
++    gs = rebase_e8m0_for_fp16(scales).float().cuda()
++    for e in range(experts):
++        qc, qs = qpn_prepack(codes[e], scales[e], 32, k_align=k_align)
++        codes[e].view(-1).copy_(qc)
++        scales[e].view(-1).copy_(qs)
++    x = torch.randn(num_tokens, k, device="cuda", generator=g).half()
++    ids = (
++        torch.rand(num_tokens, experts, device="cuda", generator=g)
++        .topk(top_k, -1)[1]
++        .to(torch.int32)
++        .contiguous()
++    )
++    perm, gids, goff = _route_tables(ids)
++    expect = torch.stack(
++        [
++            weights[e] @ x[s // top_k].float()
++            for s, e in enumerate(ids.reshape(-1).tolist())
++        ]
++    )
++    outs = {}
++    for split in splits:
++        y = torch.empty(num_tokens * top_k, n, dtype=torch.float16, device="cuda")
++        torch.ops._C.skinny_moe_qpn_sm70(
++            x,
++            codes,
++            scales,
++            gs,
++            perm,
++            gids,
++            goff,
++            top_k,
++            y,
++            False,
++            num_tokens,
++            split,
++            1,
++            1,
++        )
++        outs[split] = y.float()
++    return outs, expect
++
++
++@requires_sm70
++@pytest.mark.parametrize(
++    "k,old_split,new_splits", [(512, 8, (4, 16)), (4096, 16, (4, 8))]
++)
++def test_new_splits_agree_with_old_on_old_shapes(k, old_split, new_splits):
++    outs, expect = _grouped_run(k, (old_split, *new_splits), 64)
++    base = outs[old_split]
++    assert _rel(base, expect) < 1e-3
++    for split in new_splits:
++        other = outs[split]
++        mismatch = (other - base).abs() > base.abs() * 2.0**-9 + 2.0**-20
++        assert mismatch.float().mean().item() < 0.01, split
++
++
++@requires_sm70
++@pytest.mark.parametrize("k,splits", [(576, (4, 6, 9, 12, 18)), (288, (6, 9, 18))])
++def test_new_splits_serve_k576_and_k288(k, splits):
++    outs, expect = _grouped_run(k, splits, 32)
++    for split, y in outs.items():
++        assert torch.isfinite(y).all(), split
++        assert _rel(y, expect) < 1e-3, (split, _rel(y, expect))
+diff --git a/vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py b/vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py
+index 9eb739a33f..a81267bfb4 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/skinny_sm70_moe.py
+@@ -39,10 +39,18 @@
+ _QPN_MAX_M = 16
+ 
+ 
+-def grouped_splitk(k: int, preferred: int) -> int:
+-    """Choose only launch specializations that divide the actual K groups."""
+-    for split in dict.fromkeys((preferred, 16, 8, 10)):
+-        if k > 0 and k % 64 == 0 and (k // 16) % split == 0:
++def grouped_splitk(k: int, preferred: int, *, extended: bool = False) -> int:
++    """Choose only launch specializations that divide the actual K groups.
++
++    ``extended`` (DeepSeek-V4.1 callers only) also offers the 12/9/6/4/18-way
++    specializations, which serve K/16 = 36 (W2 at TP4, K = 576) and 18 (TP8,
++    K = 288), and accepts K % 32 like the grouped kernel does. The default
++    keeps the oracle's admission for every other model unchanged.
++    """
++    splits = (preferred, 16, 8, 10) + ((12, 9, 6, 4, 18) if extended else ())
++    align = 32 if extended else 64
++    for split in dict.fromkeys(splits):
++        if k > 0 and k % align == 0 and (k // 16) % split == 0:
+             return split
+     raise ValueError(f"skinny grouped MoE has no split-K specialization for K={k}")
+ 
+@@ -60,7 +68,11 @@ def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
+ 
+ 
+ def qpn_prepack(
+-    codes: torch.Tensor, scales: torch.Tensor, scale_group: int = 16
++    codes: torch.Tensor,
++    scales: torch.Tensor,
++    scale_group: int = 16,
++    *,
++    k_align: int = 64,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Permute one weight matrix into the fragment order the QPN kernels read.
+ 
+@@ -76,15 +88,20 @@ def qpn_prepack(
+         scale_group: codes per scale, 16 for NVFP4 (fp8-e4m3) and 32 for
+             MXFP4 (E8M0). The code layout is the same for both: a 32-code
+             MXFP4 block is two adjacent 16-code groups sharing one scale.
++        k_align: required K multiple. 64 serves every kernel (the dense QPN
++            GEMM splits K over four warps); the grouped MoE kernel needs only
++            32, which DeepSeek-V4.1's TP8 W2 (K = 288) relies on.
+ 
+     Returns:
+         The permuted codes and scales, both flat and contiguous.
+     """
+     n, k2 = codes.shape
+     k = k2 * 2
+-    if n % 32 or k % 64 or k % scale_group:
++    if k_align not in (32, 64):
++        raise ValueError(f"QPN prepack k_align must be 32 or 64, got {k_align}")
++    if n % 32 or k % k_align or k % scale_group:
+         raise ValueError(
+-            f"QPN prepack needs N % 32 == 0 and K % 64 == 0, got N={n} K={k}"
++            f"QPN prepack needs N % 32 == 0 and K % {k_align} == 0, got N={n} K={k}"
+         )
+     dev = codes.device
+     tiles, groups = n // 32, k // scale_group
+diff --git a/vllm/model_executor/layers/quantization/mxfp4_sm70_moe.py b/vllm/model_executor/layers/quantization/mxfp4_sm70_moe.py
+index d49dda0633..ee6ca21344 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4_sm70_moe.py
++++ b/vllm/model_executor/layers/quantization/mxfp4_sm70_moe.py
+@@ -41,6 +41,26 @@
+ _DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE: Final = 2048
+ _DEEPSEEK_V4_FLASH_NUM_EXPERTS: Final = 256
+ _DEEPSEEK_V4_FLASH_TOP_K: Final = 6
++_DEEPSEEK_V41_FLASH_HIDDEN_SIZE: Final = 5120
++_DEEPSEEK_V41_FLASH_INTERMEDIATE_SIZE: Final = 2304
++# Expert geometries this SM70 path is qualified for, keyed by (hidden size, full
++# expert intermediate size): model name and the admitted (global experts, top-k)
++# pairs. DeepSeek-V4.1 runs its 384-expert top-6 backbone and its 128-expert
++# top-3 DSpark draft layers on the generic grouped stages; the V4-Flash-only
++# fast paths (direct top-6, compact/broadcast decode, QPN M1) stay pinned to the
++# V4-Flash shapes they were qualified on (see _v4_flash_fast_paths).
++_SM70_MXFP4_MOE_GEOMETRIES: Final[
++    dict[tuple[int, int], tuple[str, frozenset[tuple[int, int]]]]
++] = {
++    (_DEEPSEEK_V4_FLASH_HIDDEN_SIZE, _DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE): (
++        "DeepSeek-V4-Flash",
++        frozenset({(_DEEPSEEK_V4_FLASH_NUM_EXPERTS, _DEEPSEEK_V4_FLASH_TOP_K)}),
++    ),
++    (_DEEPSEEK_V41_FLASH_HIDDEN_SIZE, _DEEPSEEK_V41_FLASH_INTERMEDIATE_SIZE): (
++        "DeepSeek-V4.1-Flash",
++        frozenset({(384, 6), (128, 3)}),
++    ),
++}
+ _GRAPH_SAFE_MAX_TOKENS: Final = 8
+ _MXFP4_QPN_M1_ENV: Final = "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE"
+ _MXFP4_QPN_M1_OP: Final = "mxfp4_moe_qpn_m1_sm70_out"
+@@ -159,9 +179,10 @@ def _compact_mxfp4_active_experts(
+     sorted_expert_ids: torch.Tensor,
+     compact_offsets: torch.Tensor,
+     active_expert_ids: torch.Tensor,
++    top_k: int = _DEEPSEEK_V4_FLASH_TOP_K,
+ ) -> None:
+     total_slots = sorted_expert_ids.numel()
+-    if not (0 < total_slots <= _GRAPH_SAFE_MAX_TOKENS * _DEEPSEEK_V4_FLASH_TOP_K):
++    if not (0 < total_slots <= _GRAPH_SAFE_MAX_TOKENS * top_k):
+         raise ValueError(f"Unsupported SM70 MXFP4 active-expert slots: {total_slots}")
+     block = triton.next_power_of_2(total_slots + 1)
+     _compact_sorted_experts_kernel[(1,)](
+@@ -180,12 +201,13 @@ def _select_mxfp4_stage_dispatch(
+     num_tokens: int,
+     num_experts: int,
+     fully_replicated_experts: bool,
++    top_k: int = _DEEPSEEK_V4_FLASH_TOP_K,
+ ) -> tuple[torch.Tensor, torch.Tensor, int]:
+     if 0 < num_tokens <= _mxfp4_active_expert_max_tokens() and fully_replicated_experts:
+         # Keep the graph launch count fixed. The compactor represents unused
+         # tail entries as zero-row experts, avoiding a host readback of the
+         # dynamic unique-expert count.
+-        graph_expert_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
++        graph_expert_slots = num_tokens * top_k
+         if _mxfp4_grouped_verifier_for_tokens(num_tokens):
+             if _mxfp4_grouped_m8_expert_rows_enabled():
+                 return (
+@@ -251,22 +273,40 @@ def validate_mxfp4_sm70_moe_contract(
+     intermediate_size_per_partition: int,
+     tp_size: int,
+ ) -> None:
+-    """Reject shapes outside the exact V4-Flash SM70 implementation contract."""
+-    if global_num_experts != _DEEPSEEK_V4_FLASH_NUM_EXPERTS:
++    """Reject shapes outside the qualified SM70 expert geometries.
++
++    Admitted: DeepSeek-V4-Flash (hidden 4096, intermediate 2048, 256 experts,
++    top-6) and DeepSeek-V4.1-Flash (hidden 5120, intermediate 2304; 384
++    experts top-6 for the backbone, 128 experts top-3 for the DSpark layers).
++    """
++    geometries = {
++        intermediate: entry
++        for (hidden, intermediate), entry in _SM70_MXFP4_MOE_GEOMETRIES.items()
++        if hidden == hidden_size
++    }
++    if not geometries:
++        supported = " or ".join(
++            f"{hidden} ({name})"
++            for (hidden, _), (name, _) in _SM70_MXFP4_MOE_GEOMETRIES.items()
++        )
+         raise NotImplementedError(
+-            "SM70 TurboMind MXFP4 MoE currently supports DeepSeek-V4-Flash "
+-            f"with {_DEEPSEEK_V4_FLASH_NUM_EXPERTS} global experts, got "
+-            f"{global_num_experts}."
++            "SM70 TurboMind MXFP4 MoE currently supports hidden size "
++            f"{supported}, got {hidden_size}."
+         )
+-    if top_k != _DEEPSEEK_V4_FLASH_TOP_K:
++    ((intermediate_size, (name, routes)),) = geometries.items()
++    expert_counts = sorted({experts for experts, _ in routes})
++    if global_num_experts not in expert_counts:
+         raise NotImplementedError(
+-            "SM70 TurboMind MXFP4 MoE currently supports DeepSeek-V4-Flash "
+-            f"top-k={_DEEPSEEK_V4_FLASH_TOP_K}, got {top_k}."
++            f"SM70 TurboMind MXFP4 MoE currently supports {name} with "
++            f"{'/'.join(map(str, expert_counts))} global experts, got "
++            f"{global_num_experts}."
+         )
+-    if hidden_size != _DEEPSEEK_V4_FLASH_HIDDEN_SIZE:
++    if (global_num_experts, top_k) not in routes:
++        widths = sorted(k for experts, k in routes if experts == global_num_experts)
+         raise NotImplementedError(
+-            "SM70 TurboMind MXFP4 MoE currently supports hidden size "
+-            f"{_DEEPSEEK_V4_FLASH_HIDDEN_SIZE}, got {hidden_size}."
++            f"SM70 TurboMind MXFP4 MoE currently supports {name} "
++            f"top-k={'/'.join(map(str, widths))} for {global_num_experts} "
++            f"experts, got {top_k}."
+         )
+     if intermediate_size_per_partition <= 0 or (
+         intermediate_size_per_partition % MXFP4_GROUP_SIZE
+@@ -276,16 +316,27 @@ def validate_mxfp4_sm70_moe_contract(
+             f"size divisible by {MXFP4_GROUP_SIZE}, got "
+             f"{intermediate_size_per_partition}."
+         )
+-    if intermediate_size_per_partition * max(tp_size, 1) != (
+-        _DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE
+-    ):
++    if intermediate_size_per_partition * max(tp_size, 1) != intermediate_size:
+         raise NotImplementedError(
+-            "SM70 TurboMind MXFP4 MoE currently supports DeepSeek-V4-Flash "
+-            f"intermediate size {_DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE}; got "
++            f"SM70 TurboMind MXFP4 MoE currently supports {name} "
++            f"intermediate size {intermediate_size}; got "
+             f"local={intermediate_size_per_partition}, tp_size={tp_size}."
+         )
+ 
+ 
++def _v4_flash_fast_paths(layer: RoutedExperts) -> bool:
++    """True only for the exact V4-Flash geometry the fused decode paths
++    (direct top-6, compact/broadcast grouped decode, QPN M1) were qualified on.
++    Other admitted geometries run the generic permute + grouped stages."""
++    return bool(
++        int(layer.sm70_mxfp4_hidden_size) == _DEEPSEEK_V4_FLASH_HIDDEN_SIZE
++        and int(layer.sm70_mxfp4_intermediate_size) * int(layer.moe_config.tp_size)
++        == _DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE
++        and int(layer.global_num_experts) == _DEEPSEEK_V4_FLASH_NUM_EXPERTS
++        and int(layer.top_k) == _DEEPSEEK_V4_FLASH_TOP_K
++    )
++
++
+ def validate_mxfp4_sm70_moe_weight_layout(
+     *,
+     local_num_experts: int,
+@@ -540,17 +591,20 @@ def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         self._allocate_graph_safe_decode_buffers(layer)
+ 
+         logger.info_once(
+-            "SM70 TurboMind MXFP4 MoE enabled for DeepSeek-V4-Flash "
+-            "(local_experts=%d, graph_safe_decode=B1-B%d, "
++            "SM70 TurboMind MXFP4 MoE enabled (hidden=%d, local_experts=%d, "
++            "top_k=%d, V4-Flash fast paths=%s, graph_safe_decode=B1-B%d, "
+             "active_expert_max_tokens=%d).",
++            hidden_size,
+             num_experts,
++            int(layer.top_k),
++            _v4_flash_fast_paths(layer),
+             _GRAPH_SAFE_MAX_TOKENS,
+             _mxfp4_active_expert_max_tokens(),
+         )
+ 
+     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
+         device = layer.w13_tm_weight.device
+-        top_k = _DEEPSEEK_V4_FLASH_TOP_K
++        top_k = int(layer.top_k)
+         max_slots = _GRAPH_SAFE_MAX_TOKENS * top_k
+         num_experts = int(layer.sm70_mxfp4_num_experts)
+         hidden_size = int(layer.sm70_mxfp4_hidden_size)
+@@ -630,7 +684,7 @@ def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
+     def _persistent_decode_buffers(
+         layer: RoutedExperts, num_tokens: int
+     ) -> dict[str, torch.Tensor]:
+-        total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
++        total_slots = num_tokens * int(layer.top_k)
+         return {
+             "output": layer._mxfp4_sm70_buf_output[:num_tokens],
+             "permuted_input": layer._mxfp4_sm70_buf_permuted_input[:total_slots],
+@@ -673,7 +727,7 @@ def _eager_buffers(
+         layer: RoutedExperts, num_tokens: int
+     ) -> dict[str, torch.Tensor]:
+         device = layer.w13_tm_weight.device
+-        top_k = _DEEPSEEK_V4_FLASH_TOP_K
++        top_k = int(layer.top_k)
+         total_slots = num_tokens * top_k
+         num_experts = int(layer.sm70_mxfp4_num_experts)
+         hidden_size = int(layer.sm70_mxfp4_hidden_size)
+@@ -759,6 +813,143 @@ def _apply_swiglu(
+                 out, gate_up, float(layer.swiglu_limit)
+             )
+ 
++    def _check_apply_inputs(
++        self, layer: RoutedExperts, x: torch.Tensor, topk_ids: torch.Tensor
++    ) -> int:
++        if not x.is_cuda or x.dtype != torch.float16 or x.ndim != 2:
++            raise TypeError("SM70 MXFP4 MoE requires CUDA FP16 activations [M, H].")
++        if not is_exact_sm70_cuda(x, enabled=True):
++            raise RuntimeError("SM70 MXFP4 MoE dispatch is restricted to CUDA SM70.")
++        hidden_size = int(layer.sm70_mxfp4_hidden_size)
++        if x.shape[1] != hidden_size:
++            raise ValueError(
++                "SM70 MXFP4 MoE activation hidden size mismatch: expected "
++                f"{hidden_size}, got {x.shape[1]}."
++            )
++        top_k = int(layer.top_k)
++        if tuple(topk_ids.shape) != (x.shape[0], top_k):
++            raise ValueError(
++                f"SM70 MXFP4 MoE requires top-k IDs with shape [M, {top_k}]."
++            )
++        if layer.apply_router_weight_on_input:
++            raise NotImplementedError(
++                "SM70 MXFP4 MoE does not support applying router weights to input."
++            )
++        return top_k
++
++    def _generic_stages(
++        self,
++        layer: RoutedExperts,
++        x: torch.Tensor,
++        topk_ids: torch.Tensor,
++        buffers: dict[str, torch.Tensor],
++        top_k: int,
++    ) -> None:
++        """Permute the routed rows by expert and run W13, SwiGLU and W2 on them;
++        leaves the per-route rows in ``buffers["sorted_output"]`` (permuted
++        order, ``buffers["inv_permuted_idx"]`` maps each route to its row)."""
++        num_tokens = x.shape[0]
++        total_slots = num_tokens * top_k
++        topk_ids_i32 = buffers["topk_ids"]
++        topk_ids_i32.copy_(topk_ids, non_blocking=True)
++        buffers["permuted_idx"].fill_(total_slots)
++        torch.ops._moe_C.moe_permute_with_scratch(
++            x,
++            topk_ids_i32,
++            buffers["token_expert_indices"],
++            layer.expert_map,
++            layer.global_num_experts,
++            layer.local_num_experts,
++            top_k,
++            buffers["permuted_input"],
++            buffers["expert_offsets64"],
++            buffers["inv_permuted_idx"],
++            buffers["permuted_idx"],
++            buffers["sort_workspace"],
++            buffers["permuted_experts_id"],
++            buffers["sorted_row_idx"],
++            buffers["topk_ids_for_sort"],
++        )
++        buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
++
++        if (
++            num_tokens > 1
++            and num_tokens <= _mxfp4_active_expert_max_tokens()
++            and not (
++                _mxfp4_grouped_verifier_for_tokens(num_tokens)
++                and not _mxfp4_grouped_m8_expert_rows_enabled()
++            )
++            and layer.expert_map is None
++            and layer.local_num_experts == layer.global_num_experts
++        ):
++            _compact_mxfp4_active_experts(
++                buffers["permuted_experts_id"],
++                buffers["compact_expert_offsets"],
++                buffers["active_expert_ids"],
++                top_k,
++            )
++
++        stage_offsets, stage_expert_ids, stage_expert_count = (
++            _select_mxfp4_stage_dispatch(
++                buffers,
++                num_tokens=num_tokens,
++                num_experts=layer.sm70_mxfp4_num_experts,
++                fully_replicated_experts=(
++                    layer.expert_map is None
++                    and layer.local_num_experts == layer.global_num_experts
++                ),
++                top_k=top_k,
++            )
++        )
++
++        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
++            buffers["gate_up"],
++            buffers["permuted_input"],
++            stage_offsets,
++            stage_expert_ids,
++            layer.w13_strided_ptrs_w,
++            layer.w13_strided_ptrs_s,
++            stage_expert_count,
++            layer.sm70_mxfp4_w13_k_dim,
++            layer.sm70_mxfp4_w13_n_dim,
++            layer.sm70_mxfp4_group_size,
++        )
++        self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
++        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
++            buffers["sorted_output"],
++            buffers["intermediate"],
++            stage_offsets,
++            stage_expert_ids,
++            layer.w2_strided_ptrs_w,
++            layer.w2_strided_ptrs_s,
++            stage_expert_count,
++            layer.sm70_mxfp4_w2_k_dim,
++            layer.sm70_mxfp4_w2_n_dim,
++            layer.sm70_mxfp4_group_size,
++        )
++
++    def apply_slots(
++        self, layer: RoutedExperts, x: torch.Tensor, topk_ids: torch.Tensor
++    ) -> torch.Tensor:
++        """Per-route expert outputs, unweighted, in route order.
++
++        Returns ``y`` [M * top_k, H] FP16 with ``y[t * top_k + j]`` = expert
++        ``topk_ids[t, j]`` applied to ``x[t]`` (TP-partial over the local
++        intermediate slice). The caller combines them, e.g. in FP32 together
++        with a shared expert (DeepSeek-V4.1, PORT_DESIGN §3.4). Runs the generic
++        grouped stages for every admitted geometry.
++        """
++        top_k = self._check_apply_inputs(layer, x, topk_ids)
++        num_tokens = x.shape[0]
++        hidden_size = int(layer.sm70_mxfp4_hidden_size)
++        if num_tokens == 0:
++            return x.new_empty((0, hidden_size))
++        buffers = self._get_buffers(layer, num_tokens)
++        self._generic_stages(layer, x, topk_ids, buffers, top_k)
++        return buffers["sorted_output"].index_select(
++            0, buffers["inv_permuted_idx"].reshape(-1)
++        )
++
+     def apply(
+         self,
+         layer: RoutedExperts,
+@@ -769,37 +960,21 @@ def apply(
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         del shared_experts, shared_experts_input
+-        if not x.is_cuda or x.dtype != torch.float16 or x.ndim != 2:
+-            raise TypeError("SM70 MXFP4 MoE requires CUDA FP16 activations [M, H].")
+-        if not is_exact_sm70_cuda(x, enabled=True):
+-            raise RuntimeError("SM70 MXFP4 MoE dispatch is restricted to CUDA SM70.")
+-        if x.shape[1] != _DEEPSEEK_V4_FLASH_HIDDEN_SIZE:
+-            raise ValueError(
+-                "SM70 MXFP4 MoE activation hidden size mismatch: expected "
+-                f"{_DEEPSEEK_V4_FLASH_HIDDEN_SIZE}, got {x.shape[1]}."
+-            )
+-        if tuple(topk_ids.shape) != (
+-            x.shape[0],
+-            _DEEPSEEK_V4_FLASH_TOP_K,
+-        ):
+-            raise ValueError("SM70 MXFP4 MoE requires top-k IDs with shape [M, 6].")
++        top_k = self._check_apply_inputs(layer, x, topk_ids)
++        hidden_size = int(layer.sm70_mxfp4_hidden_size)
+         if tuple(topk_weights.shape) != tuple(topk_ids.shape):
+             raise ValueError("SM70 MXFP4 MoE top-k weights and IDs must share shape.")
+         if topk_weights.dtype != torch.float32:
+             raise TypeError("SM70 MXFP4 MoE requires float32 top-k weights.")
+-        if layer.apply_router_weight_on_input:
+-            raise NotImplementedError(
+-                "SM70 MXFP4 MoE does not support applying router weights to input."
+-            )
+-
+         num_tokens = x.shape[0]
+         if num_tokens == 0:
+-            return x.new_empty((0, _DEEPSEEK_V4_FLASH_HIDDEN_SIZE))
++            return x.new_empty((0, hidden_size))
+         buffers = self._get_buffers(layer, num_tokens)
+         output = buffers["output"]
+ 
+         direct_top6 = (
+             num_tokens == 1
++            and _v4_flash_fast_paths(layer)
+             and envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE
+             and layer.expert_map is None
+             and layer.local_num_experts == layer.global_num_experts
+@@ -834,7 +1009,7 @@ def apply(
+                 topk_weights,
+                 buffers["token_expert_indices"],
+                 output,
+-                _DEEPSEEK_V4_FLASH_TOP_K,
++                top_k,
+                 layer.sm70_mxfp4_hidden_size,
+             )
+             logger.info_once(
+@@ -852,7 +1027,7 @@ def apply(
+                 route_ids,
+                 layer.w13_strided_ptrs_w,
+                 layer.w13_strided_ptrs_s,
+-                _DEEPSEEK_V4_FLASH_TOP_K,
++                top_k,
+                 layer.sm70_mxfp4_w13_k_dim,
+                 layer.sm70_mxfp4_w13_n_dim,
+                 layer.sm70_mxfp4_group_size,
+@@ -865,7 +1040,7 @@ def apply(
+                 route_ids,
+                 layer.w2_strided_ptrs_w,
+                 layer.w2_strided_ptrs_s,
+-                _DEEPSEEK_V4_FLASH_TOP_K,
++                top_k,
+                 layer.sm70_mxfp4_w2_k_dim,
+                 layer.sm70_mxfp4_w2_n_dim,
+                 layer.sm70_mxfp4_group_size,
+@@ -875,7 +1050,7 @@ def apply(
+                 topk_weights,
+                 buffers["token_expert_indices"],
+                 output,
+-                _DEEPSEEK_V4_FLASH_TOP_K,
++                top_k,
+                 layer.sm70_mxfp4_hidden_size,
+             )
+             return output
+@@ -903,7 +1078,7 @@ def apply(
+                 buffers["permuted_experts_id"],
+                 layer.w2_strided_ptrs_w,
+                 layer.w2_strided_ptrs_s,
+-                _DEEPSEEK_V4_FLASH_TOP_K,
++                top_k,
+                 layer.sm70_mxfp4_w2_k_dim,
+                 layer.sm70_mxfp4_w2_n_dim,
+                 layer.sm70_mxfp4_group_size,
+@@ -913,95 +1088,19 @@ def apply(
+                 topk_weights,
+                 buffers["inv_permuted_idx"],
+                 buffers["compact_expert_offsets64"],
+-                _DEEPSEEK_V4_FLASH_TOP_K,
++                top_k,
+                 output,
+             )
+             return output
+ 
+         output.zero_()
+-
+-        total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
+-        topk_ids_i32 = buffers["topk_ids"]
+-        topk_ids_i32.copy_(topk_ids, non_blocking=True)
+-        buffers["permuted_idx"].fill_(total_slots)
+-        torch.ops._moe_C.moe_permute_with_scratch(
+-            x,
+-            topk_ids_i32,
+-            buffers["token_expert_indices"],
+-            layer.expert_map,
+-            layer.global_num_experts,
+-            layer.local_num_experts,
+-            _DEEPSEEK_V4_FLASH_TOP_K,
+-            buffers["permuted_input"],
+-            buffers["expert_offsets64"],
+-            buffers["inv_permuted_idx"],
+-            buffers["permuted_idx"],
+-            buffers["sort_workspace"],
+-            buffers["permuted_experts_id"],
+-            buffers["sorted_row_idx"],
+-            buffers["topk_ids_for_sort"],
+-        )
+-        buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
+-
+-        if (
+-            num_tokens > 1
+-            and num_tokens <= _mxfp4_active_expert_max_tokens()
+-            and not (
+-                _mxfp4_grouped_verifier_for_tokens(num_tokens)
+-                and not _mxfp4_grouped_m8_expert_rows_enabled()
+-            )
+-            and layer.expert_map is None
+-            and layer.local_num_experts == layer.global_num_experts
+-        ):
+-            _compact_mxfp4_active_experts(
+-                buffers["permuted_experts_id"],
+-                buffers["compact_expert_offsets"],
+-                buffers["active_expert_ids"],
+-            )
+-
+-        stage_offsets, stage_expert_ids, stage_expert_count = (
+-            _select_mxfp4_stage_dispatch(
+-                buffers,
+-                num_tokens=num_tokens,
+-                num_experts=layer.sm70_mxfp4_num_experts,
+-                fully_replicated_experts=(
+-                    layer.expert_map is None
+-                    and layer.local_num_experts == layer.global_num_experts
+-                ),
+-            )
+-        )
+-
+-        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+-            buffers["gate_up"],
+-            buffers["permuted_input"],
+-            stage_offsets,
+-            stage_expert_ids,
+-            layer.w13_strided_ptrs_w,
+-            layer.w13_strided_ptrs_s,
+-            stage_expert_count,
+-            layer.sm70_mxfp4_w13_k_dim,
+-            layer.sm70_mxfp4_w13_n_dim,
+-            layer.sm70_mxfp4_group_size,
+-        )
+-        self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
+-        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+-            buffers["sorted_output"],
+-            buffers["intermediate"],
+-            stage_offsets,
+-            stage_expert_ids,
+-            layer.w2_strided_ptrs_w,
+-            layer.w2_strided_ptrs_s,
+-            stage_expert_count,
+-            layer.sm70_mxfp4_w2_k_dim,
+-            layer.sm70_mxfp4_w2_n_dim,
+-            layer.sm70_mxfp4_group_size,
+-        )
++        self._generic_stages(layer, x, topk_ids, buffers, top_k)
+         torch.ops._moe_C.moe_unpermute(
+             buffers["sorted_output"],
+             topk_weights,
+             buffers["inv_permuted_idx"],
+             buffers["expert_offsets64"],
+-            _DEEPSEEK_V4_FLASH_TOP_K,
++            top_k,
+             output,
+         )
+         return output

@@ -1,0 +1,43 @@
+{
+  "group": "native_v41",
+  "title": "DeepSeek-V4.1 8-GPU checkpoint qualification",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1243,
+      "title": "[Model][SM70] DeepSeek-V4.1-Flash-1017 on 8x V100: EXL3 experts, graph attention, DSpark speculative decoding, 1M context (stacks on #1031)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1243",
+      "head": "70bb718828f3c0620c0fb44ec5f671dd67194e47",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "0c75645536c6bbd01fbcd593db6df0ad9f4adf45da761e62757f11686f9c9dcf",
+      "files": 124,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1030,
+      "title": "[Kernel][SM70] Generalise the MXFP4 MoE geometry and add skinny split-K 4/6/9/12/18",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1030",
+      "head": "19f25c48ee95eeda0ba402cdea8e29f963a5fce0",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "55e2c7328364112bd17932cb0a6994093c6001c887a27dfb5c85708748d8f867",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    },
+    {
+      "number": 1031,
+      "title": "[Model][SM70] DeepSeek-V4.1-Flash on V100: PP3xTP4 (12 GPUs, 256K) and PP2xTP4 (8 GPUs)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1031",
+      "head": "a36df7c2239a13ae8da3f257151bdf92f335cc5f",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "34d5ce0c95a33dc44a66883137a70038224407968cd59cadc50933a0db8b860d",
+      "files": 106,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    }
+  ],
+  "validation_gaps": "Original #1243 requires an 8xV100 DeepSeek-V4.1 EXL3 topology and its checkpoint;54633 has4xV100. The complete124-file diff was reconstructed from exact Git trees and replay-verified, including file modes. Original source commits #1030/#1031 remain ancestors. This establishes source retention, not 1M-context/model acceptance.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
