@@ -37,7 +37,10 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionStreamResponse,
     ChatCompletionToolsParam,
 )
-from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.chat_completion.serving import (
+    OpenAIServingChat,
+    _usage_timings,
+)
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     JsonSchemaResponseFormat,
@@ -63,6 +66,24 @@ def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
         if cached_tokens is not None:
             return {"cache_read_input_tokens": cached_tokens}
     return {}
+
+
+def _timing_usage_fields(engine_usage: object, metrics: object = None) -> dict:
+    """Per-request phase timings for the Anthropic usage block.
+
+    The OpenAI endpoint attaches these to `usage.timings` directly; here the
+    value is already on the usage object it produced (`timings`) or, failing
+    that, recomputable from the request metrics attached to the output. Both
+    dialects therefore report the same measured breakdown rather than leaving
+    Anthropic clients to infer it from token arrival times.
+
+    Returns an empty dict when nothing was measured, so the key is omitted
+    instead of serialised as null.
+    """
+    timings = getattr(engine_usage, "timings", None)
+    if not isinstance(timings, dict) or not timings:
+        timings = _usage_timings(metrics)
+    return {"timings": timings} if timings else {}
 
 
 class AnthropicServingMessages(OpenAIServingChat):
@@ -518,6 +539,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                 input_tokens=generator.usage.prompt_tokens,
                 output_tokens=generator.usage.completion_tokens,
                 **_cache_usage_fields(generator.usage),
+                **_timing_usage_fields(
+                    generator.usage, getattr(generator, "metrics", None)
+                ),
             ),
             kv_transfer_params=generator.kv_transfer_params,
         )
@@ -701,6 +725,10 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     if origin_chunk.usage
                                     else 0,
                                     **_cache_usage_fields(origin_chunk.usage),
+                                    **_timing_usage_fields(
+                                        origin_chunk.usage,
+                                        getattr(origin_chunk, "metrics", None),
+                                    ),
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)

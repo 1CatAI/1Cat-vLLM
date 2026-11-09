@@ -90,6 +90,43 @@ def _token_list(rendered: Any) -> list[int]:
     return list(rendered)
 
 
+def _usage_timings(metrics: object) -> dict | None:
+    """Engine per-request prefill/decode breakdown for the response usage.
+
+    ``metrics`` is the ``RequestStateStats`` the engine attaches to every
+    finished ``RequestOutput`` (v1/engine/output_processor.py). Only its
+    monotonic timestamps are re-expressed as durations here -- nothing new is
+    measured in the serving layer.
+
+    Returns None when stats were not collected (the engine ran with
+    ``log_stats=False``, or the request finished before any timestamp was
+    taken). The field is then omitted rather than reported as zero, because a
+    zero decode time and "not measured" mean different things to a client
+    computing throughput.
+
+    Returned as a plain dict rather than a model: ``UsageInfo`` is declared
+    with ``extra="allow"``, so assigning this dict to ``usage.timings``
+    serialises it verbatim without adding a field to the protocol.
+    """
+    if metrics is None:
+        return None
+    queued = getattr(metrics, "queued_ts", 0.0)
+    scheduled = getattr(metrics, "scheduled_ts", 0.0)
+    first = getattr(metrics, "first_token_ts", 0.0)
+    last = getattr(metrics, "last_token_ts", 0.0)
+    if not (queued and scheduled and first and last):
+        return None
+    return {
+        "queue_s": scheduled - queued,
+        "prefill_s": first - scheduled,
+        "decode_s": last - first,
+        "inference_s": last - scheduled,
+        # Wider than queue_s + prefill_s by the frontend-to-core hop, which
+        # queue + prefill cannot see.
+        "ttft_s": getattr(metrics, "first_token_latency", None) or None,
+    }
+
+
 class _PrefixCacheBoundaries:
     """Prompt positions worth a partial prefix-cache entry.
 
@@ -646,8 +683,15 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        # Kept so the final usage can carry the engine's per-request breakdown.
+        # The stats object is attached to every output, but only the finished
+        # one holds a complete set of timestamps.
+        last_metrics = None
         try:
             async for res in result_generator:
+                if getattr(res, "metrics", None) is not None:
+                    last_metrics = res.metrics
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -1106,6 +1150,9 @@ class OpenAIServingChat(OpenAIServing):
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens
                     )
+                # Engine-authoritative per-request timings. Omitted when the
+                # engine collected no stats for this request.
+                final_usage.timings = _usage_timings(last_metrics)
 
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1540,6 +1587,11 @@ class OpenAIServingChat(OpenAIServing):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
             )
+        # Engine-authoritative per-request timings. Without this a
+        # non-streaming caller has no prefill/decode split at all, and any
+        # consumer that derives rates from a token stream sees the whole
+        # request as one point in time.
+        usage.timings = _usage_timings(getattr(final_res, "metrics", None))
 
         request_metadata.final_usage_info = usage
 

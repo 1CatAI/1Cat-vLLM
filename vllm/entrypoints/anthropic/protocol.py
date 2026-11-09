@@ -29,6 +29,12 @@ class AnthropicUsage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    # Per-request phase breakdown, same shape the OpenAI endpoint carries in
+    # `usage.timings`. The Anthropic wire format has no field for it, so it
+    # rides as an extra key: clients that do not know it ignore it, while those
+    # that do (the Studio proxy) get the same measured attribution here as on
+    # the OpenAI dialect instead of reconstructing it from token timing.
+    timings: dict | None = None
 
 
 class AnthropicContentBlock(BaseModel):
