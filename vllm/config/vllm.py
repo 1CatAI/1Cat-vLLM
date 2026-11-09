@@ -725,6 +725,12 @@ class VllmConfig:
         if is_mrv2_dflash:
             return True
 
+        # Qwen3.5/3.8 native MTP on SM70: the MRV2 speculator carries the
+        # shared GDN/attention verifier metadata, draft graphs and sampler
+        # paths the V1 proposer lacks (about 2x the c8 throughput).
+        if self._is_sm70_qwen3_5_mtp():
+            return True
+
         if not self._is_default_v2_model_runner_model():
             return False
 
@@ -744,6 +750,24 @@ class VllmConfig:
             return False
 
         return True
+
+    def _is_sm70_qwen3_5_mtp(self) -> bool:
+        spec = self.speculative_config
+        if spec is None or spec.method != "mtp" or self.model_config is None:
+            return False
+        architectures = set(getattr(self.model_config, "architectures", []) or [])
+        if not architectures & {
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5ForCausalLM",
+        }:
+            return False
+        from vllm.platforms import current_platform
+
+        try:
+            capability = current_platform.get_device_capability()
+        except Exception:
+            return False
+        return capability is not None and (capability.major, capability.minor) == (7, 0)
 
     def _is_default_v2_model_runner_model(self) -> bool:
         model_config = self.model_config

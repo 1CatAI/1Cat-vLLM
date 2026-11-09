@@ -65,6 +65,31 @@ def shard_hot_ids(
     return ids
 
 
+@torch.no_grad()
+def _hot_rows(head: nn.Module, local_ids: torch.Tensor) -> torch.Tensor:
+    """FP16 rows of the shared head for these local vocabulary ids.
+
+    A dense FP16 head is indexed directly. A quantized head (e.g. the FP8
+    checkpoint head in its native kernel layout) is read through its own
+    method on identity blocks, so the rows equal what that kernel computes.
+    """
+    weight = head.weight
+    if weight.dtype == torch.float16 and weight.ndim == 2:
+        return weight[local_ids].contiguous()
+    hidden = head.embedding_dim
+    rows = torch.empty(
+        (local_ids.numel(), hidden), dtype=torch.float16, device=weight.device
+    )
+    for begin in range(0, hidden, 512):
+        end = min(begin + 512, hidden)
+        eye = torch.zeros((end - begin, hidden), dtype=torch.float16, device=weight.device)
+        eye[:, begin:end].fill_diagonal_(1.0)
+        block = head.quant_method.apply(head, eye)
+        rows[:, begin:end] = block[:, local_ids].t()
+        del block
+    return rows
+
+
 class MTPHotQPN8Head(nn.Module):
     def __init__(self, head: nn.Module, ids: torch.Tensor):
         super().__init__()
@@ -72,9 +97,7 @@ class MTPHotQPN8Head(nn.Module):
         self.shard_indices = head.shard_indices
         start = self.shard_indices.org_vocab_start_index
         ids = ids.to(head.weight.device)
-        codes, scales = prepare_channel_qpn8_weight(
-            head.weight[ids - start].contiguous()
-        )
+        codes, scales = prepare_channel_qpn8_weight(_hot_rows(head, ids - start))
         self.register_buffer("codes", codes, persistent=False)
         self.register_buffer("scales", scales, persistent=False)
         self.register_buffer("hot_ids", ids.to(torch.int32), persistent=False)
@@ -138,11 +161,10 @@ def prepare_mtp_hot_qpn8_head(
         if envs.VLLM_BATCH_INVARIANT
         else "not SM70"
         if not current_platform.is_device_capability(70)
-        else f"weight {weight.dtype} {tuple(weight.shape)} on {weight.device}"
+        else f"weight on {weight.device}"
         if not weight.is_cuda
-        or weight.dtype != torch.float16
-        or weight.ndim != 2
-        or weight.shape[1] % 16
+        else f"hidden size {getattr(head, 'embedding_dim', None)}"
+        if getattr(head, "embedding_dim", 0) % 16 or not hasattr(head, "quant_method")
         else "added vocabulary"
         if getattr(shard, "num_added_elements", 0)
         else f"missing ops {missing}"
@@ -156,7 +178,7 @@ def prepare_mtp_hot_qpn8_head(
     group = get_tp_group()
     rows = shard.org_vocab_end_index - shard.org_vocab_start_index
     vocab = rows * group.world_size
-    if rows != weight.shape[0] or getattr(shard, "num_org_vocab_padding", 0):
+    if getattr(shard, "num_org_vocab_padding", 0):
         logger.info_once("SM70 MTP hot draft head skipped: padded vocabulary shards.")
         return None
     path = ranking_path or str(_DEFAULT_RANKING)
