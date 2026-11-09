@@ -1,0 +1,99 @@
+{
+  "initial_inventory": {
+    "number": 1381,
+    "title": "[Bugfix][SM70][DeepSeek-V4.1] Refill the packed-KV hot ring on a session-prefix hit (#1341)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1381",
+    "isDraft": false,
+    "headRefOid": "38d9ecf8a6a242795adf9b6fd69273ce1ba9b51a",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1381,
+    "title": "[Bugfix][SM70][DeepSeek-V4.1] Refill the packed-KV hot ring on a session-prefix hit (#1341)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nFixes #1341. The bug report and the fix are `squibloads`'s (the diff in #1341); this PR ports that fix onto `main`, adds tests, and registers the two variables with metadata. Independent of our other PRs; applies to `main` alone (TP only).\n\n## Purpose\n\nWith `VLLM_V41_SESSION_PREFIX=1`, a request that continues the last executed sequence takes a prefix hit at `cached`, and `restore_prefix` rewinds the Engram hash state and the ratio-2 compressor states. It does not rewind the packed-KV hot ring. The previous request wrote compressed rows past `cached` (its answer and up to 4 rejected drafts). Once the context is past `VLLM_V41_KV_HOT_POSITIONS`, the ring has wrapped and those rows sit in the slots of rows about `hot_rows` back, which `fill_selected` and `stage` read as current.\n\n- `kv_store.py`: `V41PackedKV.refill_hot(cached)` rewrites the hot slots of the rows before the hit from the host copy (rank 0 writes every row). Returns the number of rows copied.\n- `model.py`: `restore_prefix` calls it when `VLLM_V41_HOT_REFILL=1` and logs the first refill once.\n- `kv_cache_manager.py`: the session-prefix reach comes from `VLLM_V41_RING_REACH` (default 124; it was a fixed 128). With 5 draft tokens, rejected drafts reach `processed + 4` and overwrite the 256-row window-ring slots of `P - 128 .. P - 125`.\n\n**Defaults.** This is a correctness fix, so both variables default to the fixed behaviour, as in #1341: `VLLM_V41_HOT_REFILL=1` (set `0` for the old behaviour) and `VLLM_V41_RING_REACH=124` (set `128` for the old reach). Nothing changes unless the session prefix and the packed KV are on.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_hot_refill.py \\\n  tests/models/test_deepseek_v41_runner_state.py tests/models/test_deepseek_v41_contract.py\n# red first: the new test file against unmodified main\n```\n\n`test_deepseek_v41_hot_refill.py` builds a store after a request of prompt + answer + 4 rejected drafts, marks the rows past the hit, and checks the reader invariant: after `refill_hot(cached)`, every slot a reader can take as current (`(newest - hot_rows, newest]`) holds the host row it stands for, at the #1341 prompt length (39,560) and at 37K / 40K / 250K / 500K and small rings. A control shows the check fails without the refill; below the ring no slot changes. `restore_prefix` is checked with the switch unset, `1` and `0`, and without a packed store.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Session hit, packed KV | DeepSeek-V4.1 | `VLLM_V41_SESSION_PREFIX=1`, `VLLM_V41_PACKED_KV=1`, context past the hot ring | hot slots refilled from the host copy | CPU tests (reader invariant, control); the #1341 probe as reported there | not re-run end to end on GPUs for this PR |\n| Session hit, below the ring | same | context under `VLLM_V41_KV_HOT_POSITIONS` | no slot changes | CPU test | — |\n| Session prefix reach | same | hit 125-128 behind `processed` | not admitted (reach 124) | CPU test of the default | — |\n| Session prefix off / paged KV | all | default | unchanged | CPU tests of the touched files | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\nNot a performance change. `refill_hot` copies at most `hot_rows` rows per KV source layer, once per session hit.\n\n- New/changed environment metadata and generated reference check: two `configuration` variables registered with metadata; env, config-inventory and architecture references pass.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +2 registered, 0 unregistered reads.\n\n## Test Result\n\n**Reported in #1341** by its author (4x V100-SXM2-32GB, TP4, DSpark 5): the A/B probe there (session hit after a 64-token answer vs after a 1-token answer, greedy, logprobs) differs from the first token at ~40K on `main` and is identical with the fix; 20K / 36K / 45K / 60K identical; cold runs at 8K / 32K / 128K still bit-identical. We did not re-measure this for the PR.\n\n**Re-run for this PR, 2026-11-05,** CPU only (no visible GPU), on `main` `3c051b52e`:\n\n- `test_deepseek_v41_hot_refill.py`: 14 passed. Red first: the same file on unmodified `main`: 11 failed, 3 passed (the passing three are the no-refill control, the `HOT_REFILL=0` case and the no-store case).\n- `test_deepseek_v41_runner_state.py`, `test_deepseek_v41_contract.py`: pass (7 CUDA-only cases skipped).\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the 5 changed Python files: pass.\n\nNot re-run: any GPU test or serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1381",
+    "isDraft": false,
+    "headRefName": "pli/v41-hot-refill",
+    "headRefOid": "38d9ecf8a6a242795adf9b6fd69273ce1ba9b51a",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1381,
+    "id": "PR_kwDORjYFXs8AAAABNJHsxA",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "38d9ecf8a6a242795adf9b6fd69273ce1ba9b51a",
+    "title": "[Bugfix][SM70][DeepSeek-V4.1] Refill the packed-KV hot ring on a session-prefix hit (#1341)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1381",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nFixes #1341. The bug report and the fix are `squibloads`'s (the diff in #1341); this PR ports that fix onto `main`, adds tests, and registers the two variables with metadata. Independent of our other PRs; applies to `main` alone (TP only).\n\n## Purpose\n\nWith `VLLM_V41_SESSION_PREFIX=1`, a request that continues the last executed sequence takes a prefix hit at `cached`, and `restore_prefix` rewinds the Engram hash state and the ratio-2 compressor states. It does not rewind the packed-KV hot ring. The previous request wrote compressed rows past `cached` (its answer and up to 4 rejected drafts). Once the context is past `VLLM_V41_KV_HOT_POSITIONS`, the ring has wrapped and those rows sit in the slots of rows about `hot_rows` back, which `fill_selected` and `stage` read as current.\n\n- `kv_store.py`: `V41PackedKV.refill_hot(cached)` rewrites the hot slots of the rows before the hit from the host copy (rank 0 writes every row). Returns the number of rows copied.\n- `model.py`: `restore_prefix` calls it when `VLLM_V41_HOT_REFILL=1` and logs the first refill once.\n- `kv_cache_manager.py`: the session-prefix reach comes from `VLLM_V41_RING_REACH` (default 124; it was a fixed 128). With 5 draft tokens, rejected drafts reach `processed + 4` and overwrite the 256-row window-ring slots of `P - 128 .. P - 125`.\n\n**Defaults.** This is a correctness fix, so both variables default to the fixed behaviour, as in #1341: `VLLM_V41_HOT_REFILL=1` (set `0` for the old behaviour) and `VLLM_V41_RING_REACH=124` (set `128` for the old reach). Nothing changes unless the session prefix and the packed KV are on.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_hot_refill.py \\\n  tests/models/test_deepseek_v41_runner_state.py tests/models/test_deepseek_v41_contract.py\n# red first: the new test file against unmodified main\n```\n\n`test_deepseek_v41_hot_refill.py` builds a store after a request of prompt + answer + 4 rejected drafts, marks the rows past the hit, and checks the reader invariant: after `refill_hot(cached)`, every slot a reader can take as current (`(newest - hot_rows, newest]`) holds the host row it stands for, at the #1341 prompt length (39,560) and at 37K / 40K / 250K / 500K and small rings. A control shows the check fails without the refill; below the ring no slot changes. `restore_prefix` is checked with the switch unset, `1` and `0`, and without a packed store.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Session hit, packed KV | DeepSeek-V4.1 | `VLLM_V41_SESSION_PREFIX=1`, `VLLM_V41_PACKED_KV=1`, context past the hot ring | hot slots refilled from the host copy | CPU tests (reader invariant, control); the #1341 probe as reported there | not re-run end to end on GPUs for this PR |\n| Session hit, below the ring | same | context under `VLLM_V41_KV_HOT_POSITIONS` | no slot changes | CPU test | — |\n| Session prefix reach | same | hit 125-128 behind `processed` | not admitted (reach 124) | CPU test of the default | — |\n| Session prefix off / paged KV | all | default | unchanged | CPU tests of the touched files | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\nNot a performance change. `refill_hot` copies at most `hot_rows` rows per KV source layer, once per session hit.\n\n- New/changed environment metadata and generated reference check: two `configuration` variables registered with metadata; env, config-inventory and architecture references pass.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +2 registered, 0 unregistered reads.\n\n## Test Result\n\n**Reported in #1341** by its author (4x V100-SXM2-32GB, TP4, DSpark 5): the A/B probe there (session hit after a 64-token answer vs after a 1-token answer, greedy, logprobs) differs from the first token at ~40K on `main` and is identical with the fix; 20K / 36K / 45K / 60K identical; cold runs at 8K / 32K / 128K still bit-identical. We did not re-measure this for the PR.\n\n**Re-run for this PR, 2026-11-05,** CPU only (no visible GPU), on `main` `3c051b52e`:\n\n- `test_deepseek_v41_hot_refill.py`: 14 passed. Red first: the same file on unmodified `main`: 11 failed, 3 passed (the passing three are the no-refill control, the `HOT_REFILL=0` case and the no-store case).\n- `test_deepseek_v41_runner_state.py`, `test_deepseek_v41_contract.py`: pass (7 CUDA-only cases skipped).\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the 5 changed Python files: pass.\n\nNot re-run: any GPU test or serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-hot-refill",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1381,
+    "title": "[Bugfix][SM70][DeepSeek-V4.1] Refill the packed-KV hot ring on a session-prefix hit (#1341)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1381",
+    "isDraft": false,
+    "headRefOid": "38d9ecf8a6a242795adf9b6fd69273ce1ba9b51a",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/models/test_deepseek_v41_hot_refill.py",
+      "vllm/envs.py",
+      "vllm/models/deepseek_v41/kv_store.py",
+      "vllm/models/deepseek_v41/model.py",
+      "vllm/v1/core/kv_cache_manager.py"
+    ],
+    "diff_bytes": 13839,
+    "diff_sha256": "7987596a391e8e2872ce11907e90e13ca1fd3e986df954fc5c753cec79cd54ab"
+  },
+  "full_tree_diff_proof": null
+}
