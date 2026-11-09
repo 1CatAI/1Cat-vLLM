@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from tests.v1.kv_connector.unit.utils import MockKVConfig
@@ -38,6 +39,23 @@ EOS_TOKEN_ID = 50256
 
 def mock_kv(matched_tokens: int, is_async: bool):
     return MockKVConfig(matched_tokens=matched_tokens, is_async=is_async)
+
+
+def pretend_gpu_count(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
+    """Let a scheduler test build a config for more GPUs than are visible.
+
+    Every pretended GPU answers capability probes like the first one, so the
+    runtime policy defaults never ask the platform about a GPU that is not there.
+    """
+    from vllm.platforms import current_platform
+
+    first_gpu_is = current_platform.is_device_capability
+    monkeypatch.setattr(current_platform, "device_count", lambda: count)
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda capability, device_id=None: first_gpu_is(capability, device_id=0),
+    )
 
 
 def create_scheduler(
