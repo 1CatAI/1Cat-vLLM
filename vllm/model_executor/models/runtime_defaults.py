@@ -40,6 +40,18 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
+def _is_sm70_mtp_verifier_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    from vllm.model_executor.models.config import sm70_mtp_verifier_qualified
+
+    return sm70_mtp_verifier_qualified(
+        model_config, speculative_config, parallel_config
+    )
+
+
 def _configure_sm70_dflash2_graph_cache(
     model_config: Any,
     speculative_config: Any,

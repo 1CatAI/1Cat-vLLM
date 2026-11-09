@@ -265,6 +265,7 @@ def apply_runtime_policy_defaults(self):
     from vllm.config.policy_defaults import PolicyDefaults
     from vllm.model_executor.models.runtime_defaults import (
         _is_sm70_dflash2_verifier_contract,
+        _is_sm70_mtp_verifier_contract,
         _is_sm70_qwen38_decode_compile_contract,
     )
     from vllm.platforms import current_platform
@@ -514,14 +515,22 @@ def apply_runtime_policy_defaults(self):
             )
     if self.speculative_config is not None:
         policy = self.speculative_config.sm70_dflash2
+        on_sm70 = current_platform.is_cuda() and (
+            _any_participating_device_is_capability(self, (7, 0))
+        )
         policy.resolve(
             qualified=(
-                current_platform.is_cuda()
-                and _any_participating_device_is_capability(self, (7, 0))
+                on_sm70
                 and _is_sm70_dflash2_verifier_contract(
                     self.model_config, self.speculative_config, self.parallel_config
                 )
-            )
+            ),
+            mtp_qualified=(
+                on_sm70
+                and _is_sm70_mtp_verifier_contract(
+                    self.model_config, self.speculative_config, self.parallel_config
+                )
+            ),
         )
         if (
             self.model_config is not None

@@ -146,10 +146,15 @@ def sm70_dflash2_nvfp4_qualified(vllm_config: "VllmConfig") -> bool:
     selector = (
         int(dflash.get("selector_top_k", 0) or 0) if isinstance(dflash, Mapping) else 0
     )
+    steps = int(getattr(spec, "num_speculative_tokens", 0) or 0)
+    method = getattr(spec, "method", None)
+    # Native MTP verifies through the same NVFP4 projections as DFlash2's
+    # target; only the drafter differs.
+    workload = (method == "dflash" and steps == 7 and selector == 16) or (
+        method == "mtp" and 1 <= steps <= 7
+    )
     return bool(
-        getattr(spec, "method", None) == "dflash"
-        and int(getattr(spec, "num_speculative_tokens", 0) or 0) == 7
-        and selector == 16
+        workload
         and parallel.pipeline_parallel_size == 1
         and not parallel.enable_dbo
         and int(parallel.ubatch_size or 0) <= 1
@@ -938,6 +943,39 @@ def sm70_dflash2_verifier_qualified(
         and getattr(speculative_config, "method", None) == "dflash"
         and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
         and selector_top_k == 16
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )
+
+
+def sm70_mtp_verifier_qualified(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit the Qwen3.8 native MTP target to the shared verifier routes.
+
+    The same 27B geometry as the DFlash2 contract, verifying one to seven
+    drafts at a time. Only target-side routes are admitted; see
+    ``SM70_MTP_VERIFIER_DEFAULTS``.
+    """
+    import torch
+
+    if any(c is None for c in (model_config, speculative_config, parallel_config)):
+        return False
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    steps = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+    return bool(
+        architectures & {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(hf_text_config, "hidden_size", None) == 5120
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 4
+        and getattr(hf_text_config, "head_dim", None) == 256
+        and getattr(speculative_config, "method", None) == "mtp"
+        and 1 <= steps <= 7
         and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
         and not getattr(parallel_config, "enable_dbo", False)
         and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
