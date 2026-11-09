@@ -46,7 +46,7 @@ def test_hybrid_default_uses_physical_memory(monkeypatch, tmp_path):
 def test_apply_keeps_an_explicit_host_budget(monkeypatch, tmp_path):
     path = _checkpoint(tmp_path, 40)
     monkeypatch.setattr(ple, "total_host_bytes", lambda: 64 * GIB)
-    defaults = {}
+    defaults: dict[str, str] = {}
     assert ple.apply_hybrid_ple_defaults(defaults, path, 4) == 10.0
     assert defaults == {
         "VLLM_SM70_QWEN38_HYBRID_PLE": "1",

@@ -892,12 +892,12 @@ void sm70_hcx_out(
     } else {
       // The plain (no producer) batch kernel is specialized per group count.
       switch ((a.M + 7) / 8) {
-#define HCXB_G(G)                                                         \
-  case G:                                                                 \
-    if (full)                                                             \
-      hcx::hcx_batch_kernel<true, -1, G><<<hcx::NC, 256, sm, st>>>(a);    \
-    else                                                                  \
-      hcx::hcx_batch_kernel<false, -1, G><<<hcx::NC, 256, sm, st>>>(a);   \
+#define HCXB_G(G)                                                       \
+  case G:                                                               \
+    if (full)                                                           \
+      hcx::hcx_batch_kernel<true, -1, G><<<hcx::NC, 256, sm, st>>>(a);  \
+    else                                                                \
+      hcx::hcx_batch_kernel<false, -1, G><<<hcx::NC, 256, sm, st>>>(a); \
     break;
         HCXB_G(1)
         HCXB_G(2)

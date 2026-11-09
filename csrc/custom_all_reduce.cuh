@@ -2607,14 +2607,11 @@ class CustomAllreduce {
   }
 
   template <int ngpus, typename ResidualT, typename WeightT>
-  void sm70_allreduce_gemma_rms_norm(cudaStream_t stream, half* input,
-                                     const ResidualT* residual,
-                                     const WeightT* weight,
-                                     half* normalized_out, float* residual_out,
-                                     int num_tokens, int hidden_size,
-                                     float epsilon,
-                                     bool benchmark_reference = false,
-                                     half* k16_out = nullptr) {
+  void sm70_allreduce_gemma_rms_norm(
+      cudaStream_t stream, half* input, const ResidualT* residual,
+      const WeightT* weight, half* normalized_out, float* residual_out,
+      int num_tokens, int hidden_size, float epsilon,
+      bool benchmark_reference = false, half* k16_out = nullptr) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2651,12 +2648,12 @@ class CustomAllreduce {
       if ((num_tokens == 16 || num_tokens == 24 || num_tokens == 32) &&
           !benchmark_reference && fully_connected_ &&
           sm70_tp4_push_buffers_registered_) {
-#define VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(ROWS)                              \
-  sm70_push_allreduce_gemma_rms_norm_batch<WeightT, ROWS>                   \
-      <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,     \
-                               weight, normalized_out, k16_out,             \
-                               residual_out, rank_,                         \
-                               sm70_tp4_push_buffers_.ptrs[rank_], epsilon)
+#define VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(ROWS)                                \
+  sm70_push_allreduce_gemma_rms_norm_batch<WeightT, ROWS>                     \
+      <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,       \
+                               weight, normalized_out, k16_out, residual_out, \
+                               rank_, sm70_tp4_push_buffers_.ptrs[rank_],     \
+                               epsilon)
         if (num_tokens == 16) {
           VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(16);
         } else if (num_tokens == 24) {

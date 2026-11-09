@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Qwen3.8 Flash-Next (E512, top-10, H2560) concurrent-decode MoE permute.
 // One CTA places every routed slot stably by expert (counting sort), which
-// equals the stable expert-only CUB sort of moe_permute, and writes the dense per-expert
-// offsets the grouped GEMM consumes plus the inverse permutation the
+// equals the stable expert-only CUB sort of moe_permute, and writes the dense
+// per-expert offsets the grouped GEMM consumes plus the inverse permutation the
 // unpermute reduction reads. A second launch gathers the input rows. This
 // replaces the generic route's copy, fill, radix sort, offset, expand and
 // offset-narrowing launches for verification batches.
@@ -86,12 +86,11 @@ void qwen38_moe_permute_dense(torch::Tensor input, torch::Tensor topk_ids,
   const int slots = topk_ids.numel();
   TORCH_CHECK(slots > 0 && slots <= kMaxSlots,
               "Qwen3.8 MoE permute supports 1..1024 routed slots");
-  TORCH_CHECK(permuted_input.is_cuda() &&
-                  permuted_input.scalar_type() == at::kHalf &&
-                  permuted_input.is_contiguous() &&
-                  permuted_input.size(0) >= slots &&
-                  permuted_input.size(1) == kHidden,
-              "Qwen3.8 MoE permute output rows are too small");
+  TORCH_CHECK(
+      permuted_input.is_cuda() && permuted_input.scalar_type() == at::kHalf &&
+          permuted_input.is_contiguous() && permuted_input.size(0) >= slots &&
+          permuted_input.size(1) == kHidden,
+      "Qwen3.8 MoE permute output rows are too small");
   for (const auto& t : {expert_offsets, sorted_row_idx, inv_permuted_idx})
     TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kInt && t.is_contiguous(),
                 "Qwen3.8 MoE permute index buffers must be contiguous int32");

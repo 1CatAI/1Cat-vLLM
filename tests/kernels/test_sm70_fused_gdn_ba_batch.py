@@ -14,6 +14,7 @@ def test_fused_batch_matches_separate_projections(rows):
     op = getattr(torch.ops._C, "fp8_qpn8_dispatch_ba_split_sm70_out", None)
     if op is None or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires the SM70 native ops")
+    assert op is not None
     torch.manual_seed(5)
     device = "cuda"
     codes = torch.randint(0, 0x60, (K, N), dtype=torch.uint8, device=device)
@@ -44,4 +45,4 @@ def test_fused_batch_matches_separate_projections(rows):
     expected_ba = x.float() @ ba_weight.float().t()
     error = (torch.cat([b, a], dim=1).float() - expected_ba).abs().max()
     # One FP16 rounding of the largest value, plus the accumulation order.
-    assert error <= 2 ** -10 * expected_ba.abs().max()
+    assert error <= 2**-10 * expected_ba.abs().max()

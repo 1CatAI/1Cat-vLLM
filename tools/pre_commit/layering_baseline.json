@@ -191,8 +191,7 @@
   "platform": 1
  },
  "vllm/model_executor/layers/fused_moe/fused_moe.py": {
-  "model": 1,
-  "platform": 25
+  "platform": 23
  },
  "vllm/model_executor/layers/fused_moe/modular_kernel.py": {
   "platform": 7
@@ -211,8 +210,7 @@
   "platform": 5
  },
  "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
-  "model": 2,
-  "platform": 37
+  "platform": 35
  },
  "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": {
   "platform": 1
@@ -344,7 +342,7 @@
  },
  "vllm/platforms/runtime_defaults.py": {
   "model": 34,
-  "platform": 197
+  "platform": 196
  },
  "vllm/platforms/xpu.py": {
   "env": 1

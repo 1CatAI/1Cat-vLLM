@@ -504,7 +504,8 @@ __global__ __launch_bounds__(
                                                     half* __restrict__ output,
                                                     half* __restrict__ k16_output,
                                                     int n, int k, int m,
-                                                    vllm::sm70::Sm70FusedBa fused_ba) {
+                                                    vllm::sm70::Sm70FusedBa
+                                                        fused_ba) {
   static_assert(SplitK == 8 || SplitK == 12 || SplitK == 16,
                 "M32 two-phase QPN8 supports split-8, split-12 or split-16");
   if constexpr (FullRows) m = 32;
@@ -522,9 +523,9 @@ __global__ __launch_bounds__(
   if constexpr (FusedBA) {
     const int tiles = n / 32;
     if (blockIdx.x >= tiles) {
-      vllm::sm70::fused_ba_tile<kPhysicalWarps>(
-          input, fused_ba, &reduction_storage[0][0][0],
-          (blockIdx.x - tiles) * 8, k, m);
+      vllm::sm70::fused_ba_tile<kPhysicalWarps>(input, fused_ba,
+                                                &reduction_storage[0][0][0],
+                                                (blockIdx.x - tiles) * 8, k, m);
       return;
     }
   }
@@ -1842,7 +1843,8 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
         reinterpret_cast<const half*>(ba_weight.data_ptr<at::Half>()),
         reinterpret_cast<half*>(b_out.data_ptr<at::Half>()),
         reinterpret_cast<half*>(a_out.data_ptr<at::Half>()),
-        static_cast<int>(qkv_n), static_cast<int>(ba_n)};
+        static_cast<int>(qkv_n),
+        static_cast<int>(ba_n)};
     if (m <= 16) {
       vllm::sm70::launch_qpn_pair_m16_fused_ba<Fp8PairReader, 16>(
           qkv_out, input, codes, group_scales, static_cast<int>(n), fused,

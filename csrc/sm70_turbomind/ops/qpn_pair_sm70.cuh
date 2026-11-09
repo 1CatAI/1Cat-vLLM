@@ -6,7 +6,8 @@
 
 namespace vllm::sm70 {
 
-// Where a QKVZ projection writes its z tail and b/a when both run in one launch.
+// Where a QKVZ projection writes its z tail and b/a when both run in one
+// launch.
 struct Sm70FusedBa {
   half* z = nullptr;
   const half* weight = nullptr;
@@ -243,7 +244,8 @@ void launch_qpn_pair_m16(torch::Tensor out, torch::Tensor input,
   if (k16_output != nullptr) k16_publish(out, twin);
 }
 
-// QKVZ pairs plus b/a in one launch. `out` is qkv; the z tail goes to fused_ba.z.
+// QKVZ pairs plus b/a in one launch. `out` is qkv; the z tail goes to
+// fused_ba.z.
 template <class Reader, int Split>
 void launch_qpn_pair_m16_fused_ba(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor codes, torch::Tensor scales,

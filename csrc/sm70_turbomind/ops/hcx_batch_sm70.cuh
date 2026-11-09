@@ -332,38 +332,38 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     }
 #pragma unroll
     for (int u = 0; u < 2; ++u) {
-    if (!live[u]) continue;
-    const int oi = oi0 + u * NC * 8;
-    const int gr = oi / 96, n = oi % 96, g = gr / 8, rw = gr % 8;
-    float pb[4] = {0.f, 0.f, 0.f, 0.f};
+      if (!live[u]) continue;
+      const int oi = oi0 + u * NC * 8;
+      const int gr = oi / 96, n = oi % 96, g = gr / 8, rw = gr % 8;
+      float pb[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-    for (int j = 0; j < 3; ++j)
-      if (lane + 32 * j < NC) {
-        const float4 pv = pvs[u][j];
-        pb[0] += pv.x;
-        pb[1] += pv.y;
-        pb[2] += pv.z;
-        pb[3] += pv.w;
+      for (int j = 0; j < 3; ++j)
+        if (lane + 32 * j < NC) {
+          const float4 pv = pvs[u][j];
+          pb[0] += pv.x;
+          pb[1] += pv.y;
+          pb[2] += pv.z;
+          pb[3] += pv.w;
+        }
+#pragma unroll
+      for (int s = 16; s > 0; s >>= 1)
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+          pb[b] += __shfl_xor_sync(0xffffffff, pb[b], s);
+      float q = 0.f;
+#pragma unroll
+      for (int b = 0; b < 4; ++b) q = fmaf(rr[g][rw][b], pb[b], q);
+      half hv = __float2half_rn(q);
+      if (n < 80) {
+        const float xx = divf(__half2float(hv), 4.0f);
+        hv = __float2half_rn(xx * sigm(xx));
       }
-#pragma unroll
-    for (int s = 16; s > 0; s >>= 1)
-#pragma unroll
-      for (int b = 0; b < 4; ++b)
-        pb[b] += __shfl_xor_sync(0xffffffff, pb[b], s);
-    float q = 0.f;
-#pragma unroll
-    for (int b = 0; b < 4; ++b) q = fmaf(rr[g][rw][b], pb[b], q);
-    half hv = __float2half_rn(q);
-    if (n < 80) {
-      const float xx = divf(__half2float(hv), 4.0f);
-      hv = __float2half_rn(xx * sigm(xx));
-    }
-    const int pos = rw * LW + gcol(rk, n);
-    const unsigned w = __half_as_ushort(hv);
-    if (lane == 0) st2(lora(g, rk) + pos, w, tag);
-    if (lane == 1) st2(lora(g, p1) + pos, w, tag);
-    if (lane == 2) st2(lora(g, p2) + pos, w, tag);
-    if (FULL && lane == 3) st2(lora(g, p3) + pos, w, tag);
+      const int pos = rw * LW + gcol(rk, n);
+      const unsigned w = __half_as_ushort(hv);
+      if (lane == 0) st2(lora(g, rk) + pos, w, tag);
+      if (lane == 1) st2(lora(g, p1) + pos, w, tag);
+      if (lane == 2) st2(lora(g, p2) + pos, w, tag);
+      if (FULL && lane == 3) st2(lora(g, p3) + pos, w, tag);
     }
   }
   if (warp >= 3) {
@@ -436,9 +436,10 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
   float xvp[GMAX];
 #pragma unroll
   for (int g = 0; g < GMAX; ++g)
-    xvp[g] = g < groups && mrw < rows_of(g)
-                 ? __half2float(__ldcg(a.xn + (8 * g + mrw) * KD + quad * HD + mh))
-                 : 0.f;
+    xvp[g] =
+        g < groups && mrw < rows_of(g)
+            ? __half2float(__ldcg(a.xn + (8 * g + mrw) * KD + quad * HD + mh))
+            : 0.f;
   __syncthreads();
   TS(12);
 #pragma unroll
@@ -502,24 +503,24 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     }
   } else {
 #pragma unroll
-  for (int g = 0; g < GMAX; ++g) {
-    if (g >= groups) break;
-    const int M = rows_of(g), r0 = 8 * g;
-    {
-      if (t >= 32 && t < 32 + 2 * M) {
-        const int u = t - 32, rw = u >> 1, h = 640 * p1 + 8 * i + (u & 1) * 4;
-        const uint2 d = poll4(hb(g, rk) + (rw * HD + h) / 2, tag);
-        st4(hb(g, p2) + (rw * HD + h) / 2, d.x, d.y, tag);
-        *reinterpret_cast<uint2*>(a.blk_out + (r0 + rw) * HD + h) = d;
-      }
-      if (t >= 64 && t < 64 + 4 * M) {
-        const int u = t - 64, src = (u & 2) ? p3 : p2, rw = u >> 2,
-                  h = 640 * src + 8 * i + (u & 1) * 4;
-        const uint2 d = poll4(hb(g, rk) + (rw * HD + h) / 2, tag);
-        *reinterpret_cast<uint2*>(a.blk_out + (r0 + rw) * HD + h) = d;
+    for (int g = 0; g < GMAX; ++g) {
+      if (g >= groups) break;
+      const int M = rows_of(g), r0 = 8 * g;
+      {
+        if (t >= 32 && t < 32 + 2 * M) {
+          const int u = t - 32, rw = u >> 1, h = 640 * p1 + 8 * i + (u & 1) * 4;
+          const uint2 d = poll4(hb(g, rk) + (rw * HD + h) / 2, tag);
+          st4(hb(g, p2) + (rw * HD + h) / 2, d.x, d.y, tag);
+          *reinterpret_cast<uint2*>(a.blk_out + (r0 + rw) * HD + h) = d;
+        }
+        if (t >= 64 && t < 64 + 4 * M) {
+          const int u = t - 64, src = (u & 2) ? p3 : p2, rw = u >> 2,
+                    h = 640 * src + 8 * i + (u & 1) * 4;
+          const uint2 d = poll4(hb(g, rk) + (rw * HD + h) / 2, tag);
+          *reinterpret_cast<uint2*>(a.blk_out + (r0 + rw) * HD + h) = d;
+        }
       }
     }
-  }
   }
   __syncthreads();
   TS(9);

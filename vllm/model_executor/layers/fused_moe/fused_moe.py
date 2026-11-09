@@ -5,9 +5,6 @@
 import functools
 import json
 import os
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import Any
 
 import torch
@@ -29,6 +26,19 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.sm70.mtp_config import (
+    _SM70_MTP_MOE_MAX_M,
+    _get_sm70_mtp_moe_decode_config,
+)
+from vllm.model_executor.layers.fused_moe.sm70.mtp_config import (
+    force_sm70_mtp_moe_legacy_config as force_sm70_mtp_moe_legacy_config,
+)
+from vllm.model_executor.layers.fused_moe.sm70.mtp_projection import (
+    _sm70_mtp_moe_fp16_shape_supported as _sm70_mtp_moe_fp16_shape_supported,
+)
+from vllm.model_executor.layers.fused_moe.sm70.mtp_projection import (
+    try_mtp_fp16_projection,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input,
 )
@@ -37,18 +47,6 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
-
-_force_sm70_mtp_moe_legacy_config = ContextVar("sm70_moe_legacy_warmup", default=False)
-
-
-@contextmanager
-def force_sm70_mtp_moe_legacy_config() -> Iterator[None]:
-    """Temporarily select the legacy SM70 MoE tile during startup warmup."""
-    token = _force_sm70_mtp_moe_legacy_config.set(True)
-    try:
-        yield
-    finally:
-        _force_sm70_mtp_moe_legacy_config.reset(token)
 
 
 @triton.jit
@@ -830,42 +828,6 @@ def invoke_fused_moe_triton_kernel(
     )
 
 
-# Concurrent MTP4 drafts: the first proposer pass covers every request's
-# five-row verifier window (16 requests -> 80 rows); continuation passes have
-# one row per request.
-_SM70_MTP_MOE_MAX_M = 80
-
-
-def _sm70_mtp_moe_fp16_shape_supported(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    c: torch.Tensor,
-    weights: torch.Tensor | None,
-    ids: torch.Tensor,
-    top_k: int,
-    weighted: bool,
-) -> bool:
-    if weights is None or weights.ndim != 2 or weights.shape[1] != 10:
-        return False
-    m = weights.shape[0]
-    if not 1 <= m <= _SM70_MTP_MOE_MAX_M:
-        return False
-    n, k = (2560, 160) if weighted else (320, 2560)
-    return (
-        top_k == (1 if weighted else 10)
-        and a.shape == (m * 10 if weighted else m, k)
-        and b.shape == (512, n, k)
-        and c.shape == (m, 10, n)
-        and ids.shape == (m * 10,)
-        and a.dtype == b.dtype == c.dtype == torch.float16
-        and weights.dtype == torch.float32
-        and ids.dtype == torch.int32
-        and all(
-            t.device == a.device and t.is_contiguous() for t in (a, b, c, weights, ids)
-        )
-    )
-
-
 def dispatch_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -896,47 +858,29 @@ def dispatch_fused_moe_kernel(
     M = A.size(0)
     num_tokens = M * top_k
 
-    if (
-        unquantized_moe_policy().value("mtp_fp16_exact")
-        and not envs.VLLM_BATCH_INVARIANT
-        and not _force_sm70_mtp_moe_legacy_config.get()
-        and unquantized_moe_policy().value("mtp_tuned")
-        and sorted_token_ids is None
-        and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-        and A_scale is None
-        and B_scale is None
-        and B_zp is None
-        and B_bias is None
-        and block_shape is None
-        and compute_type == tl.float16
-        and config.get("BLOCK_SIZE_M") == 2
-        and config.get("BLOCK_SIZE_N") == 128
-        and config.get("BLOCK_SIZE_K") == 64
-        and config.get("num_warps") == 4
-        and A.is_cuda
-        and current_platform.is_device_capability(70)
-        and _sm70_mtp_moe_fp16_shape_supported(
-            A, B, C, topk_weights, expert_ids, top_k, mul_routed_weight
-        )
-        and B.data_ptr() % 16 == 0
-        and num_tokens_post_padded.device == A.device
-        and num_tokens_post_padded.dtype == torch.int32
-        and num_tokens_post_padded.numel() == 1
-        and num_tokens_post_padded.is_contiguous()
-        and hasattr(torch.ops._C, "sm70_mtp_moe_fp16_out")
+    if try_mtp_fp16_projection(
+        A,
+        B,
+        C,
+        A_scale,
+        B_scale,
+        B_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        mul_routed_weight,
+        top_k,
+        config,
+        compute_type,
+        use_fp8_w8a8,
+        use_int8_w8a8,
+        use_int8_w8a16,
+        use_int4_w4a16,
+        per_channel_quant,
+        block_shape,
+        B_bias,
     ):
-        logger.info_once(
-            "Using exact SM70 FP16 MTP MoE projections (M1..80, E512, H2560, I160)."
-        )
-        torch.ops._C.sm70_mtp_moe_fp16_out(
-            C,
-            A,
-            B,
-            expert_ids,
-            topk_weights,
-            num_tokens_post_padded,
-            mul_routed_weight,
-        )
         return
 
     if (use_int8_w8a16 or use_int4_w4a16) and (
@@ -1293,49 +1237,6 @@ def should_moe_wna16_use_cuda(
         and group_size in [32, 64, 128]
         and num_valid_tokens / num_experts <= 6
     )
-
-
-def _get_sm70_mtp_moe_decode_config(
-    M: int,
-    E: int,
-    N: int,
-    K: int,
-    topk: int,
-) -> dict[str, int] | None:
-    """Return graph-tuned exact-shape SM70 MTP tiles."""
-    if _force_sm70_mtp_moe_legacy_config.get() or not unquantized_moe_policy().value(
-        "mtp_tuned"
-    ):
-        return None
-    if (E, N, K, topk) == (256, 128, 2048, 8) and 2 <= M <= 16:
-        # Qwen3.6 TP4 shards the checkpoint-global I512 expert width to I128
-        # per rank. M2-M16 all select this tile in the exact local-shape graph
-        # oracle.
-        return {
-            "BLOCK_SIZE_M": 8,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 1,
-            "SPLIT_K": 1,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
-    if (E, N, K, topk) == (512, 160, 2560, 10) and 1 <= M <= _SM70_MTP_MOE_MAX_M:
-        # Qwen3.8-Flash-Next TP4 keeps the BF16 MTP expert weights and shards
-        # the checkpoint-global I640 expert width to I160 per rank. M5 is the
-        # first proposer pass over the verifier window; M1 covers its three
-        # autoregressive continuation passes. Concurrent requests multiply
-        # both (M5c and Mc); the exact kernel computes every route alike.
-        return {
-            "BLOCK_SIZE_M": 2,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 1,
-            "SPLIT_K": 1,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
-    return None
 
 
 def get_default_config(
