@@ -196,8 +196,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
         count = 0
         depth = 0
         end_index: int | None = None
+        saw_start = False
         for index, token_id in enumerate(token_ids):
             if token_id == self.start_token_id:
+                saw_start = True
                 depth += 1
                 continue
             if token_id == self.end_token_id:
@@ -208,7 +210,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 continue
             if depth > 0:
                 count += 1
-        if count == 0 and depth == 0 and end_index is not None:
+        if not saw_start and end_index is not None:
             # Prompt-opened reasoning: everything before the first end marker.
             count = sum(
                 1 for tid in token_ids[:end_index] if tid != self.start_token_id
