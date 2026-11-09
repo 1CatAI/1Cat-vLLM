@@ -449,6 +449,17 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _short_prompt_chunk_cap(self, num_uncached_tokens: int) -> int:
+        """Chunk cap for a request taken from the waiting queue.
+
+        Its uncached prompt part decides: below short_prompt_threshold the
+        prefill runs in short_prompt_chunk_tokens chunks, which shorten the
+        pipeline fill and drain; longer prefills keep the whole budget.
+        """
+        if 0 < num_uncached_tokens < self.scheduler_config.short_prompt_threshold:
+            return self.scheduler_config.short_prompt_chunk_tokens
+        return 0
+
     def _balanced_prefill_chunk(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
@@ -761,6 +772,8 @@ class Scheduler(SchedulerInterface):
                     )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if 0 < request.prefill_chunk_cap < num_new_tokens:
+                num_new_tokens = request.prefill_chunk_cap
             num_new_tokens = min(num_new_tokens, token_budget)
             num_new_tokens = self._balanced_prefill_chunk(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1087,8 +1100,13 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    request.prefill_chunk_cap = self._short_prompt_chunk_cap(
+                        num_new_tokens
+                    )
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    if 0 < request.prefill_chunk_cap < num_new_tokens:
+                        num_new_tokens = request.prefill_chunk_cap
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked

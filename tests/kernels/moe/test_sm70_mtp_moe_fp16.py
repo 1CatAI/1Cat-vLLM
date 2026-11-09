@@ -5,6 +5,7 @@ import torch
 
 from vllm import envs
 from vllm.model_executor.layers.fused_moe.fused_moe import (
+    _SM70_MTP_MOE_MAX_M,
     _sm70_mtp_moe_fp16_shape_supported,
     dispatch_fused_moe_kernel,
     invoke_fused_moe_triton_kernel,
@@ -39,7 +40,8 @@ def test_shape_admission(m, down):
     ids = torch.empty(m * 10, device="meta", dtype=torch.int32)
     weights = torch.empty(m, 10, device="meta", dtype=torch.float32)
     args = (x, w, y, weights, ids, 1 if down else 10, down)
-    assert _sm70_mtp_moe_fp16_shape_supported(*args) == (1 <= m <= 80)
+    # Up to 16 concurrent MTP4 verification requests of 5 rows (#1369).
+    assert _sm70_mtp_moe_fp16_shape_supported(*args) == (1 <= m <= _SM70_MTP_MOE_MAX_M)
     assert not _sm70_mtp_moe_fp16_shape_supported(x.bfloat16(), *args[1:])
     assert not _sm70_mtp_moe_fp16_shape_supported(
         x, w, y, weights, ids.long(), *args[5:]

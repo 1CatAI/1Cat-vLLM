@@ -54,6 +54,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.platforms import current_platform
+from vllm.runtime_resources import share_runtime_resources
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -308,10 +309,13 @@ def _make_draft_vllm_config(
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
 
-    draft_vllm_config = replace(
+    draft_vllm_config = share_runtime_resources(
+        replace(
+            vllm_config,
+            model_config=speculative_config.draft_model_config,
+            is_speculative_draft=True,
+        ),
         vllm_config,
-        model_config=speculative_config.draft_model_config,
-        is_speculative_draft=True,
     )
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.

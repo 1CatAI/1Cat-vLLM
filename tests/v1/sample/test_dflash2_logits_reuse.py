@@ -82,16 +82,16 @@ def test_cutoff_fallback_records_completed_projection_on_every_rank(
     monkeypatch, gather_rank
 ):
     class Speculator:
+        _trace = SimpleNamespace(value=lambda name: False)
+
         def get_sparse_draft_logits(self):
             return None, None
 
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
-    monkeypatch.setattr(
-        sparse_rejection.envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True
-    )
+    monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *args: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
     monkeypatch.setattr(
-        sparse_rejection, "_supports_sparse_sampling_contract", lambda *args: True
+        sparse_rejection, "_supports_sparse_sampling_contract", lambda *a, **k: True
     )
     logits = torch.randn(8, 64) if gather_rank else None
     fallback = Mock(return_value=logits)
@@ -112,7 +112,12 @@ def test_cutoff_fallback_records_completed_projection_on_every_rank(
     result = sparse_rejection.try_dflash2_sparse_target_rejection(
         model,
         Speculator(),
-        SimpleNamespace(sampler=SimpleNamespace(sampling_states=states)),
+        SimpleNamespace(
+            sampler=SimpleNamespace(
+                sampling_states=states,
+                penalties_state=SimpleNamespace(use_penalty=np.zeros(1, dtype=bool)),
+            )
+        ),
         SimpleNamespace(device=SimpleNamespace(type="cuda")),
         batch,
         None,

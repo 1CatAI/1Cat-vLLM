@@ -240,10 +240,18 @@ def warmup_kernels(
 
     # SamplingParams exercising all sampling features.
     if model_runner.is_pooling_model:
-        sampling_params = None
+        sampling_params = profile_sampling_params = None
         pooling_params = PoolingParams()
     else:
         sampling_params = SamplingParams.for_sampler_warmup()
+        # The larger prefill profiles (kernel-advertised sizes, a full chunk)
+        # warm the model's kernels; the default batch already exercises prompt
+        # logprobs. There they would build FP32 logits for every prompt token
+        # (605 MiB for a 1024-token chunk of a 154,880-token vocabulary), which
+        # the allocator keeps reserved on the last pipeline rank.
+        profile_sampling_params = SamplingParams.for_sampler_warmup(
+            prompt_logprobs=None
+        )
         pooling_params = None
 
     # Disable KV connector for all warmup runs. Kernel-advertised profiles run
@@ -280,7 +288,7 @@ def warmup_kernels(
                 f"{profile_idx}",
                 profile_reqs,
                 prompt_len,
-                sampling_params,
+                profile_sampling_params if profile_idx else sampling_params,
                 pooling_params,
                 block_count,
                 kv_cache_specs,
