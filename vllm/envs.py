@@ -5407,6 +5407,79 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MoE AWQ",),
         user_visible=False,
     ),
+    # Warm-block KV retention.
+    # Blocks that still carry a hash when released stay in a warm table and
+    # keep serving prefix hits, instead of going straight back to the free
+    # queue. They are evicted by pressure-gated retention (cold -> hot): a
+    # block touched on every hit leaves warm, is re-stamped when released
+    # again, and moves to the back, so hot blocks outlive cold ones.
+    # P25..P80 give the retention in seconds when usage is below that tier;
+    # at 80% and above they are reclaimed immediately.
+    "VLLM_KV_RETENTION_ENABLED": env_var(
+        lambda: os.getenv("VLLM_KV_RETENTION_ENABLED", "1").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Retain freed-but-hashed KV blocks in a warm list so repeated "
+            "prefixes keep hitting instead of being re-prefilled. "
+            "Default ON; set 0 to restore the stock free-queue behaviour."
+        ),
+        category="performance",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 warm-block KV retention",),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P25": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P25", "43200")),
+        description="Warm-block retention seconds while KV usage < 25%.",
+        category="performance",
+        declared_default=43200,
+        effective_default=43200,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P35": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P35", "21600")),
+        description="Warm-block retention seconds while KV usage < 35%.",
+        category="performance",
+        declared_default=21600,
+        effective_default=21600,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P50": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P50", "10800")),
+        description="Warm-block retention seconds while KV usage < 50%.",
+        category="performance",
+        declared_default=10800,
+        effective_default=10800,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P65": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P65", "3600")),
+        description="Warm-block retention seconds while KV usage < 65%.",
+        category="performance",
+        declared_default=3600,
+        effective_default=3600,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P80": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P80", "1800")),
+        description="Warm-block retention seconds while KV usage < 80%.",
+        category="performance",
+        declared_default=1800,
+        effective_default=1800,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_SM70_AUX_KERNEL_WARMUP": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AUX_KERNEL_WARMUP", "1"))),
         description=(
@@ -20265,6 +20338,16 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_KV_RETENTION_P80",
+        "VLLM_KV_RETENTION_P65",
+        "VLLM_KV_RETENTION_P50",
+        "VLLM_KV_RETENTION_P35",
+        "VLLM_KV_RETENTION_P25",
+        # Warm-block retention is purely a block-management policy: it does
+        # not affect any build artefact, and leaving it out of the key would
+        # invalidate the whole compile cache whenever a retention period is
+        # tuned.
+        "VLLM_KV_RETENTION_ENABLED",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",
