@@ -1,0 +1,106 @@
+{
+  "initial_inventory": {
+    "number": 983,
+    "title": "[Core] Publish GDN speculative state from WY factors",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/983",
+    "isDraft": true,
+    "headRefOid": "6dd4c56ba4482813034370a6f7f288673de435c6",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 983,
+    "title": "[Core] Publish GDN speculative state from WY factors",
+    "body": "## Purpose\n\nReplace per-token FP32 GDN state snapshots during SM70 DFlash2 verification with FP32 WY factors and one running state page. Support indexed requests, short verify sequences, accepted-prefix publication, and aligned prefix caching. Keep the target weights and output precision unchanged.\n\nPublish accepted state across the GDN layer group after sampling, save any aligned prefix before updating the running state, then normalize convolution history before plain decode or prefill can resume. Model Runner V2 publication uses its request mapping and an immutable acceptance snapshot. Unsupported hardware, dtype, layout, and speculative modes retain the existing cache layout.\n\n## Test Plan\n\n- Chained partial acceptance, request reordering, padded rows, shared factor storage, and independent prefix commits against an FP64 dense recurrence.\n- Batched publication, request-slot mapping, same-block prefix boundaries, convolution continuation, and CUDA graph replay.\n- Source-built artifact validation, C1/C4/C8 teacher-forcing KL and top-1, acceptance confidence intervals, natural completion, matched C1/C4/C8 timing, and 32K C8 memory admission.\n\n## Test Result\n\n- CUDA compilation and native operator schema loading pass with CUDA 12.8 and Torch 2.10.\n- Fake-tensor mutation dispatch passes, including Model Runner V2 operators.\n- Two CPU cache-layout and state-copy tests pass; Ruff and whitespace checks pass.\n- 23 isolated SM70 GPU tests pass against an FP64 recurrence, covering C1/C4/C8 indexed requests, chained partial acceptance, padded rows, prefix publication, convolution continuation, and graph replay.\n- Production Triton boundary-copy tests pass, including same-block overlapping convolution copies and collapsed temporal-state copy guards.\n- Real-weight layer graph timing and full-model admission are pending. This PR remains a draft until those gates complete.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/983",
+    "isDraft": true,
+    "headRefName": "codex/v100-gdn-wy-cache-20261005-114448",
+    "headRefOid": "6dd4c56ba4482813034370a6f7f288673de435c6",
+    "baseRefName": "main",
+    "baseRefOid": "7f1d25f4d3917d05060444226bff5e5aed559538",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 983,
+    "id": "PR_kwDORjYFXs8AAAABGtnP3A",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "6dd4c56ba4482813034370a6f7f288673de435c6",
+    "title": "[Core] Publish GDN speculative state from WY factors",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/983",
+    "body": "## Purpose\n\nReplace per-token FP32 GDN state snapshots during SM70 DFlash2 verification with FP32 WY factors and one running state page. Support indexed requests, short verify sequences, accepted-prefix publication, and aligned prefix caching. Keep the target weights and output precision unchanged.\n\nPublish accepted state across the GDN layer group after sampling, save any aligned prefix before updating the running state, then normalize convolution history before plain decode or prefill can resume. Model Runner V2 publication uses its request mapping and an immutable acceptance snapshot. Unsupported hardware, dtype, layout, and speculative modes retain the existing cache layout.\n\n## Test Plan\n\n- Chained partial acceptance, request reordering, padded rows, shared factor storage, and independent prefix commits against an FP64 dense recurrence.\n- Batched publication, request-slot mapping, same-block prefix boundaries, convolution continuation, and CUDA graph replay.\n- Source-built artifact validation, C1/C4/C8 teacher-forcing KL and top-1, acceptance confidence intervals, natural completion, matched C1/C4/C8 timing, and 32K C8 memory admission.\n\n## Test Result\n\n- CUDA compilation and native operator schema loading pass with CUDA 12.8 and Torch 2.10.\n- Fake-tensor mutation dispatch passes, including Model Runner V2 operators.\n- Two CPU cache-layout and state-copy tests pass; Ruff and whitespace checks pass.\n- 23 isolated SM70 GPU tests pass against an FP64 recurrence, covering C1/C4/C8 indexed requests, chained partial acceptance, padded rows, prefix publication, convolution continuation, and graph replay.\n- Production Triton boundary-copy tests pass, including same-block overlapping convolution copies and collapsed temporal-state copy guards.\n- Real-weight layer graph timing and full-model admission are pending. This PR remains a draft until those gates complete.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-gdn-wy-cache-20261005-114448",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 983,
+    "title": "[Core] Publish GDN speculative state from WY factors",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/983",
+    "isDraft": true,
+    "headRefOid": "6dd4c56ba4482813034370a6f7f288673de435c6",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "CMakeLists.txt",
+      "benchmarks/kernels/benchmark_sm70_gdn_wy_layer.py",
+      "csrc/sm70_turbomind/ops/gdn_wy_sm70.cu",
+      "tests/kernels/mamba/test_gdn_wy_sm70.py",
+      "tests/v1/worker/test_gdn_wy_cache.py",
+      "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+      "vllm/model_executor/layers/mamba/gdn/sm70_wy.py",
+      "vllm/v1/attention/backends/gdn_attn.py",
+      "vllm/v1/attention/backends/utils.py",
+      "vllm/v1/kv_cache_interface.py",
+      "vllm/v1/worker/gpu/mamba_align.py",
+      "vllm/v1/worker/mamba_utils.py"
+    ],
+    "diff_bytes": 107379,
+    "diff_sha256": "cb8d1b5b51057366a816f4ef53a11a7339577e59b3bf0c107c0e45f0986c3cda"
+  },
+  "full_tree_diff_proof": null
+}

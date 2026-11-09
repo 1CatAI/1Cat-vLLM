@@ -1,0 +1,111 @@
+{
+  "initial_inventory": {
+    "number": 629,
+    "title": "[Core][SM70] Beat A800 C32 decode and recover 32K serving",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/629",
+    "isDraft": true,
+    "headRefOid": "27e5f8e574ba7f46e755e66f94796d3438ea8867",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 629,
+    "title": "[Core][SM70] Beat A800 C32 decode and recover 32K serving",
+    "body": "## Purpose\n\nQwen3.8-27B-FP8 at concurrency 32 took 36.285 ms per stable decode step on 4x V100 TP4. The A800 reference trace took 33.521 ms, so the acceptance target for 10% higher decode-step speed was at most 30.474 ms. The rebuilt-source endpoint now measures 29.502 ms/step, 13.62% higher step rate than the A800 reference and 18.70% lower step time than the original V100 trace.\n\nOnly stable CUDA graph replay intervals from the 2048-input/256-output decode window are compared. Prefill, TTFT, request wall time, and output throughput are excluded. The A800 trace is a structural reference because it uses a different TP, dtype, KV-cache, GEMM, and attention configuration.\n\n## Change\n\n- Warm and tune the existing FP8 dense route through M32 so captured C24/C32 graphs do not fall back to the untuned tactic.\n- Enable the established fused Gemma add+RMSNorm route for the exact Qwen3.8-27B-FP8 TP4 C32 contract.\n- Enable the existing 6-warp dual-resident G6/D256 attention route at batch 16 or larger.\n- Add `VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH` so C1-C8 retain the established 8-warp route.\n- Apply these defaults only for SM70, FP16, FP8, TP4/PP1, no speculative decoding, FP16/auto KV cache, and an actual captured C32 graph. Explicit environment overrides are preserved.\n\n## Pure-decode result\n\n| Configuration | Stable step mean |\n| --- | ---: |\n| Original V100 C32 | 36.285 ms |\n| M32 tuning | 34.239 ms |\n| + fused Gemma RMSNorm | 31.336 ms |\n| + 6-warp attention | 30.140 ms |\n| Old-DSO source-default repeat | 30.124 ms |\n| Rebuilt-source endpoint repeat | **29.502 ms** |\n\nThe rebuilt-source repeat measured p50 29.489 ms, p90 29.511 ms, and p99 29.877 ms across 244 stable C32 steps. Relative to the A800 mean/p50/p90/p99, decode-step rate is higher by 13.62%/13.43%/13.90%/20.10%. Its rank-mean graph service is 14.924 ms FP8 projection, 3.812 ms GDN/conv, 3.026 ms TP4 communication, 2.901 ms full attention, and 1.235 ms elementwise/layout.\n\n## Validation\n\n- Rebuilt the Flash-V100 extension from this source with CUDA 12.8 for SM70; all four endpoint workers mapped DSO SHA256 `eea5fdd5dfb2650d1103f2ef659b28684396cd2d0cf00e578393821a37cbc1a0`.\n- Complete endpoint startup logged all five automatic defaults, 35 coordinated FP8 tuning records on each rank, and CUDA graph capture completion.\n- Deterministic 2048-input/256-output request returned HTTP 200, `finish_reason=length`, and exactly 256 output tokens.\n- Two independent rebuilt-source C32 traces measured 29.535 ms and 29.502 ms mean stable decode intervals, a 0.11% difference.\n- B1/2/4/8/16/24/32 attention sweep: bit-exact against the 8-warp output at every batch; no low-batch route change; B16 and B32 attention improve 34.24% and 35.25%.\n- `24 passed`: exact config admission/override tests plus fused Gemma RMSNorm tests.\n- `1 passed`: minimum-batch environment contract.\n- Ruff, Ruff format, clang-format, mypy, configuration validation, DCO sign-off, and all other applicable pre-commit hooks pass.\n\n\n## 8K context follow-up\n\nA matched C32 8192-input/256-output follow-up uses two complete 250-step traces per device configuration. V100 pooled rank-max mean/p50/p90/p99 are 36.152/36.152/36.198/36.220 ms; A800 pooled values are 39.723/39.678/39.994/40.529 ms. V100 decode-step rate is higher by 9.88%/9.75%/10.49%/11.90%. The 10%-faster mean threshold is 36.112 ms, so the current 8K mean misses it by 0.040 ms and is not claimed as a robust 10% win.\n\nFrom 2K to 8K, V100 step latency increases 22.54% versus 18.50% on A800. About 97% of the V100 increase comes from full attention, which grows from 2.901 ms to 9.350 ms. The next optimization target is a context-qualified attention partition choice with at least 0.2-0.3 ms/step safety margin.\n\n\n## 32K serving follow-up\n\nThe user-selected 32K criterion uses standard `vllm bench serve` rather than a cached pure-decode trace: random dataset, seed 1234, fixed 32768 input and 256 output tokens, range ratio zero, temperature zero, ignore EOS, 128 requests, request rate infinity, and maximum concurrency 32. Tokenizer hashes match and the two vLLM client versions use the same random request-generation path.\n\nBoth endpoints complete 128/128 requests with zero failures and exact token counts. V100 TP4 takes 2972.63 seconds at 0.04306 requests/s and 11.023 output tokens/s; A800 TP1 takes 2064.03 seconds at 0.06201 requests/s and 15.876 output tokens/s. V100 output throughput is 30.57% lower. V100 versus A800 ITL mean/p50/p90/p99 is 2059.92/61.94/4844.37/5103.26 ms versus 1151.94/46.64/3369.47/3593.90 ms.\n\nThe distribution is bimodal because later 32K prefills interrupt active decode. V100 has 30.23% of ITL samples above four seconds, versus 0.012% on A800; its under-100-ms ITL p50 is 60.84 ms versus 46.34 ms. Reaching 10% above the A800 output throughput requires 17.463 output tokens/s, a 58.42% improvement over the current V100 result. The next work is a chunked-prefill scheduling sweep followed by a context-qualified 32K attention partition sweep.\n\n\n\n## Current-main 32K recovery\n\nAfter merging main through PR638, the standard C32 32K screen now uses E4M3 KV, page 1568, mixed-batch resident-decode XQA, Mamba align, MBT8192, async scheduling, prefix caching, and normal CUDA graphs. A 40-request screen with the same random seed and fixed 32768/256 lengths completes 40/40 in 342.13 seconds at **29.930 output tok/s**, with mean/p50/p99 ITL of 562.31/78.35/2137.91 ms. The first 40 completions from the recorded A800 run take 933.69 seconds at 10.967 output tok/s, so this V100 screen is 2.73x the A800 rate and clears the 12.064 tok/s +10% target. The user requested shortened C32 iterations, so a fresh 128-request acceptance run is intentionally deferred.\n\nThe root cause is now separated. FP16 align left only 898 logical KV tokens at exact C32, while E4M3 raises measured capacity to 1,889,444 tokens and 57.21x maximum 33,024-token concurrency. At matched B21/B22 the old V100 steady decode was only 3.9%-4.3% behind A800; the large endpoint gap came from capacity/preemption and atomic page-aligned long-prefill interference. PR638 cuts a C1 victim's 42 prefill-induced gaps from 358-454 ms to 248-346 ms by routing resident decode rows through paged XQA.\n\nAn FP8 bridge batching prototype was tested and rejected. The bridge expansion is only about 0.186 ms/layer at q1568/KV32928; the roughly 25.17-ms bridged long-prefix attention dominates. Batching forced paged FA2 instead of the optimized single-row dense FA2 route and regressed a C4-decode plus five-cold-32K probe from 49.895 to 55.059 seconds (+10.35%). The prototype is not retained. The next useful kernel target is page-1568 dense FA2 service, while preserving the current single-row exact route.\n\nValidation: 179 focused attention policy/prefix-decode tests pass with the worktree Flash-V100 package, repository commit hooks pass, and the migration control document records all raw criteria and rejected paths.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/629",
+    "isDraft": true,
+    "headRefName": "codex/v100-27b-fp8-c32-plus10-20260914",
+    "headRefOid": "27e5f8e574ba7f46e755e66f94796d3438ea8867",
+    "baseRefName": "main",
+    "baseRefOid": "02c87ab8902d7da873a74160f93ed93013cb4cfd",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 629,
+    "id": "PR_kwDORjYFXs8AAAABDZrhVA",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "27e5f8e574ba7f46e755e66f94796d3438ea8867",
+    "title": "[Core][SM70] Beat A800 C32 decode and recover 32K serving",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/629",
+    "body": "## Purpose\n\nQwen3.8-27B-FP8 at concurrency 32 took 36.285 ms per stable decode step on 4x V100 TP4. The A800 reference trace took 33.521 ms, so the acceptance target for 10% higher decode-step speed was at most 30.474 ms. The rebuilt-source endpoint now measures 29.502 ms/step, 13.62% higher step rate than the A800 reference and 18.70% lower step time than the original V100 trace.\n\nOnly stable CUDA graph replay intervals from the 2048-input/256-output decode window are compared. Prefill, TTFT, request wall time, and output throughput are excluded. The A800 trace is a structural reference because it uses a different TP, dtype, KV-cache, GEMM, and attention configuration.\n\n## Change\n\n- Warm and tune the existing FP8 dense route through M32 so captured C24/C32 graphs do not fall back to the untuned tactic.\n- Enable the established fused Gemma add+RMSNorm route for the exact Qwen3.8-27B-FP8 TP4 C32 contract.\n- Enable the existing 6-warp dual-resident G6/D256 attention route at batch 16 or larger.\n- Add `VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH` so C1-C8 retain the established 8-warp route.\n- Apply these defaults only for SM70, FP16, FP8, TP4/PP1, no speculative decoding, FP16/auto KV cache, and an actual captured C32 graph. Explicit environment overrides are preserved.\n\n## Pure-decode result\n\n| Configuration | Stable step mean |\n| --- | ---: |\n| Original V100 C32 | 36.285 ms |\n| M32 tuning | 34.239 ms |\n| + fused Gemma RMSNorm | 31.336 ms |\n| + 6-warp attention | 30.140 ms |\n| Old-DSO source-default repeat | 30.124 ms |\n| Rebuilt-source endpoint repeat | **29.502 ms** |\n\nThe rebuilt-source repeat measured p50 29.489 ms, p90 29.511 ms, and p99 29.877 ms across 244 stable C32 steps. Relative to the A800 mean/p50/p90/p99, decode-step rate is higher by 13.62%/13.43%/13.90%/20.10%. Its rank-mean graph service is 14.924 ms FP8 projection, 3.812 ms GDN/conv, 3.026 ms TP4 communication, 2.901 ms full attention, and 1.235 ms elementwise/layout.\n\n## Validation\n\n- Rebuilt the Flash-V100 extension from this source with CUDA 12.8 for SM70; all four endpoint workers mapped DSO SHA256 `eea5fdd5dfb2650d1103f2ef659b28684396cd2d0cf00e578393821a37cbc1a0`.\n- Complete endpoint startup logged all five automatic defaults, 35 coordinated FP8 tuning records on each rank, and CUDA graph capture completion.\n- Deterministic 2048-input/256-output request returned HTTP 200, `finish_reason=length`, and exactly 256 output tokens.\n- Two independent rebuilt-source C32 traces measured 29.535 ms and 29.502 ms mean stable decode intervals, a 0.11% difference.\n- B1/2/4/8/16/24/32 attention sweep: bit-exact against the 8-warp output at every batch; no low-batch route change; B16 and B32 attention improve 34.24% and 35.25%.\n- `24 passed`: exact config admission/override tests plus fused Gemma RMSNorm tests.\n- `1 passed`: minimum-batch environment contract.\n- Ruff, Ruff format, clang-format, mypy, configuration validation, DCO sign-off, and all other applicable pre-commit hooks pass.\n\n\n## 8K context follow-up\n\nA matched C32 8192-input/256-output follow-up uses two complete 250-step traces per device configuration. V100 pooled rank-max mean/p50/p90/p99 are 36.152/36.152/36.198/36.220 ms; A800 pooled values are 39.723/39.678/39.994/40.529 ms. V100 decode-step rate is higher by 9.88%/9.75%/10.49%/11.90%. The 10%-faster mean threshold is 36.112 ms, so the current 8K mean misses it by 0.040 ms and is not claimed as a robust 10% win.\n\nFrom 2K to 8K, V100 step latency increases 22.54% versus 18.50% on A800. About 97% of the V100 increase comes from full attention, which grows from 2.901 ms to 9.350 ms. The next optimization target is a context-qualified attention partition choice with at least 0.2-0.3 ms/step safety margin.\n\n\n## 32K serving follow-up\n\nThe user-selected 32K criterion uses standard `vllm bench serve` rather than a cached pure-decode trace: random dataset, seed 1234, fixed 32768 input and 256 output tokens, range ratio zero, temperature zero, ignore EOS, 128 requests, request rate infinity, and maximum concurrency 32. Tokenizer hashes match and the two vLLM client versions use the same random request-generation path.\n\nBoth endpoints complete 128/128 requests with zero failures and exact token counts. V100 TP4 takes 2972.63 seconds at 0.04306 requests/s and 11.023 output tokens/s; A800 TP1 takes 2064.03 seconds at 0.06201 requests/s and 15.876 output tokens/s. V100 output throughput is 30.57% lower. V100 versus A800 ITL mean/p50/p90/p99 is 2059.92/61.94/4844.37/5103.26 ms versus 1151.94/46.64/3369.47/3593.90 ms.\n\nThe distribution is bimodal because later 32K prefills interrupt active decode. V100 has 30.23% of ITL samples above four seconds, versus 0.012% on A800; its under-100-ms ITL p50 is 60.84 ms versus 46.34 ms. Reaching 10% above the A800 output throughput requires 17.463 output tokens/s, a 58.42% improvement over the current V100 result. The next work is a chunked-prefill scheduling sweep followed by a context-qualified 32K attention partition sweep.\n\n\n\n## Current-main 32K recovery\n\nAfter merging main through PR638, the standard C32 32K screen now uses E4M3 KV, page 1568, mixed-batch resident-decode XQA, Mamba align, MBT8192, async scheduling, prefix caching, and normal CUDA graphs. A 40-request screen with the same random seed and fixed 32768/256 lengths completes 40/40 in 342.13 seconds at **29.930 output tok/s**, with mean/p50/p99 ITL of 562.31/78.35/2137.91 ms. The first 40 completions from the recorded A800 run take 933.69 seconds at 10.967 output tok/s, so this V100 screen is 2.73x the A800 rate and clears the 12.064 tok/s +10% target. The user requested shortened C32 iterations, so a fresh 128-request acceptance run is intentionally deferred.\n\nThe root cause is now separated. FP16 align left only 898 logical KV tokens at exact C32, while E4M3 raises measured capacity to 1,889,444 tokens and 57.21x maximum 33,024-token concurrency. At matched B21/B22 the old V100 steady decode was only 3.9%-4.3% behind A800; the large endpoint gap came from capacity/preemption and atomic page-aligned long-prefill interference. PR638 cuts a C1 victim's 42 prefill-induced gaps from 358-454 ms to 248-346 ms by routing resident decode rows through paged XQA.\n\nAn FP8 bridge batching prototype was tested and rejected. The bridge expansion is only about 0.186 ms/layer at q1568/KV32928; the roughly 25.17-ms bridged long-prefix attention dominates. Batching forced paged FA2 instead of the optimized single-row dense FA2 route and regressed a C4-decode plus five-cold-32K probe from 49.895 to 55.059 seconds (+10.35%). The prototype is not retained. The next useful kernel target is page-1568 dense FA2 service, while preserving the current single-row exact route.\n\nValidation: 179 focused attention policy/prefix-decode tests pass with the worktree Flash-V100 package, repository commit hooks pass, and the migration control document records all raw criteria and rejected paths.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-27b-fp8-c32-plus10-20260914",
+    "comments": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWQDv3c="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABZAO_dw",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "I checked the remaining patch against current main. The six-warp operator is already present; the model/TP/C32-specific default block and minimum-batch enable variable are not equivalent to generic capability admission. I will retain the recorded bitwise shape sweep and move the remaining selection into operator layout/tactic admission, with low-row fallbacks and paired decode validation. The existing default block will not be copied wholesale, and no new speed result is claimed here.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/629#issuecomment-5972934519",
+          "createdAt": "2026-10-03T19:57:51Z",
+          "updatedAt": "2026-10-03T19:57:51Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 629,
+    "title": "[Core][SM70] Beat A800 C32 decode and recover 32K serving",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/629",
+    "isDraft": true,
+    "headRefOid": "27e5f8e574ba7f46e755e66f94796d3438ea8867",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "docs/design/sm70_v100_migration_control.md",
+      "flash-attention-v100/kernel/flash_decode_paged.cu",
+      "tests/config/test_sm70_qwen38_fp8_concurrency_defaults.py",
+      "tests/v1/attention/test_sm70_flash_v100_policy.py",
+      "vllm/config/vllm.py",
+      "vllm/envs.py"
+    ],
+    "diff_bytes": 23282,
+    "diff_sha256": "719266d964c07a0d94ec1e6dc257d424fc127eb83c11c05afec4cf0b2a3b88e7"
+  },
+  "full_tree_diff_proof": null
+}

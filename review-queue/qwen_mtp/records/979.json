@@ -1,0 +1,102 @@
+{
+  "initial_inventory": {
+    "number": 979,
+    "title": "[Model] Screen FP8 drafting with a private NVFP4 candidate head",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/979",
+    "isDraft": true,
+    "headRefOid": "0a0dbe99f7536290bde1094ce0ecf9a720f13988",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 979,
+    "title": "[Model] Screen FP8 drafting with a private NVFP4 candidate head",
+    "body": "## Purpose\n\nUse a private NVFP4 proposal-head copy for SM70 DFlash2 draft7, while target verification retains its original per-channel FP8 weights and head. The real selector uses seven rows; both M7 and M8 fit one tile. Larger batches retain the original head. Quantization runs once in bounded row chunks before graph capture.\n\nThe projection changes are from merged #954. This PR adds the proposal head and its Model Runner V1/V2 preparation, rather than duplicating that projection change.\n\n## Test Plan\n\nCheck target weight/scales immutability, graph replay, zero rows, partial packing chunks and batch/strided-input fallback. Use a complete ordinary SM70 wheel with no private runtime library overlays. Measure same-service 256K startup, 1K/8K inputs, temperature 0.7, top-p 0.9, top-k 20, thinking off, seed 123, eight prompts with 600 tokens each. Compare prompt-level acceptance confidence intervals, natural EOS and warmed C4 throughput.\n\n## Test Result\n\nFour focused GPU tests pass. Fresh installed-artifact native dependency validation passes. The original complete CUDA source build is reused only for a Python correction: all sixteen native DSOs are byte-identical, native source/build configuration is unchanged, wheel RECORD is regenerated, and corrected Python matches the tested source. Ruff and source checks pass.\n\n| Same-service route | 1K ms/round | 8K ms/round |\n|---|---:|---:|\n| Original FP16 draft projections/head | 14.587 | 14.998 |\n| Private proposal head only | 14.385 | 14.788 |\n| FP8 projections + private proposal head | 13.939 | 14.354 |\n\nCombined tokens/round are 3.011 [2.868, 3.154] at 1K and 2.840 [2.741, 2.952] at 8K; each 95% prompt-bootstrap interval overlaps its control. Three natural prompts terminate normally. The eight-row draft graph selects exactly one private head kernel; captured draft graph count remains 142.\n\nThe initial cumulative C4 comparison passed, but the required incremental comparison against FP8-only main fails: baseline before/after 430.44/436.41 token/s versus 381.73 with the private head. The candidate has more long rounds despite similar median round time. A targeted repeat with CPU-only observation of existing reference flags gives 431.24 → 450.32 token/s, while full-batch reference rounds are 11/190 versus 10/194. The conflicting concurrency results are unresolved; the repeat does not invalidate the observed regression. Keep this PR in Draft; the head is not admitted for production.\n\nAssisted by Codex.\n\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/979",
+    "isDraft": true,
+    "headRefName": "codex/v100-round12-draft-integration-20261005-111157",
+    "headRefOid": "0a0dbe99f7536290bde1094ce0ecf9a720f13988",
+    "baseRefName": "main",
+    "baseRefOid": "4dc59750750eadf521d3aee9457adbec0872fd61",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 979,
+    "id": "PR_kwDORjYFXs8AAAABGsTaaQ",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "0a0dbe99f7536290bde1094ce0ecf9a720f13988",
+    "title": "[Model] Screen FP8 drafting with a private NVFP4 candidate head",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/979",
+    "body": "## Purpose\n\nUse a private NVFP4 proposal-head copy for SM70 DFlash2 draft7, while target verification retains its original per-channel FP8 weights and head. The real selector uses seven rows; both M7 and M8 fit one tile. Larger batches retain the original head. Quantization runs once in bounded row chunks before graph capture.\n\nThe projection changes are from merged #954. This PR adds the proposal head and its Model Runner V1/V2 preparation, rather than duplicating that projection change.\n\n## Test Plan\n\nCheck target weight/scales immutability, graph replay, zero rows, partial packing chunks and batch/strided-input fallback. Use a complete ordinary SM70 wheel with no private runtime library overlays. Measure same-service 256K startup, 1K/8K inputs, temperature 0.7, top-p 0.9, top-k 20, thinking off, seed 123, eight prompts with 600 tokens each. Compare prompt-level acceptance confidence intervals, natural EOS and warmed C4 throughput.\n\n## Test Result\n\nFour focused GPU tests pass. Fresh installed-artifact native dependency validation passes. The original complete CUDA source build is reused only for a Python correction: all sixteen native DSOs are byte-identical, native source/build configuration is unchanged, wheel RECORD is regenerated, and corrected Python matches the tested source. Ruff and source checks pass.\n\n| Same-service route | 1K ms/round | 8K ms/round |\n|---|---:|---:|\n| Original FP16 draft projections/head | 14.587 | 14.998 |\n| Private proposal head only | 14.385 | 14.788 |\n| FP8 projections + private proposal head | 13.939 | 14.354 |\n\nCombined tokens/round are 3.011 [2.868, 3.154] at 1K and 2.840 [2.741, 2.952] at 8K; each 95% prompt-bootstrap interval overlaps its control. Three natural prompts terminate normally. The eight-row draft graph selects exactly one private head kernel; captured draft graph count remains 142.\n\nThe initial cumulative C4 comparison passed, but the required incremental comparison against FP8-only main fails: baseline before/after 430.44/436.41 token/s versus 381.73 with the private head. The candidate has more long rounds despite similar median round time. A targeted repeat with CPU-only observation of existing reference flags gives 431.24 → 450.32 token/s, while full-batch reference rounds are 11/190 versus 10/194. The conflicting concurrency results are unresolved; the repeat does not invalidate the observed regression. Keep this PR in Draft; the head is not admitted for production.\n\nAssisted by Codex.\n\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-round12-draft-integration-20261005-111157",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 979,
+    "title": "[Model] Screen FP8 drafting with a private NVFP4 candidate head",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/979",
+    "isDraft": true,
+    "headRefOid": "0a0dbe99f7536290bde1094ce0ecf9a720f13988",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/kernels/quantization/test_sm70_dflash2_fp8_m8.py",
+      "tests/kernels/quantization/test_sm70_dflash2_nvfp4_head.py",
+      "vllm/model_executor/layers/linear.py",
+      "vllm/model_executor/layers/quantization/sm70_dflash2_fp8.py",
+      "vllm/model_executor/layers/quantization/sm70_dflash2_nvfp4_head.py",
+      "vllm/model_executor/models/qwen3_dflash2.py",
+      "vllm/v1/spec_decode/dflash.py",
+      "vllm/v1/worker/gpu/spec_decode/dflash/utils.py"
+    ],
+    "diff_bytes": 21150,
+    "diff_sha256": "8b950181b940adb09827ec1880dc92d62e43614432cd0965757e577f8f3dde02"
+  },
+  "full_tree_diff_proof": null
+}

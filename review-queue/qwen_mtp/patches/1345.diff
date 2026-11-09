@@ -1,0 +1,269 @@
+diff --git a/tests/kernels/test_sm70_fp16_grouped_verify.py b/tests/kernels/test_sm70_fp16_grouped_verify.py
+index be32311564..a80d5e7794 100644
+--- a/tests/kernels/test_sm70_fp16_grouped_verify.py
++++ b/tests/kernels/test_sm70_fp16_grouped_verify.py
+@@ -136,3 +136,65 @@ def run(enabled):
+             torch.testing.assert_close(actual, out, atol=0.0005, rtol=0.01)
+         else:
+             assert torch.equal(actual.view(torch.int16), out.view(torch.int16))
++
++
++@pytest.mark.parametrize("rows,context", [(2, 1091), (4, 8192), (4, 131072)])
++def test_grouped_fp16_serves_two_kv_heads_per_rank(rows, context):
++    """TP2: one kernel call per KV head, on the page of the FP8 checkpoint."""
++    from vllm.v1.attention.backends.flash_v100.spec.verifier import per_kv_head_views
++    from vllm.v1.attention.ops.sm70_fp16_grouped import load_grouped_fp16_fp32
++
++    grouped = load_grouped_fp16_fp32()
++    page = 800
++    pages = math.ceil(context / page)
++    generator = torch.Generator(device="cuda").manual_seed(123)
++    k, v = torch.randn(
++        (2, pages, page, 2, 256),
++        generator=generator,
++        dtype=torch.float16,
++        device="cuda",
++    )
++    q = torch.randn(
++        (rows, 12, 256), generator=generator, dtype=torch.float16, device="cuda"
++    )
++    table = torch.randperm(pages, generator=generator, device="cuda")[None].int()
++    lengths = torch.tensor(
++        [context - rows + i + 1 for i in range(rows)],
++        dtype=torch.int32,
++        device="cuda",
++    )
++    out = torch.empty_like(q)
++    for view in per_kv_head_views(q, k, v, out):
++        grouped(
++            view.query,
++            view.key,
++            view.value,
++            table,
++            lengths,
++            out=view.out,
++            softmax_scale=1 / 16,
++        )
++        out[:, view.query_heads] = view.out
++
++    old_tf32 = torch.backends.cuda.matmul.allow_tf32
++    torch.backends.cuda.matmul.allow_tf32 = False
++    try:
++        reference = torch.empty_like(q, dtype=torch.float32)
++        for head in range(2):
++            keys = k[:, :, head].index_select(0, table[0].long())
++            values = v[:, :, head].index_select(0, table[0].long())
++            keys, values = (
++                keys.reshape(-1, 256).float(),
++                values.reshape(-1, 256).float(),
++            )
++            query_heads = slice(6 * head, 6 * (head + 1))
++            scores = q[:, query_heads].float() @ keys.T / 16
++            scores.masked_fill_(
++                torch.arange(keys.shape[0], device=q.device)[None, None, :]
++                >= lengths[:, None, None],
++                -torch.inf,
++            )
++            reference[:, query_heads] = torch.softmax(scores, dim=-1) @ values
++    finally:
++        torch.backends.cuda.matmul.allow_tf32 = old_tf32
++    torch.testing.assert_close(out.float(), reference, atol=0.0005, rtol=0.01)
+diff --git a/tests/v1/attention/test_flash_v100_kv_head_views.py b/tests/v1/attention/test_flash_v100_kv_head_views.py
+new file mode 100644
+index 0000000000..6a12aa3971
+--- /dev/null
++++ b/tests/v1/attention/test_flash_v100_kv_head_views.py
+@@ -0,0 +1,41 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import torch
++
++from vllm.v1.attention.backends.flash_v100.spec.verifier import per_kv_head_views
++
++
++def test_single_kv_head_passes_the_batch_through():
++    query = torch.randn(4, 6, 256)
++    key = torch.randn(3, 800, 1, 256)
++    value = torch.randn(3, 800, 1, 256)
++    out = torch.empty_like(query)
++
++    (view,) = per_kv_head_views(query, key, value, out)
++
++    assert view.query is query
++    assert view.key is key
++    assert view.value is value
++    assert view.out is out
++
++
++def test_two_kv_heads_get_their_own_query_heads_and_cache():
++    query = torch.randn(4, 12, 256)
++    key = torch.randn(3, 800, 2, 256)
++    value = torch.randn(3, 800, 2, 256)
++    out = torch.empty_like(query)
++
++    views = per_kv_head_views(query, key, value, out)
++
++    assert len(views) == 2
++    for head, view in enumerate(views):
++        assert view.query.shape == (4, 6, 256)
++        assert view.query.is_contiguous()
++        assert view.key.shape == (3, 800, 1, 256)
++        assert view.out.shape == (4, 6, 256)
++        assert view.out is not out
++        assert torch.equal(view.query, query[:, 6 * head : 6 * (head + 1)])
++        assert torch.equal(view.key[:, :, 0], key[:, :, head])
++        assert torch.equal(view.value[:, :, 0], value[:, :, head])
++        out[:, view.query_heads] = float(head)
++    assert torch.all(out[:, :6] == 0) and torch.all(out[:, 6:] == 1)
+diff --git a/tests/v1/attention/test_sm70_fp16_grouped_admission.py b/tests/v1/attention/test_sm70_fp16_grouped_admission.py
+index 72c6e33445..d8c19208ba 100644
+--- a/tests/v1/attention/test_sm70_fp16_grouped_admission.py
++++ b/tests/v1/attention/test_sm70_fp16_grouped_admission.py
+@@ -93,3 +93,12 @@ def test_fp16_grouped_rejects_unqualified_batch_and_row_counts():
+     assert reason(scenario(5, 40)) == "request_group_count"
+     assert reason(scenario(4, 20)) == "query_rows"
+     assert reason(scenario(1, 1)) == "query_rows"
++
++
++def test_fp16_grouped_admits_the_fp8_checkpoint_page():
++    inputs = scenario()
++    page = 800
++    strides = (page * 256, 256, 256, 1)
++    inputs[2] = descriptor((316, page, 1, 256), strides=strides)
++    inputs[3] = descriptor((316, page, 1, 256), strides=strides)
++    assert reason(inputs) is None
+diff --git a/vllm/v1/attention/backends/flash_v100/spec/verifier.py b/vllm/v1/attention/backends/flash_v100/spec/verifier.py
+index db77d7bd60..720a01bb0a 100644
+--- a/vllm/v1/attention/backends/flash_v100/spec/verifier.py
++++ b/vllm/v1/attention/backends/flash_v100/spec/verifier.py
+@@ -5,7 +5,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-from typing import Any
++from typing import Any, NamedTuple
+ 
+ import torch
+ 
+@@ -88,6 +88,49 @@ class GroupedAdmission:
+     _flash_v100_window_size: Any
+ 
+ 
++class KvHeadView(NamedTuple):
++    """One KV head and the query heads that read it."""
++
++    query: torch.Tensor
++    key: torch.Tensor
++    value: torch.Tensor
++    out: torch.Tensor
++    query_heads: slice
++
++
++def per_kv_head_views(
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    out: torch.Tensor,
++) -> list[KvHeadView]:
++    """Split a verifier batch for the grouped kernel, one call per KV head.
++
++    The grouped kernel reads the context once for all query rows, but takes
++    exactly one KV head at a time. With several KV heads per rank (tensor
++    parallelism below the head count) each one gets its own call. The caller
++    writes `out` of a split batch back through `query_heads`.
++    """
++    num_kv_heads = key_cache.shape[2]
++    if num_kv_heads == 1:
++        return [KvHeadView(query, key_cache, value_cache, out, slice(None))]
++    heads_per_kv = query.shape[1] // num_kv_heads
++    views = []
++    for head in range(num_kv_heads):
++        query_heads = slice(head * heads_per_kv, (head + 1) * heads_per_kv)
++        head_query = query[:, query_heads].contiguous()
++        views.append(
++            KvHeadView(
++                head_query,
++                key_cache[:, :, head : head + 1],
++                value_cache[:, :, head : head + 1],
++                torch.empty_like(head_query),
++                query_heads,
++            )
++        )
++    return views
++
++
+ class VerificationExecutor:
+     def __init__(self, config: VerificationConfig, ops: VerificationOps):
+         self.config = config
+@@ -345,34 +388,43 @@ def call_smallq_decode_paged(
+         partition_size_hint: int | None,
+     ) -> None:
+         fp16_grouped = self.ops.fp16_grouped
++        kv_heads = (
++            per_kv_head_views(query, key_cache, value_cache, out)
++            if fp16_grouped is not None
++            else ()
++        )
+         if (
+-            fp16_grouped is not None
++            kv_heads
+             and grouped_fp16_fp32_reason(
+                 self.grouped_admission,
+-                query,
+-                key_cache,
+-                value_cache,
++                kv_heads[0].query,
++                kv_heads[0].key,
++                kv_heads[0].value,
+                 block_table,
+                 seq_lens,
+                 attn_metadata,
+-                out=out,
++                out=kv_heads[0].out,
+                 partition_size_hint=partition_size_hint,
+             )
+             is None
+         ):
+-            fp16_grouped(
+-                query,
+-                key_cache,
+-                value_cache,
+-                attn_metadata.block_table,
+-                seq_lens,
+-                out=out,
+-                softmax_scale=self.config.scale,
+-            )
++            for head in kv_heads:
++                fp16_grouped(
++                    head.query,
++                    head.key,
++                    head.value,
++                    attn_metadata.block_table,
++                    seq_lens,
++                    out=head.out,
++                    softmax_scale=self.config.scale,
++                )
++                if head.out is not out:
++                    out[:, head.query_heads].copy_(head.out)
+             logger.info_once(
+                 "FLASH_ATTN_V100 FP16 KV grouped verifier active "
+-                "(FP32 probability/PV/numerator/max/sum, page=%d).",
++                "(FP32 probability/PV/numerator/max/sum, page=%d, KV heads=%d).",
+                 key_cache.shape[1],
++                key_cache.shape[2],
+                 scope="process",
+             )
+             _routing.record_route(
+diff --git a/vllm/v1/attention/ops/sm70_grouped.py b/vllm/v1/attention/ops/sm70_grouped.py
+index fc102256e6..73f913d178 100644
+--- a/vllm/v1/attention/ops/sm70_grouped.py
++++ b/vllm/v1/attention/ops/sm70_grouped.py
+@@ -48,7 +48,7 @@ class GroupedContract:
+         batch_revision=None,
+         max_groups=4,
+         explicit_groups=False,
+-        page_sizes=(832,),
++        page_sizes=(800, 832),
+         page_alignment=1,
+         query_heads=6,
+         require_cuda=True,

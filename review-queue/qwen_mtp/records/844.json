@@ -1,0 +1,128 @@
+{
+  "initial_inventory": {
+    "number": 844,
+    "title": "[Kernel] Recover finite SM70 prefill score precision and tail peaks",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/844",
+    "isDraft": true,
+    "headRefOid": "35b84b870571dcc030096a1ce3a1da6b27de599f",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 844,
+    "title": "[Kernel] Recover finite SM70 prefill score precision and tail peaks",
+    "body": "This PR now contains only the remaining finite-score precision and missed tail-peak recovery proposal from #693. Causal padding, clipped prefix peaks and overflowing compact-score recovery are in main through #820, #850 and #851. The remaining CUDA change lowers the FP32 recovery threshold from FP16 overflow to magnitude 128 and corrects tail shifts when sampling misses a peak beyond the existing margin. It preserves the existing V representation, output dtype, margin and cuBLAS mode.\n\nThe broader native implementation passed FP64 stability and changed-input controls, and seven normal-activation outputs matched bitwise. However, its 32K release-profile screen regressed C1 decode by 50.13% and C4 by 16.04%. It remains Draft while that regression is investigated; those results are not acceptance evidence for the remaining default behavior.\n\nRebased onto the merged overflow repair. The current CPU gate passed 73 startup/profile checks and 196 attention-policy checks, with 24 hardware-dependent skips; scoped pre-commit passed. Previously recorded native results apply to the unchanged broader CUDA implementation, not a new model evaluation. No environment switch or workload whitelist is added. Original contribution history is preserved.\n\nAI assistance was used.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/844",
+    "isDraft": true,
+    "headRefName": "codex/prefill-range-repair-20261003",
+    "headRefOid": "35b84b870571dcc030096a1ce3a1da6b27de599f",
+    "baseRefName": "main",
+    "baseRefOid": "332bf87d0fdd0656ae0855198dcc4ba19e5fd7eb",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 844,
+    "id": "PR_kwDORjYFXs8AAAABGbFY4w",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "35b84b870571dcc030096a1ce3a1da6b27de599f",
+    "title": "[Kernel] Recover finite SM70 prefill score precision and tail peaks",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/844",
+    "body": "This PR now contains only the remaining finite-score precision and missed tail-peak recovery proposal from #693. Causal padding, clipped prefix peaks and overflowing compact-score recovery are in main through #820, #850 and #851. The remaining CUDA change lowers the FP32 recovery threshold from FP16 overflow to magnitude 128 and corrects tail shifts when sampling misses a peak beyond the existing margin. It preserves the existing V representation, output dtype, margin and cuBLAS mode.\n\nThe broader native implementation passed FP64 stability and changed-input controls, and seven normal-activation outputs matched bitwise. However, its 32K release-profile screen regressed C1 decode by 50.13% and C4 by 16.04%. It remains Draft while that regression is investigated; those results are not acceptance evidence for the remaining default behavior.\n\nRebased onto the merged overflow repair. The current CPU gate passed 73 startup/profile checks and 196 attention-policy checks, with 24 hardware-dependent skips; scoped pre-commit passed. Previously recorded native results apply to the unchanged broader CUDA implementation, not a new model evaluation. No environment switch or workload whitelist is added. Original contribution history is preserved.\n\nAI assistance was used.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/prefill-range-repair-20261003",
+    "comments": {
+      "totalCount": 3,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXuwFqs="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABY8fXkQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The 27 current-source native stability cases passed again on the updated base. The release-profile screen then completed one warmup and three measurements for each workload. Against the matched current-main control, median TPOT changed by -4.20% at 4K C1, +61.72% at 32K C1 and +5.63% at 32K C4; the 32K outputs and speculative acceptance also changed. This revision remains Draft.\n\nThe original patch also changes the normal score margin, V headroom and cuBLAS reduction mode, in addition to exceptional-tile recovery. I am retaining the established values for those normal-path settings while keeping missed-peak and unsafe-score recovery, then rebuilding and repeating the native and release checks. The measurements above are preserved as failed integration evidence rather than relabeled as acceptance.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/844#issuecomment-5969008529",
+          "createdAt": "2026-10-03T12:08:29Z",
+          "updatedAt": "2026-10-03T12:08:29Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABY8uagA",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The narrowed full-range repair passed 27 stability cases and seven bitwise normal-activation controls, but still failed the release-profile screen: 32K C1 TPOT +50.13%, C4 +16.04% against the matched control. It remains unmerged.\n\nI am separating the independent clipped-prefix repair from FP32 score-storage recovery. The prefix repair changes only tiles whose exponent traversal detects a missed peak; it preserves the established tail scan, score storage, V scaling and cuBLAS mode. Four dense/sparse changed-input graph regressions against FP64 are being validated on current main. The broader recovery remains in this PR until its default-model behavior and performance are resolved.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/844#issuecomment-5969255040",
+          "createdAt": "2026-10-03T12:40:10Z",
+          "updatedAt": "2026-10-03T12:40:10Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABe7AWqw",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "## Half of this PR is already on main; the remaining delta needs a CUDA rebuild\n\nChecked both halves against `main` (`b32072ac9`):\n\n| Hunk | State on main |\n|---|---|\n| `if (isfinite(sampled) && value <= sampled + kStableScoreMargin)` in `stable_finish_max` | **already present** (`stable_rows.cuh:192`) |\n| `kStableCompactScoreLimit` | still **`65504.0f`** (`stable_rows.cuh:14`) — this PR lowers it to `128.0f` |\n| `test_compact_score_range_recovery_with_changing_graph_inputs` (117 lines) | not present |\n| `docs/design/sm70_prefill_range_guard.md` | 404 on main |\n\nSo the remaining production delta is the threshold change plus its comment; the shift guard landed through #820/#850/#851.\n\n### Why I have not merged it\n\n`stable_rows.cuh` is included by `csrc/attention/sm70_79t/prefill.cu:555` and compiled into `vllm._C.abi3.so`. The CUDA image ships that `.so` prebuilt, so overlaying the header changes nothing — validating this needs a full `_C` rebuild plus the GPU test, which is the one thing I cannot do in this environment.\n\nThe test itself is the valuable part: it is CUDA-only (`pytest.skip(\"SM70 CUDA test\")`), so it will skip in CPU CI and only run on the SM70 boxes — but it is currently the only coverage for the 128 threshold.\n\nLeaving this open. Either rebuild and run the test, or split the test out as its own PR so at least the coverage lands.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/844#issuecomment-6370105003",
+          "createdAt": "2026-10-23T16:51:44Z",
+          "updatedAt": "2026-10-23T16:51:44Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 844,
+    "title": "[Kernel] Recover finite SM70 prefill score precision and tail peaks",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/844",
+    "isDraft": true,
+    "headRefOid": "35b84b870571dcc030096a1ce3a1da6b27de599f",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "csrc/attention/sm70_79t/stable_rows.cuh",
+      "docs/design/sm70_prefill_range_guard.md",
+      "tests/kernels/attention/test_sm70_79t_stability.py"
+    ],
+    "diff_bytes": 14858,
+    "diff_sha256": "755a90cec0cfbab61e01b0f4a28710f850ad57ce51d4b65c53ee87b2b58ecbbb"
+  },
+  "full_tree_diff_proof": null
+}
