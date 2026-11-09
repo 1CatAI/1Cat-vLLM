@@ -1429,7 +1429,7 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            return num_new_blocks + num_evictable_computed_blocks
+            return max(0, num_new_blocks) + num_evictable_computed_blocks
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1466,7 +1466,6 @@ class MambaManager(SingleTypeKVCacheManager):
                 #
                 # Previously this tripped the assert below and killed the
                 # EngineCore (observed 63 < 64).
-                self._allocated_block_reqs.add(request_id)
                 return []
             else:
                 prev_block_len = len(req_blocks)
