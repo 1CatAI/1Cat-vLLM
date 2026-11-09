@@ -43,7 +43,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.config.execution_policy import graph_policy
-from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.config.sm70_runtime import RuntimeTraceConfig, capture_runtime_trace
 from vllm.diagnostics import bind_diagnostics, diagnostic_channel, flush_runner_graphs
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -347,6 +347,44 @@ def _dflash_ddtree_trace_event(
         logger.exception("Failed to write DDTree trace event to %s", trace_path)
 
 
+def _clip_stateful_sample_limits(
+    output_token_ids, req_ids, requests, output_budget=None
+):
+    """Keep stop/length clipping on device before a private-state commit.
+
+    The normal CPU output processor also applies these limits. Models with
+    prefix snapshots need the same boundary before an asynchronous next step
+    consumes the sampled-count selector. Other models retain their old path.
+    """
+    for row, req_id in enumerate(req_ids[: output_token_ids.shape[0]]):
+        request = requests.get(req_id)
+        params = None if request is None else request.sampling_params
+        if params is None:
+            continue
+        if params.max_tokens is not None:
+            if output_budget is not None:
+                positions = torch.arange(
+                    output_token_ids.shape[1], device=output_token_ids.device
+                )
+                output_token_ids[row].masked_fill_(positions >= output_budget[row], -1)
+            else:
+                remaining = max(0, params.max_tokens - len(request.output_token_ids))
+                output_token_ids[row, remaining:].fill_(-1)
+        if output_token_ids.shape[1] <= 1:
+            continue
+        stops = set(params.stop_token_ids or ())
+        if not params.ignore_eos and params.eos_token_id is not None:
+            stops.add(params.eos_token_id)
+        if stops:
+            values = output_token_ids[row]
+            stop = torch.zeros_like(values, dtype=torch.bool)
+            for token_id in stops:
+                stop |= values == token_id
+            # Include the first stop itself, excluding every later candidate.
+            after = stop.to(torch.int32).cumsum(0) - stop.to(torch.int32) > 0
+            values.masked_fill_(after, -1)
+
+
 def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
     valid_token_mask = output_token_ids != -1
     token_offsets = torch.arange(
@@ -405,13 +443,13 @@ def _dflash_ddtree_metadata_profile_enabled() -> bool:
     return os.getenv("VLLM_DFLASH_DDTREE_METADATA_PROFILE", "0") == "1"
 
 
-def _dflash_ddtree_target_forward_nvtx_enabled() -> bool:
-    return capture_runtime_trace().spec_target_nvtx
+def _dflash_ddtree_target_forward_nvtx_enabled(trace: RuntimeTraceConfig) -> bool:
+    return trace.value("spec_target_nvtx")
 
 
-def _dflash_ddtree_target_forward_profiler_step() -> int:
+def _dflash_ddtree_target_forward_profiler_step(trace: RuntimeTraceConfig) -> int:
     # Compatibility name; initialized engines borrow their diagnostic policy.
-    return capture_runtime_trace().spec_target_profiler_step
+    return trace.value("spec_target_profiler_step")
 
 
 def _maybe_dump_sm70_mtp_step(
@@ -1042,6 +1080,10 @@ def _non_greedy_rows_carry_drafts(
     return any(n > 0 and not greedy for n, greedy in zip(num_draft_tokens, is_greedy))
 
 
+_V41_TRUNC_CUTOFF = int(envs.VLLM_V41_TRUNC_CUTOFF)
+_V41_TRUNC = envs.VLLM_V41_TRUNC == "1"
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -1066,8 +1108,12 @@ class GPUModelRunner(
             yield
             return
 
-        nvtx_enabled = _dflash_ddtree_target_forward_nvtx_enabled()
-        profiler_step = _dflash_ddtree_target_forward_profiler_step()
+        # The scope opens before the forward context, so the module-level
+        # lookup would rebuild a standalone trace config on every step; the
+        # runner borrows its engine's own diagnostic owner instead.
+        trace = self.vllm_config.observability_config.runtime_trace
+        nvtx_enabled = _dflash_ddtree_target_forward_nvtx_enabled(trace)
+        profiler_step = _dflash_ddtree_target_forward_profiler_step(trace)
         if not nvtx_enabled and profiler_step <= 0:
             yield
             return
@@ -2118,6 +2164,50 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    def _pp_prepend_accepted_drafts(
+        self,
+        req_id: str,
+        req_state: CachedRequestState,
+        req_index: int | None,
+        num_computed_tokens: int,
+        sent_token_ids: list[int],
+        all_token_ids: dict[str, list[int]],
+    ) -> list[int]:
+        """Non-last PP rank, non-async scheduling: rebuild the tokens sampled
+        since this rank's last update.
+
+        The scheduler sends only the tokens at ``num_computed_tokens`` onward
+        (the bonus token after a spec-decode step). The accepted drafts before
+        it, positions ``[req_state.num_tokens, num_computed_tokens)``, are the
+        previous step's scheduled drafts. Without them ``output_token_ids``
+        skips the drafts and ``token_ids_cpu`` gets the bonus token broadcast
+        over every accepted position, which corrupts the token history this
+        rank feeds the model.
+        """
+        num_accepted = num_computed_tokens - req_state.num_tokens
+        if num_accepted <= 0:
+            return sent_token_ids
+        full = all_token_ids.get(req_id)
+        if full is not None:
+            if len(full) < num_computed_tokens:
+                raise RuntimeError(
+                    f"PP spec decode: full token history is shorter than "
+                    f"num_computed_tokens for request {req_id}"
+                )
+            return list(full[req_state.num_tokens : num_computed_tokens]) + list(
+                sent_token_ids
+            )
+        prev_spec = (
+            self.input_batch.spec_token_ids[req_index] if req_index is not None else []
+        )
+        if num_accepted <= len(prev_spec):
+            return list(prev_spec[:num_accepted]) + list(sent_token_ids)
+        raise RuntimeError(
+            f"PP spec decode: accepted draft token(s) missing for request {req_id}; "
+            f"needed {num_accepted}, held {len(prev_spec)}. "
+            "The scheduler and runner disagree about token-history ownership."
+        )
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -2151,6 +2241,8 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.kv_block_copies:
+            self._kv_block_zeroer.copy_block_ids(scheduler_output.kv_block_copies)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -2234,6 +2326,12 @@ class GPUModelRunner(
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
+            if new_req_data.num_computed_tokens > 0:
+                restore = getattr(self.get_model(), "restore_prefix", None)
+                if restore is not None:
+                    restore(
+                        new_req_data.num_computed_tokens, new_req_data.prompt_token_ids
+                    )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -2346,15 +2444,25 @@ class GPUModelRunner(
                 if not req_data.new_token_ids:
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
                     new_token_ids: list[int] = []
+                    num_sent_tokens = 0
                 else:
                     # Non-async scheduling with PP: The scheduler sends
                     # sampled token ids back because there's no direct communication
                     # between the first-stage worker and the last-stage worker.
                     new_token_ids = req_data.new_token_ids[i]
+                    num_sent_tokens = len(new_token_ids)
+                    new_token_ids = self._pp_prepend_accepted_drafts(
+                        req_id,
+                        req_state,
+                        req_index,
+                        num_computed_tokens,
+                        new_token_ids,
+                        req_data.all_token_ids,
+                    )
                     # Add the sampled token(s) from the previous step (if any).
                     # This doesn't include "unverified" tokens like spec tokens.
                     num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                        num_computed_tokens + num_sent_tokens - req_state.num_tokens
                     )
                     if num_new_tokens == 1:
                         # Avoid slicing list in most common case.
@@ -2423,7 +2531,7 @@ class GPUModelRunner(
                 # according to num_computed_tokens.
                 end_token_index = max(
                     start_token_index,
-                    num_computed_tokens + len(new_token_ids),
+                    num_computed_tokens + num_sent_tokens,
                 )
                 if end_token_index > start_token_index:
                     if new_token_ids:
@@ -2520,6 +2628,31 @@ class GPUModelRunner(
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
         """
+        commit_state = getattr(
+            getattr(self, "model", None), "commit_speculative_state", None
+        )
+        if commit_state is not None:
+            # V4.1 keeps bounded Engram/C2 candidates rather than Mamba blocks.
+            # Reuse the same contiguous accepted-count convention. The model
+            # selects its full input length for a prefill chunk, including
+            # chunks whose sampler output is intentionally discarded.
+            batch = getattr(self, "input_batch", None)
+            if batch is not None:
+                budget = None
+                get_budget = getattr(self.model, "stateful_output_budget", None)
+                if get_budget is not None:
+                    if output_token_ids.shape[0] != 1:
+                        raise ValueError("Private V4.1 state requires one request")
+                    request = self.requests[batch.req_ids[0]]
+                    params = request.sampling_params
+                    if params is not None and params.max_tokens is not None:
+                        budget = get_budget(
+                            params.max_tokens, request.num_prompt_tokens
+                        )
+                _clip_stateful_sample_limits(
+                    output_token_ids, batch.req_ids, self.requests, budget
+                )
+            commit_state(_count_contiguous_spec_tokens(output_token_ids))
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
@@ -4338,7 +4471,7 @@ class GPUModelRunner(
         return cu_num_tokens
 
     def _compute_prev_positions(self, num_reqs: int) -> None:
-        """Build prev_positions mapping: current pos -> previous pos (-1 if new).
+        """Map current decode rows to previous rows (-1 for new or prefill).
 
         Populates self.prev_positions.np[:num_reqs] with the mapping.
         """
@@ -4350,7 +4483,14 @@ class GPUModelRunner(
             return
 
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
+            # KV-load recovery can rewind an existing request into its prompt.
+            # Its last input must come from the prompt, not a discarded sample.
+            prev_positions[i] = (
+                prev_req_id_to_index.get(req_id, -1)
+                if self.input_batch.num_computed_tokens_cpu[i]
+                >= self.input_batch.num_prompt_tokens[i]
+                else -1
+            )
 
     def _apply_ddtree_position_overrides(
         self,
@@ -7485,6 +7625,18 @@ class GPUModelRunner(
                 "silently fall back to an invalid no-draft-probability "
                 "acceptance path and can corrupt output quality."
             )
+        if _V41_TRUNC and len(spec_decode_metadata.num_draft_tokens) == 1:
+            from vllm.model_executor.layers.quantization import gguf_shared_runtime
+
+            trunc = gguf_shared_runtime.current_trunc(self.device)
+            if trunc is not None:
+                # Draft i is verify position i + 1; positions >= trunc were not
+                # fully computed, so they can never be accepted.
+                drafts = spec_decode_metadata.draft_token_ids
+                index = torch.arange(drafts.numel(), device=drafts.device)
+                spec_decode_metadata.draft_token_ids = torch.where(
+                    index + 1 >= trunc, torch.full_like(drafts, -1), drafts
+                )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
@@ -8263,6 +8415,15 @@ class GPUModelRunner(
 
         if self.device.type == "cuda":
             self.mixed_prefill_timer.begin(scheduler_output)
+        if _V41_TRUNC_CUTOFF:
+            from vllm.model_executor.layers.quantization import gguf_shared_runtime
+
+            # Exact only for greedy rows of a single request (positions = rows).
+            single = self.input_batch.num_reqs == 1
+            greedy = bool(getattr(self.input_batch, "all_greedy", False))
+            gguf_shared_runtime.set_trunc_cutoff(
+                _V41_TRUNC_CUTOFF if single and greedy else 0
+            )
 
         trace_enabled = (
             bool(self._runtime_trace.async_cpu and self.use_async_scheduling)
@@ -8595,6 +8756,8 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            self.mixed_prefill_timer.mark_cuda_graph()
         _sync_sm70_before_compile_graph_forward(
             cudagraph_mode, diagnostics=self._diagnostics
         )
@@ -9294,6 +9457,11 @@ class GPUModelRunner(
                 trace_output_ms = (time.perf_counter() - trace_output_t0) * 1000.0
 
         if not self.use_async_scheduling:
+            if (
+                spec_config is not None
+                and self.parallel_config.pipeline_parallel_size > 1
+            ):
+                output.set_draft_token_ids(self.take_draft_token_ids())
             if self.routed_experts_initialized:
                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
                 # synchronized by ``_to_list``'s event.synchronize(), so
@@ -12191,10 +12359,21 @@ class GPUModelRunner(
                 if cg_support.value < min_cg_support.value:
                     min_cg_support = cg_support
                     min_cg_attn_backend = attn_backend.__name__
+        graph_query_len = self.uniform_decode_query_len
+        if (
+            self.model_config.hf_text_config.model_type == "deepseek_v41_text"
+            and self.max_num_reqs == 1
+            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+            and not self.compilation_config.pass_config.enable_sp
+        ):
+            # Exact single-request M1..6 graphs need no uniform-batch padding.
+            # Rounding their capture sizes to six would also pad the native
+            # M5 draft query, whose own graph reads five noncausal positions.
+            graph_query_len = 1
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             min_cg_support,
             min_cg_attn_backend,
-            self.uniform_decode_query_len,
+            graph_query_len,
             self.parallel_config.tensor_parallel_size,
             self.kv_cache_config,
             self.max_num_reqs,
@@ -12203,7 +12382,7 @@ class GPUModelRunner(
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, graph_query_len
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
@@ -12468,7 +12647,9 @@ class GPUModelRunner(
                         shape_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
+                        cache_dtype_str=kv_cache_spec.layout_cache_dtype(
+                            self.cache_config.cache_dtype
+                        ),
                     )
                     dtype = kv_cache_spec.dtype
                     try:
@@ -12566,7 +12747,9 @@ class GPUModelRunner(
                 kernel_block_sizes[group.kv_cache_group_id],
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
+                cache_dtype_str=kv_cache_spec.layout_cache_dtype(
+                    self.cache_config.cache_dtype
+                ),
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:

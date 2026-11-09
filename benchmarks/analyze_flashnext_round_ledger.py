@@ -207,9 +207,11 @@ def analyze(sqlite_path, benchmark_path, trim=8, tokens=None, requests=1):
 
             by_scope = collections.defaultdict(list)
             by_family = collections.defaultdict(list)
+            by_name = collections.defaultdict(list)
             for a, b, s, name in active:
                 by_scope[s].append((a, b))
                 by_family[s + ": " + classify(name)].append((a, b))
+                by_name[s + ": " + name].append((a, b))
             kernel_intervals = clipped([(a, b) for a, b, _, _ in active], start, end)
             copy_intervals = clipped(copies[pid], start, end)
             busy = union_ns(kernel_intervals + copy_intervals)
@@ -233,6 +235,11 @@ def analyze(sqlite_path, benchmark_path, trim=8, tokens=None, requests=1):
                     k: union_ns(clipped(v, start, end)) / 1e6
                     for k, v in by_family.items()
                 },
+                "kernel_service_ms": {
+                    key: sum(b - a for a, b in clipped(spans, start, end)) / 1e6
+                    for key, spans in by_name.items()
+                },
+                "kernel_calls": {key: len(spans) for key, spans in by_name.items()},
                 "kernel_count": len(active),
                 "exclusive_activity_ms": {
                     k: v / 1e6
@@ -260,7 +267,13 @@ def analyze(sqlite_path, benchmark_path, trim=8, tokens=None, requests=1):
             "kernel_count",
         )
         summaries[rank] = {k: stats([c[k] for c in cells]) for k in fields}
-        for field in ("scope_union_ms", "family_union_ms", "exclusive_activity_ms"):
+        for field in (
+            "scope_union_ms",
+            "family_union_ms",
+            "exclusive_activity_ms",
+            "kernel_service_ms",
+            "kernel_calls",
+        ):
             keys = set().union(*(c[field] for c in cells))
             summaries[rank][field] = {
                 k: stats([c[field].get(k, 0) for c in cells]) for k in sorted(keys)

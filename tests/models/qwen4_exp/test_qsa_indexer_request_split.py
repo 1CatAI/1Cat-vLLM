@@ -36,7 +36,7 @@ def _enable_cublas(monkeypatch):
     set_qsa_option(monkeypatch, "qsa_cublas_min_rows", 512)
     monkeypatch.setattr(
         qsa_ops.current_platform,
-        "is_device_capability",
+        "is_device_capability_family",
         lambda capability: capability == 70,
     )
 
@@ -146,7 +146,9 @@ def test_padded_rows_keep_the_batched_path(monkeypatch):
 def test_other_platforms_keep_the_batched_path(monkeypatch):
     _enable_cublas(monkeypatch)
     monkeypatch.setattr(
-        qsa_ops.current_platform, "is_device_capability", lambda capability: False
+        qsa_ops.current_platform,
+        "is_device_capability_family",
+        lambda capability: False,
     )
     query_start_loc = [0, 5, 1029]
     q, cache, page_table, token_to_req, positions, seq_lens = _inputs(query_start_loc)
@@ -168,8 +170,8 @@ def test_other_platforms_keep_the_batched_path(monkeypatch):
 requires_sm70 = pytest.mark.skipif(
     not current_platform.is_cuda()
     or not HAS_TRITON
-    or not current_platform.is_device_capability(70),
-    reason="the SM70 cuBLAS indexer path requires a V100",
+    or not current_platform.is_device_capability_family(70),
+    reason="the cuBLAS indexer path requires a Volta or Turing GPU",
 )
 
 

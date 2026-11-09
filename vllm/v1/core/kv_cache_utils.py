@@ -563,6 +563,83 @@ def generate_block_hash_extra_keys(
     return tuple(extra_keys), new_start_mm_idx
 
 
+def generate_lookahead_block_hash_extra_keys(
+    request: Request,
+    start_token_idx: int,
+    end_token_idx: int,
+    start_mm_idx: int,
+) -> tuple[tuple[Any, ...], int]:
+    """Extra keys of a block plus the token right after it and that token's
+    own extra keys, which the EAGLE draft KV at the block's last position
+    depends on."""
+    block_extra_keys, next_block_mm_idx = generate_block_hash_extra_keys(
+        request,
+        start_token_idx,
+        end_token_idx,
+        start_mm_idx,
+    )
+    lookahead_extra_keys, _ = generate_block_hash_extra_keys(
+        request,
+        end_token_idx,
+        end_token_idx + 1,
+        next_block_mm_idx,
+    )
+    return (
+        (
+            block_extra_keys,
+            request.all_token_ids[end_token_idx],
+            lookahead_extra_keys,
+        ),
+        next_block_mm_idx,
+    )
+
+
+def generate_request_block_hash_extra_keys(
+    request: Request,
+    start_token_idx: int,
+    end_token_idx: int,
+    start_mm_idx: int,
+    use_lookahead_block_hashes: bool,
+) -> tuple[tuple[Any, ...] | None, int]:
+    if use_lookahead_block_hashes:
+        return generate_lookahead_block_hash_extra_keys(
+            request,
+            start_token_idx,
+            end_token_idx,
+            start_mm_idx,
+        )
+    return generate_block_hash_extra_keys(
+        request,
+        start_token_idx,
+        end_token_idx,
+        start_mm_idx,
+    )
+
+
+def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether block hashes also cover the token after each block, so EAGLE
+    and MTP prefix hits need no trailing block drop."""
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or not speculative_config.use_eagle_kv_cache()
+        or speculative_config.disable_lookahead_block_hashes
+    ):
+        return False
+    # The hash covers only the next token; multi-module MTP reads further ahead.
+    if speculative_config.use_multi_module_mtp():
+        return False
+    # DSpark keeps the trailing-block drop: with lookahead hashes it drafted
+    # measurably worse on DSv4, also without a prefix hit (edit 5.69 -> 5.66
+    # to 5.67 accepted tokens per round), and gained no first-token time.
+    if speculative_config.use_dspark():
+        return False
+    # KV connectors keep the legacy hashes.
+    if vllm_config.kv_transfer_config is not None:
+        return False
+    return vllm_config.cache_config.enable_prefix_caching
+
+
 def hash_block_tokens(
     hash_function: Callable[[Any], bytes],
     parent_block_hash: BlockHash | None,
@@ -676,26 +753,28 @@ def resolve_kv_cache_block_sizes(
 def get_request_block_hasher(
     block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
+    use_lookahead_block_hashes: bool = False,
 ) -> Callable[[Request], list[BlockHash]]:
     """
     Returns a function which computes the list of un-computed block hashes
-    of a request."""
+    of a request.
+
+    With ``use_lookahead_block_hashes``, each hash also covers the token right
+    after its block, which the EAGLE draft KV at the block's last position
+    depends on, so it is emitted only once that token exists."""
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * block_size
-        num_tokens = request.num_tokens
+        num_tokens = request.num_tokens - int(use_lookahead_block_hashes)
 
         if start_token_idx + block_size > num_tokens:
             # Early stop when there no new full blocks created.
             return []
 
+        # Start at the first mm input also when continuing: a block completed
+        # with generated tokens can still hold several mm inputs. Passed inputs
+        # are skipped, and blocks after the last one return early.
         curr_mm_idx = 0
-        if start_token_idx > 0:
-            # Set curr_mm_idx = -1 to indicate the last mm input.
-            # Note that since we reach to this branch only when the block is
-            # completed with generated tokens, we only need to consider the
-            # last mm input.
-            curr_mm_idx = -1
 
         prev_block_hash_value = (
             request.block_hashes[-1] if request.block_hashes else None
@@ -708,8 +787,12 @@ def get_request_block_hasher(
                 break
 
             # MM and LoRA requests need extra keys for block-hash computation.
-            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                request, start_token_idx, end_token_idx, curr_mm_idx
+            extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
+                request,
+                start_token_idx,
+                end_token_idx,
+                curr_mm_idx,
+                use_lookahead_block_hashes,
             )
 
             # Compute the hash of the current block
@@ -1109,8 +1192,41 @@ def _compact_sm70_hybrid_sliding_window_pages(
             type(spec) is not SlidingWindowSpec
             or spec.page_size_padded is not None
             or spec.page_size_bytes <= target_page
-            or spec.page_size_bytes % target_page
         ):
+            continue
+        if spec.page_size_bytes % target_page:
+            # Scale bytes can make the physical ratio non-integral. Preserve
+            # the existing prefix/checkpoint grid by using a divisor of the
+            # logical block and padding its physical page to the common size.
+            grid = math.gcd(
+                *(
+                    other.block_size
+                    for other in specs.values()
+                    if isinstance(other, (AttentionSpec, MambaSpec))
+                )
+            )
+            divisors: set[int] = set()
+            for factor in range(1, math.isqrt(grid) + 1):
+                if grid % factor == 0:
+                    divisors.update((factor, grid // factor))
+            for block_size in sorted(divisors, reverse=True):
+                if block_size >= spec.block_size or block_size % 16:
+                    continue
+                compact = replace(spec, block_size=block_size)
+                page = compact.page_size_bytes
+                if page > target_page:
+                    continue
+                # A divisor that merely fits pads away most of the block, and
+                # the padded page is charged per block: 1648 tokens/1664-page
+                # has grid 16, so block=16 fits at 1.9% utilization and costs
+                # 212992 B/token instead of 4096. Fall through to the round-up
+                # path below unless this divisor also fills the page.
+                if page * 2 >= target_page:
+                    result[name] = replace(compact, page_size_padded=target_page)
+                # Divisors descend, so this is the largest that fits; a poorer
+                # one cannot fill the page either. Leave the spec untouched so
+                # the round-up path below can size it from the byte budget.
+                break
             continue
         ratio = spec.page_size_bytes // target_page
         if spec.block_size % (16 * ratio):
@@ -1154,8 +1270,10 @@ def unify_kv_cache_spec_page_size(
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
     are the same, return the original KVCacheSpec. If not same, unify the page
-    size by increasing the block size of layers with smaller page size. Raise
-    NotImplementedError if failed to unify the page size.
+    size by increasing the block size of layers with smaller page size. When
+    page sizes are not integer multiples, use the spec's physical padding
+    contract without changing its logical block size. Raise NotImplementedError
+    for specs that cannot represent the common physical page.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1179,9 +1297,18 @@ def unify_kv_cache_spec_page_size(
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
+                # Payload, scale and state regions need not have an integral
+                # size ratio. Their logical token/checkpoint grids still agree
+                # with the scheduler; padding belongs to the physical page.
+                if isinstance(layer_spec, (AttentionSpec, MambaSpec)):
+                    padded_spec = replace(layer_spec, page_size_padded=max_page_size)
+                    if padded_spec.page_size_bytes == max_page_size:
+                        new_kv_cache_spec[layer_name] = padded_spec
+                        continue
                 raise NotImplementedError(
                     "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+                    "maximum page size and its spec cannot represent padding. "
+                    "Cannot unify the physical pages."
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
@@ -3058,6 +3185,22 @@ def _max_memory_usage_bytes_from_groups(
     return group_size * page_size * blocks_needed
 
 
+def _kv_cache_memory_needed(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    """Include the shared pool's permanent null block in startup admission.
+
+    BlockPool removes one physical block before any request can allocate.
+    Request memory alone can therefore fit while scheduling can never finish.
+    Use the allocator's byte stride, including hybrid padding and DCP packing.
+    """
+    if not kv_cache_groups:
+        return 0
+    return _max_memory_usage_bytes_from_groups(
+        vllm_config, kv_cache_groups
+    ) + _pool_bytes_per_block(kv_cache_groups)
+
+
 def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -3071,10 +3214,7 @@ def _estimate_max_model_len_from_groups(
 
     def fits(model_len: int) -> bool:
         vllm_config.model_config.max_model_len = model_len
-        return (
-            _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
-            <= available_memory
-        )
+        return _kv_cache_memory_needed(vllm_config, kv_cache_groups) <= available_memory
 
     try:
         left, right = 1, original_max
@@ -3312,13 +3452,13 @@ def get_kv_cache_configs(
                 "pool_block_bytes=%d groups=[%s]",
                 worker_index,
                 format_gib(avail_mem),
-                format_gib(_max_memory_usage_bytes_from_groups(vllm_config, groups)),
+                format_gib(_kv_cache_memory_needed(vllm_config, groups)),
                 _pool_bytes_per_block(groups),
                 ", ".join(group_ledger),
             )
         _check_enough_kv_cache_memory(
             avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+            partial(_kv_cache_memory_needed, vllm_config, groups),
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )

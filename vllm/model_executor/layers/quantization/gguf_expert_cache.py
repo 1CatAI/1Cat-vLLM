@@ -574,8 +574,18 @@ class ExpertCache:
         return dict(zip(names, self.lane.stats())) if self.lane else {}
 
     # -- decode ----------------------------------------------------------
-    def resolve(self, layer: int, ids: torch.Tensor) -> torch.Tensor:
-        """Slot ids for ``ids`` once every routed expert is resident."""
+    def resolve(
+        self,
+        layer: int,
+        ids: torch.Tensor,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Slot ids for ``ids`` once every routed expert is resident.
+
+        ``weights`` is accepted for signature parity with
+        :meth:`SharedOriginalExpertCache.resolve`, which ``gguf_moe`` calls
+        with the same arguments; slot resolution does not need it.
+        """
         self.start()
         if self.tm is not None and self.tm.preparation is not None:
             self.tm.preparation.wait_decode()
@@ -795,7 +805,7 @@ def _sub_fill(
         tl.store(inverse + (flat - base_route), q.to(tl.int32), mask=mask)
 
 
-_LATTICE = (18, 21, 22)
+_LATTICE = (16, 17, 18, 21, 22, 29)
 _LUT4 = (20, 23)
 _AFFINE = (42,)
 
@@ -803,8 +813,8 @@ _AFFINE = (42,)
 def _canonical(gguf_type: int, n: int, k: int):
     """(family, decoder, group, weight bytes, stats bytes) of one expert."""
     if gguf_type in _LATTICE:
-        group = 16 if gguf_type == 22 else 32
-        stat = 8 if gguf_type in (18, 21) else 4
+        group = 16 if gguf_type in (17, 22, 29) else 32
+        stat = 8 if gguf_type in (18, 21) else 2 if gguf_type == 29 else 4
         return 0, gguf_type, group, n * k // 4, k // group * n * stat
     if gguf_type in _LUT4:
         return 1, 0, 32, n * k // 2, k // 32 * n * 2

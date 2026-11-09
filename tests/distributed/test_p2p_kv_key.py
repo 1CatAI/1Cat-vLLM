@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for P2pNccl KV tensor-key normalization."""
 
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (

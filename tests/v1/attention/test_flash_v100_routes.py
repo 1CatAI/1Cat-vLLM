@@ -257,7 +257,7 @@ def test_every_literal_accounting_site_uses_a_declared_spec():
                 route = ast.literal_eval(arg.value.slice)
                 assert route in r.ROUTE_SPECS
                 hits.append(route)
-    assert len(set(hits)) == 44
+    assert len(set(hits)) == 47
 
 
 @pytest.mark.parametrize(

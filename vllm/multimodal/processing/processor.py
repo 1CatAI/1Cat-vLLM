@@ -1364,31 +1364,34 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         merged_prompt_updates = defaultdict[str, list[Sequence[ResolvedPromptUpdate]]](
             list
         )
-        for modality, hashes in mm_hashes.items():
-            missing_kwargs = mm_missing_kwargs.get(modality, [])
-            missing_prompt_updates = mm_missing_prompt_updates.get(modality, [])
+        try:
+            for modality, hashes in mm_hashes.items():
+                missing_kwargs = mm_missing_kwargs.get(modality, [])
+                missing_prompt_updates = mm_missing_prompt_updates.get(modality, [])
 
-            for item_idx, item_hash in enumerate(hashes):
-                if not mm_is_cached[modality][item_idx]:
-                    missing_next_idx = mm_missing_next_idx[modality]
-                    missing_kwargs_item = missing_kwargs[missing_next_idx]
-                    missing_updates_item = missing_prompt_updates[missing_next_idx]
+                for item_idx, item_hash in enumerate(hashes):
+                    if not mm_is_cached[modality][item_idx]:
+                        missing_next_idx = mm_missing_next_idx[modality]
+                        missing_kwargs_item = missing_kwargs[missing_next_idx]
+                        missing_updates_item = missing_prompt_updates[missing_next_idx]
 
-                    mm_missing_next_idx[modality] += 1
+                        mm_missing_next_idx[modality] += 1
 
-                    item = missing_kwargs_item, missing_updates_item
-                else:
-                    item = None
+                        item = missing_kwargs_item, missing_updates_item
+                    else:
+                        item = None
 
-                kwargs, updates = cache.get_and_update_item(item, item_hash)
+                    kwargs, updates = cache.get_and_update_item(item, item_hash)
 
-                merged_kwargs[modality].append(kwargs)
-                merged_prompt_updates[modality].append(
-                    [
-                        self._recompute_cached_prompt_update(update, item_idx)
-                        for update in updates
-                    ]
-                )
+                    merged_kwargs[modality].append(kwargs)
+                    merged_prompt_updates[modality].append(
+                        [
+                            self._recompute_cached_prompt_update(update, item_idx)
+                            for update in updates
+                        ]
+                    )
+        finally:
+            cache.release_sender_touches()
 
         mm_kwargs = MultiModalKwargsItems(merged_kwargs)
         mm_prompt_updates = dict(merged_prompt_updates)

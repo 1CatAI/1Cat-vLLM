@@ -164,6 +164,77 @@ def test_native_lane_matches_python_owner(monkeypatch, cache_rows, clamp):
         lane.close()
 
 
+def _fp8_lane(shards, shard_rows, cache_rows, targets=2):
+    """A Lane over raw 160-byte FP8 rows split into separately allocated shards."""
+    lane = Lane.__new__(Lane)
+    lane.request = torch.zeros(request_shape(MAX_REQS, MAX_TOKENS), dtype=torch.long)
+    lane.results = [
+        torch.full((MAX_TOKENS, 16 * 160), 0xEE, dtype=torch.uint8)
+        for _ in range(targets)
+    ]
+    lane.flags = [torch.zeros(16, dtype=torch.int32) for _ in range(targets)]
+    lane.data = shards
+    lane.seq = 0
+    pointers = [shard.ctypes.data for shard in shards]
+    lane.handle = torch.ops._C.ple_fast_lane_start(
+        lane.request,
+        MAX_REQS,
+        MAX_TOKENS,
+        pointers[0],
+        160,
+        TABLE_ROWS,
+        MULTIPLIERS,
+        SIZES,
+        OFFSETS,
+        EOS,
+        [r.data_ptr() for r in lane.results],
+        [f.data_ptr() for f in lane.flags],
+        cache_rows * 160,
+        1000,
+        True,
+        None,
+        0,
+        0,
+        pointers,
+        shard_rows,
+        False,
+    )
+    return lane
+
+
+@pytest.mark.parametrize("cache_rows", [0, 1 << 16])
+def test_native_lane_serves_sharded_fp8_rows(monkeypatch, cache_rows):
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    rng = np.random.default_rng(1339)
+    full = rng.integers(0, 256, (TABLE_ROWS, 160), dtype=np.uint8)
+    full[::7, :2] = 0x7F  # FP8 NaN bytes: copied as is, never validated as IQ4
+    shard_rows = 997  # the last shard is shorter
+    shards = [
+        np.array(full[i : i + shard_rows])  # separate allocations
+        for i in range(0, TABLE_ROWS, shard_rows)
+    ]
+    module = ngram_module()
+    lane = _fp8_lane(shards, shard_rows, cache_rows)
+    try:
+        for _ in range(16):
+            reqs = int(rng.integers(1, MAX_REQS + 1))
+            lengths = rng.integers(1, 6, reqs)
+            starts = [0, *np.cumsum(lengths).tolist()]
+            tokens = rng.integers(0, 200000, starts[-1]).tolist()
+            context = rng.integers(0, 200000, (reqs, 2)).tolist()
+            rows = module.compute_ngram_ids(
+                torch.tensor(tokens, dtype=torch.int32),
+                torch.tensor(starts, dtype=torch.int32),
+                torch.tensor(context, dtype=torch.int32),
+            )
+            want = torch.from_numpy(full[rows.numpy()].reshape(len(tokens), -1))
+            for out in lane.submit(tokens, starts, context):
+                assert torch.equal(out, want)
+        assert lane.stats()[6] == 0  # no error
+    finally:
+        lane.close()
+
+
 def test_native_lane_waits_for_consumers_and_reports_bad_rows(monkeypatch):
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
     data = table()

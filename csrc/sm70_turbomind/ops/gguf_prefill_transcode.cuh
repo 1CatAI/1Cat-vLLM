@@ -34,6 +34,21 @@ struct Format;
 
 // Lattice formats: 256-value blocks; U2 carrier, 16-bit packet per 8 values.
 template <>
+struct Format<16> {  // IQ2_XXS
+  static constexpr int kBlock = 256, kBlockBytes = 66, kGroup = 32;
+  using Stat = uint32_t;
+};
+template <>
+struct Format<17> {  // IQ2_XS
+  static constexpr int kBlock = 256, kBlockBytes = 74, kGroup = 16;
+  using Stat = uint32_t;
+};
+template <>
+struct Format<29> {  // IQ1_M
+  static constexpr int kBlock = 256, kBlockBytes = 56, kGroup = 16;
+  using Stat = uint16_t;
+};
+template <>
 struct Format<21> {  // IQ3_S
   static constexpr int kBlock = 256, kBlockBytes = 110, kGroup = 32;
   using Stat = uint64_t;
@@ -89,6 +104,77 @@ struct Group;
 template <int Type>
 using PacketOf =
     std::conditional_t<Type == 20 || Type == 23, uint32_t, uint16_t>;
+
+__device__ __forceinline__ uint16_t u16(const uint8_t* p) {
+  return uint16_t(p[0]) | (uint16_t(p[1]) << 8);
+}
+
+__device__ __forceinline__ uint32_t u32(const uint8_t* p) {
+  return uint32_t(u16(p)) | (uint32_t(u16(p + 2)) << 16);
+}
+
+__device__ __forceinline__ uint16_t iq2_packet(int index, uint32_t signs) {
+  signs |= uint32_t(__popc(signs) & 1) << 7;
+  return uint16_t((index & 255) | (signs << 8));
+}
+
+template <>
+struct Group<16> {
+  __device__ static uint32_t decode(const uint8_t* row, int k0,
+                                    uint16_t (&packets)[4], int* error) {
+    const uint8_t* b = row + (k0 / 256) * 66;
+    const int sub = (k0 % 256) / 32;
+    const uint32_t indices = u32(b + 2 + sub * 8);
+    const uint32_t meta = u32(b + 6 + sub * 8);
+#pragma unroll
+    for (int q = 0; q < 4; ++q)
+      packets[q] =
+          iq2_packet((indices >> (8 * q)) & 255, (meta >> (7 * q)) & 127);
+    const float scale = f16(b) * (0.5f + float(meta >> 28)) * 0.25f;
+    return to_f16(scale, error);
+  }
+};
+
+template <>
+struct Group<17> {
+  __device__ static uint32_t decode(const uint8_t* row, int k0,
+                                    uint16_t (&packets)[2], int* error) {
+    const uint8_t* b = row + (k0 / 256) * 74;
+    const int sub = (k0 % 256) / 16;
+    uint32_t high = 0;
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      const uint16_t code = u16(b + 2 + (2 * sub + q) * 2);
+      packets[q] = iq2_packet(code & 255, code >> 9);
+      high |= uint32_t((code >> 8) & 1) << (2 * q);
+    }
+    const int nib = (b[66 + sub / 2] >> (4 * (sub % 2))) & 15;
+    const float scale = f16(b) * (0.5f + float(nib)) * 0.25f;
+    return uint32_t(to_f16(scale, error)) | (high << 16);
+  }
+};
+
+template <>
+struct Group<29> {
+  __device__ static uint16_t decode(const uint8_t* row, int k0,
+                                    uint16_t (&packets)[2], int* error) {
+    const uint8_t* b = row + (k0 / 256) * 56;
+    const int sub = (k0 % 256) / 16;
+    const uint16_t bits = (u16(b + 48) >> 12) | ((u16(b + 50) >> 8) & 0x00f0) |
+                          ((u16(b + 52) >> 4) & 0x0f00) |
+                          (u16(b + 54) & 0xf000);
+    const int local = (u16(b + 48 + 2 * (sub / 4)) >> (3 * (sub % 4))) & 7;
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      const int t = sub * 2 + q;
+      const int high = (b[32 + t / 2] >> (4 * (t % 2))) & 15;
+      packets[q] = uint16_t(b[t] | ((high & 7) << 8) | ((high >> 3) << 15));
+    }
+    const float scale =
+        __half2float(__ushort_as_half(bits)) * float(2 * local + 1);
+    return to_f16(scale, error);
+  }
+};
 
 template <>
 struct Group<21> {

@@ -979,7 +979,8 @@ int64_t ple_fast_lane_start(
     std::vector<int64_t> offsets, int64_t eos, std::vector<int64_t> result_ptrs,
     std::vector<int64_t> flag_ptrs, int64_t cache_bytes, int64_t idle_spin_us,
     bool clamp_tokens, std::optional<torch::Tensor> draft_ring,
-    int64_t ring_reqs, int64_t ring_spec);
+    int64_t ring_reqs, int64_t ring_spec, std::vector<int64_t> shard_ptrs,
+    int64_t shard_rows, bool iq4_rows);
 torch::Tensor ple_fast_lane_stats(int64_t handle);
 
 std::vector<torch::Tensor> gguf_dmv13_decode_pack(torch::Tensor raw,

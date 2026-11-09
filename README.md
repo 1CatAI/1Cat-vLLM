@@ -130,6 +130,7 @@ The table below preserves **complete-model / API / pure-decode / speculative-dec
 | **DeepSeek-V4-Flash** | **8× V100** · TP8 · FP8 dense + MXFP4 experts · CUDA Graph · no-spec | 1024 / 256 | **15.357 ms TPOT ≈ 65.1 tok/s** | [#181](https://github.com/1CatAI/1Cat-vLLM/pull/181) · accepted no-MTP baseline |
 | **DeepSeek-V4-Flash** | **8× V100** · PP2×TP4 · no-DSpark | combined quality-checked endpoint | **73.613–73.646 tok/s** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) |
 | **DeepSeek-V4-Flash** | same PP2×TP4 strict control | dataset-quality pair | **73.539 tok/s** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) · GSM8K 64/64 · HumanEval 29/32 |
+| **DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS + DSpark5** | **8× V100** · PP2×TP4 · MRV2 · FULL graphs | 32K prompt / 1024 · code · JSON · legal · prose | **200.5 · 206.6 · 116.5 · 90.1 tok/s decode** · 1,900 tok/s prefill (2,200 at 128K) | [#1370](https://github.com/1CatAI/1Cat-vLLM/pull/1370) (open) · community result · [raw data](https://github.com/ProprietaryLegal/Volta-sPLIt-DeepSeek-V4.1-Flash-1017-8xV100-SXM2-PP2xTP4/blob/main/docs/measurements.md) |
 | **GLM-5.3-Flash-NVFP4** | 8× V100 · TP4/PP2 · E4M3 KV · no-MTP | 1K / 256 decode | **53.016 tok/s** | [#402](https://github.com/1CatAI/1Cat-vLLM/pull/402) · merged historical quality audit |
 
 ---
@@ -232,6 +233,7 @@ Natural stops move from 72/80 to 70/80, so this remains an **optional precise-co
 | **Qwen3.6-35B-A3B NVFP4 + MTP4** | ShareGPT16 final-SHA workload | **120.096 tok/s pure decode** · **97.678 E2E output tok/s** · 241.973 prefill tok/s | [#270](https://github.com/1CatAI/1Cat-vLLM/pull/270) · merged |
 | **DeepSeek-V4-Flash · PP2×TP4** | GSM8K **64/64** · HumanEval **29/32** · LongBench **44.740** | **73.539 tok/s median** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) · strict quality control |
 | **DeepSeek-V4-Flash · PP2×TP4** | Combined route endpoint: GSM8K **62/64** · 0 invalid · coherent output | **73.613–73.646 tok/s** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) |
+| **DeepSeek-V4.1-Flash-1017 · PP2×TP4 · IQ2_XXS** | MMLU-Pro **79.9 %** (700) · HumanEval+ **147/164** plus · LegalBench **0.716** (22 tasks) · top-1 vs original **89.0 %** | **182.8 tok/s code decode at 128K** | [#1370](https://github.com/1CatAI/1Cat-vLLM/pull/1370) (open) · community result |
 | **GLM-5.3-Flash-NVFP4 · no-MTP** | Max reasoning: **6/8** tasks finish within 4096 output tokens; targeted low-reasoning code rerun **2/2** AST + execution | **53.016 tok/s decode** · **266.040 tok/s 1K prefill** | [#402](https://github.com/1CatAI/1Cat-vLLM/pull/402) · merged; historical quality matrix |
 
 ---
@@ -1156,7 +1158,7 @@ The same release includes a separate Flash-Next launcher:
 serve_flash_next_nvfp4_v100.sh /models/Qwen3.8-Flash-Next-NVFP4
 ```
 
-Its defaults are **TP4, FP16 compute/KV, MTP4, 131072 context, 8192-token prefill, one sequence, memory utilization 0.90, prefix caching and synchronous scheduling**. It targets four peer-connected V100-SXM2-32GB GPUs and automatically selects compatible FP16 acceleration and hybrid PLE placement.
+Its defaults are **TP4, FP16 compute/KV, MTP4, 262144 context with FP8 KV history in pinned host memory, 4096-token prefill, up to 8 sequences, memory utilization 0.89 and prefix caching** (the 1.5.2 release configuration). Pass `--draft /models/Qwen3.8-Flash-Next-mtp` to use a separate MTP checkpoint; without it, the MTP layers inside the model are used. It targets four peer-connected V100-SXM2-32GB GPUs with 64 GB or more host RAM.
 
 The release test machine had ample host RAM: Flash-Next PLE tables alone total approximately **47.68 GiB**, before model mappings, caches and process memory. Low-RAM operation was not qualified by that release test. Later main includes capability-based device/pinned-host/disk PLE placement and packed GGUF lookup; these have their own storage and model-validation conditions ([#806](https://github.com/1CatAI/1Cat-vLLM/pull/806), [#877](https://github.com/1CatAI/1Cat-vLLM/pull/877), [#885](https://github.com/1CatAI/1Cat-vLLM/pull/885)).
 

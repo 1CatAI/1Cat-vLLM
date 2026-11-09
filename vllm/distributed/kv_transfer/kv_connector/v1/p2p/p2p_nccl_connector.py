@@ -87,6 +87,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._requests_need_load: dict[str, Any] = {}
         self.is_producer = self._kv_transfer_config.is_kv_producer
         self.chunked_prefill: dict[str, tuple[list[int], list[int] | None]] = {}
+        self._invalid_block_ids: set[int] = set()
 
         self._rank = get_world_group().rank if role == KVConnectorRole.WORKER else 0
         self._local_rank = (
@@ -201,7 +202,19 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
                 if kv_cache is None:
                     logger.warning("🚧kv_cache is None, %s", request.request_id)
-                    continue
+                    self._invalid_block_ids.update(request.block_ids.tolist())
+                    # The scheduler rejects this step's output after forward.
+                    # Keep that failed forward finite: uninitialized KV can
+                    # contain NaNs and crash the sampler before recomputation.
+                    for failed_layer in forward_context.no_compile_layers.values():
+                        failed_cache = getattr(failed_layer, "kv_cache", None)
+                        if failed_cache is not None:
+                            failed_cache.index_fill_(
+                                0, request.block_ids.to(failed_cache.device), 0
+                            )
+                    # One missing layer invalidates the entire imported prefix.
+                    # Report it through the scheduler's KV-load failure policy.
+                    break
 
                 inject_kv_into_layer(
                     layer, kv_cache, request.block_ids, request.request_id
@@ -217,6 +230,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
             layer_name: the name of that layer
         """
         return
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        invalid, self._invalid_block_ids = self._invalid_block_ids, set()
+        return invalid
 
     def save_kv_layer(
         self,
@@ -460,9 +477,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
     def parse_request_id(request_id: str, is_prefill=True) -> tuple[str, int]:
         # Regular expression to match the string hostname and integer port
         if is_prefill:
-            pattern = r"___decode_addr_(.*):(\d+)"
+            pattern = r"___decode_addr_(.*?):(\d+)(?=_|-|$)"
         else:
-            pattern = r"___prefill_addr_(.*):(\d+)___"
+            pattern = r"___prefill_addr_(.*?):(\d+)___"
 
         # Use re.search to find the pattern in the request_id
         match = re.search(pattern, request_id)

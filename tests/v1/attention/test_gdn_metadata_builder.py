@@ -836,8 +836,8 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the fused GDN metadata kernel")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (7, 0):
-        pytest.skip("the fused GDN metadata kernel is SM70-only")
+    if torch.cuda.get_device_capability(device)[0] != 7:
+        pytest.skip("the fused GDN metadata kernel is SM7x-only")
 
     # The accepted DFlash2 verifier keeps the legacy spec-core operator off.
     # Fused metadata must therefore own its graph-stable buffers independently.
@@ -985,8 +985,8 @@ def test_dflash2_fused_gdn_group_metadata_align_replay(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the fused GDN metadata kernel")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (7, 0):
-        pytest.skip("the fused GDN metadata kernel is SM70-only")
+    if torch.cuda.get_device_capability(device)[0] != 7:
+        pytest.skip("the fused GDN metadata kernel is SM7x-only")
 
     monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
     monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "1")
@@ -1130,8 +1130,8 @@ def test_mtp_fused_gdn_group_metadata_matches_legacy_replay(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the fused GDN metadata kernel")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (7, 0):
-        pytest.skip("the fused GDN metadata kernel is SM70-only")
+    if torch.cuda.get_device_capability(device)[0] != 7:
+        pytest.skip("the fused GDN metadata kernel is SM7x-only")
 
     monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
     monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0")
@@ -2070,6 +2070,7 @@ def test_sm70_qwen_gdn_003_spec_core_route_has_priority(
     )
 
     class FakeSelf:
+        gdn_policy = spec_builder.gdn_policy
         auto_sm70_qwen_gdn_003_spec_core = True
         auto_sm70_qwen_gdn_spec_core = True
         auto_sm70_qwen_gdn_full_forward = True
@@ -2179,6 +2180,7 @@ def test_sm70_qwen_gdn_spec_commit_route_is_compile_stable(
     )
 
     class FakeSelf:
+        gdn_policy = regular_builder.gdn_policy
         auto_sm70_qwen_gdn_003_spec_core = False
         auto_sm70_qwen_gdn_spec_core = True
         auto_sm70_qwen_gdn_full_forward = False

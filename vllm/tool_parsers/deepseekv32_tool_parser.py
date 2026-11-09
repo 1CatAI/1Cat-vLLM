@@ -52,7 +52,12 @@ class DeepSeekV32ToolParser(ToolParser):
     """
 
     tool_call_start_token: str = "<｜DSML｜function_calls>"
+    # Misspelled openers a model is known to emit; they open a block too.
+    tool_call_start_token_variants: tuple[str, ...] = ()
+    ignored_tool_call_tags: tuple[str, ...] = ()
     tool_call_end_token: str = "</｜DSML｜function_calls>"
+    invoke_tag_name: str = "invoke"
+    parameter_tag_name: str = "parameter"
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
@@ -64,6 +69,11 @@ class DeepSeekV32ToolParser(ToolParser):
         self._sent_content_idx: int = 0
         self._buffer: str = ""
         self._in_tool_calls: bool = False
+        self._ignored_tool_call_end: str | None = None
+        self._ignored_tool_call_blocks = {
+            f"<｜DSML｜{tag}>": f"</｜DSML｜{tag}>"
+            for tag in self.ignored_tool_call_tags
+        }
         self._active_tool_index: int | None = None
         self._active_tool_name: str | None = None
         self._active_param_name: str | None = None
@@ -73,23 +83,32 @@ class DeepSeekV32ToolParser(ToolParser):
         self._args_started: list[bool] = []
 
         # Regex patterns for complete parsing
-        self.tool_call_complete_regex = re.compile(
-            re.escape(self.tool_call_start_token)
-            + r"(.*?)"
-            + re.escape(self.tool_call_end_token),
+        invoke = re.escape(self.invoke_tag_name)
+        parameter = re.escape(self.parameter_tag_name)
+        # The model sometimes omits </｜DSML｜parameter>. The opener of the
+        # next parameter then ends the value too, in both parsing paths, so
+        # the value does not swallow that parameter.
+        self.parameter_open_marker = f"<｜DSML｜{self.parameter_tag_name} name="
+        # The model sometimes drops the tool-calls wrapper at long context and
+        # opens an invoke directly (upstream issue #48931); the invoke opener
+        # then starts the tool calls as well.
+        self.invoke_open_marker = f'<｜DSML｜{self.invoke_tag_name} name="'
+        self.invoke_complete_regex = re.compile(
+            rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>(.*?)</｜DSML｜{invoke}>',
             re.DOTALL,
         )
-        self.invoke_complete_regex = re.compile(
-            r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>', re.DOTALL
+        # The string attribute is optional: the model sometimes omits it, and
+        # without it the parameter would be lost (see _string_attr).
+        parameter_head = (
+            rf'<｜DSML｜{parameter}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
         )
         self.parameter_complete_regex = re.compile(
-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜parameter>',
+            rf"{parameter_head}(.*?)"
+            rf"(?:</｜DSML｜{parameter}>|(?={re.escape(self.parameter_open_marker)}))",
             re.DOTALL,
         )
-        self.invoke_start_regex = re.compile(r'<｜DSML｜invoke\s+name="([^"]+)"\s*>')
-        self.parameter_start_regex = re.compile(
-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>'
-        )
+        self.invoke_start_regex = re.compile(rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>')
+        self.parameter_start_regex = re.compile(parameter_head)
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -119,12 +138,18 @@ class DeepSeekV32ToolParser(ToolParser):
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
+    @staticmethod
+    def _string_attr(value: str | None) -> str:
+        """A missing string attribute counts as string="false", so the tool
+        schema decides the type, as for any non-string DSML value."""
+        return value or "false"
+
     def _parse_invoke_params(self, invoke_str: str) -> dict[str, tuple[str, str]]:
         param_dict: dict[str, tuple[str, str]] = {}
         for param_name, string_attr, param_val in self.parameter_complete_regex.findall(
             invoke_str
         ):
-            param_dict[param_name] = (param_val, string_attr)
+            param_dict[param_name] = (param_val, self._string_attr(string_attr))
         return param_dict
 
     @staticmethod
@@ -176,14 +201,54 @@ class DeepSeekV32ToolParser(ToolParser):
     def _json_escape_string_content(text: str) -> str:
         return json.dumps(text, ensure_ascii=False)[1:-1]
 
+    @staticmethod
+    def _find_first_marker(text: str, markers: Sequence[str]) -> int:
+        """Position of the earliest marker in *text*, or -1."""
+        positions = [pos for pos in map(text.find, markers) if pos != -1]
+        return min(positions, default=-1)
+
+    @staticmethod
+    def _marker_overlap(text: str, markers: Sequence[str]) -> int:
+        """Length of the longest suffix of *text* that may start a marker."""
+        return max(partial_tag_overlap(text, marker) for marker in markers)
+
+    def _tool_call_start_tokens(self) -> tuple[str, ...]:
+        return (self.tool_call_start_token, *self.tool_call_start_token_variants)
+
+    def _tool_calls_start_markers(self) -> tuple[str, ...]:
+        return (*self._tool_call_start_tokens(), self.invoke_open_marker)
+
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
         """Extract tool calls from complete model output (non-streaming)."""
-        # Quick check
-        if self.tool_call_start_token not in model_output:
+        searchable = model_output
+        invoke_ranges = []
+        if any(start in model_output for start in self._ignored_tool_call_blocks):
+            invoke_ranges = [
+                match.span()
+                for match in self.invoke_complete_regex.finditer(model_output)
+            ]
+        for start, end in self._ignored_tool_call_blocks.items():
+            # Bare invokes are valid only outside another dialect's wrapper.
+            position = 0
+            while (index := searchable.find(start, position)) != -1:
+                position = index + len(start)
+                if any(left <= index < right for left, right in invoke_ranges):
+                    # Foreign markup inside a legitimate argument is text.
+                    continue
+                stop = searchable.find(end, position)
+                stop = len(searchable) if stop == -1 else stop + len(end)
+                searchable = (
+                    searchable[:index] + " " * (stop - index) + searchable[stop:]
+                )
+                position = stop
+        first_tool_idx = self._find_first_marker(
+            searchable, self._tool_calls_start_markers()
+        )
+        if first_tool_idx == -1:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
@@ -191,31 +256,29 @@ class DeepSeekV32ToolParser(ToolParser):
         try:
             tool_calls = []
 
-            # Find all complete tool_call blocks
-            for tool_call_match in self.tool_call_complete_regex.findall(model_output):
-                # Find all invokes within this tool_call
-                for invoke_name, invoke_content in self.invoke_complete_regex.findall(
-                    tool_call_match
-                ):
-                    param_dict = self._parse_invoke_params(invoke_content)
-                    params = self._convert_params_with_schema(invoke_name, param_dict)
-                    tool_calls.append(
-                        ToolCall(
-                            type="function",
-                            function=FunctionCall(
-                                name=invoke_name,
-                                arguments=json.dumps(params, ensure_ascii=False),
-                            ),
-                        )
+            # Every complete invoke from the first tool marker on is a call,
+            # inside a tool-calls block or not. A tool call ends the turn,
+            # so text between and after the blocks is not content.
+            for invoke_name, invoke_content in self.invoke_complete_regex.findall(
+                searchable, first_tool_idx
+            ):
+                param_dict = self._parse_invoke_params(invoke_content)
+                params = self._convert_params_with_schema(invoke_name, param_dict)
+                tool_calls.append(
+                    ToolCall(
+                        type="function",
+                        function=FunctionCall(
+                            name=invoke_name,
+                            arguments=json.dumps(params, ensure_ascii=False),
+                        ),
                     )
+                )
 
             if not tool_calls:
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
                 )
 
-            # Extract content before first tool call
-            first_tool_idx = model_output.find(self.tool_call_start_token)
             content = model_output[:first_tool_idx] if first_tool_idx > 0 else None
 
             return ExtractedToolCallInformation(
@@ -234,6 +297,7 @@ class DeepSeekV32ToolParser(ToolParser):
         self._sent_content_idx = 0
         self._buffer = ""
         self._in_tool_calls = False
+        self._ignored_tool_call_end = None
         self._active_tool_index = None
         self._active_tool_name = None
         self._active_param_name = None
@@ -366,6 +430,26 @@ class DeepSeekV32ToolParser(ToolParser):
         for key, value in converted.items():
             self._append_json_param_value(tool_call_deltas, index, key, value)
 
+    def _finish_streaming_param(
+        self,
+        tool_call_deltas: dict[int, DeltaToolCall],
+        index: int,
+        raw_content: str,
+    ) -> None:
+        if self._active_param_mode in ("wrapper", "buffered"):
+            self._active_param_parts.append(raw_content)
+            self._finish_buffered_param(tool_call_deltas, index)
+        elif self._active_param_mode == "string":
+            arguments = self._json_escape_string_content(raw_content) + '"'
+            self._add_tool_call_delta(tool_call_deltas, index, arguments=arguments)
+        else:
+            self._add_tool_call_delta(tool_call_deltas, index, arguments=raw_content)
+
+        self._active_param_name = None
+        self._active_param_string_attr = None
+        self._active_param_mode = None
+        self._active_param_parts.clear()
+
     def _close_streaming_tool_call(
         self,
         tool_call_deltas: dict[int, DeltaToolCall],
@@ -396,16 +480,54 @@ class DeepSeekV32ToolParser(ToolParser):
         content_parts: list[str],
         tool_call_deltas: dict[int, DeltaToolCall],
     ) -> None:
-        parameter_end_token = "</｜DSML｜parameter>"
-        invoke_end_token = "</｜DSML｜invoke>"
+        parameter_end_token = f"</｜DSML｜{self.parameter_tag_name}>"
+        invoke_end_token = f"</｜DSML｜{self.invoke_tag_name}>"
+
+        start_markers = (
+            *self._tool_calls_start_markers(),
+            *self._ignored_tool_call_blocks,
+        )
+        between_markers = (*start_markers, self.tool_call_end_token)
 
         while True:
+            if self._ignored_tool_call_end is not None:
+                end = self._ignored_tool_call_end
+                end_idx = self._buffer.find(end)
+                size = (
+                    end_idx + len(end)
+                    if end_idx != -1
+                    else len(self._buffer) - partial_tag_overlap(self._buffer, end)
+                )
+                if not self._in_tool_calls:
+                    content_parts.append(self._buffer[:size])
+                self._buffer = self._buffer[size:]
+                if end_idx == -1:
+                    return
+                self._ignored_tool_call_end = None
+                continue
+
+            if self._active_tool_index is None:
+                ignored = next(
+                    (
+                        start
+                        for start in self._ignored_tool_call_blocks
+                        if self._buffer.startswith(start)
+                    ),
+                    None,
+                )
+                if ignored is not None:
+                    if not self._in_tool_calls:
+                        content_parts.append(ignored)
+                    self._buffer = self._buffer[len(ignored) :]
+                    self._ignored_tool_call_end = self._ignored_tool_call_blocks[
+                        ignored
+                    ]
+                    continue
+
             if not self._in_tool_calls:
-                start_idx = self._buffer.find(self.tool_call_start_token)
+                start_idx = self._find_first_marker(self._buffer, start_markers)
                 if start_idx == -1:
-                    overlap = partial_tag_overlap(
-                        self._buffer, self.tool_call_start_token
-                    )
+                    overlap = self._marker_overlap(self._buffer, start_markers)
                     sendable_idx = len(self._buffer) - overlap
                     if sendable_idx > 0:
                         content_parts.append(self._buffer[:sendable_idx])
@@ -417,56 +539,66 @@ class DeepSeekV32ToolParser(ToolParser):
                     self._buffer = self._buffer[start_idx:]
                     continue
 
-                self._buffer = self._buffer[len(self.tool_call_start_token) :]
+                # From here on the turn is tool calls (as in the batch path).
                 self._in_tool_calls = True
                 continue
 
             if self._active_tool_index is None:
-                stripped_len = len(self._buffer) - len(self._buffer.lstrip())
-                if stripped_len:
-                    self._buffer = self._buffer[stripped_len:]
-                    continue
-
-                if self._buffer.startswith(self.tool_call_end_token):
-                    self._buffer = self._buffer[len(self.tool_call_end_token) :]
-                    self._in_tool_calls = False
+                # Between calls. The wrapper tokens only frame the calls, and
+                # text between or after the blocks is dropped: a tool call
+                # ends the turn (as in the batch path).
+                wrapper_token = next(
+                    (
+                        token
+                        for token in (
+                            *self._tool_call_start_tokens(),
+                            self.tool_call_end_token,
+                        )
+                        if self._buffer.startswith(token)
+                    ),
+                    None,
+                )
+                if wrapper_token is not None:
+                    self._buffer = self._buffer[len(wrapper_token) :]
                     continue
 
                 match = self.invoke_start_regex.match(self._buffer)
-                if match is None:
-                    return
+                if match is not None:
+                    self._buffer = self._buffer[match.end() :]
+                    self._begin_streaming_tool_call(match.group(1), tool_call_deltas)
+                    continue
 
-                self._buffer = self._buffer[match.end() :]
-                self._begin_streaming_tool_call(match.group(1), tool_call_deltas)
+                marker_idx = self._find_first_marker(self._buffer, between_markers)
+                if marker_idx == -1:
+                    marker_idx = len(self._buffer) - self._marker_overlap(
+                        self._buffer, between_markers
+                    )
+                if marker_idx == 0:
+                    return  # an opener is still arriving, or nothing to drop
+                self._buffer = self._buffer[marker_idx:]
                 continue
 
             index = self._active_tool_index
 
             if self._active_param_mode is not None:
                 end_pos = self._buffer.find(parameter_end_token)
+                next_pos = self._buffer.find(self.parameter_open_marker)
+                if next_pos != -1 and (end_pos == -1 or next_pos < end_pos):
+                    # Implicit close: keep the next opener in the buffer.
+                    raw_content = self._buffer[:next_pos]
+                    self._buffer = self._buffer[next_pos:]
+                    self._finish_streaming_param(tool_call_deltas, index, raw_content)
+                    continue
                 if end_pos != -1:
                     raw_content = self._buffer[:end_pos]
                     self._buffer = self._buffer[end_pos + len(parameter_end_token) :]
-                    if self._active_param_mode in ("wrapper", "buffered"):
-                        self._active_param_parts.append(raw_content)
-                        self._finish_buffered_param(tool_call_deltas, index)
-                    elif self._active_param_mode == "string":
-                        arguments = self._json_escape_string_content(raw_content) + '"'
-                        self._add_tool_call_delta(
-                            tool_call_deltas, index, arguments=arguments
-                        )
-                    else:
-                        self._add_tool_call_delta(
-                            tool_call_deltas, index, arguments=raw_content
-                        )
-
-                    self._active_param_name = None
-                    self._active_param_string_attr = None
-                    self._active_param_mode = None
-                    self._active_param_parts.clear()
+                    self._finish_streaming_param(tool_call_deltas, index, raw_content)
                     continue
 
-                overlap = partial_tag_overlap(self._buffer, parameter_end_token)
+                overlap = max(
+                    partial_tag_overlap(self._buffer, parameter_end_token),
+                    partial_tag_overlap(self._buffer, self.parameter_open_marker),
+                )
                 safe_len = len(self._buffer) - overlap
                 if safe_len > 0:
                     raw_content = self._buffer[:safe_len]
@@ -501,7 +633,7 @@ class DeepSeekV32ToolParser(ToolParser):
 
             self._buffer = self._buffer[match.end() :]
             name = match.group(1)
-            string_attr = match.group(2)
+            string_attr = self._string_attr(match.group(2))
             self._active_param_name = name
             self._active_param_string_attr = string_attr
 

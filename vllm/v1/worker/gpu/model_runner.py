@@ -54,6 +54,10 @@ from vllm.model_executor.warmup.sm70_runtime import (
     warmup_v2_convolution,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.encoder_budget import (
+    MultiModalBudget,
+    get_dummy_encoder_profile_inputs,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -433,7 +437,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     torch.accelerator.memory_allocated(),
                     torch.accelerator.memory_reserved(),
                 )
-                logger.info(
+                logger.debug(
                     "Target CUDA storage before speculative loading: %s",
                     loaded_cuda_model_storage({"target": self.model}),
                 )
@@ -835,6 +839,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        if self.supports_mm_inputs and self.is_first_pp_rank:
+            mm_config = self.model_config.multimodal_config
+            if mm_config is not None and not mm_config.skip_mm_profiling:
+                mm_budget = MultiModalBudget(
+                    self.vllm_config,
+                    self.mm_registry,
+                    enable_cache=False,
+                )
+                dummy_mm_inputs = get_dummy_encoder_profile_inputs(
+                    self.mm_registry,
+                    mm_budget,
+                )
+                self.model_state.encoder_runner.profile_encoder_cache(
+                    dummy_mm_inputs, mm_budget
+                )
+
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -849,6 +869,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
+        self.reset_encoder_cache()
         gc.collect()
 
     def post_kv_cache_wake_up(self) -> None:
@@ -1238,9 +1259,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if num_reqs_padded > num_reqs:
                 prefix_anchor_lens[num_reqs:].zero_()
 
-        max_seq_len_np = (
-            self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None
-        )
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -1263,7 +1281,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefill_len_np=prefill_len_np,
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
-            max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             logits_indices=logits_indices,
@@ -1497,8 +1514,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            # Finish offload stores whose source blocks this step reuses before
+            # zeroing them below; see ActiveKVConnector.handle_preemptions.
+            self.kv_connector.handle_preemptions(scheduler_output)
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            if scheduler_output.kv_block_copies:
+                self._kv_block_zeroer.copy_block_ids(scheduler_output.kv_block_copies)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1527,6 +1549,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
         )
+        if not dummy_run and batch_desc.cg_mode != CUDAGraphMode.NONE:
+            self.mixed_prefill_timer.mark_cuda_graph()
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1976,6 +2000,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.use_async_scheduling:
             return async_output
+        if self.use_pp and self.num_speculative_steps:
+            model_runner_output.set_draft_token_ids(self.take_draft_token_ids())
         return async_output.get_output()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

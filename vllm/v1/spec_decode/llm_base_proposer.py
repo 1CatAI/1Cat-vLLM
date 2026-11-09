@@ -38,6 +38,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
+from vllm.runtime_resources import share_runtime_resources
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -2074,7 +2075,11 @@ class SpecDecodeBaseProposer:
         """
         from vllm.compilation.backends import set_model_tag
 
-        draft_vllm_config = self._create_draft_vllm_config()
+        # Subclasses derive the draft config further with replace(), which drops
+        # the worker-local resources; share them where the drafter is built.
+        draft_vllm_config = share_runtime_resources(
+            self._create_draft_vllm_config(), self.vllm_config
+        )
         with set_model_tag("eagle_head"):
             model = get_model(
                 vllm_config=draft_vllm_config,

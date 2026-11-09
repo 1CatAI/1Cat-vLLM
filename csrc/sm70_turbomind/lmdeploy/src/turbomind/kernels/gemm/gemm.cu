@@ -1122,6 +1122,16 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
         std::min(spec.swizzle,
                  spec.kernel->GetMaxSwizzle({actual_desc.m, actual_desc.n,
                                              actual_desc.k, actual_desc.num}));
+    // The split count was chosen for the override group count; the actual
+    // groups need partials for every group, so a bounded workspace may hold
+    // fewer splits. Launch with the most that fit instead of failing.
+    spec.splits = std::max(
+        1, std::min(spec.splits,
+                    spec.kernel->GetMaxSplits(
+                        {actual_desc.m, actual_desc.n, actual_desc.k,
+                         actual_desc.num},
+                        spec.swizzle, workspace.barriers_size,
+                        workspace.partials_size)));
   }
   MaybeTraceGemmDispatch(dispatch_context->desc(), operation.dispatch, spec,
                          measured);

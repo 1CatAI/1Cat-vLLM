@@ -888,8 +888,7 @@ def is_torch_equal_or_newer(target: str) -> bool:
 
 def _is_torch_equal(target: str) -> bool:
     assert target.count(".") == 2
-    torch_version = str(torch.__version__)
-    torch_version = version.parse(torch_version)
+    torch_version = version.parse(str(torch.__version__))
     # torch version is like "2.6.0.dev20240101" or "2.6.0.dev20240101+cpu"
     # or "2.6.0+cu128" but never "2.6.0.1"
     return (

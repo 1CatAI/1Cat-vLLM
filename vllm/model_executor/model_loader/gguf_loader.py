@@ -54,7 +54,7 @@ class GGUFModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra = load_config.model_loader_extra_config or {}
-        if set(extra) - {"multimodal_safetensors"}:
+        if set(extra) - {"multimodal_safetensors", "engram_path"}:
             raise ValueError(
                 f"Model loader extra config is not supported for "
                 f"load format {load_config.load_format}"
@@ -533,6 +533,10 @@ class GGUFModelLoader(BaseModelLoader):
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
+        if (self.load_config.model_loader_extra_config or {}).get(
+            "engram_path"
+        ) and model_config.hf_text_config.model_type != "deepseek_v41_text":
+            raise ValueError("engram_path is supported only by the V4.1 loader")
         device_config = vllm_config.device_config
         self._gguf_tp_size = vllm_config.parallel_config.tensor_parallel_size
         local_model_path = self._prepare_weights(model_config)

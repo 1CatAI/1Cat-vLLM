@@ -12,6 +12,7 @@ import torch
     [
         (8000, "sm70_d256_gqa_architecture_fwd"),
         (8192, "sm70_d256_gqa_architecture_q8192_fwd"),
+        (4096, "sm70_d256_gqa_architecture_q4096_fwd"),
     ],
 )
 @torch.inference_mode()
@@ -47,6 +48,7 @@ def test_large_scores_and_biased_values(kv_len, query_len, op_name):
     [
         (8000, "sm70_d256_gqa_architecture_fwd"),
         (8192, "sm70_d256_gqa_architecture_q8192_fwd"),
+        (4096, "sm70_d256_gqa_architecture_q4096_fwd"),
     ],
 )
 @torch.inference_mode()
@@ -87,6 +89,7 @@ def test_periodic_score_spikes_do_not_overflow(query_len, op_name):
     [
         (8000, "sm70_d256_gqa_architecture_fwd"),
         (8192, "sm70_d256_gqa_architecture_q8192_fwd"),
+        (4096, "sm70_d256_gqa_architecture_q4096_fwd"),
     ],
 )
 @torch.inference_mode()
@@ -159,6 +162,7 @@ def test_q8000_q8192_share_scores_and_preserve_graph_replay():
     [
         (8000, "sm70_d256_gqa_architecture_fwd"),
         (8192, "sm70_d256_gqa_architecture_q8192_fwd"),
+        (4096, "sm70_d256_gqa_architecture_q4096_fwd"),
     ],
 )
 @torch.inference_mode()
@@ -194,3 +198,47 @@ def test_missed_tail_peak_does_not_overflow_numerator(query_len, op_name):
     )
     reference = (scores.softmax(-1) @ v[0, :, 0].float()).permute(1, 0, 2)
     torch.testing.assert_close(output[0, rows].float(), reference, rtol=0.01, atol=0.01)
+
+
+@torch.inference_mode()
+def test_q4096_keeps_its_own_half_height_scores_beside_q8192():
+    if not torch.accelerator.is_available() or torch.cuda.get_device_capability() != (
+        7,
+        0,
+    ):
+        pytest.skip("requires SM70")
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    load_fa2_library(torch.device("cuda"))
+    if not hasattr(torch.ops._vllm_fa2_C, "sm70_d256_gqa_architecture_q4096_fwd"):
+        pytest.skip("Q4096 architecture operator was not built")
+    torch.manual_seed(733)
+    cases = []
+    for length, name in [
+        (4096, "sm70_d256_gqa_architecture_q4096_fwd"),
+        (8192, "sm70_d256_gqa_architecture_q8192_fwd"),
+    ]:
+        q = torch.randn(1, length, 6, 256, device="cuda", dtype=torch.float16)
+        k = torch.randn(1, length + 8192, 1, 256, device="cuda", dtype=torch.float16)
+        v = torch.randn_like(k)
+        out = torch.empty_like(q)
+        op = getattr(torch.ops._vllm_fa2_C, name)
+        before = torch.accelerator.memory_allocated()
+        op(q, k, v, out, 0.0625, True)
+        if length == 4096:
+            # 8192 score columns x 4096 rows x 6 heads in FP16, not the
+            # 8192-row buffer that Q8000/Q8192 share.
+            assert torch.accelerator.memory_allocated() - before < 768 * 1024**2
+        cases.append((out.clone(), out, q, k, v, op))
+    # Interleaving the families must not corrupt either result.
+    for reference, out, q, k, v, op in cases:
+        op(q, k, v, out, 0.0625, True)
+        torch.testing.assert_close(out, reference, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _, out, q, k, v, op in cases:
+            op(q, k, v, out, 0.0625, True)
+    for _ in range(3):
+        graph.replay()
+        for reference, out, *_ in cases:
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)

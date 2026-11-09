@@ -29,11 +29,17 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "gguf_shared_expert_dma.h"
+#include "gguf_shared_expert_lane.h"
+#include "gguf_shared_expert_jobs.h"
+#include "gguf_shared_engram.h"
 
 #if defined(__x86_64__) || defined(__i386__)
   #include <immintrin.h>
@@ -769,9 +775,135 @@ void copy_h2d(int64_t dst, int64_t src, int64_t bytes, int64_t stream_ptr) {
         "copy host to device");
 }
 
+// Batched strided host->device copies (one Python call per prefill tile).
+void copy_h2d_2d(const std::vector<int64_t>& dst,
+                 const std::vector<int64_t>& src,
+                 const std::vector<int64_t>& dpitch,
+                 const std::vector<int64_t>& spitch,
+                 const std::vector<int64_t>& width,
+                 const std::vector<int64_t>& height, int64_t stream_ptr) {
+  const size_t n = dst.size();
+  if (src.size() != n || dpitch.size() != n || spitch.size() != n ||
+      width.size() != n || height.size() != n)
+    throw std::invalid_argument("copy_h2d_2d: mismatched descriptor lists");
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  for (size_t i = 0; i < n; ++i)
+    check(
+        cudaMemcpy2DAsync(reinterpret_cast<void*>(dst[i]), dpitch[i],
+                          reinterpret_cast<const void*>(src[i]), spitch[i],
+                          width[i], height[i], cudaMemcpyHostToDevice, stream),
+        "copy host to device 2d");
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  using namespace vllm::gguf;
+  m.def("shared_engram_control_layout", [](uint64_t maximum) {
+    return std::vector<uint64_t>{SharedEngramReader::control_words(maximum),
+                                 SharedEngramReader::channel_words(maximum),
+                                 SharedEngramReader::rank_words(maximum)};
+  });
+  pybind11::class_<SharedEngramTable>(m, "SharedEngramTable")
+      .def(pybind11::init([](int fd, uint64_t offset, uint64_t rows) {
+        return SharedEngramTable{fd, offset, rows};
+      }));
+  pybind11::class_<SharedEngramReader>(m, "SharedEngramReader")
+      .def(pybind11::init([](uint64_t data, uint64_t bytes, uint64_t control,
+                             uint64_t maximum, uint64_t row_bytes,
+                             std::vector<SharedEngramTable> tables,
+                             uint64_t timeout_ns) {
+        return std::make_unique<SharedEngramReader>(
+            reinterpret_cast<uint8_t*>(data), bytes,
+            reinterpret_cast<uint64_t*>(control), maximum, row_bytes,
+            std::move(tables), timeout_ns);
+      }))
+      .def("stop", &SharedEngramReader::stop,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("error", &SharedEngramReader::error);
+  pybind11::class_<SharedExpertDmaLane>(m, "SharedExpertDmaLane")
+      .def(pybind11::init<uint64_t, uint64_t, uint64_t, int, unsigned, unsigned,
+                          std::vector<std::vector<int64_t>>, uint64_t, unsigned,
+                          unsigned, unsigned, unsigned, unsigned, uint64_t>())
+      .def("stop", &SharedExpertDmaLane::stop,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("error", &SharedExpertDmaLane::error)
+      .def("completed", &SharedExpertDmaLane::completed);
+  pybind11::class_<SharedExpertJobLane>(m, "SharedExpertJobLane")
+      .def(pybind11::init<uint64_t, uint64_t, int, unsigned,
+                          std::vector<std::vector<int64_t>>,
+                          std::vector<std::vector<int64_t>>, uint64_t>())
+      .def("stop", &SharedExpertJobLane::stop,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("error", &SharedExpertJobLane::error)
+      .def("completed", &SharedExpertJobLane::completed);
+  m.def("shared_expert_hint_layout", [] {
+    return std::vector<uint64_t>{kSharedHintStart,   kSharedHintHeader,
+                                 kSharedHintEntries, kSharedHintWords,
+                                 kSharedHintTokens,  kSharedHintCands};
+  });
+  m.def("shared_expert_job_layout", [] {
+    return std::vector<uint64_t>{kSharedJobStart, kSharedJobHeader,
+                                 kSharedJobEntries, kSharedJobWords};
+  });
+  m.def("shared_expert_control_layout", [] {
+    return std::vector<uint64_t>{kSharedControlWords, kSharedRankStart,
+                                 kSharedRankWords,    kSharedOpStart,
+                                 kSharedOpWords,      kSharedMaxCopies};
+  });
+  m.def("shared_expert_hit_layout", [] {
+    return std::vector<uint64_t>{kSharedHitStart, kSharedHitHeader,
+                                 kSharedHitEntries, kSharedHitWords,
+                                 kSharedTotalWords};
+  });
+  pybind11::class_<SharedExpertLayer>(m, "SharedExpertLayer")
+      .def(
+          pybind11::init([](uint64_t bytes, int32_t experts, int32_t resident) {
+            return SharedExpertLayer{bytes, experts, resident};
+          }));
+  pybind11::class_<SharedExpertCopy>(m, "SharedExpertCopy")
+      .def_readonly("slot", &SharedExpertCopy::slot)
+      .def_readonly("incoming", &SharedExpertCopy::incoming)
+      .def_readonly("victim", &SharedExpertCopy::victim)
+      .def_readonly("load_offset", &SharedExpertCopy::load_offset)
+      .def_readonly("save_offset", &SharedExpertCopy::save_offset);
+  pybind11::class_<SharedExpertPlanner>(m, "SharedExpertPlanner")
+      .def(
+          pybind11::init([](uint64_t pointer, uint64_t bytes,
+                            std::vector<SharedExpertLayer> layers,
+                            unsigned ranks, unsigned routes, uint64_t reserve) {
+            return std::make_unique<SharedExpertPlanner>(
+                reinterpret_cast<uint8_t*>(pointer), bytes, std::move(layers),
+                ranks, routes, reserve);
+          }))
+      .def("plan", &SharedExpertPlanner::plan,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("acknowledge", &SharedExpertPlanner::acknowledge)
+      .def("ready", &SharedExpertPlanner::ready)
+      .def("finish", &SharedExpertPlanner::finish,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("slot", &SharedExpertPlanner::slot)
+      .def("cold_offset", &SharedExpertPlanner::cold_offset)
+      .def("acquire", &SharedExpertPlanner::acquire)
+      .def("release", &SharedExpertPlanner::release)
+      .def("stop", &SharedExpertPlanner::stop);
+  pybind11::class_<SharedExpertCoordinator>(m, "SharedExpertCoordinator")
+      .def(pybind11::init([](uint64_t arena, uint64_t bytes, uint64_t control,
+                             std::vector<SharedExpertLayer> layers,
+                             unsigned ranks, unsigned routes, uint64_t reserve,
+                             uint64_t timeout) {
+        return std::make_unique<SharedExpertCoordinator>(
+            reinterpret_cast<uint8_t*>(arena), bytes,
+            reinterpret_cast<uint64_t*>(control), std::move(layers), ranks,
+            routes, reserve, timeout);
+      }))
+      .def("stop", &SharedExpertCoordinator::stop,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("error", &SharedExpertCoordinator::error)
+      .def("slot", &SharedExpertCoordinator::slot)
+      .def("cold_offset", &SharedExpertCoordinator::cold_offset)
+      .def("acquire", &SharedExpertCoordinator::acquire)
+      .def("release", &SharedExpertCoordinator::release);
   pybind11::class_<ExpertCacheLane>(m, "ExpertCacheLane")
       .def(pybind11::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                           std::vector<int64_t>, std::vector<int64_t>,
@@ -795,4 +927,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("host_unregister", &host_unregister);
   m.def("mapped_view", &mapped_view);
   m.def("copy_h2d", &copy_h2d);
+  m.def("copy_h2d_2d", &copy_h2d_2d,
+        pybind11::call_guard<pybind11::gil_scoped_release>());
 }

@@ -27,9 +27,13 @@ struct ScoreWorkspace {
   std::mutex& mutex;
   cudaEvent_t& completion;
   bool& completion_recorded;
-  explicit ScoreWorkspace(const at::Tensor& query, int64_t block_n);
+  // rows: score rows per KV column (query tokens x 6 query heads).
+  ScoreWorkspace(const at::Tensor& query, int64_t block_n, int64_t rows);
   ~ScoreWorkspace();
 };
+// Q8000 and Q8192 share one 8192-row buffer per device; Q4096 engines use
+// a half-height buffer of their own.
 std::shared_ptr<ScoreWorkspace> get_score_workspace(const at::Tensor& query,
-                                                    int64_t block_n);
+                                                    int64_t block_n,
+                                                    int64_t rows);
 }  // namespace onecat_sm70_prefill

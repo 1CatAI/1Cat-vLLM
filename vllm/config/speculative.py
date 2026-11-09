@@ -227,6 +227,11 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
+    disable_eagle_block_drop: bool = False
+    """Keep the trailing hashed prefix-cache page on an EAGLE/MTP hit.
+    Backport of vllm-project/vllm#53388. Default ``False`` matches current
+    1Cat behavior. Hybrid-model MTP pages can be thousands of tokens, so the
+    stock drop recomputes a full page on every prefix hit."""
     use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -234,6 +239,11 @@ class SpeculativeConfig:
     non-tree speculation. ``None`` automatically enables the SM70
     FP16 Qwen4Exp TP4 MTP route with greedy drafts. Explicit booleans override
     automatic selection; other routes retain full-logits selection."""
+    disable_lookahead_block_hashes: bool = False
+    """Disable lookahead block hashes for EAGLE-like speculative methods and
+    fall back to dropping the trailing prefix-cache block. Lookahead hashes
+    also cover the token after each block, so engines sharing a KV store and
+    external consumers of KV cache events must use the same setting."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -477,8 +487,10 @@ class SpeculativeConfig:
         if self.method == "mtp":
             factors.append(("mtp_expert_quantization", self.mtp_expert_quantization))
 
-        # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
+            factors.append(self.draft_model_config.compute_hash())
+
+            # The specific layers used also affect the computation graph.
             layer_ids = getattr(
                 self.draft_model_config.hf_config,
                 "eagle_aux_hidden_state_layer_ids",
@@ -1029,8 +1041,11 @@ class SpeculativeConfig:
 
                 if self.use_dspark():
                     draft_hf_config = self.draft_model_config.hf_config
-                    draft_hf_config.model_type = "deepseek_v4"
-                    draft_hf_config.architectures = ["DSparkDraftModel"]
+                    if draft_hf_config.model_type == "deepseek_v41_text":
+                        draft_hf_config.architectures = ["DSparkDeepseekV41ForCausalLM"]
+                    else:
+                        draft_hf_config.model_type = "deepseek_v4"
+                        draft_hf_config.architectures = ["DSparkDraftModel"]
                     self.update_arch_()
 
                 if self.use_dflash_family() or self.use_dspark():
@@ -1136,6 +1151,16 @@ class SpeculativeConfig:
                     self.target_model_config, self.draft_model_config
                 ):
                     # The draft now covers the target's extended positions.
+                    self.draft_model_config.max_model_len = max(
+                        self.draft_model_config.max_model_len,
+                        self.target_model_config.max_model_len,
+                    )
+                if (
+                    self.method == "dspark"
+                    and __import__("os").environ.get("VLLM_V41_PACKED_KV", "0") == "1"
+                ):
+                    # V4.1 DSpark attends only its sliding window and rotates
+                    # RoPE on the fly past its table: it covers the target length.
                     self.draft_model_config.max_model_len = max(
                         self.draft_model_config.max_model_len,
                         self.target_model_config.max_model_len,
@@ -1655,7 +1680,21 @@ class SpeculativeConfig:
         # so dropping an additional target block is both unnecessary and can
         # eliminate all prefix hits when hybrid page unification makes blocks
         # large. Keep DDTree and DSpark on their established V1 semantics.
-        return self.use_eagle() and not self.use_dflash()
+        # disable_eagle_block_drop is the #53388 opt-in: keep the trailing
+        # hashed page (hybrid-model MTP pages can be 2048+ tokens).
+        return (
+            self.use_eagle()
+            and not self.use_dflash()
+            and not self.disable_eagle_block_drop
+        )
+
+    def use_multi_module_mtp(self) -> bool:
+        if self.method != "mtp" or self.draft_model_config is None:
+            return False
+        num_mtp_layers = getattr(
+            self.draft_model_config.hf_config, "num_nextn_predict_layers", 1
+        )
+        return min(num_mtp_layers, self.num_speculative_tokens) > 1
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

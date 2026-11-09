@@ -43,6 +43,7 @@ _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {"step3_vl", "step3p7"}
 _VLLM_TOKENIZERS = {
     "deepseek_v32": ("deepseek_v32", "DeepseekV32Tokenizer"),
     "deepseek_v4": ("deepseek_v4", "DeepseekV4Tokenizer"),
+    "deepseek_v41": ("deepseek_v41", "DeepseekV41Tokenizer"),
     "grok2": ("grok2", "Grok2Tokenizer"),
     "hf": ("hf", "CachedHfTokenizer"),
     "gguf": ("gguf", "GGUFTokenizer"),

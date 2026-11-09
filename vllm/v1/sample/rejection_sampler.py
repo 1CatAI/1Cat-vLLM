@@ -1429,24 +1429,31 @@ def rejection_random_sample_kernel(
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
             uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
+            # A negative id marks a verify position that was not fully
+            # computed (V4.1 exact truncation): never accepted, never used as
+            # an index; its recovered token samples the plain target.
+            has_draft = draft_token_id >= 0
+            safe_id = tl.maximum(draft_token_id, 0)
             if SYNTHETIC_MODE:
                 rate = tl.load(synthetic_conditional_rates_ptr + pos)
-                accepted = uniform_prob < rate
+                accepted = has_draft and uniform_prob < rate
             else:
                 if NO_DRAFT_PROBS:
                     draft_prob = 1
                 else:
                     draft_prob = tl.load(
-                        draft_probs_ptr
-                        + (start_idx + pos) * vocab_size
-                        + draft_token_id
+                        draft_probs_ptr + (start_idx + pos) * vocab_size + safe_id
                     )
                 target_prob = tl.load(
-                    target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
+                    target_probs_ptr + (start_idx + pos) * vocab_size + safe_id
                 )
                 # NOTE(woosuk): While the draft probability should never be 0,
                 # we check it to avoid NaNs. If it happens to be 0, we reject.
-                accepted = draft_prob > 0 and target_prob / draft_prob >= uniform_prob
+                accepted = (
+                    has_draft
+                    and draft_prob > 0
+                    and target_prob / draft_prob >= uniform_prob
+                )
             if accepted:
                 token_id = draft_token_id
             else:
@@ -1513,8 +1520,10 @@ def sample_recovered_tokens_kernel(
 
     token_idx = start_idx + pos
 
-    if NO_DRAFT_PROBS:
-        draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
+    draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
+    # Negative id: no draft at this position (V4.1 exact truncation), so the
+    # recovered token samples the full target distribution.
+    has_draft = draft_token_id >= 0
 
     max_val = float("-inf")
     recovered_id = 0
@@ -1539,7 +1548,9 @@ def sample_recovered_tokens_kernel(
                 mask=vocab_mask,
                 other=0.0,
             )
-            prob = tl.maximum(target_prob - draft_prob, 0.0)
+            prob = tl.where(
+                has_draft, tl.maximum(target_prob - draft_prob, 0.0), target_prob
+            )
             # NOTE(woosuk): We don't need `prob = prob / tl.sum(prob)` here because
             # `tl.argmax` will select the maximum value.
 

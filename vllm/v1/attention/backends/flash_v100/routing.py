@@ -222,6 +222,15 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
             {"codecs": frozenset((FP16,)), "head_dims": (256,)},
         ),
         (
+            "prefill_dense_splitd_d256_splitkv_kernel",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+            },
+        ),
+        (
             "prefill_dense_splitd_d256_splitkv3_kernel",
             "prefill",
             {
@@ -296,6 +305,28 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
                 "gqa_ratios": (6,),
                 "min_chunk": 8001,
                 "max_chunk": 8191,
+            },
+        ),
+        (
+            "prefill_dense_d256_gqa_79t_fp32_q4096",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "min_chunk": 4000,
+                "max_chunk": 4096,
+            },
+        ),
+        (
+            "prefill_dense_d256_gqa_79t_fp32_q4096_pad",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "min_chunk": 4000,
+                "max_chunk": 4095,
             },
         ),
         (

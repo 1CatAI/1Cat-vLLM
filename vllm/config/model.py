@@ -93,7 +93,9 @@ def is_cumem_allocator_available() -> bool:
 RunnerOption = Literal["auto", RunnerType]
 ConvertType = Literal["none", "embed", "classify"]
 ConvertOption = Literal["auto", ConvertType]
-TokenizerMode = Literal["auto", "hf", "slow", "mistral", "deepseek_v32", "deepseek_v4"]
+TokenizerMode = Literal[
+    "auto", "hf", "slow", "mistral", "deepseek_v32", "deepseek_v4", "deepseek_v41"
+]
 ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
 LogprobsMode = Literal[
     "raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"
@@ -111,6 +113,32 @@ _RUNNER_CONVERTS: dict[RunnerType, list[ConvertType]] = {
 AttnTypeStr = Literal[
     "decoder", "encoder", "encoder_only", "encoder_decoder", "attention_free", "hybrid"
 ]
+
+
+def mm_limit_hash_factors(mm_config: MultiModalConfig) -> dict[str, Any]:
+    """Compile-cache factors from the per-prompt multimodal limits.
+
+    A limit of zero changes the traced language-model graph: with image and
+    video both at zero the vision tower is replaced by a placeholder, and with
+    every modality at zero (and no precomputed embeddings) the runner feeds
+    input IDs instead of embeddings. Non-zero values (8 vs 16 images) only
+    act at run time, so only the set of zero-limit modalities and
+    `enable_mm_embeds` are hashed, and only when some limit is zero. A config
+    without a zero limit keeps exactly the hash it had before, so existing
+    compile caches stay valid. If a model ever uses the non-zero value of a
+    limit inside the compiled graph, it must be added here.
+    """
+    zero = sorted(
+        modality
+        for modality, opts in mm_config.limit_per_prompt.items()
+        if (opts if isinstance(opts, int) else opts.count) == 0
+    )
+    if not zero:
+        return {}
+    return {
+        "mm_zero_limit_modalities": zero,
+        "mm_enable_mm_embeds": mm_config.enable_mm_embeds,
+    }
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -145,6 +173,7 @@ class ModelConfig:
     - "mistral" will always use the tokenizer from `mistral_common`.
     - "deepseek_v32" will always use the tokenizer from `deepseek_v32`.
     - "deepseek_v4" will always use the tokenizer from `deepseek_v4`.
+    - "deepseek_v41" uses the independent V4.1 text and tool encoding.
     - "qwen_vl" will always use the tokenizer from `qwen_vl`.
     - Other custom values can be supported via plugins.
 
@@ -427,6 +456,7 @@ class ModelConfig:
         # here early.
         if self.multimodal_config:
             factors["language_model_only"] = self.multimodal_config.language_model_only
+            factors.update(mm_limit_hash_factors(self.multimodal_config))
         return hash_factors(factors)
 
     def _update_nested(
@@ -633,6 +663,8 @@ class ModelConfig:
                 self.tokenizer_mode = "deepseek_v32"
             elif arch == "DeepseekV4ForCausalLM":
                 self.tokenizer_mode = "deepseek_v4"
+            elif arch == "DeepseekV41ForCausalLM":
+                self.tokenizer_mode = "deepseek_v41"
 
             if self.tokenizer_mode != "auto":
                 logger.info(

@@ -286,6 +286,38 @@ def _zero_kv_blocks_kernel(
     )
 
 
+@triton.jit
+def _copy_kv_blocks_kernel(
+    seg_addrs_ptr,
+    seg_block_strides_ptr,
+    seg_page_sizes_ptr,
+    seg_num_blocks_ptr,
+    src_ids_ptr,
+    dst_ids_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy whole KV cache blocks across all segments (see the zero kernel)."""
+    pair_index = tl.program_id(0)
+    seg_index = tl.program_id(1)
+    chunk_index = tl.program_id(2)
+    page_size_el = tl.load(seg_page_sizes_ptr + seg_index)
+    chunk_offset = chunk_index.to(tl.int64) * BLOCK_SIZE
+    if chunk_offset >= page_size_el:
+        return
+    src_id = tl.load(src_ids_ptr + pair_index)
+    dst_id = tl.load(dst_ids_ptr + pair_index)
+    num_blocks = tl.load(seg_num_blocks_ptr + seg_index)
+    if src_id < 0 or src_id >= num_blocks or dst_id < 0 or dst_id >= num_blocks:
+        return
+    seg_addr = tl.load(seg_addrs_ptr + seg_index)
+    block_stride_el = tl.load(seg_block_strides_ptr + seg_index).to(tl.int64)
+    ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
+    cols = chunk_offset + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    mask = cols < page_size_el
+    values = tl.load(ptr + src_id.to(tl.int64) * block_stride_el + cols, mask=mask)
+    tl.store(ptr + dst_id.to(tl.int64) * block_stride_el + cols, values, mask=mask)
+
+
 class KVBlockZeroer:
     """Manages efficient zeroing of KV cache blocks via a Triton kernel.
 
@@ -374,9 +406,16 @@ class KVBlockZeroer:
                         spec.head_size,
                         cache_dtype_str=cache_dtype,
                     )
-                    dp = kv.data_ptr()
-
                     el = kv.element_size()
+                    # Packed DCP pages (attn_utils) expose each member as a
+                    # view offset by whole kernel blocks inside one physical
+                    # page, with a block stride that spans every member. Zero
+                    # from the page base: starting at member j's own offset
+                    # runs j kernel blocks past the page into the next block.
+                    # The members then share one segment that covers the page.
+                    page_offset_el = kv.storage_offset() % kv.stride(block_dim)
+                    dp = kv.data_ptr() - page_offset_el * el
+
                     cur_bytes = kv.stride(block_dim) * el
                     assert cur_bytes % 4 == 0
                     kernel_block_el = cur_bytes // 4
@@ -453,6 +492,43 @@ class KVBlockZeroer:
             (max_page_size_el + blk_size - 1) // blk_size,
             blk_size,
             n_segs,
+        )
+
+    def copy_block_ids(self, pairs: list[tuple[int, int]]) -> None:
+        """Copy whole KV cache blocks (source, destination) in one launch."""
+        if not pairs:
+            return
+        if self._meta is None:
+            raise RuntimeError("KV block copies need initialized block metadata")
+        (
+            seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
+            seg_num_blocks,
+            max_chunks,
+            blk_size,
+            n_segs,
+        ) = self._meta
+        src = async_tensor_h2d(
+            [p[0] for p in pairs],
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        dst = async_tensor_h2d(
+            [p[1] for p in pairs],
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        _copy_kv_blocks_kernel[(len(pairs), n_segs, max_chunks)](
+            seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
+            seg_num_blocks,
+            src,
+            dst,
+            BLOCK_SIZE=blk_size,
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:

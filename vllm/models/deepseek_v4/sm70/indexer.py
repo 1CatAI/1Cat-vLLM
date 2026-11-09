@@ -51,8 +51,8 @@ _RELU_BLOCK_M = 32
 # Route prefill scoring through cuBLAS instead of the Triton MMA. Set 0 for an
 # A/B against the Triton kernel above (which stays as the reference shape and
 # is what the decode path still uses, since decode gathers from a paged cache).
-# Cap (MiB) on the [tokens*heads, key_tile] fp16 score tile. At the default
-# 2048-token prefill chunk and 64 heads this is 128 KiB per key, so the tile
+# Cap (MiB) on the [tokens*heads, key_tile] fp32 score tile. At the default
+# 2048-token prefill chunk and 64 heads this is 512 KiB per key, so the tile
 # is what keeps a long-context chunk from asking for gigabytes in one go.
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
@@ -609,16 +609,16 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
         q2 = q2.contiguous()
 
     rows = num_q * num_heads
-    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 2))
+    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 4))
     k_tile = max(_RELU_BLOCK_N, min(num_k, budget // _RELU_BLOCK_N * _RELU_BLOCK_N))
 
     for start in range(0, num_k, k_tile):
         stop = min(start + k_tile, num_k)
         width = stop - start
-        # fp16 out with fp32 accumulate: the epilogue reduces in fp32 and only
-        # the top-k *set* is consumed downstream, so the 5e-4 rounding here is
-        # far below the gap between neighbouring index scores.
-        scores = torch.mm(q2, k_fp16[start:stop].t())
+        # fp32 out: the keys enter unscaled (e4m3 reaches 448), so one q . k can
+        # pass fp16's 65504; an fp16 tile overflowed to inf, and to NaN where
+        # mixed-sign head weights summed +inf and -inf in the epilogue.
+        scores = torch.mm(q2, k_fp16[start:stop].t(), out_dtype=torch.float32)
         _relu_weight_headsum_kernel[(num_q, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
             scores,
             weights,
@@ -695,6 +695,20 @@ def sm70_indexer_prefill_logits(
     return torch.mm(weighted_q, k_fp16.t(), out_dtype=torch.float32)
 
 
+def _decode_score_tile_keys(max_seq_len: int, rows: int, num_heads: int) -> int:
+    """Keys per FP32 score tile of the cuBLAS decode route, 0 if none fits.
+
+    The gathered keys stay whole; the [rows * heads, keys] scores, by far the
+    largest buffer, are tiled so the gather plus one tile fit the indexer
+    workspace budget. A key bound whose scores fit keeps a single tile.
+    """
+    budget = sparse_policy().value("indexer_prefill_tile_mb") * 2**20
+    tile = (budget - max_seq_len * _INDEX_HEAD_DIM * 2) // (rows * num_heads * 4)
+    if tile >= max_seq_len:
+        return max_seq_len
+    return max(0, tile // _EPILOGUE_BLOCK_K * _EPILOGUE_BLOCK_K)
+
+
 def _decode_logits_cublas(
     q: torch.Tensor,
     cache: torch.Tensor,
@@ -708,16 +722,18 @@ def _decode_logits_cublas(
 
     `block_table` holds `table_rows_per_request` identical rows per request
     (the flattened speculative decode) or one (the native layout); `q`,
-    `weights` and `flat_lens` hold the request's rows back to back.
+    `weights` and `flat_lens` hold the request's rows back to back. The FP32
+    scores are computed in key tiles of `_decode_score_tile_keys`.
     """
     total_rows, num_heads, head_dim = q.shape
     num_requests = block_table.shape[0] // table_rows_per_request
     rows = total_rows // num_requests
+    tile_keys = _decode_score_tile_keys(max_seq_len, rows, num_heads)
     workspace = current_workspace_manager()
     gathered_k, k_scales, scores = workspace.get_simultaneous(
         ((max_seq_len, head_dim), torch.float16),
         ((max_seq_len,), torch.float32),
-        ((rows * num_heads, max_seq_len), torch.float32),
+        ((rows * num_heads, tile_keys), torch.float32),
     )
     out = torch.empty((total_rows, max_seq_len), dtype=torch.float32, device=q.device)
     for request in range(num_requests):
@@ -769,29 +785,35 @@ def _score_request_cublas(
     )
 
     q2 = q.reshape(total_rows * num_heads, head_dim)
-    torch.mm(
-        q2,
-        gathered_k.t(),
-        out=scores,
-        out_dtype=torch.float32,
-    )
-    _relu_weight_headsum_kernel[
-        (total_rows, triton.cdiv(max_seq_len, _EPILOGUE_BLOCK_K))
-    ](
-        scores,
-        weights,
-        k_scales,
-        out,
-        scores.stride(0) * num_heads,
-        scores.stride(0),
-        weights.stride(0),
-        out.stride(0),
-        max_seq_len,
-        num_heads=num_heads,
-        BLOCK_K=_EPILOGUE_BLOCK_K,
-        BLOCK_H=_EPILOGUE_BLOCK_H,
-        num_warps=4,
-    )
+    tile_keys = scores.shape[1]
+    for start in range(0, max_seq_len, tile_keys):
+        width = min(tile_keys, max_seq_len - start)
+        # A contiguous [rows * heads, width] view keeps the rows of the last,
+        # narrower tile back to back, as the epilogue's strides expect.
+        tile_scores = scores.view(-1)[: q2.shape[0] * width].view(q2.shape[0], width)
+        torch.mm(
+            q2,
+            gathered_k[start : start + width].t(),
+            out=tile_scores,
+            out_dtype=torch.float32,
+        )
+        _relu_weight_headsum_kernel[
+            (total_rows, triton.cdiv(width, _EPILOGUE_BLOCK_K))
+        ](
+            tile_scores,
+            weights,
+            k_scales[start : start + width],
+            out[:, start : start + width],
+            tile_scores.stride(0) * num_heads,
+            tile_scores.stride(0),
+            weights.stride(0),
+            out.stride(0),
+            width,
+            num_heads=num_heads,
+            BLOCK_K=_EPILOGUE_BLOCK_K,
+            BLOCK_H=_EPILOGUE_BLOCK_H,
+            num_warps=4,
+        )
 
 
 def _decode_cublas_blocker(
@@ -863,10 +885,10 @@ def _decode_cublas_blocker(
             and weights.dtype == torch.float32,
         ),
         (
-            "shared gather and FP32 scores within the indexer workspace budget",
-            lambda: max_seq_len
-            * (_INDEX_HEAD_DIM * 2 + rows_per_request() * q.shape[1] * 4)
-            <= policy.value("indexer_prefill_tile_mb") * 2**20,
+            "the shared key gather and one FP32 score tile within the indexer "
+            "workspace budget",
+            lambda: _decode_score_tile_keys(max_seq_len, rows_per_request(), q.shape[1])
+            > 0,
         ),
         (
             f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
@@ -961,7 +983,9 @@ def sm70_indexer_decode_logits(
             table_rows_per_request,
         )
         if blocker is None:
-            logger.info_once("SM70 indexer decode: cuBLAS route on %s.", q.device)
+            logger.info_once(
+                "SM70 indexer decode: cuBLAS route on %s.", q.device, scope="process"
+            )
             return _decode_logits_cublas(
                 q,
                 cache,
@@ -976,6 +1000,7 @@ def sm70_indexer_decode_logits(
             "needs %s.",
             q.device,
             blocker,
+            scope="process",
         )
 
     if native_rows:

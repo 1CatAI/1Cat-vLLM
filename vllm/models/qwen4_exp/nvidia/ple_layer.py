@@ -7,6 +7,7 @@ import math
 import os
 import resource
 import time
+import weakref
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -616,6 +617,49 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     return capability is not None and capability.major < 8
 
 
+# cudaHostRegisterPortable | cudaHostRegisterMapped. On a UVA system this is
+# what cudaHostRegisterDefault already means; it is spelled out because the
+# UVA gather depends on the mapping (get_cuda_view_from_cpu_tensor asks
+# cudaHostGetDevicePointer for the device address of registered memory).
+_CUDA_HOST_REGISTER_PORTABLE_MAPPED = 0x01 | 0x02
+
+
+def _unregister_host_ptr(ptr: int) -> None:
+    # Runs only when the table is garbage collected; process exit releases
+    # the registration together with the CUDA context.
+    torch.cuda.cudart().cudaHostUnregister(ptr)
+
+
+def _pin_host_tensor_exact(tensor: torch.Tensor) -> None:
+    """Page-lock a CPU tensor at exactly its own size.
+
+    ``pin_memory=True`` goes through torch's CachingHostAllocator, which
+    rounds every request up to the next power of two before allocating
+    (torch 2.10 ATen/core/CachingHostAllocator.h:251,278), so an 11.92 GiB
+    per-rank PLE share pinned 16 GiB. Registering an ordinary allocation pins
+    ``nbytes`` and nothing more -- the same bypass vLLM's
+    simple_kv_offload/cuda_mem_ops.py:pin_tensor uses for its CPU KV cache.
+    """
+    ptr = tensor.data_ptr()
+    err = torch.cuda.cudart().cudaHostRegister(
+        ptr, tensor.nbytes, _CUDA_HOST_REGISTER_PORTABLE_MAPPED
+    )
+    if err.value != 0:
+        raise RuntimeError(
+            f"cudaHostRegister of the {format_gib(tensor.nbytes)} PLE host "
+            f"share failed: {err}"
+        )
+    if not tensor.is_pinned():
+        # get_cuda_view_from_cpu_tensor would otherwise take its unpinned
+        # branch and cudaHostAlloc a second full copy of the table.
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+        raise RuntimeError("PLE host share is not pinned after cudaHostRegister")
+    finalizer = weakref.finalize(tensor, _unregister_host_ptr, ptr)
+    # ``atexit`` is a documented writable property; typeshed's __slots__
+    # declaration does not list it.
+    finalizer.atexit = False  # type: ignore[misc]
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """TP-sharded FP8 PLE table split between device memory and pinned host.
 
@@ -863,8 +907,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             (placement.host_rows, self.embedding_dim),
             dtype=self._meta_weight_dtype,
             device="cpu",
-            pin_memory=placement.host_rows > 0,
         )
+        if placement.host_rows > 0:
+            _pin_host_tensor_exact(host_storage)
         # Publish only a complete allocation so a host allocation failure
         # cannot leave the idempotent path pointing at a half-built table.
         self.ple_device_table = device_table

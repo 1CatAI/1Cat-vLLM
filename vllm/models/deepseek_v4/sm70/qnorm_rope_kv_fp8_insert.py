@@ -5,7 +5,7 @@
 
 import torch
 
-from vllm.config.sm70_sparse import sparse_policy
+from vllm.config.sm70_sparse import Sm70SparseConfig, sparse_policy
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     quantize_and_insert_k_cache,
 )
@@ -211,8 +211,14 @@ def sm70_qnorm_rope_kv_fp8_insert(
     cos_sin_cache: torch.Tensor,
     eps: float,
     block_size: int,
+    *,
+    policy: Sm70SparseConfig | None = None,
 ) -> torch.Tensor:
-    """Apply the V4 Q/KV transform using FP16 compute on exact SM70."""
+    """Apply the V4 Q/KV transform using FP16 compute on exact SM70.
+
+    Callers outside a forward context pass their engine's ``policy``; without
+    it the lookup there would build a standalone policy on every call.
+    """
     assert q.dtype == torch.float16 and kv.dtype == torch.float16, (
         f"SM70 DeepSeek V4 requires FP16 Q/KV, got {q.dtype} and {kv.dtype}"
     )
@@ -222,7 +228,7 @@ def sm70_qnorm_rope_kv_fp8_insert(
 
     num_tokens, num_heads, _ = q.shape
     if (
-        sparse_policy().value("qnorm_kv_fused_tp4")
+        (policy if policy is not None else sparse_policy()).value("qnorm_kv_fused_tp4")
         and num_tokens == 1
         and num_heads == 16
     ):

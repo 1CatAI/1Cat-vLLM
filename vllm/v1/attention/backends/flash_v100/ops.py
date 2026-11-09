@@ -43,6 +43,8 @@ _sm70_d256_gqa_architecture_op = None
 _sm70_d256_gqa_architecture_op_checked = False
 _sm70_d256_gqa_architecture_q8192_op = None
 _sm70_d256_gqa_architecture_q8192_op_checked = False
+_sm70_d256_gqa_architecture_q4096_op = None
+_sm70_d256_gqa_architecture_q4096_op_checked = False
 _fp8_e5m2_paged_kv_to_fp16 = None
 _fp8_e5m2_paged_kv_to_fp16_checked = False
 _flash_attn_turboquant_decode_paged = None
@@ -334,6 +336,40 @@ def get_sm70_d256_gqa_architecture_q8192_op():
     return bind_prefill_operation(_sm70_d256_gqa_architecture_q8192_op, 8192)
 
 
+def get_sm70_d256_gqa_architecture_q4096_op():
+    """Load the native Q4096 specialization when the extension provides it."""
+    global _sm70_d256_gqa_architecture_q4096_op
+    global _sm70_d256_gqa_architecture_q4096_op_checked
+    if _sm70_d256_gqa_architecture_q4096_op_checked:
+        return bind_prefill_operation(_sm70_d256_gqa_architecture_q4096_op, 4096)
+
+    _sm70_d256_gqa_architecture_q4096_op_checked = True
+    op_name = "sm70_d256_gqa_architecture_q4096_fwd"
+    try:
+        if not hasattr(torch.ops._vllm_fa2_C, op_name):
+            get_sm70_splitd_d256_ops()
+        if not _sm70_gqa_has_fp32_accumulation():
+            _sm70_d256_gqa_architecture_q4096_op = None
+            return None
+        _sm70_d256_gqa_architecture_q4096_op = getattr(
+            torch.ops._vllm_fa2_C,
+            op_name,
+            None,
+        )
+    except (AttributeError, ImportError, RuntimeError):
+        _sm70_d256_gqa_architecture_q4096_op = None
+    return bind_prefill_operation(_sm70_d256_gqa_architecture_q4096_op, 4096)
+
+
+def get_sm70_splitd_d256_splitkv_op():
+    """Runtime split-count variant of split-KV3; absent from older FA2 builds."""
+    if get_sm70_splitd_d256_ops() is None:
+        return None
+    return getattr(
+        torch.ops._vllm_fa2_C, "sm70_d256_splitd_n32_dense_splitkv_fwd", None
+    )
+
+
 def get_sm70_v37_e4m3_bridge_op():
     """Resolve the format-specific bridge from the same FA2 runtime."""
     # E4M3 storage conversion is independent of the dense compute kernel.
@@ -462,6 +498,9 @@ LEGACY_ALIASES = {
     "_get_sm70_d256_gqa_architecture_q8192_op": (
         "get_sm70_d256_gqa_architecture_q8192_op"
     ),
+    "_get_sm70_d256_gqa_architecture_q4096_op": (
+        "get_sm70_d256_gqa_architecture_q4096_op"
+    ),
     "_get_flash_grouped_verify_op": "get_flash_grouped_verify_op",
     "_get_flash_ops": "get_flash_ops",
 }
@@ -477,5 +516,6 @@ if TYPE_CHECKING:
     _get_sm70_splitd_d256_ops = get_sm70_splitd_d256_ops
     _callable_accepts_keyword = callable_accepts_keyword
     _get_sm70_d256_gqa_architecture_q8192_op = get_sm70_d256_gqa_architecture_q8192_op
+    _get_sm70_d256_gqa_architecture_q4096_op = get_sm70_d256_gqa_architecture_q4096_op
     _get_flash_grouped_verify_op = get_flash_grouped_verify_op
     _get_flash_ops = get_flash_ops

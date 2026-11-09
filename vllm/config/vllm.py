@@ -1187,7 +1187,12 @@ class VllmConfig:
         )
         self.kernel_config.capture_provider_inputs()
         self.kernel_config.sm70_nvfp4.resolve(
-            qualified=sm70_dflash2_nvfp4_qualified(self), active=False
+            qualified=sm70_dflash2_nvfp4_qualified(self),
+            active=False,
+            enforce_eager=(
+                self.model_config is not None and self.model_config.enforce_eager
+            ),
+            kv_cache_memory_bytes=self.cache_config.kv_cache_memory_bytes,
         )
         if self.model_config is not None and self.model_config.quantization == "awq":
             self.kernel_config.sm70_awq.resolve()

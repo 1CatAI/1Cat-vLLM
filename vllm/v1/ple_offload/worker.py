@@ -41,7 +41,7 @@ import zmq
 from cuda.bindings import driver as cuda_driver
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -384,10 +384,13 @@ def _init_offload_distributed() -> None:
     # initialize_model_parallel reads the active VllmConfig in the current
     # vLLM version. Explicitly configure DP1/TP1/PP1 to match the isolated
     # world, regardless of any DP environment variables inherited from the GPU
-    # worker. The real DP/TP configuration is used later for model construction,
-    # registration, and request routing.
-    offload_config = VllmConfig()
-    offload_parallel_config = offload_config.parallel_config
+    # worker. ParallelConfig takes those variables at construction and
+    # VllmConfig.__post_init__ derives the participating devices from them, so
+    # the parallel config is reduced to DP1 before the VllmConfig is built: a DP
+    # rank that sees only its own GPU would otherwise look up the device at its
+    # inherited local DP rank. The real DP/TP configuration is used later for
+    # model construction, registration, and request routing.
+    offload_parallel_config = ParallelConfig()
     offload_parallel_config.data_parallel_size = 1
     offload_parallel_config.data_parallel_size_local = 1
     offload_parallel_config.data_parallel_rank = 0
@@ -400,6 +403,7 @@ def _init_offload_distributed() -> None:
     offload_parallel_config.world_size = 1
     offload_parallel_config.nnodes = 1
     offload_parallel_config.node_rank = 0
+    offload_config = VllmConfig(parallel_config=offload_parallel_config)
     with set_current_vllm_config(offload_config):
         ensure_model_parallel_initialized(
             tensor_model_parallel_size=1,
@@ -931,11 +935,14 @@ class PleOffloadRunner:
         if set(self._worker_targets) != {0} or len(self._layers) != 1:
             return "requires_one_dp_rank_and_one_ple_layer"
         layer = next(iter(self._layers.values()))
-        reader = getattr(getattr(layer, "ngram_embedding", None), "_cpu_reader", None)
-        if reader is None or reader.source_type != 20:
-            return "requires_cpu_owned_iq4nl_rows"
-        if getattr(layer, "_packed_result_layout", None) is None:
-            return "requires_packed_results"
+        if self._fast_lane_fp8_shards(layer) is None:
+            reader = getattr(
+                getattr(layer, "ngram_embedding", None), "_cpu_reader", None
+            )
+            if reader is None or reader.source_type != 20:
+                return "requires_cpu_owned_iq4nl_rows"
+            if getattr(layer, "_packed_result_layout", None) is None:
+                return "requires_packed_results"
         if getattr(layer, "_cascade", False):
             # Packed rows split across device/host tiers merge in Python.
             return "tiered_cascade_uses_the_python_owner"
@@ -945,6 +952,24 @@ class PleOffloadRunner:
         if any(t.cpu_output_buffer is None for t in targets):
             return "requires_mapped_result_transport"
         return None
+
+    @staticmethod
+    def _fast_lane_fp8_shards(layer) -> tuple[list[int], int, int, int] | None:
+        """(shard pointers, rows per shard, row bytes, rows) of a whole-table
+        FP8 disk layer whose results are raw rows in n-gram id order."""
+        pointers = list(getattr(layer, "_disk_shard_pointers", None) or [])
+        if (
+            not pointers
+            or getattr(layer, "_cascade", False)
+            or getattr(layer, "_packed_result_layout", None) is not None
+        ):
+            return None
+        return (
+            pointers,
+            int(layer._disk_shard_size),
+            int(layer.head_dim),
+            int(layer.ngram_embedding.org_vocab_size),
+        )
 
     @staticmethod
     def _native_draft_ring(registrations: list[PleOffloadRegistration]):
@@ -969,17 +994,25 @@ class PleOffloadRunner:
         assert registration.fast_lane_geometry is not None
         max_reqs, max_tokens = registration.fast_lane_geometry
         layer = next(iter(self._layers.values()))
-        reader = layer.ngram_embedding._cpu_reader
         targets = sorted(
             next(iter(self._worker_targets[0].values())), key=lambda t: t.tp_rank
         )
+        fp8 = self._fast_lane_fp8_shards(layer)
+        if fp8 is not None:
+            shard_ptrs, shard_rows, row_bytes, num_rows = fp8
+            table_ptr = shard_ptrs[0]
+        else:
+            reader = layer.ngram_embedding._cpu_reader
+            shard_ptrs, shard_rows = [], 0
+            table_ptr = reader.data.ctypes.data
+            row_bytes, num_rows = reader.data.shape[1], reader.logical_rows
         handle = torch.ops._C.ple_fast_lane_start(
             request,
             max_reqs,
             max_tokens,
-            reader.data.ctypes.data,
-            reader.data.shape[1],
-            reader.logical_rows,
+            table_ptr,
+            row_bytes,
+            num_rows,
             layer.layer_multipliers.tolist(),
             layer.ngram_heads_vocab_sizes.tolist(),
             layer.ngram_heads_offsets.tolist(),
@@ -990,10 +1023,15 @@ class PleOffloadRunner:
             50_000,
             self._clamp_input_ids,
             *self._native_draft_ring(registrations),
+            shard_ptrs,
+            shard_rows,
+            fp8 is None,
         )
         self._fast_lane = FastLaneOwner(request, handle)
         logger.info(
-            "PLE fast lane serving %d TP result buffer(s) natively.", len(targets)
+            "PLE fast lane serving %d TP result buffer(s) natively (%s rows).",
+            len(targets),
+            "IQ4_NL" if fp8 is None else f"FP8 x{len(shard_ptrs)} shards",
         )
 
     def _start_draft_prefetch(self, registrations: list[PleOffloadRegistration]):

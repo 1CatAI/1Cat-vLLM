@@ -30,10 +30,12 @@ class _FakeRunner:
         self._device = device
         self.calls = 0
         self.graph_calls = 0
+        self.inference_modes: list[bool] = []
         self._kept: list[torch.Tensor] = []
 
     def profile_run(self) -> None:
         self.calls += 1
+        self.inference_modes.append(torch.is_inference_mode_enabled())
         if self.calls == 1:
             scratch = torch.empty(1024 * MiB, dtype=torch.uint8, device=self._device)
             self._kept.append(
@@ -95,8 +97,11 @@ def test_kv_budget_ignores_cold_compile_scratch(
     worker.vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(
             cudagraph_mode=graph_mode,
+            cudagraph_capture_sizes=None,
             runtime=GraphPolicy(estimate_graph_memory=estimate_graphs),
-        )
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        speculative_config=None,
     )
     runner = _FakeRunner(device, weights_bytes)
     worker.model_runner = runner
@@ -117,6 +122,8 @@ def test_kv_budget_ignores_cold_compile_scratch(
     )
     assert abs(charged - 64 * MiB) <= 32 * MiB
     assert runner.calls == 2
+    # With autograd on, an encoder forward keeps every block's activations alive.
+    assert runner.inference_modes == [True, True]
     assert runner.graph_calls == int(graph_bytes > 0)
     assert worker.cudagraph_memory_estimate == graph_bytes
     del weights

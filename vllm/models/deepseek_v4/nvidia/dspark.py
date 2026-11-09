@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.sm70_sparse import Sm70SparseConfig, sparse_policy
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -108,6 +109,9 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
+        # Context KV is precomputed outside the forward context, so the drafter
+        # keeps its engine's sparse policy instead of looking it up per call.
+        self._sparse_policy = sparse_policy(vllm_config)
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         self.hidden_size = config.hidden_size
@@ -216,7 +220,9 @@ class DSparkDeepseekV4Model(nn.Module):
             qr_kv, _ = attn.fused_wqa_wkv(main_x)
             kv = attn.kv_norm(qr_kv[..., attn.q_lora_rank :]).contiguous()
             if slot_mapping is not None:
-                _insert_context_kv(attn, kv, context_positions, slot_mapping)
+                _insert_context_kv(
+                    attn, kv, context_positions, slot_mapping, self._sparse_policy
+                )
 
     def forward(
         self,
@@ -257,6 +263,7 @@ def _insert_context_kv(
     kv: torch.Tensor,
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
+    policy: Sm70SparseConfig | None,
 ) -> None:
     mla = attn.mla_attn
     cache_layer = mla.swa_cache_layer
@@ -280,6 +287,7 @@ def _insert_context_kv(
             attn.rotary_emb.cos_sin_cache,
             attn.eps,
             cache_layer.block_size,
+            policy=policy,
         )
         return
 

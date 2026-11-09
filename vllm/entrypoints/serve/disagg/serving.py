@@ -27,7 +27,11 @@ from vllm.entrypoints.openai.engine.protocol import (
     RequestResponseMetadata,
     UsageInfo,
 )
-from vllm.entrypoints.openai.engine.serving import OpenAIServing, clamp_prompt_logprobs
+from vllm.entrypoints.openai.engine.serving import (
+    OpenAIServing,
+    clamp_prompt_logprobs,
+    drop_misaligned_logprobs,
+)
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.disagg.mm_serde import decode_mm_kwargs_item
 from vllm.entrypoints.serve.disagg.protocol import (
@@ -307,7 +311,10 @@ class ServingTokens(OpenAIServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
-        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
+        if (
+            self.enable_prompt_tokens_details
+            and final_res.num_cached_tokens is not None
+        ):
             # This info is not available at the /coordinator level
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
@@ -424,7 +431,7 @@ class ServingTokens(OpenAIServing):
                 total_tokens=num_prompt_tokens + total_completion_tokens,
             )
 
-            if self.enable_prompt_tokens_details and num_cached_tokens:
+            if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
                     cached_tokens=num_cached_tokens
                 )
@@ -458,6 +465,7 @@ class ServingTokens(OpenAIServing):
         """Create OpenAI-style logprobs."""
         logprobs_content: list[ChatCompletionLogProbsContent] = []
 
+        top_logprobs = drop_misaligned_logprobs(token_ids, top_logprobs)
         for i, token_id in enumerate(token_ids):
             token = f"token_id:{token_id}"
             step_top_logprobs = top_logprobs[i]

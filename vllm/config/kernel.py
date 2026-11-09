@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import asdict, fields
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from vllm.config.execution_policy import LayerExecutionPolicy
 from vllm.config.gdn import GdnConfig
@@ -254,6 +254,12 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     """Captured native selectors/tuning; unused formats do not affect graph keys."""
     qpn4: bool | None = None
     """Retain the shape/model-qualified QPN4 provider."""
+    qpn4_lazy_dense_workspace: bool | None = None
+    """Auto uses native temporary scratch for eager, automatically profiled KV.
+
+    True forces temporary scratch; False forces the resident workspace.
+    Both paths retain load-time workspace admission and QPN4 qualification.
+    """
     dense_qpn2: bool = True
     """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
     qpn2: bool | None = None
@@ -274,13 +280,34 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     loader_aliases: ClassVar[dict[str, str]] = SM70_LOADER_ALIASES["nvfp4"]
     input_aliases: ClassVar[tuple[str, ...]] = (*SM70_NVFP4_LINEAR_ALIASES.values(),)
 
-    def resolve(self, *, qualified: bool, active: bool = True) -> None:
+    def resolve(
+        self,
+        *,
+        qualified: bool,
+        active: bool = True,
+        enforce_eager: bool = False,
+        kv_cache_memory_bytes: int | None = None,
+    ) -> None:
         self.capture_inputs()
 
         self.active = self.active or active
         if self.resolved:
             return
         self.qualified = qualified
+        workspace_field = "qpn4_lazy_dense_workspace"
+        self.sources[workspace_field] = (
+            "configuration"
+            if self.qpn4_lazy_dense_workspace is not None
+            else "auto:eager-profile"
+            if enforce_eager and kv_cache_memory_bytes is None
+            else "auto:resident"
+        )
+        if self.qpn4_lazy_dense_workspace is None:
+            # Fixed KV budgets skip peak-memory deduction. Graph pools can
+            # retain temporary scratch, so auto keeps their resident contract.
+            self.qpn4_lazy_dense_workspace = (
+                enforce_eager and kv_cache_memory_bytes is None
+            )
         defaults = {
             "qpn2": qualified,
             "prefill": qualified,
@@ -528,6 +555,14 @@ class Sm70GgufConfig:
     are copied in by a native host thread while the step waits in-graph; LRU
     keeps the slots hot. Prefill assembles each layer's full bank. Off at 0."""
 
+    expert_cache_host_storage: Literal["rank_local", "shared_original"] = "rank_local"
+    """Host expert representation. ``shared_original`` uses one unsliced GGUF
+    cold pool per local TP4 group, with a single native swap coordinator."""
+
+    expert_cache_offload_fraction: float = Field(default=0.30, gt=0.0, lt=1.0)
+    """Actual fraction of cold experts in ``shared_original`` mode. GPU spare
+    slots are additional capacity and do not reduce this fraction."""
+
     expert_cache_spare_slots: int = Field(default=8, ge=1, le=64)
     """Free GPU slots kept per layer so decode misses never wait on eviction."""
 
@@ -615,6 +650,28 @@ class Sm70GgufConfig:
         if value <= 0:
             raise ValueError("GGUF prefill_min_m must be positive")
         return value
+
+    @model_validator(mode="after")
+    def validate_shared_expert_storage(self) -> "Sm70GgufConfig":
+        self.check_shared_expert_storage()
+        return self
+
+    def check_shared_expert_storage(self) -> None:
+        if self.expert_cache_host_storage == "shared_original":
+            if self.expert_storage != "original" or not self.expert_arena:
+                raise ValueError("shared_original requires original experts and arena")
+            if self.expert_cache_fraction or self.expert_cache_host_slack:
+                raise ValueError(
+                    "shared_original requires expert_cache_fraction=0 and "
+                    "expert_cache_host_slack=0; use expert_cache_offload_fraction"
+                )
+            if self.expert_cache_profile is not None:
+                raise ValueError("shared_original currently uses deterministic hot ids")
+            if (
+                self.expert_cache_prefill != "turbomind"
+                or self.expert_cache_prefill_prepare != "all"
+            ):
+                raise ValueError("shared_original requires complete TurboMind prefill")
 
 
 @config
@@ -853,6 +910,10 @@ class KernelConfig:
         """Platform-neutral view of ``sm70_gdn_spec_replay`` for generic GDN
         and Mamba layers."""
         return self.sm70_gdn_spec_replay
+
+    sm70_round_cost_diagnostics: bool = False
+    """Record bounded decode routing histories for a byte/instruction cost
+    ledger. Extra diagnostic kernels invalidate latency measurements."""
 
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,

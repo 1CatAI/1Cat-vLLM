@@ -42,19 +42,25 @@ def test_dynamic_prefill_and_batch_keep_fp16_graph_route():
         fullgraph=True,
         dynamic=True,
     )
-    for rows in [12, 8, 7, 32, 8, 128]:
+    for rows in [12, 8, 7, 32, 16, 8, 24, 40, 128]:
         x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16) * 0.1
         actual = compiled(x)
         assert torch.isfinite(actual).all()
-        if rows != 8:
+        if rows % 8 or rows > 32:
             # The compiled dynamic graph must preserve the original matrix,
-            # rather than silently applying FP8 to prefill or concurrency.
+            # rather than silently applying FP8 to prefill or partial blocks.
             expected = F.linear(x, original)
             assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
         else:
             expected = apply_dflash2_fp8_m8(layer, x, None)
             assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
             assert not torch.equal(actual, F.linear(x, original))
+            # Each request's eight rows match what it gets drafting alone.
+            for row in range(0, rows, 8):
+                alone = apply_dflash2_fp8_m8(layer, x[row : row + 8], None)
+                assert torch.equal(
+                    actual[row : row + 8].view(torch.int16), alone.view(torch.int16)
+                )
     assert len(compilations) == 1
     x = torch.randn(8, 5120, device="cuda", dtype=torch.float16) * 0.1
     graph = torch.cuda.CUDAGraph()
@@ -67,7 +73,8 @@ def test_dynamic_prefill_and_batch_keep_fp16_graph_route():
             output.view(torch.int16),
             apply_dflash2_fp8_m8(layer, x, None).view(torch.int16),
         )
-    assert apply_dflash2_fp8_m8(layer, x.repeat(4, 1), None) is None
+    assert apply_dflash2_fp8_m8(layer, x.repeat(5, 1), None) is None
+    assert apply_dflash2_fp8_m8(layer, x[:7], None) is None
     assert apply_dflash2_fp8_m8(layer, x.T.contiguous().T, None) is None
     assert apply_dflash2_fp8_m8(layer, x.unsqueeze(0), None) is None
 

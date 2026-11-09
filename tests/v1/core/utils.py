@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
@@ -40,6 +42,23 @@ def mock_kv(matched_tokens: int, is_async: bool):
     return MockKVConfig(matched_tokens=matched_tokens, is_async=is_async)
 
 
+def pretend_gpu_count(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
+    """Let a scheduler test build a config for more GPUs than are visible.
+
+    Every pretended GPU answers capability probes like the first one, so the
+    runtime policy defaults never ask the platform about a GPU that is not there.
+    """
+    from vllm.platforms import current_platform
+
+    first_gpu_is = current_platform.is_device_capability
+    monkeypatch.setattr(current_platform, "device_count", lambda: count)
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda capability, device_id=None: first_gpu_is(capability, device_id=0),
+    )
+
+
 def create_scheduler(
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,
@@ -48,6 +67,8 @@ def create_scheduler(
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
     long_prefill_token_threshold_adaptive: bool = False,
+    short_prompt_chunk_tokens: int = 0,
+    short_prompt_threshold: int = 0,
     disable_chunked_mm_input: bool = False,
     use_kv_connector: None | bool | str | MockKVConfig = None,
     num_blocks: int = 10000,
@@ -60,6 +81,7 @@ def create_scheduler(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    device_config: DeviceConfig | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -73,6 +95,8 @@ def create_scheduler(
       long_prefill_token_threshold: cap on prefill chunk size
       long_prefill_token_threshold_adaptive: floor the cap at a
                              fair share of the token budget
+      short_prompt_chunk_tokens / short_prompt_threshold: chunk size of
+                             prompts whose uncached part is shorter
 
     Returns:
       {class}`Scheduler` instance
@@ -92,6 +116,8 @@ def create_scheduler(
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
         long_prefill_token_threshold_adaptive=long_prefill_token_threshold_adaptive,
+        short_prompt_chunk_tokens=short_prompt_chunk_tokens,
+        short_prompt_threshold=short_prompt_threshold,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
@@ -143,6 +169,7 @@ def create_scheduler(
     )
 
     vllm_config = VllmConfig(
+        device_config=device_config or DeviceConfig(),
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,

@@ -7,9 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
-from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config.diagnostic_dump import parse_int_filter
-from vllm.config.execution_policy import communication_policy, graph_policy
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.diagnostics import (
     diagnostic_channel,
@@ -48,6 +46,9 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
+)
+from vllm.model_executor.layers.fused_moe.sm70.communication import (
+    can_use_sum2_allreduce,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -342,6 +343,19 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> FusedMoE layer lookup in custom ops.
         self.layer_name = layer_name
 
+        from vllm.config import get_current_vllm_config_or_none
+
+        cost_config = get_current_vllm_config_or_none()
+        if (
+            cost_config is not None
+            and cost_config.kernel_config.sm70_round_cost_diagnostics
+        ):
+            from vllm.sm70_round_cost import attach_route_recorder
+
+            parameter = next(gate.parameters(), None) if gate is not None else None
+            if parameter is not None and parameter.device.type == "cuda":
+                attach_route_recorder(self.router, layer_name, parameter.device)
+
         self._forward_entry = self._select_forward()
 
     def _select_forward(self) -> Callable:
@@ -494,49 +508,13 @@ class MoERunner(MoERunnerInterface):
 
         return states[..., :trunc_size]
 
-    def _can_use_sm70_moe_sum2_allreduce(
-        self,
-        shared_output: torch.Tensor | None,
-        fused_output: torch.Tensor,
-    ) -> bool:
-        if shared_output is None:
-            return False
-        if graph_policy().dual_compile and not use_sm70_decode_graph_semantics():
-            return False
-        if not current_platform.is_cuda():
-            return False
-        if self.moe_config.is_sequence_parallel:
-            return False
-        if self._fused_output_is_reduced:
-            return False
-        if self.moe_config.tp_size <= 1:
-            return False
-        if self.moe_config.ep_size != 1 or self.moe_config.pcp_size != 1:
-            return False
-        if (
-            shared_output.shape != fused_output.shape
-            or shared_output.dtype != fused_output.dtype
-        ):
-            return False
-
-        tp_size = self.moe_config.tp_size
-        glm53_q8 = bool(
-            communication_policy().value("moe_sum2_q8")
-            and tp_size == 8
-            and shared_output.dtype == torch.float16
-            and tuple(shared_output.shape) == (8, 4096)
-        )
-        if not communication_policy().moe_add_allreduce and not glm53_q8:
-            return False
-        return tp_size in (2, 4, 6, 8)
-
     def _maybe_sm70_moe_sum2_allreduce(
         self,
         shared_output: torch.Tensor | None,
         fused_output: torch.Tensor,
         trunc_size: int,
     ) -> torch.Tensor | None:
-        if not self._can_use_sm70_moe_sum2_allreduce(shared_output, fused_output):
+        if not can_use_sum2_allreduce(self, shared_output, fused_output):
             return None
         assert shared_output is not None
         if capture_runtime_trace().profile_trace and not torch.compiler.is_compiling():

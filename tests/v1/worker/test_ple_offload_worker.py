@@ -399,6 +399,7 @@ def test_ple_offload_uses_event_per_inflight_mrv2_batch() -> None:
     connector = PleOffloadConnector.__new__(PleOffloadConnector)
     connector.tp_rank = 0
     connector.dp_rank = 0
+    connector.fast_lane = None
     connector._uses_cuda_inputs = True
     connector._request_queue = queue.Queue(maxsize=2)
     connector._d2h_event_pool = queue.Queue(maxsize=2)
@@ -606,7 +607,7 @@ def test_ple_offload_requires_ple_layers(
     worker.model_config = SimpleNamespace(  # type: ignore[assignment]
         hf_text_config=SimpleNamespace(ple_layer_ids=ple_layer_ids)
     )
-    monkeypatch.setattr(envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
 
     assert worker._has_ple_layers() is expected
 
@@ -776,9 +777,12 @@ def test_offload_distributed_sets_config_only_for_model_parallel(
 
     # The Offload subprocess may inherit DP environment variables from a GPU
     # worker, but its isolated model-parallel world must always remain DP1.
-    monkeypatch.setattr(envs, "VLLM_DP_SIZE", 2)
-    monkeypatch.setattr(envs, "VLLM_DP_RANK", 1)
-    monkeypatch.setattr(envs, "VLLM_DP_RANK_LOCAL", 1)
+    # Through the environment, not as envs attributes: VLLM_DP_RANK_LOCAL
+    # defaults to VLLM_DP_RANK, so restoring it as an attribute would leave
+    # local DP rank 1 behind for the rest of the process.
+    set_lazy_env(monkeypatch, "VLLM_DP_SIZE", "2")
+    set_lazy_env(monkeypatch, "VLLM_DP_RANK", "1")
+    set_lazy_env(monkeypatch, "VLLM_DP_RANK_LOCAL", "1")
 
     monkeypatch.setattr(
         ple_offload_worker.dist,
@@ -863,6 +867,7 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
             dtype=torch.float32,
             hf_text_config=SimpleNamespace(ple_embed_dim=2),
         ),
+        kernel_config=SimpleNamespace(ple_fast_lane=False),
     )
     runner._layers = {
         "ple": SimpleNamespace(
@@ -1148,6 +1153,58 @@ def test_ple_layer_keeping_local_tables_initializes_and_merges_itself(
 
     monkeypatch.setattr(ple_offload_layer, "is_offload_process", lambda: True)
     assert _LocalTablesPleLayer.get_target_device() == torch.device("cpu")
+
+
+class _ConfigBoundLocalTablesPleLayer(_WeightLoadingPleLayer):
+    """Keeps local tables only while the engine config is current.
+
+    The Qwen4Exp cascade reads ``kernel_config.ple_disk_cascade_active`` from
+    the current config, which the GPU worker sets around construction and
+    loading but not around the forward.
+    """
+
+    config_current = True
+
+    @classmethod
+    def offload_keeps_local_tables(cls) -> bool:
+        return cls.config_current
+
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        del args, kwargs
+        # Ids below 5 are resident; the worker serves the rest.
+        remote = self.wait_offloaded_output(hidden_states, input_ids.shape[0])
+        ids = input_ids.unsqueeze(-1)
+        return torch.where(ids < 5, ids, remote)
+
+
+def test_ple_layer_merges_local_tables_outside_the_engine_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_lazy_env(monkeypatch, "VLLM_PLE_CPU_OFFLOAD", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_HYBRID_PLE", None)
+    monkeypatch.setattr(ple_offload_layer, "is_offload_process", lambda: False)
+
+    layer = _ConfigBoundLocalTablesPleLayer()
+    assert layer.weight.shape == (2,)
+
+    # The worker writes only the slots of the ids it serves (5 and 6); the
+    # resident slot keeps what the buffer held.
+    worker_buffer = torch.tensor([[0], [5], [6]])
+    monkeypatch.setattr(
+        layer, "wait_offloaded_output", lambda hidden, num_tokens: worker_buffer
+    )
+    layer._is_cpu_offloaded = True
+    # The forward has to merge the tables the constructor built, even though
+    # the classmethod answers differently once the config is gone.
+    monkeypatch.setattr(_ConfigBoundLocalTablesPleLayer, "config_current", False)
+    output = layer(torch.zeros(3), torch.tensor([4, 5, 6]))
+    assert torch.equal(output, torch.tensor([[4], [5], [6]]))
 
 
 def test_ple_offload_runner_binds_remote_placements_per_layer() -> None:

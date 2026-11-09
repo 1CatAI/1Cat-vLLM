@@ -122,14 +122,16 @@ from .utils import (
 logger = init_logger(__name__)
 
 
-@triton.jit
+# Prefill chunks can have any length. Keep the row count out of the
+# specialization, or every new length compiles a kernel while a request waits.
+@triton.jit(do_not_specialize=["num_rows"])
 def _sm70_qwen35_gdn_split_kernel(
     mixed_qkvz,
     mixed_ba,
     output,
     stride_qkvz_row: tl.int64,
     stride_ba_row: tl.int64,
-    num_rows: tl.constexpr,
+    num_rows: tl.int64,
     qkv_size: tl.constexpr,
     z_size: tl.constexpr,
     ba_size: tl.constexpr,

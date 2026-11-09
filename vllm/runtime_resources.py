@@ -8,7 +8,9 @@ input. A forward borrows the same owners, never a copy of their mutable state.
 """
 
 from contextlib import ExitStack, contextmanager
-from typing import Any
+from typing import Any, TypeVar
+
+_Config = TypeVar("_Config")
 
 
 class _RuntimeResources(dict[str, Any]):
@@ -68,6 +70,21 @@ def current_runtime_resources() -> dict[str, Any] | None:
 
     config = get_current_vllm_config_or_none()
     return runtime_resources_for(config) if config is not None else None
+
+
+def share_runtime_resources(derived: _Config, parent: Any) -> _Config:
+    """Let a config derived from `parent` for the same worker borrow its
+    resources and return it.
+
+    `dataclasses.replace` does not carry this private map, so a drafter built
+    from a copy of the target's config would bind its native owners to a fresh
+    map, while it runs in the target's forward context, which activates only
+    the target's owners.
+    """
+    # A private map outside the declared config fields, as in
+    # runtime_resources_for: never serialized or hashed.
+    setattr(derived, "_runtime_resources", runtime_resources_for(parent))  # noqa: B010
+    return derived
 
 
 def release_runtime_resources(config) -> None:

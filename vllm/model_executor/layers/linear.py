@@ -332,6 +332,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # ParallelLMHead does not inherit LinearBase. Bind the same per-layer
+        # snapshots once during preparation, before any provider can return.
+        if not hasattr(layer, "_layer_execution_policy"):
+            layer._layer_execution_policy = layer_policy()
+        if not hasattr(layer, "_layer_trace"):
+            layer._layer_trace = capture_runtime_trace()
         if current_platform.is_cpu():
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 

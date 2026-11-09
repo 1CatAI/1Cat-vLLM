@@ -5,6 +5,24 @@
 #include <torch/all.h>
 #include "cuda_utils.h"
 #include "ops.h"
+
+void gguf_v41_swiglu_q8_sm70_out(torch::Tensor out, torch::Tensor projection,
+                                 torch::Tensor probabilities);
+void deepseek_v41_swiglu_sm70_out(torch::Tensor out, torch::Tensor gate,
+                                  torch::Tensor up);
+void gguf_v41_dp4a_gate_reuse_sm70_out(torch::Tensor out,
+                                       torch::Tensor activation,
+                                       torch::Tensor ids, torch::Tensor gate,
+                                       torch::Tensor up, int64_t source_type);
+void gguf_v41_dp4a_gate_adaptive_sm70_out(torch::Tensor out,
+                                          torch::Tensor activation,
+                                          torch::Tensor ids, torch::Tensor gate,
+                                          torch::Tensor up,
+                                          int64_t source_type);
+void gguf_v41_dp4a_q8_down_tiled_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor ids,
+    torch::Tensor probabilities, torch::Tensor weights, int64_t source_type,
+    int64_t left, int64_t tiles);
 #include "core/registration.h"
 #include <torch/library.h>
 #include <torch/version.h>
@@ -214,7 +232,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int[] sizes, int[] offsets, int eos, int[] result_ptrs, "
       "int[] flag_ptrs, int cache_bytes, int idle_spin_us, "
       "bool clamp_tokens, Tensor? draft_ring, int ring_reqs, "
-      "int ring_spec) -> int");
+      "int ring_spec, int[] shard_ptrs=[], int shard_rows=0, "
+      "bool iq4_rows=True) -> int");
   ops.impl("ple_fast_lane_start", torch::kCPU, &ple_fast_lane_start);
   ops.def("ple_fast_lane_stats(int handle) -> Tensor");
   ops.impl("ple_fast_lane_stats", &ple_fast_lane_stats);
@@ -390,6 +409,36 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int left=0) -> ()");
   ops.impl("gguf_dp4a_raw_down_unroute_sm70_out", torch::kCUDA,
            &gguf_dp4a_raw_down_unroute_sm70_out);
+  // Distinct names let V4.1 admission reject older prebuilt extensions.
+  ops.def(
+      "gguf_v41_dp4a_down_sm70_out(Tensor(a!) out, Tensor input, Tensor ids, "
+      "Tensor probabilities, Tensor weights, int source_type, int left=0) -> "
+      "()");
+  ops.impl("gguf_v41_dp4a_down_sm70_out", torch::kCUDA,
+           &gguf_dp4a_raw_down_unroute_sm70_out);
+  ops.def(
+      "gguf_v41_dp4a_q8_down_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "ids, "
+      "Tensor probabilities, Tensor weights, int source_type, int left=0) -> "
+      "()");
+  ops.impl("gguf_v41_dp4a_q8_down_sm70_out", torch::kCUDA,
+           &gguf_dp4a_raw_down_unroute_sm70_out);
+  ops.def(
+      "gguf_v41_dp4a_q8_down_tiled_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor ids, Tensor probabilities, Tensor weights, int source_type, "
+      "int left, int tiles=0) -> ()");
+  ops.impl("gguf_v41_dp4a_q8_down_tiled_sm70_out", torch::kCUDA,
+           &gguf_v41_dp4a_q8_down_tiled_sm70_out);
+  ops.def(
+      "gguf_v41_swiglu_q8_sm70_out(Tensor(a!) out, Tensor projection, "
+      "Tensor probabilities) -> ()");
+  ops.impl("gguf_v41_swiglu_q8_sm70_out", torch::kCUDA,
+           &gguf_v41_swiglu_q8_sm70_out);
+  ops.def(
+      "deepseek_v41_swiglu_sm70_out(Tensor(a!) out, Tensor gate, Tensor up) -> "
+      "()");
+  ops.impl("deepseek_v41_swiglu_sm70_out", torch::kCUDA,
+           &deepseek_v41_swiglu_sm70_out);
   ops.def(
       "gguf_dense_restore_canonical_sm70_out(Tensor(a!) weight, Tensor(b!) "
       "stats, "
@@ -438,6 +487,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int lanes_per_row=16, bool bank_aware=False) -> ()");
   ops.impl("gguf_dp4a_gate_up_sm70_out", torch::kCUDA,
            &gguf_dp4a_gate_up_sm70_out);
+  ops.def(
+      "gguf_v41_dp4a_gate_up_sm70_out(Tensor(a!) out, Tensor activation, "
+      "Tensor "
+      "ids, Tensor gate, Tensor up, int source_type, bool activated, "
+      "int lanes_per_row=16, bool bank_aware=False) -> ()");
+  ops.impl("gguf_v41_dp4a_gate_up_sm70_out", torch::kCUDA,
+           &gguf_dp4a_gate_up_sm70_out);
+  ops.def(
+      "gguf_v41_dp4a_gate_reuse_sm70_out(Tensor(a!) out, Tensor activation, "
+      "Tensor ids, Tensor gate, Tensor up, int source_type) -> ()");
+  ops.impl("gguf_v41_dp4a_gate_reuse_sm70_out", torch::kCUDA,
+           &gguf_v41_dp4a_gate_reuse_sm70_out);
+  ops.def(
+      "gguf_v41_dp4a_gate_adaptive_sm70_out(Tensor(a!) out, Tensor activation, "
+      "Tensor ids, Tensor gate, Tensor up, int source_type) -> ()");
+  ops.impl("gguf_v41_dp4a_gate_adaptive_sm70_out", torch::kCUDA,
+           &gguf_v41_dp4a_gate_adaptive_sm70_out);
   ops.def(
       "gguf_dp4a_gate_up_grouped_sm70_out(Tensor(a!) out, Tensor activation, "
       "Tensor ids, Tensor gate, Tensor up, int source_type, "

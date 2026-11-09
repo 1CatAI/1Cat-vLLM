@@ -10,6 +10,7 @@
 #include <ATen/cuda/Exceptions.h>
 #include <cstdlib>
 #include <map>
+#include <tuple>
 #include "shared_workspace.h"
 
 namespace onecat_sm70_prefill {
@@ -34,32 +35,41 @@ std::shared_ptr<ExecutionGate> execution_gate(int device) {
   if (!gate) gate = std::make_shared<ExecutionGate>(device);
   return gate;
 }
-ScoreWorkspace::ScoreWorkspace(const at::Tensor& query, int64_t block_n)
+ScoreWorkspace::ScoreWorkspace(const at::Tensor& query, int64_t block_n,
+                               int64_t rows)
     : block_n(block_n),
-      scores(at::empty({block_n * 8192 * 6}, query.options())),
+      scores(at::empty({block_n * rows}, query.options())),
       gate(execution_gate(query.get_device())),
       mutex(gate->mutex),
       completion(gate->completion),
       completion_recorded(gate->completion_recorded) {}
 ScoreWorkspace::~ScoreWorkspace() = default;
 std::shared_ptr<ScoreWorkspace> get_score_workspace(const at::Tensor& query,
-                                                    int64_t block_n) {
+                                                    int64_t block_n,
+                                                    int64_t rows) {
   const int64_t configured = policy_value(PolicyField::ScoreBlockTokens);
   if (configured != 0) block_n = configured;
   TORCH_CHECK(block_n >= 8192 && block_n <= 16 * 8192 && block_n % 8192 == 0,
               "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS must be a "
               "multiple of 8192 between 8192 and 131072");
+  const bool half_height = rows <= 4096 * 6;
+  const int64_t capacity_rows = half_height ? 4096 * 6 : 8192 * 6;
   if (auto* owner = current_owner()) {
     return owner->workspace<ScoreWorkspace>(
-        CacheSlot::Scores, query.get_device(),
-        [&] { return std::make_shared<ScoreWorkspace>(query, block_n); });
+        half_height ? CacheSlot::Q4096Scores : CacheSlot::Scores,
+        query.get_device(), [&] {
+          return std::make_shared<ScoreWorkspace>(query, block_n,
+                                                  capacity_rows);
+        });
   }
   static std::mutex mutex;
-  static std::map<std::pair<int, int64_t>, std::shared_ptr<ScoreWorkspace>>
+  static std::map<std::tuple<int, int64_t, int64_t>,
+                  std::shared_ptr<ScoreWorkspace>>
       cache;
   std::lock_guard<std::mutex> lock(mutex);
-  auto& entry = cache[{query.get_device(), block_n}];
-  if (!entry) entry = std::make_shared<ScoreWorkspace>(query, block_n);
+  auto& entry = cache[{query.get_device(), block_n, capacity_rows}];
+  if (!entry)
+    entry = std::make_shared<ScoreWorkspace>(query, block_n, capacity_rows);
   return entry;
 }
 }  // namespace onecat_sm70_prefill
@@ -75,6 +85,11 @@ at::Tensor sm70_d256_gqa_architecture_fwd(const at::Tensor& q,
 }
 namespace onecat_79t_q8192 {
 at::Tensor sm70_d256_gqa_architecture_q8192_fwd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, double softmax_scale, bool causal);
+}
+namespace onecat_79t_q4096 {
+at::Tensor sm70_d256_gqa_architecture_q4096_fwd(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     at::Tensor& out, double softmax_scale, bool causal);
 }
@@ -126,29 +141,35 @@ PrefillOwner::PrefillOwner(std::vector<int64_t> values)
 }
 std::vector<int64_t> PrefillOwner::observations() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  return {observations_[0], observations_[1]};
+  return {observations_[0], observations_[1], observations_[2]};
 }
-at::Tensor PrefillOwner::run(bool aligned, at::Tensor q, at::Tensor k,
-                             at::Tensor v, at::Tensor out, double scale,
-                             bool causal) {
+at::Tensor PrefillOwner::run(int kind, at::Tensor q, at::Tensor k, at::Tensor v,
+                             at::Tensor out, double scale, bool causal) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   TORCH_CHECK(!closed_, "SM70 prefill runtime has been closed");
   OwnerScope scope(this);
   auto result =
-      aligned
-          ? onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd(
+      kind == 2
+          ? onecat_79t_q4096::sm70_d256_gqa_architecture_q4096_fwd(
                 q, k, v, out, scale, causal)
-          : flash::sm70_d256_gqa_architecture_fwd(q, k, v, out, scale, causal);
-  ++observations_[aligned ? 1 : 0];
+          : (kind == 1 ? onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd(
+                             q, k, v, out, scale, causal)
+                       : flash::sm70_d256_gqa_architecture_fwd(q, k, v, out,
+                                                               scale, causal));
+  ++observations_[kind];
   return result;
 }
 at::Tensor PrefillOwner::q8000(at::Tensor q, at::Tensor k, at::Tensor v,
                                at::Tensor out, double scale, bool causal) {
-  return run(false, q, k, v, out, scale, causal);
+  return run(0, q, k, v, out, scale, causal);
 }
 at::Tensor PrefillOwner::q8192(at::Tensor q, at::Tensor k, at::Tensor v,
                                at::Tensor out, double scale, bool causal) {
-  return run(true, q, k, v, out, scale, causal);
+  return run(1, q, k, v, out, scale, causal);
+}
+at::Tensor PrefillOwner::q4096(at::Tensor q, at::Tensor k, at::Tensor v,
+                               at::Tensor out, double scale, bool causal) {
+  return run(2, q, k, v, out, scale, causal);
 }
 void PrefillOwner::close() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -179,6 +200,7 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
       .def(torch::init<std::vector<int64_t>>())
       .def("q8000", &onecat_sm70_prefill::PrefillOwner::q8000)
       .def("q8192", &onecat_sm70_prefill::PrefillOwner::q8192)
+      .def("q4096", &onecat_sm70_prefill::PrefillOwner::q4096)
       .def("values", &onecat_sm70_prefill::PrefillOwner::values)
       .def("observations", &onecat_sm70_prefill::PrefillOwner::observations)
       .def("close", &onecat_sm70_prefill::PrefillOwner::close);
@@ -191,9 +213,14 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
   ops.def(
       "sm70_d256_gqa_architecture_q8192_fwd(Tensor q, Tensor k, Tensor v, "
       "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
+  ops.def(
+      "sm70_d256_gqa_architecture_q4096_fwd(Tensor q, Tensor k, Tensor v, "
+      "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
   ops.impl("sm70_d256_gqa_architecture_q8192_fwd",
            &onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd);
+  ops.impl("sm70_d256_gqa_architecture_q4096_fwd",
+           &onecat_79t_q4096::sm70_d256_gqa_architecture_q4096_fwd);
 }
