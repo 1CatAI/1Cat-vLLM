@@ -1,0 +1,99 @@
+{
+  "initial_inventory": {
+    "number": 1013,
+    "title": "Update cupy-cuda13x requirement from <14.1.0 to <14.3.0",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1013",
+    "isDraft": false,
+    "headRefOid": "1c3592f23a27304f8384a2675c1003fe4581effd",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1013,
+    "title": "Update cupy-cuda13x requirement from <14.1.0 to <14.3.0",
+    "body": "Updates the requirements on [cupy-cuda13x](https://github.com/cupy/cupy) to permit the latest version.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a href=\"https://github.com/cupy/cupy/releases\">cupy-cuda13x's releases</a>.</em></p>\n<blockquote>\n<h2>v14.2.0</h2>\n<h1>CuPy v14.2.0 Release Note</h1>\n<p>This release for the CuPy v14 series introduces new features, enhancements, and bug fixes.</p>\n<p>💬 Join the <a href=\"https://matrix.to/#/#cupy_community:gitter.im\">Matrix chat</a> to talk with developers and users and ask quick questions!</p>\n<p>🙌 Help us sustain the project by <a href=\"https://github.com/sponsors/cupy\">sponsoring CuPy</a>!</p>\n<h2>✨ Highlights</h2>\n<h3>SciPy-compatible Sparse Array Classes</h3>\n<p>We are happy to present to you the new sparse array classes, following SciPy counterparts for CPU. We encourage users to migrate from sparse matrices to sparse arrays following <a href=\"https://docs.scipy.org/doc/scipy/reference/sparse.migration_to_sparray.html\">SciPy’s migration guide</a>. New user code should stick to sparse arrays.</p>\n<p>In this release, the supported formats include COO, CSR, CSC, and DIA. All formats support 2D and COO/CSR additionally support 1D. Both 32-bit and 64-bit indexing are supported. See <a href=\"https://docs.cupy.dev/en/stable/reference/scipy_sparse.html\">our sparse array documentation</a> for more information.</p>\n<h3>Windows on Arm Support (experimental)</h3>\n<p>CuPy now offers experimental support for <a href=\"https://docs.nvidia.com/cuda/developer-preview/13.4/cuda-toolkit-release-notes/index.html#rtx-spark-windows-on-arm-preview\">CUDA 13.4 Developer Preview on RTX Spark</a>. Building CuPy from source on WoA (Windows on Arm) is now possible. Experimental WoA wheels <del>will be uploaded to PyPI in a few days after the release</del> are available on PyPI (uploaded on 2026-09-01).</p>\n<h3>Initial integration with nvmath-python</h3>\n<p>As part of tighter coupling with <a href=\"https://developer.nvidia.com/cuda/python\">NVIDIA CUDA Python platform</a>, CuPy has begun the integration with <a href=\"https://docs.nvidia.com/cuda/nvmath-python/latest/index.html\">nvmath-python, NVIDIA Math Libraries for the Python Ecosystem</a>. CuPy can now be built from source against nvmath-python v1.0+ with the environment variable <code>CUPY_USE_CUDA_PYTHON=1</code> to access CUDA math libraries. nvmath-python will become a default dependency in a future CuPy release.</p>\n<h3>Python 3.14 free-threaded Wheels for Windows</h3>\n<p>In addition to the Linux wheels provided in v14.1, CuPy v14.2 now offers Python 3.14t wheels for Windows.</p>\n<h2>📝 Changes</h2>\n<p>See <a href=\"https://github.com/cupy/cupy/pulls?q=is%3Apr+is%3Aclosed+milestone%3Av14.2.0\">here</a> for the complete list of merged PRs.</p>\n<h3>New Features</h3>\n<ul>\n<li>Use nvmath bindings for CUDA library bindings (<a href=\"https://redirect.github.com/cupy/cupy/issues/10112\">#10112</a>)</li>\n<li>ENH: add explicit copy arg to reshape (<a href=\"https://redirect.github.com/cupy/cupy/issues/10147\">#10147</a>)</li>\n<li>Add <code>cumulative_sum</code> and <code>cumulative_prod</code> (Array API) (<a href=\"https://redirect.github.com/cupy/cupy/issues/10200\">#10200</a>)</li>\n</ul>\n<h3>Enhancements</h3>\n<ul>\n<li>TST: Assert cupy.linalg.solve throws LinAlgError (<a href=\"https://redirect.github.com/cupy/cupy/issues/9987\">#9987</a>)</li>\n<li>Define NULL in cupyx.scipy.spatial Delaunay kernel string (<a href=\"https://redirect.github.com/cupy/cupy/issues/9991\">#9991</a>)</li>\n<li>Replace deprecated HIP API calls with their non-deprecated equivalents (<a href=\"https://redirect.github.com/cupy/cupy/issues/9993\">#9993</a>)</li>\n<li>FeistelBijection RawKernel: select &lt;stdint.h&gt; on HIP, keep &lt;cuda/std/cstdint&gt; on CUDA (<a href=\"https://redirect.github.com/cupy/cupy/issues/9994\">#9994</a>)</li>\n<li>Resolve symlinks when deriving ROCm install path from hipcc (<a href=\"https://redirect.github.com/cupy/cupy/issues/9995\">#9995</a>)</li>\n<li>Test with and document support for cusparseLt v0.9.1 (<a href=\"https://redirect.github.com/cupy/cupy/issues/10004\">#10004</a>)</li>\n<li>Provide HIPRTC fallback for cupy.ndarray.byteswap (<a href=\"https://redirect.github.com/cupy/cupy/issues/10006\">#10006</a>)</li>\n<li>Update xsf submodule (<a href=\"https://redirect.github.com/cupy/cupy/issues/10027\">#10027</a>)</li>\n<li>Add SciPy-compatible sparse array classes (sparray) [split 1/3] (<a href=\"https://redirect.github.com/cupy/cupy/issues/10032\">#10032</a>)</li>\n<li>ENH: It seems cooperative groups do not need rdc (anymore) (<a href=\"https://redirect.github.com/cupy/cupy/issues/10038\">#10038</a>)</li>\n</ul>\n\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a href=\"https://github.com/cupy/cupy/commit/dc1552a32f5489bdf6a5a721dfd952a92d47d934\"><code>dc1552a</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10217\">#10217</a> from kmaehashi/bump-docker-v14.2.0</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/dcb70f28fa4e077f4d5992cfb90806a4b45aa7b4\"><code>dcb70f2</code></a> bump version in Dockerfile</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/78bf2c7963882555292483dbe0a35e9d87aba6c1\"><code>78bf2c7</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10209\">#10209</a> from kmaehashi/bump-v14.2.0</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/232d0deaee492cb5e67b8982c1913b4103cd99d8\"><code>232d0de</code></a> bump version to v14.2.0</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/1aee5465e2a0a765497b3dbacada543e0daaac42\"><code>1aee546</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10208\">#10208</a> from chainer-ci/bp-10003-v14-weak-old-fusion</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/2181d94989c8e85bcc3cdf1a0661862fe4924bcc\"><code>2181d94</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10003\">#10003</a> from seberg/weak-old-fusion</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/6de78f4640a6409c95ff21cb4d391f3e306b0ae9\"><code>6de78f4</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10207\">#10207</a> from chainer-ci/bp-10190-v14-ci/pfnci-followups</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/da29eea0b9c7e838acaf06aedd041400a49fbff3\"><code>da29eea</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10190\">#10190</a> from leofang/ci/pfnci-followups</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/82dea1c9c05c542ece6df78cf3f55c5fef092433\"><code>82dea1c</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10206\">#10206</a> from chainer-ci/bp-10205-v14-copilot/generate-gitat...</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/c1975b080bc5a642c32eed6f80a2a72ae6f679ce\"><code>c1975b0</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10203\">#10203</a> from chainer-ci/bp-10177-v14-name-expr-cache-mapping</li>\n<li>Additional commits viewable in <a href=\"https://github.com/cupy/cupy/compare/v1.0.0a1...v14.2.0\">compare view</a></li>\n</ul>\n</details>\n<br />\n\n\nDependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all of the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)\n\n\n</details>",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1013",
+    "isDraft": false,
+    "headRefName": "dependabot/pip/cupy-cuda13x-lt-14.3.0",
+    "headRefOid": "1c3592f23a27304f8384a2675c1003fe4581effd",
+    "baseRefName": "main",
+    "baseRefOid": "2d5078372d7f1de8fc66515b7b758a1a09aedd62",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "dependabot"
+    },
+    "labels": {
+      "nodes": [
+        {
+          "name": "dependencies"
+        }
+      ]
+    }
+  },
+  "discussion": {
+    "number": 1013,
+    "id": "PR_kwDORjYFXs8AAAABHAYnfw",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "1c3592f23a27304f8384a2675c1003fe4581effd",
+    "title": "Update cupy-cuda13x requirement from <14.1.0 to <14.3.0",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1013",
+    "body": "Updates the requirements on [cupy-cuda13x](https://github.com/cupy/cupy) to permit the latest version.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a href=\"https://github.com/cupy/cupy/releases\">cupy-cuda13x's releases</a>.</em></p>\n<blockquote>\n<h2>v14.2.0</h2>\n<h1>CuPy v14.2.0 Release Note</h1>\n<p>This release for the CuPy v14 series introduces new features, enhancements, and bug fixes.</p>\n<p>💬 Join the <a href=\"https://matrix.to/#/#cupy_community:gitter.im\">Matrix chat</a> to talk with developers and users and ask quick questions!</p>\n<p>🙌 Help us sustain the project by <a href=\"https://github.com/sponsors/cupy\">sponsoring CuPy</a>!</p>\n<h2>✨ Highlights</h2>\n<h3>SciPy-compatible Sparse Array Classes</h3>\n<p>We are happy to present to you the new sparse array classes, following SciPy counterparts for CPU. We encourage users to migrate from sparse matrices to sparse arrays following <a href=\"https://docs.scipy.org/doc/scipy/reference/sparse.migration_to_sparray.html\">SciPy’s migration guide</a>. New user code should stick to sparse arrays.</p>\n<p>In this release, the supported formats include COO, CSR, CSC, and DIA. All formats support 2D and COO/CSR additionally support 1D. Both 32-bit and 64-bit indexing are supported. See <a href=\"https://docs.cupy.dev/en/stable/reference/scipy_sparse.html\">our sparse array documentation</a> for more information.</p>\n<h3>Windows on Arm Support (experimental)</h3>\n<p>CuPy now offers experimental support for <a href=\"https://docs.nvidia.com/cuda/developer-preview/13.4/cuda-toolkit-release-notes/index.html#rtx-spark-windows-on-arm-preview\">CUDA 13.4 Developer Preview on RTX Spark</a>. Building CuPy from source on WoA (Windows on Arm) is now possible. Experimental WoA wheels <del>will be uploaded to PyPI in a few days after the release</del> are available on PyPI (uploaded on 2026-09-01).</p>\n<h3>Initial integration with nvmath-python</h3>\n<p>As part of tighter coupling with <a href=\"https://developer.nvidia.com/cuda/python\">NVIDIA CUDA Python platform</a>, CuPy has begun the integration with <a href=\"https://docs.nvidia.com/cuda/nvmath-python/latest/index.html\">nvmath-python, NVIDIA Math Libraries for the Python Ecosystem</a>. CuPy can now be built from source against nvmath-python v1.0+ with the environment variable <code>CUPY_USE_CUDA_PYTHON=1</code> to access CUDA math libraries. nvmath-python will become a default dependency in a future CuPy release.</p>\n<h3>Python 3.14 free-threaded Wheels for Windows</h3>\n<p>In addition to the Linux wheels provided in v14.1, CuPy v14.2 now offers Python 3.14t wheels for Windows.</p>\n<h2>📝 Changes</h2>\n<p>See <a href=\"https://github.com/cupy/cupy/pulls?q=is%3Apr+is%3Aclosed+milestone%3Av14.2.0\">here</a> for the complete list of merged PRs.</p>\n<h3>New Features</h3>\n<ul>\n<li>Use nvmath bindings for CUDA library bindings (<a href=\"https://redirect.github.com/cupy/cupy/issues/10112\">#10112</a>)</li>\n<li>ENH: add explicit copy arg to reshape (<a href=\"https://redirect.github.com/cupy/cupy/issues/10147\">#10147</a>)</li>\n<li>Add <code>cumulative_sum</code> and <code>cumulative_prod</code> (Array API) (<a href=\"https://redirect.github.com/cupy/cupy/issues/10200\">#10200</a>)</li>\n</ul>\n<h3>Enhancements</h3>\n<ul>\n<li>TST: Assert cupy.linalg.solve throws LinAlgError (<a href=\"https://redirect.github.com/cupy/cupy/issues/9987\">#9987</a>)</li>\n<li>Define NULL in cupyx.scipy.spatial Delaunay kernel string (<a href=\"https://redirect.github.com/cupy/cupy/issues/9991\">#9991</a>)</li>\n<li>Replace deprecated HIP API calls with their non-deprecated equivalents (<a href=\"https://redirect.github.com/cupy/cupy/issues/9993\">#9993</a>)</li>\n<li>FeistelBijection RawKernel: select &lt;stdint.h&gt; on HIP, keep &lt;cuda/std/cstdint&gt; on CUDA (<a href=\"https://redirect.github.com/cupy/cupy/issues/9994\">#9994</a>)</li>\n<li>Resolve symlinks when deriving ROCm install path from hipcc (<a href=\"https://redirect.github.com/cupy/cupy/issues/9995\">#9995</a>)</li>\n<li>Test with and document support for cusparseLt v0.9.1 (<a href=\"https://redirect.github.com/cupy/cupy/issues/10004\">#10004</a>)</li>\n<li>Provide HIPRTC fallback for cupy.ndarray.byteswap (<a href=\"https://redirect.github.com/cupy/cupy/issues/10006\">#10006</a>)</li>\n<li>Update xsf submodule (<a href=\"https://redirect.github.com/cupy/cupy/issues/10027\">#10027</a>)</li>\n<li>Add SciPy-compatible sparse array classes (sparray) [split 1/3] (<a href=\"https://redirect.github.com/cupy/cupy/issues/10032\">#10032</a>)</li>\n<li>ENH: It seems cooperative groups do not need rdc (anymore) (<a href=\"https://redirect.github.com/cupy/cupy/issues/10038\">#10038</a>)</li>\n</ul>\n\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a href=\"https://github.com/cupy/cupy/commit/dc1552a32f5489bdf6a5a721dfd952a92d47d934\"><code>dc1552a</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10217\">#10217</a> from kmaehashi/bump-docker-v14.2.0</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/dcb70f28fa4e077f4d5992cfb90806a4b45aa7b4\"><code>dcb70f2</code></a> bump version in Dockerfile</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/78bf2c7963882555292483dbe0a35e9d87aba6c1\"><code>78bf2c7</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10209\">#10209</a> from kmaehashi/bump-v14.2.0</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/232d0deaee492cb5e67b8982c1913b4103cd99d8\"><code>232d0de</code></a> bump version to v14.2.0</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/1aee5465e2a0a765497b3dbacada543e0daaac42\"><code>1aee546</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10208\">#10208</a> from chainer-ci/bp-10003-v14-weak-old-fusion</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/2181d94989c8e85bcc3cdf1a0661862fe4924bcc\"><code>2181d94</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10003\">#10003</a> from seberg/weak-old-fusion</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/6de78f4640a6409c95ff21cb4d391f3e306b0ae9\"><code>6de78f4</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10207\">#10207</a> from chainer-ci/bp-10190-v14-ci/pfnci-followups</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/da29eea0b9c7e838acaf06aedd041400a49fbff3\"><code>da29eea</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10190\">#10190</a> from leofang/ci/pfnci-followups</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/82dea1c9c05c542ece6df78cf3f55c5fef092433\"><code>82dea1c</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10206\">#10206</a> from chainer-ci/bp-10205-v14-copilot/generate-gitat...</li>\n<li><a href=\"https://github.com/cupy/cupy/commit/c1975b080bc5a642c32eed6f80a2a72ae6f679ce\"><code>c1975b0</code></a> Merge pull request <a href=\"https://redirect.github.com/cupy/cupy/issues/10203\">#10203</a> from chainer-ci/bp-10177-v14-name-expr-cache-mapping</li>\n<li>Additional commits viewable in <a href=\"https://github.com/cupy/cupy/compare/v1.0.0a1...v14.2.0\">compare view</a></li>\n</ul>\n</details>\n<br />\n\n\nDependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all of the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)\n\n\n</details>",
+    "author": {
+      "login": "dependabot"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "dependabot/pip/cupy-cuda13x-lt-14.3.0",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1013,
+    "title": "Update cupy-cuda13x requirement from <14.1.0 to <14.3.0",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1013",
+    "isDraft": false,
+    "headRefOid": "1c3592f23a27304f8384a2675c1003fe4581effd",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "requirements/kv_connectors.txt"
+    ],
+    "diff_bytes": 486,
+    "diff_sha256": "bee0562322f1e3490680ab23323608f4917ae1724df5b2f7b62c401788dfab9f"
+  },
+  "full_tree_diff_proof": null
+}

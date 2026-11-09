@@ -1,0 +1,13 @@
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index b3178168c9..c76afc7973 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -791,7 +791,7 @@ rapidfuzz==3.12.1
+     # via jiwer
+ ray==2.48.0
+     # via -r requirements/test/cuda.in
+-redis==5.2.0
++redis==8.1.0
+     # via tensorizer
+ referencing==0.35.1
+     # via

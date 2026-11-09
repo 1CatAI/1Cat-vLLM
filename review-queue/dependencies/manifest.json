@@ -1,0 +1,76 @@
+{
+  "group": "dependencies",
+  "title": "Dependency and build matrix reconciliation queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1350,
+      "title": "Bump the minor-update group with 174 updates",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1350",
+      "head": "2e6e79d0d9594da11b2567476a347ad95281cba1",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "65fc525da5e971c937df56918949897c0323ff5834f64c69eae8234b8e7a82b5",
+      "files": 9,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1351,
+      "title": "Bump typepy from 1.3.2 to 2.0.0",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1351",
+      "head": "6f9475bb59c4fce2b3024ef0f0854a9efbede264",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "d48d2aba1e3b98bdbbd98cdbb9a06104b958253ff5f3b4710be35fa140544f19",
+      "files": 1,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1281,
+      "title": "Bump actions/setup-python from 6.1.0 to 7.1.0",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1281",
+      "head": "f7e8157be362800c529aeb2ca67ad6f5941227f5",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "6eb02e68a1a25045ebf94bd8581ff711917e8ec90ca71c398ca44a5d46a13df9",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1013,
+      "title": "Update cupy-cuda13x requirement from <14.1.0 to <14.3.0",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1013",
+      "head": "1c3592f23a27304f8384a2675c1003fe4581effd",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "bee0562322f1e3490680ab23323608f4917ae1724df5b2f7b62c401788dfab9f",
+      "files": 1,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1014,
+      "title": "Bump plotly from 5.24.1 to 7.1.0",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1014",
+      "head": "fa361081e391d2456e0929defb576b108dbc3372",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "2bedcf11cf66d63ba819931b265866ce3555801c6ffc665ca36cd6a8a35c73de",
+      "files": 1,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1015,
+      "title": "Bump redis from 5.2.0 to 8.1.0",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1015",
+      "head": "4da969c9cc24c3319440fcf1d436d01bc5fc6df4",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "4cb840c41dbf2eadec30990d1d047dfcc8bf5cc4639406cd97e9d8578b01c6ea",
+      "files": 1,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "#1350 mixes torch2.10.0 with torchaudio2.11.1+cpu and FlashInfer Python0.7.2 with cubin0.6.11. Reconcile ABI/version constraints and regenerate maintained lock variants rather than merging lock fragments. Validate resolver/import/build matrices for CUDA/ROCm/CPU and major redis/plotly/typepy changes; workflow setup-python also needs its own CI execution.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
