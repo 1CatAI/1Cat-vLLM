@@ -785,6 +785,7 @@ if TYPE_CHECKING:
     VLLM_SPEC_DUMP_ALIGNMENT_LIMIT: int = 3
     VLLM_SPEC_DUMP_ALIGNMENT_STEPS: str | None = None
     VLLM_DEBUG_MTP_LOAD: bool = False
+    VLLM_DEBUG_ANTHROPIC_TRACE: bool = False
     VLLM_DEBUG_MTP_LOAD_VERBOSE: bool = False
     VLLM_DFLASH_PROFILE: bool = False
     VLLM_DFLASH_PROFILE_LOG_INTERVAL: int = 32
@@ -11823,6 +11824,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_DEBUG_ANTHROPIC_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEBUG_ANTHROPIC_TRACE", "0"))),
+        description=(
+            "vLLM: log a structural summary of each /v1/messages request and "
+            "dump the last complete one to /tmp/anth_last_request.json for "
+            "offline replay. Structure and lengths only, never the content. "
+            "Off by default."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
         user_visible=True,
     ),
     "VLLM_DEBUG_MTP_LOAD": env_var(
