@@ -180,3 +180,27 @@ def test_finished_request_returns_every_block_with_pending_entries():
     _drive(manager, pool, 25, lag=1, chunk_tokens=40)
     manager.free(RID)
     assert pool.get_num_free_blocks() == free_before
+
+
+@pytest.mark.parametrize("spec_blocks", [0, 1, 4])
+def test_speculative_rollback_keeps_owned_blocks_without_negative_admission(
+    spec_blocks,
+):
+    pool, manager = _manager(spec_blocks)
+    free_before = pool.get_num_free_blocks()
+    manager.allocate_new_blocks(RID, BLOCK_SIZE + 4, BLOCK_SIZE + 4)
+    retained = list(manager.req_to_blocks[RID])
+    free_retained = pool.get_num_free_blocks()
+    for tokens in (BLOCK_SIZE + 1, BLOCK_SIZE, BLOCK_SIZE - 1, BLOCK_SIZE + 1):
+        assert manager.get_num_blocks_to_allocate(RID, tokens, [], tokens, tokens) == 0
+        assert manager.allocate_new_blocks(RID, tokens, tokens) == []
+        assert manager.req_to_blocks[RID] == retained
+        assert pool.get_num_free_blocks() == free_retained
+    # Growing past the next boundary still allocates at most one new block.
+    needed = manager.get_num_blocks_to_allocate(
+        RID, 2 * BLOCK_SIZE + 1, [], 2 * BLOCK_SIZE, 2 * BLOCK_SIZE + 1
+    )
+    assert needed == 1
+    manager.allocate_new_blocks(RID, 2 * BLOCK_SIZE + 1, 2 * BLOCK_SIZE + 1)
+    manager.free(RID)
+    assert pool.get_num_free_blocks() == free_before
