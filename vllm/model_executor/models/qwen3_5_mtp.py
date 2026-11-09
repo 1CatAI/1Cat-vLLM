@@ -531,6 +531,12 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        if vllm_config.kernel_config.sm70_mtp_draft_qpn8:
+            from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+                mark_mtp_draft_qpn8,
+            )
+
+            mark_mtp_draft_qpn8(self.model)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )

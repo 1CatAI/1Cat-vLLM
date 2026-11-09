@@ -351,6 +351,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if not prepare_dflash2_fp8_m8(layer):
             prepare_dflash2_fp16_m8(layer)
 
+        from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+            prepare_mtp_draft_qpn8,
+        )
+
+        if prepare_mtp_draft_qpn8(layer):
+            return
+
         from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
             maybe_prepare_online_qpn8,
         )
@@ -402,6 +409,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         draft_fp8 = apply_dflash2_fp8_m8(layer, x, bias)
         if draft_fp8 is not None:
             return draft_fp8
+        from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+            apply_mtp_draft_qpn8,
+        )
+
+        mtp_qpn8 = apply_mtp_draft_qpn8(layer, x, bias)
+        if mtp_qpn8 is not None:
+            return mtp_qpn8
         from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
             apply_dflash2_fp16_m8,
         )

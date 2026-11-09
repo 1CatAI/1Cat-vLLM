@@ -832,6 +832,12 @@ class KernelConfig:
     per line). With ``sm70_draft_hot_vocab`` > 0, the draft keeps the first
     that many ranked ids, each rank reading its own vocabulary shard."""
 
+    sm70_mtp_draft_qpn8: bool = True
+    """Requantize the Qwen3.5/3.8 native MTP drafter's decoder projections to
+    channel-QPN8 on SM70. Only draft proposals change; verification uses the
+    target's own weights. Measured on the 27B: 15.7 -> 15.1 ms per MTP4 round
+    with unchanged acceptance."""
+
     sm70_draft_single_graph: bool = False
     """Capture all MTP draft decode steps, including their slot mappings and
     attention metadata, as one CUDA graph instead of one replay per step."""
