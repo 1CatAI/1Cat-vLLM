@@ -50,11 +50,14 @@ def test_full_response_cache_usage(serving, details):
 
     expected = details.get("cached_tokens") if details is not None else None
     assert result.usage.cache_read_input_tokens == expected
-    assert result.usage.input_tokens == 24
+    assert result.usage.input_tokens == 24 - (expected or 0)
     assert result.usage.output_tokens == 3
     assert result.usage.cache_creation_input_tokens is None
     assert result.id == response.id
     assert result.model == response.model
+    serialized = result.model_dump(exclude_unset=True)
+    assert serialized["type"] == "message"
+    assert serialized["role"] == "assistant"
     assert result.content[0].text == "hello"
     assert result.stop_reason == "end_turn"
 
@@ -93,11 +96,14 @@ def test_stream_response_cache_usage(serving, initial_details, final_details):
     message = events[0]["message"]
     assert message["id"] == "chatcmpl-cache-test"
     assert message["model"] == "test-model"
+    assert message["type"] == "message"
+    assert message["role"] == "assistant"
     for usage, details, output_tokens in [
         (message["usage"], initial_details, 0),
         (events[1]["usage"], final_details, 3),
     ]:
-        assert usage["input_tokens"] == 24
+        expected_cached = details.get("cached_tokens") if details is not None else None
+        assert usage["input_tokens"] == 24 - (expected_cached or 0)
         assert usage["output_tokens"] == output_tokens
         expected = details.get("cached_tokens") if details is not None else None
         if expected is None:
