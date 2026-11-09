@@ -41,6 +41,11 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
+from vllm.v1.core.sched.phase_separation import (
+    Phase,
+    PhaseConfig,
+    PhaseCreditAllocator,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -340,6 +345,45 @@ class Scheduler(SchedulerInterface):
             and self.mamba_state_block_size is not None
             and self.mamba_state_block_size >= self.max_num_scheduled_tokens
         )
+        # Phase separation: a pure scheduler-layer time-credit allocator that
+        # forces each step to be either pure prefill or pure decode, so the
+        # decode phase can replay a full CUDA graph (measured: cpu 343ms ->
+        # 23.7ms on the reference deployment).
+        # It addresses the same defect from the other side as MixedPrefillBudget,
+        # so the two are mutually exclusive -- see the forced
+        # control_mixed_prefill = False in schedule().
+        #
+        # On by default; set 0 to turn it off for A/B comparisons.
+        self.phase_separation: PhaseCreditAllocator | None = None
+        _phase_on = os.environ.get("VLLM_SM70_PHASE_SEPARATION", "1").strip().lower()
+        if _phase_on not in ("", "0", "false", "no", "off"):
+            self.phase_separation = PhaseCreditAllocator(
+                PhaseConfig(
+                    # Use the **real** block size rather than the
+                    # --block-size flag value: hybrid-model platforms raise it,
+                    # and a chunk floor below the real block submits half a
+                    # block per step.
+                    block_size=(
+                        self.mamba_state_block_size or self.cache_config.block_size
+                    ),
+                    decode_time_share=float(
+                        os.environ.get("VLLM_SM70_PHASE_DECODE_SHARE", "0.4766")
+                    ),
+                    max_decode_wait_ms=float(
+                        os.environ.get("VLLM_SM70_PHASE_MAX_WAIT_MS", "300")
+                    ),
+                    log_interval_steps=int(
+                        os.environ.get("VLLM_SM70_PHASE_LOG_INTERVAL", "0")
+                    ),
+                )
+            )
+            logger.info(
+                "Phase separation enabled (decode_share=%.4f, max_wait=%.0fms, "
+                "block_size=%d)",
+                self.phase_separation.config.decode_time_share,
+                self.phase_separation.config.max_decode_wait_ms,
+                self.phase_separation.config.block_size,
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -620,8 +664,55 @@ class Scheduler(SchedulerInterface):
             and self.current_step >= r.next_decode_eligible_step
         }
         resident_tokens = {rid: n for rid, n in resident_tokens.items() if n > 0}
+        # Phase decision.
+        #
+        # charge_elapsed must run **before** next_phase: in the other order the
+        # credit lags by a step, so credit earned by a prefill step only shows up
+        # two steps later, and after crossing zero it takes two consecutive
+        # prefill steps to recover -- one prefill step is wasted (measured share
+        # 33% -> 23%).
+        phase: Phase | None = None
+        if self.phase_separation is not None:
+            _now = time.monotonic()
+            self.phase_separation.charge_elapsed(_now)
+            # A request that just finished prefill and has not produced its
+            # first token is the one most in need of service: the client has
+            # already waited through the whole prompt, and holding it back any
+            # longer reads as "stuck".
+            _fresh = any(
+                remaining == 0 and r.num_output_tokens == 0
+                for r, remaining in (
+                    (r, prefill_remaining[r.request_id]) for r in self.running
+                )
+            )
+            _running_prefill = any(
+                remaining > 0 for remaining in prefill_remaining.values()
+            )
+            _has_waiting = bool(self.waiting) and (
+                len(self.running) < self.max_num_running_reqs
+            )
+            phase = self.phase_separation.next_phase(
+                has_decode=any(
+                    remaining == 0 for remaining in prefill_remaining.values()
+                ),
+                has_prefill=_running_prefill,
+                now=_now,
+                fresh_decode=_fresh,
+                has_waiting=_has_waiting,
+            )
+            if phase is not None:
+                self.phase_separation.begin_phase(phase, _now)
+        # A prefill step must complete within one phase, or the wait the guard
+        # promises (`max_decode_wait_ms + one prefill step`) does not hold.
+        # `prefill_chunk_cap` is derived from measured ms/token, so it narrows
+        # automatically at long context.
+        if self.phase_separation is not None and phase is Phase.PREFILL:
+            _chunk_cap = self.phase_separation.prefill_chunk_cap()
+            if _chunk_cap < token_budget:
+                token_budget = _chunk_cap
         control_mixed_prefill = (
-            self.mixed_prefill_enabled
+            self.phase_separation is None
+            and self.mixed_prefill_enabled
             and bool(resident_tokens)
             and self.scheduler_config.mixed_prefill_step_latency_ms > 0
             and self.scheduler_config.enable_chunked_prefill
@@ -682,10 +773,56 @@ class Scheduler(SchedulerInterface):
                 self.max_num_scheduled_tokens // num_eligible_reqs,
             )
 
+        # Phase filter.
+        # In a DECODE phase, skip requests that still owe prefill work -- letting
+        # one in turns the step back into a mixed batch, the CUDA graph falls
+        # back to eager, and the benefit is gone.
+        # A PREFILL phase skips nothing: decoders are not meant to be scheduled
+        # then anyway, and resident_tokens / limit_prefill are already disabled
+        # by control_mixed_prefill = False.
+        _phase_filter = phase is Phase.DECODE and self.phase_separation is not None
+
+        # Even share of the budget on sweep steps.
+        #
+        # The scheduler walks `self.running` in arrival order and spends the
+        # token budget as it goes. A request that just finished prefill sits at
+        # the back, while long-output requests at the front consume the whole
+        # budget, so the new request is never scheduled and the client sees its
+        # prompt complete with no output.
+        #
+        # Fix: a sweep step splits the output budget **evenly** across every
+        # pending decode request. `self.running` order is left alone (preemption
+        # pops from the tail), and the split is done with a per-request quota.
+        _sweep_quota = 0
+        if self.phase_separation is not None and phase is Phase.DECODE:
+            if self.phase_separation.due_for_sweep():
+                _pending = [
+                    r.request_id
+                    for r in self.running
+                    if prefill_remaining.get(r.request_id, 0) == 0
+                ]
+                # Quota is the step budget divided evenly, capped by the
+                # per-request ceiling scheduler_config reserves for multi-request
+                # steps -- otherwise a single request could get a wider slot
+                # than usual.
+                _sweep_quota = self.phase_separation.sweep_share(
+                    _pending, token_budget
+                )
+                if _sweep_quota:
+                    _est = self.scheduler_config.max_num_batched_tokens // max(
+                        1, len(self.running)
+                    )
+                    _sweep_quota = min(_sweep_quota, _est)
+                self.phase_separation.clear_sweep()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if _phase_filter and prefill_remaining.get(request.request_id, 0) > 0:
+                req_index += 1
+                continue
 
             if self.current_step < request.next_decode_eligible_step:
                 req_index += 1
@@ -761,6 +898,12 @@ class Scheduler(SchedulerInterface):
                     )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            # Sweep step: every pending decode request gets a channel of the
+            # **same width**, so none can take more than its share. Long-output
+            # requests come first but are capped at the even share too, leaving
+            # the remainder for the new requests behind them.
+            if _sweep_quota > 0 and prefill_remaining.get(request.request_id, 0) == 0:
+                num_new_tokens = min(num_new_tokens, _sweep_quota)
             num_new_tokens = min(num_new_tokens, token_budget)
             num_new_tokens = self._balanced_prefill_chunk(
                 request, request.num_computed_tokens, num_new_tokens
@@ -975,7 +1118,13 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        # A pure DECODE phase admits **no** new requests: letting one in turns
+        # the step back into a mixed batch and loses the FULL graph.
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and (phase is None or phase is Phase.PREFILL)
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -1397,6 +1546,57 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        # End-of-step accounting.
+        if self.phase_separation is not None:
+            if phase is Phase.PREFILL:
+                # Count only tokens that genuinely belong to prefill, or decode
+                # tokens land in the prefill denominator -- the exact mistake
+                # that made the mixed-prefill budget collapse.
+                _prefill_tok = sum(
+                    min(n, prefill_remaining.get(rid, 0))
+                    for rid, n in num_scheduled_tokens.items()
+                    if prefill_remaining.get(rid, 0) > 0
+                )
+            else:
+                _prefill_tok = 0
+            self.phase_separation.observe_step_work(
+                scheduled_tokens=total_num_scheduled_tokens,
+                prefill_tokens=_prefill_tok,
+            )
+            # Record who should have produced a token but was not scheduled. In
+            # a PREFILL phase decoders are not scheduled by design, so they only
+            # count as owed when the phase let them through -- otherwise the
+            # heuristic mistakes the design for starvation.
+            if phase is Phase.DECODE:
+                _pending_dec = [
+                    r.request_id
+                    for r in self.running
+                    if prefill_remaining.get(r.request_id, 0) == 0
+                ]
+                self.phase_separation.mark_pending_decoders(
+                    _pending_dec, set(num_scheduled_tokens)
+                )
+            # The right phase was chosen yet no token was scheduled (for
+            # instance every decode request was unavailable this step), so
+            # switch phase next step; otherwise it spins forever, since an empty
+            # step advances no credit.
+            if phase is not None and total_num_scheduled_tokens == 0:
+                self.phase_separation.note_empty_phase_step(phase)
+            # Periodically log the realised pattern (off by default:
+            # VLLM_SM70_PHASE_LOG_INTERVAL=0). The knob is a **time share**, but
+            # people reason in "how many decode steps per round", and this line
+            # converts between the two views -- turn it on when tuning.
+            # Do not measure this with the step profiler: it samples every 40
+            # steps, and sampling every step would force a device synchronise
+            # and perturb the very rhythm being measured.
+            elif (
+                phase is not None
+                and self.phase_separation.config.log_interval_steps > 0
+                and self.current_step
+                % self.phase_separation.config.log_interval_steps
+                == 0
+            ):
+                logger.info("[phase-separation] %s", self.phase_separation.stats())
         return scheduler_output
 
     def _build_kv_connector_meta(

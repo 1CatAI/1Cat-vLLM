@@ -5407,6 +5407,68 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MoE AWQ",),
         user_visible=False,
     ),
+    # Phase separation (a pure scheduler-layer time-credit allocator).
+    # Forces each engine step to be either pure prefill or pure decode so the
+    # decode phase can replay a full CUDA graph. On by default; set 0 to fall
+    # back to mixed batching for A/B comparisons.
+    "VLLM_SM70_PHASE_SEPARATION": env_var(
+        lambda: os.getenv("VLLM_SM70_PHASE_SEPARATION", "1").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Run whole scheduler steps as either pure-decode or pure-prefill "
+            "phases so the decode phase can replay a FULL CUDA graph. "
+            "Default ON; set 0 to fall back to mixed batching for A/B."
+        ),
+        category="performance",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_DECODE_SHARE": env_var(
+        lambda: float(os.getenv("VLLM_SM70_PHASE_DECODE_SHARE", "0.4766")),
+        description=(
+            "Target share of wall-clock time given to the decode phase when "
+            "phase separation is on. The credit earn rate is "
+            "share/(1-share), so this is NOT the rate itself."
+        ),
+        category="performance",
+        declared_default="0.4766",
+        effective_default="0.4766",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_MAX_WAIT_MS": env_var(
+        lambda: float(os.getenv("VLLM_SM70_PHASE_MAX_WAIT_MS", "300")),
+        description=(
+            "Hard ceiling on how long a decoder may go unserved while prefill "
+            "phases run, in milliseconds. The wait a client actually observes "
+            "is this plus one prefill step, since the guard can only be "
+            "evaluated at a step boundary."
+        ),
+        category="performance",
+        declared_default="300.0",
+        effective_default="300.0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_LOG_INTERVAL": env_var(
+        lambda: int(os.getenv("VLLM_SM70_PHASE_LOG_INTERVAL", "0")),
+        description=(
+            "Emit a phase-pattern line every N engine steps. 0 = silent. "
+            "Diagnostic only: the configured knob is a time share, but this "
+            "line reports the realised decode:prefill step ratio."
+        ),
+        category="diagnostics",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=False,
+    ),
     "VLLM_SM70_AUX_KERNEL_WARMUP": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AUX_KERNEL_WARMUP", "1"))),
         description=(
@@ -20265,6 +20327,11 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        # Phase separation is purely a **scheduler-layer** switch: it decides
+        # only whether a step runs prefill or decode, and changes no build
+        # artefact. Left out of the cache key, tuning decode_share or
+        # log_interval would invalidate the whole torch.compile cache
+        # (27G, and expensive to rebuild).
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",
