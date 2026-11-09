@@ -364,6 +364,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     request.num_in_flight_tokens = 1
 
     scheduler.perf_metrics = None
+    scheduler.mixed_prefill_budget = Mock()
     scheduler.connector = None
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True

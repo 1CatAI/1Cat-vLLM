@@ -108,7 +108,7 @@ def test_fp8_warmup_matches_secondary_batch_dispatch(monkeypatch, gated, prescal
     monkeypatch.setattr(
         warmup.sm70_ops,
         "fp8_gemm_sm70_prefill_prescaled_out",
-        lambda *args: prescaled_calls.append(args),
+        lambda *args, native_policy=(): prescaled_calls.append(args),
     )
     rows = [1, 8, 16, 32, 33, 48, 64, 65]
 
@@ -121,7 +121,11 @@ def test_fp8_warmup_matches_secondary_batch_dispatch(monkeypatch, gated, prescal
         calls = prescaled_calls
     else:
         assert not prescaled_calls
-        assert policies == [{"preserve_default_partition": True}] * 3
+        expected_policy: dict[str, object] = {"preserve_default_partition": True}
+        native_arguments = warmup._warmup_native("fp8").arguments
+        if native_arguments:
+            expected_policy["native_policy"] = native_arguments
+        assert policies == [expected_policy] * 3
     assert [tuple(call[0].shape) for call in calls] == [
         (m, 32 if gated else 64) for m in (33, 48, 64)
     ]
@@ -137,7 +141,9 @@ def test_fp8_warmup_matches_grouped_bmm_runtime_slice(monkeypatch):
     calls = []
     monkeypatch.setattr(torch.ops._C, "fp8_gemm_sm70_out_meta", object(), raising=False)
 
-    def record_call(out, x, weight, scales, group_size, k_ld, q_ld, gated_silu):
+    def record_call(
+        out, x, weight, scales, group_size, k_ld, q_ld, gated_silu, *, native_policy=()
+    ):
         calls.append(
             SimpleNamespace(
                 out_shape=tuple(out.shape),
@@ -184,12 +190,12 @@ def test_fp8_warmup_includes_one_launch_grouped_decode(monkeypatch):
     monkeypatch.setattr(
         warmup.sm70_ops,
         "fp8_gemm_sm70_out",
-        lambda *args: dense_calls.append(args),
+        lambda *args, native_policy=(): dense_calls.append(args),
     )
     monkeypatch.setattr(
         warmup.sm70_ops,
         "fp8_moe_gemm_sm70_per_expert_dispatch_out",
-        lambda *args: grouped_calls.append(args),
+        lambda *args, native_policy=(): grouped_calls.append(args),
     )
 
     count = warmup._warmup_fp8_dense_layers([(layer, False)], [1, 4])
@@ -305,7 +311,15 @@ def test_fp8_warmup_supports_modelopt_turbomind_layout(monkeypatch):
     monkeypatch.setattr(
         warmup.sm70_ops,
         "fp8_gemm_sm70_out",
-        lambda out, x, weight, scales, group_size, k_ld, q_ld, gated_silu: calls.append(
+        lambda out,
+        x,
+        weight,
+        scales,
+        group_size,
+        k_ld,
+        q_ld,
+        gated_silu,
+        native_policy=(): calls.append(
             (out.shape, x.shape, scales, group_size, k_ld, q_ld)
         ),
     )
@@ -343,13 +357,13 @@ def test_nvfp4_warmup_uses_converter_padded_output_size(monkeypatch, compact):
     monkeypatch.setattr(
         warmup.sm70_ops,
         "nvfp4_gemm_sm70_out",
-        lambda *args: calls.append(args),
+        lambda *args, native_policy=(): calls.append(args),
     )
     compact_calls = []
     monkeypatch.setattr(
         warmup.sm70_ops,
         "nvfp4_qpn2_compact_tm_gemm_sm70_out",
-        lambda *args: compact_calls.append(args),
+        lambda *args, native_policy=(): compact_calls.append(args),
     )
 
     count = warmup._warmup_fp4_dense_layers([state], [1, 4])
@@ -391,7 +405,7 @@ def test_nvfp4_warmup_preserves_batch_scale_format(monkeypatch, gated_silu):
     monkeypatch.setattr(
         warmup.sm70_ops,
         "nvfp4_gemm_sm70_prescaled_out",
-        lambda *args: calls.append(args),
+        lambda *args, native_policy=(): calls.append(args),
     )
     count = warmup._warmup_fp4_dense_layers([state], [1, 8, 16, 32, 33, 64])
 
@@ -448,6 +462,8 @@ def test_nvfp4_moe_warmup_discovers_and_uses_compact_decode_shapes(monkeypatch):
         k,
         n,
         group_size,
+        *,
+        native_policy=(),
     ):
         calls.append(
             (
@@ -514,7 +530,7 @@ def test_nvfp4_moe_warmup_uses_slot_compact_through_80_rows(monkeypatch):
     monkeypatch.setattr(
         warmup.sm70_ops,
         "nvfp4_moe_dense_stage_sm70_out",
-        lambda *args: calls.append(args),
+        lambda *args, native_policy=(): calls.append(args),
     )
     monkeypatch.setattr(
         warmup,
@@ -548,7 +564,7 @@ def test_nvfp4_moe_warmup_uses_full_expert_groups_above_80_rows(monkeypatch):
     monkeypatch.setattr(
         warmup.sm70_ops,
         "nvfp4_moe_dense_stage_sm70_out",
-        lambda *args: calls.append(args),
+        lambda *args, native_policy=(): calls.append(args),
     )
     monkeypatch.setattr(
         torch.ops._C,
@@ -574,7 +590,7 @@ def test_nvfp4_moe_warmup_supports_mtp4_c16_width(monkeypatch):
     monkeypatch.setattr(
         warmup.sm70_ops,
         "nvfp4_moe_dense_stage_sm70_out",
-        lambda *args: calls.append(args),
+        lambda *args, native_policy=(): calls.append(args),
     )
     monkeypatch.setattr(
         torch.ops._C,
@@ -616,7 +632,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
     )
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
-    warmup.envs.disable_envs_cache()
+    envs.disable_envs_cache()
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(
         warmup,
@@ -669,7 +685,7 @@ def test_fp8_coordinated_warmup_follower_imports_rank0_lut(monkeypatch):
     )
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
-    warmup.envs.disable_envs_cache()
+    envs.disable_envs_cache()
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(
         warmup,
@@ -704,7 +720,7 @@ def test_fp8_coordinated_warmup_follower_imports_rank0_lut(monkeypatch):
 def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "1")
-    warmup.envs.disable_envs_cache()
+    envs.disable_envs_cache()
 
     assert not warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
         has_awq_dense=False,
@@ -716,7 +732,7 @@ def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
 def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.delenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", raising=False)
-    warmup.envs.disable_envs_cache()
+    envs.disable_envs_cache()
 
     assert warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
         has_awq_dense=False,

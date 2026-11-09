@@ -1001,6 +1001,16 @@ def test_negative_graph_variant_uses_an_isolated_pool():
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:
+    @pytest.fixture(autouse=True)
+    def capture_stream(self):
+        # Earlier CUDA tests may restore the default stream. Capture owns a
+        # non-default stream instead of relying on process-wide test order.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            yield
+            stream.synchronize()
+
     def setup_method(self):
         self.vllm_config = _create_vllm_config(CompilationConfig())
         self.model = SimpleMLP().to(DEVICE_TYPE)
