@@ -785,6 +785,7 @@ if TYPE_CHECKING:
     VLLM_SPEC_DUMP_ALIGNMENT_LIMIT: int = 3
     VLLM_SPEC_DUMP_ALIGNMENT_STEPS: str | None = None
     VLLM_DEBUG_MTP_LOAD: bool = False
+    VLLM_DEBUG_RENDER_TEMPLATE_KWARGS: bool = False
     VLLM_DEBUG_MTP_LOAD_VERBOSE: bool = False
     VLLM_DFLASH_PROFILE: bool = False
     VLLM_DFLASH_PROFILE_LOG_INTERVAL: int = 32
@@ -11821,6 +11822,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="debug",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_DEBUG_RENDER_TEMPLATE_KWARGS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEBUG_RENDER_TEMPLATE_KWARGS", "0"))),
+        description=(
+            "vLLM: dump the request-level, server-default and merged "
+            "chat_template_kwargs before rendering. Off by default."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
