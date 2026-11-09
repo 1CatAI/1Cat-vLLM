@@ -85,78 +85,324 @@
       "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c1/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c1/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c4/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c4/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c8/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c8/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
@@ -565,78 +811,324 @@
       "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c1/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c1/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c4/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c4/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c8/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c8/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
@@ -1045,78 +1537,324 @@
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c1/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c1/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c4/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c4/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c8/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c8/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
@@ -1525,78 +2263,324 @@
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c1/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c1/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c4/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c4/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c8/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c8/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
@@ -2005,78 +2989,324 @@
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c1/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c1/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c4/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c4/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c8/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c8/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
@@ -2485,78 +3715,324 @@
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c1/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c1/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c4/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c4/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c8/q4096",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c8/q8192",
       "route": {
         "prepared_layout": "nvfp4",
-        "qpn2": false,
-        "shared": false,
-        "prefill": false,
+        "qpn2": true,
+        "shared": true,
+        "prefill": true,
         "compact_scales": false,
-        "batch_prescale": false,
+        "batch_prescale": true,
         "gated_turbomind": false,
-        "dispatch": []
+        "dispatch": [
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 8,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 32,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 64,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          },
+          {
+            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
+            "m": 1024,
+            "split_k": 16,
+            "nacc": 2,
+            "gated": false,
+            "prefill_min_m": 256
+          }
+        ]
       }
     },
     {
