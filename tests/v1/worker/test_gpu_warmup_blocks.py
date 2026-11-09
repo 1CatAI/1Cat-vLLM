@@ -101,6 +101,15 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
     assert started == finished
     assert connector_states == [True, False]
     assert len(samples) == 6 + 6 * 2
+    # Only the short prompts ask for prompt logprobs: on the kernel profile and
+    # the full chunk they would build logits for every prompt token.
+    prompt_logprobs = [
+        {r.sampling_params.prompt_logprobs for r in output.scheduled_new_reqs}
+        for output in executions
+        if output.scheduled_new_reqs
+    ]
+    assert prompt_logprobs[:3] == [{1}, {None}, {None}]
+    assert all(entry == {1} for entry in prompt_logprobs[3:])
 
 
 def _speculative_config(method: str) -> SpeculativeConfig:
