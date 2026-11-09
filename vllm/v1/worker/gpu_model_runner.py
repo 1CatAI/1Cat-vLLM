@@ -4471,7 +4471,7 @@ class GPUModelRunner(
         return cu_num_tokens
 
     def _compute_prev_positions(self, num_reqs: int) -> None:
-        """Build prev_positions mapping: current pos -> previous pos (-1 if new).
+        """Map current decode rows to previous rows (-1 for new or prefill).
 
         Populates self.prev_positions.np[:num_reqs] with the mapping.
         """
@@ -4483,7 +4483,14 @@ class GPUModelRunner(
             return
 
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
+            # KV-load recovery can rewind an existing request into its prompt.
+            # Its last input must come from the prompt, not a discarded sample.
+            prev_positions[i] = (
+                prev_req_id_to_index.get(req_id, -1)
+                if self.input_batch.num_computed_tokens_cpu[i]
+                >= self.input_batch.num_prompt_tokens[i]
+                else -1
+            )
 
     def _apply_ddtree_position_overrides(
         self,
