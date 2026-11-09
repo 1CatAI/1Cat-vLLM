@@ -328,6 +328,8 @@ class Scheduler(SchedulerInterface):
         self.mamba_state_block_size = (
             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
         )
+        if self.need_mamba_block_aligned_split:
+            self.mixed_prefill_budget.block_size = self.mamba_state_block_size
         # Sparse admission only retains replay/shared-prefix and periodic
         # boundaries. Materializing discarded states must not split the whole
         # model's prefill into one-state-block forwards. Mixed alignments still
@@ -667,7 +669,7 @@ class Scheduler(SchedulerInterface):
                 0,
                 min(
                     tokens,
-                    self.mixed_prefill_budget.tokens - used,
+                    self.mixed_prefill_budget.budget - used,
                     token_budget - reserve,
                 ),
             )
@@ -1397,7 +1399,7 @@ class Scheduler(SchedulerInterface):
                 else 0
             ),
             mixed_prefill_budget=(
-                self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
+                self.mixed_prefill_budget.budget if control_mixed_prefill else 0
             ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
