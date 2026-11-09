@@ -20,7 +20,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
-    generate_block_hash_extra_keys,
+    generate_request_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
     make_block_hash_with_group_id,
@@ -186,6 +186,8 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        use_lookahead_block_hashes: Whether block hashes also cover the token
+            after each block; KV cache events then carry that token.
     """
 
     def __init__(
@@ -197,11 +199,13 @@ class BlockPool:
         metrics_collector: KVCacheMetricsCollector | None = None,
         device_state_blocks: int = 0,
         device_state_group_ids: tuple[int, ...] = (),
+        use_lookahead_block_hashes: bool = False,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self.use_lookahead_block_hashes = use_lookahead_block_hashes
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -353,11 +357,12 @@ class BlockPool:
                 )
                 extra_keys_list: list[tuple[Any, ...] | None] = []
                 for block_idx in indices:
-                    extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                    extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
                         request,
                         block_idx * block_size,
                         (block_idx + 1) * block_size,
                         curr_mm_idx,
+                        self.use_lookahead_block_hashes,
                     )
                     extra_keys_list.append(extra_keys)
 

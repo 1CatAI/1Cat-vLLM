@@ -214,8 +214,10 @@ def nvfp4_qpn2_dense_linear(
     return torch.ops.vllm.nvfp4_qpn2_dense_linear(x, codes, scales, global_scale, n, k)
 
 
-# Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu.
-QPN2_DISPATCH_MAX_ROWS = 32
+# A native launch still admits at most 32 rows. Larger short batches reuse
+# that kernel in row chunks; only the Python dispatch range reaches 128.
+QPN2_NATIVE_MAX_ROWS = 32
+QPN2_DISPATCH_MAX_ROWS = 128
 
 
 def _nvfp4_qpn2_dispatch_linear(
@@ -239,17 +241,32 @@ def _nvfp4_qpn2_dispatch_linear(
         from vllm._sm70.policy import call_native
 
         out = torch.empty((x.shape[0], n), dtype=x.dtype, device=x.device)
-        call_native(
-            sm70_ops.nvfp4_qpn2_gemm_sm70_out,
-            native_policy,
-            out,
-            x,
-            codes,
-            scales,
-            global_scale,
-            split_k,
-            accumulator_chains,
-        )
+        if x.shape[0] <= QPN2_NATIVE_MAX_ROWS:
+            call_native(
+                sm70_ops.nvfp4_qpn2_gemm_sm70_out,
+                native_policy,
+                out,
+                x,
+                codes,
+                scales,
+                global_scale,
+                split_k,
+                accumulator_chains,
+            )
+            return out
+        for start in range(0, x.shape[0], QPN2_NATIVE_MAX_ROWS):
+            count = min(QPN2_NATIVE_MAX_ROWS, x.shape[0] - start)
+            call_native(
+                sm70_ops.nvfp4_qpn2_gemm_sm70_out,
+                native_policy,
+                out.narrow(0, start, count),
+                x.narrow(0, start, count),
+                codes,
+                scales,
+                global_scale,
+                split_k,
+                accumulator_chains,
+            )
         return out
     return _nvfp4_qpn2_dense_linear(x, codes, scales, global_scale, n, k)
 
@@ -288,7 +305,7 @@ def nvfp4_qpn2_dispatch_linear(
     accumulator_chains: int,
     native_policy: list[str] | None = None,
 ) -> torch.Tensor:
-    """QPN2 kernels for M <= 32, dequantization plus cuBLAS above.
+    """Chunked QPN2 for M <= 128, dequantization plus cuBLAS above.
 
     The split is decided at run time inside the op.
     """
