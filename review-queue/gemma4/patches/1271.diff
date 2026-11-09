@@ -1,0 +1,1737 @@
+diff --git a/docs/configuration/env_var_reference.md b/docs/configuration/env_var_reference.md
+index 0cd2a4f70a..4c2bf60650 100644
+--- a/docs/configuration/env_var_reference.md
++++ b/docs/configuration/env_var_reference.md
+@@ -117,6 +117,7 @@ This is the user reference. Internal tuning, diagnostics and compatibility alias
+ | `VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS` | configuration | Allows harmony instructions to be injected on system messages | False | False | None | No SM70 path association |
+ | `VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS` | configuration | Valid values are container,code\_interpreter,web\_search\_preview ex VLLM\_GPT\_OSS\_SYSTEM\_TOOL\_MCP\_LABELS=container,code\_interpreter If the server\_label of your mcp tool is not in this list it will be completely ignored. | set() | Computed by env\_set\_with\_choices('VLLM\_GPT\_OSS\_SYSTEM\_TOOL\_MCP\_LABELS', default=[], choices=['container', 'code\_interpreter', 'web\_search\_preview']) | None | No SM70 path association |
+ | `VLLM_GPU_NIC_PCIE_MAPPING` | configuration | Comma-separated GPU\_BDF=NIC\_BDF pairs for RDMA NIC selection. Must be set together with VLLM\_NIC\_SELECTION\_VARS. | '' | '' | None | No SM70 path association |
++| `VLLM_GPU_SYNC_CHECK` | debug | GPU sync debug mode: 'warn' logs unintended GPU<->CPU syncs, 'error' raises. Unset disables. | None | None | None | No SM70 path association |
+ | `VLLM_HAS_FLASHINFER_CUBIN` | configuration | If set, it means we pre-downloaded cubin files and flashinfer will read the cubin files directly. | False | False | None | No SM70 path association |
+ | `VLLM_HOST_IP` | configuration | used in distributed environment to determine the ip address of the current node, when the node has multiple network interfaces. If you are using multi-node inference, you should set this differently on each node. | '' | '' | None | No SM70 path association |
+ | `VLLM_HTTP_TIMEOUT_KEEP_ALIVE` | configuration | Timeout in seconds for keeping HTTP connections alive in API server | 5 | 5 | None | No SM70 path association |
+diff --git a/flash-attention-v100/kernel/flash_decode_paged.cu b/flash-attention-v100/kernel/flash_decode_paged.cu
+index 3af29129d5..97828ec6f4 100644
+--- a/flash-attention-v100/kernel/flash_decode_paged.cu
++++ b/flash-attention-v100/kernel/flash_decode_paged.cu
+@@ -5142,6 +5142,9 @@ at::Tensor flash_attention_decode_paged(
+     case 256:
+       LAUNCH_BY_PARTITION(256);
+       break;
++    case 512:
++      LAUNCH_BY_PARTITION(512);
++      break;
+     default:
+       TORCH_CHECK(false, "Unsupported head_dim for paged decode: ", head_dim);
+   }
+@@ -6345,6 +6348,9 @@ at::Tensor flash_attention_decode_qk_scores(
+     case 256:
+       LAUNCH_BY_PARTITION(256);
+       break;
++    case 512:
++      LAUNCH_BY_PARTITION(512);
++      break;
+     default:
+       TORCH_CHECK(false, "Unsupported head_dim for paged decode: ", head_dim);
+   }
+diff --git a/flash-attention-v100/kernel/flash_v100_traits.cuh b/flash-attention-v100/kernel/flash_v100_traits.cuh
+index eaa191e2c3..f4ecac9e14 100644
+--- a/flash-attention-v100/kernel/flash_v100_traits.cuh
++++ b/flash-attention-v100/kernel/flash_v100_traits.cuh
+@@ -15,6 +15,8 @@ struct FlashV100Traits {
+   static constexpr int BLOCK_N_128 = 176;
+   static constexpr int BLOCK_M_256 = 32;
+   static constexpr int BLOCK_N_256 = 64;
++  static constexpr int BLOCK_M_512 = 16;
++  static constexpr int BLOCK_N_512 = 32;
+   static constexpr int WARPS_PER_BLOCK = 16;
+   static constexpr int THREADS_PER_WARP = 32;
+ 
+@@ -22,12 +24,14 @@ struct FlashV100Traits {
+                                  : (D == 32)  ? BLOCK_M_32
+                                  : (D == 64)  ? BLOCK_M_64
+                                  : (D == 128) ? BLOCK_M_128
++                                 : (D == 512) ? BLOCK_M_512
+                                               : BLOCK_M_256;
+ 
+   static constexpr int BLOCK_N = (D == 16)    ? BLOCK_N_16
+                                  : (D == 32)  ? BLOCK_N_32
+                                  : (D == 64)  ? BLOCK_N_64
+                                  : (D == 128) ? BLOCK_N_128
++                                 : (D == 512) ? BLOCK_N_512
+                                               : BLOCK_N_256;
+ 
+   static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * THREADS_PER_WARP;
+diff --git a/flash-attention-v100/kernel/fused_mha_forward.cu b/flash-attention-v100/kernel/fused_mha_forward.cu
+index 23ace0bf6f..94bd99cf35 100644
+--- a/flash-attention-v100/kernel/fused_mha_forward.cu
++++ b/flash-attention-v100/kernel/fused_mha_forward.cu
+@@ -56,6 +56,11 @@ using namespace nvcuda::wmma;
+ #define BLOCK_N_256_LOW_SMEM 32
+ #define WARPS_256_LOW_SMEM 16
+ 
++// head_dim 512 (gemma global layers): small blocks so 512-wide tiles fit smem.
++#define BLOCK_M_512 16
++#define BLOCK_N_512 32
++#define WARPS_512 16
++
+ template <int D, bool LOW_SMEM = false>
+ struct KernelConfig {
+   static constexpr int BLOCK_M =
+@@ -63,18 +68,21 @@ struct KernelConfig {
+       : (D == 32)  ? BLOCK_M_32
+       : (D == 64)  ? BLOCK_M_64
+       : (D == 128) ? BLOCK_M_128
++      : (D == 512) ? BLOCK_M_512
+                    : (LOW_SMEM ? BLOCK_M_256_LOW_SMEM : BLOCK_M_256);
+   static constexpr int BLOCK_N =
+       (D == 16)    ? BLOCK_N_16
+       : (D == 32)  ? BLOCK_N_32
+       : (D == 64)  ? BLOCK_N_64
+       : (D == 128) ? BLOCK_N_128
++      : (D == 512) ? BLOCK_N_512
+                    : (LOW_SMEM ? BLOCK_N_256_LOW_SMEM : BLOCK_N_256);
+   static constexpr int WARPS_PER_BLOCK =
+       (D == 16)    ? WARPS_16
+       : (D == 32)  ? WARPS_32
+       : (D == 64)  ? WARPS_64
+       : (D == 128) ? WARPS_128
++      : (D == 512) ? WARPS_512
+                    : (LOW_SMEM ? WARPS_256_LOW_SMEM : WARPS_256);
+ 
+   static constexpr int THREADS_PER_BLOCK =
+@@ -986,8 +994,8 @@ at::Tensor flash_attention_qk_scores(const at::Tensor& q, const at::Tensor& k,
+ 
+   TORCH_CHECK(k.size(0) == B, "K batch size must match Q");
+   TORCH_CHECK(k.size(3) == D, "K head_dim must match Q");
+-  TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0,
+-              "D must be even, <=256, multiple of 8");
++  TORCH_CHECK((D <= 256 || D == 512) && D % 8 == 0 && D % 2 == 0,
++              "D must be even, multiple of 8, and <=256 or ==512");
+   TORCH_CHECK(H_KV > 0, "num_kv_heads must be positive");
+   TORCH_CHECK(H % H_KV == 0,
+               "num_attention_heads must be divisible by num_kv_heads");
+@@ -1021,6 +1029,10 @@ at::Tensor flash_attention_qk_scores(const at::Tensor& q, const at::Tensor& k,
+       launcher_flash_attention_qk_scores<256>(q, k, scores, softmax_scale,
+                                               is_causal, stream);
+       break;
++    case 512:
++      launcher_flash_attention_qk_scores<512>(q, k, scores, softmax_scale,
++                                              is_causal, stream);
++      break;
+     default:
+       TORCH_CHECK(false, "Unsupported D: ", D);
+   }
+@@ -1054,8 +1066,8 @@ std::vector<at::Tensor> flash_attention_forward(
+   const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
+   const int H_KV = k.size(1);
+   const int N = k.size(2);
+-  TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0,
+-              "D must be even, <=256, multiple of 8");
++  TORCH_CHECK((D <= 256 || D == 512) && D % 8 == 0 && D % 2 == 0,
++              "D must be even, multiple of 8, and <=256 or ==512");
+   TORCH_CHECK(H_KV > 0, "num_kv_heads must be positive");
+   TORCH_CHECK(H % H_KV == 0,
+               "num_attention_heads must be divisible by num_kv_heads");
+@@ -1104,6 +1116,11 @@ std::vector<at::Tensor> flash_attention_forward(
+           q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, scalar_pv,
+           window_size_left, window_size_right, stream);
+       break;
++    case 512:
++      launcher_flash_attention_forward<512>(
++          q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, scalar_pv,
++          window_size_left, window_size_right, stream);
++      break;
+     default:
+       TORCH_CHECK(false, "Unsupported D: ", D);
+   }
+diff --git a/flash-attention-v100/kernel/fused_mha_forward_paged.cu b/flash-attention-v100/kernel/fused_mha_forward_paged.cu
+index a455c65055..2199c815da 100644
+--- a/flash-attention-v100/kernel/fused_mha_forward_paged.cu
++++ b/flash-attention-v100/kernel/fused_mha_forward_paged.cu
+@@ -72,6 +72,11 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
+ #define BLOCK_N_256 64
+ #define WARPS_256 16
+ 
++// head_dim 512 (gemma global layers): small blocks so 512-wide tiles fit smem.
++#define BLOCK_M_512 16
++#define BLOCK_N_512 32
++#define WARPS_512 16
++
+ #define BLOCK_M_256_LOW_SMEM 16
+ #define BLOCK_N_256_LOW_SMEM 128
+ #define KV_STAGE_N_256_LOW_SMEM 1
+@@ -88,16 +93,16 @@ struct KernelConfig {
+       (D == 16)   ? BLOCK_M_16
+       : (D == 32) ? BLOCK_M_32
+       : (D == 64) ? BLOCK_M_64
+-      : (D == 128)
+-          ? BLOCK_M_128
++      : (D == 128) ? BLOCK_M_128
++      : (D == 512) ? BLOCK_M_512
+           : (LOW_SMEM ? (LOW_SMEM_BM32 ? BLOCK_M_256 : BLOCK_M_256_LOW_SMEM)
+                       : BLOCK_M_256);
+   static constexpr int BLOCK_N =
+       (D == 16)   ? BLOCK_N_16
+       : (D == 32) ? BLOCK_N_32
+       : (D == 64) ? BLOCK_N_64
+-      : (D == 128)
+-          ? BLOCK_N_128
++      : (D == 128) ? BLOCK_N_128
++      : (D == 512) ? BLOCK_N_512
+           : (LOW_SMEM ? (LOW_SMEM_SCALAR_QK ? BLOCK_N_256_LOW_SMEM_SCALAR_QK
+                                             : BLOCK_N_256_LOW_SMEM)
+                       : BLOCK_N_256);
+@@ -106,6 +111,7 @@ struct KernelConfig {
+       : (D == 32)  ? WARPS_32
+       : (D == 64)  ? WARPS_64
+       : (D == 128) ? WARPS_128
++      : (D == 512) ? WARPS_512
+                    : (LOW_SMEM ? WARPS_256_LOW_SMEM : WARPS_256);
+ 
+   static constexpr int THREADS_PER_BLOCK =
+@@ -3576,8 +3582,8 @@ at::Tensor flash_attention_prefill_paged(
+   const int D = q.size(3);
+   const int num_kv_heads = k_cache.size(2);
+ 
+-  TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0,
+-              "D must be even, <=256, multiple of 8");
++  TORCH_CHECK((D <= 256 || D == 512) && D % 8 == 0 && D % 2 == 0,
++              "D must be even, multiple of 8, and <=256 or ==512");
+   TORCH_CHECK(H % num_kv_heads == 0,
+               "num_heads must be divisible by num_kv_heads");
+   TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
+@@ -3657,6 +3663,9 @@ at::Tensor flash_attention_prefill_paged(
+     case 256:
+       LAUNCH_PAGED_BY_KV(256);
+       break;
++    case 512:
++      LAUNCH_PAGED_BY_KV(512);
++      break;
+     default:
+       TORCH_CHECK(false, "Unsupported D: ", D);
+   }
+@@ -4028,8 +4037,8 @@ at::Tensor flash_attention_decode_paged_wmma(
+ 
+   TORCH_CHECK(B <= block_table.size(0), "block_table batch size must cover q");
+   TORCH_CHECK(B <= seq_lens.size(0), "seq_lens batch size must cover q");
+-  TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0,
+-              "D must be even, <=256, multiple of 8");
++  TORCH_CHECK((D <= 256 || D == 512) && D % 8 == 0 && D % 2 == 0,
++              "D must be even, multiple of 8, and <=256 or ==512");
+   TORCH_CHECK(H % num_kv_heads == 0,
+               "num_heads must be divisible by num_kv_heads");
+ 
+@@ -4087,6 +4096,9 @@ at::Tensor flash_attention_decode_paged_wmma(
+     case 256:
+       LAUNCH_DECODE_WMMA_BY_KV(256);
+       break;
++    case 512:
++      LAUNCH_DECODE_WMMA_BY_KV(512);
++      break;
+     default:
+       TORCH_CHECK(false, "Unsupported D: ", D);
+   }
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..6cc402fcb1 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1068,6 +1068,7 @@
+     VLLM_USE_SPINLOOP_EXT: bool = False
+     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
+     VLLM_NIC_SELECTION_VARS: str = ""
++    VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
+ 
+     # Native-only compatibility controls are raw optional strings.
+     VLLM_CUSTOM_ALLREDUCE_ALGO: str | None = None
+@@ -16741,6 +16742,21 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=True,
+     ),
++    "VLLM_GPU_SYNC_CHECK": env_var(
++        env_with_choices(
++            "VLLM_GPU_SYNC_CHECK", None, ["warn", "error"]
++        ),
++        description=(
++            "GPU sync debug mode: 'warn' logs unintended GPU<->CPU syncs, "
++            "'error' raises. Unset disables."
++        ),
++        category="debug",
++        declared_default="None",
++        effective_default="None",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
+     # Comma-separated list of env vars to set from the GPU-NIC mapping.
+     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
+     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 79aac717b6..0ca966ad02 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import contextlib
+ from collections.abc import Mapping
+ from typing import TYPE_CHECKING, Any
+ 
+@@ -255,8 +256,14 @@ def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+         with different head dimensions for prefill-decode disaggregation.
+         """
+         hf_text_config = vllm_config.model_config.hf_text_config
+-        head_dim = getattr(hf_text_config, "head_dim", None)
+-        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
++        # head_dim is per-layer; __dict__ bypasses the heterogeneity guard.
++        head_dim = hf_text_config.__dict__.get("head_dim")
++        # global_head_dim only lives in per_layer_config.
++        per_layer = getattr(hf_text_config, "per_layer_config", None)
++        global_head_dim = None
++        if per_layer is not None:
++            with contextlib.suppress(ValueError, IndexError, AttributeError):
++                global_head_dim = per_layer["full_attention"].head_dim
+ 
+         # Only force Triton when head dimensions actually differ AND the
+         # larger one exceeds FlashAttention's kernel limit (head_size <= 256).
+@@ -863,6 +870,7 @@ def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+     "Gemma3TextModel": Gemma3TextModelConfig,
+     "Gemma4ForCausalLM": Gemma4Config,
+     "Gemma4ForConditionalGeneration": Gemma4Config,
++    "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
+     "GptOssForCausalLM": GptOssForCausalLMConfig,
+     "GteModel": SnowflakeGteNewModelConfig,
+     "GteNewForSequenceClassification": GteNewModelConfig,
+diff --git a/vllm/model_executor/models/gemma3n_mm.py b/vllm/model_executor/models/gemma3n_mm.py
+index 2b5266f0c9..c9ee87b4c2 100644
+--- a/vllm/model_executor/models/gemma3n_mm.py
++++ b/vllm/model_executor/models/gemma3n_mm.py
+@@ -83,6 +83,30 @@ class Gemma3nImagePixelInputs(TensorSchema):
+     pixel_values: Annotated[torch.Tensor, TensorShape("bn", 3, "h", "w")]
+ 
+ 
++def batch_audio_features(
++    input_features: torch.Tensor | list[torch.Tensor],
++    input_features_mask: torch.Tensor | list[torch.Tensor],
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if isinstance(input_features, torch.Tensor):
++        assert isinstance(input_features_mask, torch.Tensor)
++        return input_features.squeeze(1), input_features_mask.squeeze(1)
++
++    assert isinstance(input_features_mask, list)
++    max_len = max(features.shape[0] for features in input_features)
++    batched_features = input_features[0].new_zeros(
++        (len(input_features), max_len, input_features[0].shape[-1])
++    )
++    batched_mask = input_features_mask[0].new_zeros(
++        (len(input_features_mask), max_len), dtype=torch.bool
++    )
++    for i, (features, mask) in enumerate(
++        zip(input_features, input_features_mask, strict=True)
++    ):
++        batched_features[i, : features.shape[0]] = features
++        batched_mask[i, : mask.shape[0]] = mask
++    return batched_features, batched_mask
++
++
+ class Gemma3nAudioInputs(TensorSchema):
+     """
+     Dimensions:
+diff --git a/vllm/model_executor/models/gemma4.py b/vllm/model_executor/models/gemma4.py
+index 75f6945ccc..cd40f7cce2 100644
+--- a/vllm/model_executor/models/gemma4.py
++++ b/vllm/model_executor/models/gemma4.py
+@@ -18,6 +18,7 @@
+ # limitations under the License.
+ """Gemma 4 model implementation for vLLM."""
+ 
++import contextlib
+ from collections.abc import Iterable
+ from dataclasses import replace
+ from itertools import islice
+@@ -211,7 +212,28 @@ def _get_text_config(config):
+     transparently returns the text config regardless of nesting.
+     """
+     if hasattr(config, "text_config"):
+-        return config.text_config
++        tc = config.text_config
++        # transformers >=5.18 intercepts __getattribute__ for per-layer
++        # attrs; set the escape hatch before any other access.
++        with contextlib.suppress(AttributeError, TypeError):
++            tc.allow_global_per_layer_attribute_access = True
++        # Gemma4TextConfig dataclass does not declare global_head_dim as a
++        # field, so the value is silently dropped when loading from JSON.
++        # Read it from the raw config.json file.
++        try:
++            import json as _json
++            import os as _os
++
++            _path = getattr(config, "_name_or_path", None)
++            if _path and _os.path.isdir(_path):
++                with open(_os.path.join(_path, "config.json")) as _f:
++                    _raw = _json.load(_f)
++                _tc_raw = _raw.get("text_config", _raw)
++                if "global_head_dim" in _tc_raw:
++                    tc.global_head_dim = _tc_raw["global_head_dim"]
++        except Exception:
++            pass
++        return tc
+     return config
+ 
+ 
+@@ -556,13 +578,15 @@ def __init__(
+         layer_idx = extract_layer_index(prefix)
+         self.layer_idx = layer_idx
+ 
+-        # Gemma4 uses different head dimensions for sliding vs full attention
++        # Gemma4 uses different head dimensions for sliding vs full attention.
++        # per_layer_config covers full-attention layers only; sliding layers
++        # use base values read via __dict__ (bypasses heterogeneity guard).
+         layer_type = config.layer_types[layer_idx]
+         self.is_full_attention = layer_type == "full_attention"
+         if self.is_full_attention:
+-            head_dim = getattr(config, "global_head_dim", config.head_dim)
++            head_dim = config.per_layer_config[layer_idx].head_dim
+         else:
+-            head_dim = config.head_dim
++            head_dim = config.__dict__["head_dim"]
+ 
+         # Determine if this full-attention layer uses k_eq_v
+         # (laptop variant: no v_proj, K reused as V on full attention layers)
+@@ -570,14 +594,16 @@ def __init__(
+             config, "attention_k_eq_v", False
+         )
+ 
+-        # For k_eq_v full-attention layers, use num_global_key_value_heads
+-        # as the KV head count when k_eq_v is enabled.
++        # k_eq_v: KV head count from per-layer config.
+         if use_k_eq_v:
++            _plc = config.per_layer_config[layer_idx]
+             num_kv_heads = getattr(
+-                config, "num_global_key_value_heads", config.num_key_value_heads
++                _plc,
++                "num_key_value_heads",
++                config.__dict__["num_key_value_heads"],
+             )
+         else:
+-            num_kv_heads = config.num_key_value_heads
++            num_kv_heads = config.__dict__["num_key_value_heads"]
+ 
+         self.self_attn = Gemma4Attention(
+             config=config,
+@@ -962,6 +988,31 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         cache_config = vllm_config.cache_config
+         quant_config = vllm_config.quant_config
+         self.config = config
++
++        # Gemma4TextConfig dataclass does not declare global_head_dim or
++        # num_global_key_value_heads, so they're silently dropped from the
++        # JSON. Read them from the model's config.json file.
++        with contextlib.suppress(AttributeError, TypeError):
++            config.allow_global_per_layer_attribute_access = True
++        _need_ghd = not hasattr(config, "global_head_dim")
++        _need_gkv = not hasattr(config, "num_global_key_value_heads")
++        if _need_ghd or _need_gkv:
++            _model_path = vllm_config.model_config.model
++            import json as _json
++            import os as _os
++
++            _cfg_file = _os.path.join(_model_path, "config.json")
++            if _os.path.isfile(_cfg_file):
++                with open(_cfg_file) as _f:
++                    _raw = _json.load(_f)
++                _tc_raw = _raw.get("text_config", _raw)
++                if _need_ghd and "global_head_dim" in _tc_raw:
++                    config.global_head_dim = _tc_raw["global_head_dim"]
++                if _need_gkv and "num_global_key_value_heads" in _tc_raw:
++                    config.num_global_key_value_heads = _tc_raw[
++                        "num_global_key_value_heads"
++                    ]
++
+         self.quant_config = quant_config
+ 
+         # PLE config values (default to 0 if not present — disables PLE)
+diff --git a/vllm/model_executor/models/gemma4_mtp.py b/vllm/model_executor/models/gemma4_mtp.py
+index c294ffc6f9..4e451ff653 100644
+--- a/vllm/model_executor/models/gemma4_mtp.py
++++ b/vllm/model_executor/models/gemma4_mtp.py
+@@ -273,17 +273,16 @@ def __init__(
+         layer_idx = extract_layer_index(prefix)
+         layer_type = config.layer_types[layer_idx]
+         is_full_attention = layer_type == "full_attention"
+-        head_dim = (
+-            getattr(config, "global_head_dim", config.head_dim)
+-            if is_full_attention
+-            else config.head_dim
+-        )
++        if is_full_attention:
++            head_dim = config.per_layer_config[layer_idx].head_dim
++        else:
++            head_dim = config.__dict__["head_dim"]
+ 
+         self.self_attn = Gemma4MTPAttention(
+             config=config,
+             hidden_size=self.hidden_size,
+             num_heads=config.num_attention_heads,
+-            num_kv_heads=config.num_key_value_heads,
++            num_kv_heads=config.__dict__["num_key_value_heads"],
+             head_dim=head_dim,
+             max_position_embeddings=config.max_position_embeddings,
+             cache_config=cache_config,
+diff --git a/vllm/model_executor/models/gemma4_unified.py b/vllm/model_executor/models/gemma4_unified.py
+new file mode 100644
+index 0000000000..31dd567e24
+--- /dev/null
++++ b/vllm/model_executor/models/gemma4_unified.py
+@@ -0,0 +1,545 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Gemma 4 Unified multimodal model (encoder-free image + audio + video).
++
++The Unified Gemma4 variant has no SigLIP vision tower and no audio tower.
++Raw pixel patches are projected directly to LM space via a Dense+LayerNorm
++pipeline with factorized 2D positional embeddings (Gemma4UnifiedVisionEmbedder),
++then routed through the same Gemma4MultimodalEmbedder used by the tower-based
++variant.  Audio inputs are raw waveform frames projected directly through the
++multimodal embedder.
++
++This module subclasses Gemma4ForConditionalGeneration from gemma4_mm rather
++than reimplementing it from scratch.  Only the multimodal pipeline differs;
++the language model, MTP integration, bidirectional attention helpers,
++embedding/forward path, and LoRA support are all inherited unchanged.
++"""
++
++import math
++from collections.abc import Iterable, Mapping
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++from transformers.models.gemma4_unified.configuration_gemma4_unified import (
++    Gemma4UnifiedConfig,
++)
++from transformers.models.gemma4_unified.processing_gemma4_unified import (
++    Gemma4UnifiedProcessor,
++)
++
++from vllm.config import VllmConfig
++from vllm.model_executor.layers.linear import ColumnParallelLinear
++from vllm.model_executor.models.gemma3n_mm import batch_audio_features
++from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
++from vllm.model_executor.models.gemma4_mm import (
++    _SUPPORTED_SOFT_TOKENS,
++    _VIDEO_MAX_FRAMES,
++    _VIDEO_MAX_SOFT_TOKENS,
++    Gemma4AudioInputs,
++    Gemma4DummyInputsBuilder,
++    Gemma4ForConditionalGeneration,
++    Gemma4ImageInputs,
++    Gemma4ImagePixelInputs,
++    Gemma4MultimodalEmbedder,
++    Gemma4MultiModalProcessor,
++    Gemma4ProcessingInfo,
++    Gemma4VideoInputs,
++    _get_max_soft_tokens,
++)
++from vllm.model_executor.models.module_mapping import MultiModelKeys
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.utils.gpu_sync_debug import gpu_sync_allowed
++
++from .utils import (
++    AutoWeightsLoader,
++    WeightsMapper,
++    init_vllm_registered_model,
++    maybe_prefix,
++)
++
++# Re-export so tests/code targeting the unified variant can import from here
++# rather than reaching into gemma4_mm.
++__all__ = [
++    "Gemma4ImagePixelInputs",
++    "Gemma4UnifiedVisionEmbedder",
++    "Gemma4UnifiedProcessingInfo",
++    "Gemma4UnifiedForConditionalGeneration",
++]
++
++
++# ---------------------------------------------------------------------------
++# Encoder-free vision embedder
++# ---------------------------------------------------------------------------
++
++
++class Gemma4UnifiedVisionEmbedder(nn.Module):
++    """Encoder-free vision embedder for Gemma4 Unified variants.
++
++    Projects raw pixel patches to LM space via dense projection and
++    factorized 2D positional embeddings.  Replaces the SigLIP vision
++    tower used by the tower-based Gemma4 variant.
++
++    Pipeline: raw patches → LN₁ → Dense → LN₂ → +factorized_posemb → LN₃.
++    """
++
++    def __init__(self, config, quant_config=None, prefix=""):
++        super().__init__()
++        patch_dim = config.model_patch_size**2 * 3
++        mm_embed_dim = config.mm_embed_dim
++
++        self.patch_dim = patch_dim
++        self.mm_embed_dim = mm_embed_dim
++
++        self.patch_ln1 = nn.LayerNorm(patch_dim)
++        self.patch_dense = ColumnParallelLinear(
++            patch_dim,
++            mm_embed_dim,
++            bias=True,
++            quant_config=quant_config,
++            prefix=f"{prefix}.patch_dense",
++            gather_output=True,
++        )
++        self.patch_ln2 = nn.LayerNorm(mm_embed_dim)
++
++        self.pos_embedding = nn.Parameter(
++            torch.zeros(config.mm_posemb_size, 2, mm_embed_dim)
++        )
++        self.pos_norm = nn.LayerNorm(mm_embed_dim)
++
++    def _factorized_posemb(
++        self,
++        positions_xy: torch.Tensor,
++    ) -> torch.Tensor:
++        """Factorized 2D positional embedding lookup: sum of x and y tables.
++
++        pos_embedding has shape (max_pos, 2, D). Padding positions (-1) are
++        clamped before indexing and zeroed via mask.
++        """
++        max_pos, _, embed_dim = self.pos_embedding.shape
++        clamped_pos = positions_xy.clamp(min=0, max=max_pos - 1).to(torch.long) * 2
++        clamped_pos[..., 1] += 1
++        embs = F.embedding(clamped_pos, self.pos_embedding.view(-1, embed_dim))
++        embs.masked_fill_((positions_xy < 0).unsqueeze(-1), 0.0)
++        return embs[..., 0, :].add_(embs[..., 1, :])
++
++    def forward(
++        self,
++        pixel_values: torch.Tensor,
++        pixel_position_ids: torch.Tensor,
++    ) -> torch.Tensor:
++        dtype = self.pos_embedding.dtype
++        if pixel_values.dtype != dtype:
++            pixel_values = pixel_values.to(dtype)
++        hidden_states = self.patch_ln1(pixel_values)
++        hidden_states, _ = self.patch_dense(hidden_states)
++        hidden_states = self.patch_ln2(hidden_states)
++
++        pos_embs = self._factorized_posemb(pixel_position_ids)
++        hidden_states = self.pos_norm(hidden_states + pos_embs)
++        return hidden_states
++
++
++# ---------------------------------------------------------------------------
++# Processing info
++# ---------------------------------------------------------------------------
++
++
++class Gemma4UnifiedProcessingInfo(Gemma4ProcessingInfo):
++    """ProcessingInfo for the Gemma4 Unified variant.
++
++    Two field-name differences from the tower-based parent:
++      * config → ``Gemma4UnifiedConfig`` (not ``Gemma4Config``)
++      * vision_config.``num_soft_tokens`` (not ``default_output_length``)
++
++    Everything else (token sequencing, audio limits, video frame budget,
++    parser construction) is inherited unchanged.
++    """
++
++    def get_hf_config(self):
++        return self.ctx.get_hf_config(Gemma4UnifiedConfig)
++
++    def get_hf_processor(self, **kwargs: object) -> Gemma4UnifiedProcessor:
++        return self.ctx.get_hf_processor(
++            Gemma4UnifiedProcessor,
++            **kwargs,
++        )
++
++    def get_mm_max_tokens_per_item(
++        self, seq_len: int, mm_counts: Mapping[str, int]
++    ) -> Mapping[str, int] | None:
++        config = self.get_hf_config()
++        # Unified field is `num_soft_tokens`.  Tower-based parent uses
++        # `default_output_length`, hence the override.
++        tokens_per_image = config.vision_config.num_soft_tokens
++        merged_kwargs = self.ctx.get_merged_mm_kwargs({})
++        val, _ = _get_max_soft_tokens(merged_kwargs)
++        if isinstance(val, int) and val in _SUPPORTED_SOFT_TOKENS:
++            tokens_per_image = val
++        tokens: dict[str, int] = {"image": tokens_per_image}
++        if config.audio_config is not None:
++            processor = self.get_hf_processor()
++            tokens["audio"] = processor.audio_seq_length
++        num_frames = _VIDEO_MAX_FRAMES
++        mm_config = self.ctx.model_config.get_multimodal_config()
++        video_opts = mm_config.limit_per_prompt.get("video")
++        if video_opts is not None and video_opts.num_frames is not None:
++            num_frames = min(num_frames, video_opts.num_frames)
++        tokens["video"] = num_frames * (_VIDEO_MAX_SOFT_TOKENS + 2 + 6)
++        return tokens
++
++    def _compute_num_soft_tokens(
++        self,
++        image_width: int,
++        image_height: int,
++        max_soft_tokens: int | None = None,
++    ) -> int:
++        vision_cfg = self.get_hf_config().vision_config
++        patch_size = vision_cfg.patch_size
++        pooling_kernel_size = vision_cfg.pooling_kernel_size
++
++        if max_soft_tokens is None:
++            max_soft_tokens = vision_cfg.num_soft_tokens
++
++        unit = patch_size * pooling_kernel_size
++        max_patches = max_soft_tokens * pooling_kernel_size**2
++        num_patches_orig = (image_height / patch_size) * (image_width / patch_size)
++        scale = math.sqrt(max_patches / num_patches_orig)
++        target_h = max(unit, int(math.floor(image_height * scale / unit)) * unit)
++        target_w = max(unit, int(math.floor(image_width * scale / unit)) * unit)
++        num_patches = (target_h // patch_size) * (target_w // patch_size)
++        num_soft_tokens = num_patches // (pooling_kernel_size**2)
++        return min(num_soft_tokens, max_soft_tokens)
++
++
++# ---------------------------------------------------------------------------
++# Main model
++# ---------------------------------------------------------------------------
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    Gemma4MultiModalProcessor,
++    info=Gemma4UnifiedProcessingInfo,
++    dummy_inputs=Gemma4DummyInputsBuilder,
++)
++class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
++    """Encoder-free Gemma4 (Unified) for conditional generation.
++
++    Inherits multimodal embedding routing, PLE handling, bidirectional
++    attention helpers, language-model forward, LoRA, and pipeline-parallel
++    support from :class:`Gemma4ForConditionalGeneration`.  Overrides only:
++
++      * ``__init__`` — builds the encoder-free vision embedder instead of
++        SigLIP/audio towers (LightOnOCR-style: ``nn.Module.__init__`` +
++        full rebuild, no ``super().__init__()``).
++      * ``hf_to_vllm_mapper`` — adds the ``model.vision_embedder.`` prefix.
++      * ``_process_image_input`` / ``_process_video_input`` /
++        ``_process_audio_input`` — encoder-free projection paths.
++      * ``load_weights`` — ignore-prefix list excludes the absent towers.
++      * ``get_mm_mapping`` — no tower entries.
++    """
++
++    hf_to_vllm_mapper = WeightsMapper(
++        orig_to_new_prefix={
++            "model.embed_audio.": "embed_audio.",
++            "model.embed_vision.": "embed_vision.",
++            "model.language_model.": "language_model.model.",
++            "model.vision_embedder.": "vision_embedder.",
++            "lm_head.": "language_model.lm_head.",
++            "model": "language_model.model",
++        }
++    )
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        # LightOnOCR-style rebuild: do NOT call super().__init__ — that
++        # would build a SigLIP vision tower and an audio tower we don't
++        # need.  Initialize nn.Module directly and assemble the
++        # encoder-free pipeline below.
++        nn.Module.__init__(self)
++        config = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        multimodal_config = vllm_config.model_config.multimodal_config
++        self.config = config
++        self.quant_config = quant_config
++        self.multimodal_config = multimodal_config
++
++        # No towers — set to None so inherited load_weights / get_mm_mapping
++        # and any tower-aware logic short-circuits.
++        self.vision_tower = None
++        self.audio_tower = None
++
++        # ---- Encoder-free vision embedder ----
++        if config.vision_config is None:
++            raise ValueError("Gemma4 Unified requires a vision configuration")
++        self.vision_embedder = Gemma4UnifiedVisionEmbedder(
++            config.vision_config,
++            quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "vision_embedder"),
++        )
++        self.embed_vision = Gemma4MultimodalEmbedder(
++            config.vision_config,
++            config.text_config,
++        )
++
++        # ---- Encoder-free audio embedder ----
++        self.embed_audio = (
++            Gemma4MultimodalEmbedder(
++                config.audio_config,
++                config.text_config,
++            )
++            if config.audio_config is not None
++            else None
++        )
++
++        # ---- Language model (vLLM optimised) ----
++        with self._mark_language_model(vllm_config):
++            self.language_model: Gemma4ForCausalLM = init_vllm_registered_model(
++                vllm_config=vllm_config,
++                hf_config=config.text_config,
++                prefix=maybe_prefix(prefix, "language_model"),
++                architectures=["Gemma4ForCausalLM"],
++            )
++
++            # PLE is disabled for the unified variant (text config defaults
++            # hidden_size_per_layer_input to 0).  Skip the buffer.
++            ple_dim = getattr(
++                config.text_config,
++                "hidden_size_per_layer_input",
++                None,
++            )
++            if ple_dim is not None and ple_dim > 0:
++                embed = self.language_model.model.embed_tokens
++                self.per_layer_embeddings = torch.zeros(
++                    vllm_config.scheduler_config.max_num_batched_tokens,
++                    config.text_config.num_hidden_layers,
++                    ple_dim,
++                    device=next(embed.parameters()).device,
++                    dtype=vllm_config.model_config.dtype,
++                )
++            else:
++                self.per_layer_embeddings = None
++
++        self.make_empty_intermediate_tensors = (
++            self.language_model.make_empty_intermediate_tensors
++        )
++
++        # --- Precompute full-attention layer indices for bidi clearing ---
++        self._full_attn_layer_idxs: frozenset[int] = frozenset()
++        text_config = config.text_config
++        if getattr(text_config, "use_bidirectional_attention", None) == "vision":
++            layer_types = getattr(text_config, "layer_types", None)
++            if layer_types:
++                self._full_attn_layer_idxs = frozenset(
++                    i for i, lt in enumerate(layer_types) if lt != "sliding_attention"
++                )
++
++        # --- MixtureOfExperts delegation to language_model ---
++        self.moe_layers = self.language_model.moe_layers
++        self.num_moe_layers = self.language_model.num_moe_layers
++        self.num_logical_experts = self.language_model.num_logical_experts
++        self.num_physical_experts = self.language_model.num_physical_experts
++        self.num_local_physical_experts = self.language_model.num_local_physical_experts
++        self.num_routed_experts = self.language_model.num_routed_experts
++        self.num_expert_groups = self.language_model.num_expert_groups
++        self.num_shared_experts = self.language_model.num_shared_experts
++        self.num_redundant_experts = self.language_model.num_redundant_experts
++        self.set_eplb_state = self.language_model.set_eplb_state
++
++        gen_cfg = vllm_config.model_config.try_get_generation_config()
++        self._suppress_token_ids = gen_cfg.get("suppress_tokens") if gen_cfg else None
++
++    # ------------------------------------------------------------------ #
++    # Multimodal processing (encoder-free overrides)
++    # ------------------------------------------------------------------ #
++
++    @staticmethod
++    def _vision_chunk(
++        patches_per_item: int,
++        free_bytes: int,
++        total_bytes: int,
++        patch_dim: int = 6912,
++        mm_embed_dim: int = 3840,
++    ) -> int:
++        """Max items (images or video frames) to embed in one batch."""
++        if patches_per_item <= 0:
++            return 1
++        budget = min(free_bytes // 2, total_bytes // 10)
++        # Peak transient memory per patch across patch_ln1, patch_dense,
++        # _factorized_posemb, and embed_vision (~64 KB/patch in bf16).
++        cost = patches_per_item * (2 * patch_dim + 4 * mm_embed_dim) * 2
++        return max(1, budget // max(1, cost))
++
++    def _embed_vision_patches(
++        self,
++        pixel_values: torch.Tensor,
++        pixel_position_ids: torch.Tensor,
++    ) -> torch.Tensor:
++        weight = self.embed_vision.embedding_projection.weight
++        target_dtype = weight.dtype
++        if pixel_values.numel() == 0:
++            return torch.empty(
++                (*pixel_values.shape[:-1], weight.shape[0]),
++                device=pixel_values.device,
++                dtype=target_dtype,
++            )
++
++        total_items = pixel_values.shape[0]
++        if total_items <= 1:
++            embedded = self.vision_embedder(pixel_values, pixel_position_ids)
++            return self.embed_vision(embedded.to(target_dtype))
++
++        patches_per_item = pixel_values.shape[1] if pixel_values.ndim == 3 else 1
++        free_bytes, total_bytes = (
++            torch.accelerator.get_memory_info()
++            if pixel_values.is_cuda
++            else (1 << 60, 1 << 60)
++        )
++        max_batch = self._vision_chunk(
++            patches_per_item,
++            free_bytes,
++            total_bytes,
++            pixel_values.shape[-1],
++            self.vision_embedder.mm_embed_dim,
++        )
++        if total_items <= max_batch:
++            embedded = self.vision_embedder(pixel_values, pixel_position_ids)
++            return self.embed_vision(embedded.to(target_dtype))
++
++        chunks: list[torch.Tensor] = []
++        for idx in range(0, total_items, max_batch):
++            pv_chunk = pixel_values[idx : idx + max_batch]
++            pp_chunk = pixel_position_ids[idx : idx + max_batch]
++            embedded = self.vision_embedder(pv_chunk, pp_chunk)
++            chunks.append(self.embed_vision(embedded.to(target_dtype)))
++        return torch.cat(chunks, dim=0)
++
++    def _process_image_input(
++        self,
++        image_input: Gemma4ImageInputs,
++    ) -> list[torch.Tensor]:
++        pixel_values = image_input["pixel_values"]
++        pixel_position_ids = image_input["pixel_position_ids"]
++
++        if isinstance(pixel_values, (list, tuple)):
++            if len(pixel_values) == 0:
++                return []
++            lengths = [pv.shape[0] for pv in pixel_values]
++            pixel_values = torch.cat(pixel_values, dim=0)
++            pixel_position_ids = torch.cat(pixel_position_ids, dim=0)
++        else:
++            lengths = None
++
++        projected = self._embed_vision_patches(pixel_values, pixel_position_ids)
++        padding_mask = (pixel_position_ids == -1).all(dim=-1)
++
++        if lengths is not None:
++            proj_chunks: torch.Tensor | tuple[torch.Tensor, ...] = torch.split(
++                projected, lengths, dim=0
++            )
++            mask_chunks: torch.Tensor | tuple[torch.Tensor, ...] = torch.split(
++                padding_mask, lengths, dim=0
++            )
++        else:
++            proj_chunks = projected
++            mask_chunks = padding_mask
++
++        with gpu_sync_allowed():
++            return [
++                chunk[~mask]
++                for chunk, mask in zip(proj_chunks, mask_chunks, strict=True)
++            ]
++
++    def _process_video_input(
++        self,
++        video_input: Gemma4VideoInputs,
++    ) -> list[torch.Tensor]:
++        pixel_values = video_input["pixel_values_videos"]
++        pixel_position_ids = video_input["pixel_position_ids_videos"]
++        frame_counts = video_input["video_frame_counts"]
++
++        if isinstance(frame_counts, torch.Tensor):
++            with gpu_sync_allowed():
++                fc_list = frame_counts.tolist()
++        else:
++            fc_list = list(frame_counts)
++
++        if isinstance(pixel_values, (list, tuple)):
++            if len(pixel_values) == 0:
++                return []
++            pixel_values = torch.cat(pixel_values, dim=0)
++            pixel_position_ids = torch.cat(pixel_position_ids, dim=0)
++
++        if pixel_values.shape[0] == 0:
++            return []
++
++        projected = self._embed_vision_patches(pixel_values, pixel_position_ids)
++        padding_mask = (pixel_position_ids == -1).all(dim=-1)
++
++        proj_per_video = torch.split(projected, fc_list, dim=0)
++        mask_per_video = torch.split(padding_mask, fc_list, dim=0)
++
++        with gpu_sync_allowed():
++            return [
++                proj_chunk[~mask_chunk]
++                for proj_chunk, mask_chunk in zip(
++                    proj_per_video, mask_per_video, strict=True
++                )
++            ]
++
++    def _process_audio_input(
++        self,
++        audio_input: Gemma4AudioInputs,
++    ) -> list[torch.Tensor]:
++        """Project raw waveform-frame features directly to LM space.
++
++        No audio tower: the per-frame raw features are passed straight
++        through the multimodal embedder, then padding is stripped.
++        """
++        input_features, input_features_mask = batch_audio_features(
++            audio_input["input_features_padded"],
++            audio_input["input_features_mask"],
++        )
++
++        assert self.embed_audio is not None
++        target_dtype = self.embed_audio.embedding_projection.weight.dtype
++        audio_features = self.embed_audio(input_features.to(target_dtype))
++        per_audio: list[torch.Tensor] = []
++        with gpu_sync_allowed():
++            for enc, mask in zip(audio_features, input_features_mask, strict=True):
++                per_audio.append(enc[mask])
++        return per_audio
++
++    # ------------------------------------------------------------------ #
++    # Weight loading
++    # ------------------------------------------------------------------ #
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        ignore_prefixes = [
++            # Vestigial Gemma3n-style embedding tables not used by
++            # Gemma4MultimodalEmbedder (which has only projection + norm).
++            "embed_vision.embedding.",
++            "embed_audio.embedding.",
++        ]
++        if self.embed_audio is None:
++            ignore_prefixes.append("embed_audio.")
++
++        loader = AutoWeightsLoader(
++            self,
++            ignore_unexpected_prefixes=ignore_prefixes,
++        )
++        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++
++    # ------------------------------------------------------------------ #
++    # LoRA / multimodal mapping
++    # ------------------------------------------------------------------ #
++
++    def get_mm_mapping(self) -> MultiModelKeys:
++        """Module prefix mapping for the encoder-free model (no towers)."""
++        connectors = ["embed_vision"]
++        if self.embed_audio is not None:
++            connectors.append("embed_audio")
++        return MultiModelKeys.from_string_field(
++            language_model="language_model",
++            connector=connectors,
++            tower_model=[],
++        )
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index bb8c040359..4d4d6a6148 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -417,6 +417,10 @@
+         "Gemma3nForConditionalGeneration",
+     ),
+     "Gemma4ForConditionalGeneration": ("gemma4_mm", "Gemma4ForConditionalGeneration"),
++    "Gemma4UnifiedForConditionalGeneration": (
++        "gemma4_unified",
++        "Gemma4UnifiedForConditionalGeneration",
++    ),
+     "GlmAsrForConditionalGeneration": ("glmasr", "GlmAsrForConditionalGeneration"),
+     "GLM4VForCausalLM": ("glm4v", "GLM4VForCausalLM"),
+     "Glm4vForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),
+diff --git a/vllm/platforms/cuda.py b/vllm/platforms/cuda.py
+index 05926cb0ee..bfb63d9eb1 100644
+--- a/vllm/platforms/cuda.py
++++ b/vllm/platforms/cuda.py
+@@ -744,28 +744,37 @@ def get_device_capability(
+             return cls._torch_device_capability(device_id)
+         return cls._nvml_device_capability(device_id)
+ 
++    _torch_cap_cache: dict = {}
++    _nvml_cap_cache: dict = {}
++
+     @classmethod
+-    @cache
+     def _torch_device_capability(cls, device_id: int) -> DeviceCapability | None:
+-        # Same contract as the NVML path: an unusable index answers None.
+-        # torch raises AssertionError for an out-of-range ordinal.
++        if device_id in cls._torch_cap_cache:
++            return cls._torch_cap_cache[device_id]
+         try:
+             major, minor = torch.cuda.get_device_capability(device_id)
+         except (RuntimeError, AssertionError):
++            cls._torch_cap_cache[device_id] = None
+             return None
+-        return DeviceCapability(major=major, minor=minor)
++        cap = DeviceCapability(major=major, minor=minor)
++        cls._torch_cap_cache[device_id] = cap
++        return cap
+ 
+     @classmethod
+-    @cache
+     @with_nvml_context
+     def _nvml_device_capability(cls, device_id: int) -> DeviceCapability | None:
++        if device_id in cls._nvml_cap_cache:
++            return cls._nvml_cap_cache[device_id]
+         try:
+             physical_device_id = cls.device_id_to_physical_device_id(device_id)
+             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+             major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+-            return DeviceCapability(major=major, minor=minor)
++            cap = DeviceCapability(major=major, minor=minor)
+         except RuntimeError:
++            cls._nvml_cap_cache[device_id] = None
+             return None
++        cls._nvml_cap_cache[device_id] = cap
++        return cap
+ 
+     @classmethod
+     @with_nvml_context
+diff --git a/vllm/transformers_utils/model_arch_config_convertor.py b/vllm/transformers_utils/model_arch_config_convertor.py
+index d33169d03d..24c6349a96 100644
+--- a/vllm/transformers_utils/model_arch_config_convertor.py
++++ b/vllm/transformers_utils/model_arch_config_convertor.py
+@@ -520,6 +520,14 @@ def get_num_hidden_layers(self) -> int:
+ 
+ 
+ class Gemma4MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
++    def __init__(self, hf_config, hf_text_config):
++        super().__init__(hf_config, hf_text_config)
++        _allow = getattr(
++            hf_text_config, "allow_global_per_layer_attribute_access", False
++        )
++        if not _allow:
++            hf_text_config.allow_global_per_layer_attribute_access = True
++
+     def get_hidden_size(self) -> int:
+         # The speculator buffer must match the backbone (target) model's
+         # hidden dimension, not the draft model's smaller dimension.
+@@ -532,11 +540,20 @@ def get_num_hidden_layers(self) -> int:
+ 
+ 
+ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
+-    def is_mm_prefix_lm(self) -> bool:
+-        return (
+-            getattr(self.hf_text_config, "use_bidirectional_attention", None)
+-            == "vision"
++    def __init__(self, hf_config, hf_text_config):
++        super().__init__(hf_config, hf_text_config)
++        # Allow global access to per-layer attrs (head_dim, num_kv_heads).
++        _allow = getattr(
++            hf_text_config, "allow_global_per_layer_attribute_access", False
+         )
++        if not _allow:
++            hf_text_config.allow_global_per_layer_attribute_access = True
++
++    def is_mm_prefix_lm(self) -> bool:
++        # use_bidirectional_attention="vision" describes the vision
++        # encoder's self-attention pattern, not the text model's.
++        # Gemma-4 text is standard causal — no mm_prefix_lm.
++        return False
+ 
+     def get_head_size(self) -> int:
+         # Gemma4 uses dual head dimensions: head_dim (sliding attention)
+@@ -558,6 +575,8 @@ def get_head_size(self) -> int:
+     "gemma4": Gemma4ModelArchConfigConvertor,
+     "gemma4_mtp": Gemma4MTPModelArchConfigConvertor,
+     "gemma4_text": Gemma4ModelArchConfigConvertor,
++    "gemma4_unified": Gemma4ModelArchConfigConvertor,
++    "gemma4_unified_text": Gemma4ModelArchConfigConvertor,
+     "glm4_moe_mtp": GLM4MoeMTPModelArchConfigConvertor,
+     "glm_ocr_mtp": GLM4MoeMTPModelArchConfigConvertor,
+     "longcat_flash_mtp": LongCatFlashMTPModelArchConfigConvertor,
+diff --git a/vllm/utils/gpu_sync_debug.py b/vllm/utils/gpu_sync_debug.py
+new file mode 100644
+index 0000000000..8d0e7ae187
+--- /dev/null
++++ b/vllm/utils/gpu_sync_debug.py
+@@ -0,0 +1,403 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Detect unintended GPU<->CPU syncs in the hot path.
++
++`torch.cuda.set_sync_debug_mode` is process-global, so we arm it at "warn"
++(which never raises) and decide in `_sync_warning_hook` whether a given sync
++is a failure. The scoping lives in ContextVars, which are per-thread and
++per-asyncio-task, so an allow region opened on one thread is invisible to
++every other one.
++
++torch's mode only instruments explicit synchronizing calls, so it misses
++`non_blocking=True` CPU<->CUDA copies that the CUDA driver silently stages
++through pageable memory (when the CPU tensor is not pinned or not densely
++laid out). Those are caught by the wrappers on `Tensor.to`/`Tensor.cuda`/
++`Tensor.copy_` installed by `_install_copy_checkers()`.
++"""
++
++import functools
++import sys
++import threading
++import warnings
++from contextlib import contextmanager, nullcontext
++from contextvars import ContextVar
++
++import torch
++
++import vllm.envs as envs
++from vllm.platforms import current_platform
++
++SYNC_ERROR_MESSAGE = (
++    "GPU<->CPU sync detected - avoid it or wrap with gpu_sync_allowed()"
++)
++
++# Warning text torch emits in "warn" mode.
++_TORCH_SYNC_WARNING = "called a synchronizing CUDA operation"
++
++_GPU_SYNC_ALLOWED_FIRST_SEEN: set[tuple[str, int]] = set()
++
++# Read once: `envs.__getattr__` re-evaluates the env lambda on every access,
++# which dominates the cost of a disabled `gpu_sync_allowed()`. Tests toggling
++# the env var must patch this attribute instead.
++_SYNC_CHECK_MODE: str | None = (
++    envs.VLLM_GPU_SYNC_CHECK if current_platform.is_cuda_alike() else None
++)
++
++# Configured mode while a thread is inside a checked call, else None.
++_checking: ContextVar[str | None] = ContextVar("vllm_gpu_sync_checking", default=None)
++# Depth of nested `gpu_sync_allowed()` regions on this thread.
++_allow_depth: ContextVar[int] = ContextVar("vllm_gpu_sync_allow_depth", default=0)
++
++# Off during engine setup so model load, KV cache init and warmup may sync
++# freely; flipped on by `enable_gpu_sync_check()` once warmup completes.
++_sync_check_enabled: bool = False
++
++
++def enable_gpu_sync_check() -> None:
++    """Flip the sync-check gate on, once per worker, after warmup."""
++    if _SYNC_CHECK_MODE is None:
++        return
++    global _sync_check_enabled
++    _sync_check_enabled = True
++    _install_compile_time_sync_suppressors()
++    _install_copy_checkers()
++
++
++_arm_lock = threading.Lock()
++_arm_count: int = 0
++_saved_sync_debug_mode: int = 0
++_prev_showwarning = warnings.showwarning
++_sync_filter_head: tuple | None = None
++
++
++def _sync_warning_hook(message, category, filename, lineno, file=None, line=None):
++    """Turn torch's sync warning into an error, but only on a thread that is
++    being checked and is outside any allow region."""
++    if _TORCH_SYNC_WARNING in str(message):
++        mode = _checking.get()
++        if mode is None or _allow_depth.get():
++            return None
++        if mode == "error":
++            raise RuntimeError(SYNC_ERROR_MESSAGE)
++    return _prev_showwarning(message, category, filename, lineno, file, line)
++
++
++def _install_warning_hook() -> None:
++    """(Re)install the hook and a filter that lets torch's warning reach it.
++
++    Done per checked call because pytest runs each test inside
++    `warnings.catch_warnings()`, which restores both `showwarning` and
++    `filters`. The hook is left in place afterwards: outside a checked call
++    the debug mode is disarmed, so torch emits nothing for it to see.
++    """
++    global _prev_showwarning, _sync_filter_head
++    if warnings.showwarning is not _sync_warning_hook:
++        _prev_showwarning = warnings.showwarning
++        warnings.showwarning = _sync_warning_hook
++    # "always" so the warning survives filtering and isn't deduplicated by
++    # `__warningregistry__`. `filterwarnings` prepends, so only re-assert it
++    # once ours is no longer in front.
++    if warnings.filters[:1] != [_sync_filter_head]:
++        warnings.filterwarnings(
++            "always", message=_TORCH_SYNC_WARNING, category=UserWarning
++        )
++        _sync_filter_head = warnings.filters[0]
++
++
++@contextmanager
++def _checked_region(mode: str):
++    """Police syncs on this thread for the duration of the block.
++
++    The debug mode is armed per call so that syncs outside a checked region
++    emit nothing, and refcounted because `execute_model` and `sample_tokens`
++    nest. "warn" rather than "error" because torch's error mode raises on
++    whichever thread synced, with no way to exempt one.
++    """
++    global _arm_count, _saved_sync_debug_mode
++    _install_warning_hook()
++    with _arm_lock:
++        if _arm_count == 0:
++            _saved_sync_debug_mode = torch.cuda.get_sync_debug_mode()
++            torch.cuda.set_sync_debug_mode("warn")
++        _arm_count += 1
++    token = _checking.set(mode)
++    try:
++        yield
++    finally:
++        _checking.reset(token)
++        with _arm_lock:
++            _arm_count -= 1
++            if _arm_count == 0:
++                torch.cuda.set_sync_debug_mode(_saved_sync_debug_mode)
++
++
++@contextmanager
++def _allow_syncs():
++    token = _allow_depth.set(_allow_depth.get() + 1)
++    try:
++        yield
++    finally:
++        _allow_depth.reset(token)
++
++
++# Shared, since `nullcontext` is stateless: reusing one instance avoids an
++# allocation per call, which is most of the cost when the check is disabled.
++_NOOP_CM = nullcontext()
++
++_compile_time_suppressors_installed: bool = False
++
++
++def _suppressing(fn):
++    """Allow the syncs `fn` performs on its calling thread."""
++
++    @functools.wraps(fn)
++    def wrapper(*args, **kwargs):
++        # Not `gpu_sync_allowed()`, which no-ops while
++        # `torch.compiler.is_compiling()` -- exactly when these run.
++        with _allow_syncs():
++            return fn(*args, **kwargs)
++
++    return wrapper
++
++
++def _install_compile_time_sync_suppressors() -> None:
++    """Allow the syncs torch's compile passes perform.
++
++    Warmup-time compiles run before the gate flips, but lazy ones fire inside
++    `execute_model`.
++    """
++    global _compile_time_suppressors_installed
++    if _compile_time_suppressors_installed:
++        return
++    _compile_time_suppressors_installed = True
++
++    try:
++        from torch._inductor.fx_passes import joint_graph as _jg
++
++        orig = _jg.joint_graph_passes
++        wrapped = _suppressing(orig)
++        # `compile_fx` imports this by value, so patching the defining module
++        # alone misses that rebind; patch every compile-time module still
++        # holding the original.
++        _jg.joint_graph_passes = wrapped
++        for name, mod in list(sys.modules.items()):
++            if (
++                mod is not None
++                and name.startswith(
++                    ("torch._inductor", "torch._functorch", "torch._dynamo")
++                )
++                and getattr(mod, "joint_graph_passes", None) is orig
++            ):
++                setattr(mod, "joint_graph_passes", wrapped)  # noqa: B010
++    except Exception:  # pragma: no cover
++        pass
++
++    try:
++        # Inductor builds its cudagraph tree lazily, so `deferred_cudagraphify`
++        # and the `capture_begin` sync inside it can fire during
++        # `execute_model`. It resolves `cudagraphify` as a module global at
++        # call time, so patching the attribute is enough.
++        from torch._inductor import cudagraph_trees as _ct
++
++        _ct.cudagraphify = _suppressing(_ct.cudagraphify)
++    except Exception:  # pragma: no cover
++        pass
++
++
++# ---------------------------------------------------------------------------
++# Implicit sync detection in `non_blocking` CPU<->CUDA copies.
++#
++# A `non_blocking=True` copy between CPU and CUDA still blocks the host when
++# the CPU side is not pinned or not densely laid out (gapped strided slices
++# stage through a pageable temp): D2H copies into such memory wait for the
++# stream, and H2D copies from it do too beyond a driver size threshold.
++# None of that goes through an API torch's sync debug mode instruments, so
++# wrap the Python-level transfer entry points and flag such copies on threads
++# in a checked region.
++
++IMPLICIT_SYNC_ERROR_MESSAGE = (
++    "Implicit GPU<->CPU sync detected - use a pinned, densely laid out CPU "
++    "tensor, or wrap with gpu_sync_allowed()"
++)
++
++# Captured at import; `_install_copy_checkers` replaces these attributes.
++_torch_to = torch.Tensor.to
++_torch_cuda = torch.Tensor.cuda
++_torch_copy_ = torch.Tensor.copy_
++
++
++# Once ``Tensor.to`` is replaced below, Dynamo sees the saved C++ descriptor
++# through this module global instead of as a recognized tensor method. Put the
++# descriptor behind a weak-referenceable Python callable so ``allow_in_graph``
++# can admit it and the downstream compiler can lower the original operation.
++@torch.compiler.allow_in_graph
++def _torch_to_in_graph(self, *args, **kwargs):
++    return _torch_to(self, *args, **kwargs)
++
++
++# torch's own parser for `Tensor.to`'s overloaded signature, returning
++# (device, dtype, non_blocking, memory_format) (also used by torch._dynamo).
++_parse_to = getattr(torch._C._nn, "_parse_to", None)
++
++
++def _active_check_mode() -> str | None:
++    """The mode the calling thread is being checked in, if any."""
++    if not _sync_check_enabled or torch.compiler.is_compiling() or _allow_depth.get():
++        return None
++    return _checking.get()
++
++
++def _is_dense(t: torch.Tensor) -> bool:
++    """Whether `t`'s elements fill a contiguous storage range, possibly
++    permuted (e.g. a transposed matrix). Such layouts can be copied with
++    pitched cudaMemcpy2D/3DAsync directly from/to pinned memory, whereas
++    gapped layouts (e.g. strided slices) stage through a pageable temp."""
++    if t.is_contiguous():
++        # The common case, answered by a memoized TensorImpl flag.
++        return True
++    expected_stride = 1
++    for stride, size in sorted(zip(t.stride(), t.shape)):
++        if size <= 1:
++            continue
++        if stride != expected_stride:
++            return False
++        expected_stride *= size
++    return True
++
++
++def _cpu_copy_stall_reason(
++    cpu_tensor: torch.Tensor, device: torch.device | None
++) -> str | None:
++    """Why a `non_blocking` copy between `cpu_tensor` and a CUDA tensor would
++    silently block the host, or None if it is genuinely asynchronous.
++
++    `device` describes the other side of the copy; a non-CUDA `device` means
++    the copy does not involve the GPU at all.
++    """
++    if device is None or device.type != "cuda" or cpu_tensor.device.type != "cpu":
++        return None
++    if cpu_tensor.numel() == 0:
++        return None  # Nothing to copy; torch issues no CUDA call at all.
++    if not _is_dense(cpu_tensor):
++        return "the CPU tensor is not densely laid out"
++    if not cpu_tensor.is_pinned():
++        return "the CPU tensor is not pinned"
++    return None
++
++
++def _report_implicit_sync(op: str, direction: str, reason: str, mode: str) -> None:
++    msg = (
++        f"Tensor.{op}: a non_blocking {direction} copy that may be silently "
++        f"synchronous ({reason}). {IMPLICIT_SYNC_ERROR_MESSAGE}"
++    )
++    if mode == "error":
++        raise RuntimeError(msg)
++    warnings.warn(msg, stacklevel=3)
++
++
++def _checked_to(self, *args, **kwargs):
++    # Only H2D is checked: D2H `to` allocates a pinned destination in
++    # supported torch versions, so it is genuinely asynchronous.
++    if (mode := _active_check_mode()) is not None and _parse_to is not None:
++        try:
++            device, _, non_blocking, _ = _parse_to(*args, **kwargs)
++        except Exception:
++            pass  # Invalid args; let the original call raise.
++        else:
++            if non_blocking and (reason := _cpu_copy_stall_reason(self, device)):
++                _report_implicit_sync("to", "H2D", reason, mode)
++    return _torch_to_in_graph(self, *args, **kwargs)
++
++
++def _checked_cuda(self, *args, **kwargs):
++    # Signature: cuda(device=None, non_blocking=False, memory_format=None).
++    if (mode := _active_check_mode()) is not None:
++        device = args[0] if args else kwargs.get("device")
++        non_blocking = args[1] if len(args) > 1 else kwargs.get("non_blocking", False)
++        if non_blocking:
++            if device is None:
++                device = torch.device("cuda")
++            elif isinstance(device, int):
++                device = torch.device("cuda", device)
++            elif not isinstance(device, torch.device):
++                device = torch.device(device)
++            if reason := _cpu_copy_stall_reason(self, device):
++                _report_implicit_sync("cuda", "H2D", reason, mode)
++    return _torch_cuda(self, *args, **kwargs)
++
++
++def _checked_copy_(self, *args, **kwargs):
++    # Signature: copy_(src, non_blocking=False).
++    if (
++        (mode := _active_check_mode()) is not None
++        and args
++        and isinstance(src := args[0], torch.Tensor)
++    ):
++        non_blocking = args[1] if len(args) > 1 else kwargs.get("non_blocking", False)
++        if non_blocking:
++            if self.device.type == "cuda":
++                reason = _cpu_copy_stall_reason(src, self.device)
++                direction = "H2D"
++            else:
++                reason = _cpu_copy_stall_reason(self, src.device)
++                direction = "D2H"
++            if reason:
++                _report_implicit_sync("copy_", direction, reason, mode)
++    return _torch_copy_(self, *args, **kwargs)
++
++
++_copy_checkers_installed: bool = False
++
++
++def _install_copy_checkers() -> None:
++    """Wrap the Python-level CPU<->CUDA transfer entry points with the checks
++    above.
++
++    The patch is process-global, but it only reports on threads inside a
++    checked region, matching the scoping of the torch-level check. Copies
++    issued from C++ (e.g. inside compiled graphs) bypass it.
++    """
++    global _copy_checkers_installed
++    if _copy_checkers_installed:
++        return
++    _copy_checkers_installed = True
++    torch.Tensor.to = _checked_to  # type: ignore[method-assign]
++    torch.Tensor.cuda = _checked_cuda  # type: ignore[method-assign]
++    torch.Tensor.copy_ = _checked_copy_  # type: ignore[method-assign]
++
++
++def gpu_sync_allowed(first_only: bool = False):
++    """Allow GPU<->CPU syncs inside the `with` block, on this thread only.
++
++    With `first_only`, only the first entry from a given call site
++    (filename, lineno) is allowed, so later syncs there are still reported.
++    """
++    if _SYNC_CHECK_MODE is None or torch.compiler.is_compiling():
++        return _NOOP_CM
++    if first_only:
++        frame = sys._getframe(1)
++        key = (frame.f_code.co_filename, frame.f_lineno)
++        if key in _GPU_SYNC_ALLOWED_FIRST_SEEN:
++            return _NOOP_CM
++        _GPU_SYNC_ALLOWED_FIRST_SEEN.add(key)
++    return _allow_syncs()
++
++
++def with_gpu_sync_check(fn):
++    """Report GPU<->CPU syncs performed by `fn` on its calling thread.
++
++    Active only once `enable_gpu_sync_check()` has flipped the gate. Other
++    threads are never policed, so deliberate syncs there (e.g. the EPLB
++    transfer worker) are unaffected.
++    """
++    if (mode := _SYNC_CHECK_MODE) is None:
++        return fn
++
++    @functools.wraps(fn)
++    def wrapper(*args, **kwargs):
++        if not _sync_check_enabled:
++            return fn(*args, **kwargs)
++        with _checked_region(mode):
++            return fn(*args, **kwargs)
++
++    return wrapper
+diff --git a/vllm/v1/attention/backends/flash_v100/backend.py b/vllm/v1/attention/backends/flash_v100/backend.py
+index 6abd51e49c..77a0a4dc0d 100644
+--- a/vllm/v1/attention/backends/flash_v100/backend.py
++++ b/vllm/v1/attention/backends/flash_v100/backend.py
+@@ -49,4 +49,4 @@ def supports_non_causal(cls) -> bool:
+     @staticmethod
+     def get_supported_head_sizes() -> list[int]:
+         # Keep this aligned with the dense prefill kernel dispatch table.
+-        return [64, 128, 256]
++        return [64, 128, 256, 512]
+diff --git a/vllm/v1/attention/ops/sm70_grouped_long.py b/vllm/v1/attention/ops/sm70_grouped_long.py
+index 76db55ab6d..127c0e3980 100644
+--- a/vllm/v1/attention/ops/sm70_grouped_long.py
++++ b/vllm/v1/attention/ops/sm70_grouped_long.py
+@@ -5,7 +5,6 @@
+ import hashlib
+ import importlib.util
+ import json
+-from functools import lru_cache
+ from pathlib import Path
+ 
+ import torch
+@@ -14,6 +13,7 @@
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ 
++_builtin_long_attention_cache: dict = {}
+ logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
+ 
+ # Capacity the shipped operator was qualified for. This is a claim about the
+@@ -50,18 +50,20 @@
+ }
+ 
+ 
+-@lru_cache(maxsize=1)
+ def builtin_long_attention():
+-    try:
+-        # The FA2 library loads on first use; resolve it before the lookup.
+-        from vllm.vllm_flash_attn.flash_attn_interface import (
+-            ensure_fa2_library_loaded,
+-        )
++    if "op" not in _builtin_long_attention_cache:
++        try:
++            from vllm.vllm_flash_attn.flash_attn_interface import (
++                ensure_fa2_library_loaded,
++            )
+ 
+-        ensure_fa2_library_loaded()
+-        return getattr(torch.ops._vllm_fa2_C, BUILTIN_OP)
+-    except (AttributeError, ImportError):
+-        return None
++            ensure_fa2_library_loaded()
++            _builtin_long_attention_cache["op"] = getattr(
++                torch.ops._vllm_fa2_C, BUILTIN_OP
++            )
++        except (AttributeError, ImportError):
++            _builtin_long_attention_cache["op"] = None
++    return _builtin_long_attention_cache["op"]
+ 
+ 
+ # Explicit opt-out. The accelerated route is on by default, so an operator needs
+@@ -78,8 +80,12 @@ def long_attention_enabled(policy=None) -> bool:
+     return bool(policy.e4m3_long_manifest) or builtin_long_attention() is not None
+ 
+ 
+-@lru_cache(maxsize=4)
++_attention_library_cache: dict = {}
++
++
+ def load_attention_library(manifest_name: str):
++    if manifest_name in _attention_library_cache:
++        return _attention_library_cache[manifest_name]
+     manifest_path = Path(manifest_name).resolve()
+     manifest = json.loads(manifest_path.read_text())
+     library = Path(manifest["library"])
+@@ -103,11 +109,16 @@ def load_attention_library(manifest_name: str):
+     loaded_file = module.__file__
+     if loaded_file is None or Path(loaded_file).resolve() != library:
+         raise RuntimeError("Long-attention native extension module alias")
++    _attention_library_cache[manifest_name] = (module, manifest)
+     return module, manifest
+ 
+ 
+-@lru_cache(maxsize=1)
++_long_attention_cache: dict = {}
++
++
+ def load_long_attention(manifest_name: str):
++    if manifest_name in _long_attention_cache:
++        return _long_attention_cache[manifest_name]
+     module, manifest = load_attention_library(manifest_name)
+     # Split counts change both arithmetic and workspace geometry.
+     if manifest.get("splits", 80) != 80 or manifest["head_groups"] != 1:
+@@ -122,6 +133,7 @@ def load_long_attention(manifest_name: str):
+         query_rows,
+         scope="process",
+     )
++    _long_attention_cache[manifest_name] = (module.run, manifest)
+     return module.run, manifest
+ 
+ 
+diff --git a/vllm/v1/attention/ops/sm70_grouped_scalar.py b/vllm/v1/attention/ops/sm70_grouped_scalar.py
+index a7c6565b5c..f679cbe79f 100644
+--- a/vllm/v1/attention/ops/sm70_grouped_scalar.py
++++ b/vllm/v1/attention/ops/sm70_grouped_scalar.py
+@@ -2,8 +2,6 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Explicit compact E4M3 scalar attention for SM70 target tail graphs."""
+ 
+-from functools import lru_cache
+-
+ import torch
+ 
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+@@ -17,6 +15,7 @@
+     run_six_head_groups,
+ )
+ 
++_builtin_scalar_cache: dict = {}
+ logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_scalar")
+ 
+ 
+@@ -39,26 +38,33 @@
+ }
+ 
+ 
+-@lru_cache(maxsize=1)
+ def builtin_scalar_tail_attention():
+-    try:
+-        # The FA2 library loads on first use; resolve it before the lookup.
+-        from vllm.vllm_flash_attn.flash_attn_interface import (
+-            ensure_fa2_library_loaded,
+-        )
++    if "op" not in _builtin_scalar_cache:
++        try:
++            from vllm.vllm_flash_attn.flash_attn_interface import (
++                ensure_fa2_library_loaded,
++            )
+ 
+-        ensure_fa2_library_loaded()
+-        return getattr(torch.ops._vllm_fa2_C, BUILTIN_SCALAR_OP)
+-    except (AttributeError, ImportError):
+-        return None
++            ensure_fa2_library_loaded()
++            _builtin_scalar_cache["op"] = getattr(
++                torch.ops._vllm_fa2_C, BUILTIN_SCALAR_OP
++            )
++        except (AttributeError, ImportError):
++            _builtin_scalar_cache["op"] = None
++    return _builtin_scalar_cache["op"]
+ 
+ 
+ def scalar_tail_attention_available() -> bool:
+     return builtin_scalar_tail_attention() is not None
+ 
+ 
+-@lru_cache(maxsize=4)
++_scalar_tail_cache: dict = {}
++
++
+ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
++    cache_key = (manifest_name, device)
++    if cache_key in _scalar_tail_cache:
++        return _scalar_tail_cache[cache_key]
+     if manifest_name:
+         module, manifest = load_attention_library(manifest_name)
+     else:
+@@ -77,6 +83,7 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
+             "long-context route is disabled.",
+             scope="process",
+         )
++        _scalar_tail_cache[cache_key] = None
+         return None
+     capability = long_attention_capability(long_manifest)
+     if not (
+@@ -173,4 +180,5 @@ def run(
+         )
+         return True
+ 
++    _scalar_tail_cache[cache_key] = run
+     return run

@@ -1,0 +1,21 @@
+{
+  "group": "gemma4",
+  "title": "Gemma4 model qualification",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1271,
+      "title": "[SM70][Gemma4] V100 support: D=512 attention, transformers heterogeneity, gemma4_unified port",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1271",
+      "head": "8602637fa368d68b484e7432633609ce7e15e980",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "de87b7f86a2ecdfe0cecf2910413608251ea76593cb59149e867c362a7830917",
+      "files": 18,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "Require Gemma4 checkpoint, D=512 attention, heterogeneous transformer compatibility and the actual multimodal/unified entry path. V100 component availability alone does not establish model-level correctness or capacity.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
