@@ -1,0 +1,126 @@
+{
+  "initial_inventory": {
+    "number": 1102,
+    "title": "[Quantization][SM70] EXL3 routed-expert MoE, loading exllamav3 checkpoints",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1102",
+    "isDraft": true,
+    "headRefOid": "b96d43e5c8df201992a181836d631198ef827edf",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1102,
+    "title": "[Quantization][SM70] EXL3 routed-expert MoE, loading exllamav3 checkpoints",
+    "body": "## Purpose\n\nThis lets vLLM load exllamav3 (EXL3) checkpoints directly and run their routed MoE experts on V100. The experts stay trellis-coded, and the kernels decode them inside the matmul. GLM-5.3-Flash at about 2.1 bpw (K = 2/3 experts) fits on 4x V100-SXM2-32GB, where the 16-bit and NVFP4 checkpoints need all 8 cards.\n\n## Change\n\n**Kernels** (`csrc/sm70_turbomind/ops/exl3_moe_sm70.cu`, SM70 TurboMind build only):\n- Four `exl3_moe_*_out` torch ops form the chain pre / gemv (gate + up fused) / mid / gemv / post.\n- Each lane decodes trellis runs straight into `mma.m8n8k4` operands with FP32 accumulate. Nothing is dequantized to memory.\n- Supported: mcg codebook, K = 2, 3 or 4, and both tile orders exllamav3 writes. Those are `sm80`, its default, and `colmajor`, the order an `m8n8k4` lane reads directly (turboderp-org/exllamav3#475).\n- Prefill groups each expert's slots so its tiles are decoded once per 8 rows.\n- The grouping is built on the device with no host syncs and a worst-case group count, so decode and prefill are both CUDA-graph capturable.\n- The ops allocate nothing and run on the current stream.\n\n**`vllm/model_executor/layers/quantization/exl3.py`** (new, generic):\n- `Exl3Config` (`quant_method: exl3`) reads each MoE layer's bit width from the checkpoint's safetensors headers in `maybe_update_config`. It rejects mixed widths within a layer, and codebooks or sign formats other than mcg with `suh` / `svh`, at config time.\n- `Exl3MoEMethod` loads the per-expert `trellis` / `suh` / `svh` / `mcg` tensors through the standard expert mapping. It checks that every expert was loaded and carries the mcg marker, and verifies per-tensor `.tile_order` markers against the config when present.\n- Tensor parallelism slices the intermediate dimension. Expert parallelism is rejected.\n- A pure-torch EXL3 decoder is the test oracle. It also dequantizes the few dense EXL3 tensors a conversion may contain besides the experts (here the MTP layer) to FP16 at load, through `Exl3Config.dequantize_dense`.\n- This file and every other touched generic file gain no model, platform or environment coupling. `check_layering.py` from `agent/arch-layering-20261008` reports no growth.\n\n**GLM-5.3** (`vllm/models/glm5next/nvidia/`): both loaders run the dense-dequant iterator and split the fused KDA `self_attn.qkv_proj` / `self_attn.conv1d` tensors that exllamav3 writes back into q/k/v.\n\n## Not a duplicate\n\nNo open or closed PR adds EXL3 / exllamav3 support (searched \"exl3\", \"exllamav3\", \"EXL3\", \"trellis\"). The only hit is #689, which was closed and is general Volta support.\n\n## Test Plan\n\n- `tests/kernels/quantization/test_exl3_moe.py` (new):\n  - The decoder matches exllamav3's CUDA `ext.reconstruct` bit for bit (sha256 golden, K = 2/3/4).\n  - Tile-order permutations and slot grouping.\n  - The full MoE chain against the decoder oracle: both orders × K = 2/3/4 × T = 1, 5, 70, 300 (plain and grouped paths).\n  - CUDA-graph replay against eager, bitwise.\n  - Config header parsing and its rejections.\n  - Dense dequantization.\n- Mutation check: inverting the tile-order flag.\n- Kernel speed against the original out-of-tree kernel these were ported from, on the same random weights.\n- `pre-commit run` on the changed files, plus the layering ratchet.\n- E2E on 4x V100-SXM2-32GB (TP4, CUDA graphs, FP8 KV): GLM-5.3-Flash EXL3, loaded straight from the exllamav3 output.\n\n## Test Result\n\n- `pytest tests/kernels/quantization/test_exl3_moe.py`: **36 passed** on V100-SXM2-32GB. The ops came from a standalone build of `exl3_moe_sm70.cu` registered into `_C` (same pattern as the sparse-MLA PR).\n- Mutation check: inverting the order flag fails all 24 kernel cases.\n- Speed, per launch, per-rank GLM shapes, 64 experts, median of 3, against the original kernel:\n  - colmajor: 0.97–1.00× (unchanged).\n  - sm80: +8–13% at K = 2 and +15–20% at K = 3 in decode.\n  - sm80 grouped prefill: about +10% at K = 2, −4% to +1% at K = 3.\n- Full CMake wheel build (09c5fae9f): `pytest tests/kernels/quantization/test_exl3_moe.py` on it, 39 passed.\n- pre-commit: all hooks pass. Layering ratchet: no growth.\n- E2E: GLM-5.3-Flash EXL3 from the exllamav3 output dir, greedy 8/8 identical to the repacked reference, 48.5 tok/s, 70.8K needle pass. Details in the comment below.\n\nGates before review:\n\n- [x] Kernel tests against an independent oracle, failing under mutation\n- [x] pre-commit and layering ratchet\n- [x] Full wheel build (CMake path) and `pytest tests/kernels/quantization/test_exl3_moe.py` on it\n- [x] E2E: GLM-5.3-Flash EXL3 from the exllamav3 output dir, TP4 on 4x V100, CUDA graphs on: load, greedy smoke, decode speed, long-context replay\n\n## AI assistance\n\nThis change was developed with AI assistance (Claude). The submitting human (@philbert440) is accountable for it and reviews every changed line before this leaves draft.\n\n@philbert440\n\n\n### Update (commit b96d43e5c): strip-major tiles, direct window loads, 8-deep prefetch\n\nA torch-profiler capture of the decode step on 4x V100 (GLM-5.3-Flash TP4, MTP k=3, 4-token verify) put the routed-expert GEMV at 9.0 ms of a 38 ms step while reading about 2.1 GiB per rank, i.e. a quarter of HBM bandwidth. Ablation builds of the kernel (no MMA / no decode / no shuffles / loads only) showed two things: with the compute removed, the loads alone reached only 51% of bandwidth because a warp's successive k-tiles sit 2 KB apart in the `[k/16, n/16]` tile order; and each lane's decode could not start until the tile had been broadcast through another lane and shuffled.\n\n**Change.**\n- `Exl3MoEMethod.process_weights_after_loading` reorders each expert's trellis in place to a strip-major order, `[n/32 strips, k/16, 2 tiles, 16K]`, one expert at a time (`exl3_strip_major_`), so no second copy of the expert weights exists during load. The kernels address tiles through `strip_block`.\n- Each lane loads the window words its own decode needs with `__ldg` (`LaneWords`), from the same 128 B line the warp reads as a whole, replacing `TileWords` and its shuffles. Both tile orders (sm80, colmajor) keep their window geometry.\n- The k-tile loop prefetches 8 tiles per warp before decoding any.\n\n**Measured** (in-graph microbench, S = 32 slots, K = 2, per-rank shapes): gate/up k=4096 n=512: 146 -> 121 us; down k=512 n=4096: 145 -> 129 us. Loads-only floor: 51% -> 61% of HBM peak. Output is bitwise identical to the previous kernel (same reduction order). Eight warps per block looked 7% better in isolation for k=4096 but not end to end, so the block shape is unchanged.\n\n**End to end** (TP4, MTP k=3, FP8 KV, CUDA graphs, with #1125 and the decode fast paths of #1159): 82.4 -> 85.8 tok/s decode; greedy output identical on a 7-prompt set including a 150-token prompt (grouped prefill path).\n\n**Tests.** `test_exl3_moe_kernel` and the CUDA-graph test feed the ops strip-major copies and keep the checkpoint order for the oracle; `test_strip_major_is_a_tile_permutation` pins the permutation and the inverse; `test_exl3_moe_kernel_needs_strip_major` is the mutation check (un-permuted tiles fail the oracle bound). Result on a full SM70 CMake rebuild of this branch (V100-SXM2-32GB): 41 passed (36 before, plus the strip-major round-trip, the mutation check and the extra parametrizations). E2E on that build, branch alone, exllamav3 output dir loaded directly, serve config of the earlier evidence run: greedy output identical to that run on 8/8 prompts; decode 49.6 tok/s without speculation (48.5 before).\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1102",
+    "isDraft": true,
+    "headRefName": "sm70-exl3-moe",
+    "headRefOid": "b96d43e5c8df201992a181836d631198ef827edf",
+    "baseRefName": "main",
+    "baseRefOid": "c4f6245f841466782752a8c3283e4727565cf17a",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "rivetphilbot"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1102,
+    "id": "PR_kwDORjYFXs8AAAABHbh0fw",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "b96d43e5c8df201992a181836d631198ef827edf",
+    "title": "[Quantization][SM70] EXL3 routed-expert MoE, loading exllamav3 checkpoints",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1102",
+    "body": "## Purpose\n\nThis lets vLLM load exllamav3 (EXL3) checkpoints directly and run their routed MoE experts on V100. The experts stay trellis-coded, and the kernels decode them inside the matmul. GLM-5.3-Flash at about 2.1 bpw (K = 2/3 experts) fits on 4x V100-SXM2-32GB, where the 16-bit and NVFP4 checkpoints need all 8 cards.\n\n## Change\n\n**Kernels** (`csrc/sm70_turbomind/ops/exl3_moe_sm70.cu`, SM70 TurboMind build only):\n- Four `exl3_moe_*_out` torch ops form the chain pre / gemv (gate + up fused) / mid / gemv / post.\n- Each lane decodes trellis runs straight into `mma.m8n8k4` operands with FP32 accumulate. Nothing is dequantized to memory.\n- Supported: mcg codebook, K = 2, 3 or 4, and both tile orders exllamav3 writes. Those are `sm80`, its default, and `colmajor`, the order an `m8n8k4` lane reads directly (turboderp-org/exllamav3#475).\n- Prefill groups each expert's slots so its tiles are decoded once per 8 rows.\n- The grouping is built on the device with no host syncs and a worst-case group count, so decode and prefill are both CUDA-graph capturable.\n- The ops allocate nothing and run on the current stream.\n\n**`vllm/model_executor/layers/quantization/exl3.py`** (new, generic):\n- `Exl3Config` (`quant_method: exl3`) reads each MoE layer's bit width from the checkpoint's safetensors headers in `maybe_update_config`. It rejects mixed widths within a layer, and codebooks or sign formats other than mcg with `suh` / `svh`, at config time.\n- `Exl3MoEMethod` loads the per-expert `trellis` / `suh` / `svh` / `mcg` tensors through the standard expert mapping. It checks that every expert was loaded and carries the mcg marker, and verifies per-tensor `.tile_order` markers against the config when present.\n- Tensor parallelism slices the intermediate dimension. Expert parallelism is rejected.\n- A pure-torch EXL3 decoder is the test oracle. It also dequantizes the few dense EXL3 tensors a conversion may contain besides the experts (here the MTP layer) to FP16 at load, through `Exl3Config.dequantize_dense`.\n- This file and every other touched generic file gain no model, platform or environment coupling. `check_layering.py` from `agent/arch-layering-20261008` reports no growth.\n\n**GLM-5.3** (`vllm/models/glm5next/nvidia/`): both loaders run the dense-dequant iterator and split the fused KDA `self_attn.qkv_proj` / `self_attn.conv1d` tensors that exllamav3 writes back into q/k/v.\n\n## Not a duplicate\n\nNo open or closed PR adds EXL3 / exllamav3 support (searched \"exl3\", \"exllamav3\", \"EXL3\", \"trellis\"). The only hit is #689, which was closed and is general Volta support.\n\n## Test Plan\n\n- `tests/kernels/quantization/test_exl3_moe.py` (new):\n  - The decoder matches exllamav3's CUDA `ext.reconstruct` bit for bit (sha256 golden, K = 2/3/4).\n  - Tile-order permutations and slot grouping.\n  - The full MoE chain against the decoder oracle: both orders × K = 2/3/4 × T = 1, 5, 70, 300 (plain and grouped paths).\n  - CUDA-graph replay against eager, bitwise.\n  - Config header parsing and its rejections.\n  - Dense dequantization.\n- Mutation check: inverting the tile-order flag.\n- Kernel speed against the original out-of-tree kernel these were ported from, on the same random weights.\n- `pre-commit run` on the changed files, plus the layering ratchet.\n- E2E on 4x V100-SXM2-32GB (TP4, CUDA graphs, FP8 KV): GLM-5.3-Flash EXL3, loaded straight from the exllamav3 output.\n\n## Test Result\n\n- `pytest tests/kernels/quantization/test_exl3_moe.py`: **36 passed** on V100-SXM2-32GB. The ops came from a standalone build of `exl3_moe_sm70.cu` registered into `_C` (same pattern as the sparse-MLA PR).\n- Mutation check: inverting the order flag fails all 24 kernel cases.\n- Speed, per launch, per-rank GLM shapes, 64 experts, median of 3, against the original kernel:\n  - colmajor: 0.97–1.00× (unchanged).\n  - sm80: +8–13% at K = 2 and +15–20% at K = 3 in decode.\n  - sm80 grouped prefill: about +10% at K = 2, −4% to +1% at K = 3.\n- Full CMake wheel build (09c5fae9f): `pytest tests/kernels/quantization/test_exl3_moe.py` on it, 39 passed.\n- pre-commit: all hooks pass. Layering ratchet: no growth.\n- E2E: GLM-5.3-Flash EXL3 from the exllamav3 output dir, greedy 8/8 identical to the repacked reference, 48.5 tok/s, 70.8K needle pass. Details in the comment below.\n\nGates before review:\n\n- [x] Kernel tests against an independent oracle, failing under mutation\n- [x] pre-commit and layering ratchet\n- [x] Full wheel build (CMake path) and `pytest tests/kernels/quantization/test_exl3_moe.py` on it\n- [x] E2E: GLM-5.3-Flash EXL3 from the exllamav3 output dir, TP4 on 4x V100, CUDA graphs on: load, greedy smoke, decode speed, long-context replay\n\n## AI assistance\n\nThis change was developed with AI assistance (Claude). The submitting human (@philbert440) is accountable for it and reviews every changed line before this leaves draft.\n\n@philbert440\n\n\n### Update (commit b96d43e5c): strip-major tiles, direct window loads, 8-deep prefetch\n\nA torch-profiler capture of the decode step on 4x V100 (GLM-5.3-Flash TP4, MTP k=3, 4-token verify) put the routed-expert GEMV at 9.0 ms of a 38 ms step while reading about 2.1 GiB per rank, i.e. a quarter of HBM bandwidth. Ablation builds of the kernel (no MMA / no decode / no shuffles / loads only) showed two things: with the compute removed, the loads alone reached only 51% of bandwidth because a warp's successive k-tiles sit 2 KB apart in the `[k/16, n/16]` tile order; and each lane's decode could not start until the tile had been broadcast through another lane and shuffled.\n\n**Change.**\n- `Exl3MoEMethod.process_weights_after_loading` reorders each expert's trellis in place to a strip-major order, `[n/32 strips, k/16, 2 tiles, 16K]`, one expert at a time (`exl3_strip_major_`), so no second copy of the expert weights exists during load. The kernels address tiles through `strip_block`.\n- Each lane loads the window words its own decode needs with `__ldg` (`LaneWords`), from the same 128 B line the warp reads as a whole, replacing `TileWords` and its shuffles. Both tile orders (sm80, colmajor) keep their window geometry.\n- The k-tile loop prefetches 8 tiles per warp before decoding any.\n\n**Measured** (in-graph microbench, S = 32 slots, K = 2, per-rank shapes): gate/up k=4096 n=512: 146 -> 121 us; down k=512 n=4096: 145 -> 129 us. Loads-only floor: 51% -> 61% of HBM peak. Output is bitwise identical to the previous kernel (same reduction order). Eight warps per block looked 7% better in isolation for k=4096 but not end to end, so the block shape is unchanged.\n\n**End to end** (TP4, MTP k=3, FP8 KV, CUDA graphs, with #1125 and the decode fast paths of #1159): 82.4 -> 85.8 tok/s decode; greedy output identical on a 7-prompt set including a 150-token prompt (grouped prefill path).\n\n**Tests.** `test_exl3_moe_kernel` and the CUDA-graph test feed the ops strip-major copies and keep the checkpoint order for the oracle; `test_strip_major_is_a_tile_permutation` pins the permutation and the inverse; `test_exl3_moe_kernel_needs_strip_major` is the mutation check (un-permuted tiles fail the oracle bound). Result on a full SM70 CMake rebuild of this branch (V100-SXM2-32GB): 41 passed (36 before, plus the strip-major round-trip, the mutation check and the extra parametrizations). E2E on that build, branch alone, exllamav3 output dir loaded directly, serve config of the earlier evidence run: greedy output identical to that run on 8/8 prompts; decode 49.6 tok/s without speculation (48.5 before).\n",
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRefName": "sm70-exl3-moe",
+    "comments": {
+      "totalCount": 2,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWtJaGs="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABaf8FLg",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "E2E results. Setup: 4x V100-SXM2-32GB, TP4, CUDA graphs, FP8 E4M3 KV, 131K context, no speculation. This branch is plain main and doesn't include the GLM MTP wiring from #1091.\n\n- **Build:** full CMake wheel of this branch (09c5fae9f). `pytest tests/kernels/quantization/test_exl3_moe.py` on that wheel: 39 passed.\n- **Model:** GLM-5.3-Flash EXL3.\n  - Routed experts: mcg, K=2 with K=3 on five layers, `colmajor` tile order. The MTP layer is K=4.\n  - Loaded straight from the exllamav3 output directory, with no repack.\n  - 24.3 GiB per GPU, 54 s load, KV cache 374,491 tokens.\n  - The route log shows both the K=2 and K=3 expert layers.\n- **Greedy:** 8/8 prompts token-identical to the same weights repacked for the out-of-tree loader these kernels came from, on the previous build with main's attention route. The bench token hash `e16d64ddfffb37cf` is identical across runs.\n- **Speed:**\n  - Decode: 48.5 tok/s mean over 4 realistic prompts. The reference also gets 48.5.\n  - Prefill: about 720 tok/s warm at 1K tokens.\n- **Long context:** 70.8K-token needle passes (246.6 s).\n- **Bug found by this run, fixed in 09c5fae9f:** dequantizing the dense MTP tensors ran out of memory, needing 8 GiB for `o_proj` at K=4. The reference decoder now decodes in 4096-tile chunks. The main model passes the MTP layer's tensors through untouched and leaves them to `Glm5NextMTP`. Two tests added.\n\nGates: full wheel build and tests, and E2E, are both done.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1102#issuecomment-6073287982",
+          "createdAt": "2026-10-09T02:54:12Z",
+          "updatedAt": "2026-10-09T02:54:12Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABa0loaw",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "### Update (commit b96d43e5c): strip-major tiles, direct window loads, 8-deep prefetch\n\nA torch-profiler capture of the decode step on 4x V100 (GLM-5.3-Flash TP4, MTP k=3, 4-token verify) put the routed-expert GEMV at 9.0 ms of a 38 ms step while reading about 2.1 GiB per rank, i.e. a quarter of HBM bandwidth. Ablation builds of the kernel (no MMA / no decode / no shuffles / loads only) showed two things: with the compute removed, the loads alone reached only 51% of bandwidth because a warp's successive k-tiles sit 2 KB apart in the `[k/16, n/16]` tile order; and each lane's decode could not start until the tile had been broadcast through another lane and shuffled.\n\n**Change.**\n- `Exl3MoEMethod.process_weights_after_loading` reorders each expert's trellis in place to a strip-major order, `[n/32 strips, k/16, 2 tiles, 16K]`, one expert at a time (`exl3_strip_major_`), so no second copy of the expert weights exists during load. The kernels address tiles through `strip_block`.\n- Each lane loads the window words its own decode needs with `__ldg` (`LaneWords`), from the same 128 B line the warp reads as a whole, replacing `TileWords` and its shuffles. Both tile orders (sm80, colmajor) keep their window geometry.\n- The k-tile loop prefetches 8 tiles per warp before decoding any.\n\n**Measured** (in-graph microbench, S = 32 slots, K = 2, per-rank shapes): gate/up k=4096 n=512: 146 -> 121 us; down k=512 n=4096: 145 -> 129 us. Loads-only floor: 51% -> 61% of HBM peak. Output is bitwise identical to the previous kernel (same reduction order). Eight warps per block looked 7% better in isolation for k=4096 but not end to end, so the block shape is unchanged.\n\n**End to end** (TP4, MTP k=3, FP8 KV, CUDA graphs, with #1125 and the decode fast paths of #1159): 82.4 -> 85.8 tok/s decode; greedy output identical on a 7-prompt set including a 150-token prompt (grouped prefill path).\n\n**Tests.** `test_exl3_moe_kernel` and the CUDA-graph test feed the ops strip-major copies and keep the checkpoint order for the oracle; `test_strip_major_is_a_tile_permutation` pins the permutation and the inverse; `test_exl3_moe_kernel_needs_strip_major` is the mutation check (un-permuted tiles fail the oracle bound). Result on a full SM70 CMake rebuild of this branch (V100-SXM2-32GB): 41 passed (36 before, plus the strip-major round-trip, the mutation check and the extra parametrizations). E2E on that build, branch alone, exllamav3 output dir loaded directly, serve config of the earlier evidence run: greedy output identical to that run on 8/8 prompts; decode 49.6 tok/s without speculation (48.5 before).\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1102#issuecomment-6094940267",
+          "createdAt": "2026-10-10T07:05:05Z",
+          "updatedAt": "2026-10-10T07:05:05Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1102,
+    "title": "[Quantization][SM70] EXL3 routed-expert MoE, loading exllamav3 checkpoints",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1102",
+    "isDraft": true,
+    "headRefOid": "b96d43e5c8df201992a181836d631198ef827edf",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "CMakeLists.txt",
+      "csrc/ops.h",
+      "csrc/sm70_turbomind/ops/exl3_moe_sm70.cu",
+      "csrc/torch_bindings.cpp",
+      "pyproject.toml",
+      "tests/kernels/quantization/test_exl3_moe.py",
+      "vllm/_custom_ops.py",
+      "vllm/model_executor/layers/quantization/__init__.py",
+      "vllm/model_executor/layers/quantization/exl3.py",
+      "vllm/models/glm5next/nvidia/model.py",
+      "vllm/models/glm5next/nvidia/mtp.py"
+    ],
+    "diff_bytes": 78999,
+    "diff_sha256": "93628d85ef2f32b2da40f82a6b9abd621fcf14ac49d720ccff6add6f67810396"
+  },
+  "full_tree_diff_proof": null
+}
