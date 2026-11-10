@@ -51,6 +51,7 @@ from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
+from vllm.runtime_resources import runtime_resources_for
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
@@ -68,7 +69,10 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import (
+    configure_attention_workspace,
+    is_residual_scattered_for_sp,
+)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -453,6 +457,11 @@ class Worker(WorkerBase):
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            # Reuse the worker's one-time capacity/admission snapshot. Optional
+            # attention workspace policies must not probe free memory per call.
+            runtime_resources_for(self.vllm_config)["gpu_memory_budget_bytes"] = int(
+                self.requested_memory
+            )
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
@@ -565,6 +574,14 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+        # Resolve hybrid physical pages before optional workspaces are profiled.
+        # This shared worker path covers both model runner generations.
+        configure_attention_workspace(
+            self.vllm_config,
+            get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec()),
+        )
         # Compilation and lazy workspaces have very different lifetimes. Avoid
         # pinning large split segments behind small persistent allocations on
         # SM70, then restore the serving allocator before measuring its peak.
@@ -823,6 +840,9 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+
+        # Rebind the admitted geometry before KV allocation and graph capture.
+        configure_attention_workspace(self.vllm_config, kv_cache_config.kv_cache_groups)
 
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
