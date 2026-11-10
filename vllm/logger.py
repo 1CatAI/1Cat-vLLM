@@ -342,6 +342,49 @@ def _trace_calls(log_path, root_dir, frame, event, arg=None):
     return partial(_trace_calls, log_path, root_dir)
 
 
+class _StartupLogHandler(logging.FileHandler):
+    """Opt-in startup mirror, detached by Uvicorn's readiness log."""
+
+    _installed = None
+    _loggers = ("vllm", "uvicorn.error")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        if (
+            record.name == "uvicorn.error"
+            and record.getMessage() == "Application startup complete."
+        ):
+            self.close()
+
+    def close(self) -> None:
+        for name in self._loggers:
+            logging.getLogger(name).removeHandler(self)
+        if type(self)._installed is self:
+            type(self)._installed = None
+        super().close()
+
+    @classmethod
+    def install(cls) -> None:
+        from vllm import envs
+
+        path = envs.VLLM_STARTUP_LOG_FILE
+        if cls._installed is not None or not path:
+            return
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            handler = cls(path, mode="a", encoding="utf-8")
+        except OSError as error:
+            logging.getLogger("vllm").warning(
+                "Cannot open startup log %s: %s", path, error
+            )
+            return
+        cls._installed = handler
+        for name in cls._loggers:
+            logging.getLogger(name).addHandler(handler)
+
+
 def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     """
     Enable tracing of every function call in code under `root_dir`.

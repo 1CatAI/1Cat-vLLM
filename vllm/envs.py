@@ -338,6 +338,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
+    VLLM_STARTUP_LOG_FILE: str | None = None
     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = True
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
@@ -4453,6 +4454,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
+    ),
+    "VLLM_STARTUP_LOG_FILE": env_var(
+        lambda: os.getenv("VLLM_STARTUP_LOG_FILE"),
+        description=(
+            "Path for the separate startup log file. Startup lines are "
+            "mirrored here until 'Application startup complete' is seen, then "
+            "the handler detaches. Disabled when unset; logs are appended "
+            "so starting another API process does not truncate an active log."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
         user_visible=True,
     ),
     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": env_var(
@@ -20352,6 +20368,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_STARTUP_LOG_FILE",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",
