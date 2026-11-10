@@ -58,6 +58,7 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+_STREAM_KEEPALIVE_INTERVAL = 15.0
 
 
 class InputStreamError(Exception):
@@ -579,16 +580,6 @@ class AsyncLLM(EngineClient):
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
             finished = False
-            # Idle keep-alive: while the engine produces no token (long
-            # thinking / long prefill), emit a STREAM_KEEPALIVE sentinel every
-            # 15s so the API layer can keep the SSE stream alive instead of
-            # being cut off by an intermediary's idle timeout.
-            #
-            # The sentinel is visible to every consumer of this generator
-            # (chat/completion/responses/disagg/speech, 11 call sites), so it is
-            # opt-in: only callers that pass keepalive=True -- and therefore
-            # know how to skip it -- ever see it.
-            _KEEPALIVE_INTERVAL = 15.0
             while not finished:
                 # Note: drain queue without await if possible (avoids
                 # task switching under load which helps performance).
@@ -599,7 +590,7 @@ class AsyncLLM(EngineClient):
                     else:
                         try:
                             out = await asyncio.wait_for(
-                                q.get(), timeout=_KEEPALIVE_INTERVAL
+                                q.get(), timeout=_STREAM_KEEPALIVE_INTERVAL
                             )
                         except asyncio.TimeoutError:
                             yield STREAM_KEEPALIVE
