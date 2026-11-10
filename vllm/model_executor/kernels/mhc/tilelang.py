@@ -795,18 +795,9 @@ def mhc_fused_post_pre_tilelang(
             or (num_tokens == 8 and tile_n == 12 and n_splits == 4)
         )
     )
-    # Unset policy (provenance "default") takes the fused native op for the
-    # 1-8 token decode and verify batches; an explicit setting still decides.
-    _policy = layer_policy()
-    _fused_sources = getattr(_policy, "sources", {})
-    _fused_post_dot = (
-        True
-        if _fused_sources.get("mhc_fused_post_dot", "default") == "default"
-        else bool(_policy.mhc_fused_post_dot)
-    )
     use_sm70_fused_post_dot_q8 = (
         use_sm70_fp32_stage
-        and _fused_post_dot
+        and layer_policy().mhc_fused_post_dot
         and 1 <= num_tokens <= 8
         and n_splits in (4, 8)
     )
