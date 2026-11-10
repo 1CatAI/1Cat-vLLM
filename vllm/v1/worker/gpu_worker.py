@@ -193,6 +193,7 @@ class Worker(WorkerBase):
                 )
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._pp_send_tensors: dict[str, torch.Tensor] | None = None
         # whether that send may still run while the next step computes
         self._pp_send_overlaps_next_step = False
 
@@ -491,7 +492,11 @@ class Worker(WorkerBase):
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
+            (
+                self._scoped_allocator_max_split(max_split_size_mb=20)
+                if envs.VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE
+                else nullcontext()
+            ),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
@@ -517,7 +522,6 @@ class Worker(WorkerBase):
             )
         self.model_runner.reload_weights(*args, **kwargs)
 
-    @torch.inference_mode()
     def _prefill_graph_reserve(self, activation_peak: int) -> int:
         """Graph pool bytes to keep out of the KV budget without the estimator.
 
@@ -548,6 +552,7 @@ class Worker(WorkerBase):
         )
         return max(0, activation_peak)
 
+    @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
@@ -1340,12 +1345,10 @@ class Worker(WorkerBase):
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # A pending PP send whose tensors the next forward may overwrite (CUDA
-        # graph outputs) must finish before it. An eager step's outputs are
-        # fresh tensors the send holds, so that send overlaps the next step's
-        # compute and is awaited before the next send: the transfer of a
-        # prefill chunk no longer sits between two chunks on every stage
-        # (DeepSeek-V4 PP5, 1020-token chunks: 4.1-5.2 s of 35.5 s per stage
-        # in NCCL, none of it beside compute).
+        # graph outputs) must finish before it. Eager sends own a copy because
+        # providers can return reusable workspace even outside CUDA graphs.
+        # That copy stays live until communication completes, allowing the next
+        # forward to overlap the send without overwriting its input.
         if not self._pp_send_overlaps_next_step:
             self._wait_pp_sends()
 
@@ -1451,8 +1454,14 @@ class Worker(WorkerBase):
             self._pp_send_work = get_pp_group().isend_tensor_dict_static(output.tensors)
             logger.info_once("Default SM70 metadata-free PP hidden transfer enabled.")
         else:
+            send_tensors = output.tensors
+            if self._pp_send_overlaps_next_step:
+                self._pp_send_tensors = {
+                    name: tensor.clone() for name, tensor in send_tensors.items()
+                }
+                send_tensors = self._pp_send_tensors
             self._pp_send_work = get_pp_group().isend_tensor_dict(
-                output.tensors,
+                send_tensors,
                 all_gather_group=get_tp_group(),
                 all_gather_tensors=all_gather_tensors,
             )
@@ -1460,9 +1469,11 @@ class Worker(WorkerBase):
         return None
 
     def _pp_send_overlaps(self, num_tokens: int, static_transfer: bool) -> bool:
-        """Whether this step's PP send may still run while the next step
-        computes: only an eager step (more tokens than the largest captured
-        graph) sends fresh tensors that no later forward overwrites."""
+        """Whether this step can send an owned copy across the next forward.
+
+        Graph-sized and static transfers keep the existing synchronization.
+        Eager outputs are not assumed to own fresh storage.
+        """
         compilation_config = self.vllm_config.compilation_config
         largest_graph = compilation_config.max_cudagraph_capture_size or 0
         return not static_transfer and num_tokens > largest_graph
@@ -1471,6 +1482,7 @@ class Worker(WorkerBase):
         for handle in self._pp_send_work:
             handle.wait()
         self._pp_send_work = []
+        self._pp_send_tensors = None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
