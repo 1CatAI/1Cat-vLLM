@@ -31,7 +31,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _CANDIDATES = 32
+_GLOBAL_DRAFT_CANDIDATES = 128
 _MAX_ROWS = 8
+
+
+def _draft_candidate_count(vocab: int) -> int:
+    # Preserve the global search budget when a rank owns a wider vocabulary
+    # shard. Target certification retains its independent local shortlist.
+    local = triton.cdiv(vocab * _GLOBAL_DRAFT_CANDIDATES, 248320)
+    return triton.next_power_of_2(max(_CANDIDATES, local))
 
 
 @triton.jit
@@ -128,8 +136,7 @@ def _finish(
     tl.store(Pairs + row * 2 + 1, (best_id + Start).to(tl.float32))
 
 
-def _select_candidates(logits):
-    keep = _CANDIDATES
+def _select_candidates(logits, keep=_CANDIDATES):
     rows, vocab = logits.shape
     assert 32 <= vocab <= 2147483647
     wide_ids = vocab > 65536
@@ -198,7 +205,11 @@ def _refined_head(
         2,
     )
     return _rerank_candidates(
-        x, weight, _select_candidates(logits), start, reference_mma
+        x,
+        weight,
+        _select_candidates(logits, _draft_candidate_count(weight.shape[0])),
+        start,
+        reference_mma,
     )
 
 
@@ -271,7 +282,7 @@ class MTPRefinedHead(nn.Module):
         logger.info_once(
             "SM70 MTP refined head enabled with full-vocabulary NVFP4 proposals "
             "and %d original-weight candidates per rank.",
-            _CANDIDATES,
+            _draft_candidate_count(rows),
         )
 
     @property

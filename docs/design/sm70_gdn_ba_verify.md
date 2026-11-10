@@ -50,6 +50,10 @@ The same owners handle these changes:
   FP16 output rounding and E4M3 writer bytes are retained. Other cache layouts
   keep the standard writer; padded tokens and invalid slots do not publish KV.
 - Refined draft and bounded target heads use the full vocabulary shard.
+  Draft candidate counts follow each shard's share of a global 128-candidate
+  budget (32 on a 62080-row shard and 64 on a 124160-row shard). Enlarging a
+  shard therefore retains its candidate coverage rather than halving the
+  global budget. Target certification keeps its separate local shortlist.
   Candidate and dense-fallback ranking use wider IDs when a shard exceeds
   65536 rows. The target still certifies against every discarded bound and
   otherwise scores the complete original FP16 head. Old head extensions decline
