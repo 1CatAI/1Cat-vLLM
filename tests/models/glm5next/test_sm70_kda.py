@@ -276,22 +276,14 @@ def test_sm70_glm53_fp16_gemv_swizzle_matches_baseline_and_graph(
 def test_sm70_kda_output_norm_triton_matches_decomposed(
     num_tokens: int,
 ) -> None:
-    """The SM70 decode path calls the Triton gated RMSNorm directly: with the
-    default `custom_ops` ("none") the CustomOp dispatch takes the decomposed
-    eager path, which is the same arithmetic in eight kernels. Both must agree
-    on the FP32 recurrent output with FP16 gate and output: bit for bit at 1
-    and 4 tokens; at 8 tokens the Triton reduction order differs and a couple
-    of elements in 16K land one FP16 ulp apart."""
+    """Qualify the optional fused norm against the existing FP32 reference."""
     device = torch.device(current_platform.device_type)
     heads, dim = 16, 128
     with set_current_vllm_config(VllmConfig()):
         norm = FusedRMSNormGated(
             dim, eps=1e-5, activation="sigmoid", device=device, dtype=torch.float16
         )
-        assert not FusedRMSNormGated.enabled(), (
-            "the direct Triton call in the GLM KDA layer exists because the "
-            "CustomOp dispatch takes forward_native by default"
-        )
+        assert not FusedRMSNormGated.enabled()
     torch.manual_seed(20261010 + num_tokens)
     with torch.no_grad():
         norm.weight.copy_(1 + 0.1 * torch.randn(dim, device=device))
@@ -301,7 +293,7 @@ def test_sm70_kda_output_norm_triton_matches_decomposed(
 
     decomposed = norm.forward_native(x, gate, out_dtype=torch.float16)
     triton_out = norm.forward_cuda(x, gate, out_dtype=torch.float16)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert triton_out.dtype == torch.float16
     assert triton_out.shape == decomposed.shape
