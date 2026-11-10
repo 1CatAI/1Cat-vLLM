@@ -243,15 +243,15 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
 # block-table row and one length per token. two_requests: the same, twice.
 @pytest.mark.parametrize("layout", ["native", "flattened", "two_requests"])
 @pytest.mark.parametrize("num_rows", [3, 8, 13])
+@pytest.mark.parametrize("graph_width", [2048, 8192])
 @requires_sm70
 def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
-    monkeypatch, padded_blocks, layout, num_rows
+    monkeypatch, padded_blocks, layout, num_rows, graph_width
 ):
     torch.manual_seed(20260824)
     generator = torch.Generator().manual_seed(20260824)
     num_heads = 64
-    live_seq_len = 1017
-    graph_width = 2048
+    live_seq_len = graph_width // 2 - 7
     blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
 
     bits, _ = _random_fp8_keys(blocks * _BLOCK_SIZE, generator)
