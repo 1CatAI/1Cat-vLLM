@@ -101,3 +101,64 @@ def test_prepared_projection_borrows_native_owner_outside_forward(kind, mixed):
     )
     del projections, graph
     release_runtime_resources(config)
+
+
+@pytest.mark.parametrize("kind", [14, 23, 18])
+def test_mixed_projections_keep_distinct_engine_owners(monkeypatch, kind):
+    configs = [
+        SimpleNamespace(
+            kernel_config=KernelConfig(sm70_turbomind_workspace_bytes=budget * 1024**2)
+        )
+        for budget in (8, 16)
+    ]
+    data = (
+        affine_source(n=64, k=512, weight_type=kind)
+        if kind == 14
+        else source(kind, n=64, k=512)
+    )
+    projections, owners = [], []
+    for config in configs:
+        with set_current_vllm_config(config):
+            owners.append(bind_native_runtime())
+            projections.extend(
+                prepare_gguf_projections(
+                    [(torch.from_numpy(data).cuda(), kind)], torch.float16, True, 512
+                )
+            )
+    assert owners[0] is not owners[1]
+    process_storage = torch.ops._C.sm70_gemm_workspace_storage()
+
+    def cross_engine_mix(*args):
+        raise AssertionError("A mixed native call cannot borrow two engine owners")
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "prepared_gguf_mixed_projection", cross_engine_mix
+    )
+    stream = torch.cuda.Stream()
+    try:
+        for rows in (5, 20):
+            x = torch.randn(rows, 512, device="cuda", dtype=torch.float16) * 0.125
+            with torch.cuda.stream(stream):
+                expected = torch.cat([p(x) for p in projections], dim=-1)
+                actual = apply_prepared_gguf_projections(x, projections)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = apply_prepared_gguf_projections(x, projections)
+                x.copy_(torch.randn_like(x) * 0.125)
+                graph.replay()
+                torch.testing.assert_close(
+                    captured,
+                    torch.cat([p(x) for p in projections], dim=-1),
+                    rtol=0,
+                    atol=0,
+                )
+            assert _active_owner.get() is None
+            assert torch.ops._C.sm70_gemm_workspace_storage() == process_storage
+            for owner, budget in zip(owners, (8, 16)):
+                with owner.activate():
+                    storage = torch.ops._C.sm70_gemm_workspace_storage()
+                assert storage[0] > 0 and storage[1] == budget * 1024**2
+    finally:
+        for config in configs:
+            release_runtime_resources(config)
