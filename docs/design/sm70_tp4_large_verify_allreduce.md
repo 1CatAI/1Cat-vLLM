@@ -11,6 +11,11 @@ and two-epoch protocol. Smaller-message launch geometry and accumulation order
 are unchanged. The maximum persistent IPC allocation grows by approximately
 2.5 MiB per rank; account for this allocation when sizing a nearly full device.
 
+Explicit algorithm overrides bypass TP4 push dispatch. The extension does not
+expand the separate H2560 batch selector or the sum2 range. At 512 KiB and
+above, each output partition retains the old two-stage rank rotation during
+FP32 accumulation; below that boundary the existing canonical order remains.
+
 ## Validation
 
 `tests/distributed/test_sm70_large_push_all_reduce.py` compares captured chains

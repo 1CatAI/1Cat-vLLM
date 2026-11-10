@@ -219,7 +219,8 @@ inline bool sm70_qwen4exp_verify_batch_bytes(size_t bytes) {
 
 inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
                                           size_t bytes,
-                                          bool allow_generic = false) {
+                                          bool allow_generic = false,
+                                          bool allow_large_verifier = false) {
   // Experimental message-size admission, independent of model or batch shape.
   // Each thread handles one 16-byte pack. Use the smallest covering grid,
   // bounded by the existing persistent buffer, including for known payloads.
@@ -236,7 +237,9 @@ inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
       (concurrency != nullptr && std::strcmp(concurrency, "1") == 0 &&
        (bytes == kSm70Tp4PushAllreduceM16Bytes ||
         bytes == kSm70Tp4PushAllreduceM32Bytes ||
-        (bytes > kSm70Tp4PushAllreduceM32Bytes &&
+        (allow_large_verifier &&
+         policy.raw(CollectivePolicyField::custom_allreduce_algo) == nullptr &&
+         bytes > kSm70Tp4PushAllreduceM32Bytes &&
          bytes <= kSm70Tp4PushAllreduceM64Bytes &&
          bytes % (kSm70GemmaRmsNormHiddenSize * sizeof(half)) == 0)))) {
     return kSm70Tp4PushAllreduceBlocks;
@@ -813,12 +816,12 @@ DINLINE void sm70_push_store_volatile_16b(const P& value, void* address,
                  "l"(destination));
 }
 
-template <typename P, int ngpus, typename A>
+template <typename P, int ngpus, typename A, int StartRank = 0>
 DINLINE P sm70_push_reduce(P (&values)[ngpus]) {
-  A accumulator = upcast(values[0]);
+  A accumulator = upcast(values[StartRank]);
 #pragma unroll
   for (int rank = 1; rank < ngpus; ++rank) {
-    packed_assign_add(accumulator, upcast(values[rank]));
+    packed_assign_add(accumulator, upcast(values[(StartRank + rank) % ngpus]));
   }
   return downcast<P>(accumulator);
 }
@@ -873,7 +876,7 @@ __global__ void __launch_bounds__(512, 1)
   sm70_pack32_barrier_at_end<ngpus>(sg, self_sg, rank);
 }
 
-template <int ngpus>
+template <int ngpus, bool RotatedOrder = false>
 __global__ void __launch_bounds__(1024, 1)
     sm70_cross_device_reduce_1stage_push(RankData push_buffers,
                                          const half* __restrict__ input,
@@ -927,8 +930,29 @@ __global__ void __launch_bounds__(1024, 1)
       if (!has_empty_slot) break;
     }
 
-    reinterpret_cast<P*>(output)[offset] =
-        sm70_push_reduce<P, ngpus, A>(peer_values);
+    P reduced;
+    if constexpr (RotatedOrder) {
+      // The old two-stage path starts each output partition at its owner rank.
+      // Match that FP32 addition order, including cancellation and signed zero.
+      const int partition = offset / (packed_size / ngpus);
+      const int owner = partition < ngpus ? partition : ngpus - 1;
+      switch (owner) {
+        case 1:
+          reduced = sm70_push_reduce<P, ngpus, A, 1>(peer_values);
+          break;
+        case 2:
+          reduced = sm70_push_reduce<P, ngpus, A, 2>(peer_values);
+          break;
+        case 3:
+          reduced = sm70_push_reduce<P, ngpus, A, 3>(peer_values);
+          break;
+        default:
+          reduced = sm70_push_reduce<P, ngpus, A>(peer_values);
+      }
+    } else {
+      reduced = sm70_push_reduce<P, ngpus, A>(peer_values);
+    }
+    reinterpret_cast<P*>(output)[offset] = reduced;
 
     P empty;
 #pragma unroll
@@ -2478,14 +2502,25 @@ class CustomAllreduce {
       // pull path.
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
+          policy_.raw(CollectivePolicyField::custom_allreduce_algo) ==
+              nullptr &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           custom_allreduce_current_device_is_sm70()) {
         const int push_blocks =
-            sm70_tp4_push_allreduce_blocks(policy_, bytes, true);
+            sm70_tp4_push_allreduce_blocks(policy_, bytes, true, true);
         if (push_blocks > 0) {
-          sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
-              <<<push_blocks, sm70_tp4_push_allreduce_threads(bytes), 0,
-                 stream>>>(sm70_tp4_push_buffers_, input, output, rank_, size);
+          if (bytes >= 512 * 1024) {
+            sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize,
+                                                 true>
+                <<<push_blocks, sm70_tp4_push_allreduce_threads(bytes), 0,
+                   stream>>>(sm70_tp4_push_buffers_, input, output, rank_,
+                             size);
+          } else {
+            sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
+                <<<push_blocks, sm70_tp4_push_allreduce_threads(bytes), 0,
+                   stream>>>(sm70_tp4_push_buffers_, input, output, rank_,
+                             size);
+          }
           return;
         }
       }
@@ -2856,6 +2891,8 @@ class CustomAllreduce {
       }
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
+          policy_.raw(CollectivePolicyField::custom_allreduce_algo) ==
+              nullptr &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           (generic_small || qwen38_batch || qwen38_m2 || qwen38_mtp5 ||
            qwen4_exp_m1_enabled) &&

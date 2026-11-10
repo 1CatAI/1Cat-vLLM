@@ -28,12 +28,20 @@ def _check_large_push(rank: int, rendezvous: str) -> None:
     try:
         # Selection is captured when the communicator is constructed. Changing
         # an environment variable after construction cannot make an A/B test.
-        for enabled in (False, True):
+        for enabled, algorithm in (
+            (False, None),
+            (True, None),
+            (False, "1stage"),
+            (True, "1stage"),
+            (False, "2stage"),
+            (True, "2stage"),
+        ):
             policy = CommunicationPolicy(
                 native=CollectiveNativeConfig(
                     sm70_tp4_push_allreduce_concurrency=enabled,
                     sm70_tp4_push_allreduce_small_messages=False,
                     sm70_tp4_push_allreduce_qwen38_batch=False,
+                    custom_allreduce_algo=algorithm,
                 )
             )
             config = VllmConfig(
@@ -53,8 +61,12 @@ def _check_large_push(rank: int, rendezvous: str) -> None:
 
         # Include partial batches and alternating packet lengths: the same
         # persistent two-epoch buffer must not retain a previous graph's tail.
-        shapes = [(rows, 5120) for rows in (8, 16, 32, 33, 40, 48, 56, 64, 65)]
-        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        shapes = [
+            (rows, 5120) for rows in (8, 16, 32, 33, 40, 48, 51, 52, 56, 63, 64, 65)
+        ]
+        # The pure-SM70 collective binary does not emit BF16 kernels. Qualify
+        # FP16 push and the supported FP32 fallback in this hardware suite.
+        for dtype in (torch.float16, torch.float32):
             inputs = [
                 torch.empty(shape, dtype=dtype, device="cuda") for shape in shapes
             ]
@@ -89,10 +101,11 @@ def _check_large_push(rank: int, rendezvous: str) -> None:
                         torch.cuda._sleep(10000)
                     graph.replay()
                 torch.accelerator.synchronize()
-                for actual, expected in zip(outputs[1], outputs[0]):
-                    assert torch.equal(
-                        actual.view(torch.uint8), expected.view(torch.uint8)
-                    )
+                for baseline, candidate in zip(outputs[::2], outputs[1::2]):
+                    for actual, expected in zip(candidate, baseline):
+                        assert torch.equal(
+                            actual.view(torch.uint8), expected.view(torch.uint8)
+                        ), (dtype, tuple(actual.shape), cycle)
                 for group in guards:
                     for storage in group:
                         assert bool(torch.all(storage[:8] == 123))
