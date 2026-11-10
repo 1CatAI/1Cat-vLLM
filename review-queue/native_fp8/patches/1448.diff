@@ -1,0 +1,482 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b2fd3d28c4..454249b967 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -310,10 +310,25 @@ endif()
+ # _C extension
+ #
+ 
++# CUDA activation quantization needs SM80+; use the requested Torch archs,
++# not CMake's independently detected/default architecture. Other backends
++# retain their existing source and operator registrations.
++set(VLLM_ACT_QUANT_ARCHS "")
++set(VLLM_REGISTER_DEEPGEMM_MOE_OPS ON)
++if(VLLM_GPU_LANG STREQUAL "CUDA")
++  foreach(_arch IN LISTS CUDA_ARCHS)
++    if(_arch VERSION_GREATER_EQUAL "8.0")
++      list(APPEND VLLM_ACT_QUANT_ARCHS "${_arch}")
++    endif()
++  endforeach()
++  if(NOT VLLM_ACT_QUANT_ARCHS)
++    set(VLLM_REGISTER_DEEPGEMM_MOE_OPS OFF)
++  endif()
++endif()
++
+ set(VLLM_EXT_SRC
+   "csrc/cuda_view.cu"
+   "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
+-  "csrc/quantization/activation_kernels.cu"
+   "csrc/cuda_utils_kernels.cu"
+   "csrc/custom_all_reduce.cu"
+   "csrc/torch_bindings.cpp"
+@@ -321,6 +336,9 @@ set(VLLM_EXT_SRC
+   "csrc/ple_fast_lane.cpp"
+   "csrc/gguf_dmv13_pack.cpp"
+   "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
++if(NOT VLLM_GPU_LANG STREQUAL "CUDA")
++  list(APPEND VLLM_EXT_SRC "csrc/quantization/activation_kernels.cu")
++endif()
+ 
+ if(VLLM_GPU_LANG STREQUAL "CUDA")
+   list(APPEND VLLM_EXT_SRC
+@@ -364,6 +382,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+   set_gencode_flags_for_srcs(
+     SRCS "${VLLM_EXT_SRC}"
+     CUDA_ARCHS "${CUDA_ARCHS}")
++  if(VLLM_ACT_QUANT_ARCHS)
++    list(APPEND VLLM_EXT_SRC "csrc/quantization/activation_kernels.cu")
++    set_gencode_flags_for_srcs(
++      SRCS "csrc/quantization/activation_kernels.cu"
++      CUDA_ARCHS "${VLLM_ACT_QUANT_ARCHS}")
++  endif()
+ 
+   set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS "")
+   cuda_archs_loose_intersection(SM70_TURBOMIND_ARCHS "7.0" "${CUDA_ARCHS}")
+@@ -754,6 +778,9 @@ define_extension_target(
+ # driver API. This causes problems when linking with earlier versions of CUDA.
+ # Setting this variable sidesteps the issue by calling the driver directly.
+ target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
++if(VLLM_REGISTER_DEEPGEMM_MOE_OPS)
++  target_compile_definitions(_C PRIVATE VLLM_REGISTER_DEEPGEMM_MOE_OPS=1)
++endif()
+ if(VLLM_REGISTER_BASIC_ACTIVATION_IN_C)
+   target_compile_definitions(_C PRIVATE VLLM_REGISTER_BASIC_ACTIVATION_IN_C=1)
+ endif()
+diff --git a/csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu b/csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu
+index dbd011b28c..5eee39bef6 100644
+--- a/csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu
++++ b/csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu
+@@ -2145,6 +2145,48 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
+     }
+     return;
+   }
++  // Block-scaled checkpoints (e.g. Qwen3.8-27B-FP8, weight_block_size
++  // 128x128) never satisfy the channel_scales gate above, so every M=9..32
++  // decode step falls through to the full weight reconstruction below,
++  // measured at ~50 ms/step extra on V100 TP4 with DFlash2 q8 and 2-4
++  // concurrent requests (target_forward 65 ms at M=16 vs 20 ms at M=8).
++  // Chunk through the accepted M=1..8 route instead: each output row is an
++  // independent dot product over the same packed weight, so per-row
++  // reduction order (and therefore numerics) match the single-stream M<=8
++  // path exactly. Reuse the per-engine chunked-decode policy, including its
++  // explicit rollback, rather than consulting a new process-global env flag.
++  const bool chunked_small_split =
++      split_k == 4 || split_k == 8 || split_k == 16 ||
++      (!gated_silu && (split_k == 12 || split_k == 32));
++  const bool chunked_small_config =
++      chunked_small_split &&
++      (accumulator_chains == 1 || accumulator_chains == 2) &&
++      (split_k != 12 || (accumulator_chains == 2 && !prefetch_codes));
++  if (m > 8 && m <= 32 && !channel_scales && qpn8_m32_chunked_enabled &&
++      chunked_small_config && (dense_shape || gated_shape)) {
++    static std::once_flag block_chunked_log_once;
++    std::call_once(block_chunked_log_once, []() {
++      std::fprintf(stderr,
++                   "INFO SM70 block-FP8 QPN8 M=9..32 chunked decode route "
++                   "engaged (set VLLM_SM70_FP8_QPN8_M32_CHUNKED=0 to "
++                   "restore the per-step dequant fallback).\n");
++    });
++    for (int64_t row = 0; row < m; row += 8) {
++      const int64_t rows = std::min<int64_t>(8, m - row);
++      auto input_chunk = input.narrow(0, row, rows);
++      auto out_chunk = out.narrow(0, row, rows);
++      if (gated_silu) {
++        fp8_qpn8_gated_pair_sm70_out(out_chunk, input_chunk, codes,
++                                     group_scales, split_k, accumulator_chains,
++                                     true, prefetch_codes);
++      } else {
++        fp8_qpn8_gemm_sm70_out(out_chunk, input_chunk, codes, group_scales,
++                               split_k, accumulator_chains, true,
++                               prefetch_codes);
++      }
++    }
++    return;
++  }
+   fp8_qpn8_prefill_sm70_out(out, dense_weight_ptr, input, codes, group_scales,
+                             gated_silu);
+ }
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index fe913222e5..006cdcf4a3 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -200,12 +200,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "Tensor up) -> ()");
+   ops.impl("gguf_iq3_gated_sm70_out", torch::kCUDA, &gguf_iq3_gated_sm70_out);
+ #endif
++#ifdef VLLM_REGISTER_DEEPGEMM_MOE_OPS
+   ops.def(
+       "persistent_masked_m_silu_mul_quant(Tensor input, Tensor counts, Tensor! "
+       "y_q, Tensor! y_s,"
+       "bool use_ue8m0) -> ()");
+   ops.impl("persistent_masked_m_silu_mul_quant", torch::kCUDA,
+            &persistent_masked_m_silu_mul_quant);
++#endif
+ 
+   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
+   ops.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
+@@ -253,9 +255,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
+ #endif
+ 
++#ifdef VLLM_REGISTER_DEEPGEMM_MOE_OPS
+   ops.def(
+       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
+   ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);
++#endif
+ 
+   // Fused SiLU+Mul + per-block quantization
+   ops.def(
+diff --git a/tests/compile/passes/test_act_quant_fusion_registration.py b/tests/compile/passes/test_act_quant_fusion_registration.py
+index 981a9b439e..35fdb2759e 100644
+--- a/tests/compile/passes/test_act_quant_fusion_registration.py
++++ b/tests/compile/passes/test_act_quant_fusion_registration.py
+@@ -1,6 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from types import SimpleNamespace
++
++import pytest
++
+ from vllm.compilation.passes.fusion.act_quant_fusion import (
+     ActivationQuantFusionPass,
+ )
+@@ -26,3 +30,45 @@ def test_activation_quant_fusion_skips_missing_backend_ops(monkeypatch):
+     monkeypatch.setattr(act_quant_fusion, "FUSED_OPS", {})
+ 
+     ActivationQuantFusionPass(config)
++
++
++@pytest.mark.parametrize("capability", [70, 75, 80, 90])
++@pytest.mark.parametrize("available", [False, True])
++def test_static_fp8_fusion_requires_supported_cuda_device(
++    monkeypatch, capability, available
++):
++    import vllm.compilation.passes.fusion.act_quant_fusion as fusion
++
++    operators = SimpleNamespace()
++    if available:
++        operators.silu_and_mul_quant = object()
++    monkeypatch.setattr(
++        fusion, "torch", SimpleNamespace(ops=SimpleNamespace(_C=operators))
++    )
++    monkeypatch.setattr(
++        fusion,
++        "current_platform",
++        SimpleNamespace(
++            is_cuda=lambda: True,
++            has_device_capability=lambda minimum: capability >= minimum,
++        ),
++    )
++    assert fusion._supports_static_fp8_silu_mul_quant() == (
++        available and capability >= 80
++    )
++
++
++def test_static_fp8_fusion_preserves_non_cuda_backends(monkeypatch):
++    import vllm.compilation.passes.fusion.act_quant_fusion as fusion
++
++    monkeypatch.setattr(
++        fusion,
++        "torch",
++        SimpleNamespace(
++            ops=SimpleNamespace(_C=SimpleNamespace(silu_and_mul_quant=object()))
++        ),
++    )
++    monkeypatch.setattr(
++        fusion, "current_platform", SimpleNamespace(is_cuda=lambda: False)
++    )
++    assert fusion._supports_static_fp8_silu_mul_quant()
+diff --git a/tests/kernels/quantization/test_sm70_qpn8_block_chunked.py b/tests/kernels/quantization/test_sm70_qpn8_block_chunked.py
+new file mode 100644
+index 0000000000..51f672b145
+--- /dev/null
++++ b/tests/kernels/quantization/test_sm70_qpn8_block_chunked.py
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Block-scaled concurrent decode against the accepted eight-row kernels."""
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
++    reason="requires SM70",
++)
++
++
++@pytest.mark.parametrize("rows", [9, 15, 16, 17, 24, 31, 32])
++@pytest.mark.parametrize(
++    "k,n,split,gated",
++    [(1536, 256, 12, False), (4096, 512, 16, False), (512, 512, 8, True)],
++)
++def test_block_decode_preserves_small_row_bits_and_graph_inputs(
++    monkeypatch, rows, k, n, split, gated
++):
++    import vllm._C  # noqa: F401
++
++    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32_CHUNKED", "1")
++    torch.manual_seed(1069)
++    weight = (torch.randn(n, k, device="cuda") * 0.3).to(torch.float8_e4m3fn)
++    scales = torch.full((n // 128, k // 128), 0.125, device="cuda")
++    codes, packed_scales = torch.ops._C.fp8_qpn8_prepare_sm70(weight, scales)
++    x = torch.empty(rows, k, device="cuda", dtype=torch.float16)
++    width = n // 2 if gated else n
++    backing = x.new_full((rows + 2, width), float("nan"))
++    output = backing[1:-1]
++    expected = torch.empty_like(output)
++    workspace = x.new_full((k, n), float("nan"))
++    small = (
++        torch.ops._C.fp8_qpn8_gated_pair_sm70_out
++        if gated
++        else torch.ops._C.fp8_qpn8_gemm_sm70_out
++    )
++
++    def call():
++        torch.ops._C.fp8_qpn8_dispatch_sm70_out(
++            output,
++            workspace.data_ptr(),
++            x,
++            codes,
++            packed_scales,
++            split,
++            2,
++            False,
++            gated,
++        )
++
++    x.normal_(0, 0.1)
++    call()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        call()
++    for amplitude in (0.1, 0.3, 0.0):
++        x.normal_(0, amplitude)
++        for start in range(0, rows, 8):
++            small(
++                expected[start : start + 8],
++                x[start : start + 8],
++                codes,
++                packed_scales,
++                split,
++                2,
++                True,
++                False,
++            )
++        for invoke in (call, graph.replay):
++            output.fill_(float("nan"))
++            invoke()
++            assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
++            assert torch.isnan(backing[[0, -1]]).all()
++            # The old fallback would reconstruct the dense matrix here.
++            assert torch.isnan(workspace).all()
++
++
++@pytest.mark.parametrize(
++    "gated,k,split,chains,prefetch,chunked",
++    [
++        (True, 512, 32, 2, False, True),
++        (True, 512, 8, 2, False, False),
++        (False, 1536, 12, 1, False, True),
++        (False, 1536, 12, 2, True, True),
++    ],
++)
++def test_rollback_and_unsupported_configs_keep_dense_fallback(
++    monkeypatch, gated, k, split, chains, prefetch, chunked
++):
++    import vllm._C  # noqa: F401
++
++    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32_CHUNKED", str(int(chunked)))
++    torch.manual_seed(10690)
++    n = 512
++    weight = (torch.randn(n, k, device="cuda") * 0.3).to(torch.float8_e4m3fn)
++    scales = torch.full((n // 128, k // 128), 0.125, device="cuda")
++    codes, packed_scales = torch.ops._C.fp8_qpn8_prepare_sm70(weight, scales)
++    x = torch.randn(17, k, device="cuda", dtype=torch.float16) * 0.1
++    output = x.new_empty((17, n // 2 if gated else n))
++    workspace = x.new_full((k, n), float("nan"))
++    # These configurations were accepted by the prefill fallback before the
++    # new block route, even when the small-row kernel cannot execute them.
++    torch.ops._C.fp8_qpn8_dispatch_sm70_out(
++        output,
++        workspace.data_ptr(),
++        x,
++        codes,
++        packed_scales,
++        split,
++        chains,
++        prefetch,
++        gated,
++    )
++    assert torch.isfinite(workspace).all()
++    expected = x.double() @ (weight.double() * 0.125).t()
++    if gated:
++        gate, up = expected.chunk(2, dim=-1)
++        expected = gate.sigmoid() * gate * up
++    assert (output.double() - expected).norm() / expected.norm() < 0.005
+diff --git a/tests/kernels/quantization/test_sm70_qpn8_block_fp8.py b/tests/kernels/quantization/test_sm70_qpn8_block_fp8.py
+index a9a7484340..f7903e2f6d 100644
+--- a/tests/kernels/quantization/test_sm70_qpn8_block_fp8.py
++++ b/tests/kernels/quantization/test_sm70_qpn8_block_fp8.py
+@@ -220,3 +220,58 @@ def test_volta_turbomind_copy_follows_decode_rows(
+         layer
+     )
+     assert hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight") == copy
++
++
++@pytest.mark.parametrize("rows", [9, 16, 17, 32, 33])
++def test_no_copy_dynamic_provider_reaches_chunked_dispatch(
++    default_vllm_config, monkeypatch, rows
++):
++    if torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("Volta no-copy dispatcher")
++    from vllm import _sm70_ops as ops
++    from vllm.runtime_resources import (
++        activate_runtime_resources,
++        runtime_resources_for,
++    )
++
++    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
++        False
++    )
++    layer, reference = _layer(512, 1536)
++    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(512, 1536))
++    kernel.process_weights_after_loading(layer)
++    assert not hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight")
++    calls = []
++    original = ops.fp8_qpn8_dispatch_sm70_out
++
++    def dispatch(*args, native_policy=None, **kwargs):
++        calls.append(args[2].shape[0])
++        return original(*args, native_policy=native_policy, **kwargs)
++
++    monkeypatch.setattr(ops, "fp8_qpn8_dispatch_sm70_out", dispatch)
++    compiled = torch.compile(
++        lambda value: kernel.apply_weights(layer, value), fullgraph=True, dynamic=True
++    )
++    x = torch.randn(rows, 1536, device="cuda", dtype=torch.float16) * 0.1
++    # Compiled operators borrow the engine owner from the forward context.
++    # Eager calls activate it themselves, so exercise the compiled path with
++    # the same resource activation used by a real model forward.
++    with activate_runtime_resources(runtime_resources_for(default_vllm_config)):
++        output = compiled(x)
++        assert bool(calls) == (rows <= 32)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            output = compiled(x)
++        for amplitude in (0.1, 0.3, 0.0):
++            x.normal_(0, amplitude)
++            graph.replay()
++            if rows <= 32:
++                # The independent, unchanged small-row route is the exact oracle.
++                expected = torch.cat(
++                    [kernel.apply_weights(layer, part) for part in x.split(8)]
++                )
++                assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
++            else:
++                expected = x.float() @ reference.t()
++                error = (output.float() - expected).norm()
++                assert error / expected.norm().clamp_min(1e-12) < 1e-3
+diff --git a/vllm/compilation/passes/fusion/act_quant_fusion.py b/vllm/compilation/passes/fusion/act_quant_fusion.py
+index d311884a79..2161672643 100644
+--- a/vllm/compilation/passes/fusion/act_quant_fusion.py
++++ b/vllm/compilation/passes/fusion/act_quant_fusion.py
+@@ -30,9 +30,19 @@
+ 
+ SILU_MUL_OP = torch.ops._C.silu_and_mul.default
+ 
+-FUSED_OPS: dict[QuantKey, OpOverload] = {
+-    kFp8StaticTensorSym: torch.ops._C.silu_and_mul_quant.default,  # noqa: E501
+-}
++
++# Mixed CUDA wheels may register this op for SM80+ while running on a
++# pre-SM80 device. Operator availability alone does not qualify the fusion.
++def _supports_static_fp8_silu_mul_quant() -> bool:
++    return hasattr(torch.ops._C, "silu_and_mul_quant") and (
++        not current_platform.is_cuda() or current_platform.has_device_capability(80)
++    )
++
++
++silu_and_mul_quant_supported = _supports_static_fp8_silu_mul_quant()
++FUSED_OPS: dict[QuantKey, OpOverload] = {}
++if silu_and_mul_quant_supported:
++    FUSED_OPS[kFp8StaticTensorSym] = torch.ops._C.silu_and_mul_quant.default  # noqa: E501
+ silu_and_mul_nvfp4_quant_supported = current_platform.is_cuda() and hasattr(
+     torch.ops._C, "silu_and_mul_nvfp4_quant"
+ )
+diff --git a/vllm/model_executor/kernels/linear/qpn/fp8_block.py b/vllm/model_executor/kernels/linear/qpn/fp8_block.py
+index 2eb76437f2..8d7f012bd2 100644
+--- a/vllm/model_executor/kernels/linear/qpn/fp8_block.py
++++ b/vllm/model_executor/kernels/linear/qpn/fp8_block.py
+@@ -11,9 +11,9 @@
+ TurboMind layout for larger M, avoiding a full dense reconstruction on short
+ prefills, when decode can exceed M=8 or
+ kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill asks for it.
+-Turing, and Volta without that second layout, use invocation-private
+-dense scratch for the existing FP16 prefill operator. Native arithmetic is
+-unchanged.
++Volta without that second layout dispatches M=9..32 through the packed
++chunked route when available. Other larger inputs use invocation-private
++dense scratch for the existing FP16 prefill operator.
+ """
+ 
+ from collections.abc import Sequence
+@@ -42,7 +42,7 @@
+ )
+ from vllm.platforms import current_platform
+ 
+-# Block-scale QPN8 GEMM supports M up to this bound; larger M uses a fallback.
++# The direct GEMM bound; no-copy Volta also supports the chunked M9-M32 route.
+ _QPN8_MAX_M = 8
+ logger = init_logger(__name__)
+ 
+@@ -104,6 +104,28 @@ def _qpn8_native_linear(
+         )
+         return out
+     dense = torch.empty((k_dim * n_dim,), dtype=torch.float16, device=x.device)
++    if (
++        x.shape[0] <= 32
++        and current_platform.is_device_capability(70)
++        and hasattr(torch.ops._C, "fp8_qpn8_dispatch_sm70_out")
++    ):
++        # Keep the held TurboMind layout above unchanged. The dispatcher
++        # owns policy/config admission and falls back into this private
++        # scratch when chunking is disabled or unsupported.
++        call_native(
++            sm70_ops.fp8_qpn8_dispatch_sm70_out,
++            native_policy,
++            out,
++            dense.data_ptr(),
++            x,
++            codes,
++            group_scales,
++            split_k,
++            accumulator_chains,
++            prefetch_codes,
++            False,
++        )
++        return out
+     call_native(
+         sm70_ops.fp8_qpn8_prefill_sm70_out,
+         native_policy,

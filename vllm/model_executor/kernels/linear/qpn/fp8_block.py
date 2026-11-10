@@ -11,9 +11,9 @@ M=0 returns an empty output. M=1..8 uses packed GEMM. Volta retains its
 TurboMind layout for larger M, avoiding a full dense reconstruction on short
 prefills, when decode can exceed M=8 or
 kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill asks for it.
-Turing, and Volta without that second layout, use invocation-private
-dense scratch for the existing FP16 prefill operator. Native arithmetic is
-unchanged.
+Volta without that second layout dispatches M=9..32 through the packed
+chunked route when available. Other larger inputs use invocation-private
+dense scratch for the existing FP16 prefill operator.
 """
 
 from collections.abc import Sequence
@@ -42,7 +42,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 
-# Block-scale QPN8 GEMM supports M up to this bound; larger M uses a fallback.
+# The direct GEMM bound; no-copy Volta also supports the chunked M9-M32 route.
 _QPN8_MAX_M = 8
 logger = init_logger(__name__)
 
@@ -104,6 +104,28 @@ def _qpn8_native_linear(
         )
         return out
     dense = torch.empty((k_dim * n_dim,), dtype=torch.float16, device=x.device)
+    if (
+        x.shape[0] <= 32
+        and current_platform.is_device_capability(70)
+        and hasattr(torch.ops._C, "fp8_qpn8_dispatch_sm70_out")
+    ):
+        # Keep the held TurboMind layout above unchanged. The dispatcher
+        # owns policy/config admission and falls back into this private
+        # scratch when chunking is disabled or unsupported.
+        call_native(
+            sm70_ops.fp8_qpn8_dispatch_sm70_out,
+            native_policy,
+            out,
+            dense.data_ptr(),
+            x,
+            codes,
+            group_scales,
+            split_k,
+            accumulator_chains,
+            prefetch_codes,
+            False,
+        )
+        return out
     call_native(
         sm70_ops.fp8_qpn8_prefill_sm70_out,
         native_policy,

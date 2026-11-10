@@ -1,0 +1,110 @@
+diff --git a/csrc/sm70_turbomind/ops/gemm_runtime.cpp b/csrc/sm70_turbomind/ops/gemm_runtime.cpp
+index 67805c066..92407af6b 100644
+--- a/csrc/sm70_turbomind/ops/gemm_runtime.cpp
++++ b/csrc/sm70_turbomind/ops/gemm_runtime.cpp
+@@ -194,7 +194,7 @@ bool awq_tune_small_shapes_enabled() {
+ 
+ bool fp8_tune_small_shapes_enabled() {
+   return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_tune_small_shapes,
+-                                 1) != 0;
++                                 0) != 0;
+ }
+ 
+ bool mxfp4_tune_small_shapes_enabled() {
+diff --git a/tests/quantization/test_sm70_warmup.py b/tests/quantization/test_sm70_warmup.py
+index d708c5bdc..c37a0106e 100644
+--- a/tests/quantization/test_sm70_warmup.py
++++ b/tests/quantization/test_sm70_warmup.py
+@@ -713,6 +713,39 @@ def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
+     )
+ 
+ 
++def test_fp8_small_shape_tuning_defaults_to_fixed_dispatch(monkeypatch):
++    monkeypatch.delenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", raising=False)
++    monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
++    envs.disable_envs_cache()
++    calls = []
++
++    def warmup_layers(layers, m_values):
++        calls.append((layers, m_values))
++        return 5
++
++    monkeypatch.setattr(warmup, "_warmup_fp8_dense_layers", warmup_layers)
++    monkeypatch.setattr(
++        warmup,
++        "_export_lut_bytes",
++        lambda device: (_ for _ in ()).throw(AssertionError()),
++    )
++
++    assert not envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
++    assert not warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
++        has_awq_dense=False,
++        has_fp8_dense=True,
++        fp4_kinds=set(),
++    )
++    layers = [(nn.Module(), False)]
++    count = warmup._warmup_fp8_dense_layers_coordinated(
++        layers,
++        [1, 4],
++        torch.device("cuda:0"),
++    )
++    assert count == 5
++    assert calls == [(layers, [1, 4])]
++
++
+ def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
+     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
+     monkeypatch.delenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", raising=False)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index b7699f87c..3aff6e3dc 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -298,7 +298,7 @@ if TYPE_CHECKING:
+     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL: int = 128
+     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS: int = 4
+     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS: int = 0
+-    VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
++    VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = False
+     VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
+     VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
+     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
+@@ -4725,14 +4725,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         replacement="parallel_config.communication.awq_overlap_kernel_reducer_blocks=0",
+     ),
+     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": env_var(
+-        lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))),
++        lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "0"))),
+         description=(
+             "SM70: fp8 tune small shapes. The consumer locations and unset "
+             "defaults are listed below."
+         ),
+         category="configuration",
+-        declared_default="True",
+-        effective_default="True",
++        declared_default="False",
++        effective_default="False",
+         automatic_conditions=(),
+         acceleration_paths=("TurboMind FP8",),
+         user_visible=False,
+diff --git a/vllm/model_executor/warmup/awq_sm70_warmup.py b/vllm/model_executor/warmup/awq_sm70_warmup.py
+index fe96ef8f4..4109f3189 100644
+--- a/vllm/model_executor/warmup/awq_sm70_warmup.py
++++ b/vllm/model_executor/warmup/awq_sm70_warmup.py
+@@ -103,7 +103,7 @@ def _lut_cache_disabled_for_dynamic_quant_dispatch(
+     )
+     fp8_dynamic = (
+         has_fp8_dense
+-        and _native_number("fp8", "fp8_tune_small_shapes", 1)
++        and _native_number("fp8", "fp8_tune_small_shapes", 0)
+         and not _native_number("fp8", "fp8_reuse_imported_cache", 0)
+     )
+     mxfp4_dynamic = (
+@@ -260,7 +260,7 @@ def _warmup_fp8_dense_layers_coordinated(
+     if not layers:
+         return 0
+     if not _native_number(
+-        "fp8", "fp8_tune_small_shapes", 1
++        "fp8", "fp8_tune_small_shapes", 0
+     ) or not capture_runtime_config().value("fp8_coordinated_tuning"):
+         return _warmup_fp8_dense_layers(layers, m_values)
+ 

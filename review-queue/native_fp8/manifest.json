@@ -1,0 +1,109 @@
+{
+  "group": "native_fp8",
+  "title": "Native FP8/QPN and SM75 kernel qualification",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1448,
+      "title": "[SM70] Integrate QPN8 block chunking and architecture-safe activation builds",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1448",
+      "head": "f165b6ac47eeea932d6c7b482d7c45a144f97693",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "57eb754b0fc09dcca4b1156ca2e63a54455e6ec4abadcff8782427fec1d06568",
+      "files": 8,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1157,
+      "title": "[Kernel][SM70] Native block-scale QPN8 GEMM for M=17-32 decode: single-pass weight read",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1157",
+      "head": "dd4c9f85059c62af1774c17d2d332a1516b4b12e",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "462bfc37038cb9dce6f6cdb55283d8cb7cae429ee2f2839988a413e0134ffc51",
+      "files": 1,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1412,
+      "title": "sm70: instantiate the E4M3 GEMM at quantization groups 64 and 32",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1412",
+      "head": "c28f814964913fc40cc7a378cd5e77ca5da3fa7a",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "b16312aef3a7b7b5067a67ad35f2eedc9f023ef6c4f1a1688501bbc9d279aa9b",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1021,
+      "title": "[Kernel][SM70] Keep 32x32 UE8M0 block-FP8 dense weights in FP8 on Volta",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1021",
+      "head": "13825030f926dd92ddf60061d507b8325daf9590",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "8f9d9ff265455b5de770a39794848d4b06d5e8dc7ee55f41130f410db77ffb3a",
+      "files": 7,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1187,
+      "title": "[SM70] Default the FP8 small-shape runtime tuning to off",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1187",
+      "head": "739083e52cf3f3871d6e1eb91eda814d66f2f943",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "7fea79c849a4fb1b76886cd775271eb4e190fd3945738f229a50cf585a2644cc",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1346,
+      "title": "[Perf][SM75][Build] Pin the Turing FlashAttention library to the split-wave heuristic",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1346",
+      "head": "68aeae6b705adffed48ae6bfca2117195cfb9084",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "d4e1a9bc40b288380eb6abfb555dda7dee42c051313314de6a13cf53e5eb2df2",
+      "files": 1,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1278,
+      "title": "[Perf][SM75] Turing tensor-core paths for block-FP8 QPN8 and the grouped skinny MoE; bound the MoE grid",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1278",
+      "head": "c15d1446fa00d3196243da5de951d8ed3586de0a",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "1e4314a70e04f1c4ca72584a36de7234644dca22ff393ea5dbc9b779c283ba95",
+      "files": 20,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1322,
+      "title": "build: fix SM70-only builds broken by activation_kernels.cu and its act-quant ops",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1322",
+      "head": "03485453bee261228e6a4591e3ca93cfb9551fcd",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "efb8b16d3302118c54cc33dc9cb6a2e257c3f0c91e267bd025a9396995a78aec",
+      "files": 3,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    },
+    {
+      "number": 1069,
+      "title": "[Kernel][SM70] Chunk block-scaled QPN8 decode through the M<=8 route for M=9..32",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1069",
+      "head": "8837881a4dd8441229b9646cd5d73c4a31e945c3",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "3bec9e0d6bdc396765588bf40f028dadffef528abd9df15a48c5a23aa7230e7a",
+      "files": 1,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    }
+  ],
+  "validation_gaps": "The complete development native library scored192/200 on GSM8K-200 against the release-native193/200 control; question153 newly hit the length limit. Keep it isolated. #1187 changes runtime tuning defaults and needs a matched frozen-tuning control, not attribution to kernels. #1278/#1346 require actual SM75 qualification; a V100 cannot establish Turing behavior. Validate native correctness, graph replay, concurrent resource ownership, matched model quality and whole-round timing before promotion.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

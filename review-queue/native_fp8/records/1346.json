@@ -1,0 +1,95 @@
+{
+  "initial_inventory": {
+    "number": 1346,
+    "title": "[Perf][SM75][Build] Pin the Turing FlashAttention library to the split-wave heuristic",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1346",
+    "isDraft": false,
+    "headRefOid": "68aeae6b705adffed48ae6bfca2117195cfb9084",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1346,
+    "title": "[Perf][SM75][Build] Pin the Turing FlashAttention library to the split-wave heuristic",
+    "body": "## Purpose\n\nThe Turing FlashAttention library picks its split-KV count with num_splits_heuristic, which multiplies the SM count by a hard-coded 2 CTAs per SM. For head dim 256 on Turing the 64 x 32 kernel uses exactly 64 KB of shared memory, so one CTA fits per SM: the heuristic planned 144 slots on 72 SMs, and with two KV heads and a 236,000-token context it chose 62 splits = 124 CTAs, a second wave of 52 CTAs after a full one.\n\nThe commit this PR pins derives the resident CTAs per SM from the kernel's shared memory tiles, capped at 2 as before, and chooses the split count with the fewest KV blocks streamed in sequence. For that shape it gives 36 splits = 72 CTAs, one full wave.\n\nThis PR changes one line: VLLM_FLASH_ATTN_SM75_COMMIT moves from 43b9d29c9 to 6ab41c291 (github.com/Peuqui/flash-attention, branch splitkv-wave-heuristic), the repository main already pins.\n\nNot a duplicate: searched the open PRs of this repository (86 at the time of writing) for num_splits_heuristic, split-KV and flash_attn_sm75. #1279 and #1286 appear for their own split-KV paths in another kernel and do not change this pin.\n\nAI assistance was used for this change. I reviewed the change and ran the measurements below.\n\n## Test Plan\n\nThe library built on its own from github.com/Peuqui/flash-attention at the new commit is the one our fork has run in production since 2026-10-31; the kernel measurement and the model series below used it. I did not build this PR's CMake path here: the pin only moves to another commit of the same repository, reachable on its branch splitkv-wave-heuristic (git ls-remote).\npre-commit run --from-ref origin/main --to-ref HEAD\npre-commit run mypy-3.10 --all-files --hook-stage manual\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| FLASH_ATTN decode on SM75 through the Turing library | fp16 KV, head dim 256 | split-KV, long context, several KV heads | 36 instead of 62 splits at the measured shape | measured: kernel in CUDA graphs and model series | other Turing SM counts than 72 |\n| same | other head dims | shared memory allows 2 CTAs per SM | same assumption as before, new choice rule | source | not measured |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: default enabled, no switch, through the pin.\n- Required CLI options and environment switches: none. Benchmark entry: Qwen3.8-27B NVFP4, --tensor-parallel-size 2 on two Quadro RTX 8000, MTP with 3 speculative tokens, attention_backend FLASH_ATTN.\n- KV cache dtype used for the benchmark: the entry's default, fp16.\n- Wheel SHA or source commit: library commit 6ab41c291 in the changed arm. vLLM fork build: reference tag verified-2026-10-28-prod-v5, changed ea2ec07f6, one commit later, a fix for nested outputs of DFlash-type drafters that this MTP entry does not reach.\n- PYTHONPATH, source overlays, or external native libraries used: the fork tree and a patched Triton 3.6 build on PYTHONPATH in both arms; between the arms the Turing FlashAttention library and that one commit differ.\n- User-entry route-hit, speed, and output-quality evidence: OpenAI API server entry, below.\n- Existing kernel/backend registry and capability-rejection reasons: not touched.\n- Per-engine configuration and deprecated-variable compatibility: no new or changed setting.\n- New/changed environment metadata and generated reference check: none.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: no change.\n\n## Test Result\n\nKernel on a Quadro RTX 8000 in CUDA graphs (2 KV heads, 6 query heads per KV head, 24 packed rows, 832-token pages), ms per call, lower is better, the 62 splits of the former rule against 36: 236,000 tokens 1.494 -> 1.292, 100,000 tokens 0.669 -> 0.571, 33,000 tokens 0.257 -> 0.217. 37 splits, a second wave of two CTAs, took 2.18 ms. Outputs equal up to 1.5e-5.\n\nQwen3.8-27B on two RTX 8000 (TP2, MTP), runs T T P T P through the same server entry, counted T#2 + T#4 against P#3 + P#5, ms per decode round (lower is better):\n- 33,208 tokens: 34.5 / 34.4 changed, 35.3 / 35.2 reference.\n- 184,134 tokens: 49.4 / 49.4 changed, 52.5 / 52.5 reference.\n- 249,992 tokens: 57.0 / 57.1 changed, 60.4 / 60.4 reference.\n- 259,552 tokens: 58.1 / 57.9 changed, 62.1 / 61.3 reference.\n\nPrefill of 8,490 tokens 5.52 / 5.52 s (1,538 / 1,539 tok/s) changed, 5.53 / 5.53 s (1,535 / 1,535 tok/s) reference. Memory peak 48,331 MiB per card in all arms, KV pool 1,040,933 tokens. GSM8K-30 29/30 changed, 28/30 reference.\n\npre-commit run --from-ref origin/main --to-ref HEAD on this branch (main 4d57473db plus this commit; it merges cleanly into main 6db9c816c): every hook passes except check-layering, which reports vllm/model_executor/layers/fused_moe/runner/moe_runner.py (platform coupling 37 -> 39) exactly as main 4d57473db does. pre-commit run mypy-3.10 --all-files --hook-stage manual: no issues.\n\n🤖 Generated with Claude Code (https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_0172gtUkBtN8FSrthHLCZe8W\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1346",
+    "isDraft": false,
+    "headRefName": "pr-fa2-split-heuristic",
+    "headRefOid": "68aeae6b705adffed48ae6bfca2117195cfb9084",
+    "baseRefName": "main",
+    "baseRefOid": "6db9c816cd9b936fa7d6aed31a404b4d23d1e6fc",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "Peuqui/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "Peuqui"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "Peuqui"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1346,
+    "id": "PR_kwDORjYFXs8AAAABMSNVUQ",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "68aeae6b705adffed48ae6bfca2117195cfb9084",
+    "title": "[Perf][SM75][Build] Pin the Turing FlashAttention library to the split-wave heuristic",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1346",
+    "body": "## Purpose\n\nThe Turing FlashAttention library picks its split-KV count with num_splits_heuristic, which multiplies the SM count by a hard-coded 2 CTAs per SM. For head dim 256 on Turing the 64 x 32 kernel uses exactly 64 KB of shared memory, so one CTA fits per SM: the heuristic planned 144 slots on 72 SMs, and with two KV heads and a 236,000-token context it chose 62 splits = 124 CTAs, a second wave of 52 CTAs after a full one.\n\nThe commit this PR pins derives the resident CTAs per SM from the kernel's shared memory tiles, capped at 2 as before, and chooses the split count with the fewest KV blocks streamed in sequence. For that shape it gives 36 splits = 72 CTAs, one full wave.\n\nThis PR changes one line: VLLM_FLASH_ATTN_SM75_COMMIT moves from 43b9d29c9 to 6ab41c291 (github.com/Peuqui/flash-attention, branch splitkv-wave-heuristic), the repository main already pins.\n\nNot a duplicate: searched the open PRs of this repository (86 at the time of writing) for num_splits_heuristic, split-KV and flash_attn_sm75. #1279 and #1286 appear for their own split-KV paths in another kernel and do not change this pin.\n\nAI assistance was used for this change. I reviewed the change and ran the measurements below.\n\n## Test Plan\n\nThe library built on its own from github.com/Peuqui/flash-attention at the new commit is the one our fork has run in production since 2026-10-31; the kernel measurement and the model series below used it. I did not build this PR's CMake path here: the pin only moves to another commit of the same repository, reachable on its branch splitkv-wave-heuristic (git ls-remote).\npre-commit run --from-ref origin/main --to-ref HEAD\npre-commit run mypy-3.10 --all-files --hook-stage manual\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| FLASH_ATTN decode on SM75 through the Turing library | fp16 KV, head dim 256 | split-KV, long context, several KV heads | 36 instead of 62 splits at the measured shape | measured: kernel in CUDA graphs and model series | other Turing SM counts than 72 |\n| same | other head dims | shared memory allows 2 CTAs per SM | same assumption as before, new choice rule | source | not measured |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: default enabled, no switch, through the pin.\n- Required CLI options and environment switches: none. Benchmark entry: Qwen3.8-27B NVFP4, --tensor-parallel-size 2 on two Quadro RTX 8000, MTP with 3 speculative tokens, attention_backend FLASH_ATTN.\n- KV cache dtype used for the benchmark: the entry's default, fp16.\n- Wheel SHA or source commit: library commit 6ab41c291 in the changed arm. vLLM fork build: reference tag verified-2026-10-28-prod-v5, changed ea2ec07f6, one commit later, a fix for nested outputs of DFlash-type drafters that this MTP entry does not reach.\n- PYTHONPATH, source overlays, or external native libraries used: the fork tree and a patched Triton 3.6 build on PYTHONPATH in both arms; between the arms the Turing FlashAttention library and that one commit differ.\n- User-entry route-hit, speed, and output-quality evidence: OpenAI API server entry, below.\n- Existing kernel/backend registry and capability-rejection reasons: not touched.\n- Per-engine configuration and deprecated-variable compatibility: no new or changed setting.\n- New/changed environment metadata and generated reference check: none.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: no change.\n\n## Test Result\n\nKernel on a Quadro RTX 8000 in CUDA graphs (2 KV heads, 6 query heads per KV head, 24 packed rows, 832-token pages), ms per call, lower is better, the 62 splits of the former rule against 36: 236,000 tokens 1.494 -> 1.292, 100,000 tokens 0.669 -> 0.571, 33,000 tokens 0.257 -> 0.217. 37 splits, a second wave of two CTAs, took 2.18 ms. Outputs equal up to 1.5e-5.\n\nQwen3.8-27B on two RTX 8000 (TP2, MTP), runs T T P T P through the same server entry, counted T#2 + T#4 against P#3 + P#5, ms per decode round (lower is better):\n- 33,208 tokens: 34.5 / 34.4 changed, 35.3 / 35.2 reference.\n- 184,134 tokens: 49.4 / 49.4 changed, 52.5 / 52.5 reference.\n- 249,992 tokens: 57.0 / 57.1 changed, 60.4 / 60.4 reference.\n- 259,552 tokens: 58.1 / 57.9 changed, 62.1 / 61.3 reference.\n\nPrefill of 8,490 tokens 5.52 / 5.52 s (1,538 / 1,539 tok/s) changed, 5.53 / 5.53 s (1,535 / 1,535 tok/s) reference. Memory peak 48,331 MiB per card in all arms, KV pool 1,040,933 tokens. GSM8K-30 29/30 changed, 28/30 reference.\n\npre-commit run --from-ref origin/main --to-ref HEAD on this branch (main 4d57473db plus this commit; it merges cleanly into main 6db9c816c): every hook passes except check-layering, which reports vllm/model_executor/layers/fused_moe/runner/moe_runner.py (platform coupling 37 -> 39) exactly as main 4d57473db does. pre-commit run mypy-3.10 --all-files --hook-stage manual: no issues.\n\n🤖 Generated with Claude Code (https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_0172gtUkBtN8FSrthHLCZe8W\n",
+    "author": {
+      "login": "Peuqui"
+    },
+    "headRepository": {
+      "nameWithOwner": "Peuqui/1Cat-vLLM"
+    },
+    "headRefName": "pr-fa2-split-heuristic",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1346,
+    "title": "[Perf][SM75][Build] Pin the Turing FlashAttention library to the split-wave heuristic",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1346",
+    "isDraft": false,
+    "headRefOid": "68aeae6b705adffed48ae6bfca2117195cfb9084",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "cmake/external_projects/vllm_flash_attn_sm75.cmake"
+    ],
+    "diff_bytes": 611,
+    "diff_sha256": "d4e1a9bc40b288380eb6abfb555dda7dee42c051313314de6a13cf53e5eb2df2"
+  },
+  "full_tree_diff_proof": null
+}

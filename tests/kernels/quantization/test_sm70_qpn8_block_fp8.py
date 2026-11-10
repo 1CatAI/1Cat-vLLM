@@ -220,3 +220,58 @@ def test_volta_turbomind_copy_follows_decode_rows(
         layer
     )
     assert hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight") == copy
+
+
+@pytest.mark.parametrize("rows", [9, 16, 17, 32, 33])
+def test_no_copy_dynamic_provider_reaches_chunked_dispatch(
+    default_vllm_config, monkeypatch, rows
+):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Volta no-copy dispatcher")
+    from vllm import _sm70_ops as ops
+    from vllm.runtime_resources import (
+        activate_runtime_resources,
+        runtime_resources_for,
+    )
+
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        False
+    )
+    layer, reference = _layer(512, 1536)
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(512, 1536))
+    kernel.process_weights_after_loading(layer)
+    assert not hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight")
+    calls = []
+    original = ops.fp8_qpn8_dispatch_sm70_out
+
+    def dispatch(*args, native_policy=None, **kwargs):
+        calls.append(args[2].shape[0])
+        return original(*args, native_policy=native_policy, **kwargs)
+
+    monkeypatch.setattr(ops, "fp8_qpn8_dispatch_sm70_out", dispatch)
+    compiled = torch.compile(
+        lambda value: kernel.apply_weights(layer, value), fullgraph=True, dynamic=True
+    )
+    x = torch.randn(rows, 1536, device="cuda", dtype=torch.float16) * 0.1
+    # Compiled operators borrow the engine owner from the forward context.
+    # Eager calls activate it themselves, so exercise the compiled path with
+    # the same resource activation used by a real model forward.
+    with activate_runtime_resources(runtime_resources_for(default_vllm_config)):
+        output = compiled(x)
+        assert bool(calls) == (rows <= 32)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = compiled(x)
+        for amplitude in (0.1, 0.3, 0.0):
+            x.normal_(0, amplitude)
+            graph.replay()
+            if rows <= 32:
+                # The independent, unchanged small-row route is the exact oracle.
+                expected = torch.cat(
+                    [kernel.apply_weights(layer, part) for part in x.split(8)]
+                )
+                assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+            else:
+                expected = x.float() @ reference.t()
+                error = (output.float() - expected).norm()
+                assert error / expected.norm().clamp_min(1e-12) < 1e-3
