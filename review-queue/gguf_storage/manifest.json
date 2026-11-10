@@ -1,0 +1,98 @@
+{
+  "group": "gguf_storage",
+  "title": "GGUF/EXL3 storage and precision integration queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 959,
+      "title": "[Model] Use original-byte IQ3_XXS expert banks on SM70",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/959",
+      "head": "f02e37e081029791542a5dd43ca41d3a661ecc79",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "fc166d2d08a41f28930d8261392f31d9a122db162ba8910f95a2d9c85ec44ba7",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1102,
+      "title": "[Quantization][SM70] EXL3 routed-expert MoE, loading exllamav3 checkpoints",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1102",
+      "head": "b96d43e5c8df201992a181836d631198ef827edf",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "93628d85ef2f32b2da40f82a6b9abd621fcf14ac49d720ccff6add6f67810396",
+      "files": 11,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1167,
+      "title": "[Core] Bound GGUF weight storage and host KV state on SM70",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1167",
+      "head": "403a76e9ad09fd0466b698e9a7b24f01a1a3f26b",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "b13b1370771eedc3db471a75a03b1f0cae67a7441da104be07cb4dc49eafd194",
+      "files": 104,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1020,
+      "title": "[Core] Reduce GGUF TP4 loading and runtime memory",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1020",
+      "head": "55915c7f16c593b2dc7388c80ded0ff52094edc8",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "0c7799d64abcbc1ae951c8e678381e578cf36804e522ae59584862ca9a058c51",
+      "files": 41,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 894,
+      "title": "[Kernel] Preserve BF16 checkpoint weights in small SM70 linear operators",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/894",
+      "head": "73bc8ab85bd2b611fd5984422a0a6ce1ef6dfae2",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "ccd2c726da93021d997793a46d274684a0928491e9ea9a6ab6248dd343f7c763",
+      "files": 7,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 890,
+      "title": "[Kernel] Preserve FP32 channel-FP8 verification logits",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/890",
+      "head": "ac7c9eab16b2d37538e50c9fc397edfac0513030",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "ec35ae620f6c8296a78bdfa4a00aac4ad2c6a50869eeafc1833ddee73a53c516",
+      "files": 13,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 822,
+      "title": "[Kernel] Select QPN2 activation packing through per-engine policy",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822",
+      "head": "813bf2e5e8b2c0c04452c5354d510ea7d2a9c83e",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "c90920feecebd7bef7fe7f5de3227e23f6ce2798b768f4fd42bb182974868105",
+      "files": 15,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 897,
+      "title": "[Kernel] Add original and equal-byte IQ operators on SM70",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897",
+      "head": "881ad90eae7ee4c7159ff7973bad0261b1a30ac8",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "22d16dc9aa369c0777565a17279205feb158b93f8d3d82c4502190bd6c60d2be",
+      "files": 24,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    }
+  ],
+  "validation_gaps": "Original-byte expert banks, EXL3 loading, host KV and GGUF memory lifetime changes require the corresponding checkpoints and cold/hot cache, eviction, graph replay and memory-capacity runs. #894/#890 alter numerical storage/logit paths: require matched quality and sampling checks. Preserve each alternative; do not blindly concatenate overlapping model/provider changes.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

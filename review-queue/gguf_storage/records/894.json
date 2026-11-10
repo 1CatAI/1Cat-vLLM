@@ -1,0 +1,101 @@
+{
+  "initial_inventory": {
+    "number": 894,
+    "title": "[Kernel] Preserve BF16 checkpoint weights in small SM70 linear operators",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/894",
+    "isDraft": true,
+    "headRefOid": "73bc8ab85bd2b611fd5984422a0a6ce1ef6dfae2",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 894,
+    "title": "[Kernel] Preserve BF16 checkpoint weights in small SM70 linear operators",
+    "body": "Add SM70 reference operators that retain original two-byte BF16 weight storage and expand values directly into FP32 registers. Cover small-M dense projections and reuse the existing MTP expert projection implementation with a BF16 decoder; activation/output boundaries remain FP16.\n\nFifteen research-extension GPU numerical checks pass, including graph replay, an FP64 oracle and bitwise FP16 specialization regression checks. Formal installed-package validation, real-activation timing and model integration remain pending. No model route or speedup is claimed. The compact BF16 reader is retained for later precision comparison; the initial Flash-Next MTP4 baseline uses the existing FP16 load path.",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/894",
+    "isDraft": true,
+    "headRefName": "agent/v100-gguf-bf16-reader-20261004-052933",
+    "headRefOid": "73bc8ab85bd2b611fd5984422a0a6ce1ef6dfae2",
+    "baseRefName": "main",
+    "baseRefOid": "fc601673c2724bc32cc29d882924de5947bd1be5",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 894,
+    "id": "PR_kwDORjYFXs8AAAABGg8TlA",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "73bc8ab85bd2b611fd5984422a0a6ce1ef6dfae2",
+    "title": "[Kernel] Preserve BF16 checkpoint weights in small SM70 linear operators",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/894",
+    "body": "Add SM70 reference operators that retain original two-byte BF16 weight storage and expand values directly into FP32 registers. Cover small-M dense projections and reuse the existing MTP expert projection implementation with a BF16 decoder; activation/output boundaries remain FP16.\n\nFifteen research-extension GPU numerical checks pass, including graph replay, an FP64 oracle and bitwise FP16 specialization regression checks. Formal installed-package validation, real-activation timing and model integration remain pending. No model route or speedup is claimed. The compact BF16 reader is retained for later precision comparison; the initial Flash-Next MTP4 baseline uses the existing FP16 load path.",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "agent/v100-gguf-bf16-reader-20261004-052933",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 894,
+    "title": "[Kernel] Preserve BF16 checkpoint weights in small SM70 linear operators",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/894",
+    "isDraft": true,
+    "headRefOid": "73bc8ab85bd2b611fd5984422a0a6ce1ef6dfae2",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "CMakeLists.txt",
+      "csrc/sm70_turbomind/ops/bf16_weight_sm70.cu",
+      "csrc/sm70_turbomind/ops/mtp_moe_fp16_sm70.cu",
+      "docs/design/sm70_bf16_checkpoint_reader.md",
+      "tests/kernels/linear/test_sm70_bf16_weight.py",
+      "tests/kernels/moe/test_sm70_mtp_moe_bf16.py",
+      "vllm/_custom_ops.py"
+    ],
+    "diff_bytes": 19171,
+    "diff_sha256": "ccd2c726da93021d997793a46d274684a0928491e9ea9a6ab6248dd343f7c763"
+  },
+  "full_tree_diff_proof": null
+}

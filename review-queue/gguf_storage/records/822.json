@@ -1,0 +1,190 @@
+{
+  "initial_inventory": {
+    "number": 822,
+    "title": "[Kernel] Select QPN2 activation packing through per-engine policy",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822",
+    "isDraft": true,
+    "headRefOid": "813bf2e5e8b2c0c04452c5354d510ea7d2a9c83e",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 822,
+    "title": "[Kernel] Select QPN2 activation packing through per-engine policy",
+    "body": "Select FP16 QPN2 activation packing through KernelConfig and the existing linear-kernel framework. Native kernels admit layouts by alignment, reduction work, projection CTAs and row-tile occupancy. Supported paths default on in this candidate; unavailable layouts retain the existing route and report their capability reason. No enable environment variable or model/TP whitelist is added. Old native extensions retain compatible fallback behavior.\n\nThe branch was rebased onto main after #862 while preserving original contribution history. The CPU gate passed 73 startup/profile and 62 scoped quantization checks, with 60 hardware-dependent skips; scoped pre-commit passed. The SM70 native build completed. Previously recorded native operator and graph tests remain separate from model admission.\n\nThe isolated release comparison used identical source/native artifacts/settings and changed only activation_pack. Three measured repeats after warmup gave median request TPOT changes of -10.49% at 4K C1, +65.76% at 32K C1, and +6.32% at 32K C4. Sampled token sequences differed between arms. This fails default-route performance admission, and this PR remains Draft.\n\nThe separate 32K greedy pairing returned identical 80-token outputs. A subsequent short Nsight graph-node trace also preserved those 80 warmup tokens and found zero activation-pack row-kernel launches during the captured 32K single-request generation: QPN2 used existing PACKED=false variants. Thus the observed C1 timing difference is not yet attributable to activation-pack execution. The next check is compiled/runtime behavior with the compute route held fixed; no numerical cause or quality noninferiority is claimed.\n\nAn older comparison changed an unrelated PLE policy between arms and is excluded. Unverified: full target-task quality, unavailable target-model profiles, physical Turing hardware, and integration with the newer mixed-prefill native update in #860. AI assistance was used.",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822",
+    "isDraft": true,
+    "headRefName": "codex/pr-qpn2-activation-pack-20261003",
+    "headRefOid": "813bf2e5e8b2c0c04452c5354d510ea7d2a9c83e",
+    "baseRefName": "main",
+    "baseRefOid": "1e9c6a5ffff7ba67a54285c3615ae6e9dd124182",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 822,
+    "id": "PR_kwDORjYFXs8AAAABGZCo6Q",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "813bf2e5e8b2c0c04452c5354d510ea7d2a9c83e",
+    "title": "[Kernel] Select QPN2 activation packing through per-engine policy",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822",
+    "body": "Select FP16 QPN2 activation packing through KernelConfig and the existing linear-kernel framework. Native kernels admit layouts by alignment, reduction work, projection CTAs and row-tile occupancy. Supported paths default on in this candidate; unavailable layouts retain the existing route and report their capability reason. No enable environment variable or model/TP whitelist is added. Old native extensions retain compatible fallback behavior.\n\nThe branch was rebased onto main after #862 while preserving original contribution history. The CPU gate passed 73 startup/profile and 62 scoped quantization checks, with 60 hardware-dependent skips; scoped pre-commit passed. The SM70 native build completed. Previously recorded native operator and graph tests remain separate from model admission.\n\nThe isolated release comparison used identical source/native artifacts/settings and changed only activation_pack. Three measured repeats after warmup gave median request TPOT changes of -10.49% at 4K C1, +65.76% at 32K C1, and +6.32% at 32K C4. Sampled token sequences differed between arms. This fails default-route performance admission, and this PR remains Draft.\n\nThe separate 32K greedy pairing returned identical 80-token outputs. A subsequent short Nsight graph-node trace also preserved those 80 warmup tokens and found zero activation-pack row-kernel launches during the captured 32K single-request generation: QPN2 used existing PACKED=false variants. Thus the observed C1 timing difference is not yet attributable to activation-pack execution. The next check is compiled/runtime behavior with the compute route held fixed; no numerical cause or quality noninferiority is claimed.\n\nAn older comparison changed an unrelated PLE policy between arms and is excluded. Unverified: full target-task quality, unavailable target-model profiles, physical Turing hardware, and integration with the newer mixed-prefill native update in #860. AI assistance was used.",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/pr-qpn2-activation-pack-20261003",
+    "comments": {
+      "totalCount": 8,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWP897A="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABY5I5vQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The initial row-count-only packing rule regressed several operator shapes, despite bitwise-correct results. Packing now also requires enough reduction work per split and projection CTAs, and gated kernels retain the direct route for sparsely occupied row tiles. Eligibility follows actual kernel work and device resources; no model, TP or speculative-token count is used.\n\nAlso keep native ABI discovery constant during full-graph tracing and add a regression for the previously observed graph break. Native layout fallback reasons are exposed during loading. The standard extension rebuild completed; final paired operator validation is pending GPU availability.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822#issuecomment-5965494717",
+          "createdAt": "2026-10-03T04:23:53Z",
+          "updatedAt": "2026-10-03T04:23:53Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABY54s1g",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The updated native artifact passed all 60 packing controls, and 48 paired operator cases remained bit-identical with at most 0.25% timing variation on fallback layouts. The available 27B release-profile matrix completed all 12 request groups; single-request output matched the recorded control, while C4 retained the previously observed late formatting difference.\n\nAn additional fresh-process 32K C1 comparison did not reproduce the initial speed concern, but explicit packing-on produced a deterministic token difference from packing-off after the first 68 identical tokens. This PR remains Draft while the shared-weight graph path and fresh-process variation are investigated. The result is not being accepted as a model-quality pass, and no kernel arithmetic change is being introduced to hide it.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822#issuecomment-5966277846",
+          "createdAt": "2026-10-03T06:16:29Z",
+          "updatedAt": "2026-10-03T06:16:29Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABY6YwyQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The shared-weight graph extension check passed all 35 cases with four changing-input amplitudes and bit-identical packing-off/on outputs. A subsequent fresh packing-off process that reused its compiled cache also changed the release-model output, beginning at the second token. Therefore the model difference is not attributable to activation packing alone; compile-cache reuse and process state are being isolated before acceptance. No default route or arithmetic workaround has been merged for this result.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822#issuecomment-5966803145",
+          "createdAt": "2026-10-03T07:33:12Z",
+          "updatedAt": "2026-10-03T07:33:12Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABY7VcKQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "A fresh-cache greedy-target diagnostic at 32K context also shows a token difference: the two arms first diverge at output position 32. Each arm is stable across its two repeated generations. The official probabilistic draft policy and the other release settings were retained; this diagnostic is not a replacement for the earlier sampled release measurements.\n\nThe native operator/reference and changing graph-replay checks remain passed. The model discrepancy is still being localized, so the default packing change remains Draft. The earlier disabled-packing warm-cache discrepancy is retained; these observations do not yet establish which operation causes the model difference.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822#issuecomment-5967797289",
+          "createdAt": "2026-10-03T09:31:23Z",
+          "updatedAt": "2026-10-03T09:31:23Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABY-IsVQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "Reviewing the earlier greedy comparison found that the enabled arm also set ple_disk_cascade=True while the disabled arm did not. That comparison cannot isolate activation packing, so it is excluded from admission evidence. The current-main follow-up keeps every other policy identical and changes only activation_pack. Native operator comparisons remain separate evidence; this PR stays Draft pending the corrected model pairing.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822#issuecomment-5970734165",
+          "createdAt": "2026-10-03T15:47:25Z",
+          "updatedAt": "2026-10-03T15:47:25Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABY-msSw",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The corrected current-source greedy 32K C1 comparison changes only activation_pack. Both the warmup and measured request return the same 80 tokens in both arms, using identical core, FA2 and Flash-V100 libraries. This resolves that comparison's output mismatch without changing kernel arithmetic.\n\nOne measured decode timing remains slower, so it is not acceptance evidence yet. The release-sampling 4K C1 / 32K C1 / 32K C4 matrix is being repeated three times per case. This PR remains Draft pending that speed screen.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822#issuecomment-5971225675",
+          "createdAt": "2026-10-03T16:45:31Z",
+          "updatedAt": "2026-10-03T16:45:31Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABY_eCHw",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The isolated repeated release comparison is complete. Both arms used identical source/native artifacts and release settings, changing only activation_pack. Three measured repeats after warmup gave median request TPOT changes of -10.49% at 4K C1, +65.76% at 32K C1, and +6.32% at 32K C4. Sampling output sequences differed between arms, so the timing difference cannot yet be attributed to packing alone; the separate 80-token greedy pairing was identical. This does not pass default-route admission. The PR remains Draft while I localize actual packing route hits and compare the long-context execution. GPU workers have been shut down and the shared reservation released. CPU checks on the rebased branch passed 135 tests, with 60 hardware skips, plus scoped pre-commit.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822#issuecomment-5972132383",
+          "createdAt": "2026-10-03T18:22:45Z",
+          "updatedAt": "2026-10-03T18:22:45Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABY_z3sA",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The short 32K C1 graph-node trace found zero nvfp4_qpn2_pack_rows_kernel launches and only existing PACKED=false QPN2 variants. Its greedy warmup reproduced the previous identical 80-token pairing. This rules out activation-pack execution cost as the direct cause of the observed C1 slowdown for that captured request; it does not yet identify the compiled/runtime cause. I am retaining the negative release comparison and keeping the PR Draft. The trace timings are diagnostic overhead, not a new performance baseline.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822#issuecomment-5972490160",
+          "createdAt": "2026-10-03T19:01:34Z",
+          "updatedAt": "2026-10-03T19:01:34Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 822,
+    "title": "[Kernel] Select QPN2 activation packing through per-engine policy",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/822",
+    "isDraft": true,
+    "headRefOid": "813bf2e5e8b2c0c04452c5354d510ea7d2a9c83e",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "csrc/ops.h",
+      "csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu",
+      "csrc/sm70_turbomind/ops/nvfp4_qpn4_sm70.cu",
+      "csrc/torch_bindings.cpp",
+      "tests/kernels/quantization/test_nvfp4_qpn2_block_pack.py",
+      "tests/quantization/test_sm70_nvfp4_kernel_selection.py",
+      "tests/quantization/test_sm70_nvfp4_qpn2.py",
+      "tests/quantization/test_turing_qpn_kernel_selection.py",
+      "tools/sm70_route_snapshot.py",
+      "vllm/_sm70_ops.py",
+      "vllm/config/kernel.py",
+      "vllm/model_executor/kernels/linear/nvfp4/sm70.py",
+      "vllm/model_executor/kernels/linear/pre_ampere_qpn.py",
+      "vllm/model_executor/layers/quantization/sm70_turbomind.py",
+      "vllm/model_executor/layers/quantization/utils/nvfp4_qpn2_dequant.py"
+    ],
+    "diff_bytes": 57930,
+    "diff_sha256": "c90920feecebd7bef7fe7f5de3227e23f6ce2798b768f4fd42bb182974868105"
+  },
+  "full_tree_diff_proof": null
+}

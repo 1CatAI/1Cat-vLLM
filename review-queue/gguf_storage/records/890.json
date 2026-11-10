@@ -1,0 +1,107 @@
+{
+  "initial_inventory": {
+    "number": 890,
+    "title": "[Kernel] Preserve FP32 channel-FP8 verification logits",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/890",
+    "isDraft": true,
+    "headRefOid": "ac7c9eab16b2d37538e50c9fc397edfac0513030",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 890,
+    "title": "[Kernel] Preserve FP32 channel-FP8 verification logits",
+    "body": "## Purpose\n\nPreserve FP32 verifier logits for the supported SM70 channel-FP8 head without changing checkpoint weights or scales. The DFlash2 proposal head retains its original FP16 output. Compact target top-k retains source value/ID bits and the existing cutoff/nucleus fallback.\n\nThis extends the existing head route rather than introducing a second quantization backend. AI assistance was used.\n\n## Test Plan\n\nOrdinary complete wheel, CUDA 12.8/Torch 2.10, four V100-SXM2-16GB GPUs at 300 W, TP4, original unsloth NVFP4 model and DFlash2 draft7, 256K maximum length, .92 memory utilization. Same-service 1K/8K, eight 600-token prompts at fixed seed, temperature .7/top-p .9/top-k 20, thinking disabled; warmed C4 and natural EOS. Teacher-forcing tests cover the changed head on fixed real prompt prefixes against original FP8 codes/BF16 scales with FP64 dense accumulation.\n\n## Test Result\n\nFinal installed artifact passes native dependency checks and 18 GPU/fake/graph tests. Its 16 native libraries are byte-identical to the complete source build; Python source equality and regenerated wheel RECORD are verified. No private runtime extension or preload is required.\n\n| Measurement | Main control | Candidate |\n|---|---:|---:|\n| 1K round latency | 14.137 ms | 14.143 ms |\n| 8K round latency | 14.537 ms | 14.534 ms |\n| 1K tokens/round, 95% CI | 3.034 [2.836, 3.227] | 3.056 [2.852, 3.247] |\n| 8K tokens/round, 95% CI | 2.946 [2.875, 3.024] | 2.967 [2.884, 3.059] |\n| C4 throughput | 438.15 token/s | 435.65 token/s |\n| Reference-path fraction, 1K | 1.626% | 1.322% |\n| Reference-path fraction, 8K | 2.080% | 1.478% |\n| Draft graph kernels | 142 | 142 |\n\nAcceptance intervals overlap, and three natural prompts end normally. Across 1040 teacher-forcing positions, head-only mean/p99/max KL is 1.053e-8 / 9.163e-8 / 9.923e-7, top-1 agreement is 100%, and recorded maximum logit error is .00408. This is head validation, not an FP64 oracle for the whole model.\n\nThere is no material round-latency improvement, and measured C4 throughput is .57% lower. Keep this PR in Draft: it does not pass the performance/concurrency gate. The initial shared FP32 proposal-output attempt added five draft graph kernels and regressed C4; preserving the original proposal output removes that regression but does not establish a speedup. A diagnostic oracle with an extra resident head shard ran out of memory at 8K; the final chunked oracle completes both lengths.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/890",
+    "isDraft": true,
+    "headRefName": "codex/v100-fp32-fp8-head-20261004-044247",
+    "headRefOid": "ac7c9eab16b2d37538e50c9fc397edfac0513030",
+    "baseRefName": "main",
+    "baseRefOid": "bddfd61cbbec240d36107b24b7c3139b4a81006f",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 890,
+    "id": "PR_kwDORjYFXs8AAAABGgwZ2A",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "ac7c9eab16b2d37538e50c9fc397edfac0513030",
+    "title": "[Kernel] Preserve FP32 channel-FP8 verification logits",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/890",
+    "body": "## Purpose\n\nPreserve FP32 verifier logits for the supported SM70 channel-FP8 head without changing checkpoint weights or scales. The DFlash2 proposal head retains its original FP16 output. Compact target top-k retains source value/ID bits and the existing cutoff/nucleus fallback.\n\nThis extends the existing head route rather than introducing a second quantization backend. AI assistance was used.\n\n## Test Plan\n\nOrdinary complete wheel, CUDA 12.8/Torch 2.10, four V100-SXM2-16GB GPUs at 300 W, TP4, original unsloth NVFP4 model and DFlash2 draft7, 256K maximum length, .92 memory utilization. Same-service 1K/8K, eight 600-token prompts at fixed seed, temperature .7/top-p .9/top-k 20, thinking disabled; warmed C4 and natural EOS. Teacher-forcing tests cover the changed head on fixed real prompt prefixes against original FP8 codes/BF16 scales with FP64 dense accumulation.\n\n## Test Result\n\nFinal installed artifact passes native dependency checks and 18 GPU/fake/graph tests. Its 16 native libraries are byte-identical to the complete source build; Python source equality and regenerated wheel RECORD are verified. No private runtime extension or preload is required.\n\n| Measurement | Main control | Candidate |\n|---|---:|---:|\n| 1K round latency | 14.137 ms | 14.143 ms |\n| 8K round latency | 14.537 ms | 14.534 ms |\n| 1K tokens/round, 95% CI | 3.034 [2.836, 3.227] | 3.056 [2.852, 3.247] |\n| 8K tokens/round, 95% CI | 2.946 [2.875, 3.024] | 2.967 [2.884, 3.059] |\n| C4 throughput | 438.15 token/s | 435.65 token/s |\n| Reference-path fraction, 1K | 1.626% | 1.322% |\n| Reference-path fraction, 8K | 2.080% | 1.478% |\n| Draft graph kernels | 142 | 142 |\n\nAcceptance intervals overlap, and three natural prompts end normally. Across 1040 teacher-forcing positions, head-only mean/p99/max KL is 1.053e-8 / 9.163e-8 / 9.923e-7, top-1 agreement is 100%, and recorded maximum logit error is .00408. This is head validation, not an FP64 oracle for the whole model.\n\nThere is no material round-latency improvement, and measured C4 throughput is .57% lower. Keep this PR in Draft: it does not pass the performance/concurrency gate. The initial shared FP32 proposal-output attempt added five draft graph kernels and regressed C4; preserving the original proposal output removes that regression but does not establish a speedup. A diagnostic oracle with an extra resident head shard ran out of memory at 8K; the final chunked oracle completes both lengths.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-fp32-fp8-head-20261004-044247",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 890,
+    "title": "[Kernel] Preserve FP32 channel-FP8 verification logits",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/890",
+    "isDraft": true,
+    "headRefOid": "ac7c9eab16b2d37538e50c9fc397edfac0513030",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "csrc/ops.h",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/arch/config_sm70_s884.h",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu",
+      "csrc/sm70_turbomind/ops/awq_sm70_gemm.cu",
+      "csrc/sm70_turbomind/ops/compact_half_topk_sm70.cu",
+      "csrc/torch_bindings.cpp",
+      "docs/design/sm70_fp8_fp32_logits.md",
+      "tests/kernels/core/test_sm70_compact_half_topk.py",
+      "tests/kernels/quantization/test_sm70_fp8_fp32_head.py",
+      "vllm/_sm70_ops.py",
+      "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py",
+      "vllm/model_executor/layers/sm70_compact_topk.py",
+      "vllm/model_executor/models/qwen3_dflash2.py"
+    ],
+    "diff_bytes": 34657,
+    "diff_sha256": "ec35ae620f6c8296a78bdfa4a00aac4ad2c6a50869eeafc1833ddee73a53c516"
+  },
+  "full_tree_diff_proof": null
+}
