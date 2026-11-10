@@ -203,6 +203,22 @@ STREAM_FINISHED = RequestOutput(
     finished=True,
 )
 
+# Idle keep-alive sentinel.
+# During long thinking or long prefill the engine can go many seconds without
+# emitting a token, and intermediaries (proxies, load balancers) drop the SSE
+# connection on their idle timeout. AsyncLLM emits one of these every 15s of
+# idleness so the API layer can keep the stream alive.
+# Note `finished=False`: this is not an end-of-request marker, so consumers
+# must recognise and skip it.
+STREAM_KEEPALIVE = RequestOutput(
+    request_id="",
+    prompt=None,
+    prompt_token_ids=None,
+    prompt_logprobs=None,
+    outputs=[],
+    finished=False,
+)
+
 _O = TypeVar("_O", default=PoolingOutput)
 
 

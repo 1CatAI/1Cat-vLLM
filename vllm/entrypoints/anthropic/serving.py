@@ -649,6 +649,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         generator: AsyncGenerator[str, None],
         request: AnthropicMessagesRequest | None = None,
     ) -> AsyncGenerator[str, None]:
+        generator = _iter_upstream_sse(generator)
         try:
 
             class _ActiveBlockState:
@@ -760,7 +761,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                 state.start(block)
                 return event
 
-            async for item in _iter_upstream_sse(generator):
+            async for item in generator:
                 if item.startswith(":"):
                     yield item
                     continue

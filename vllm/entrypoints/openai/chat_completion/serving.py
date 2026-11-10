@@ -57,6 +57,7 @@ from vllm.entrypoints.openai.engine.serving import (
     clamp_prompt_logprobs,
     drop_misaligned_logprobs,
 )
+from vllm.entrypoints.openai.engine.usage import get_request_usage_timings
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_stop_tokens_for_assistant_actions,
@@ -68,7 +69,7 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import STREAM_KEEPALIVE, CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
@@ -504,6 +505,7 @@ class OpenAIServingChat(OpenAIServing):
                     sub_request_id,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
+                    keepalive=bool(request.stream),
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=reasoning_ended,
@@ -646,12 +648,23 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        # Kept so the final usage can carry the engine's per-request breakdown.
+        # The stats object is attached to every output, but only the finished
+        # one holds a complete set of timestamps.
+        last_metrics = None
         try:
             async for res in result_generator:
+                if getattr(res, "metrics", None) is not None:
+                    last_metrics = res.metrics
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
+
+                if res is STREAM_KEEPALIVE:
+                    yield ": keepalive\n\n"
+                    continue
 
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
@@ -1102,10 +1115,15 @@ class OpenAIServingChat(OpenAIServing):
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
                 )
-                if self.enable_prompt_tokens_details and num_cached_tokens:
+                if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens
                     )
+                # Engine-authoritative per-request timings. Omitted when the
+                # engine collected no stats for this request.
+                final_usage.timings = get_request_usage_timings(
+                    last_metrics, num_choices=num_choices
+                )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1536,10 +1554,20 @@ class OpenAIServingChat(OpenAIServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
-        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
+        if (
+            self.enable_prompt_tokens_details
+            and final_res.num_cached_tokens is not None
+        ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
             )
+        # Engine-authoritative per-request timings. Without this a
+        # non-streaming caller has no prefill/decode split at all, and any
+        # consumer that derives rates from a token stream sees the whole
+        # request as one point in time.
+        usage.timings = get_request_usage_timings(
+            getattr(final_res, "metrics", None), num_choices=len(choices)
+        )
 
         request_metadata.final_usage_info = usage
 
