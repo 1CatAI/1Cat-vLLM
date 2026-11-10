@@ -31,6 +31,8 @@ def current_version() -> int:
 
 
 def _implementation_modules():
+    from vllm.tool_parsers import ToolParser
+
     return {
         name: module
         for name, module in dict(sys.modules).items()
@@ -38,6 +40,13 @@ def _implementation_modules():
         and name not in (_BASE, __name__)
         and module is not None
         and not hasattr(module, "__path__")
+        and not any(
+            isinstance(value, type)
+            and value.__module__ == name
+            and issubclass(value, ToolParser)
+            and not value.supports_hot_reload
+            for value in vars(module).values()
+        )
     }
 
 
@@ -99,6 +108,9 @@ def prepare_reload() -> ParserReload:
                     setattr(module, item, stage(child))
             return module if fromlist else proxies["vllm"]
         if absolute.startswith(_PACKAGE + "."):
+            if absolute in loaded:
+                # Identity-bound implementations remain canonical dependencies.
+                return builtins.__import__(name, globals, locals, fromlist, level)
             raise ValueError(f"New parser dependency requires a restart: {absolute}")
         return builtins.__import__(name, globals, locals, fromlist, level)
 

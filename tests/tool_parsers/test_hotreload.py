@@ -191,3 +191,25 @@ def test_prepare_existing_parser_implementations():
         candidate = prepared.manager.tool_parsers[name]
         assert candidate is not old
         assert issubclass(candidate, ToolParser)
+
+
+def test_unsupported_active_parser_requires_restart(source, monkeypatch):
+    monkeypatch.setattr(source.cls, "supports_hot_reload", False)
+    app = make_app(source, "{{ inline_template }}")
+    holder = app.state.openai_serving_chat
+    before = dict(vars(holder))
+    result = TestClient(app).post("/v1/internal/reload")
+    assert result.status_code == 409
+    assert "requires a restart" in result.json()["error"]
+    assert vars(holder) == before
+    assert reload.current_version() == 0
+
+
+def test_mistral_retains_canonical_class_identity():
+    from vllm.tool_parsers.mistral_tool_parser import MistralToolParser
+
+    assert not MistralToolParser.supports_hot_reload
+    with reload.reload_lock:
+        prepared = reload.prepare_reload()
+    assert MistralToolParser.__module__ not in prepared.modules
+    assert prepared.replacement(MistralToolParser) is MistralToolParser

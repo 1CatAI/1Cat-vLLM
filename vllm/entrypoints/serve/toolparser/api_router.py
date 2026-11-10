@@ -36,6 +36,11 @@ def _prepare_holders(app, prepared):
         values = vars(holder)
         changes = {}
         if values.get("tool_parser") is not None:
+            if not values["tool_parser"].supports_hot_reload:
+                raise ValueError(
+                    f"{values['tool_parser'].__name__} requires a restart; "
+                    "its canonical parser class is retained"
+                )
             changes["tool_parser"] = prepared.replacement(values["tool_parser"])
         parser = values.get("parser_cls")
         if isinstance(parser, type) and issubclass(parser, _WrappedParser):
