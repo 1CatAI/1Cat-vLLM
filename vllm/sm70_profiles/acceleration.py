@@ -853,7 +853,8 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         fp16_reason,
         kv_cache_dtype=dtype,
         runtime_guards="FP16 operands; local Q/KV heads=6/1, D=256; page=832; "
-        "causal full context; B1 q2..8 or B2..4 q8; capacity<=266240",
+        "causal full context; B1 q2..8 or B2..4 q8; "
+        "served-window capacity requires the FP16 context revision",
         arithmetic="FP32 probability/PV/numerator/max/sum",
         short_context_splits=_row(
             fp16_reason

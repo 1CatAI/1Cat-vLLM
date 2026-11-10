@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.config.flash_v100 import FlashV100Options
+from vllm.v1.attention.ops import sm70_grouped as grouped
 from vllm.v1.attention.ops import sm70_grouped_long as long
 from vllm.v1.attention.ops import sm70_grouped_scalar as scalar
 
@@ -29,7 +30,7 @@ def test_native_abi_and_served_window(monkeypatch, context, revision, is_scalar)
     monkeypatch.setattr(torch.ops, "_vllm_fa2_C", native)
     monkeypatch.setattr(long, "builtin_long_attention", lambda: object())
     monkeypatch.setattr(
-        long,
+        grouped,
         "get_current_vllm_config_or_none",
         lambda: SimpleNamespace(model_config=SimpleNamespace(max_model_len=context)),
     )

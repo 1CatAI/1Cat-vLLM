@@ -11,11 +11,12 @@ import torch
 def _routes(monkeypatch, context):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
+    from vllm.v1.attention.ops import sm70_grouped as grouped_owner
     from vllm.v1.attention.ops import sm70_grouped_long as long
     from vllm.v1.attention.ops import sm70_grouped_scalar as scalar
 
     monkeypatch.setattr(
-        long,
+        grouped_owner,
         "get_current_vllm_config_or_none",
         lambda: SimpleNamespace(model_config=SimpleNamespace(max_model_len=context)),
     )

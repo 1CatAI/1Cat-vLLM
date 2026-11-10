@@ -10,10 +10,10 @@ from pathlib import Path
 
 import torch
 
-from vllm.config import get_current_vllm_config_or_none
 from vllm.config.execution_policy import flash_v100_options
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.v1.attention.ops.sm70_grouped import model_context_limit
 
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
 
@@ -147,15 +147,7 @@ def builtin_dynamic_context(*, scalar: bool = False) -> bool:
 
 def builtin_context_limit(capacity: int | None = None, *, scalar: bool = False) -> int:
     """Resolve the served window against the loaded operator's workspace ABI."""
-    if capacity is None:
-        config = get_current_vllm_config_or_none()
-        capacity = (
-            config.model_config.max_model_len
-            if config is not None and config.model_config is not None
-            else BUILTIN_MAX_CONTEXT
-        )
-    if type(capacity) is not int or not 0 < capacity <= 2**31 - 4096:
-        raise ValueError("SM70 E4M3 context must fit positive int32 page arithmetic")
+    capacity = model_context_limit(capacity, fallback=BUILTIN_MAX_CONTEXT)
     return (
         capacity
         if builtin_dynamic_context(scalar=scalar)

@@ -10,11 +10,26 @@ from typing import Any, Literal
 
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.config.execution_policy import graph_policy
 from vllm.v1.attention.kv_codecs import FP8_E4M3, FP16, KVCodec, resolve_kv_codec
 
 GROUP_ROWS = 8
 MAX_CONTEXT = 266240
+
+
+def model_context_limit(capacity: int | None = None, *, fallback: int) -> int:
+    """Resolve a served window within the native int32 page-arithmetic bound."""
+    if capacity is None:
+        config = get_current_vllm_config_or_none()
+        capacity = (
+            config.model_config.max_model_len
+            if config is not None and config.model_config is not None
+            else fallback
+        )
+    if type(capacity) is not int or not 0 < capacity <= 2**31 - 4096:
+        raise ValueError("SM70 grouped context must fit positive int32 page arithmetic")
+    return capacity
 
 
 @dataclass(frozen=True)
@@ -226,33 +241,13 @@ def grouped_fp32_reason(
     if contract.early_cache_dtype and not codec.stores(k, v):
         return "kv_layout"
     context_limit = MAX_CONTEXT
-    if codec is FP8_E4M3 and parent.shape[1] * k.shape[1] > MAX_CONTEXT:
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
-        from vllm.v1.attention.ops.sm70_grouped_long import (
-            builtin_dynamic_context,
-            long_attention_graph_contract,
-        )
-
-        descriptor = (
-            get_forward_context().batch_descriptor
-            if is_forward_context_available()
-            else None
-        )
-        bucket = getattr(descriptor, "attention_context_bucket", None)
-        if bucket is not None and bucket > 0:
-            capacity, _ = long_attention_graph_contract(bucket)
-            if (
-                capacity is not None
-                and bucket <= capacity
-                and builtin_dynamic_context()
-            ):
-                context_limit = max(
-                    context_limit,
-                    ((capacity + k.shape[1] - 1) // k.shape[1]) * k.shape[1],
-                )
+    if parent.shape[1] * k.shape[1] > MAX_CONTEXT:
+        capacity = _import_symbol(contract.loader_module, "grouped_context_limit")()
+        if capacity > MAX_CONTEXT:
+            context_limit = min(
+                ((capacity + k.shape[1] - 1) // k.shape[1]) * k.shape[1],
+                ((2**31 - 4096) // k.shape[1]) * k.shape[1],
+            )
     if not 0 < parent.shape[1] * k.shape[1] <= context_limit:
         return "context_capacity"
     if not explicit and (parent_seq is None or parent_seq.shape != (groups,)):
