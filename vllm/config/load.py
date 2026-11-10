@@ -83,9 +83,9 @@ class LoadConfig:
     - "direct": Decoder-layer tensors, the bulk of a checkpoint, are read
       with O_DIRECT into private buffers, past the page cache, so a checkpoint
       larger than host RAM does not push other processes into swap. Under
-      pipeline parallelism each stage reads only its own decoder layers. Other
-      tensors stay memory-mapped, and their pages are released from the page
-      cache once loaded.
+      pipeline parallelism a stage reads only its own decoder layers, and the
+      embedding, final norm and LM head only if it holds them. Other tensors
+      stay memory-mapped; their pages leave the page cache once loaded.
     - "torchao": Weights are loaded in upfront and then reconstructed
       into torchao tensor subclasses. This is used when the checkpoint
       was quantized using torchao and saved using safetensors.

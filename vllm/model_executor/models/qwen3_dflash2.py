@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Callable
 from functools import cache
 
@@ -18,8 +17,10 @@ from vllm.config.sm70_dflash2 import (
 )
 from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -28,9 +29,11 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.sm70_topk_gather import gather_topk_pairs
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 
@@ -58,8 +61,10 @@ def _use_sm70_bf16_emulation(config) -> bool:
         "bf16",
         "torch.bfloat16",
     }
-    enabled = os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION", "1").strip().lower()
-    enabled = enabled in ("1", "true", "yes", "on")
+    policy = capture_sm70_dflash2_config()
+    from vllm.config.sm70_dflash2 import dflash2_bf16_emulation
+
+    enabled = dflash2_bf16_emulation(policy)
     if not (enabled and is_bf16 and current_platform.is_cuda()):
         return False
     # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the
@@ -228,6 +233,32 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
                 config.rms_norm_eps,
                 runtime_dtype,
             )
+        self.self_attn._sm70_dflash2_qk_rope = bool(
+            self.use_sm70_bf16_emulation
+            and config.hidden_size == 5120
+            and vllm_config.speculative_config is not None
+            and get_dflash_model_draft_tokens(vllm_config.speculative_config) == 7
+            and vllm_config.model_config.dtype == torch.float16
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+            and self.self_attn.q_size == 1024
+            and self.self_attn.kv_size == 256
+            and self.self_attn.head_dim == 128
+            and self.self_attn.is_neox_style
+            and self.self_attn.rotary_emb.rotary_dim == 128
+            and self.self_attn.attn.attn_backend.get_name() == "FLASH_ATTN_V100"
+        )
+        if self.self_attn._sm70_dflash2_qk_rope:
+            # Import registers the cache-aware opaque op before model tracing.
+            from vllm.model_executor.layers.attention import (
+                sm70_dflash2_qk_rope,  # noqa: F401
+            )
+
+            logger.info_once(
+                "SM70 DFlash2 fused Q/K norm, RoPE and KV publication enabled."
+            )
         draft_config = config.dflash_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
@@ -246,6 +277,27 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
         )
+
+        if (
+            self.use_sm70_bf16_emulation
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+        ):
+            for projection in (
+                self.self_attn.qkv_proj,
+                self.self_attn.o_proj,
+                self.mlp.gate_up_proj,
+                self.mlp.down_proj,
+                self.attention_conv.kernel_projection,
+                self.mlp_conv.kernel_projection,
+            ):
+                if isinstance(projection.quant_method, UnquantizedLinearMethod):
+                    projection._sm70_dflash2_fp16_m8 = True
+                    projection._sm70_dflash2_fp8_m8 = (
+                        get_dflash_model_draft_tokens(speculative_config) == 7
+                    )
 
     def forward(
         self,
@@ -270,6 +322,29 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         return hidden_states, residual
 
 
+def _lookup_rows(table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    return table[ids]
+
+
+def _lookup_sharded_rows(
+    table: torch.Tensor,
+    ids: torch.Tensor,
+    start: int,
+    reduce: Callable[[torch.Tensor], torch.Tensor] = tensor_model_parallel_all_reduce,
+) -> torch.Tensor:
+    """Rows of a vocabulary-sharded table, replicated on every rank.
+
+    Each id has exactly one owner; the other ranks contribute exact zeros, so
+    the sum preserves finite nonzero values bitwise. Zero values are equal,
+    but adding +0 from non-owners may clear an owner's negative-zero sign.
+    """
+    local = ids - start
+    owned = (local >= 0) & (local < table.shape[0])
+    rows = table[local.clamp(0, table.shape[0] - 1)]
+    rows = torch.where(owned[..., None], rows, torch.zeros_like(rows))
+    return reduce(rows)
+
+
 def _score_edges(
     predecessor_table: torch.Tensor,
     successor_table: torch.Tensor,
@@ -278,9 +353,12 @@ def _score_edges(
     hidden: torch.Tensor,
     anchor_token_ids: torch.Tensor,
     top_k: int,
+    vocab_size: int | None = None,
+    lookup: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = _lookup_rows,
 ) -> torch.Tensor:
-    vocab_size = successor_table.shape[0]
-    successors = successor_table[candidate_ids.clamp(0, vocab_size - 1)]
+    if vocab_size is None:
+        vocab_size = successor_table.shape[0]
+    successors = lookup(successor_table, candidate_ids.clamp(0, vocab_size - 1))
     predecessor_ids = torch.cat(
         (
             anchor_token_ids[:, None, None].expand(-1, 1, top_k),
@@ -288,7 +366,7 @@ def _score_edges(
         ),
         dim=1,
     )
-    predecessors = predecessor_table[predecessor_ids.clamp(0, vocab_size - 1)]
+    predecessors = lookup(predecessor_table, predecessor_ids.clamp(0, vocab_size - 1))
     return unary_logits[:, :, None] + torch.einsum(
         "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
     )
@@ -304,15 +382,31 @@ class CandidateSelector(nn.Module):
         top_k: int,
         params_dtype: torch.dtype,
         prefix: str,
+        shard_codebooks: bool = False,
     ) -> None:
         super().__init__()
         self.top_k = top_k
+        self.vocab_size = vocab_size
+        tp_size = get_tensor_model_parallel_world_size() if shard_codebooks else 1
+        # Sharded: each rank keeps a contiguous 1/TP of the vocabulary rows.
+        self.shard_codebooks = tp_size > 1
+        self.rows_per_rank = -(-vocab_size // tp_size)
+        self.vocab_start = (
+            get_tensor_model_parallel_rank() * self.rows_per_rank
+            if self.shard_codebooks
+            else 0
+        )
         self.predecessor_codebook = nn.Parameter(
-            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+            torch.empty(self.rows_per_rank, rank, dtype=params_dtype),
+            requires_grad=False,
         )
         self.successor_codebook = nn.Parameter(
-            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+            torch.empty(self.rows_per_rank, rank, dtype=params_dtype),
+            requires_grad=False,
         )
+        if self.shard_codebooks:
+            for codebook in (self.predecessor_codebook, self.successor_codebook):
+                set_weight_attrs(codebook, {"weight_loader": self._load_rows})
         self.hidden_projection = ReplicatedLinear(
             hidden_size,
             rank,
@@ -339,7 +433,25 @@ class CandidateSelector(nn.Module):
             hidden,
             anchor_token_ids,
             self.top_k,
+            self.vocab_size,
+            self._lookup,
         )
+
+    def _lookup(self, table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        if self.shard_codebooks:
+            return _lookup_sharded_rows(table, ids, self.vocab_start)
+        return _lookup_rows(table, ids)
+
+    def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        expected_shape = (self.vocab_size, param.shape[1])
+        if tuple(loaded_weight.shape) != expected_shape:
+            raise ValueError(
+                f"Expected full codebook shape {expected_shape}, "
+                f"got {tuple(loaded_weight.shape)}"
+            )
+        rows = loaded_weight[self.vocab_start : self.vocab_start + self.rows_per_rank]
+        param.data.zero_()
+        param.data[: rows.shape[0]].copy_(rows)
 
 
 class DFlash2Qwen3Model(DFlashQwen3Model):
@@ -353,11 +465,13 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         output_size: int,
         prefix: str,
     ) -> nn.Module:
+        from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+
         use_sharded_fc = (
             sm70_dflash2_enabled(
                 "sharded_context_fc", capture_sm70_dflash2_config(vllm_config)
             )
-            and self.quant_config is None
+            and (self.quant_config is None or isinstance(self.quant_config, GGUFConfig))
             and current_platform.is_cuda()
             and current_platform.is_device_capability(70)
             and vllm_config.parallel_config.tensor_parallel_size == 4
@@ -381,7 +495,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             bias=False,
             gather_output=True,
             params_dtype=vllm_config.model_config.dtype,
-            quant_config=None,
+            quant_config=self.quant_config,
             prefix=prefix,
             return_bias=False,
         )
@@ -443,6 +557,13 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
+                shard_codebooks=bool(
+                    getattr(
+                        capture_sm70_dflash2_config(vllm_config),
+                        "sharded_selector_codebook",
+                        False,
+                    )
+                ),
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -459,6 +580,10 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._packed_topk_enabled = vllm_config.kernel_config.sm70_packed_topk_gather
+        self._packed_topk_selections = (
+            vllm_config.kernel_config.collective_kernel_selections
+        )
         self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
         draft_config = self.config.dflash_config
         self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
@@ -510,8 +635,18 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             values, ids = local_candidates
 
         if get_tensor_model_parallel_world_size() > 1:
-            values = tensor_model_parallel_all_gather(values, dim=-1)
-            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            packed = gather_topk_pairs(
+                values,
+                ids,
+                vocab_size=self.lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
+            )
+            if packed is None:
+                values = tensor_model_parallel_all_gather(values, dim=-1)
+                ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            else:
+                values, ids = packed
 
         if values.shape[-1] > selector.top_k:
             values, selected = _topk(values, selector.top_k)

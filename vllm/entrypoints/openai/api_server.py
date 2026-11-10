@@ -16,8 +16,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import uvloop
-from fastapi import FastAPI, HTTPException
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import State
 
@@ -29,18 +28,13 @@ from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.server_utils import (
-    engine_error_handler,
-    exception_handler,
-    generation_error_handler,
     get_uvicorn_log_config,
-    http_exception_handler,
     lifespan,
     log_response,
-    validation_exception_handler,
+    register_exception_handlers,
 )
 from vllm.entrypoints.sagemaker.api_router import sagemaker_standards_bootstrap
 from vllm.entrypoints.serve.elastic_ep.middleware import (
@@ -63,7 +57,6 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import is_valid_ipv6_address
 from vllm.utils.system_utils import decorate_logs, set_ulimit
-from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -254,12 +247,7 @@ def build_app(
         allow_headers=args.allowed_headers,
     )
 
-    app.exception_handler(HTTPException)(http_exception_handler)
-    app.exception_handler(RequestValidationError)(validation_exception_handler)
-    app.exception_handler(EngineGenerateError)(engine_error_handler)
-    app.exception_handler(EngineDeadError)(engine_error_handler)
-    app.exception_handler(GenerationError)(generation_error_handler)
-    app.exception_handler(Exception)(exception_handler)
+    register_exception_handlers(app)
 
     # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
     if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:

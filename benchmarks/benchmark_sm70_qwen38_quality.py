@@ -15,13 +15,17 @@ import hashlib
 import json
 import os
 import resource
+import shutil
 import statistics
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 
 import regex as re
+
+REQUEST_METRICS_ENABLED = True
 
 
 def final_text(text):
@@ -119,8 +123,82 @@ def health_failures(records):
         if health["line_repetition"] >= 3:
             reasons.append("repeated_final_answer_line")
         if reasons:
-            failures.append({"id": record["id"], "reasons": reasons})
+            failure = {"id": record["id"], "reasons": reasons}
+            if "seed" in record:
+                failure["seed"] = record["seed"]
+            failures.append(failure)
     return failures
+
+
+def compare_quality(reference, candidate):
+    """Compare three-seed task and health counts under a frozen contract."""
+    for key in ("contract", "sampling", "suite_sha256", "quality_seed_bases"):
+        if reference[key] != candidate[key]:
+            raise ValueError(f"Quality arms differ in {key}")
+    if len(set(reference["quality_seed_bases"])) != 3:
+        raise ValueError("Quality admission requires three distinct seed bases")
+    arms = []
+    for report in (reference, candidate):
+        if not report["complete"] or not report["quality_evaluated"]:
+            raise ValueError("Quality arms must be complete")
+        indexed = {(r["id"], r["seed"]): r for r in report["quality"]}
+        if len(indexed) != len(report["quality"]):
+            raise ValueError("Duplicate case/seed records")
+        arms.append(indexed)
+    if not arms[0] or arms[0].keys() != arms[1].keys():
+        raise ValueError("Quality arms require the same case/seed records")
+    for key, baseline in arms[0].items():
+        tested = arms[1][key]
+        for field in ("category", "input_tokens", "prompt_token_sha256"):
+            if baseline[field] != tested[field]:
+                raise ValueError(f"Quality prefix differs in {field}: {key}")
+    for case_id in {key[0] for key in arms[0]}:
+        if sum(key[0] == case_id for key in arms[0]) != 3:
+            raise ValueError(f"Case requires three seeds: {case_id}")
+    needles = [
+        r["input_tokens"] for r in reference["quality"] if r["category"] == "needle"
+    ]
+    if not any(130000 <= n < 140000 for n in needles) or not any(
+        257000 <= n < 262144 for n in needles
+    ):
+        raise ValueError("Quality admission requires 128K and 258K needle inputs")
+    rows = []
+    for category in sorted({r["category"] for r in arms[0].values()}):
+        counts = []
+        for arm in arms:
+            records = [r for r in arm.values() if r["category"] == category]
+            failures = health_failures(records)
+            counts.append(
+                {
+                    "passed": sum(r["score"]["passed"] for r in records),
+                    "total": len(records),
+                    "unhealthy": len(failures),
+                    "reasons": {
+                        reason: sum(reason in f["reasons"] for f in failures)
+                        for reason in (
+                            "not_natural_eos",
+                            "empty_final_answer",
+                            "replacement_characters",
+                            "repeated_final_answer_line",
+                        )
+                    },
+                }
+            )
+        baseline, tested = counts
+        accepted = (
+            tested["passed"] >= baseline["passed"]
+            and tested["unhealthy"] <= baseline["unhealthy"]
+            and all(tested["reasons"][k] <= v for k, v in baseline["reasons"].items())
+        )
+        rows.append(
+            {
+                "category": category,
+                "reference": baseline,
+                "candidate": tested,
+                "passed": accepted,
+            }
+        )
+    return {"passed": all(r["passed"] for r in rows), "categories": rows}
 
 
 def prompt_token_ids(case, tok):
@@ -155,7 +233,11 @@ def run(args):
     out = args.output.parent
     out.mkdir(parents=True, exist_ok=True)
     model = str(args.model)
-    suite = json.loads(args.cases.read_text())
+    suite = (
+        json.loads(args.cases.read_text())
+        if args.cases is not None
+        else {"sampling": {}, "cases": []}
+    )
     import torch
     from transformers import AutoTokenizer
 
@@ -164,9 +246,12 @@ def run(args):
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     import vllm
     from vllm import LLM, SamplingParams
+    from vllm.config.kernel import KernelConfig
 
     report = {
         "complete": False,
+        "instrumented": args.ple_phase_probe,
+        "speed_acceptance": not args.ple_phase_probe,
         "runtime": vllm.__version__,
         "runtime_path": vllm.__file__,
         "torch": str(torch.__version__),
@@ -175,7 +260,14 @@ def run(args):
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in Path(vllm.__file__).parent.glob("*.so")
         },
-        "suite_sha256": hashlib.sha256(args.cases.read_bytes()).hexdigest(),
+        "suite_sha256": hashlib.sha256(args.cases.read_bytes()).hexdigest()
+        if args.cases is not None
+        else None,
+        "quality_evaluated": not args.timing_only,
+        "quality_seed_base": args.quality_seed,
+        "quality_seed_bases": args.quality_seeds or [args.quality_seed],
+        "disabled_kernels": args.disable_kernel,
+        "quality_case_ids": args.case_id,
         "sampling": suite["sampling"],
         "contract": {
             "model": model,
@@ -198,6 +290,17 @@ def run(args):
 
     save()
     tok = AutoTokenizer.from_pretrained(model)
+    diagnostic = {}
+    if args.ple_phase_probe:
+        diagnostic["worker_extension_cls"] = (
+            "benchmarks.qwen38_ple_phase_probe.PlePhaseWorkerExtension"
+        )
+        os.chdir(out)
+    kernel_config = {"ple_result_transport": args.ple_result_transport}
+    if "ple_disk_row_gather" in KernelConfig.__dataclass_fields__:
+        kernel_config["ple_disk_row_gather"] = not args.disable_ple_row_gather
+    elif args.disable_ple_row_gather:
+        raise RuntimeError("Installed runtime lacks the requested PLE reader control")
     llm = LLM(
         model=model,
         tensor_parallel_size=4,
@@ -211,8 +314,9 @@ def run(args):
         enable_prefix_caching=False,
         language_model_only=True,
         speculative_config=None,
-        disable_log_stats=False,
-        kernel_config={"ple_result_transport": args.ple_result_transport},
+        disable_log_stats=not REQUEST_METRICS_ENABLED,
+        **diagnostic,
+        kernel_config=kernel_config,
     )
     try:
         cfg = llm.llm_engine.vllm_config
@@ -225,63 +329,76 @@ def run(args):
             "get_sm70_acceleration_report", timeout=30
         )
         save()
-        chunk = tok.encode(
-            "This fixed benchmark prompt is used to create a deterministic "
-            "tokenized input for single-request decode measurement. ",
-            add_special_tokens=False,
-        )
-        ids = (chunk * ((8192 + len(chunk) - 1) // len(chunk)))[:8192]
-        llm.generate(
-            [{"prompt_token_ids": ids}],
-            SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
-            use_tqdm=False,
-        )
-        for i in range(6):
-            o = llm.generate(
+        if not args.quality_only:
+            chunk = tok.encode(
+                "This fixed benchmark prompt is used to create a deterministic "
+                "tokenized input for single-request decode measurement. ",
+                add_special_tokens=False,
+            )
+            ids = (chunk * ((8192 + len(chunk) - 1) // len(chunk)))[:8192]
+            llm.generate(
                 [{"prompt_token_ids": ids}],
-                SamplingParams(
-                    temperature=0,
-                    top_p=1,
-                    top_k=-1,
-                    seed=0,
-                    max_tokens=513,
-                    ignore_eos=True,
-                ),
+                SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
                 use_tqdm=False,
-            )[0]
-            report["timing"].append(metrics(o))
-            save()
-            print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
-        for i, case in enumerate(suite["cases"]):
+            )
+            for i in range(args.timing_repeats):
+                o = llm.generate(
+                    [{"prompt_token_ids": ids}],
+                    SamplingParams(
+                        temperature=0,
+                        top_p=1,
+                        top_k=-1,
+                        seed=0,
+                        max_tokens=513,
+                        ignore_eos=True,
+                    ),
+                    use_tqdm=False,
+                )[0]
+                report["timing"].append(metrics(o))
+                save()
+                print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
+        for i, case in enumerate([] if args.timing_only else suite["cases"]):
+            if args.case_id and case["id"] not in args.case_id:
+                continue
             prompt_ids = prompt_token_ids(case, tok)
-            o = llm.generate(
-                [{"prompt_token_ids": prompt_ids}],
-                SamplingParams(
-                    temperature=1, top_p=0.95, top_k=20, seed=4201 + i, max_tokens=4096
-                ),
-                use_tqdm=False,
-            )[0]
-            record = {
-                "id": case["id"],
-                "category": case["category"],
-                "input_tokens": len(prompt_ids),
-                "prompt_token_sha256": hashlib.sha256(
-                    json.dumps(prompt_ids).encode()
-                ).hexdigest(),
-                **metrics(o),
-            }
-            text = final_text(record["text"])
-            lines = [s.strip() for s in text.splitlines() if len(s.strip()) > 24]
-            record["health"] = {
-                "natural_eos": record["finish_reason"] == "stop",
-                "nonempty_final": bool(text),
-                "replacement_characters": text.count("\ufffd"),
-                "line_repetition": max((lines.count(s) for s in set(lines)), default=0),
-            }
-            record["score"] = check(case, record["text"])
-            report["quality"].append(record)
-            save()
-            print("QUALITY", case["id"], record["score"], record["health"], flush=True)
+            for seed_base in args.quality_seeds or [args.quality_seed]:
+                o = llm.generate(
+                    [{"prompt_token_ids": prompt_ids}],
+                    SamplingParams(
+                        temperature=1,
+                        top_p=0.95,
+                        top_k=20,
+                        seed=seed_base + i,
+                        max_tokens=4096,
+                    ),
+                    use_tqdm=False,
+                )[0]
+                record = {
+                    "id": case["id"],
+                    "category": case["category"],
+                    "seed": seed_base + i,
+                    "input_tokens": len(prompt_ids),
+                    "prompt_token_sha256": hashlib.sha256(
+                        json.dumps(prompt_ids).encode()
+                    ).hexdigest(),
+                    **metrics(o),
+                }
+                text = final_text(record["text"])
+                lines = [s.strip() for s in text.splitlines() if len(s.strip()) > 24]
+                record["health"] = {
+                    "natural_eos": record["finish_reason"] == "stop",
+                    "nonempty_final": bool(text),
+                    "replacement_characters": text.count("\ufffd"),
+                    "line_repetition": max(
+                        (lines.count(s) for s in set(lines)), default=0
+                    ),
+                }
+                record["score"] = check(case, record["text"])
+                report["quality"].append(record)
+                save()
+                print(
+                    "QUALITY", case["id"], record["score"], record["health"], flush=True
+                )
         report["summary"] = {
             category: {
                 "passed": sum(
@@ -293,35 +410,190 @@ def run(args):
             }
             for category in ("mbpp", "gsm8k", "chinese", "needle")
         }
-        report["median_tpot_ms"] = statistics.median(
-            r["tpot_ms"] for r in report["timing"]
+        report["median_tpot_ms"] = (
+            statistics.median(r["tpot_ms"] for r in report["timing"])
+            if report["timing"]
+            else None
         )
         report["health_failures"] = health_failures(report["quality"])
-        report["health_passed"] = not report["health_failures"]
+        report["health_passed"] = (
+            not report["health_failures"] if not args.timing_only else None
+        )
+        if args.ple_phase_probe:
+            report["ple_phases"] = llm.collective_rpc("ple_phase_records")
         report["complete"] = True
+        report["health_triage_required"] = bool(report["health_failures"])
         save()
-        if not report["health_passed"]:
-            raise SystemExit("Output health gate failed; see health_failures in report")
+        if report["health_passed"] is False and not args.quality_seeds:
+            raise SystemExit(
+                "Output anomaly requires three candidate and three baseline seeds; "
+                "see report"
+            )
     finally:
         llm.llm_engine.engine_core.shutdown()
 
 
-if __name__ == "__main__":
+def compare_timing(reference, candidate, expected_saving_ms):
+    """Check the matched contract before calibrating an endpoint estimate."""
+    if reference.get("instrumented") or candidate.get("instrumented"):
+        raise ValueError("Instrumented runs cannot establish endpoint savings")
+    for key in ("runtime", "torch", "cuda", "source_native", "contract"):
+        if reference[key] != candidate[key]:
+            raise ValueError(f"Timing arms differ in {key}")
+    if not reference["complete"] or not candidate["complete"]:
+        raise ValueError("Timing arms must be complete")
+    baseline = reference["median_tpot_ms"]
+    observed = baseline - candidate["median_tpot_ms"]
+    error = abs(observed - expected_saving_ms) / expected_saving_ms
+    return {
+        "baseline_ms": baseline,
+        "candidate_ms": candidate["median_tpot_ms"],
+        "expected_saving_ms": expected_saving_ms,
+        "observed_saving_ms": observed,
+        "estimate_relative_error": error,
+        "calibration_required": error > 0.15,
+    }
+
+
+def preflight(args):
+    """Reject incomplete launch contracts before importing/loading the model."""
+    if sys.version_info[:2] != (3, 12):
+        raise RuntimeError("The frozen runtime requires Python 3.12")
+    header = Path(sysconfig.get_path("include")) / "Python.h"
+    if not header.is_file():
+        raise RuntimeError(f"Python development header is missing: {header}")
+    if not REQUEST_METRICS_ENABLED:
+        raise RuntimeError("Request metrics must be enabled")
+    tree = ast.parse(Path(__file__).read_text())
+    guard = ast.parse('if __name__ == "__main__": main()').body[0].test
+    if not any(
+        isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(guard)
+        for node in tree.body
+    ):
+        raise RuntimeError("The endpoint entry requires a spawn main guard")
+    if not (args.model / "config.json").is_file():
+        raise RuntimeError("Model config is missing")
+    index = args.model / "model.safetensors.index.json"
+    if not index.is_file():
+        raise RuntimeError("The sharded checkpoint index is missing")
+    shards = set(json.loads(index.read_text())["weight_map"].values())
+    missing = [name for name in sorted(shards) if not (args.model / name).is_file()]
+    if missing:
+        raise RuntimeError(f"Checkpoint shards missing: {missing[:3]}")
+    if not args.timing_only:
+        if args.cases is None or not args.cases.is_file():
+            raise RuntimeError("Quality mode requires the frozen cases JSON")
+        suite = json.loads(args.cases.read_text())
+        known = {case["id"] for case in suite["cases"]}
+        if set(args.case_id or []) - known:
+            raise RuntimeError("Unknown quality case IDs")
+    if args.output.exists():
+        raise RuntimeError("Refusing to overwrite a retained result")
+    free = shutil.disk_usage(args.output.parent).free
+    if free < args.min_free_gib * 1024**3:
+        raise RuntimeError(f"Insufficient disk: {free / 1024**3:.2f} GiB free")
+    consumers = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            "0,1,2,3",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    ).strip()
+    if consumers:
+        raise RuntimeError(f"GPU 0-3 occupied by PIDs: {consumers}")
+    return {
+        "python": sys.version,
+        "header": str(header),
+        "free_bytes": free,
+        "gpu_idle": True,
+        "request_metrics": True,
+        "spawn_guard": True,
+        "gpu_lock": "/tmp/gpu0-3.lock",
+    }
+
+
+def open_gpu_lock(inherited_fd=None, lock_path=Path("/tmp/gpu0-3.lock")):
+    """Keep a caller's reservation without releasing and racing to reacquire."""
+    lock = (
+        os.fdopen(os.dup(inherited_fd), "a")
+        if inherited_fd is not None
+        else lock_path.open("a")
+    )
+    try:
+        actual, expected = os.fstat(lock.fileno()), lock_path.stat()
+        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise RuntimeError("Inherited descriptor is not the required GPU lock")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        lock.close()
+        raise
+    return lock
+
+
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--cases", type=Path, required=True)
+    parser.add_argument("--cases", type=Path)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--timing-only", action="store_true")
+    modes.add_argument("--quality-only", action="store_true")
+    parser.add_argument("--quality-seed", type=int, default=4201)
+    parser.add_argument(
+        "--quality-seeds",
+        type=int,
+        nargs="+",
+        help="Run all seed bases with one loaded engine",
+    )
+    parser.add_argument("--disable-kernel", action="append", default=[])
+    parser.add_argument("--case-id", action="append")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--min-free-gib", type=float, default=8)
+    parser.add_argument("--gpu-lock-fd", type=int)
+    parser.add_argument("--runtime-cache", type=Path)
+    parser.add_argument("--ple-phase-probe", action="store_true")
+    parser.add_argument("--timing-repeats", type=int, default=6)
+    parser.add_argument("--reference-timing", type=Path)
+    parser.add_argument("--expected-saving-ms", type=float)
+    parser.add_argument("--disable-ple-row-gather", action="store_true")
     parser.add_argument(
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
     args = parser.parse_args()
+    if args.quality_seeds is not None and (
+        len(args.quality_seeds) != 3 or len(set(args.quality_seeds)) != 3
+    ):
+        parser.error("--quality-seeds requires exactly three distinct seed bases")
+    if args.timing_repeats < 2:
+        parser.error("--timing-repeats must be at least 2")
+    if args.ple_phase_probe and args.reference_timing is not None:
+        parser.error("Instrumented phases cannot be endpoint speed acceptance")
+    if args.min_free_gib < 8:
+        parser.error("--min-free-gib must be at least 8")
+    if args.reference_timing is not None:
+        if args.quality_only:
+            parser.error("--reference-timing requires timing requests")
+        if args.expected_saving_ms is None or args.expected_saving_ms <= 0:
+            parser.error("--reference-timing requires positive --expected-saving-ms")
+        reference = json.loads(args.reference_timing.read_text())
+    else:
+        reference = None
+    args.model = args.model.resolve()
+    args.output = args.output.resolve()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     # Resolve defaults in a fresh process, before importing the runtime.
     for key in list(os.environ):
         if key.startswith(
             ("VLLM_", "TRITON_", "TORCHINDUCTOR_", "FLASH_QLA_", "ONECAT_", "SM70_")
         ) or key in ("PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH"):
             del os.environ[key]
-    cache = args.output.parent / "runtime"
+    cache = (
+        args.runtime_cache.resolve()
+        if args.runtime_cache is not None
+        else args.output.parent / "runtime"
+    )
     os.environ.update(
         CUDA_VISIBLE_DEVICES="0,1,2,3",
         CUDA_DEVICE_ORDER="PCI_BUS_ID",
@@ -335,19 +607,42 @@ if __name__ == "__main__":
         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
         TORCH_EXTENSIONS_DIR=str(cache / "extensions"),
     )
-    with open("/tmp/gpu0-3.lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        import subprocess
+    if args.disable_kernel:
+        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(args.disable_kernel)
+    summary = {"complete": False, "output": str(args.output)}
+    summary_path = args.output.with_suffix(".summary.json")
+    try:
+        with open_gpu_lock(args.gpu_lock_fd):
+            summary["preflight"] = preflight(args)
+            run(args)
+            report = json.loads(args.output.read_text())
+            if reference is not None:
+                summary["estimate_comparison"] = compare_timing(
+                    reference, report, args.expected_saving_ms
+                )
+            summary.update(
+                complete=report["complete"],
+                median_tpot_ms=report["median_tpot_ms"],
+                quality_evaluated=report["quality_evaluated"],
+                health_triage_required=report["health_triage_required"],
+                cpu_row_readers=[
+                    rank["ple_disk_row_readers"]
+                    for rank in report["worker_routes"]
+                    if rank.get("ple_disk_row_readers")
+                ],
+                route_report=str(args.output),
+                instrumented=report["instrumented"],
+                speed_acceptance=report["speed_acceptance"],
+            )
+    except BaseException as error:
+        summary["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+        )
+        print("COMPLETION_SUMMARY", summary_path, flush=True)
 
-        if subprocess.check_output(
-            [
-                "nvidia-smi",
-                "-i",
-                "0,1,2,3",
-                "--query-compute-apps=pid",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-        ).strip():
-            raise SystemExit("GPU 0-3 have other consumers; gate not launched")
-        run(args)
+
+if __name__ == "__main__":
+    main()

@@ -1,3 +1,4 @@
+#include "flash_v100_policy.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -20,8 +21,6 @@
 #include "fused_mma.h"
 
 namespace {
-
-std::atomic<int64_t> tp2_e4m3_scalar_fast_calls{0};
 
 int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
   if (kv_cache_dtype == "auto" || kv_cache_dtype == "float16" ||
@@ -147,34 +146,33 @@ struct alignas(256) XQATCStagedPVSmem256Wide {
 };
 
 bool xqa_padded_smem_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_PADDED_SMEM");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_padded_smem_enabled);
 }
 
 bool xqa_g6_dual_cta_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA");
-  return value != nullptr && value[0] == '1';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_dual_cta_enabled);
 }
 
 bool xqa_e4m3_batch_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_batch_enabled);
 }
 
 bool xqa_e4m3_batch_optimized_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_batch_optimized_enabled);
 }
 
 bool xqa_e4m3_page800_fastpath_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_page800_fastpath_enabled);
 }
 
 bool xqa_e4m3_page800_fastpath_trace_enabled() {
-  const char* value =
-      std::getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE");
-  return value != nullptr && value[0] == '1';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_page800_fastpath_trace_enabled);
 }
 
 void trace_xqa_e4m3_page800_fastpath(const int batch_size,
@@ -183,7 +181,7 @@ void trace_xqa_e4m3_page800_fastpath(const int batch_size,
   if (!active || !xqa_e4m3_page800_fastpath_trace_enabled()) {
     return;
   }
-  static std::atomic<bool> traced{false};
+  auto& traced = flash_v100::policy::observation(0);
   if (!traced.exchange(true, std::memory_order_relaxed)) {
     TORCH_WARN("Flash-V100 E4M3 page800 fast path active: batch=", batch_size,
                ", partition_size=", partition_size,
@@ -192,191 +190,193 @@ void trace_xqa_e4m3_page800_fastpath(const int batch_size,
 }
 
 bool xqa_e5m2_g6_dual_cta_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e5m2_g6_dual_cta_enabled);
 }
 
 bool xqa_e5m2_g6_split_reduce_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e5m2_g6_split_reduce_enabled);
 }
 
 bool xqa_e5m2_partition_page_ids_enabled() {
-  const char* value =
-      std::getenv("VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e5m2_partition_page_ids_enabled);
 }
 
 bool xqa_e5m2_pair_load_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e5m2_pair_load_enabled);
 }
 
 bool xqa_e5m2_batch_wide_load_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e5m2_batch_wide_load_enabled);
 }
 
 bool dflash2_grouped_fixed_interleaved_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::dflash2_grouped_fixed_interleaved_enabled);
 }
 
 bool dflash2_grouped_stage_page_ids_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::dflash2_grouped_stage_page_ids_enabled);
 }
 
 int xqa_e5m2_p1024_begin() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN");
-  return value == nullptr ? 61633 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e5m2_p1024_begin);
 }
 
 int xqa_e5m2_scalar_xqa_seq_len() {
-  const char* value = std::getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN");
-  return value == nullptr ? 16384 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e5m2_scalar_xqa_seq_len);
 }
 
 bool xqa_e5m2_g6_dual_cta_trace_enabled() {
-  static const bool enabled = [] {
-    const char* value =
-        std::getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE");
-    return value != nullptr && value[0] == '1';
-  }();
-  return enabled;
+  if (!flash_v100::policy::active) {
+    static const bool legacy = flash_v100::policy::value(
+        flash_v100::policy::Field::xqa_e5m2_g6_dual_cta_trace_enabled);
+    return legacy;
+  }
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e5m2_g6_dual_cta_trace_enabled);
 }
 
 bool xqa_mtp5_dual_cta_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA");
-  return value == nullptr || value[0] == '1';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_mtp5_dual_cta_enabled);
 }
 
 bool xqa_g6_dual_cta_dense_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE");
-  return value != nullptr && value[0] == '1';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_dual_cta_dense_enabled);
 }
 
 bool xqa_g6_p1024_auto_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_p1024_auto_enabled);
 }
 
 bool xqa_g6_p1024_auto_trace_enabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE");
-    return value != nullptr && value[0] == '1';
-  }();
-  return enabled;
+  if (!flash_v100::policy::active) {
+    static const bool legacy = flash_v100::policy::value(
+        flash_v100::policy::Field::xqa_g6_p1024_auto_trace_enabled);
+    return legacy;
+  }
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_p1024_auto_trace_enabled);
 }
 
 bool xqa_g6_p1024_sawtooth_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_p1024_sawtooth_enabled);
 }
 
 bool xqa_e4m3_g6_p64_p256_auto_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_p64_p256_auto_enabled);
 }
 
 bool xqa_e4m3_g6_p64_p256_auto_trace_enabled() {
-  static const bool enabled = [] {
-    const char* value =
-        std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE");
-    return value != nullptr && value[0] == '1';
-  }();
-  return enabled;
+  if (!flash_v100::policy::active) {
+    static const bool legacy = flash_v100::policy::value(
+        flash_v100::policy::Field::xqa_e4m3_g6_p64_p256_auto_trace_enabled);
+    return legacy;
+  }
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_p64_p256_auto_trace_enabled);
 }
 
 int xqa_e4m3_g6_p256_begin() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN");
-  return value == nullptr ? 12288 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_p256_begin);
 }
 
 int xqa_e4m3_g6_dual_cta_begin() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN");
-  return value == nullptr ? 32768 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_dual_cta_begin);
 }
 
 bool xqa_e4m3_g6_wave_partitions_enabled() {
-  const char* value =
-      std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_wave_partitions_enabled);
 }
 
 bool xqa_e4m3_g6_merged_wave_launch_enabled() {
-  const char* value =
-      std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_merged_wave_launch_enabled);
 }
 
 int xqa_e4m3_g6_p512_begin() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN");
-  return value == nullptr ? 49152 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_p512_begin);
 }
 
 int xqa_e4m3_g6_p896_begin() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN");
-  return value == nullptr ? 98304 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_p896_begin);
 }
 
 int xqa_e4m3_g6_p1664_begin() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN");
-  return value == nullptr ? 196608 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_e4m3_g6_p1664_begin);
 }
 
 bool decode_partition_size_overridden() {
-  return std::getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") != nullptr;
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::decode_partition_size_overridden);
 }
 
 bool xqa_g6_qk_pipeline_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_qk_pipeline_enabled);
 }
 
 int xqa_g6_qk_pipeline_warps() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS");
-  return value != nullptr && std::atoi(value) == 6 ? 6 : 8;
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_qk_pipeline_warps);
 }
 
 bool xqa_g6_qk_pipeline_trace_enabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE");
-    return value != nullptr && value[0] == '1';
-  }();
-  return enabled;
+  if (!flash_v100::policy::active) {
+    static const bool legacy = flash_v100::policy::value(
+        flash_v100::policy::Field::xqa_g6_qk_pipeline_trace_enabled);
+    return legacy;
+  }
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_qk_pipeline_trace_enabled);
 }
 
 bool xqa_g6_p1024_sawtooth_trace_enabled() {
-  static const bool enabled = [] {
-    const char* value =
-        std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE");
-    return value != nullptr && value[0] == '1';
-  }();
-  return enabled;
+  if (!flash_v100::policy::active) {
+    static const bool legacy = flash_v100::policy::value(
+        flash_v100::policy::Field::xqa_g6_p1024_sawtooth_trace_enabled);
+    return legacy;
+  }
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_p1024_sawtooth_trace_enabled);
 }
 
 int xqa_g6_p1024_sawtooth_p1024_mid_seq_len() {
-  const char* value =
-      std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN");
-  return value == nullptr ? 111104 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_p1024_sawtooth_p1024_mid_seq_len);
 }
 
 int xqa_g6_p1024_sawtooth_p256_long_seq_len() {
-  const char* value =
-      std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN");
-  return value == nullptr ? 147841 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_p1024_sawtooth_p256_long_seq_len);
 }
 
 int xqa_g6_p1024_sawtooth_p1024_final_seq_len() {
-  const char* value =
-      std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN");
-  return value == nullptr ? 258176 : std::max(1, std::atoi(value));
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_g6_p1024_sawtooth_p1024_final_seq_len);
 }
 
 bool xqa_split_reduce_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE");
-  return value != nullptr && value[0] == '1';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_split_reduce_enabled);
 }
 
 enum class XQABatchContextRoute : int {
@@ -387,14 +387,13 @@ enum class XQABatchContextRoute : int {
 };
 
 bool xqa_batch_context_routing_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_batch_context_routing_enabled);
 }
 
 bool xqa_batch_context_routing_trace_enabled() {
-  const char* value =
-      std::getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE");
-  return value != nullptr && value[0] == '1';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_batch_context_routing_trace_enabled);
 }
 
 XQABatchContextRoute select_xqa_batch_context_route(const int batch_size,
@@ -464,7 +463,7 @@ void trace_xqa_batch_context_route(const int batch_size, const int max_seq_len,
                                                    : 4;
   const unsigned long long bit =
       1ULL << (batch_class * 15 + context_class * 3 + static_cast<int>(route));
-  static std::atomic<unsigned long long> traced_routes{0};
+  auto& traced_routes = flash_v100::policy::observation(1);
   const unsigned long long previous =
       traced_routes.fetch_or(bit, std::memory_order_relaxed);
   if ((previous & bit) == 0) {
@@ -476,61 +475,58 @@ void trace_xqa_batch_context_route(const int batch_size, const int max_seq_len,
 }
 
 int xqa_block16_layout_mode() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT");
-  if (value == nullptr) {
-    return 0;
-  }
-  const int mode = std::atoi(value);
-  return mode == 1 || mode == 2 ? mode : 0;
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_block16_layout_mode);
 }
 
 bool xqa_block16_layout_required() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE");
-  return value != nullptr && value[0] == '1';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_block16_layout_required);
 }
 
 bool xqa_block16_layout_trace_enabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE");
-    return value != nullptr && value[0] == '1';
-  }();
-  return enabled;
+  if (!flash_v100::policy::active) {
+    static const bool legacy = flash_v100::policy::value(
+        flash_v100::policy::Field::xqa_block16_layout_trace_enabled);
+    return legacy;
+  }
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_block16_layout_trace_enabled);
 }
 
 bool xqa_block784_index_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_BLOCK784_INDEX");
-  return value == nullptr || value[0] != '0';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_block784_index_enabled);
 }
 
 bool xqa_block784_index_trace_enabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE");
-    return value != nullptr && value[0] == '1';
-  }();
-  return enabled;
+  if (!flash_v100::policy::active) {
+    static const bool legacy = flash_v100::policy::value(
+        flash_v100::policy::Field::xqa_block784_index_trace_enabled);
+    return legacy;
+  }
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_block784_index_trace_enabled);
 }
 
 bool xqa_aligned_padded_smem_enabled() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM");
-  return value != nullptr && value[0] == '1';
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_aligned_padded_smem_enabled);
 }
 
 bool xqa_aligned_padded_smem_trace_enabled() {
-  static const bool enabled = [] {
-    const char* value =
-        std::getenv("VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE");
-    return value != nullptr && value[0] == '1';
-  }();
-  return enabled;
+  if (!flash_v100::policy::active) {
+    static const bool legacy = flash_v100::policy::value(
+        flash_v100::policy::Field::xqa_aligned_padded_smem_trace_enabled);
+    return legacy;
+  }
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_aligned_padded_smem_trace_enabled);
 }
 
 int xqa_split_reduce_dim_tile() {
-  const char* value = std::getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE");
-  if (value == nullptr) {
-    return 8;
-  }
-  const int dim_tile = std::atoi(value);
-  return dim_tile == 8 || dim_tile == 16 || dim_tile == 32 ? dim_tile : 8;
+  return flash_v100::policy::value(
+      flash_v100::policy::Field::xqa_split_reduce_dim_tile);
 }
 
 template <int SEQ_LEN_ROUTE>
@@ -3605,15 +3601,12 @@ void launch_flash_attention_decode_paged(
                 "anchored decode window requires an fp16 KV cache");
     if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 && D == 256 &&
                   PARTITION_SIZE == 1024 && std::is_same_v<PARTIAL_T, float>) {
-      const char* enabled = std::getenv("VLLM_FLASH_V100_E4M3_SCALAR_FAST");
-      if (enabled == nullptr) {
-        enabled = std::getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST");
-      }
-      const bool use_fast =
-          (enabled == nullptr || (enabled[0] == '1' && enabled[1] == '\0')) &&
-          window_size_left == -1 && window_size_right == -1;
+      const bool use_fast = flash_v100::policy::value(
+                                flash_v100::policy::Field::e4m3_scalar_fast) &&
+                            window_size_left == -1 && window_size_right == -1;
       if (use_fast) {
-        tp2_e4m3_scalar_fast_calls.fetch_add(1, std::memory_order_relaxed);
+        flash_v100::policy::observation(12).fetch_add(
+            1, std::memory_order_relaxed);
         launch_partition(std::false_type{}, std::true_type{});
       } else {
         launch_partition(std::false_type{}, std::false_type{});
@@ -4584,7 +4577,7 @@ int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 3; }
 int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count() {
   // Includes capture-time launches; CUDA Graph replay does not call this host
   // dispatcher again. This counter proves route admission, not round count.
-  return tp2_e4m3_scalar_fast_calls.load(std::memory_order_relaxed);
+  return flash_v100::policy::observation(12).load(std::memory_order_relaxed);
 }
 
 int64_t flash_attention_grouped_verify_max_query_tokens() {
@@ -5474,7 +5467,7 @@ at::Tensor flash_attention_decode_paged_xqa(
 #undef LAUNCH_E4M3_WAVE_REDUCER
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        static bool traced_wave_partitions = false;
+        auto& traced_wave_partitions = flash_v100::policy::observation(2);
         if (xqa_e4m3_g6_p64_p256_auto_trace_enabled() &&
             !traced_wave_partitions) {
           TORCH_WARN(
@@ -5535,7 +5528,7 @@ at::Tensor flash_attention_decode_paged_xqa(
               max_logits.stride(1), out.stride(0), out.stride(1), p256_begin, 0,
               0, 0);
 
-      static bool traced_p64_p256_auto = false;
+      auto& traced_p64_p256_auto = flash_v100::policy::observation(3);
       if (xqa_e4m3_g6_p64_p256_auto_trace_enabled() && !traced_p64_p256_auto) {
         TORCH_WARN(
             "Flash-V100 XQA E4M3 G6 device-side p64/p256 route active; "
@@ -5747,7 +5740,7 @@ at::Tensor flash_attention_decode_paged_xqa(
   trace_xqa_batch_context_route(q.size(0), batch_context_max_seq_len,
                                 partition_size, k_cache.size(1),
                                 batch_context_route);
-  static bool traced_e5m2_batch_wide_load = false;
+  auto& traced_e5m2_batch_wide_load = flash_v100::policy::observation(4);
   if (xqa_batch_context_routing_trace_enabled() && use_e5m2_batch_wide_load &&
       !traced_e5m2_batch_wide_load) {
     TORCH_WARN(
@@ -5755,7 +5748,7 @@ at::Tensor flash_attention_decode_paged_xqa(
         "128-bit loads active");
     traced_e5m2_batch_wide_load = true;
   }
-  static bool traced_block16_layout = false;
+  auto& traced_block16_layout = flash_v100::policy::observation(5);
   if (xqa_block16_layout_trace_enabled() && block16_layout_mode != 0 &&
       !traced_block16_layout) {
     TORCH_WARN("Flash-V100 XQA block16 mode ", block16_layout_mode,
@@ -5763,7 +5756,7 @@ at::Tensor flash_attention_decode_paged_xqa(
                k_cache.size(2), ",", k_cache.size(3), "]");
     traced_block16_layout = true;
   }
-  static bool traced_block784_index = false;
+  auto& traced_block784_index = flash_v100::policy::observation(6);
   if (xqa_block784_index_trace_enabled() && use_block784_index &&
       !traced_block784_index) {
     TORCH_WARN(
@@ -5772,7 +5765,7 @@ at::Tensor flash_attention_decode_paged_xqa(
         k_cache.size(1), ",", k_cache.size(2), ",", k_cache.size(3), "]");
     traced_block784_index = true;
   }
-  static bool traced_g6_p1024_auto = false;
+  auto& traced_g6_p1024_auto = flash_v100::policy::observation(7);
   if (xqa_g6_p1024_auto_trace_enabled() && use_g6_p1024_auto &&
       !traced_g6_p1024_auto) {
     TORCH_WARN(
@@ -5781,7 +5774,7 @@ at::Tensor flash_attention_decode_paged_xqa(
         g6_p1024_route_seq_len);
     traced_g6_p1024_auto = true;
   }
-  static bool traced_g6_p1024_sawtooth = false;
+  auto& traced_g6_p1024_sawtooth = flash_v100::policy::observation(8);
   if (xqa_g6_p1024_sawtooth_trace_enabled() && use_g6_p1024_sawtooth &&
       !traced_g6_p1024_sawtooth) {
     TORCH_WARN("Flash-V100 XQA p1024/p256 sawtooth route active; thresholds=",
@@ -5790,7 +5783,7 @@ at::Tensor flash_attention_decode_paged_xqa(
                g6_p1024_sawtooth_p1024_final_seq_len);
     traced_g6_p1024_sawtooth = true;
   }
-  static bool traced_g6_qk_pipeline = false;
+  auto& traced_g6_qk_pipeline = flash_v100::policy::observation(9);
   if (xqa_g6_qk_pipeline_trace_enabled() && use_g6_qk_pipeline &&
       !traced_g6_qk_pipeline) {
     TORCH_WARN(
@@ -5800,7 +5793,7 @@ at::Tensor flash_attention_decode_paged_xqa(
         g6_qk_pipeline_warps);
     traced_g6_qk_pipeline = true;
   }
-  static bool traced_e5m2_g6_dual_cta = false;
+  auto& traced_e5m2_g6_dual_cta = flash_v100::policy::observation(10);
   if (xqa_e5m2_g6_dual_cta_trace_enabled() && use_e5m2_g6_dual_cta &&
       !traced_e5m2_g6_dual_cta) {
     TORCH_WARN(
@@ -5814,7 +5807,7 @@ at::Tensor flash_attention_decode_paged_xqa(
         ", scalar_xqa_seq_len=", e5m2_scalar_xqa_seq_len);
     traced_e5m2_g6_dual_cta = true;
   }
-  static bool traced_aligned_padded_smem = false;
+  auto& traced_aligned_padded_smem = flash_v100::policy::observation(11);
   if (xqa_aligned_padded_smem_trace_enabled() && use_aligned_padded_smem &&
       !traced_aligned_padded_smem) {
     TORCH_WARN("Flash-V100 XQA aligned padded shared layout active");

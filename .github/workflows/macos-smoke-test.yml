@@ -13,7 +13,8 @@ jobs:
   macos-m1-smoke-test:
     runs-on: macos-latest
     timeout-minutes: 30
-
+    env:
+      GLOO_SOCKET_IFNAME: lo0
     steps:
       - uses: actions/checkout@v6.0.1
 
@@ -30,11 +31,48 @@ jobs:
           uv venv
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependencies and build vLLM
+      - name: Install dependencies
         run: |
           uv pip install -r requirements/build/cpu.txt --index-strategy unsafe-best-match
           uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-          uv pip install -e . --no-build-isolation
+
+      - name: Verify single-process Gloo
+        timeout-minutes: 2
+        run: |
+          .venv/bin/python - <<'PY'
+          from datetime import timedelta
+          import socket
+          import torch
+          import torch.distributed as dist
+
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+              listener.settimeout(5)
+              listener.bind(("127.0.0.1", 0))
+              listener.listen(1)
+              with socket.create_connection(listener.getsockname(), timeout=5) as client:
+                  client.sendall(b"smoke")
+                  connection, _ = listener.accept()
+                  with connection:
+                      connection.settimeout(5)
+                      assert connection.recv(5) == b"smoke"
+          print("Python loopback communication passed", flush=True)
+
+          timeout = timedelta(seconds=30)
+          dist.init_process_group(
+              "gloo", store=dist.HashStore(), rank=0, world_size=1, timeout=timeout
+          )
+          try:
+              value = torch.ones(1)
+              dist.all_reduce(value)
+              assert value.item() == 1
+              print("In-memory single-rank Gloo passed", flush=True)
+          finally:
+              dist.destroy_process_group()
+
+          PY
+
+      - name: Build vLLM
+        run: uv pip install -e . --no-build-isolation
         env:
           CMAKE_BUILD_PARALLEL_LEVEL: 4
 
@@ -48,32 +86,40 @@ jobs:
           VLLM_CPU_KVCACHE_SPACE=1 \
           vllm serve Qwen/Qwen3-0.6B \
             --max-model-len=2K \
+            --max-num-seqs 2 \
+            --max-num-batched-tokens 128 \
             --load-format=dummy \
             --hf-overrides '{"num_hidden_layers": 2}' \
             --enforce-eager \
             --port 8000 &
 
           SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
           # Wait for server to start
           for i in {1..30}; do
-            if curl -s http://localhost:8000/health > /dev/null; then
+            if curl -fsS --connect-timeout 2 --max-time 2 \
+                http://localhost:8000/health > /dev/null; then
               echo "Server started successfully"
               break
             fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "Server exited before becoming healthy"
+              wait "$SERVER_PID"
+              exit 1
+            fi
             if [ "$i" -eq 30 ]; then
               echo "Server failed to start"
-              kill "$SERVER_PID"
               exit 1
             fi
             sleep 2
           done
 
           # Test health endpoint
-          curl -f http://localhost:8000/health
+          curl -f --connect-timeout 2 --max-time 30 http://localhost:8000/health
 
           # Test completion
-          curl -f http://localhost:8000/v1/completions \
+          curl -f --connect-timeout 2 --max-time 30 http://localhost:8000/v1/completions \
             -H "Content-Type: application/json" \
             -d '{
               "model": "Qwen/Qwen3-0.6B",
@@ -81,5 +127,4 @@ jobs:
               "max_tokens": 5
             }'
 
-          # Cleanup
-          kill "$SERVER_PID"
+          # The EXIT trap cleans up the server on both success and failure.

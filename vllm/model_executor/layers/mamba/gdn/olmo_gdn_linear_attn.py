@@ -17,6 +17,7 @@ from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
+from vllm.model_executor.layers.fla.ops.gdn_chunk_kernels import bind_chunk_kernels
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -72,6 +73,9 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         super().__init__(config, vllm_config, prefix=prefix)
+        self.chunk_kernels = bind_chunk_kernels(
+            vllm_config, vllm_config.kernel_config.gdn.schedule
+        )
 
         assert getattr(config, "linear_use_gate", True), (
             "OlmoHybridGatedDeltaNet requires linear_use_gate=True"
@@ -462,6 +466,7 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
                 use_qk_l2norm_in_kernel=True,
+                kernels=self.chunk_kernels,
             )
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype

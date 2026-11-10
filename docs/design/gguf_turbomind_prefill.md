@@ -113,3 +113,29 @@ RPATH/RUNPATH remain empty. The affine prefill arithmetic is unchanged.
 
 - Final wheel SHA256: `53faa03f7df0221466fc77008d59e83ec69582f69f9811125b947b68f32c09ad`
 - Final core SHA256: `b6a3385459729f78f11acc06b1b4290d9dcc128ade182450c5a15a904324b692`
+
+## Additional Flash-Next layout calibration candidate
+
+The existing affine family additionally admits these physical `(bits, group,
+K, N)` layouts at4096 query rows: `(4,32,2560,1536)`, `(4,32,1536,2560)`,
+`(4,32,2560,3072)`, `(4,32,2560,4096)`, `(5,32,2560,1536)`, and
+`(5,32,1536,2560)`. Smaller batches retain fused MMA and the small-batch
+segment path. Weight restoration, scratch ownership and decode are retained.
+Correctness uses the existing FP16 operands/FP32 accumulation contract;
+the measured acceleration subset is4096--8192 rows on SM70/CUDA12.8.
+
+Two additional Q8/group32 layouts select the same DQ/FP32 BLAS family:
+K1536/N2560 at M>=4096, and K160/N2560 at M>=6144. Segment restoration
+and DQ are included in the paired four-rank measurements. The latter retains
+fused MMA below6144 because the4096-row measurement regresses. Threshold
+neighbors, native/framework dispatch, compiled calls and changed-input graph
+replay pass; the measured acceleration subset is4096--8192 and6144--8192
+query rows respectively, without widening the native correctness range.
+
+The native NN provider uses cuBLAS algorithm3 TensorOp (enum103) only for SM70, K2560,
+N1536/3072/3328/3584/4096 and6000--6200 rows. Other shapes keep the existing
+algorithm; an unsupported algorithm3 also retries the existing one. FP32
+accumulation and the ban on reduced-precision reductions are unchanged.
+Threshold neighbors and graph replay use the existing .003 row-L2 contract.
+Full segment-restoration measurements and the normal-package identity are in
+the performance worklog. Full-model evaluation is required before promotion.

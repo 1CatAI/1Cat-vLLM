@@ -50,3 +50,20 @@ def test_dense_fp64_oracle_with_column_and_k_tails(m):
     magnitude = x.cpu().double().abs() @ weight.cpu().double().abs().T
     bound = spacing + magnitude * 32 * torch.finfo(torch.float32).eps
     assert bool((torch.abs(actual - reference) <= bound).all())
+
+
+@pytest.mark.parametrize("m", [1, 5])
+def test_weights_above_fp16_range_keep_finite_products(m):
+    weight = torch.full((19, 257), 2**20, dtype=torch.bfloat16, device="cuda")
+    x = torch.full((m, 257), 2**-20, dtype=torch.float16, device="cuda")
+    output = torch.ops._C.sm70_bf16_weight_linear(x, weight)
+    assert torch.isfinite(output).all()
+    assert torch.equal(output, torch.full_like(output, 257))
+
+
+@pytest.mark.parametrize("m", [0, 6])
+def test_outside_row_contract_is_rejected(m):
+    x = torch.empty(m, 257, dtype=torch.float16, device="cuda")
+    weight = torch.empty(19, 257, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="M1..5"):
+        torch.ops._C.sm70_bf16_weight_linear(x, weight)

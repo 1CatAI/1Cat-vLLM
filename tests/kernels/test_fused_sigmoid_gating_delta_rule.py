@@ -347,7 +347,7 @@ def test_fused_sigmoid_gating_delta_rule_update_spec(
     )
 
 
-@pytest.mark.parametrize("num_reqs", [1, 2])
+@pytest.mark.parametrize("num_reqs", [1, 2, 3, 4])
 @pytest.mark.parametrize("num_speculative_tokens", [3, 7])
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("runtime_bridge", [False, True])

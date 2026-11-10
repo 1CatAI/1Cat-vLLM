@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import vllm.envs as envs
 from vllm.config import CUDAGraphMode
+from vllm.config.execution_policy import GraphPolicy
 from vllm.platforms import current_platform
 from vllm.utils.mem_utils import MemorySnapshot
 from vllm.v1.worker.gpu_worker import Worker
@@ -30,10 +30,12 @@ class _FakeRunner:
         self._device = device
         self.calls = 0
         self.graph_calls = 0
+        self.inference_modes: list[bool] = []
         self._kept: list[torch.Tensor] = []
 
     def profile_run(self) -> None:
         self.calls += 1
+        self.inference_modes.append(torch.is_inference_mode_enabled())
         if self.calls == 1:
             scratch = torch.empty(1024 * MiB, dtype=torch.uint8, device=self._device)
             self._kept.append(
@@ -59,12 +61,10 @@ class _FakeRunner:
         (CUDAGraphMode.FULL, True, 256 * MiB, True),
     ],
 )
+@pytest.mark.parametrize("idle_reserved_mib", [0, 256])
 def test_kv_budget_ignores_cold_compile_scratch(
-    monkeypatch, graph_mode, estimate_graphs, graph_bytes, use_v2
+    monkeypatch, graph_mode, estimate_graphs, graph_bytes, use_v2, idle_reserved_mib
 ) -> None:
-    monkeypatch.setattr(
-        envs, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", estimate_graphs
-    )
     device = torch.device("cuda:0")
     torch.accelerator.empty_cache()
     worker = Worker.__new__(Worker)
@@ -74,13 +74,34 @@ def test_kv_budget_ignores_cold_compile_scratch(
     worker.device = device
     worker.init_snapshot = MemorySnapshot(device=device)
     weights_bytes = 512 * MiB
+    measure = MemorySnapshot.measure
+
+    def with_idle_allocator_pool(snapshot):
+        measure(snapshot)
+        if snapshot.torch_allocated_memory >= weights_bytes:
+            # A retained allocator segment is CUDA/Torch reserved memory, but
+            # its idle portion contains no persistent warmup tensors. Model
+            # this valid snapshot independently of the device allocator's
+            # version-specific splitting/reclamation behavior.
+            idle = idle_reserved_mib * MiB
+            snapshot.torch_memory += idle
+            snapshot.cuda_memory += idle
+            snapshot.free_memory -= idle
+
+    monkeypatch.setattr(MemorySnapshot, "measure", with_idle_allocator_pool)
     weights = torch.empty(weights_bytes, dtype=torch.uint8, device=device)
     worker.requested_memory = int(worker.init_snapshot.free_memory * 0.9)
     worker.cache_config = SimpleNamespace(
         kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
     )
     worker.vllm_config = SimpleNamespace(
-        compilation_config=SimpleNamespace(cudagraph_mode=graph_mode)
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=graph_mode,
+            cudagraph_capture_sizes=None,
+            runtime=GraphPolicy(estimate_graph_memory=estimate_graphs),
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        speculative_config=None,
     )
     runner = _FakeRunner(device, weights_bytes)
     worker.model_runner = runner
@@ -101,6 +122,8 @@ def test_kv_budget_ignores_cold_compile_scratch(
     )
     assert abs(charged - 64 * MiB) <= 32 * MiB
     assert runner.calls == 2
+    # With autograd on, an encoder forward keeps every block's activations alive.
+    assert runner.inference_modes == [True, True]
     assert runner.graph_calls == int(graph_bytes > 0)
     assert worker.cudagraph_memory_estimate == graph_bytes
     del weights

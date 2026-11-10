@@ -1,0 +1,1296 @@
+{
+  "scope": "Unprofiled matched sixteen prompts; first twenty output rounds per prompt omitted; full-round means equal-weighted by prompt, output-token latency pooled; C4 smoke includes first-use setup, no throughput claim",
+  "runtime": "1.5.2.dev1003+gd6268878bb",
+  "contract": {
+    "candidate_python_source": "d6268878bb107a9c87faf50abf12aa5ece25dec3",
+    "candidate_native_source": "2165020b286191a13214f244f0a1f80d7dbf4bdb",
+    "integration_main": "bc01f2899db721a99788f3bc2abc041e4b9a7fd0",
+    "wheel_sha256": "14201d0f6a3ad5050ff09f0a75fe55cc0ff19f5404797ec129614421ce070d60",
+    "gpu_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "gpu_topology": "all pairwise NV2, NUMA0",
+    "sm_clock_mhz": 1290,
+    "memory_clock_mhz": 877,
+    "power_limit_w": 300,
+    "target_sha256": "64b53b64c7aa39f20a7e54bd80582fe595b1d745624ee8a72e92508c0326d810",
+    "draft_sha256": "c18e800daedc59ca68fd13b6a856d795746af6d399a9279ac6a277d1d422f87e",
+    "prompt_fixture_sha256": "765c61184fd80939b5678c07e388efe6be57543ab7e5dff9c489e1775c050415",
+    "runtime_type": "fresh ordinary installed wheel; standard dependencies linked to declared previous benchmark environment",
+    "private_kernel_overrides": false,
+    "sampling": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 20,
+      "seed": 123,
+      "thinking": false,
+      "timing_max_tokens": 600,
+      "timing_ignore_eos": true,
+      "health_ignore_eos": false
+    },
+    "tensor_parallel_size": 4,
+    "speculative_tokens": 7,
+    "speculative_method": "dflash",
+    "speculative_acceptance": "probabilistic",
+    "kv_dtype": "float16",
+    "ssm_dtype": "float32",
+    "attention_backend": "FLASH_ATTN_V100",
+    "max_model_len": 262144,
+    "max_num_batched_tokens": 1024,
+    "max_num_seqs": 4,
+    "cudagraph": true,
+    "prefix_cache": false,
+    "drop_first_rounds_per_prompt": 20,
+    "cohorts": [
+      {
+        "input_tokens": 1024,
+        "prompts": 8
+      },
+      {
+        "input_tokens": 8192,
+        "prompts": 8
+      }
+    ]
+  },
+  "cohorts": [
+    {
+      "input_tokens": 1024,
+      "baseline": {
+        "prompts": 8,
+        "prompt_mean_full_round_ms": 19.507364709968083,
+        "prompt_mean_tokens_per_round": 2.9207734165045425,
+        "steady_intervals": 1490,
+        "steady_emitted_tokens": 4334,
+        "pooled_ms_per_output_token": 6.70656872654087,
+        "pooled_output_tokens_per_second": 149.1075452701403,
+        "draft_rounds": 1650,
+        "accepted_draft_tokens": 3157,
+        "draft_acceptance_fraction": 0.2733333333333333,
+        "mean_ttft_ms": 346.0750877857208
+      },
+      "candidate": {
+        "prompts": 8,
+        "prompt_mean_full_round_ms": 17.236686776917153,
+        "prompt_mean_tokens_per_round": 2.851803766956403,
+        "steady_intervals": 1525,
+        "steady_emitted_tokens": 4334,
+        "pooled_ms_per_output_token": 6.065123133289567,
+        "pooled_output_tokens_per_second": 164.8771142850031,
+        "draft_rounds": 1685,
+        "accepted_draft_tokens": 3125,
+        "draft_acceptance_fraction": 0.26494277236117,
+        "mean_ttft_ms": 371.1753785610199
+      },
+      "round_saving_ms": 2.27067793305093,
+      "round_speedup": 1.131735174076015
+    },
+    {
+      "input_tokens": 8192,
+      "baseline": {
+        "prompts": 8,
+        "prompt_mean_full_round_ms": 20.568914876834906,
+        "prompt_mean_tokens_per_round": 2.8938613307938104,
+        "steady_intervals": 1519,
+        "steady_emitted_tokens": 4353,
+        "pooled_ms_per_output_token": 7.1773572297295685,
+        "pooled_output_tokens_per_second": 139.32704866045498,
+        "draft_rounds": 1679,
+        "accepted_draft_tokens": 3127,
+        "draft_acceptance_fraction": 0.26605972943078365,
+        "mean_ttft_ms": 2693.329334259033
+      },
+      "candidate": {
+        "prompts": 8,
+        "prompt_mean_full_round_ms": 18.344938411680697,
+        "prompt_mean_tokens_per_round": 2.990100963032946,
+        "steady_intervals": 1463,
+        "steady_emitted_tokens": 4353,
+        "pooled_ms_per_output_token": 6.165524926958719,
+        "pooled_output_tokens_per_second": 162.19219155655446,
+        "draft_rounds": 1623,
+        "accepted_draft_tokens": 3184,
+        "draft_acceptance_fraction": 0.2802570196285538,
+        "mean_ttft_ms": 2841.849684715271
+      },
+      "round_saving_ms": 2.223976465154209,
+      "round_speedup": 1.1212310674064812
+    }
+  ],
+  "clock_audit": {
+    "off": {
+      "complete": true,
+      "cases": 16,
+      "pair_admission": [
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        },
+        {
+          "pure": 8,
+          "mixed": 52
+        }
+      ],
+      "planes_per_rank": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "health": [
+        {
+          "prompt": "请只回答17乘以23的数值。",
+          "text": "391",
+          "finish_reason": "stop"
+        },
+        {
+          "prompt": "Reply with one brief sentence explaining what a unit test does.",
+          "text": "A unit test verifies that a specific, isolated piece of code (such as a function or method) behaves as expected under given conditions.",
+          "finish_reason": "stop"
+        }
+      ],
+      "c4_requests": 4,
+      "clock_samples": [
+        {
+          "rank": 0,
+          "sm": "1290 MHz",
+          "memory": "877 MHz",
+          "samples": 90
+        },
+        {
+          "rank": 1,
+          "sm": "1290 MHz",
+          "memory": "877 MHz",
+          "samples": 90
+        },
+        {
+          "rank": 2,
+          "sm": "1290 MHz",
+          "memory": "877 MHz",
+          "samples": 90
+        },
+        {
+          "rank": 3,
+          "sm": "1290 MHz",
+          "memory": "877 MHz",
+          "samples": 90
+        }
+      ],
+      "window_utc": [
+        "2026-10-06T06:16:04.471351+00:00",
+        "2026-10-06T06:17:48.413683+00:00"
+      ]
+    },
+    "on": {
+      "complete": true,
+      "cases": 16,
+      "pair_admission": [
+        {
+          "pure": 0,
+          "mixed": 14
+        },
+        {
+          "pure": 0,
+          "mixed": 14
+        },
+        {
+          "pure": 0,
+          "mixed": 14
+        },
+        {
+          "pure": 0,
+          "mixed": 14
+        }
+      ],
+      "planes_per_rank": [
+        215,
+        215,
+        215,
+        215
+      ],
+      "health": [
+        {
+          "prompt": "请只回答17乘以23的数值。",
+          "text": "391",
+          "finish_reason": "stop"
+        },
+        {
+          "prompt": "Reply with one brief sentence explaining what a unit test does.",
+          "text": "A unit test verifies that a specific, isolated piece of code (such as a function or method) behaves as expected under given conditions.",
+          "finish_reason": "stop"
+        }
+      ],
+      "c4_requests": 4,
+      "clock_samples": [
+        {
+          "rank": 0,
+          "sm": "1290 MHz",
+          "memory": "877 MHz",
+          "samples": 82
+        },
+        {
+          "rank": 1,
+          "sm": "1290 MHz",
+          "memory": "877 MHz",
+          "samples": 82
+        },
+        {
+          "rank": 2,
+          "sm": "1290 MHz",
+          "memory": "877 MHz",
+          "samples": 82
+        },
+        {
+          "rank": 3,
+          "sm": "1290 MHz",
+          "memory": "877 MHz",
+          "samples": 82
+        }
+      ],
+      "window_utc": [
+        "2026-10-06T06:33:11.534613+00:00",
+        "2026-10-06T06:34:43.561151+00:00"
+      ]
+    }
+  },
+  "routes": {
+    "off_pairs": [
+      {
+        "pure": 8,
+        "mixed": 52
+      },
+      {
+        "pure": 8,
+        "mixed": 52
+      },
+      {
+        "pure": 8,
+        "mixed": 52
+      },
+      {
+        "pure": 8,
+        "mixed": 52
+      }
+    ],
+    "on_pairs": [
+      {
+        "pure": 0,
+        "mixed": 14
+      },
+      {
+        "pure": 0,
+        "mixed": 14
+      },
+      {
+        "pure": 0,
+        "mixed": 14
+      },
+      {
+        "pure": 0,
+        "mixed": 14
+      }
+    ],
+    "on_plane_counts": [
+      215,
+      215,
+      215,
+      215
+    ]
+  },
+  "natural_health": [
+    {
+      "prompt": "请只回答17乘以23的数值。",
+      "text": "391",
+      "finish_reason": "stop"
+    },
+    {
+      "prompt": "Reply with one brief sentence explaining what a unit test does.",
+      "text": "A unit test verifies that a specific, isolated piece of code (such as a function or method) behaves as expected under given conditions.",
+      "finish_reason": "stop"
+    }
+  ],
+  "c4": {
+    "requests": 4,
+    "wall_seconds": 7.745630040066317,
+    "outputs": [
+      {
+        "text": "Software testing is not just a \"checklist\" step at the end of a project; it is a fundamental pillar of software engineering that ensures quality, reliability, and business value. Here’s why it matters, broken down into key categories:\n\n### 1. **Ensures Correctness and Quality**\n- **Detects Defects Early:** Testing identifies bugs before they reach production. Catching a bug during development is significantly cheaper and faster than fixing it after release.\n",
+        "finish_reason": "length",
+        "tokens": 96
+      },
+      {
+        "text": "要计算 $17 \\times 23$，我们可以使用多种方法。下面我将展示最常用且直观的**拆分法（分配律）**以及**竖式乘法**两种过程。\n\n### 方法一：拆分法（分配律）\n\n将其中一个数拆分为整数和个位数，利用乘法分配律 $(a + b) \\times c = a \\times c + b \\times c$ 进行计算。\n\n我们将 $23$",
+        "finish_reason": "length",
+        "tokens": 96
+      },
+      {
+        "text": "Here are three practical and effective ways to save water:\n\n1. **Fix Leaks Promptly**\n   A dripping faucet or a running toilet can waste hundreds of gallons of water per month. Check under sinks and in your bathroom for signs of moisture or slow drips. If you hear a toilet running when it shouldn’t, replace the flapper or fill valve. Even a small leak can add up to significant savings over time.\n\n2. **Use Water-Eff",
+        "finish_reason": "length",
+        "tokens": 96
+      },
+      {
+        "text": "晨光透过薄雾，轻柔地洒在刚刚苏醒的大地上。昨夜的雨洗去了尘世的喧嚣，空气里弥漫着泥土与青草混合的清新气息，每一口呼吸都像是被过滤过般纯净。\n\n屋檐下，最后几滴雨水还在不知疲倦地坠落，“滴答”声清脆悦耳，敲打着青石板路，泛起层层涟漪。树叶上的水珠晶莹剔透，折射着初升的太阳，像无数颗散落的钻石，在",
+        "finish_reason": "length",
+        "tokens": 96
+      }
+    ]
+  },
+  "raw_sha256": {
+    "model-off.json": "2f18c754818a29928e0f3fd23a311f773ef6675da0d21dc9521bc3fbe2f263f4",
+    "model-on.json": "4795b53ad3b26b05194f217217d7064878250ea61300567d7c5f4fa66a511568",
+    "model-clocks.csv": "301ae0296497dad13d8f2508894d1d2ff99eaefe5305438c90b2be9fc1dbce3a",
+    "topology.txt": "d3b9b58f1b625b166113e7d49eca9e0472916f032e187dbe88a30dd9caa7166f",
+    "runtime-audit.json": "657b3c1e793a60e81f1a1264cd1041d6bf02a4ffe96fe172beaa40fff3c26f2c",
+    "nv-matched-cases.json": "765c61184fd80939b5678c07e388efe6be57543ab7e5dff9c489e1775c050415"
+  },
+  "prompt_results": {
+    "off": [
+      {
+        "prompt_id": "nv-1024-0",
+        "actual_input_len": 1024,
+        "steady_round_ms": 19.485937270881802,
+        "tokens_per_round": 3.086206896551724,
+        "steady_rounds": 174,
+        "ttft_ms": 446.11358642578125
+      },
+      {
+        "prompt_id": "nv-1024-1",
+        "actual_input_len": 1024,
+        "steady_round_ms": 19.500862970796714,
+        "tokens_per_round": 2.617224880382775,
+        "steady_rounds": 209,
+        "ttft_ms": 332.1642875671387
+      },
+      {
+        "prompt_id": "nv-1024-2",
+        "actual_input_len": 1024,
+        "steady_round_ms": 19.530595568609115,
+        "tokens_per_round": 2.736040609137056,
+        "steady_rounds": 197,
+        "ttft_ms": 332.1406841278076
+      },
+      {
+        "prompt_id": "nv-1024-3",
+        "actual_input_len": 1024,
+        "steady_round_ms": 19.497779512855132,
+        "tokens_per_round": 2.8082901554404147,
+        "steady_rounds": 193,
+        "ttft_ms": 331.83956146240234
+      },
+      {
+        "prompt_id": "nv-1024-4",
+        "actual_input_len": 1024,
+        "steady_round_ms": 19.490392649881976,
+        "tokens_per_round": 3.133720930232558,
+        "steady_rounds": 172,
+        "ttft_ms": 331.4974308013916
+      },
+      {
+        "prompt_id": "nv-1024-5",
+        "actual_input_len": 1024,
+        "steady_round_ms": 19.51080149792405,
+        "tokens_per_round": 2.865284974093264,
+        "steady_rounds": 193,
+        "ttft_ms": 331.5460681915283
+      },
+      {
+        "prompt_id": "nv-1024-6",
+        "actual_input_len": 1024,
+        "steady_round_ms": 19.529240191414278,
+        "tokens_per_round": 3.0508474576271185,
+        "steady_rounds": 177,
+        "ttft_ms": 331.67171478271484
+      },
+      {
+        "prompt_id": "nv-1024-7",
+        "actual_input_len": 1024,
+        "steady_round_ms": 19.5133080173816,
+        "tokens_per_round": 3.0685714285714285,
+        "steady_rounds": 175,
+        "ttft_ms": 331.62736892700195
+      },
+      {
+        "prompt_id": "nv-8192-0",
+        "actual_input_len": 8192,
+        "steady_round_ms": 20.549339321810788,
+        "tokens_per_round": 2.707920792079208,
+        "steady_rounds": 202,
+        "ttft_ms": 2701.4617919921875
+      },
+      {
+        "prompt_id": "nv-8192-1",
+        "actual_input_len": 8192,
+        "steady_round_ms": 20.561603466455725,
+        "tokens_per_round": 2.6553398058252426,
+        "steady_rounds": 206,
+        "ttft_ms": 2691.906452178955
+      },
+      {
+        "prompt_id": "nv-8192-2",
+        "actual_input_len": 8192,
+        "steady_round_ms": 20.552502906660443,
+        "tokens_per_round": 2.8195876288659796,
+        "steady_rounds": 194,
+        "ttft_ms": 2692.7666664123535
+      },
+      {
+        "prompt_id": "nv-8192-3",
+        "actual_input_len": 8192,
+        "steady_round_ms": 20.547032948223137,
+        "tokens_per_round": 2.5,
+        "steady_rounds": 212,
+        "ttft_ms": 2691.36118888855
+      },
+      {
+        "prompt_id": "nv-8192-4",
+        "actual_input_len": 8192,
+        "steady_round_ms": 20.56792127597003,
+        "tokens_per_round": 3.2883435582822087,
+        "steady_rounds": 163,
+        "ttft_ms": 2691.983938217163
+      },
+      {
+        "prompt_id": "nv-8192-5",
+        "actual_input_len": 8192,
+        "steady_round_ms": 20.604111365312097,
+        "tokens_per_round": 2.781725888324873,
+        "steady_rounds": 197,
+        "ttft_ms": 2692.3587322235107
+      },
+      {
+        "prompt_id": "nv-8192-6",
+        "actual_input_len": 8192,
+        "steady_round_ms": 20.58351688174298,
+        "tokens_per_round": 3.425,
+        "steady_rounds": 160,
+        "ttft_ms": 2692.3887729644775
+      },
+      {
+        "prompt_id": "nv-8192-7",
+        "actual_input_len": 8192,
+        "steady_round_ms": 20.585290848504048,
+        "tokens_per_round": 2.972972972972973,
+        "steady_rounds": 185,
+        "ttft_ms": 2692.4071311950684
+      }
+    ],
+    "on": [
+      {
+        "prompt_id": "nv-1024-0",
+        "actual_input_len": 1024,
+        "steady_round_ms": 17.228629936546305,
+        "tokens_per_round": 2.6323529411764706,
+        "steady_rounds": 204,
+        "ttft_ms": 511.7664337158203
+      },
+      {
+        "prompt_id": "nv-1024-1",
+        "actual_input_len": 1024,
+        "steady_round_ms": 17.24174863137483,
+        "tokens_per_round": 2.617224880382775,
+        "steady_rounds": 209,
+        "ttft_ms": 351.2156009674072
+      },
+      {
+        "prompt_id": "nv-1024-2",
+        "actual_input_len": 1024,
+        "steady_round_ms": 17.225021020793182,
+        "tokens_per_round": 2.8823529411764706,
+        "steady_rounds": 187,
+        "ttft_ms": 351.062536239624
+      },
+      {
+        "prompt_id": "nv-1024-3",
+        "actual_input_len": 1024,
+        "steady_round_ms": 17.212430784144463,
+        "tokens_per_round": 2.7794871794871794,
+        "steady_rounds": 195,
+        "ttft_ms": 350.8718013763428
+      },
+      {
+        "prompt_id": "nv-1024-4",
+        "actual_input_len": 1024,
+        "steady_round_ms": 17.215919254261546,
+        "tokens_per_round": 3.115606936416185,
+        "steady_rounds": 173,
+        "ttft_ms": 350.9228229522705
+      },
+      {
+        "prompt_id": "nv-1024-5",
+        "actual_input_len": 1024,
+        "steady_round_ms": 17.274075575387446,
+        "tokens_per_round": 2.8952879581151834,
+        "steady_rounds": 191,
+        "ttft_ms": 350.8787155151367
+      },
+      {
+        "prompt_id": "nv-1024-6",
+        "actual_input_len": 1024,
+        "steady_round_ms": 17.234096203609713,
+        "tokens_per_round": 3.0508474576271185,
+        "steady_rounds": 177,
+        "ttft_ms": 351.3360023498535
+      },
+      {
+        "prompt_id": "nv-1024-7",
+        "actual_input_len": 1024,
+        "steady_round_ms": 17.261572809219754,
+        "tokens_per_round": 2.8412698412698414,
+        "steady_rounds": 189,
+        "ttft_ms": 351.3491153717041
+      },
+      {
+        "prompt_id": "nv-8192-0",
+        "actual_input_len": 8192,
+        "steady_round_ms": 18.334383443774033,
+        "tokens_per_round": 3.0388888888888888,
+        "steady_rounds": 180,
+        "ttft_ms": 2852.660655975342
+      },
+      {
+        "prompt_id": "nv-8192-1",
+        "actual_input_len": 8192,
+        "steady_round_ms": 18.35156231643442,
+        "tokens_per_round": 2.7908163265306123,
+        "steady_rounds": 196,
+        "ttft_ms": 2841.9554233551025
+      },
+      {
+        "prompt_id": "nv-8192-2",
+        "actual_input_len": 8192,
+        "steady_round_ms": 18.34589510690421,
+        "tokens_per_round": 2.9095744680851063,
+        "steady_rounds": 188,
+        "ttft_ms": 2841.4318561553955
+      },
+      {
+        "prompt_id": "nv-8192-3",
+        "actual_input_len": 8192,
+        "steady_round_ms": 18.33257728555639,
+        "tokens_per_round": 2.704081632653061,
+        "steady_rounds": 196,
+        "ttft_ms": 2841.245174407959
+      },
+      {
+        "prompt_id": "nv-8192-4",
+        "actual_input_len": 8192,
+        "steady_round_ms": 18.354452766500916,
+        "tokens_per_round": 3.2883435582822087,
+        "steady_rounds": 163,
+        "ttft_ms": 2842.0891761779785
+      },
+      {
+        "prompt_id": "nv-8192-5",
+        "actual_input_len": 8192,
+        "steady_round_ms": 18.351006193067104,
+        "tokens_per_round": 2.8541666666666665,
+        "steady_rounds": 192,
+        "ttft_ms": 2838.1714820861816
+      },
+      {
+        "prompt_id": "nv-8192-6",
+        "actual_input_len": 8192,
+        "steady_round_ms": 18.342237656741787,
+        "tokens_per_round": 3.361963190184049,
+        "steady_rounds": 163,
+        "ttft_ms": 2838.815212249756
+      },
+      {
+        "prompt_id": "nv-8192-7",
+        "actual_input_len": 8192,
+        "steady_round_ms": 18.347392524466724,
+        "tokens_per_round": 2.972972972972973,
+        "steady_rounds": 185,
+        "ttft_ms": 2838.428497314453
+      }
+    ]
+  },
+  "trace": {
+    "contract": {
+      "input": 1024,
+      "output": 64,
+      "max_model_len": 32768,
+      "tp": 4,
+      "sm_clock_mhz": 1290,
+      "memory_clock_mhz": 877,
+      "sampling": {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 20,
+        "seed": 123
+      },
+      "nsys": "2024.6.2",
+      "boundary": "first target GPU node to next target GPU node; drop first and final transition",
+      "interpretation": "Service sums are non-additive; profiled intervals do not replace unprofiled model latency. Weight footprints are not measured DRAM traffic."
+    },
+    "clock_samples": [
+      {
+        "rank": 0,
+        "sm": "1290 MHz",
+        "memory": "877 MHz",
+        "count": 1
+      },
+      {
+        "rank": 1,
+        "sm": "1290 MHz",
+        "memory": "877 MHz",
+        "count": 1
+      },
+      {
+        "rank": 2,
+        "sm": "1290 MHz",
+        "memory": "877 MHz",
+        "count": 1
+      },
+      {
+        "rank": 3,
+        "sm": "1290 MHz",
+        "memory": "877 MHz",
+        "count": 1
+      }
+    ],
+    "ranks": [
+      {
+        "rank": 0,
+        "rounds": 13,
+        "projection_service_ms": 8.51211376923077,
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 34.07795993589744,
+            "service_ms_per_round": 1.635742076923077,
+            "weight_stream_bytes_per_call": 9924266.666666666,
+            "effective_weight_gbps": 291.2224407016961
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 20.25391185897436,
+            "service_ms_per_round": 0.9721877692307693,
+            "weight_stream_bytes_per_call": 3932160.0,
+            "effective_weight_gbps": 194.14323649570383
+          },
+          "gate_up.native": {
+            "calls_per_round": 14.0,
+            "us_per_call": 62.63500549450549,
+            "service_ms_per_round": 0.8768900769230769,
+            "weight_stream_bytes_per_call": 14771931.42857143,
+            "effective_weight_gbps": 235.8414645603769
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 28.793234375,
+            "service_ms_per_round": 1.842767,
+            "weight_stream_bytes_per_call": 10681440.0,
+            "effective_weight_gbps": 370.9704808041385
+          },
+          "gate_up.planes": {
+            "calls_per_round": 50.0,
+            "us_per_call": 46.03506461538462,
+            "service_ms_per_round": 2.301753230769231,
+            "weight_stream_bytes_per_call": 20833894.4,
+            "effective_weight_gbps": 452.5657685953904
+          },
+          "attention.q+k+v": {
+            "calls_per_round": 16.0,
+            "us_per_call": 36.05434134615385,
+            "service_ms_per_round": 0.5768694615384615,
+            "weight_stream_bytes_per_call": 8780800.0,
+            "effective_weight_gbps": 243.54348664135856
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 19.119009615384616,
+            "service_ms_per_round": 0.3059041538461539,
+            "weight_stream_bytes_per_call": 3824640.0,
+            "effective_weight_gbps": 200.0438347456242
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 11.501345562130178,
+            "service_ms_per_round": 1.4951749230769233
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 6.011525939177102,
+            "service_ms_per_round": 0.7754868461538461
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.463080128205128,
+            "service_ms_per_round": 1.2186835384615387
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.8038978365384617,
+            "service_ms_per_round": 0.48689892307692306
+          },
+          "layout_or_copy": {
+            "calls_per_round": 37.0,
+            "us_per_call": 3.306060291060291,
+            "service_ms_per_round": 0.12232423076923077
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.18285096153846,
+            "service_ms_per_round": 1.029851230769231
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.781599889319314,
+            "service_ms_per_round": 0.8036423846153847
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.4217525083612,
+            "service_ms_per_round": 0.9987003076923077
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 12.881,
+            "service_ms_per_round": 0.231858
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 270.1082307692308,
+            "service_ms_per_round": 0.2701082307692308
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.404983277591973,
+            "service_ms_per_round": 0.1703146153846154
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 103.82418461538461,
+            "service_ms_per_round": 0.519120923076923
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 273.09430769230767,
+            "service_ms_per_round": 0.27309430769230775
+          }
+        },
+        "means": {
+          "round_ms": 18.805984384615385,
+          "target_graph_ms": 14.929987615384615,
+          "target_kernel_union_ms": 13.624705692307693,
+          "target_inter_kernel_gap_ms": 1.305281923076923,
+          "after_target_ms": 3.875996769230769,
+          "after_target_kernel_union_ms": 3.266504,
+          "after_target_inter_kernel_gap_ms": 0.6094927692307692,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.107153846153846,
+          "graph_boundary_idle_us": 353.8066153846154,
+          "draft_graph_end_to_next_target_us": 214.1376923076923,
+          "last_tail_graph_to_next_target_us": 214.1376923076923
+        },
+        "previous_output_batch": {
+          "projection_service_ms": 10.541797846153846,
+          "means": {
+            "round_ms": 21.043222692307694,
+            "target_graph_ms": 17.128622,
+            "target_kernel_union_ms": 15.766467153846154,
+            "target_inter_kernel_gap_ms": 1.3621548461538462,
+            "after_target_ms": 3.914600692307692,
+            "after_target_kernel_union_ms": 3.2977805384615384,
+            "after_target_inter_kernel_gap_ms": 0.6168201538461539,
+            "tail_kernel_count": 210,
+            "tail_last_kernel_to_next_target_us": 10.569846153846154,
+            "graph_boundary_idle_us": 357.80315384615386,
+            "draft_graph_end_to_next_target_us": 216.07807692307694,
+            "last_tail_graph_to_next_target_us": 216.07807692307694
+          }
+        }
+      },
+      {
+        "rank": 1,
+        "rounds": 13,
+        "projection_service_ms": 8.630130538461538,
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 34.2138766025641,
+            "service_ms_per_round": 1.6422660769230768,
+            "weight_stream_bytes_per_call": 9924266.666666666,
+            "effective_weight_gbps": 290.0655421760336
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 20.44430128205128,
+            "service_ms_per_round": 0.9813264615384616,
+            "weight_stream_bytes_per_call": 3932160.0,
+            "effective_weight_gbps": 192.33525987274365
+          },
+          "gate_up.native": {
+            "calls_per_round": 14.0,
+            "us_per_call": 62.7789010989011,
+            "service_ms_per_round": 0.8789046153846155,
+            "weight_stream_bytes_per_call": 14771931.42857143,
+            "effective_weight_gbps": 235.3008920194368
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 29.14625721153846,
+            "service_ms_per_round": 1.8653604615384616,
+            "weight_stream_bytes_per_call": 10681440.0,
+            "effective_weight_gbps": 366.4772434579153
+          },
+          "gate_up.planes": {
+            "calls_per_round": 50.0,
+            "us_per_call": 47.47655384615384,
+            "service_ms_per_round": 2.3738276923076924,
+            "weight_stream_bytes_per_call": 20833894.4,
+            "effective_weight_gbps": 438.8249085540523
+          },
+          "attention.q+k+v": {
+            "calls_per_round": 16.0,
+            "us_per_call": 36.05008173076923,
+            "service_ms_per_round": 0.5768013076923076,
+            "weight_stream_bytes_per_call": 8780800.0,
+            "effective_weight_gbps": 243.57226331904454
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 19.477745192307694,
+            "service_ms_per_round": 0.3116439230769231,
+            "weight_stream_bytes_per_call": 3824640.0,
+            "effective_weight_gbps": 196.35948423385565
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 10.727166863905325,
+            "service_ms_per_round": 1.3945316923076922
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 6.013612403100775,
+            "service_ms_per_round": 0.775756
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.466296474358975,
+            "service_ms_per_round": 1.2191466923076923
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.8615078125,
+            "service_ms_per_round": 0.494273
+          },
+          "layout_or_copy": {
+            "calls_per_round": 37.0,
+            "us_per_call": 3.297802494802495,
+            "service_ms_per_round": 0.1220186923076923
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.267459134615386,
+            "service_ms_per_round": 1.0325586923076924
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.833294410625346,
+            "service_ms_per_round": 0.8108279230769232
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.77227090301003,
+            "service_ms_per_round": 1.0067622307692308
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 11.355649572649572,
+            "service_ms_per_round": 0.2044016923076923
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 274.03646153846154,
+            "service_ms_per_round": 0.27403646153846156
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.44638127090301,
+            "service_ms_per_round": 0.17126676923076922
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 104.51021538461538,
+            "service_ms_per_round": 0.5225510769230769
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 278.2579230769231,
+            "service_ms_per_round": 0.2782579230769231
+          }
+        },
+        "means": {
+          "round_ms": 18.826123384615386,
+          "target_graph_ms": 14.952870384615384,
+          "target_kernel_union_ms": 13.652215923076923,
+          "target_inter_kernel_gap_ms": 1.3006544615384616,
+          "after_target_ms": 3.873253,
+          "after_target_kernel_union_ms": 3.2678702307692307,
+          "after_target_inter_kernel_gap_ms": 0.6053827692307693,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.020307692307693,
+          "graph_boundary_idle_us": 347.27715384615385,
+          "draft_graph_end_to_next_target_us": 211.4123076923077,
+          "last_tail_graph_to_next_target_us": 211.4123076923077
+        },
+        "previous_output_batch": {
+          "projection_service_ms": 10.548743769230768,
+          "means": {
+            "round_ms": 21.090526384615384,
+            "target_graph_ms": 17.175171307692306,
+            "target_kernel_union_ms": 15.720770230769231,
+            "target_inter_kernel_gap_ms": 1.4544010769230769,
+            "after_target_ms": 3.9153550769230767,
+            "after_target_kernel_union_ms": 3.290934076923077,
+            "after_target_inter_kernel_gap_ms": 0.624421,
+            "tail_kernel_count": 210,
+            "tail_last_kernel_to_next_target_us": 11.367384615384616,
+            "graph_boundary_idle_us": 364.3433076923077,
+            "draft_graph_end_to_next_target_us": 216.597,
+            "last_tail_graph_to_next_target_us": 216.597
+          }
+        }
+      },
+      {
+        "rank": 2,
+        "rounds": 13,
+        "projection_service_ms": 8.604730230769231,
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 34.045003205128204,
+            "service_ms_per_round": 1.6341601538461537,
+            "weight_stream_bytes_per_call": 9924266.666666666,
+            "effective_weight_gbps": 291.5043540125669
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 20.463020833333335,
+            "service_ms_per_round": 0.9822250000000001,
+            "weight_stream_bytes_per_call": 3932160.0,
+            "effective_weight_gbps": 192.15931176665222
+          },
+          "gate_up.native": {
+            "calls_per_round": 14.0,
+            "us_per_call": 62.85009340659341,
+            "service_ms_per_round": 0.8799013076923077,
+            "weight_stream_bytes_per_call": 14771931.42857143,
+            "effective_weight_gbps": 235.0343591855625
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 29.09953245192308,
+            "service_ms_per_round": 1.862370076923077,
+            "weight_stream_bytes_per_call": 10681440.0,
+            "effective_weight_gbps": 367.0656914384239
+          },
+          "gate_up.planes": {
+            "calls_per_round": 50.0,
+            "us_per_call": 47.169546153846156,
+            "service_ms_per_round": 2.358477307692308,
+            "weight_stream_bytes_per_call": 20833894.4,
+            "effective_weight_gbps": 441.68104420697773
+          },
+          "attention.q+k+v": {
+            "calls_per_round": 16.0,
+            "us_per_call": 36.0082548076923,
+            "service_ms_per_round": 0.5761320769230769,
+            "weight_stream_bytes_per_call": 8780800.0,
+            "effective_weight_gbps": 243.8551950627774
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 19.46651923076923,
+            "service_ms_per_round": 0.31146430769230765,
+            "weight_stream_bytes_per_call": 3824640.0,
+            "effective_weight_gbps": 196.47272091431145
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 11.121586982248521,
+            "service_ms_per_round": 1.4458063076923076
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 5.986113297555158,
+            "service_ms_per_round": 0.7722086153846153
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.463426282051282,
+            "service_ms_per_round": 1.2187333846153847
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.397537860576923,
+            "service_ms_per_round": 0.43488484615384615
+          },
+          "layout_or_copy": {
+            "calls_per_round": 37.0,
+            "us_per_call": 3.3084511434511437,
+            "service_ms_per_round": 0.1224126923076923
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.287471153846155,
+            "service_ms_per_round": 1.033199076923077
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.847888765910349,
+            "service_ms_per_round": 0.8128565384615384
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.752575250836124,
+            "service_ms_per_round": 1.0063092307692307
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 11.116602564102564,
+            "service_ms_per_round": 0.20009884615384615
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 275.71015384615384,
+            "service_ms_per_round": 0.2757101538461538
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.457531772575251,
+            "service_ms_per_round": 0.1715232307692308
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 104.91946153846153,
+            "service_ms_per_round": 0.5245973076923077
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 277.9896153846154,
+            "service_ms_per_round": 0.27798961538461536
+          }
+        },
+        "means": {
+          "round_ms": 18.826081923076924,
+          "target_graph_ms": 14.947994384615384,
+          "target_kernel_union_ms": 13.616474846153846,
+          "target_inter_kernel_gap_ms": 1.3315195384615384,
+          "after_target_ms": 3.8780875384615383,
+          "after_target_kernel_union_ms": 3.268929846153846,
+          "after_target_inter_kernel_gap_ms": 0.6091576923076923,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.773538461538461,
+          "graph_boundary_idle_us": 348.6576153846154,
+          "draft_graph_end_to_next_target_us": 215.79876923076924,
+          "last_tail_graph_to_next_target_us": 215.79876923076924
+        },
+        "previous_output_batch": {
+          "projection_service_ms": 10.565824538461538,
+          "means": {
+            "round_ms": 21.082971846153846,
+            "target_graph_ms": 17.165003923076924,
+            "target_kernel_union_ms": 15.696188846153845,
+            "target_inter_kernel_gap_ms": 1.468815076923077,
+            "after_target_ms": 3.917967923076923,
+            "after_target_kernel_union_ms": 3.2784144615384614,
+            "after_target_inter_kernel_gap_ms": 0.6395534615384615,
+            "tail_kernel_count": 210,
+            "tail_last_kernel_to_next_target_us": 11.596230769230768,
+            "graph_boundary_idle_us": 373.73853846153844,
+            "draft_graph_end_to_next_target_us": 219.19876923076924,
+            "last_tail_graph_to_next_target_us": 219.19876923076924
+          }
+        }
+      },
+      {
+        "rank": 3,
+        "rounds": 13,
+        "projection_service_ms": 8.593690461538461,
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 34.06272275641025,
+            "service_ms_per_round": 1.6350106923076924,
+            "weight_stream_bytes_per_call": 9924266.666666666,
+            "effective_weight_gbps": 291.3527123958117
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 20.469971153846156,
+            "service_ms_per_round": 0.9825586153846154,
+            "weight_stream_bytes_per_call": 3932160.0,
+            "effective_weight_gbps": 192.0940664960916
+          },
+          "gate_up.native": {
+            "calls_per_round": 14.0,
+            "us_per_call": 62.681412087912086,
+            "service_ms_per_round": 0.8775397692307693,
+            "weight_stream_bytes_per_call": 14771931.42857143,
+            "effective_weight_gbps": 235.66685778957026
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 29.025498798076924,
+            "service_ms_per_round": 1.8576319230769232,
+            "weight_stream_bytes_per_call": 10681440.0,
+            "effective_weight_gbps": 368.00194457666635
+          },
+          "gate_up.planes": {
+            "calls_per_round": 50.0,
+            "us_per_call": 47.055275384615385,
+            "service_ms_per_round": 2.3527637692307692,
+            "weight_stream_bytes_per_call": 20833894.4,
+            "effective_weight_gbps": 442.7536387729142
+          },
+          "attention.q+k+v": {
+            "calls_per_round": 16.0,
+            "us_per_call": 36.00343269230769,
+            "service_ms_per_round": 0.5760549230769231,
+            "weight_stream_bytes_per_call": 8780800.0,
+            "effective_weight_gbps": 243.88785577870914
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 19.508173076923075,
+            "service_ms_per_round": 0.3121307692307692,
+            "weight_stream_bytes_per_call": 3824640.0,
+            "effective_weight_gbps": 196.05321241097175
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 10.925832544378698,
+            "service_ms_per_round": 1.4203582307692306
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 5.987897435897436,
+            "service_ms_per_round": 0.7724387692307693
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.457738247863247,
+            "service_ms_per_round": 1.2179143076923078
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.726155048076923,
+            "service_ms_per_round": 0.47694784615384617
+          },
+          "layout_or_copy": {
+            "calls_per_round": 37.0,
+            "us_per_call": 3.3306632016632016,
+            "service_ms_per_round": 0.12323453846153846
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.153509615384614,
+            "service_ms_per_round": 1.0289123076923077
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.839433868289984,
+            "service_ms_per_round": 0.8116813076923076
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 44.06875250836121,
+            "service_ms_per_round": 1.0135813076923077
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 10.665576923076923,
+            "service_ms_per_round": 0.19198038461538458
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 275.5154615384615,
+            "service_ms_per_round": 0.2755154615384615
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.416939799331104,
+            "service_ms_per_round": 0.17058961538461537
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 104.31423076923078,
+            "service_ms_per_round": 0.5215711538461538
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 278.12953846153846,
+            "service_ms_per_round": 0.2781295384615385
+          }
+        },
+        "means": {
+          "round_ms": 18.84253453846154,
+          "target_graph_ms": 14.963159769230769,
+          "target_kernel_union_ms": 13.617535846153846,
+          "target_inter_kernel_gap_ms": 1.3456239230769231,
+          "after_target_ms": 3.879374769230769,
+          "after_target_kernel_union_ms": 3.262782923076923,
+          "after_target_inter_kernel_gap_ms": 0.6165918461538461,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.143384615384615,
+          "graph_boundary_idle_us": 360.00053846153844,
+          "draft_graph_end_to_next_target_us": 217.49692307692308,
+          "last_tail_graph_to_next_target_us": 217.49692307692308
+        },
+        "previous_output_batch": {
+          "projection_service_ms": 10.522513923076923,
+          "means": {
+            "round_ms": 21.10212523076923,
+            "target_graph_ms": 17.184784076923076,
+            "target_kernel_union_ms": 15.726993076923076,
+            "target_inter_kernel_gap_ms": 1.457791,
+            "after_target_ms": 3.917341153846154,
+            "after_target_kernel_union_ms": 3.2890576153846154,
+            "after_target_inter_kernel_gap_ms": 0.6282835384615384,
+            "tail_kernel_count": 210,
+            "tail_last_kernel_to_next_target_us": 12.24853846153846,
+            "graph_boundary_idle_us": 362.88953846153845,
+            "draft_graph_end_to_next_target_us": 219.24276923076923,
+            "last_tail_graph_to_next_target_us": 219.24276923076923
+          }
+        }
+      }
+    ],
+    "raw_sha256": {
+      "trace-dmv.nsys-rep": "b8f1391106b3db4bb27044e4ad9527156cd9643de128ecadd522a22eacf67318",
+      "trace-dmv.sqlite": "b4393c1dc6e612b6b11637b003499aefce7ef0a87da165a258ec3c3f01b65653",
+      "trace-dmv.json": "85b690373e400c3da280fe57ba9202cae538b460ec7e7ea811423fa7c0d1336b",
+      "trace-projections.json": "cad1315f919f52caf6fbd09d0ca2a1f89526accb7140182a3887ea9dc96bab93",
+      "trace-clocks.csv": "6646686785aa0db98018ec6102e6451714dd344e32d379b8ef165b80982b5e73"
+    }
+  }
+}

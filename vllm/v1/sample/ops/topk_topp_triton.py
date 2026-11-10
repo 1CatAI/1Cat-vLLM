@@ -11,14 +11,12 @@ using Pivot-based Truncation and Selection" By Park et al.
 
 import torch
 
-from vllm import envs
+from vllm.config.execution_policy import layer_policy
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
-
-_TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
-_TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 
 
 def _use_sm70_topk_topp_8_warps(
@@ -27,6 +25,7 @@ def _use_sm70_topk_topp_8_warps(
     vocab_size: int,
     topk_enabled: bool,
     topp_enabled: bool,
+    policy=None,
 ) -> bool:
     if (
         device.type != "cuda"
@@ -35,8 +34,9 @@ def _use_sm70_topk_topp_8_warps(
     ):
         return False
 
+    policy = layer_policy() if policy is None else policy
     if (
-        envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS
+        policy.value("topk_topp_b8_b16_warps8")
         and vocab_size == 154_880
         and batch_size == 8
         and not topk_enabled
@@ -44,7 +44,7 @@ def _use_sm70_topk_topp_8_warps(
     ):
         return True
     if (
-        envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS
+        policy.value("topk_topp_b8_b16_warps8")
         and vocab_size == 248_320
         and batch_size in (8, 16)
         and topk_enabled
@@ -55,7 +55,7 @@ def _use_sm70_topk_topp_8_warps(
         vocab_size == 248_320
         and topk_enabled
         and topp_enabled
-        and envs.VLLM_SM70_TOPK_TOPP_8_WARPS
+        and policy.value("topk_topp_warps8")
         and batch_size in (5, 10, 20, 40, 60, 80)
     )
 
@@ -1090,6 +1090,43 @@ def sort_topk_with_vocab_ties(
     return out_values, out_indices
 
 
+@triton.jit
+def _clear_compact_rows_kernel(
+    logits,
+    reference_rows,
+    row_stride,
+    vocab_size,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if not tl.load(reference_rows + row):
+        offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(
+            logits + row * row_stride + offsets,
+            -float("inf"),
+            mask=offsets < vocab_size,
+        )
+
+
+@triton.jit
+def _scatter_compact_rows_kernel(
+    logits,
+    reference_rows,
+    values,
+    indices,
+    row_stride,
+    values_stride,
+    indices_stride,
+    CAPACITY: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if not tl.load(reference_rows + row):
+        offsets = tl.arange(0, CAPACITY)
+        value = tl.load(values + row * values_stride + offsets)
+        index = tl.load(indices + row * indices_stride + offsets)
+        tl.store(logits + row * row_stride + index, value)
+
+
 def _apply_top_k_top_p_compact(
     logits: torch.Tensor,
     k: torch.Tensor,
@@ -1104,16 +1141,24 @@ def _apply_top_k_top_p_compact(
     vocabulary order. Restore that order before sorting the shortlist so that
     top-p also splits ties at the same token. Numerically close cumulative
     probabilities still use the full reference reduction.
+
+    Rows are classified on the device, so admitting a batch needs no
+    device-to-host sync: rows with nothing to filter (top-k disabled and
+    top_p >= 1, e.g. greedy rows in a mixed batch) are left unchanged,
+    top-k-only rows skip the top-p boundary check, and rows whose k does not
+    fit the shortlist take the dense reference route with the other
+    ambiguous rows.
     """
     capacity = 128
-    if not ((k > 0) & (k < capacity)).all():
-        return None
+    vocab_size = logits.shape[1]
+    no_top_p = p >= 1.0
+    passthrough = ((k <= 0) | (k >= vocab_size)) & no_top_p
+    admitted = (k > 0) & (k < capacity)
+    shortlist_k = torch.where(admitted, k, torch.ones_like(k))
 
     values, indices = logits.topk(capacity, dim=-1, sorted=False)
-    values, indices = sort_topk_with_vocab_ties(
-        values, indices, vocab_size=logits.shape[1]
-    )
-    cutoff = values.gather(1, (capacity - k.long()).unsqueeze(1))
+    values, indices = sort_topk_with_vocab_ties(values, indices, vocab_size=vocab_size)
+    cutoff = values.gather(1, (capacity - shortlist_k.long()).unsqueeze(1))
     reference_rows = (values[:, 0] >= cutoff[:, 0]) | ~torch.isfinite(values[:, -1])
     reference_rows |= torch.isnan(values[:, 0])
     values.masked_fill_(values < cutoff, -float("inf"))
@@ -1123,23 +1168,62 @@ def _apply_top_k_top_p_compact(
     # Conservative margin for the different FP32 softmax/cumsum reduction.
     # There are fewer than capacity nonzero probabilities in admitted rows.
     margin = 8 * capacity * torch.finfo(torch.float32).eps
-    reference_rows |= ((cumulative - boundary).abs() <= margin).any(dim=-1)
-    remove = cumulative <= boundary
+    # With top_p >= 1 nothing is removed, so the boundary check would only
+    # send top-k-only rows to the dense route (cumulative and boundary are 0).
+    reference_rows |= ~no_top_p & ((cumulative - boundary).abs() <= margin).any(dim=-1)
+    reference_rows |= ~admitted
+    reference_rows &= ~passthrough
+    keep_rows = reference_rows | passthrough
+    remove = (cumulative <= boundary) & ~no_top_p.unsqueeze(1)
     remove[:, -1] = False
     values.masked_fill_(remove, -float("inf"))
-    result = torch.full_like(logits, -float("inf"))
-    result.scatter_(1, indices, values)
+    # Direct callers permit in-place filtering. Keep the original logits in
+    # ambiguous rows until their dense reference is computed, and rewrite the
+    # other rows from the shortlist without another full-vocabulary tensor.
+    result = logits
+    _clear_compact_rows_kernel[(logits.shape[0], triton.cdiv(logits.shape[1], 4096))](
+        result,
+        keep_rows,
+        result.stride(0),
+        result.shape[1],
+        BLOCK=4096,
+    )
+    _scatter_compact_rows_kernel[(logits.shape[0],)](
+        result,
+        keep_rows,
+        values,
+        indices,
+        result.stride(0),
+        values.stride(0),
+        indices.stride(0),
+        CAPACITY=capacity,
+        num_warps=4,
+    )
 
     if reference_rows.any():
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         rows = reference_rows.nonzero(as_tuple=True)[0]
-        reference = apply_top_k_top_p_pytorch(
-            logits.index_select(0, rows),
-            k.index_select(0, rows),
-            p.index_select(0, rows),
-        )
-        result.index_copy_(0, rows, reference)
+        # Sorting the full vocabulary for every ambiguous row at once needs
+        # batch-sized value/index/softmax buffers. Bound this rare fallback's
+        # workspace to two rows, without changing ties or nucleus boundaries.
+        # PyTorch uses a different cumulative scan for a singleton batch;
+        # preserve the multi-row reduction even in an odd final chunk.
+        # This eager path already synchronizes; captured callers use the
+        # separate graph-compatible reference path below.
+        for start in range(0, rows.numel(), 2):
+            chunk = rows[start : start + 2]
+            valid = chunk.numel()
+            if valid == 1 and rows.numel() > 1:
+                chunk = torch.cat((chunk, rows[:1]))
+            reference = apply_top_k_top_p_pytorch(
+                logits.index_select(0, chunk),
+                k.index_select(0, chunk),
+                p.index_select(0, chunk),
+                rowwise_sort=True,
+            )
+            result.index_copy_(0, chunk[:valid], reference[:valid])
+            del reference
     if mask_value != float("-inf"):
         result.masked_fill_(torch.isneginf(result), mask_value)
     return result
@@ -1150,6 +1234,8 @@ def apply_top_k_top_p_triton(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     mask_value: float = float("-inf"),
+    *,
+    runtime=None,
 ) -> torch.Tensor:
     """
     Apply combined top-k and top-p masking using Triton.
@@ -1178,9 +1264,10 @@ def apply_top_k_top_p_triton(
     if batch_size == 0 or not (topk_enabled or topp_enabled):
         return logits
 
-    # Sampling normally runs outside the model graphs. Keep direct graph
-    # callers correct without introducing a device-to-host fence in capture.
-    if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+    # The pivot kernel can miss split ties in a single grammar-masked row.
+    # Keep direct callers on the same reference route as the public sampler.
+    # Graph callers also need a route without a device-to-host fence.
+    if batch_size == 1 or (logits.is_cuda and torch.cuda.is_current_stream_capturing()):
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         reference_logits = apply_top_k_top_p_pytorch(logits, k, p)
@@ -1221,22 +1308,23 @@ def apply_top_k_top_p_triton(
     num_sm = num_compute_units(logits.device.index)
     NUM_PROGRAMS = min(num_sm, batch_size)
 
-    # Cache per-Triton Program buffer on each device.
+    runtime = bind_topk_topp_runtime() if runtime is None else runtime
+    # Cache per-Triton Program buffer on each device and engine.
     buf_key = (logits.device, logits.dtype, vocab_size)
-    buffer = _TRITON_BUFFER_CACHE.get(buf_key)
+    buffer = runtime.buffers.get(buf_key)
     if buffer is None or buffer.shape[0] < NUM_PROGRAMS:
         size = min(next_power_of_2(NUM_PROGRAMS), num_sm)
         buffer = logits.new_empty((size, vocab_size))
-        _TRITON_BUFFER_CACHE[buf_key] = buffer
+        runtime.buffers[buf_key] = buffer
     if buffer.shape[0] > NUM_PROGRAMS:
         buffer = buffer[:NUM_PROGRAMS]
 
     # Cache lookup table entries on each device.
-    tables = _TRITON_TABLE_CACHE.get(logits.device)
+    tables = runtime.tables.get(logits.device)
     if tables is None:
         normal_cdf_to_sigma_table = logits.new_tensor(_NORMAL_CDF_TO_SIGMA_TABLE)
         percentile_to_std_table = logits.new_tensor(_PERCENTILE_TO_STD_TABLE)
-        _TRITON_TABLE_CACHE[logits.device] = (
+        runtime.tables[logits.device] = (
             normal_cdf_to_sigma_table,
             percentile_to_std_table,
         )
@@ -1256,6 +1344,7 @@ def apply_top_k_top_p_triton(
         vocab_size,
         topk_enabled,
         topp_enabled,
+        policy=runtime.policy,
     ):
         # Eight warps preserve the tile and masking algorithm while using the
         # otherwise idle lanes in its reduction-heavy passes. B8/B16 no-MTP
@@ -1301,7 +1390,7 @@ def apply_top_k_top_p_triton(
     return logits
 
 
-def reset_buffer_cache():
-    _TRITON_BUFFER_CACHE.clear()
-    _TRITON_TABLE_CACHE.clear()
+def reset_buffer_cache(runtime=None):
+    runtime = bind_topk_topp_runtime() if runtime is None else runtime
+    runtime.close()
     torch.accelerator.empty_cache()

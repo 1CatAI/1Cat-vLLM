@@ -6,12 +6,15 @@ Name and GDN layout rules are adapted from vllm-gguf-plugin at
 e2b8ad532b8b5ea175100202c30430c1d2b5e6a8 (Apache-2.0).
 """
 
+import os
+
 import gguf
 import numpy as np
 import regex as re
 import torch
 
 from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
+from vllm.transformers_utils.gguf_tensor_reader import dequantize, quant_size
 
 _GLOBALS = {
     "token_embd.weight": "model.embed_tokens.weight",
@@ -43,7 +46,117 @@ _LAYERS = {
 }
 
 
+def _embedding_chunks(tensor, dtype, name, rows_per_chunk=1024):
+    rows, columns = map(int, tensor.shape[::-1])
+    for start in range(0, rows, rows_per_chunk):
+        stop = min(start + rows_per_chunk, rows)
+        data = gguf.quants.dequantize(tensor.data[start:stop], tensor.tensor_type)
+        decoded = torch.from_numpy(data)
+        converted = decoded.to(dtype)
+        if torch.any(torch.isfinite(decoded) & ~torch.isfinite(converted)):
+            raise ValueError(
+                f"GGUF {name}: values overflow {dtype}; use --dtype float32"
+            )
+        yield start, stop, converted
+
+
+def _decode_embedding_rows(tensor, dtype, name, start, stop):
+    data = gguf.quants.dequantize(tensor.data[start:stop], tensor.tensor_type)
+    decoded = torch.from_numpy(data)
+    converted = decoded.to(dtype)
+    if torch.any(torch.isfinite(decoded) & ~torch.isfinite(converted)):
+        raise ValueError(f"GGUF {name}: values overflow {dtype}; use --dtype float32")
+    return converted
+
+
+def _validate_embedding_range(tensor, dtype, name, rows_per_chunk=1024):
+    """Check that every decoded row fits ``dtype`` (the dense loader's range
+    check) without keeping the table.
+
+    The answer depends only on the file, so it is recorded next to vLLM's
+    cache keyed by file identity and tensor offset; the first check decodes
+    row chunks on a few threads.
+    """
+    import hashlib
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm import envs
+
+    base = tensor.data
+    while base is not None and not isinstance(base, np.memmap):
+        base = base.base
+    marker = None
+    if base is not None and base.filename is not None:
+        path = str(base.filename)
+        stat = os.stat(path)
+        key = json.dumps(
+            [
+                path,
+                stat.st_size,
+                stat.st_mtime_ns,
+                int(getattr(tensor, "data_offset", 0)),
+                str(dtype),
+            ]
+        )
+        marker = os.path.join(
+            envs.VLLM_CACHE_ROOT,
+            "gguf_range_checks",
+            hashlib.sha256(key.encode()).hexdigest()[:32],
+        )
+        if os.path.exists(marker):
+            return
+    rows = int(tensor.shape[-1])
+    workers = max(1, min(6, (os.cpu_count() or 1) // 4))
+    with ThreadPoolExecutor(workers) as pool:
+        # list() re-raises the first failing chunk in row order.
+        list(
+            pool.map(
+                lambda start: _decode_embedding_rows(
+                    tensor, dtype, name, start, min(start + rows_per_chunk, rows)
+                ),
+                range(0, rows, rows_per_chunk),
+            )
+        )
+    if marker is not None:
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w") as file:
+                file.write(key)
+        except OSError:
+            pass
+
+
+def _dequantize_embedding(tensor, dtype, name, rows_per_chunk=1024):
+    """Bound temporary decode/range-check memory for dense vocabulary tables.
+
+    Row chunks are independent; NumPy and Torch release the GIL inside each
+    decode, so a few threads shorten startup without changing any value.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    rows, columns = map(int, tensor.shape[::-1])
+    weight = torch.empty((rows, columns), dtype=dtype, device="cpu")
+
+    def fill(start):
+        stop = min(start + rows_per_chunk, rows)
+        weight[start:stop].copy_(
+            _decode_embedding_rows(tensor, dtype, name, start, stop)
+        )
+
+    workers = max(1, min(6, (os.cpu_count() or 1) // 4))
+    with ThreadPoolExecutor(workers) as pool:
+        # list() re-raises the first failing chunk in row order.
+        list(pool.map(fill, range(0, rows, rows_per_chunk)))
+    return weight
+
+
 class Qwen35Adapter:
+    global_names = _GLOBALS
+    layer_names = _LAYERS
+    architecture_label = "Qwen3.5"
+    packed_embeddings = True
+
     def __init__(self, config, tp_size=1):
         self.config = config
         self.tp_size = tp_size
@@ -62,8 +175,8 @@ class Qwen35Adapter:
     def build_name_map(self, tensors):
         result = {}
         for name in tensors:
-            if name in _GLOBALS:
-                result[name] = _GLOBALS[name]
+            if name in self.global_names:
+                result[name] = self.global_names[name]
                 continue
             match = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
             if match:
@@ -75,10 +188,10 @@ class Qwen35Adapter:
                         self.config, "num_nextn_predict_layers", 0
                     ):
                         continue
-                elif suffix in _LAYERS:
-                    result[name] = f"model.layers.{block}.{_LAYERS[suffix]}"
+                elif suffix in self.layer_names:
+                    result[name] = f"model.layers.{block}.{self.layer_names[suffix]}"
                     continue
-            raise ValueError(f"Unmapped Qwen3.5 GGUF tensor: {name}")
+            raise ValueError(f"Unmapped {self.architecture_label} GGUF tensor: {name}")
         return result
 
     @staticmethod
@@ -92,7 +205,7 @@ class Qwen35Adapter:
             (".down_proj.weight", ".out_proj.weight", ".o_proj.weight")
         ):
             return False
-        block_size, _ = gguf.GGML_QUANT_SIZES[tensor.tensor_type]
+        block_size, _ = quant_size(tensor.tensor_type)
         local_k, remainder = divmod(int(tensor.shape[0]), self.tp_size)
         tiled_span = local_k
         if self.layout is not None and name.endswith("linear_attn.out_proj.weight"):
@@ -148,7 +261,18 @@ class Qwen35Adapter:
         # All linear type descriptors must arrive before any weight payload,
         # including F16/F32 shards mixed with packed GGML shards.
         for raw, name in name_map.items():
-            if self.is_linear(name):
+            packed_embedding = (
+                self.packed_embeddings
+                and not getattr(self.config, "tie_word_embeddings", False)
+                and name.endswith("embed_tokens.weight")
+                and tensors[raw].tensor_type
+                not in (
+                    gguf.GGMLQuantizationType.F32,
+                    gguf.GGMLQuantizationType.F16,
+                    gguf.GGMLQuantizationType.BF16,
+                )
+            )
+            if self.is_linear(name) or packed_embedding:
                 yield (
                     name.removesuffix(".weight") + ".qweight_type",
                     torch.tensor(
@@ -164,11 +288,30 @@ class Qwen35Adapter:
                 gguf.GGMLQuantizationType.F16,
                 gguf.GGMLQuantizationType.BF16,
             )
+            if quantized and name.endswith("embed_tokens.weight"):
+                if self.packed_embeddings and not getattr(
+                    self.config, "tie_word_embeddings", False
+                ):
+                    # Validate the same FP16 range as the dense loader, using
+                    # only a bounded row chunk. Serving decodes selected rows
+                    # from the original GGML bytes through GGUFEmbeddingMethod.
+                    _validate_embedding_range(tensor, dtype, raw)
+                    yield (
+                        name.removesuffix(".weight") + ".qweight",
+                        torch.from_numpy(tensor.data.copy()),
+                    )
+                    continue
+                # Embedding row order is unchanged by restoration. Keep the
+                # existing global-table contract for the TP weight loader,
+                # without full FP32 decode and boolean temporary tables.
+                yield name, _dequantize_embedding(tensor, dtype, raw)
+                continue
             dense_fallback = self.needs_dense_fallback(name, tensor)
             if quantized and (not self.is_linear(name) or dense_fallback):
                 # Embeddings and convolution use the model's dense parameters.
-                data = gguf.quants.dequantize(tensor.data, tensor.tensor_type)
-                weight = torch.from_numpy(data.copy())
+                data = dequantize(tensor.data, tensor.tensor_type)
+                # Dequantization owns this dense array; avoid a second copy.
+                weight = torch.from_numpy(data)
             elif tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
                 data = tensor.data.view(np.uint16).copy()
                 weight = torch.from_numpy(data).view(torch.bfloat16)

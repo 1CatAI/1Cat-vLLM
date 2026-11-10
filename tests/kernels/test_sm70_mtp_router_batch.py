@@ -16,7 +16,7 @@ def test_pack_preserves_every_weight_bit():
     assert torch.equal(restored.view(torch.int16), raw)
 
 
-@pytest.mark.parametrize("rows", [5, 10])
+@pytest.mark.parametrize("rows", [5, 10, 15, 20, 40])
 def test_native_and_dispatch_changed_input_graph(rows, monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("Requires SM70")
@@ -35,7 +35,10 @@ def test_native_and_dispatch_changed_input_graph(rows, monkeypatch):
     actual = torch.empty_like(expected)
 
     def run():
-        torch.mm(x, w.t(), out=expected)
+        # cuBLAS picks other reductions above ten rows; the kernel keeps the
+        # five-row arithmetic for every row of a concurrent batch.
+        for start in range(0, rows, 5):
+            torch.mm(x[start : start + 5], w.t(), out=expected[start : start + 5])
         torch.ops._C.qwen38_router_batch_sm70_out(actual, x, packed)
         return gemv._qwen38_sm70_fp16_gemv(x, w, "model.layers.0.mlp.gate", packed)
 

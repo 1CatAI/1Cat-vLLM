@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("down", [False, True])
-@pytest.mark.parametrize("m", [1, 5])
+@pytest.mark.parametrize("m", [1, 5, 80])
 def test_original_bf16_mtp_routes_and_graph(m, down):
     n, k = (2560, 160) if down else (320, 2560)
     w = torch.full((512, n, k), 2**-30, dtype=torch.bfloat16, device="cuda")

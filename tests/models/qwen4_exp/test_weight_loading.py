@@ -309,18 +309,14 @@ def test_qsa_e4m3_loader_requires_all_24_scales(monkeypatch) -> None:
     }
     incomplete = required - {next(iter(required))}
 
-    monkeypatch.setattr(
-        qwen4_exp_model.envs, "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", False
-    )
+    monkeypatch.setenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "0")
     assert _validate_qsa_e4m3_scale_load(required, required, "fp8_e4m3") == set()
     # Non-strict: the caller gets the missing names back instead of an error.
     assert _validate_qsa_e4m3_scale_load(required, incomplete, "fp8") == (
         required - incomplete
     )
 
-    monkeypatch.setattr(
-        qwen4_exp_model.envs, "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", True
-    )
+    monkeypatch.setenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "1")
     assert _validate_qsa_e4m3_scale_load(required, required, "fp8_e4m3") == set()
     with pytest.raises(ValueError, match="Loaded 23/24"):
         _validate_qsa_e4m3_scale_load(required, incomplete, "fp8")

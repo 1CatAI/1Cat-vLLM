@@ -8,6 +8,8 @@ import gguf
 import regex as re
 from huggingface_hub import hf_hub_download
 
+from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
 
 def gguf_shard_paths(path: str | Path) -> list[Path]:
     path = Path(path)
@@ -83,7 +85,7 @@ def gguf_tensor_index(paths: list[Path]) -> dict[str, gguf.ReaderTensor]:
     architecture = None
     declared_total = None
     for index, path in enumerate(paths):
-        reader = gguf.GGUFReader(path)
+        reader = GGUFReader(path)
         field = reader.get_field("general.architecture")
         arch = field.contents() if field is not None else None
         if index == 0:

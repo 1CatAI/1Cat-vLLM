@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tests.models.qwen4_exp.qsa_policy_utils import set_qsa_option
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 
 qsa_sparse_paged_attention = qsa_ops.qsa_sparse_paged_attention
@@ -69,9 +70,9 @@ def test_e4m3_page4_workspace_capture_safe(rows, monkeypatch):
     _sm70_only()
     torch.manual_seed(400 + rows)
     # Force the grouped(16)+XQA-page4 split that builds the XQA workspace.
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 16)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 16)
+    set_qsa_option(monkeypatch, "qsa_grouped_page4", True)
     args, kwargs = _e4m3_inputs(rows)
 
     eager = qsa_sparse_paged_attention(*args, **kwargs).clone()

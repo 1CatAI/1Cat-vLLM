@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Block-FP8 linears on SM70/SM75 through the native QPN8 operators."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -22,6 +24,191 @@ pytestmark = pytest.mark.skipif(
     or torch.cuda.get_device_capability() not in ((7, 0), (7, 5)),
     reason="requires an SM70 or SM75 GPU",
 )
+
+
+def _chunk_policy(enabled):
+    from vllm.config.sm70_native import Sm70NativeConfig
+
+    policy = Sm70NativeConfig(fp8_qpn8_m32_chunked=enabled)
+    policy.resolve("fp8")
+    return "sm70:1:" + "".join(f"{len(value)}:{value}" for value in policy.values)
+
+
+def _native_block_policy():
+    from vllm.config.sm70_native import Sm70NativeConfig
+
+    policy = Sm70NativeConfig(fp8_qpn8_m32_chunked=True, fp8_qpn8_m32_native=True)
+    policy.resolve("fp8")
+    return "sm70:1:" + "".join(f"{len(value)}:{value}" for value in policy.values)
+
+
+@pytest.mark.parametrize("rows", [9, 16, 17, 31, 32])
+@pytest.mark.parametrize("gated", [False, True])
+def test_block_dispatch_chunked_policy_and_graph(rows, gated):
+    import vllm._C  # noqa: F401
+
+    torch.manual_seed(297)
+    k, n = 512, 256
+    weight = (torch.randn(n, k, device="cuda") * 8).to(torch.float8_e4m3fn)
+    scales = torch.rand(n // 128, k // 128, device="cuda") * 0.01 + 0.002
+    codes, packed = torch.ops._C.fp8_qpn8_prepare_sm70(weight, scales)
+    x = torch.empty(rows, k, device="cuda", dtype=torch.float16)
+    out = x.new_empty(rows, n // 2 if gated else n)
+    reference = torch.empty_like(out)
+    workspace = x.new_full((k, n), float("nan"))
+    token = _chunk_policy(True)
+    small = (
+        torch.ops._C.fp8_qpn8_gated_pair_sm70_out
+        if gated
+        else torch.ops._C.fp8_qpn8_gemm_sm70_out
+    )
+
+    def call():
+        torch.ops._C.fp8_qpn8_dispatch_sm70_out(
+            out,
+            workspace.data_ptr(),
+            x,
+            codes,
+            packed,
+            8,
+            2,
+            False,
+            gated,
+            native_policy=token,
+        )
+
+    x.normal_(0, 0.1)
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for amplitude in (0.1, 0.3, 0.0):
+        x.normal_(0, amplitude)
+        for start in range(0, rows, 8):
+            small(
+                reference[start : start + 8],
+                x[start : start + 8],
+                codes,
+                packed,
+                8,
+                2,
+                True,
+                False,
+            )
+        for invoke in (call, graph.replay):
+            out.fill_(float("nan"))
+            invoke()
+            assert torch.isfinite(out).all()
+            # Chunking preserves the established small-row reduction order.
+            assert torch.equal(out.view(torch.int16), reference.view(torch.int16))
+            # Admission must avoid full-matrix reconstruction, including replay.
+            assert workspace.isnan().all()
+
+
+@pytest.mark.parametrize("rows", [17, 24, 31, 32])
+@pytest.mark.parametrize("gated", [False, True])
+def test_block_dispatch_native_policy_and_graph(rows, gated):
+    import vllm._C  # noqa: F401
+
+    torch.manual_seed(297)
+    k, n = 512, 256
+    weight = (torch.randn(n, k, device="cuda") * 8).to(torch.float8_e4m3fn)
+    scales = torch.rand(n // 128, k // 128, device="cuda") * 0.01 + 0.002
+    codes, packed = torch.ops._C.fp8_qpn8_prepare_sm70(weight, scales)
+    x = torch.empty(rows, k, device="cuda", dtype=torch.float16)
+    out = x.new_empty(rows, n // 2 if gated else n)
+    reference = torch.empty_like(out)
+    workspace = x.new_full((k, n), float("nan"))
+    token = _native_block_policy()
+    split = 8 if gated else 16
+    small = (
+        torch.ops._C.fp8_qpn8_gated_pair_sm70_out
+        if gated
+        else torch.ops._C.fp8_qpn8_gemm_sm70_out
+    )
+
+    def call():
+        torch.ops._C.fp8_qpn8_dispatch_sm70_out(
+            out,
+            workspace.data_ptr(),
+            x,
+            codes,
+            packed,
+            split,
+            2,
+            False,
+            gated,
+            native_policy=token,
+        )
+
+    x.normal_(0, 0.1)
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for amplitude in (0.1, 0.3, 0.0):
+        x.normal_(0, amplitude)
+        for start in range(0, rows, 8):
+            small(
+                reference[start : start + 8],
+                x[start : start + 8],
+                codes,
+                packed,
+                split,
+                2,
+                True,
+                False,
+            )
+        for invoke in (call, graph.replay):
+            out.fill_(float("nan"))
+            invoke()
+            assert torch.isfinite(out).all()
+            # Chunking preserves the established small-row reduction order.
+            assert torch.equal(out.view(torch.int16), reference.view(torch.int16))
+            # Admission must avoid full-matrix reconstruction, including replay.
+            assert workspace.isnan().all()
+
+
+@pytest.mark.parametrize(
+    "enabled,rows,split,chains,gated",
+    [
+        (None, 9, 8, 2, False),
+        (False, 32, 8, 2, True),
+        (True, 33, 8, 2, False),
+        (True, 17, 3, 2, False),
+        (True, 17, 12, 1, False),
+        (True, 17, 32, 2, True),
+    ],
+)
+def test_block_dispatch_retains_prefill_fallback(enabled, rows, split, chains, gated):
+    import vllm._C  # noqa: F401
+
+    layer, _ = _layer(256, 512)
+    codes, packed = torch.ops._C.fp8_qpn8_prepare_sm70(
+        layer.weight, layer.weight_scale_inv
+    )
+    x = torch.randn(rows, 512, device="cuda", dtype=torch.float16) * 0.1
+    out = x.new_empty(rows, 128 if gated else 256)
+    reference = torch.empty_like(out)
+    workspace = x.new_full((512, 256), float("nan"))
+    torch.ops._C.fp8_qpn8_prefill_sm70_out(
+        reference, workspace.data_ptr(), x, codes, packed, gated
+    )
+    workspace.fill_(float("nan"))
+    torch.ops._C.fp8_qpn8_dispatch_sm70_out(
+        out,
+        workspace.data_ptr(),
+        x,
+        codes,
+        packed,
+        split,
+        chains,
+        False,
+        gated,
+        native_policy=_chunk_policy(enabled),
+    )
+    assert torch.isfinite(workspace).all()
+    torch.testing.assert_close(out, reference, rtol=0, atol=0)
 
 
 def _config(n: int, k: int) -> FP8ScaledMMLinearLayerConfig:
@@ -140,3 +327,81 @@ def test_volta_medium_prefill_keeps_original_turbomind_output(default_vllm_confi
         False,
     )
     torch.testing.assert_close(kernel.apply_weights(layer, x), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m", [9, 64, 512])
+def test_volta_without_turbomind_copy_keeps_one_layout(default_vllm_config, m):
+    # A 32 GiB V100 pipeline stage of DeepSeek-V4 runs out of memory when every
+    # block FP8 weight is held twice; without the copy, rows beyond M=8 take
+    # the dense prefill operator that Turing uses.
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        False
+    )
+    layer, reference = _layer(1536, 4096)
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096))
+    kernel.process_weights_after_loading(layer)
+    assert not hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight")
+    assert not hasattr(layer, "_qpn8_fallback_k_ld")
+    x = torch.randn(m, 4096, device="cuda", dtype=torch.float16) * 0.1
+    y = kernel.apply_weights(layer, x)
+    expected = x.float() @ reference.t()
+    assert ((y.float() - expected).norm() / expected.norm()).item() < 1e-3
+
+
+@pytest.mark.parametrize("turbomind_copy", [True, False])
+def test_volta_warmup_follows_the_held_layout(default_vllm_config, turbomind_copy):
+    # The coordinated Volta warmup used to read TurboMind attributes that block
+    # QPN8 layers never carry and failed the engine start.
+    if torch.cuda.get_device_capability()[0:2] not in ((7, 0), (7, 2)):
+        pytest.skip("the coordinated dense warmup runs on Volta only")
+    from vllm.model_executor.warmup.awq_sm70_warmup import (
+        _iter_unique_fp8_dense_layers,
+        _warmup_fp8_dense_layers,
+    )
+
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        turbomind_copy
+    )
+    layer, _ = _layer(1536, 4096)
+    QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096)).process_weights_after_loading(
+        layer
+    )
+    model = torch.nn.Module()
+    model.proj = layer
+    layers = list(_iter_unique_fp8_dense_layers(model))
+    assert layers == ([(layer, False)] if turbomind_copy else [])
+    # Only rows beyond the native QPN8 bound use the TurboMind copy.
+    assert _warmup_fp8_dense_layers(layers, [1, 8, 9, 64]) == (
+        2 if turbomind_copy else 0
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "speculative_tokens", "explicit", "copy"),
+    [
+        (1, 5, None, False),  # one request verifying six rows stays on QPN8
+        (8, 0, None, False),
+        (9, 0, None, True),
+        (2, 5, None, True),  # twelve decode rows reach the TurboMind copy
+        (1, 5, True, True),
+        (4, 5, False, False),
+    ],
+)
+def test_volta_turbomind_copy_follows_decode_rows(
+    default_vllm_config, max_num_seqs, speculative_tokens, explicit, copy
+):
+    if torch.cuda.get_device_capability()[0:2] not in ((7, 0), (7, 2)):
+        pytest.skip("only Volta holds the TurboMind copy")
+    default_vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    if speculative_tokens:
+        default_vllm_config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=speculative_tokens
+        )
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        explicit
+    )
+    layer, _ = _layer(1536, 4096)
+    QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096)).process_weights_after_loading(
+        layer
+    )
+    assert hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight") == copy

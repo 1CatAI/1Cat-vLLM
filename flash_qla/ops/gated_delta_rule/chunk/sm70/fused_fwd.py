@@ -279,6 +279,8 @@ def chunk_gated_delta_rule_fwd_sm70_vlk_varlen(
     validate_cu_seqlens: bool = True,
     gate_is_exp: bool = False,
     output: torch.Tensor | None = None,
+    *,
+    native_policy=None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run SM70/SM75 forward with vLLM-only state layout [N, Hv, V, K].
 
@@ -300,7 +302,7 @@ def chunk_gated_delta_rule_fwd_sm70_vlk_varlen(
     )
     if scale is None:
         scale = q.shape[-1] ** -0.5
-    ext = _load_ext()
+    ext = native_policy if native_policy is not None else _load_ext()
     output, final_state = ext.gdn_forward_vlk_varlen(
         q,
         k,
@@ -331,6 +333,8 @@ def gdn_decode_mixed_qkv_global_state_sm70(
     output: torch.Tensor,
     scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    *,
+    native_policy=None,
 ) -> torch.Tensor:
     """Run fused SM70 mixed-QKV decode against vLLM global state slots."""
 
@@ -397,7 +401,7 @@ def gdn_decode_mixed_qkv_global_state_sm70(
         raise ValueError("output must have shape [T,Hv,V].")
     if scale is None:
         scale = k_dim**-0.5
-    ext = _load_ext()
+    ext = native_policy if native_policy is not None else _load_ext()
     ext.gdn_decode_mixed_qkv_global_state(
         mixed_qkv,
         a,

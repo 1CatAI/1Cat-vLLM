@@ -9,6 +9,8 @@ import torch
 from torch import nn
 
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
+from vllm.diagnostics import diagnostic_channel, diagnostic_history, diagnostics_for
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -95,20 +97,10 @@ from .multimodal import (
     Glm5NextMultiModalProcessor,
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
+    max_grid_side,
 )
 
 logger = init_logger(__name__)
-
-_DEBUG_DFLASH_TARGET_FINITE = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
-)
-_DEBUG_DFLASH_TARGET_TRACE = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
-)
-_DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION = int(
-    os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
-)
-_DFLASH_TARGET_TRACE_SEEN: set[tuple[int, str]] = set()
 
 
 def _debug_dflash_target_finite(
@@ -117,7 +109,10 @@ def _debug_dflash_target_finite(
     positions: torch.Tensor,
     **tensors: torch.Tensor | None,
 ) -> None:
-    if not _DEBUG_DFLASH_TARGET_FINITE or positions.numel() <= 1:
+    if (
+        not capture_runtime_trace().dflash.value("proposal_stages")
+        or positions.numel() <= 1
+    ):
         return
     for name, tensor in tensors.items():
         if tensor is None:
@@ -144,20 +139,20 @@ def _debug_dflash_target_trace(
     **tensors: torch.Tensor | None,
 ) -> None:
     if (
-        not _DEBUG_DFLASH_TARGET_TRACE
+        not capture_runtime_trace().dflash.value("target_layer_trace")
         or positions.numel() > 8
         or get_tensor_model_parallel_rank() != 0
-        or int(positions[-1].item()) < _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION
+        or int(positions[-1].item()) < target_trace_min_position()
     ):
         return
     key = (layer_idx, stage)
-    if key in _DFLASH_TARGET_TRACE_SEEN:
+    if key in diagnostic_history("glm_target_seen"):
         return
-    _DFLASH_TARGET_TRACE_SEEN.add(key)
+    diagnostic_history("glm_target_seen")[key] = True
     token_index = int(
-        torch.nonzero(
-            positions >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION, as_tuple=False
-        )[0].item()
+        torch.nonzero(positions >= target_trace_min_position(), as_tuple=False)[
+            0
+        ].item()
     )
     for name, tensor in tensors.items():
         if tensor is None or tensor.numel() == 0:
@@ -507,15 +502,15 @@ class Glm5NextDecoderLayer(nn.Module):
         torch.Tensor | None,
     ]:
         if (
-            _DEBUG_DFLASH_TARGET_TRACE
+            capture_runtime_trace().dflash.value("target_layer_trace")
             and positions.numel() <= 8
             and get_tensor_model_parallel_rank() == 0
-            and int(positions[-1].item()) >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION
+            and int(positions[-1].item()) >= target_trace_min_position()
             and isinstance(self.self_attn, Glm5NextLinearAttention)
         ):
             trace_token_index = int(
                 torch.nonzero(
-                    positions >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION,
+                    positions >= target_trace_min_position(),
                     as_tuple=False,
                 )[0].item()
             )
@@ -690,7 +685,7 @@ class Glm5NextDecoderLayer(nn.Module):
 
         # Fully Connected
         if (
-            _DEBUG_DFLASH_TARGET_TRACE
+            capture_runtime_trace().dflash.value("target_layer_trace")
             and self.layer_idx == 3
             and 1 < positions.numel() <= 8
         ):
@@ -899,8 +894,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         self._materialize_pp_mhc_boundary = bool(
             getattr(config, "mhc", False)
             and pp_group.world_size > 1
-            and os.getenv("VLLM_GLM53_PP_MHC_MATERIALIZE", "0").strip().lower()
-            in ("1", "true", "yes", "on")
+            and vllm_config.kernel_config.layer_execution.glm_pp_mhc_materialize
         )
         if self._materialize_pp_mhc_boundary:
             logger.info_once(
@@ -912,12 +906,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
-        self._debug_pp_aux_dump_dir = os.getenv(
-            "VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR", ""
-        ).strip()
-        self._debug_pp_aux_dump_count = 0
+        self._pp_aux_dump = diagnostic_channel(
+            "dflash_pp_aux", owner=diagnostics_for(vllm_config)
+        )
         self._debug_pp_aux_dump_limit = max(
-            0, int(os.getenv("VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT", "2"))
+            0, self._pp_aux_dump.policy.value("max_dumps")
         )
 
     def _debug_dump_pp_aux_hidden_states(
@@ -928,16 +921,13 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
     ) -> None:
         """Persist PP boundary tensors so sender and receiver can be exact-matched."""
         if (
-            not getattr(self, "_debug_pp_aux_dump_dir", "")
+            not self._pp_aux_dump.policy.directory
             or not aux_hidden_states
-            or getattr(self, "_debug_pp_aux_dump_count", 0)
-            >= getattr(self, "_debug_pp_aux_dump_limit", 0)
+            or self._pp_aux_dump.reports >= getattr(self, "_debug_pp_aux_dump_limit", 0)
             or positions.numel() <= 1
         ):
             return
-        min_position = int(
-            os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
-        )
+        min_position = target_trace_min_position()
         if int(positions.max().item()) < min_position:
             return
 
@@ -953,15 +943,13 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 for boundary, hidden in sorted(aux_hidden_states.items())
             },
         }
-        os.makedirs(self._debug_pp_aux_dump_dir, exist_ok=True)
-        dump_index = self._debug_pp_aux_dump_count
-        dump_path = os.path.join(
-            self._debug_pp_aux_dump_dir,
+        dump_index = self._pp_aux_dump.reports
+        dump_path = self._pp_aux_dump.write(
             f"pp_aux_{dump_index:02d}_{role}_pp{pp_group.rank_in_group}_"
             f"tp{tp_rank}_pid{os.getpid()}.pt",
+            payload,
         )
-        torch.save(payload, dump_path)
-        self._debug_pp_aux_dump_count += 1
+        self._pp_aux_dump.reports += 1
         logger.warning(
             "Saved DFlash PP auxiliary hidden states (%s) to %s", role, dump_path
         )
@@ -1493,6 +1481,8 @@ class Glm5NextForConditionalGeneration(
         return Glm5NextForCausalLM.get_mamba_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        from vllm.transformers_utils.processors.glm5next import Glm5NextProcessor
+
         super(Glm4vForConditionalGeneration, self).__init__()
         config = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -1510,6 +1500,12 @@ class Glm5NextForConditionalGeneration(
             self.visual = Glm5NextVisionTransformer(
                 config.text_config,
                 config.vision_config,
+                max_grid_side=max(
+                    max_grid_side(processor)
+                    for processor in Glm5NextProcessor.media_processors_from_pretrained(
+                        self.model_config.model
+                    )
+                ),
                 # Read eps from the VISION sub-config, not the top-level
                 # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__ mirrors
                 # the latter onto text_config (1e-5), silently ignoring the

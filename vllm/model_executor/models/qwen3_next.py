@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
-import os
 import time
 from collections.abc import Iterable
 from itertools import islice
@@ -10,7 +9,6 @@ from itertools import islice
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -19,11 +17,22 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
+from vllm.config.diagnostic_dump import parse_int_filter
+from vllm.config.execution_policy import communication_policy, layer_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import (
+    diagnostic_channel,
+    flush_layer_buffers,
+    layer_dump_requested,
+    legacy_channel,
+    record_layer_tensor,
+)
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -61,9 +70,10 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
 
 from .interfaces import (
     EagleModelMixin,
@@ -84,14 +94,14 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-_SM70_QWEN_LAYER_DUMP_COUNTS: dict[str, int] = {}
-_SM70_QWEN_LAYER_DUMP_SAVE_COUNTS: dict[str, int] = {}
-_SM70_QWEN_LAYER_GRAPH_BUFFERS: dict[str, torch.Tensor] = {}
-_SM70_QWEN_LAYER_GRAPH_META: dict[str, dict[str, object]] = {}
+_SM70_QWEN_LAYER_DUMP_COUNTS = legacy_channel("qwen_layer").counts
+_SM70_QWEN_LAYER_DUMP_SAVE_COUNTS = legacy_channel("qwen_layer").saves
+_SM70_QWEN_LAYER_GRAPH_BUFFERS = legacy_channel("qwen_layer").buffers
+_SM70_QWEN_LAYER_GRAPH_META = legacy_channel("qwen_layer").metadata
 
 
 def _sm70_profile_trace_enabled() -> bool:
-    return envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling()
+    return capture_runtime_trace().profile_trace and not torch.compiler.is_compiling()
 
 
 def _sm70_profile_trace(message: str, *args: object) -> None:
@@ -102,184 +112,26 @@ def _sm70_profile_trace(message: str, *args: object) -> None:
 
 
 def _sm70_parse_int_ranges(raw_ranges: str | None) -> set[int] | None:
-    if not raw_ranges:
-        return None
-    values: set[int] = set()
-    for raw_part in raw_ranges.split(","):
-        part = raw_part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start_raw, end_raw = part.split("-", 1)
-            start = int(start_raw.strip())
-            end = int(end_raw.strip())
-            if end < start:
-                start, end = end, start
-            values.update(range(start, end + 1))
-        else:
-            values.add(int(part))
-    return values
+    selected = parse_int_filter(raw_ranges)
+    return None if selected is None else set(selected)
 
 
 def _sm70_qwen_layer_dump_requested(layer_idx: int) -> bool:
-    if not os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR"):
-        return False
-    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_IDS", "0,1")
-    if raw_layer_ids.strip().lower() in {"*", "all"}:
-        return True
-    try:
-        layer_ids = _sm70_parse_int_ranges(raw_layer_ids) or {0, 1}
-    except ValueError:
-        layer_ids = {0, 1}
-    return layer_idx in layer_ids
+    return layer_dump_requested(layer_idx)
 
 
 def _sm70_qwen_layer_dump_token_count_allowed(tensor: torch.Tensor) -> bool:
-    raw = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS")
-    if not raw or tensor.ndim == 0:
-        return True
-    try:
-        max_tokens = int(raw)
-    except ValueError:
-        return True
-    return max_tokens <= 0 or int(tensor.shape[0]) <= max_tokens
+    return diagnostic_channel("qwen_layer").policy.allows_tokens(tensor)
 
 
 def _sm70_qwen_layer_dump_impl(
-    tensor: torch.Tensor,
-    label: str,
-    layer_idx: int,
-    layer_type: str,
+    tensor: torch.Tensor, label: str, layer_idx: int, layer_type: str
 ) -> torch.Tensor:
-    # The custom-op schema has no output alias annotation. Returning the input
-    # can corrupt AOT buffer reuse and change the tensors being diagnosed.
-    tensor = tensor.clone()
-    dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
-    graph_buffers = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS") == "1"
-    target_labels = {
-        item.strip()
-        for item in os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_LABELS", "").split(",")
-        if item.strip()
-    }
-    if target_labels and label not in target_labels:
-        return tensor
-    if not _sm70_qwen_layer_dump_token_count_allowed(tensor):
-        return tensor
-    if graph_buffers and dump_dir and tensor.is_cuda:
-        shape = tuple(tensor.shape)
-        key = f"{os.getpid()}:{layer_idx}:{label}:{shape}"
-        buffer = _SM70_QWEN_LAYER_GRAPH_BUFFERS.get(key)
-        if (
-            buffer is None
-            or tuple(buffer.shape) != shape
-            or buffer.dtype != tensor.dtype
-            or buffer.device != tensor.device
-        ):
-            buffer = torch.empty_like(tensor)
-            _SM70_QWEN_LAYER_GRAPH_BUFFERS[key] = buffer
-            _SM70_QWEN_LAYER_GRAPH_META[key] = {
-                "label": label,
-                "layer_idx": layer_idx,
-                "layer_type": layer_type,
-                "shape": shape,
-                "dtype": str(tensor.dtype),
-                "pid": os.getpid(),
-            }
-        buffer.copy_(tensor)
-        if torch.cuda.is_current_stream_capturing():
-            return tensor
-
-    enable_file = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE")
-    can_save = bool(dump_dir) and (not enable_file or os.path.exists(enable_file))
-    direct_save = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE", "1") != "0"
-    if direct_save and can_save and not torch.cuda.is_current_stream_capturing():
-        target_counts = _sm70_parse_int_ranges(
-            os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS")
-        )
-        try:
-            max_dumps = int(os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS", "4"))
-        except ValueError:
-            max_dumps = 4
-        key = f"{os.getpid()}:{layer_idx}:{label}"
-        count = _SM70_QWEN_LAYER_DUMP_COUNTS.get(key, 0)
-        _SM70_QWEN_LAYER_DUMP_COUNTS[key] = count + 1
-        if target_counts is not None and count not in target_counts:
-            return tensor
-        save_count = _SM70_QWEN_LAYER_DUMP_SAVE_COUNTS.get(key, 0)
-        if max_dumps <= 0 or save_count < max_dumps:
-            _SM70_QWEN_LAYER_DUMP_SAVE_COUNTS[key] = save_count + 1
-            safe_label = label.replace("/", "_").replace(".", "_")
-            safe_type = layer_type.replace("/", "_").replace(".", "_")
-            path = os.path.join(
-                dump_dir,
-                (
-                    f"pid{os.getpid()}_layer{layer_idx:02d}_{safe_type}_"
-                    f"{safe_label}_{count:03d}.pt"
-                ),
-            )
-            os.makedirs(dump_dir, exist_ok=True)
-            torch.save(
-                {
-                    "label": label,
-                    "layer_idx": layer_idx,
-                    "layer_type": layer_type,
-                    "count": count,
-                    "pid": os.getpid(),
-                    "shape": tuple(tensor.shape),
-                    "dtype": str(tensor.dtype),
-                    "tensor": tensor.detach().cpu(),
-                },
-                path,
-            )
-    return tensor
+    return record_layer_tensor(tensor, label, layer_idx, layer_type)
 
 
 def dump_sm70_qwen_layer_graph_buffers(step: int, stage: str) -> None:
-    dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
-    if not dump_dir:
-        return
-    enable_file = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE")
-    if enable_file and not os.path.exists(enable_file):
-        return
-    target_steps = _sm70_parse_int_ranges(
-        os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS")
-        or os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS")
-    )
-    if target_steps is not None and step not in target_steps:
-        return
-    if not _SM70_QWEN_LAYER_GRAPH_BUFFERS:
-        return
-    os.makedirs(dump_dir, exist_ok=True)
-    for key, buffer in _SM70_QWEN_LAYER_GRAPH_BUFFERS.items():
-        meta = _SM70_QWEN_LAYER_GRAPH_META.get(key, {})
-        label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
-        layer_type = (
-            str(meta.get("layer_type", "unknown")).replace("/", "_").replace(".", "_")
-        )
-        layer_idx = int(meta.get("layer_idx", -1))
-        shape = "x".join(str(dim) for dim in tuple(buffer.shape))
-        path = os.path.join(
-            dump_dir,
-            (
-                f"pid{os.getpid()}_step{step:04d}_layer{layer_idx:02d}_"
-                f"{layer_type}_{label}_shape{shape}.pt"
-            ),
-        )
-        torch.save(
-            {
-                **meta,
-                "step": step,
-                "stage": stage,
-                "graph_buffer_key": key,
-                "tensor": buffer.detach().cpu(),
-            },
-            path,
-        )
-    from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
-        dump_sm70_moe_runner_graph_buffers,
-    )
-
-    dump_sm70_moe_runner_graph_buffers(step, stage)
+    flush_layer_buffers(step, stage)
 
 
 def _sm70_qwen_layer_dump_fake(
@@ -391,11 +243,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 prefix=f"{prefix}.shared_expert",
             )
             if (
-                envs.VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP
-                or not envs.VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP
+                layer_policy().value("disable_shared_moe_overlap")
+                or not layer_policy().shared_moe_overlap
             ):
                 self.shared_expert._vllm_disable_shared_experts_stream = True
-            if envs.VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP:
+            if layer_policy().shared_moe_overlap:
                 logger.info_once(
                     "Enabling Qwen3Next FusedMoE shared_experts stream "
                     "overlap by explicit request.",
@@ -466,6 +318,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
             final_hidden_states = final_hidden_states[:num_tokens]
 
+        if getattr(self, "sm70_hcx_packed_outputs", False):
+            # HCX consumes an owned two-plane TP payload at the next boundary.
+            return final_hidden_states
         return final_hidden_states.view(orig_shape)
 
 
@@ -548,6 +403,38 @@ class Qwen3NextAttention(nn.Module):
 
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _is_dflash2_spec_config,
+        )
+
+        self.sm70_qk_rope_prep = bool(
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+            and tp_size == 4
+            and model_config is not None
+            and model_config.dtype == torch.float16
+            and model_config.quantization == "compressed-tensors"
+            and config.model_type == "qwen3_5_text"
+            and _is_dflash2_spec_config(get_current_vllm_config())
+            and self.attn_output_gate
+            and self.num_heads == 6
+            and self.num_kv_heads == 1
+            and self.head_dim == 256
+            and getattr(self.rotary_emb, "rotary_dim", None) == 64
+            and getattr(self.rotary_emb, "mrope_interleaved", False)
+            and getattr(self.rotary_emb, "mrope_section", None) == [11, 11, 10]
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float16
+            and not self.attn.calculate_kv_scales
+            and self.attn.attn_backend.get_name() == "FLASH_ATTN_V100"
+            and self.attn.kv_sharing_target_layer_name is None
+        )
+        if self.sm70_qk_rope_prep:
+            # Register the opaque preparation operator before compilation.
+            from vllm.model_executor.layers.attention import sm70_qwen38_qk_rope
+
+            _ = sm70_qwen38_qk_rope
 
     def forward(
         self,
@@ -571,7 +458,8 @@ class Qwen3NextAttention(nn.Module):
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            if not self.sm70_qk_rope_prep:
+                gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         v = _sm70_dump_qwen_layer_tensor(
@@ -581,14 +469,31 @@ class Qwen3NextAttention(nn.Module):
             v,
         )
 
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim
-        )
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim
-        )
+        if self.sm70_qk_rope_prep:
+            q = torch.empty((qkv.shape[0], 1536), device=qkv.device, dtype=qkv.dtype)
+            k = torch.empty((qkv.shape[0], 256), device=qkv.device, dtype=qkv.dtype)
+            gate = torch.empty_like(q)
+            torch.ops.vllm.sm70_qwen38_qk_norm_rope_cache(
+                qkv,
+                q,
+                k,
+                gate,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                _encode_layer_name(self.attn.layer_name),
+            )
+        else:
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+                -1, self.num_heads * self.head_dim
+            )
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
 
-        q, k = self.rotary_emb(positions, q, k)
+            q, k = self.rotary_emb(positions, q, k)
         q = _sm70_dump_qwen_layer_tensor(
             "full_attn_q_rot",
             self.layer_idx,
@@ -602,7 +507,7 @@ class Qwen3NextAttention(nn.Module):
             k,
         )
 
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, kv_cache_updated=self.sm70_qk_rope_prep)
         attn_output = _sm70_dump_qwen_layer_tensor(
             "full_attn_core_out",
             self.layer_idx,
@@ -751,9 +656,13 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
 
         use_direct_attention_output = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
-            or getattr(self, "sm70_dflash2_direct_attention_output", False)
-        ) and torch.compiler.is_compiling()
+            (
+                communication_policy().long_prefill_norm
+                or getattr(self, "sm70_dflash2_direct_attention_output", False)
+            )
+            and torch.compiler.is_compiling()
+            and self.layer_type == "full_attention"
+        )
         self_attention_output = (
             None if use_direct_attention_output else torch.empty_like(hidden_states)
         )
@@ -778,6 +687,8 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = projected_attention_output
         else:
             hidden_states = self_attention_output
+        if getattr(self, "sm70_gdn_outer_allreduce", False):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = _sm70_dump_qwen_layer_tensor(
             "attn_out",
             self.layer_idx,
@@ -852,6 +763,13 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=(
+                vllm_config.quant_config
+                if vllm_config.model_config.quantization == "gguf"
+                and vllm_config.kernel_config.sm70_gguf.embedding_storage == "original"
+                else None
+            ),
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):

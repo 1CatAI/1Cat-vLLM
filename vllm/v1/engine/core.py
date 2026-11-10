@@ -48,6 +48,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
+    is_lookahead_block_hashing_enabled,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -195,7 +196,7 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
-            if envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH > 0:
+            if vllm_config.scheduler_config.sm70_queue_depth() > 0:
                 logger.info(
                     "SM70 async scheduling queue depth override active: %d",
                     self.batch_queue_size,
@@ -216,7 +217,9 @@ class EngineCore:
             init_none_hash(caching_hash_fn)
 
             self.request_block_hasher = get_request_block_hasher(
-                hash_block_size, caching_hash_fn
+                hash_block_size,
+                caching_hash_fn,
+                is_lookahead_block_hashing_enabled(vllm_config),
             )
 
         self.step_fn = (
@@ -235,7 +238,9 @@ class EngineCore:
         maybe_attach_gc_debug_callback()
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
-        enable_envs_cache()
+        from vllm.config.policy_defaults import engine_policy_aliases
+
+        enable_envs_cache(exclude=engine_policy_aliases(vllm_config))
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -258,6 +263,12 @@ class EngineCore:
                 # much memory can be allocated for kv cache.
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+                # The pool is the smallest one over the workers; only rank 0 logs
+                # its own figure, so name all of them.
+                logger.info(
+                    "Available KV cache memory per worker: %s",
+                    ", ".join(f"{m / 2**30:.2f} GiB" for m in available_gpu_memory),
+                )
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
@@ -532,7 +543,13 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+        # Queued PP outputs carry the drafts of their own completed step.
+        if (
+            not self.async_scheduling
+            and self.use_spec_decode
+            and model_executed
+            and self.batch_queue is None
+        ):
             profile_ddtree_engine = (
                 os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE", "0") == "1"
             )
@@ -585,11 +602,11 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
-        trace_enabled = envs.VLLM_SM70_ASYNC_CPU_TRACE
+        trace_enabled = self.vllm_config.observability_config.runtime_trace.async_cpu
         trace_step = self._sm70_async_cpu_trace_step
-        trace_log = trace_enabled and (
-            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
-        )
+        trace_every = self.vllm_config.observability_config.runtime_trace.async_every
+        assert trace_every is not None
+        trace_log = trace_enabled and trace_step % trace_every == 0
         if trace_enabled:
             self._sm70_async_cpu_trace_step += 1
         trace_t0 = time.perf_counter() if trace_log else 0.0
@@ -633,6 +650,7 @@ class EngineCore:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
                     trace_sample_t0 = time.perf_counter() if trace_log else 0.0
+                    self._fill_structured_output_drafts(scheduler_output)
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
@@ -709,6 +727,20 @@ class EngineCore:
         if trace_log:
             trace_update_ms = (time.perf_counter() - trace_update_t0) * 1000.0
 
+        if (
+            self.use_spec_decode
+            and not self.async_scheduling
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            # Apply only this step's proposals, after its sampled tokens. A later
+            # in-flight step must not replace or delay these proposals.
+            draft_token_ids = model_output.draft_token_ids
+            if draft_token_ids is None:
+                raise RuntimeError(
+                    "PP synchronous speculative decoding: missing step drafts"
+                )
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
@@ -717,8 +749,14 @@ class EngineCore:
             # we need to get the draft token ids from the prior step before
             # we can compute the grammar bitmask for the deferred request.
             if self.use_spec_decode:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
-                assert draft_token_ids is not None
+                if self.async_scheduling:
+                    draft_token_ids = self.model_executor.take_draft_token_ids()
+                else:
+                    draft_token_ids = model_output.draft_token_ids
+                if draft_token_ids is None:
+                    raise RuntimeError(
+                        "PP speculative decoding: missing deferred drafts"
+                    )
                 # Update the draft token ids in the scheduler output to
                 # filter out the invalid spec tokens, which will be padded
                 # with -1 and skipped by the grammar bitmask computation.
@@ -754,6 +792,53 @@ class EngineCore:
             )
 
         return engine_core_outputs, model_executed
+
+    def _fill_structured_output_drafts(self, scheduler_output: SchedulerOutput) -> None:
+        """Replace draft placeholders with the worker's drafts before the
+        grammar bitmask is built.
+
+        Under async scheduling the spec-token rows are -1 placeholders that
+        are only resolved on the deferred path, which requires a step of the
+        same request to be in flight. With pipeline parallelism a request is
+        not re-scheduled until pp_size steps later, so a single request never
+        takes that path: the bitmask is then built from placeholders (every
+        draft row unconstrained) while the worker still verifies its real
+        drafts. A draft window that crosses the reasoning-end marker is
+        accepted unconstrained and xgrammar rejects it on the next advance
+        (#442). When no step of the structured request is in flight, the
+        worker's latest drafts belong to its last completed step, so fill
+        them in exactly as the deferred path does.
+        """
+        if not (
+            self.use_spec_decode
+            and scheduler_output.has_structured_output_requests
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            return
+        # Custom schedulers may not expose the request registry. Keep their
+        # existing draft path rather than imposing a new interface requirement.
+        requests = getattr(self.scheduler, "requests", None)
+        if requests is None:
+            return
+        needs_drafts = False
+        for req_id, spec in scheduler_output.scheduled_spec_decode_tokens.items():
+            request = requests.get(req_id)
+            if (
+                request is not None
+                and request.use_structured_output
+                and request.num_output_placeholders <= len(spec) + 1
+                and any(token == -1 for token in spec)
+            ):
+                needs_drafts = True
+                break
+        if not needs_drafts:
+            return
+        draft_token_ids = self.model_executor.take_draft_token_ids()
+        if draft_token_ids is None:
+            return
+        self.scheduler.update_draft_token_ids_in_output(
+            draft_token_ids, scheduler_output
+        )
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():

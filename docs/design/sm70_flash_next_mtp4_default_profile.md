@@ -55,9 +55,10 @@ Strict acceleration validation applies to the target release profile, with
 internal proposer configs marked separately before draft KV/backend overrides.
 An FP16 draft does not need to provide the target's E4M3 attention operators.
 
-The wheel installs `serve_flash_next_nvfp4_v100.sh MODEL [serve options...]`.
-Its release defaults match the four-V100 MTP4/FP16-KV prefix-cache recipe:
-131072 context, 8192 prefill tokens, one sequence and memory utilization 0.90.
+The wheel installs `serve_flash_next_nvfp4_v100.sh MODEL [--draft PATH] [serve options...]`.
+Since 1.5.2 its defaults are the release recipe: 262144 context with FP8 KV
+history in pinned host memory (`qsa_host_kv`), 4096 prefill tokens, up to eight
+sequences and memory utilization 0.89.
 It does not set any `VLLM_*` variable. The remaining TileLang kernels require
 a standard CUDA 12.8 Toolkit on PATH; CUDA 12.0 compilation fails in the clean
 runtime check. Hybrid PLE uses the actual checkpoint table size (approximately

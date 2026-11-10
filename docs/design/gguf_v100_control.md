@@ -141,7 +141,18 @@ heads, 128-dimensional GDN heads, HC count=4/rank=320. PLE keys include
 exact int64 multipliers, offsets and prime vocabulary sizes. GGUF PLE layer
 index 1 maps to HF layer ID 2. Q2_0 uses K blocks of 64, so expert down
 local K=160 still cannot be byte-sliced under TP4; IQ4_NL K blocks of 32
-are aligned. Flash-Next retains TP4. Canonical group32 reblocking now supports Q2_0 K=160 shards in the TurboMind operator layer; the model adapter connection remains pending.
+are aligned. Flash-Next retains TP4. Canonical group32 reblocking supports
+Q2_0 K=160 shards in the TurboMind operator layer; the canonical MoE model
+connection remains pending. The adapter fallback currently converts each
+64-value Q2_0 block into two Q4_1 blocks using the same integer values, scale
+and additive offset. This preserves decoded values but adds 2.014 GiB per rank
+for the 30 affected expert down projections. Replace this temporary storage
+with canonical u2 when integrating grouped TurboMind experts.
+
+Three CPU tests cover decoded equality, all four K=160 boundaries and
+independent projection storage; three GPU FFN checks compare summed TP
+partials with the full expert reference. All 1,224 checkpoint tensors have
+adapter names. Full-model generation and quality are still pending.
 
 ### Loading validation and open gates
 

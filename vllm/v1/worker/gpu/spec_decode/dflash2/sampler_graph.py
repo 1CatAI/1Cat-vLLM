@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Device-side compact/reference dispatch for a uniform DFlash2 verifier."""
+"""Device-side compact/reference dispatch for uniform DFlash2 verifier batches."""
 
+from copy import copy
 from typing import Any
 
 import numpy as np
@@ -21,11 +22,38 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 
 logger = init_logger(__name__)
 
+ROWS_PER_REQUEST = 8
+# Each request count captures its own graphs into private pools the KV budget
+# does not cover: about 170 MiB per count up to c4, and 2.7 GiB in total once
+# c5-c8 are captured too, which also ran slower than the host-decision path.
+MAX_GRAPH_REQUESTS = 4
+MAX_GRAPHS = 8
+# Capture allocates outside the budget. Serving still needs room after it: the
+# host-decision path at c8 reserves about 1.3 GiB on top of the idle footprint.
+CAPTURE_HEADROOM_BYTES = 5 << 29
+
 
 @triton.jit
-def _prepare_inputs(
+def _prepare_hidden(
     hidden,
     fixed_hidden,
+    dense,
+    dense_pointer,
+    hidden_size: tl.constexpr,
+    block: tl.constexpr,
+):
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    tl.store(
+        fixed_hidden + offsets,
+        tl.load(hidden + offsets, offsets < hidden_size, 0),
+        offsets < hidden_size,
+    )
+    if tl.program_id(0) == 0:
+        tl.store(dense_pointer, dense.to(tl.int64))
+
+
+@triton.jit
+def _prepare_request(
     inputs,
     fixed_inputs,
     positions,
@@ -37,21 +65,16 @@ def _prepare_inputs(
     fixed_ids,
     values,
     fixed_values,
-    dense,
-    dense_pointer,
-    hidden_size: tl.constexpr,
     sparse_size: tl.constexpr,
     source_sparse_stride: tl.constexpr,
     fixed_sparse_stride: tl.constexpr,
+    rows: tl.constexpr,
     block: tl.constexpr,
 ):
-    request = tl.load(source_mapping)
-    offsets = tl.program_id(0) * block + tl.arange(0, block)
-    tl.store(
-        fixed_hidden + offsets,
-        tl.load(hidden + offsets, offsets < hidden_size, 0),
-        offsets < hidden_size,
-    )
+    index = tl.program_id(0)
+    request = tl.load(source_mapping + index)
+    offsets = tl.arange(0, block)
+    first = index * rows
     tl.store(
         fixed_ids + request * fixed_sparse_stride + offsets,
         tl.load(
@@ -66,34 +89,49 @@ def _prepare_inputs(
         ),
         offsets < sparse_size,
     )
-    if tl.program_id(0) == 0:
-        tl.store(mapping, request)
-        tl.store(expanded + offsets, request, offsets < 8)
-        tl.store(
-            fixed_inputs + offsets,
-            tl.load(inputs + offsets, offsets < 8, 0),
-            offsets < 8,
-        )
-        tl.store(
-            fixed_positions + offsets,
-            tl.load(positions + offsets, offsets < 8, 0),
-            offsets < 8,
-        )
-        tl.store(dense_pointer, dense.to(tl.int64))
+    tl.store(mapping + index, request)
+    tl.store(expanded + first + offsets, request, offsets < rows)
+    tl.store(
+        fixed_inputs + first + offsets,
+        tl.load(inputs + first + offsets, offsets < rows, 0),
+        offsets < rows,
+    )
+    tl.store(
+        fixed_positions + first + offsets,
+        tl.load(positions + first + offsets, offsets < rows, 0),
+        offsets < rows,
+    )
 
 
 @triton.jit
 def _copy_dense_slot(
-    source_pointer, destination, mapping, slot_size: tl.constexpr, block: tl.constexpr
+    source_pointer,
+    destination,
+    mapping,
+    destination_stride: tl.constexpr,
+    slot_size: tl.constexpr,
+    block: tl.constexpr,
 ):
     # The source address is refreshed with the current request's inputs.
     # Only the reference branch reads dense proposals; compact rounds incur
     # no full-vocabulary copy, and inactive request slots are never copied.
     source = tl.load(source_pointer).to(destination.dtype)
-    request = tl.load(mapping)
-    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    request = tl.load(mapping + tl.program_id(0))
+    offsets = tl.program_id(1) * block + tl.arange(0, block)
     values = tl.load(source + request * slot_size + offsets, offsets < slot_size, 0)
-    tl.store(destination + offsets, values, offsets < slot_size)
+    tl.store(
+        destination + request * destination_stride + offsets,
+        values,
+        offsets < slot_size,
+    )
+
+
+def _capture_headroom(device: torch.device) -> bool:
+    free, _ = torch.cuda.mem_get_info(device)
+    idle = torch.accelerator.memory_reserved(device) - (
+        torch.accelerator.memory_allocated(device)
+    )
+    return free + idle >= CAPTURE_HEADROOM_BYTES
 
 
 def _all_ranks_support(status: int) -> bool:
@@ -107,46 +145,106 @@ def _all_ranks_support(status: int) -> bool:
     return unsupported.item() == 0
 
 
+def _snapshot_sampling_inputs(
+    sampler: Any,
+) -> tuple[Any, list[tuple[Any, torch.Tensor]]]:
+    """Give this graph fixed addresses without changing eager sampling state."""
+    view = copy(sampler)
+    copies: list[tuple[Any, torch.Tensor]] = []
+    for state_name, names in (
+        ("sampling_states", ("temperature", "top_k", "top_p", "min_p", "seeds")),
+        (
+            "penalties_state",
+            ("repetition_penalty", "frequency_penalty", "presence_penalty"),
+        ),
+    ):
+        source_state = getattr(sampler, state_name)
+        state = copy(source_state)
+        for name in names:
+            source = getattr(source_state, name, None)
+            if source is None:
+                continue
+            tensor = source.gpu.clone()
+            field = copy(source)
+            field.gpu = tensor
+            setattr(state, name, field)
+            copies.append((source, tensor))
+        setattr(view, state_name, state)
+    return view, copies
+
+
 class _RejectionGraph:
-    def __init__(self, model, speculator, rejection, hidden, batch, sparse):
+    def __init__(self, model, speculator, rejection, hidden, batch, sparse, penalties):
+        self.requests = batch.num_reqs
+        # Penalties are a trace constant: graphs without them launch no kernel.
+        self.penalties = penalties
+        rows = self.requests * ROWS_PER_REQUEST
         self.hidden = torch.empty_like(hidden)
-        self.inputs = torch.empty_like(batch.input_ids[:8])
-        self.positions = torch.empty_like(batch.positions[:8])
+        self.inputs = torch.empty_like(batch.input_ids[:rows])
+        self.positions = torch.empty_like(batch.positions[:rows])
         # MRv2 allocates expanded metadata anew every round. Keep graph inputs
         # independent of those allocations and preserve the original slot ID.
-        self.mapping = batch.idx_mapping[:1].clone()
-        self.expanded = batch.expanded_idx_mapping[:8].clone()
+        self.mapping = batch.idx_mapping[: self.requests].clone()
+        self.expanded = batch.expanded_idx_mapping[:rows].clone()
         self.local = torch.arange(
-            8, dtype=batch.expanded_local_pos.dtype, device=hidden.device
-        )
-        self.cu = batch.cu_num_logits[:2].clone()
+            ROWS_PER_REQUEST,
+            dtype=batch.expanded_local_pos.dtype,
+            device=hidden.device,
+        ).repeat(self.requests)
+        self.cu = batch.cu_num_logits[: self.requests + 1].clone()
         self.request_indices = batch.idx_mapping_np.copy()
         self.rejection = rejection
+        self.sampler, self._parameter_copies = _snapshot_sampling_inputs(
+            rejection.sampler
+        )
         self.model = model
         self.speculator = speculator
         self.sparse = tuple(torch.empty_like(t) for t in sparse)
         dense = speculator.draft_logits
-        # Only one request is captured. Alias its private proposal slot for
-        # every state index while preserving the original request mapping.
-        # Dense kernels accept stride(0)==0; no other request slot is read.
-        self.draft_slot = dense.new_empty((1, *dense.shape[1:]))
-        self.draft_logits = self.draft_slot.expand(dense.shape[0], -1, -1)
+        if self.requests == 1:
+            # Alias the one private proposal slot for every state index while
+            # preserving the original request mapping. Dense kernels accept
+            # stride(0)==0; no other request slot is read.
+            self.draft_slot = dense.new_empty((1, *dense.shape[1:]))
+            self.draft_logits = self.draft_slot.expand(dense.shape[0], -1, -1)
+        else:
+            # Every replay refills the slots it reads, so graphs can share this.
+            shared = getattr(rejection, "_sm70_dflash2_graph_draft_logits", None)
+            if shared is None or shared.shape != dense.shape:
+                shared = dense.new_empty(dense.shape)
+                rejection._sm70_dflash2_graph_draft_logits = shared
+            self.draft_logits = shared
         self.dense_pointer = self.inputs.new_empty(1, dtype=torch.int64)
-        self.output = self.inputs.new_empty((1, 8), dtype=torch.int64)
-        self.count = self.inputs.new_empty(1, dtype=torch.int32)
+        self.output = self.inputs.new_empty(
+            (self.requests, ROWS_PER_REQUEST), dtype=torch.int64
+        )
+        self.count = self.inputs.new_empty(self.requests, dtype=torch.int32)
         self.counters = self.inputs.new_zeros(2, dtype=torch.int64)
         self.request_id = None
         self.prefix = torch.cuda.CUDAGraph(keep_graph=True)
         self.reference = torch.cuda.CUDAGraph(keep_graph=True)
         self.compact = torch.cuda.CUDAGraph(keep_graph=True)
+        self.sampler.sampling_states.capture_mode = True
         self.prepare(hidden, batch, sparse)
 
     def prepare(self, hidden, batch, sparse):
+        # UVA pools rotate their GPU aliases. Refresh fixed graph-owned tensors
+        # on the consumer stream, including parameters indexed by high slots.
+        for source, tensor in self._parameter_copies:
+            tensor.copy_(source.gpu)
+        self.cu.copy_(batch.cu_num_logits[: self.requests + 1])
         ids, values = sparse
         fixed_ids, fixed_values = self.sparse
-        _prepare_inputs[(triton.cdiv(hidden.numel(), 1024),)](
+        _prepare_hidden[(triton.cdiv(hidden.numel(), 1024),)](
             hidden,
             self.hidden,
+            self.speculator.draft_logits,
+            self.dense_pointer,
+            hidden.numel(),
+            1024,
+            num_warps=4,
+        )
+        _prepare_request[(self.requests,)](
             batch.input_ids,
             self.inputs,
             batch.positions,
@@ -158,42 +256,55 @@ class _RejectionGraph:
             fixed_ids,
             values,
             fixed_values,
-            self.speculator.draft_logits,
-            self.dense_pointer,
-            hidden.numel(),
             ids.shape[1] * ids.shape[2],
             ids.stride(0),
             fixed_ids.stride(0),
-            1024,
-            num_warps=4,
+            ROWS_PER_REQUEST,
+            triton.next_power_of_2(ids.shape[1] * ids.shape[2]),
+            num_warps=1,
         )
         # Dense proposals are accessed indirectly inside a conditional body.
         # Record their consumer stream for replaced/eager tensor lifetimes.
         self.speculator.draft_logits.record_stream(torch.cuda.current_stream())
 
     def _probe(self):
-        from .sparse_rejection import _compact_target_reference_flags
+        from .sparse_rejection import _compact_target_reference_flags, _penalize_probe
 
-        self.ids, self.values, self.fallback = (
-            self.model.get_topk_tokens_and_logits_with_fallback(self.hidden, 64)
+        probe = getattr(
+            self.model,
+            "get_compact_target_probe_with_fallback",
+            self.model.get_topk_tokens_and_logits_with_fallback,
         )
+        self.ids, self.values, self.fallback = probe(self.hidden, 64)
         if self.fallback is None:
             return False
-        states = self.rejection.sampler.sampling_states
+        sampler = self.sampler
+        states = sampler.sampling_states
+        floors = None
+        if self.penalties:
+            floors = _penalize_probe(
+                self.values,
+                self.ids,
+                sampler.penalties_state,
+                self.expanded,
+                self.inputs,
+                self.local,
+            )
         self.values, self.ids = sort_topk_with_vocab_ties(
             self.values, self.ids, vocab_size=states.vocab_size, descending=True
         )
         self.flags = _compact_target_reference_flags(
-            self.values, states.temperature.gpu, states.top_p.gpu, self.expanded
+            self.values, states.temperature.gpu, states.top_p.gpu, self.expanded, floors
         )
         return True
 
     def _dense(self):
         slot_size = self.draft_logits.shape[1] * self.draft_logits.shape[2]
-        _copy_dense_slot[(triton.cdiv(slot_size, 4096),)](
+        _copy_dense_slot[(self.requests, triton.cdiv(slot_size, 4096))](
             self.dense_pointer,
             self.draft_logits,
             self.mapping,
+            self.draft_logits.stride(0),
             slot_size,
             4096,
             num_warps=4,
@@ -201,7 +312,7 @@ class _RejectionGraph:
         logits = self.fallback()
         if logits is None:
             raise RuntimeError("DFlash2 graph rejection requires replicated logits")
-        sampler = self.rejection.sampler
+        sampler = self.sampler
         states = sampler.sampling_states
         processed = sampler.apply_sampling_params(
             logits,
@@ -229,7 +340,7 @@ class _RejectionGraph:
         self.count.copy_(count)
 
     def _compact(self):
-        sampler = self.rejection.sampler
+        sampler = self.sampler
         states = sampler.sampling_states
         ids, values = self.sparse
         output, count = dflash2_sparse_topk_rejection_sample(
@@ -289,7 +400,7 @@ class _RejectionGraph:
         return _all_ranks_support(status)
 
     def replay(self, hidden, batch, sparse):
-        request_id = batch.req_ids[0]
+        request_id = tuple(batch.req_ids)
         if request_id != self.request_id:
             self.counters.zero_()
             self.request_id = request_id
@@ -315,11 +426,14 @@ def try_graph_rejection(
 ) -> SamplerOutput | None:
     """Caller has checked the positive-temperature compact sampling contract."""
     if (
-        getattr(batch, "num_reqs", 0) != 1
-        or batch.num_tokens != 8
-        or hidden.shape[0] != 8
-        or rejection.num_speculative_steps != 7
-        or not np.array_equal(batch.cu_num_logits_np, [0, 8])
+        not 1 <= getattr(batch, "num_reqs", 0) <= MAX_GRAPH_REQUESTS
+        or batch.num_tokens != batch.num_reqs * ROWS_PER_REQUEST
+        or hidden.shape[0] != batch.num_reqs * ROWS_PER_REQUEST
+        or rejection.num_speculative_steps != ROWS_PER_REQUEST - 1
+        or not np.array_equal(
+            batch.cu_num_logits_np,
+            np.arange(batch.num_reqs + 1) * ROWS_PER_REQUEST,
+        )
         or get_tensor_model_parallel_world_size() != 4
         or not hasattr(model, "get_topk_tokens_and_logits_with_fallback")
         or not hasattr(torch.ops._C, "sm70_sampler_graph_prepare_collective")
@@ -332,6 +446,7 @@ def try_graph_rejection(
         return None
     states = rejection.sampler.sampling_states
     idx = batch.idx_mapping_np
+    penalties = bool(np.any(rejection.sampler.penalties_state.use_penalty[idx]))
     # CPU dispatch choices are trace constants; numeric parameters and request
     # slots remain live GPU inputs. Private input storage makes cache decisions
     # independent of the allocator and the target graph's output lifetime.
@@ -346,19 +461,24 @@ def try_graph_rejection(
         id(model),
         id(speculator),
         hidden.dtype,
-        bool(np.any(states.temperature.np[idx] != 1.0)),
         bool(np.any(states.top_p.np[idx] != 1.0)),
         rejection.sampler.use_fp64_gumbel,
+        penalties,
         tuple((t.dtype, tuple(t.shape), tuple(t.stride())) for t in tensors),
     )
     graphs = getattr(rejection, "_sm70_dflash2_rejection_graphs", None)
     if graphs is None:
         graphs = rejection._sm70_dflash2_rejection_graphs = {}
     if key not in graphs:
-        if len(graphs) >= 8:
+        if len(graphs) >= MAX_GRAPHS:
             # Bound graph storage for unexpected shape/contract combinations.
             return None
-        candidate = _RejectionGraph(model, speculator, rejection, hidden, batch, sparse)
+        if not _all_ranks_support(0 if _capture_headroom(hidden.device) else 801):
+            graphs[key] = None
+            return None
+        candidate = _RejectionGraph(
+            model, speculator, rejection, hidden, batch, sparse, penalties
+        )
         graphs[key] = candidate if candidate.capture() else None
     graph = graphs[key]
     if graph is None:

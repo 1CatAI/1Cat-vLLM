@@ -10,6 +10,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
+from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -44,20 +45,28 @@ def _mtp_batch_runtime_contract(vllm_config=None) -> bool:
     )
 
 
-def _pack_hc_batch_weight(weight: torch.Tensor, role: str, rank: int) -> torch.Tensor:
-    """Lossless TP4 packs; keep checkpoint layout for M1 and prefill."""
-    if weight.dtype != torch.float16 or not 0 <= rank < 4:
+def _pack_hc_batch_weight(
+    weight: torch.Tensor, role: str, rank: int | None
+) -> torch.Tensor:
+    """Lossless batch packs; keep checkpoint layout for M1 and prefill."""
+    if weight.dtype != torch.float16 or (rank is not None and not 0 <= rank < 4):
         raise ValueError("HC batch packing requires FP16 and a TP4 rank")
     weight = weight.detach()
     if role == "down" and weight.shape == (336, 10240):
+        if rank is None:
+            padded = weight.new_zeros((352, 10240))
+            padded[:336].copy_(weight)
+            return padded.reshape(11, 32, 640, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
         padded = weight.new_zeros((96, 10240))
         padded[:88].copy_(weight[rank * 80 : rank * 80 + 88])
         return padded.reshape(3, 32, 640, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
     if role == "up" and weight.shape == (10240, 320):
-        shard = weight.reshape(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
+        shard = weight.reshape(4, 2560, 320)
+        if rank is not None:
+            shard = shard[:, rank * 640 : (rank + 1) * 640]
         return (
             shard.contiguous()
-            .reshape(4, 80, 8, 20, 2, 8)
+            .reshape(4, 320 if rank is None else 80, 8, 20, 2, 8)
             .permute(1, 3, 4, 0, 2, 5)
             .contiguous()
         )
@@ -73,7 +82,20 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
         return
     if not ops.supports_sm70_qwen38_hc_batch():
         raise RuntimeError("Rebuild the SM70 extension for batched HC")
-    rank = get_tp_group().rank_in_group
+    hc_ll = getattr(get_tp_group().device_communicator, "hc_ll_comm", None)
+    rank: int | None = get_tp_group().rank_in_group
+    ll_admitted = hc_ll is not None and hc_ll.status["enabled"]
+    if ll_admitted:
+        assert hc_ll is not None
+        rank = hc_ll.logical_rank
+    ca = getattr(get_tp_group().device_communicator, "ca_comm", None)
+    if (
+        not ll_admitted
+        and not (ca is not None and not ca.disabled and ca.fully_connected)
+        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        and ops.supports_sm70_qwen38_hc_replicated()
+    ):
+        rank = None
     layer.register_buffer(
         "_sm70_qwen38_hc_batch_packed",
         _pack_hc_batch_weight(weight, layer._sm70_qwen38_hc_batch_role, rank),
@@ -86,10 +108,11 @@ def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool
         return False
     reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
     admitted = (
-        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and not reduced and 2 <= x.shape[0] <= 16
+        layer_policy().batch_fastpath and not reduced and 2 <= x.shape[0] <= 16
         if concurrent_batch
-        else envs.VLLM_SM70_MTP_HC_BATCH and reduced and x.shape[0] in (5, 10)
+        else layer_policy().hc_mtp_batch and reduced and x.shape[0] in (5, 10)
     )
+
     return bool(
         admitted
         and not envs.VLLM_BATCH_INVARIANT
@@ -109,6 +132,34 @@ def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool
             and w.is_contiguous()
             and w.data_ptr() % 16 == 0
             for w in (packed_down, packed_up)
+        )
+    )
+
+
+def _replicated_runtime_ok(x, down, up, concurrent_batch):
+    return bool(
+        concurrent_batch
+        and layer_policy().batch_fastpath
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and x.ndim == 2
+        and (2 <= x.shape[0] <= 16 or x.shape[0] == 20)
+        and x.shape[1] == _HC_HIDDEN
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and down is not None
+        and up is not None
+        and down.shape == (11, 640, 2, 32, 8)
+        and up.shape == (320, 20, 2, 4, 8, 8)
+        and all(
+            w.device == x.device
+            and w.dtype == x.dtype
+            and w.is_contiguous()
+            and w.data_ptr() % 16 == 0
+            for w in (down, up)
         )
     )
 
@@ -371,6 +422,60 @@ def _qwen38_sm70_fp16_fused_hc(
     concurrent_batch: bool = False,
     reassociated_down: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.distributed.parallel_state import (
+        get_tp_group,
+        model_parallel_is_initialized,
+    )
+
+    hc_ll = (
+        getattr(get_tp_group().device_communicator, "hc_ll_comm", None)
+        if model_parallel_is_initialized()
+        else None
+    )
+    if x.ndim == 2 and x.shape[0] > 8:
+        logger.warning_once(
+            "FNXDBG HC M=%d concurrent=%s ll=%s down=%s up=%s contiguous=%s",
+            x.shape[0],
+            concurrent_batch,
+            None if hc_ll is None else hc_ll.status.get("enabled"),
+            None if packed_down is None else tuple(packed_down.shape),
+            None if packed_up is None else tuple(packed_up.shape),
+            x.is_contiguous(),
+        )
+    if (
+        hc_ll is not None
+        and hc_ll.status["enabled"]
+        and concurrent_batch
+        and x.ndim == 2
+        and 1 <= x.shape[0] <= 20
+        and x.shape[1] == _HC_HIDDEN
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and packed_down is not None
+        and packed_down.shape == (3, 640, 2, 32, 8)
+        and packed_up is not None
+        and packed_up.shape == (80, 20, 2, 4, 8, 8)
+    ):
+        result = hc_ll.apply(x, packed_down, packed_up)
+        logger.info_once(
+            "SM70 TP4 HC uses two-launch LL shards over direct NVLink peers."
+        )
+        assert result is not None
+        return result
+    if _replicated_runtime_ok(x, packed_down, packed_up, concurrent_batch):
+        from vllm import _custom_ops as ops
+
+        if ops.supports_sm70_qwen38_hc_replicated():
+            m = x.shape[0]
+            partials = x.new_empty((20, m, 352), dtype=torch.float32)
+            lora, block, injection = (x.new_empty((m, n)) for n in (320, 2560, 4))
+            ops.sm70_qwen38_hc_replicated(
+                x, packed_down, packed_up, partials, lora, block, injection
+            )
+            logger.info_once(
+                "SM70 batched HC uses replicated FP32 MMA without TP transport."
+            )
+            return block, injection
     if _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch):
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -391,8 +496,8 @@ def _qwen38_sm70_fp16_fused_hc(
                 block,
                 injection,
                 round_down_partials=not concurrent_batch,
-                cooperative=not concurrent_batch and envs.VLLM_SM70_MTP_HC_COOPERATIVE,
-                full_unroll=not concurrent_batch and envs.VLLM_SM70_MTP_HC_FULL_UNROLL,
+                cooperative=not concurrent_batch and layer_policy().hc_cooperative,
+                full_unroll=not concurrent_batch and layer_policy().hc_full_unroll,
                 fused_chain=concurrent_batch,
             )
             logger.info_once(
@@ -400,6 +505,40 @@ def _qwen38_sm70_fp16_fused_hc(
                 concurrent_batch,
             )
             return block, injection
+        # Local MMA does not require a fully-connected IPC topology. For the
+        # FP32-partial policy, transport disjoint Half output rows through the
+        # TP group's admitted collective (including the verified-edge ring).
+        # Each element has one contributor, preserving its Half value without
+        # narrowing a sum of live contributions.
+        from vllm import _custom_ops as ops
+
+        group = get_tp_group()
+        # The local+collective screen regressed M10. Keep it as a reference;
+        # automatic non-mesh preparation uses the replicated FP32 route.
+        if concurrent_batch and group.world_size == 4 and x.shape[0] == 5:
+            if ops.supports_sm70_qwen38_hc_local():
+                m = x.shape[0]
+                partials = x.new_empty((20, m, 96), dtype=torch.float32)
+                local_down = x.new_empty((m, 336))
+                ops.sm70_qwen38_hc_down_local(
+                    x, packed_down, partials, local_down, group.rank_in_group
+                )
+                gathered = group.all_reduce(local_down)
+                lora = gathered[:, :320].contiguous()
+                local_block = x.new_empty((m, 2560))
+                ops.sm70_qwen38_hc_up_local(
+                    lora, packed_up, x, local_block, group.rank_in_group
+                )
+                block = group.all_reduce(local_block)
+                logger.info_once(
+                    "SM70 TP4 batch HC uses local FP32 MMA and the admitted "
+                    "TP collective; fully-connected IPC is unavailable."
+                )
+                return block, gathered[:, 320:324].contiguous()
+            logger.warning_once(
+                "SM70 TP4 local batch HC unavailable: packaged local operators "
+                "missing; retaining dense HC projections."
+            )
     if not _runtime_ok(x, down_weight, up_weight):
         # Preserve the ordinary projection and FP16 materialization boundaries
         # for prefill and any unsupported runtime shape. This fallback lives
@@ -599,8 +738,8 @@ def enable_qwen38_sm70_fp16_fused_hc(
 ) -> None:
     """Mark exact base-model HC modules for the fused M=1 route."""
     if (
-        not envs.VLLM_SM70_QWEN38_FUSED_HC_FP16
-        or envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
+        not layer_policy().fused_hc
+        or layer_policy().value("online_qpn8")
         or dtype != torch.float16
         or not current_platform.is_device_capability((7, 0))
         or not _exact_runtime_contract(vllm_config)
@@ -633,7 +772,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
             not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         )
         concurrent_batch = bool(
-            envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+            layer_policy().batch_fastpath
             and _batch_runtime_contract(vllm_config)
             and tp4
             # The default worker disables FP16 partial reductions. Reuse the
@@ -642,7 +781,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
             # legacy FP16-partial policy retains its own qualified schedule.
             and (
                 not _mtp_batch_runtime_contract(vllm_config)
-                or (envs.VLLM_SM70_MTP_HC_BATCH and fp32_partials)
+                or (layer_policy().hc_mtp_batch and fp32_partials)
             )
         )
         # Only HC's packed collective owns exactly four TP shards. Local router
@@ -650,7 +789,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
         if tp4 and (
             concurrent_batch
             or (
-                envs.VLLM_SM70_MTP_HC_BATCH and _mtp_batch_runtime_contract(vllm_config)
+                layer_policy().hc_mtp_batch and _mtp_batch_runtime_contract(vllm_config)
             )
         ):
             for role, layer in (
@@ -678,3 +817,212 @@ __all__ = [
     "enable_qwen38_sm70_fp16_fused_hc",
     "maybe_apply_qwen38_sm70_fp16_fused_hc",
 ]
+
+
+def _unpack_hc_storage(down: torch.Tensor, up: torch.Tensor):
+    """Recover local checkpoint rows, never the full replicated matrices."""
+    if down.ndim == 6:
+        return (
+            down.reshape(80, 3, 2, 2, 2, 2, 2, 4, 4, 8)
+            .permute(1, 7, 6, 8, 2, 3, 0, 4, 5, 9)
+            .contiguous()
+            .reshape(96, 10240)[:88],
+            up.reshape(80, 5, 4, 2, 2, 4, 4, 8)
+            .permute(5, 0, 4, 6, 1, 2, 3, 7)
+            .contiguous()
+            .reshape(2560, 320),
+        )
+    return (
+        down.permute(0, 3, 1, 2, 4).contiguous().reshape(96, 10240)[:88],
+        up.permute(3, 0, 4, 1, 2, 5).contiguous().reshape(2560, 320),
+    )
+
+
+def _logical_hc_rank_rows(value: torch.Tensor, order: tuple[int, ...]) -> torch.Tensor:
+    """Restore logical ranks without creating a host index during capture."""
+    if order == (0, 1, 2, 3):
+        return value
+    return torch.cat([value[:, rank : rank + 1] for rank in order], dim=1)
+
+
+def _sharded_hc_project(
+    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.distributed.parallel_state import get_tp_group
+
+    from .ops.hc import hc_assemble_ranks, hc_gate_mix_local, hc_packet_silu
+
+    group = get_tp_group()
+    communicator = getattr(group.device_communicator, "hc_ll_comm", None)
+    assert communicator is not None and communicator.status["enabled"]
+    result = communicator.apply(x, down, up) if down.ndim == 5 else None
+    if result is not None:
+        return result
+    # Keep large-M prefill usable without retaining replicated checkpoint banks.
+    # The LL topology can reorder ranks; gathered rows must follow logical order.
+    local_down, local_up = _unpack_hc_storage(down, up)
+    order = tuple(communicator.order)
+    local = torch.mm(x, local_down.T)
+    del local_down
+    # Gather along rows (no reorder copy); one kernel takes the logical rank
+    # order, applies the HC SiLU and extracts the injection logits.
+    packet = group.all_gather(local, dim=0)
+    del local
+    lora, injection = hc_packet_silu(packet, order, 4)
+    del packet
+    local_gate = torch.mm(lora, local_up.T)
+    del lora, local_up
+    # The mix is elementwise per hidden column and this rank holds every
+    # stream's gate for its columns: mix locally, gather the 4x narrower
+    # result (rank-major rows) and assemble it in logical rank order.
+    mixed = hc_gate_mix_local(x, local_gate, order.index(group.rank_in_group), 4)
+    # Large prefill gates are no longer needed. Reclaim their storage before
+    # allocating the full gathered block and its assembled output.
+    del local_gate
+    gathered = group.all_gather(mixed, dim=0)
+    del mixed
+    return hc_assemble_ranks(gathered, order), injection
+
+
+def _sharded_hc_project_fake(
+    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return x.new_empty((x.shape[0], 2560)), x.new_empty((x.shape[0], 4))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sharded_hc_project",
+    op_func=_sharded_hc_project,
+    fake_impl=_sharded_hc_project_fake,
+)
+sharded_hc_project = torch.ops.vllm.qwen38_sharded_hc_project
+
+
+def _sharded_hc_project_sequence_rows(
+    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project row-owned residuals using transient copies of existing shards."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    from .ops.hc import hc_gate_mix_gathered, hc_packet_silu
+
+    group = get_tp_group()
+    communicator = getattr(group.device_communicator, "hc_ll_comm", None)
+    if (
+        group.world_size != 4
+        or communicator is None
+        or not communicator.status["enabled"]
+    ):
+        raise ValueError("HC sequence rows require qualified TP4 sharded transport")
+    order = tuple(communicator.order)
+    local_down, local_up = _unpack_hc_storage(down, up)
+    full_down = group.all_gather(local_down, dim=0)
+    del local_down
+    projected = torch.mm(x, full_down.T)
+    del full_down
+    lora, injection = hc_packet_silu(projected, order, 4, rank_columns=True)
+    del projected
+    full_up = group.all_gather(local_up, dim=0)
+    del local_up
+    gate = torch.mm(lora, full_up.T)
+    del lora, full_up
+    local_block = hc_gate_mix_gathered(x, gate, order)
+    del gate
+    block = group.all_gather(local_block, dim=0)
+    logger.info_once("SM70 HC prefill keeps query rows local and gathers block inputs.")
+    return block, injection
+
+
+def _sharded_hc_project_sequence_rows_fake(
+    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return x.new_empty((4 * x.shape[0], 2560)), x.new_empty((x.shape[0], 4))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sharded_hc_project_sequence_rows",
+    op_func=_sharded_hc_project_sequence_rows,
+    fake_impl=_sharded_hc_project_sequence_rows_fake,
+)
+sharded_hc_project_sequence_rows = (
+    torch.ops.vllm.qwen38_sharded_hc_project_sequence_rows
+)
+
+
+def prepare_sharded_hc_storage(model, vllm_config) -> None:
+    """Replace replicated FP16 HC matrices with the existing lossless LL pack."""
+    if vllm_config.kernel_config.hc_weight_storage != "sharded":
+        return
+    from vllm.distributed.parallel_state import get_tp_group
+
+    from .hyperconnection import GatedResidual
+
+    group = get_tp_group()
+    communicator = getattr(group.device_communicator, "hc_ll_comm", None)
+    if communicator is None or not communicator.status["enabled"]:
+        reason = (
+            "communicator_unavailable"
+            if communicator is None
+            else communicator.status["reason"]
+        )
+        raise ValueError(
+            f"Sharded HC storage requires qualified TP4 transport: {reason}"
+        )
+    if vllm_config.lora_config is not None:
+        raise ValueError("Sharded HC storage does not support LoRA adapters")
+    count = 0
+    for module in model.modules():
+        if not isinstance(module, GatedResidual) or hasattr(module, "hc_shard_down"):
+            continue
+        if (module.hc_count, module.hidden_size, module.lora_rank) != (4, 2560, 320):
+            raise ValueError("Sharded HC storage requires HC4, hidden 2560, rank 320")
+        down_layer = (
+            module.input_mix_weight_down_block_inject
+            if module.use_combine
+            else module.input_mix_weight_down
+        )
+        up_layer = module.input_mix_weight_up
+        down = down_layer.weight
+        up = up_layer.weight
+        staged = all(
+            getattr(layer, "_hc_cpu_staging", False) for layer in (down_layer, up_layer)
+        )
+        if (
+            (not staged and not down.is_cuda)
+            or down.dtype != torch.float16
+            or up.dtype != torch.float16
+        ):
+            raise ValueError("Sharded HC storage requires FP16 checkpoint matrices")
+        if not module.use_combine:
+            down = torch.nn.functional.pad(down, (0, 0, 0, 16))
+        rank = communicator.logical_rank
+        module.register_buffer(
+            "hc_shard_down",
+            getattr(module, "_hcx_down", None)
+            if hasattr(module, "_hcx_down")
+            else _pack_hc_batch_weight(down, "down", rank).to(communicator.device),
+            persistent=False,
+        )
+        module.register_buffer(
+            "hc_shard_up",
+            getattr(module, "_hcx_up", None)
+            if hasattr(module, "_hcx_up")
+            else _pack_hc_batch_weight(up, "up", rank).to(communicator.device),
+            persistent=False,
+        )
+        for layer in (down_layer, up_layer):
+            layer.register_parameter(
+                "weight",
+                nn.Parameter(layer.weight.new_empty((0,)), requires_grad=False),
+            )
+            # The ordinary dense provider borrows the former weight through
+            # an unregistered reference. Both HC schedules now read the shard
+            # bank, so this provider must not keep staged checkpoint pages.
+            if hasattr(layer, "_sm70_dense_state"):
+                del layer._sm70_dense_state
+            if hasattr(layer, "_sm70_qwen38_hc_batch_packed"):
+                delattr(layer, "_sm70_qwen38_hc_batch_packed")
+        count += 1
+    logger.info(
+        "Prepared %d lossless HC shards; replicated projection banks released", count
+    )
