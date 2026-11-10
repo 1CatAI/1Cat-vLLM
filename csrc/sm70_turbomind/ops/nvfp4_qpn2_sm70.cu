@@ -792,7 +792,7 @@ void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
                   codes, scales, input, output, n, k, m, global_scale);
           return;
         }
-        if (k < 4096 && k % 256 == 0) {
+        if (k % 256 == 0 && (k < 4096 || n / 16 >= 4 * sms)) {
           nvfp4_qpn2_projection_sm70_kernel<0, 16, 16>
               <<<dim3(row_blocks, n / 16), 256, 0, stream>>>(
                   codes, scales, input, output, n, k, m, global_scale);

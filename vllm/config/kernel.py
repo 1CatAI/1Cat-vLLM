@@ -271,9 +271,10 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     bundled_down_decode: bool = False
     """Use adjacent QPN2 codes/scales for compatible local down projections.
 
-    Qualified prefill/shared-weight routes retain this single native packing
-    and restore bounded prefill scratch. Other routes retain an additional
-    bundled copy beside their existing layout.
+    Compact shared-weight routes use the common TurboMind packing and native
+    projection schedule without an extra weight copy. Separately qualified
+    native-layout routes can bundle their existing packing; other routes may
+    retain an additional bundled copy.
     """
     shared_scales: bool | None = None
     """Allow compact scales when batch layouts and native ABI permit them."""

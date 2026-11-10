@@ -85,8 +85,9 @@ __global__ void dflash2_fp16_m8_kernel(half* __restrict__ output,
 
 namespace {
 
-// Score one gathered vocabulary row with the dense WMMA head's single FP32
-// accumulator chain. A parallel dot reduction changes FP16 rounding at ties.
+// Retain the dense head's FP32 partitions, including its final FP32 sum.
+// Changing that schedule can change FP16 rounding at close logits.
+template <int Partitions>
 __global__ void fp16_candidate_scores_sm70_kernel(
     half* __restrict__ scores, const half* __restrict__ input,
     const half* __restrict__ weight, const int* __restrict__ ids,
@@ -115,41 +116,49 @@ __global__ void fp16_candidate_scores_sm70_kernel(
   }
   __syncwarp();
 
-  float accumulator[8] = {};
-  for (int first = 0; first < Width / 16; first += PrefetchGroups) {
-    uint4 weight_first[PrefetchGroups];
-    uint4 weight_second[PrefetchGroups];
+  float accumulator[Partitions][8] = {};
 #pragma unroll
-    for (int group = 0; group < PrefetchGroups; ++group) {
-      weight_first[group] = make_uint4(0, 0, 0, 0);
-      weight_second[group] = make_uint4(0, 0, 0, 0);
-      if (lane == 0) {
-        const half* address = candidate_weight + (first + group) * 16;
-        weight_first[group] = *reinterpret_cast<const uint4*>(address);
-        weight_second[group] = *reinterpret_cast<const uint4*>(address + 8);
-      }
-    }
+  for (int part = 0; part < Partitions; ++part) {
+    for (int first = part * (Width / 16 / Partitions);
+         first < (part + 1) * (Width / 16 / Partitions);
+         first += PrefetchGroups) {
+      uint4 weight_first[PrefetchGroups];
+      uint4 weight_second[PrefetchGroups];
 #pragma unroll
-    for (int group = 0; group < PrefetchGroups; ++group) {
-      uint4 input_first = make_uint4(0, 0, 0, 0);
-      uint4 input_second = make_uint4(0, 0, 0, 0);
-      if ((lane & 19) == 0) {
-        const half* address = activation + (first + group) * 16;
-        input_first = *reinterpret_cast<const uint4*>(address);
-        input_second = *reinterpret_cast<const uint4*>(address + 8);
+      for (int group = 0; group < PrefetchGroups; ++group) {
+        weight_first[group] = make_uint4(0, 0, 0, 0);
+        weight_second[group] = make_uint4(0, 0, 0, 0);
+        if (lane == 0) {
+          const half* address = candidate_weight + (first + group) * 16;
+          weight_first[group] = *reinterpret_cast<const uint4*>(address);
+          weight_second[group] = *reinterpret_cast<const uint4*>(address + 8);
+        }
       }
-      MMA(accumulator, input_first.x, input_first.y, weight_first[group].x,
-          weight_first[group].y);
-      MMA(accumulator, input_first.z, input_first.w, weight_first[group].z,
-          weight_first[group].w);
-      MMA(accumulator, input_second.x, input_second.y, weight_second[group].x,
-          weight_second[group].y);
-      MMA(accumulator, input_second.z, input_second.w, weight_second[group].z,
-          weight_second[group].w);
+#pragma unroll
+      for (int group = 0; group < PrefetchGroups; ++group) {
+        uint4 input_first = make_uint4(0, 0, 0, 0);
+        uint4 input_second = make_uint4(0, 0, 0, 0);
+        if ((lane & 19) == 0) {
+          const half* address = activation + (first + group) * 16;
+          input_first = *reinterpret_cast<const uint4*>(address);
+          input_second = *reinterpret_cast<const uint4*>(address + 8);
+        }
+        MMA(accumulator[part], input_first.x, input_first.y,
+            weight_first[group].x, weight_first[group].y);
+        MMA(accumulator[part], input_first.z, input_first.w,
+            weight_first[group].z, weight_first[group].w);
+        MMA(accumulator[part], input_second.x, input_second.y,
+            weight_second[group].x, weight_second[group].y);
+        MMA(accumulator[part], input_second.z, input_second.w,
+            weight_second[group].z, weight_second[group].w);
+      }
     }
   }
   if (lane == 0) {
-    scores[row * candidates + candidate] = __float2half_rn(accumulator[0]);
+    float value = accumulator[0][0];
+#pragma unroll
+    for (int part = 1; part < Partitions; ++part) value += accumulator[part][0];
+    scores[row * candidates + candidate] = __float2half_rn(value);
   }
 }
 
@@ -188,8 +197,13 @@ void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
                         std::numeric_limits<float>::quiet_NaN());
     return;
   }
-  fp16_candidate_scores_sm70_kernel<<<dim3(input.size(0), ids.size(1)), 32, 0,
-                                      at::cuda::getCurrentCUDAStream()>>>(
+  // The qualified wider shard's multirow cuBLAS projection uses two K
+  // partitions; a single row and the narrower shard retain one chain.
+  auto kernel = input.size(0) > 1 && weight.size(0) > 65536
+                    ? fp16_candidate_scores_sm70_kernel<2>
+                    : fp16_candidate_scores_sm70_kernel<1>;
+  kernel<<<dim3(input.size(0), ids.size(1)), 32, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(scores.data_ptr()),
       reinterpret_cast<const half*>(input.data_ptr()),
       reinterpret_cast<const half*>(weight.data_ptr()), ids.data_ptr<int>(),
@@ -264,9 +278,9 @@ void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
 
 namespace {
 // Certified rows preserve their output storage. Other rows execute the
-// complete original-weight projection with its single accumulator chain.
+// complete original-weight projection with the qualified FP32 partitions.
 
-template <int Prefetch>
+template <int Prefetch, int Partitions>
 __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
     half* scores, const half* input, const half* weight, const int* certified,
     int rows, int vocab) {
@@ -288,28 +302,36 @@ __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
   int input_row = (lane & 3) + ((lane & 16) ? 4 : 0);
   bool active = input_row < rows && certified[input_row] == 0;
   const half* weight_row = weight + static_cast<int64_t>(column) * 5120;
-  float accum[8] = {};
-  for (int first = 0; first < 320; first += Prefetch) {
-    uint4 first_weight[Prefetch], second_weight[Prefetch];
+  float accum[Partitions][8] = {};
 #pragma unroll
-    for (int group = 0; group < Prefetch; ++group) {
-      const half* address = weight_row + (first + group) * 16;
-      first_weight[group] = __ldcs(reinterpret_cast<const uint4*>(address));
-      second_weight[group] =
-          __ldcs(reinterpret_cast<const uint4*>(address + 8));
-    }
+  for (int part = 0; part < Partitions; ++part) {
+    for (int first = part * (320 / Partitions);
+         first < (part + 1) * (320 / Partitions); first += Prefetch) {
+      uint4 first_weight[Prefetch], second_weight[Prefetch];
 #pragma unroll
-    for (int group = 0; group < Prefetch; ++group) {
-      uint4 a0 = make_uint4(0, 0, 0, 0), a1 = make_uint4(0, 0, 0, 0);
-      if (active) {
-        const half* address = input + input_row * 5120 + (first + group) * 16;
-        a0 = __ldg(reinterpret_cast<const uint4*>(address));
-        a1 = __ldg(reinterpret_cast<const uint4*>(address + 8));
+      for (int group = 0; group < Prefetch; ++group) {
+        const half* address = weight_row + (first + group) * 16;
+        first_weight[group] = __ldcs(reinterpret_cast<const uint4*>(address));
+        second_weight[group] =
+            __ldcs(reinterpret_cast<const uint4*>(address + 8));
       }
-      MMA(accum, a0.x, a0.y, first_weight[group].x, first_weight[group].y);
-      MMA(accum, a0.z, a0.w, first_weight[group].z, first_weight[group].w);
-      MMA(accum, a1.x, a1.y, second_weight[group].x, second_weight[group].y);
-      MMA(accum, a1.z, a1.w, second_weight[group].z, second_weight[group].w);
+#pragma unroll
+      for (int group = 0; group < Prefetch; ++group) {
+        uint4 a0 = make_uint4(0, 0, 0, 0), a1 = make_uint4(0, 0, 0, 0);
+        if (active) {
+          const half* address = input + input_row * 5120 + (first + group) * 16;
+          a0 = __ldg(reinterpret_cast<const uint4*>(address));
+          a1 = __ldg(reinterpret_cast<const uint4*>(address + 8));
+        }
+        MMA(accum[part], a0.x, a0.y, first_weight[group].x,
+            first_weight[group].y);
+        MMA(accum[part], a0.z, a0.w, first_weight[group].z,
+            first_weight[group].w);
+        MMA(accum[part], a1.x, a1.y, second_weight[group].x,
+            second_weight[group].y);
+        MMA(accum[part], a1.z, a1.w, second_weight[group].z,
+            second_weight[group].w);
+      }
     }
   }
 #pragma unroll
@@ -317,9 +339,13 @@ __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
     int row = (index & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
     int column = blockIdx.y * 32 + ((lane >> 2) & 3) * 8 + (index & 1) +
                  (((lane >> 1) & 1) << 1) + ((index >> 2) << 2);
-    if (row < rows && certified[row] == 0)
+    if (row < rows && certified[row] == 0) {
+      float value = accum[0][index];
+#pragma unroll
+      for (int part = 1; part < Partitions; ++part) value += accum[part][index];
       scores[static_cast<int64_t>(row) * vocab + column] =
-          __float2half_rn(accum[index]);
+          __float2half_rn(value);
+    }
   }
 }
 
@@ -355,8 +381,11 @@ void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
   const int64_t row_tiles = (input.size(0) + 7) / 8;
   TORCH_CHECK(row_tiles <= properties->maxGridSize[0]);
   TORCH_CHECK(vocab / 32 <= properties->maxGridSize[1]);
-  fp16_masked_head_sm70_kernel<8><<<dim3(row_tiles, vocab / 32), 32, 0,
-                                    at::cuda::getCurrentCUDAStream()>>>(
+  auto kernel = input.size(0) > 1 && vocab > 65536
+                    ? fp16_masked_head_sm70_kernel<8, 2>
+                    : fp16_masked_head_sm70_kernel<8, 1>;
+  kernel<<<dim3(row_tiles, vocab / 32), 32, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(scores.data_ptr()),
       reinterpret_cast<const half*>(input.data_ptr()),
       reinterpret_cast<const half*>(weight.data_ptr()),

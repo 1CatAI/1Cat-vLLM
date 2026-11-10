@@ -141,11 +141,11 @@ def test_wide_dense_fallback_keeps_high_ids_and_all_tiles(vocab):
         assert torch.equal(output[~active], pairs[~active])
 
 
-@pytest.mark.parametrize("rows", [1, 5, 8, 9, 17, 32, 33, 40, 64])
-def test_masked_dense_head_graph_replay(rows):
+@pytest.mark.parametrize("rows", [*range(1, 10), 17, 32, 33, 40, 64])
+@pytest.mark.parametrize("vocab", [62080, 124160])
+def test_masked_dense_head_graph_replay(rows, vocab):
     require_native()
     torch.manual_seed(49071)
-    vocab = 124160 if rows in (1, 5, 8, 17) else 62080
     weight = torch.randn(vocab, 5120, device="cuda", dtype=torch.float16)
     x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16)
     flags = torch.zeros(rows, device="cuda", dtype=torch.int32)
@@ -162,15 +162,9 @@ def test_masked_dense_head_graph_replay(rows):
         graph.replay()
         reference = torch.nn.functional.linear(x, weight)
         active = flags == 0
-        if vocab <= 65536 or rows > 8:
-            assert torch.equal(
-                scores[active].view(torch.int16), reference[active].view(torch.int16)
-            )
-        else:
-            oracle = x[active].double() @ weight.double().T
-            assert (
-                scores[active].double() - oracle
-            ).norm() <= 2**-11 * oracle.norm() + 2**-14
+        assert torch.equal(
+            scores[active].view(torch.int16), reference[active].view(torch.int16)
+        )
         assert bool((scores[~active] == 111).all())
     flags.fill_(1)
     scores.fill_(42)

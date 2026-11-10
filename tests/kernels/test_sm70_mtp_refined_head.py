@@ -80,8 +80,9 @@ def test_refined_head_rerank_ties_and_replay():
         )
 
 
-@pytest.mark.parametrize("rows", [1, 5, 8, 9, 17, 32, 33, 40, 64])
-def test_fp16_candidate_scores_preserve_precision_and_dense_fallback(rows):
+@pytest.mark.parametrize("rows", [*range(1, 10), 17, 32, 33, 40, 64])
+@pytest.mark.parametrize("vocab", [62080, 124160])
+def test_fp16_candidate_scores_preserve_precision_and_dense_fallback(rows, vocab):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
     operation = getattr(torch.ops._C, "sm70_fp16_candidate_scores_out", None)
@@ -89,7 +90,6 @@ def test_fp16_candidate_scores_preserve_precision_and_dense_fallback(rows):
         pytest.skip("requires the candidate scoring operator")
     assert operation is not None
     torch.manual_seed(71328)
-    vocab = 124160 if rows in (1, 5, 8, 17) else 62080
     weight = torch.randn(vocab, 5120, device="cuda", dtype=torch.float16)
     x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16)
     ids = torch.randint(0, vocab, (rows, 32), device="cuda", dtype=torch.int32)
@@ -101,21 +101,11 @@ def test_fp16_candidate_scores_preserve_precision_and_dense_fallback(rows):
     for cycle in range(32):
         x.normal_().mul_(0.1 if cycle < 16 else 2)
         graph.replay()
-        # The reference head uses the dense WMMA reduction. Pad the one-row
-        # oracle so cuBLAS keeps that path independently of GEMV heuristics.
-        dense_input = x.expand(8, -1).contiguous() if rows == 1 else x
         assert not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         assert not torch.backends.cuda.matmul.allow_fp16_accumulation
-        dense = torch.nn.functional.linear(dense_input, weight)[:rows]
+        dense = torch.nn.functional.linear(x, weight)
         expected = dense.gather(1, ids.long())
-        if vocab <= 65536 or rows > 8:
-            assert torch.equal(scores.view(torch.int16), expected.view(torch.int16))
-        else:
-            # Compare original-weight FP32 scoring to FP64. A split-K cuBLAS
-            # reference can round the same dot product to a neighboring half;
-            # its rounding boundaries are not an exact contract for new shards.
-            oracle = (x.double()[:, None] * weight[ids.long()].double()).sum(-1)
-            assert (scores.double() - oracle).norm() <= 2**-11 * oracle.norm() + 2**-14
+        assert torch.equal(scores.view(torch.int16), expected.view(torch.int16))
 
 
 def test_fp16_candidate_scores_invalid_ids_are_bounded():

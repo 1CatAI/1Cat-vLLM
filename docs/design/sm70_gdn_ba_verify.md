@@ -32,8 +32,10 @@ The same owners handle these changes:
 - QPN2/QPN8 preparation and dispatch consume local N/K. Bundled FFN weights,
   scale rebias and gated projections use the same implementation for wider
   shards; measured constant-width schedules remain internal tuning choices.
-  Qualified bundled down projections retain a single native weight layout and
-  restore prefill scratch, avoiding a second persistent weight copy on TP2.
+  Shared-weight/compact-scale down projections retain one TurboMind packing.
+  Their native decode schedule consumes that packing directly, avoiding a
+  second persistent weight copy and retaining the original prefill projection
+  and its accumulation order.
 - GDN projection splitting, convolution/gating/output initialization and
   per-head N128 normalization derive their widths from the local head layout.
   Live lengths, invalid slots and accepted-history offsets retain the existing
@@ -47,10 +49,11 @@ The same owners handle these changes:
   65536 rows. The target still certifies against every discarded bound and
   otherwise scores the complete original FP16 head. Old head extensions decline
   wider shards. Public dense projection APIs keep their original fallback.
-  A wider cuBLAS reference may select split-K even with FP32-only reductions.
-  Native small-row original-weight scoring retains its existing single FP32
-  chain. Numerical checks bound the different FP16 rounding; the target's
-  existing conservative bounds already cover FP32 reduction-order differences.
+  A wider multirow cuBLAS reference selects two K partitions even with
+  FP32-only reductions. Native scoring retains that FP32 partition schedule;
+  single-row and narrower projections retain one chain. Qualified TP2/TP4
+  scores are checked bitwise against the original dense projection, including
+  every M1–8 width and the dense fallback above the fast-row capacity.
 - Collective admission uses communicator capabilities. The two-peer pull
   reduction and four-peer push transport remain topology-specific internals;
   both provide fused all-reduce/Gemma RMSNorm and can publish the existing K16

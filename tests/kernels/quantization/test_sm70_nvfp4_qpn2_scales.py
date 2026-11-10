@@ -37,7 +37,9 @@ def test_native_decode_follows_the_loaded_row_capacity(monkeypatch, rows, capaci
         assert not calls
 
 
-@pytest.mark.parametrize("k,n", [(5120, 7168), (5120, 8256), (3072, 5120)])
+@pytest.mark.parametrize(
+    "k,n", [(5120, 7168), (5120, 8256), (3072, 5120), (4352, 5120), (8704, 5120)]
+)
 @pytest.mark.parametrize("global_scale", [2**-20, 0.000502813432831, 0.5])
 def test_wider_shared_projection_basis_keeps_original_weights(k, n, global_scale):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
@@ -120,6 +122,61 @@ def test_bundled_down_selection_uses_local_geometry(packed_k):
     config.gated_silu = False
     layer.prefix = "model.layers.0.mlp.other_proj"
     assert not _bundled_down_layout(layer, config)
+
+
+@pytest.mark.parametrize("k", [4352, 8704])
+@pytest.mark.parametrize("rows", [1, 5, 8])
+def test_shared_down_projection_matches_native_weight_schedule(k, rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    from vllm import _sm70_ops as ops
+
+    torch.manual_seed(950)
+    n, global_scale = 5120, 0.000502813432831
+    raw = (
+        torch.tensor([0, 2**-9, 0.5, 1.5, 7, 24, 192, 448], device="cuda")
+        .to(torch.float8_e4m3fn)
+        .repeat(n, k // 128)
+    )
+    logical = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
+    packed = logical[:, ::2] | (logical[:, 1::2] << 4)
+    codes, scales = ops.nvfp4_qpn2_prepare_sm70(packed, raw)
+    tm, tm_scales, meta = torch.ops._C.nvfp4_sm70_prepare(
+        logical.T.contiguous(),
+        (raw.float() * global_scale).half().T.contiguous(),
+        16,
+        False,
+    )
+    k_ld, q_ld = int(meta[0]), int(meta[1])
+    x = torch.randn(rows, k, device="cuda", dtype=torch.float16)
+    actual, expected = x.new_empty(rows, n), x.new_empty(rows, n)
+
+    def run():
+        ops.nvfp4_qpn2_tm_dispatch_sm70_out(
+            actual,
+            x,
+            tm,
+            scales,
+            global_scale,
+            16,
+            2,
+            tm_scales,
+            16,
+            k_ld,
+            q_ld,
+            False,
+            0,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for amplitude in (2**-20, 0.125, 2):
+        x.normal_().mul_(amplitude)
+        graph.replay()
+        ops.nvfp4_qpn2_gemm_sm70_out(expected, x, codes, scales, global_scale, 16, 2)
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize(
