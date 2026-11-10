@@ -55,7 +55,7 @@ def test_full_response_cache_usage(serving, details, timings):
     assert result.usage.input_tokens == 24 - (expected or 0)
     assert result.usage.output_tokens == 3
     assert result.usage.cache_creation_input_tokens is None
-    assert result.id == response.id
+    assert result.id == "msg_cache-test"
     assert result.model == response.model
     serialized = result.model_dump(exclude_unset=True)
     assert serialized["type"] == "message"
@@ -99,7 +99,7 @@ def test_stream_response_cache_usage(serving, initial_details, final_details, ti
         "message_stop",
     ]
     message = events[0]["message"]
-    assert message["id"] == "chatcmpl-cache-test"
+    assert message["id"] == "msg_cache-test"
     assert message["model"] == "test-model"
     assert message["type"] == "message"
     assert message["role"] == "assistant"
