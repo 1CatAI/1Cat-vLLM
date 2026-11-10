@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 
-import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
@@ -58,34 +57,14 @@ def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
 
 
-def _extract_upstream_error(data_str: str) -> str | None:
-    """Return the message of an upstream `{"error": {...}}` SSE frame.
-
-    The OpenAI-compatible chat stream signals mid-stream failures by emitting
-    an error payload in place of a normal chunk. The Anthropic converter
-    expects every non-`[DONE]` frame to validate as
-    `ChatCompletionStreamResponse`, which such a payload cannot — so without
-    this check a single upstream hiccup turns into an opaque
-    `ValidationError` on the client instead of a readable error.
-
-    Returns `None` for ordinary chunks.
-    """
-    try:
-        payload = json.loads(data_str)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict) or "error" not in payload:
-        return None
-    error = payload.get("error")
-    if isinstance(error, dict):
-        message = error.get("message")
-        if message:
-            return str(message)
-        return json.dumps(error, ensure_ascii=False)
-    return str(error)
+def _timing_usage_fields(usage: UsageInfo | None) -> dict[str, dict[str, float]]:
+    if usage is not None and usage.timings is not None:
+        return {"timings": usage.timings}
+    return {}
 
 
 def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
+    """Anthropic `cache_read_input_tokens`, when the engine measured a hit."""
     if usage is not None and usage.prompt_tokens_details is not None:
         cached_tokens = usage.prompt_tokens_details.cached_tokens
         if cached_tokens is not None:
@@ -94,45 +73,16 @@ def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
 
 
 def _anthropic_input_tokens(usage: UsageInfo | None) -> int:
-    """Anthropic `input_tokens` counts **fresh** tokens only.
+    """Report fresh prompt tokens, subtracting measured cache reads.
 
-    vLLM's `prompt_tokens` is fresh + cached (OpenAI semantics). Anthropic
-    reports cache hits separately in `cache_read_input_tokens` and counts only
-    the misses in `input_tokens`. Without the correction a client treats the
-    total as fresh, computes a cache hit rate of roughly 48.5% (the signature
-    is input ~= 2x cached) when the real figure is usually above 99%, and
-    compacts its context far too early.
-
-    When the cache breakdown is not known yet -- the first streaming chunk --
-    return 0 rather than falling back to the total.
-
-    Observed 1.5.2 streaming chunk sequence (`include_usage` +
-    `continuous_usage_stats`):
-        chunk#1  {"prompt_tokens": 437}
-        chunk#2  {"prompt_tokens": 437}
-        chunk#3  {"prompt_tokens": 437}
-        chunk#4  {"prompt_tokens": 437, "prompt_tokens_details": {"cached_tokens": 384}}
-
-    ``message_start`` rides on chunk#1, before ``prompt_tokens_details``
-    appears. The old code fell back to ``prompt_tokens`` (total 437) when the
-    real fresh count was 53. A client that receives neither
-    ``cache_read_input_tokens`` nor ``prompt_tokens_details`` has nothing to
-    subtract from, believes the context is 437 tokens, and compacts early --
-    which the user sees as their history disappearing.
-
-    So: no ``prompt_tokens_details`` means the breakdown is unknown, and 0 is
-    returned. The accurate value arrives with ``message_delta``, whose chunk
-    does carry the breakdown (437 - 384 = 53).
+    Without a cache breakdown, preserve the engine's prompt count. This also
+    covers deployments that do not enable prompt token details. Streaming
+    updates can refine the count when cache details become available.
     """
     if usage is None:
         return 0
-    if usage.prompt_tokens_details is None:
-        # Breakdown not ready yet: report 0 rather than the total, so the
-        # client does not mistake it for the fresh count.
-        return 0
-    prompt_tokens = usage.prompt_tokens or 0
-    cached = usage.prompt_tokens_details.cached_tokens or 0
-    return max(0, prompt_tokens - cached)
+    cached = _cache_usage_fields(usage).get("cache_read_input_tokens", 0)
+    return max(0, usage.prompt_tokens - cached)
 
 
 class AnthropicServingMessages(OpenAIServingChat):
@@ -595,64 +545,13 @@ class AnthropicServingMessages(OpenAIServingChat):
         """
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Received messages request %s", request.model_dump_json())
-        # Debug probe (off by default): log a structural summary of the
-        # request and dump the last complete one to
-        # `/tmp/anth_last_request.json` for offline replay. Only structure and
-        # lengths are logged, never the content itself.
-        if envs.VLLM_DEBUG_ANTHROPIC_TRACE:
-            try:
-                _parts = []
-                for _i, _m in enumerate(request.messages):
-                    _c = _m.content
-                    if isinstance(_c, str):
-                        _parts.append(f"{_i}:{_m.role}:str({len(_c)})")
-                    else:
-                        _kinds = []
-                        for _b in (_c or []):
-                            _t = getattr(_b, "type", "?")
-                            if _t == "tool_result":
-                                _rc = getattr(_b, "content", None)
-                                _rl = len(_rc) if isinstance(_rc, str) else (
-                                    sum(len(getattr(x, "text", "") or "")
-                                        for x in (_rc or []) if not isinstance(x, dict))
-                                    if isinstance(_rc, list) else 0
-                                )
-                                _kinds.append(
-                                    f"tool_result(id={getattr(_b,'tool_use_id',None)},len={_rl})")
-                            elif _t == "tool_use":
-                                _kinds.append(f"tool_use(id={getattr(_b,'id',None)},name={getattr(_b,'name',None)})")
-                            elif _t == "text":
-                                _kinds.append(f"text({len(getattr(_b,'text','') or '')})")
-                            elif _t == "thinking":
-                                _kinds.append(f"thinking({len(getattr(_b,'thinking','') or '')})")
-                            else:
-                                _kinds.append(_t)
-                        _parts.append(f"{_i}:{_m.role}:{_kinds}")
-                logger.info(
-                    "[ANTH-TRACE] stream=%s tools=%s tool_choice=%s msgs=%d "
-                    "ctk=%s max_tok=%s temp=%s | %s",
-                    getattr(request, "stream", None),
-                    [getattr(t, "name", "?") for t in (request.tools or [])],
-                    getattr(request, "tool_choice", None),
-                    len(request.messages),
-                    getattr(request, "chat_template_kwargs", None),
-                    getattr(request, "max_tokens", None),
-                    getattr(request, "temperature", None),
-                    " ; ".join(_parts),
-                )
-                # Keep the last complete request for offline replay.
-                try:
-                    with open("/tmp/anth_last_request.json", "w", encoding="utf-8") as _fh:
-                        _fh.write(request.model_dump_json())
-                except Exception:  # noqa: BLE001
-                    pass
-            except Exception as _e:  # noqa: BLE001
-                logger.info("[ANTH-TRACE] failed: %r", _e)
         chat_req = self._convert_anthropic_to_openai_request(request)
         # carry per-chunk output token ids only when
         # asked for (see `_wants_token_ids`). Off unless requested keeps the
         # response lean for every caller that does not run a live TPS meter.
-        chat_req.return_token_ids = self._wants_token_ids(request, raw_request)
+        output_ids = self._wants_token_ids(request, raw_request)
+        request = request.model_copy(update={"return_token_ids": output_ids})
+        chat_req.return_token_ids = output_ids or request.return_prompt_token_ids
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Convert to OpenAI request %s", chat_req.model_dump_json())
         generator = await self.create_chat_completion(chat_req, raw_request)
@@ -668,7 +567,7 @@ class AnthropicServingMessages(OpenAIServingChat):
     def messages_full_converter(
         self,
         generator: ChatCompletionResponse,
-        request: AnthropicMessagesRequest,
+        request: AnthropicMessagesRequest | None = None,
     ) -> AnthropicMessagesResponse:
         # the Anthropic schema has no token-id
         # fields; carry the OpenAI layer's ids through, mirroring
@@ -679,22 +578,14 @@ class AnthropicServingMessages(OpenAIServingChat):
                 output_token_ids.extend(output_choice.token_ids)
         result = AnthropicMessagesResponse(
             id=generator.id,
-            # These must be passed explicitly; do not rely on the protocol
-            # layer's field defaults.
-            #
-            # The response is serialised with
-            # `model_dump_json(exclude_unset=True)`, which emits only fields
-            # that were explicitly assigned. Field defaults such as
-            # `type: Literal["message"] = "message"` and
-            # `role: ... = "assistant"` are never set, so they are dropped.
-            # Observed:
-            #   exclude_unset=True  -> {"id":..., "content":[], "model":..., "usage":...}
-            #   exclude_unset=False -> {"id":..., "type":"message", "role":"assistant", ...}
-            #
-            # An Anthropic SDK receiving a message_start without `type`/`role`
-            # treats it as unparseable and drops it silently, so after a
-            # reload every assistant message vanishes from the client's
-            # history while the tool-call state survives.
+            # Explicit, not relying on the pydantic field defaults in
+            # `protocol.py`: the response is serialized with
+            # `exclude_unset=True`, which drops any field that was never
+            # assigned — defaults included. A `message_start` without
+            # `type`/`role` is not a recognizable message to the Anthropic
+            # SDK, which silently discards it, so the assistant turn never
+            # reaches the client and the conversation history looks lost
+            # after a reload.
             type="message",
             role="assistant",
             content=[],
@@ -703,11 +594,16 @@ class AnthropicServingMessages(OpenAIServingChat):
                 input_tokens=_anthropic_input_tokens(generator.usage),
                 output_tokens=generator.usage.completion_tokens,
                 **_cache_usage_fields(generator.usage),
+                **_timing_usage_fields(generator.usage),
             ),
             kv_transfer_params=generator.kv_transfer_params,
-            token_ids=output_token_ids or None,
+            token_ids=(output_token_ids or None)
+            if request and request.return_token_ids
+            else None,
             prompt_token_ids=(
-                generator.prompt_token_ids if request.return_prompt_token_ids else None
+                generator.prompt_token_ids
+                if request and request.return_prompt_token_ids
+                else None
             ),
         )
         choice = generator.choices[0]
@@ -751,7 +647,7 @@ class AnthropicServingMessages(OpenAIServingChat):
     async def message_stream_converter(
         self,
         generator: AsyncGenerator[str, None],
-        request: AnthropicMessagesRequest,
+        request: AnthropicMessagesRequest | None = None,
     ) -> AsyncGenerator[str, None]:
         try:
 
@@ -864,7 +760,10 @@ class AnthropicServingMessages(OpenAIServingChat):
                 state.start(block)
                 return event
 
-            async for item in generator:
+            async for item in _iter_upstream_sse(generator):
+                if item.startswith(":"):
+                    yield item
+                    continue
                 if item.startswith("data:"):
                     data_str = item[5:].strip().rstrip("\n")
                     if data_str == "[DONE]":
@@ -908,16 +807,16 @@ class AnthropicServingMessages(OpenAIServingChat):
                         )
 
                         if first_item:
+                            prompt_token_ids = origin_chunk.prompt_token_ids
                             chunk = AnthropicStreamEvent(
                                 type="message_start",
                                 message=AnthropicMessagesResponse(
                                     id=origin_chunk.id,
-                                    # Same as messages_full_converter:
-                                    # `exclude_unset=True` drops fields that
-                                    # were never assigned, so they must be
-                                    # passed explicitly. Missing -> the SDK
-                                    # discards the whole message_start and the
-                                    # assistant message never renders.
+                                    # Same reason as `messages_full_converter`:
+                                    # `exclude_unset=True` on the way out drops
+                                    # any field not explicitly assigned, and a
+                                    # `message_start` missing `type`/`role` is
+                                    # discarded by the Anthropic SDK.
                                     type="message",
                                     role="assistant",
                                     content=[],
@@ -938,8 +837,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     # un-opted-in reply has no `prompt_token_ids`
                                     # key at all (mirrors content_delta_event).
                                     **(
-                                        {"prompt_token_ids": origin_chunk.prompt_token_ids}
-                                        if request.return_prompt_token_ids
+                                        {"prompt_token_ids": prompt_token_ids}
+                                        if request and request.return_prompt_token_ids
                                         else {}
                                     ),
                                 ),
@@ -947,7 +846,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                             first_item = False
                             data = chunk.model_dump_json(exclude_unset=True)
                             yield wrap_data_with_event(data, "message_start")
-                            continue
+                            if not origin_chunk.choices:
+                                continue
 
                         # last chunk including usage info
                         if len(origin_chunk.choices) == 0:
@@ -960,6 +860,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_delta",
                                 delta=AnthropicDelta(stop_reason=stop_reason),
                                 usage=AnthropicUsage(
+                                    # By the time `message_delta` arrives the
+                                    # chunk carries `prompt_tokens_details`, so
+                                    # this is the authoritative fresh count.
                                     input_tokens=_anthropic_input_tokens(
                                         origin_chunk.usage
                                     ),
@@ -967,8 +870,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     if origin_chunk.usage
                                     else 0,
                                     **_cache_usage_fields(origin_chunk.usage),
+                                    **_timing_usage_fields(origin_chunk.usage),
                                 ),
                             )
+                            ids = take_token_ids()
+                            if ids:
+                                chunk.token_ids = ids
                             data = chunk.model_dump_json(exclude_unset=True)
                             yield wrap_data_with_event(data, "message_delta")
                             continue
@@ -979,7 +886,10 @@ class AnthropicServingMessages(OpenAIServingChat):
 
                         # the ids this chunk decoded,
                         # handed to whichever content_block_delta the chunk produces.
-                        pending_token_ids = origin_chunk.choices[0].token_ids
+                        if request and request.return_token_ids:
+                            pending_token_ids = (pending_token_ids or []) + (
+                                origin_chunk.choices[0].token_ids or []
+                            )
 
                         # thinking / text content
                         reasoning_delta = origin_chunk.choices[0].delta.reasoning
@@ -997,9 +907,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     )
                                     yield start_event
                                 chunk = content_delta_event(
-                                    (state.block_index if state.block_index is not None
-                                     else state.content_block_index),
-                                        AnthropicDelta(
+                                    (
+                                        state.block_index
+                                        if state.block_index is not None
+                                        else state.content_block_index
+                                    ),
+                                    AnthropicDelta(
                                         type="thinking_delta",
                                         thinking=reasoning_delta,
                                     ),
@@ -1019,9 +932,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     )
                                     yield start_event
                                 chunk = content_delta_event(
-                                    (state.block_index if state.block_index is not None
-                                     else state.content_block_index),
-                                        AnthropicDelta(
+                                    (
+                                        state.block_index
+                                        if state.block_index is not None
+                                        else state.content_block_index
+                                    ),
+                                    AnthropicDelta(
                                         type="text_delta",
                                         text=origin_chunk.choices[0].delta.content,
                                     ),
@@ -1064,9 +980,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         and state.tool_use_id == tool_call.id
                                     ):
                                         chunk = content_delta_event(
-                                            (state.block_index if state.block_index is not None
-                                             else state.content_block_index),
-                                                AnthropicDelta(
+                                            (
+                                                state.block_index
+                                                if state.block_index is not None
+                                                else state.content_block_index
+                                            ),
+                                            AnthropicDelta(
                                                 type="input_json_delta",
                                                 partial_json=tool_call.function.arguments,
                                             ),
@@ -1085,9 +1004,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         and state.tool_use_id == tool_use_id
                                     ):
                                         chunk = content_delta_event(
-                                            (state.block_index if state.block_index is not None
-                                             else state.content_block_index),
-                                                AnthropicDelta(
+                                            (
+                                                state.block_index
+                                                if state.block_index is not None
+                                                else state.content_block_index
+                                            ),
+                                            AnthropicDelta(
                                                 type="input_json_delta",
                                                 partial_json=tool_call.function.arguments,
                                             ),
@@ -1098,7 +1020,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         )
                             continue
                 else:
-                                        # Non-`data:` SSE frames are legal: comment lines (a
+                    # Non-`data:` SSE frames are legal: comment lines (a
                     # `: keepalive` sentinel emitted after 120s of engine
                     # silence), blank lines, and `event:` / `id:` / `retry:`
                     # fields.
@@ -1147,3 +1069,58 @@ class AnthropicServingMessages(OpenAIServingChat):
         )
 
         return response
+
+
+def _extract_upstream_error(data_str: str) -> str | None:
+    """Return the message of an upstream `{"error": {...}}` SSE frame.
+
+    The OpenAI-compatible chat stream signals mid-stream failures by emitting
+    an error payload in place of a normal chunk. The Anthropic converter
+    expects every non-`[DONE]` frame to validate as
+    `ChatCompletionStreamResponse`, which such a payload cannot — so without
+    this check a single upstream hiccup turns into an opaque
+    `ValidationError` on the client instead of a readable error.
+
+    Returns `None` for ordinary chunks.
+    """
+    try:
+        payload = json.loads(data_str)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or "error" not in payload:
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if message:
+            return str(message)
+        return json.dumps(error, ensure_ascii=False)
+    return str(error)
+
+
+async def _iter_upstream_sse(generator: AsyncGenerator[str, None]):
+    """Accept fragmented/coalesced internal SSE without losing comments."""
+    buffer = ""
+
+    def frame_items(frame: str):
+        data = []
+        for line in frame.split("\n"):
+            if line.startswith(":"):
+                yield line + "\n\n"
+            else:
+                field, separator, value = line.partition(":")
+                if field == "data" and separator:
+                    data.append(value.removeprefix(" "))
+        if data:
+            yield "data: " + "\n".join(data) + "\n\n"
+
+    async for chunk in generator:
+        buffer = (buffer + chunk).replace("\r\n", "\n")
+        while "\n\n" in buffer:
+            frame, buffer = buffer.split("\n\n", 1)
+            for item in frame_items(frame):
+                yield item
+    # The in-process producer may close without a final blank line.
+    if buffer:
+        for item in frame_items(buffer):
+            yield item

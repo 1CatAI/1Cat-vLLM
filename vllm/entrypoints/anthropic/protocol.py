@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pydantic models for Anthropic API protocol"""
 
-import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -29,6 +28,14 @@ class AnthropicUsage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    # Per-request phase breakdown, same shape the OpenAI endpoint carries in
+    # `usage.timings`. The Anthropic wire format has no field for it, so it
+    # rides as an extra key: clients that do not know it ignore it, while those
+    # that do (the Studio proxy) get the same measured attribution here as on
+    # the OpenAI dialect instead of reconstructing it from token timing.
+    timings: dict[str, float] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AnthropicContentBlock(BaseModel):
@@ -226,7 +233,9 @@ class AnthropicStreamEvent(BaseModel):
     # tracing the tokens in agent scenarios — the token ids a
     # `content_block_delta` decodes from, mirroring the OpenAI protocol's
     # per-chunk `choices[].token_ids`.
-    token_ids: list[int] | None = None
+    token_ids: list[int] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -251,8 +260,12 @@ class AnthropicMessagesResponse(BaseModel):
     # (mirroring the OpenAI protocol's `choices[].token_ids`), plus the prompt's
     # ids when the request opted in with `return_prompt_token_ids`.
     # Neither is in the Anthropic spec.
-    token_ids: list[int] | None = None
-    prompt_token_ids: list[int] | None = None
+    token_ids: list[int] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    prompt_token_ids: list[int] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("id", mode="before")
     @classmethod
@@ -282,7 +295,7 @@ class AnthropicMessagesResponse(BaseModel):
             return v
         for prefix in ("chatcmpl-", "cmpl-"):
             if v.startswith(prefix):
-                return f"msg_{v[len(prefix):]}"
+                return f"msg_{v[len(prefix) :]}"
         return f"msg_{v}"
 
 
