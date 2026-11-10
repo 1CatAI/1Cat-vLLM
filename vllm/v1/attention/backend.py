@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
-    from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, KVQuantMode
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -762,6 +762,15 @@ class AttentionImplBase(ABC, Generic[T]):
     standard AttentionImpl and MLAAttentionImpl. Does not define a forward
     method - subclasses define their own forward interfaces.
     """
+
+    def configure_kv_cache_workspace(
+        self, vllm_config: "VllmConfig", kv_cache_spec: "KVCacheSpec"
+    ) -> None:
+        """Bind optional workspace bounds before profiling and KV allocation.
+
+        Backends without a page-dependent workspace need no preparation.
+        """
+        return None
 
     # Required attributes that all impls should have
     num_heads: int

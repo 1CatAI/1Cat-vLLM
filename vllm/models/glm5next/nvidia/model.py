@@ -97,6 +97,7 @@ from .multimodal import (
     Glm5NextMultiModalProcessor,
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
+    max_grid_side,
 )
 
 logger = init_logger(__name__)
@@ -1480,6 +1481,8 @@ class Glm5NextForConditionalGeneration(
         return Glm5NextForCausalLM.get_mamba_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        from vllm.transformers_utils.processors.glm5next import Glm5NextProcessor
+
         super(Glm4vForConditionalGeneration, self).__init__()
         config = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -1497,6 +1500,12 @@ class Glm5NextForConditionalGeneration(
             self.visual = Glm5NextVisionTransformer(
                 config.text_config,
                 config.vision_config,
+                max_grid_side=max(
+                    max_grid_side(processor)
+                    for processor in Glm5NextProcessor.media_processors_from_pretrained(
+                        self.model_config.model
+                    )
+                ),
                 # Read eps from the VISION sub-config, not the top-level
                 # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__ mirrors
                 # the latter onto text_config (1e-5), silently ignoring the

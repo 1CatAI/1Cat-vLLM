@@ -40,7 +40,13 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
     extract_harmony_streaming_delta,
 )
+from vllm.entrypoints.openai.chat_completion.tool_stream import (
+    StreamedToolCall,
+    flush_tool_calls,
+    record_tool_calls,
+)
 from vllm.entrypoints.openai.engine.protocol import (
+    CompletionTokenUsageInfo,
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
@@ -57,6 +63,7 @@ from vllm.entrypoints.openai.engine.serving import (
     clamp_prompt_logprobs,
     drop_misaligned_logprobs,
 )
+from vllm.entrypoints.openai.engine.usage import get_request_usage_timings
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_stop_tokens_for_assistant_actions,
@@ -68,7 +75,7 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import STREAM_KEEPALIVE, CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
@@ -88,6 +95,17 @@ def _token_list(rendered: Any) -> list[int]:
     if isinstance(rendered, dict) or hasattr(rendered, "keys"):
         rendered = rendered["input_ids"]
     return list(rendered)
+
+
+def _count_reasoning_tokens(reasoning_parser, token_ids_per_choice) -> int | None:
+    if reasoning_parser is None or token_ids_per_choice is None:
+        return None
+    counts = [
+        reasoning_parser.count_reasoning_tokens(ids)
+        for ids in token_ids_per_choice
+        if ids
+    ]
+    return sum(counts) if counts else None
 
 
 class _PrefixCacheBoundaries:
@@ -504,6 +522,7 @@ class OpenAIServingChat(OpenAIServing):
                     sub_request_id,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
+                    keepalive=bool(request.stream),
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=reasoning_ended,
@@ -568,6 +587,12 @@ class OpenAIServingChat(OpenAIServing):
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
         finish_reason_sent = [False] * num_choices
+        generated_ids_per_choice: list[list[int]] | None = (
+            [[] for _ in range(num_choices)] if reasoning_parser is not None else None
+        )
+        sent_tool_calls: list[dict[int, StreamedToolCall]] = [
+            {} for _ in range(num_choices)
+        ]
         num_prompt_tokens = 0
         num_cached_tokens = None
         if self.use_harmony:
@@ -646,12 +671,23 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        # Kept so the final usage can carry the engine's per-request breakdown.
+        # The stats object is attached to every output, but only the finished
+        # one holds a complete set of timestamps.
+        last_metrics = None
         try:
             async for res in result_generator:
+                if getattr(res, "metrics", None) is not None:
+                    last_metrics = res.metrics
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
+
+                if res is STREAM_KEEPALIVE:
+                    yield ": keepalive\n\n"
+                    continue
 
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
@@ -901,6 +937,8 @@ class OpenAIServingChat(OpenAIServing):
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
+                    if generated_ids_per_choice is not None:
+                        generated_ids_per_choice[i].extend(output.token_ids)
 
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
@@ -979,14 +1017,39 @@ class OpenAIServingChat(OpenAIServing):
                                 if auto_tools_called
                                 else 0
                             )
+                        flushed = False
+                        if tool_parser and tool_choice_auto:
+                            text = previous_texts[i]
+                            if reasoning_parser is not None:
+                                _, content = reasoning_parser.extract_reasoning(
+                                    text, request=request
+                                )
+                                text = content or ""
+                            delta_message, flushed = flush_tool_calls(
+                                tool_parser,
+                                text,
+                                request,
+                                delta_message,
+                                sent_tool_calls[i],
+                            )
+                            if delta_message is None:
+                                delta_message = DeltaMessage()
+                            auto_tools_called = auto_tools_called or flushed
                         should_check = (
-                            self._should_check_for_unstreamed_tool_arg_tokens(
+                            not flushed
+                            and self._should_check_for_unstreamed_tool_arg_tokens(
                                 delta_message, output
                             )
                         )
                         # only check if there are any tool calls
                         # detected by partial parsing
-                        if should_check and tool_parser and auto_tools_called:
+                        if (
+                            should_check
+                            and tool_parser
+                            and auto_tools_called
+                            and 0 <= index < len(tool_parser.prev_tool_call_arr)
+                            and index < len(tool_parser.streamed_args_for_tool)
+                        ):
                             latest_delta_len = 0
                             if (
                                 isinstance(
@@ -1063,6 +1126,9 @@ class OpenAIServingChat(OpenAIServing):
                         finish_reason_sent[i] = True
 
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
+                    record_tool_calls(
+                        choice_data.delta.tool_calls or [], sent_tool_calls[i]
+                    )
                     chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -1093,11 +1159,19 @@ class OpenAIServingChat(OpenAIServing):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
+            reasoning_tokens = _count_reasoning_tokens(
+                reasoning_parser, generated_ids_per_choice
+            )
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
             if include_usage:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
+                    completion_tokens_details=(
+                        CompletionTokenUsageInfo(reasoning_tokens=reasoning_tokens)
+                        if reasoning_tokens is not None
+                        else None
+                    ),
                     prompt_tokens=num_prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
@@ -1106,6 +1180,11 @@ class OpenAIServingChat(OpenAIServing):
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens
                     )
+                # Engine-authoritative per-request timings. Omitted when the
+                # engine collected no stats for this request.
+                final_usage.timings = get_request_usage_timings(
+                    last_metrics, num_choices=num_choices
+                )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1128,6 +1207,10 @@ class OpenAIServingChat(OpenAIServing):
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
+            if reasoning_tokens is not None:
+                request_metadata.final_usage_info.completion_tokens_details = (
+                    CompletionTokenUsageInfo(reasoning_tokens=reasoning_tokens)
+                )
 
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
@@ -1543,7 +1626,21 @@ class OpenAIServingChat(OpenAIServing):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
             )
+        # Engine-authoritative per-request timings. Without this a
+        # non-streaming caller has no prefill/decode split at all, and any
+        # consumer that derives rates from a token stream sees the whole
+        # request as one point in time.
+        usage.timings = get_request_usage_timings(
+            getattr(final_res, "metrics", None), num_choices=len(choices)
+        )
 
+        reasoning_tokens = _count_reasoning_tokens(
+            reasoning_parser, [output.token_ids for output in final_res.outputs]
+        )
+        if reasoning_tokens is not None:
+            usage.completion_tokens_details = CompletionTokenUsageInfo(
+                reasoning_tokens=reasoning_tokens
+            )
         request_metadata.final_usage_info = usage
 
         # ``final_res.prompt`` is the rendered chat-templated prompt text

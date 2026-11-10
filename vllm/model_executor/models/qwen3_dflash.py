@@ -65,12 +65,17 @@ _SLIDING_ATTENTION = "sliding_attention"
 
 
 def _dflash_context_projection_dtype(projection: nn.Module) -> torch.dtype | None:
+    method = getattr(projection, "quant_method", None)
+    kernel = getattr(method, "kernel", None)
+    dtype = getattr(kernel, "input_dtype", None)
+    if dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return dtype
     weight = getattr(projection, "weight", None)
     if weight is not None and weight.is_floating_point():
         return weight.dtype
     # Packed weights have no floating weight parameter. Their quantization
     # method declares the projection operand dtype independently of storage.
-    dtype = getattr(getattr(projection, "quant_method", None), "params_dtype", None)
+    dtype = getattr(method, "params_dtype", None)
     return dtype if dtype in (torch.float16, torch.bfloat16, torch.float32) else None
 
 

@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import hashlib
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -259,6 +261,16 @@ class SpeculativeConfig:
     keeps its trained width and lookup may fill the extra target-verification
     positions. Only valid with ``method='dflash'`` and a DFlash2 selector
     capability."""
+    draft_token_map: str | None = None
+    """Path to a list of target token ids that the MTP drafter may propose
+    (FR-Spec). The drafter's shared lm_head is restricted to these rows, which
+    cuts its cost per draft token; the target still verifies with the full
+    vocabulary, so the output is unchanged. Accepts SGLang's
+    `--speculative-token-map` file (`.pt`) or a JSON list; EOS ids are always
+    included. Requires method 'mtp', an unquantized lm_head shared with the
+    target, and Model Runner V2. Backport of vllm-project/vllm#59740."""
+    draft_token_map_sha256: str | None = Field(default=None, init=False)
+    """Initialization-bound token-map identity, checked again by each worker."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
@@ -449,6 +461,8 @@ class SpeculativeConfig:
         factors: list[Any] = [
             ("use_local_argmax_reduction", self.use_local_argmax_reduction)
         ]
+        if self.draft_token_map is not None:
+            factors.append(("draft_token_map_sha256", self.draft_token_map_sha256))
         if self.method == "dspark":
             factors.append(
                 ("diagnostic_confidence_logits", self.diagnostic_confidence_logits)
@@ -1527,6 +1541,14 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+        if self.draft_token_map is not None and self.method != "mtp":
+            raise ValueError(
+                f"draft_token_map requires method 'mtp', got {self.method!r}."
+            )
+        if self.draft_token_map is not None and self.draft_token_map_sha256 is None:
+            self.draft_token_map_sha256 = hashlib.sha256(
+                Path(self.draft_token_map).read_bytes()
+            ).hexdigest()
         if self.ngram_assist:
             if not self.use_dflash():
                 raise ValueError("ngram_assist is only supported with method='dflash'.")

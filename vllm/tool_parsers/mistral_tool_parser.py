@@ -127,6 +127,7 @@ class MistralToolParser(ToolParser):
 
     # Used to generate correct grammar in `adjust_request`
     model_can_reason: bool = False
+    supports_hot_reload: bool = False
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)

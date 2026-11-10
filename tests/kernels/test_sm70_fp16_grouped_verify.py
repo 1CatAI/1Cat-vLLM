@@ -136,3 +136,65 @@ def test_short_plan_boundary_replays_match_legacy():
             torch.testing.assert_close(actual, out, atol=0.0005, rtol=0.01)
         else:
             assert torch.equal(actual.view(torch.int16), out.view(torch.int16))
+
+
+@pytest.mark.parametrize("rows,context", [(2, 1091), (4, 8192), (4, 131072)])
+def test_grouped_fp16_serves_two_kv_heads_per_rank(rows, context):
+    """TP2: one kernel call per KV head, on the page of the FP8 checkpoint."""
+    from vllm.v1.attention.backends.flash_v100.spec.verifier import per_kv_head_views
+    from vllm.v1.attention.ops.sm70_fp16_grouped import load_grouped_fp16_fp32
+
+    grouped = load_grouped_fp16_fp32()
+    page = 800
+    pages = math.ceil(context / page)
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    k, v = torch.randn(
+        (2, pages, page, 2, 256),
+        generator=generator,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    q = torch.randn(
+        (rows, 12, 256), generator=generator, dtype=torch.float16, device="cuda"
+    )
+    table = torch.randperm(pages, generator=generator, device="cuda")[None].int()
+    lengths = torch.tensor(
+        [context - rows + i + 1 for i in range(rows)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    out = torch.empty_like(q)
+    for view in per_kv_head_views(q, k, v, out):
+        grouped(
+            view.query,
+            view.key,
+            view.value,
+            table,
+            lengths,
+            out=view.out,
+            softmax_scale=1 / 16,
+        )
+        out[:, view.query_heads] = view.out
+
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        reference = torch.empty_like(q, dtype=torch.float32)
+        for head in range(2):
+            keys = k[:, :, head].index_select(0, table[0].long())
+            values = v[:, :, head].index_select(0, table[0].long())
+            keys, values = (
+                keys.reshape(-1, 256).float(),
+                values.reshape(-1, 256).float(),
+            )
+            query_heads = slice(6 * head, 6 * (head + 1))
+            scores = q[:, query_heads].float() @ keys.T / 16
+            scores.masked_fill_(
+                torch.arange(keys.shape[0], device=q.device)[None, None, :]
+                >= lengths[:, None, None],
+                -torch.inf,
+            )
+            reference[:, query_heads] = torch.softmax(scores, dim=-1) @ values
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    torch.testing.assert_close(out.float(), reference, atol=0.0005, rtol=0.01)

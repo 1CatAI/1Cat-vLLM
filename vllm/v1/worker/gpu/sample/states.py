@@ -17,6 +17,8 @@ _NP_INT64_MAX = np.iinfo(np.int64).max
 
 class SamplingStates:
     def __init__(self, max_num_reqs: int, vocab_size: int):
+        # Graph-owned views retain the cheap identity-temperature kernel.
+        self.capture_mode = False
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
         self._topk_runtime = bind_topk_topp_runtime()
@@ -73,7 +75,7 @@ class SamplingStates:
         idx_mapping_np: np.ndarray,
     ) -> None:
         temp_np = self.temperature.np[idx_mapping_np]
-        if np.all((temp_np == 0.0) | (temp_np == 1.0)):
+        if not self.capture_mode and np.all((temp_np == 0.0) | (temp_np == 1.0)):
             # No request requires temperature. Skip the kernel launch.
             return
 

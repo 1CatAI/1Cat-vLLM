@@ -19,6 +19,7 @@ import uvloop
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import State
+from starlette.responses import Response
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
@@ -171,6 +172,12 @@ def build_app(
     else:
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
+
+    # Process liveness only; /health retains the engine readiness check and
+    # unknown paths retain their normal status codes.
+    @app.head("/")
+    async def _head_probe() -> Response:
+        return Response(status_code=200)
 
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
@@ -658,6 +665,10 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     decorate_logs("APIServer", skip_if_decorated=True)
 
+    from vllm.logger import _StartupLogHandler
+
+    _StartupLogHandler.install()
+
     # Interrupt initialization if SIGTERM arrives before uvicorn installs its
     # own signal handlers. Once uvicorn is running it replaces this.
     def _interrupt_init(*_) -> None:
@@ -673,6 +684,10 @@ async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Run a single API server worker."""
+
+    from vllm.logger import _StartupLogHandler
+
+    _StartupLogHandler.install()
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)

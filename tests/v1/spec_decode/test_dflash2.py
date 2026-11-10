@@ -14,7 +14,6 @@ import vllm.model_executor.layers.logits_processor as logits_processor_module
 import vllm.model_executor.models.qwen3_dflash as dflash_model
 import vllm.model_executor.models.qwen3_dflash2 as dflash2_model
 import vllm.model_executor.models.shared_weights as shared_weights
-import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
@@ -59,9 +58,11 @@ from vllm.model_executor.models.qwen3_dflash import (
     _dflash_layer_causal,
 )
 from vllm.model_executor.models.qwen3_dflash2 import (
+    CandidateSelector,
     DFlash2Qwen3ForCausalLM,
     DFlash2Qwen3Model,
     _grouped_conv,
+    _lookup_sharded_rows,
     _score_edges,
 )
 from vllm.v1.attention.backend import AttentionType
@@ -1067,6 +1068,145 @@ def test_selector_edges_match_sequential_reference():
     torch.testing.assert_close(actual, expected)
 
 
+def _shards(table: torch.Tensor, tp: int) -> tuple[list[torch.Tensor], int]:
+    rows = -(-table.shape[0] // tp)
+    shards = []
+    for rank in range(tp):
+        shard = torch.zeros(rows, table.shape[1], dtype=table.dtype)
+        part = table[rank * rows : (rank + 1) * rows]
+        shard[: part.shape[0]] = part
+        shards.append(shard)
+    return shards, rows
+
+
+def _assert_nonzero_bits_and_zero_values(actual, expected):
+    # Adding +0 from non-owners can clear the sign of an owner's -0.
+    integer_dtype = {torch.float16: torch.int16, torch.float32: torch.int32}[
+        expected.dtype
+    ]
+    nonzero = expected != 0
+    assert torch.equal(
+        actual[nonzero].view(integer_dtype), expected[nonzero].view(integer_dtype)
+    )
+    assert torch.equal(actual[~nonzero], expected[~nonzero])
+
+
+@pytest.mark.parametrize("vocab", [3, 17, 20, 248320])
+def test_sharded_codebook_lookup_preserves_nonzero_bits(vocab):
+    # Four ranks, each with a contiguous slice; the last slice is padded.
+    torch.manual_seed(2)
+    table = torch.randn(vocab, 8).to(torch.float16)
+    ids = torch.cat(
+        (torch.tensor([0, vocab - 1]), torch.randint(vocab, (2, 7, 16)).flatten())
+    ).view(-1, 2)
+    shards, rows = _shards(table, 4)
+    partial = [
+        _lookup_sharded_rows(shard, ids, rank * rows, reduce=lambda x: x)
+        for rank, shard in enumerate(shards)
+    ]
+    total = partial[0]
+    for rows_from_rank in partial[1:]:
+        total = total + rows_from_rank
+    _assert_nonzero_bits_and_zero_values(total, table[ids])
+    # Every row has exactly one owner.
+    owners = sum((p != 0).any(-1).to(torch.int64) for p in partial)
+    assert int(owners.max()) <= 1
+
+
+def test_sharded_codebook_scores_preserve_nonzero_bits():
+    torch.manual_seed(3)
+    batch, steps, top_k, rank, vocab = 8, 7, 16, 32, 101
+    predecessors = torch.randn(vocab, rank).to(torch.float16)
+    successors = torch.randn(vocab, rank).to(torch.float16)
+    candidate_ids = torch.randint(vocab, (batch, steps, top_k))
+    unary = torch.randn(batch, steps, top_k)
+    hidden = torch.randn(batch, steps, rank).to(torch.float16)
+    anchors = torch.randint(vocab, (batch,))
+    expected = _score_edges(
+        predecessors, successors, candidate_ids, unary, hidden, anchors, top_k
+    )
+    shard_tables = {
+        id(predecessors): _shards(predecessors, 4)[0],
+        id(successors): _shards(successors, 4)[0],
+    }
+    rows = -(-vocab // 4)
+
+    def lookup(table, ids):
+        total = None
+        for rank_index, shard in enumerate(shard_tables[id(table)]):
+            part = _lookup_sharded_rows(
+                shard, ids, rank_index * rows, reduce=lambda x: x
+            )
+            total = part if total is None else total + part
+        return total
+
+    actual = _score_edges(
+        predecessors,
+        successors,
+        candidate_ids,
+        unary,
+        hidden,
+        anchors,
+        top_k,
+        vocab,
+        lookup,
+    )
+    _assert_nonzero_bits_and_zero_values(actual, expected)
+
+
+@pytest.mark.parametrize("vocab,tp", [(3, 4), (17, 4), (20, 4)])
+def test_sharded_codebook_loader_takes_its_rows(vocab, tp):
+    loaded = torch.arange(vocab * 3, dtype=torch.float32).view(vocab, 3)
+    rows = -(-vocab // tp)
+    for rank in range(tp):
+        start = rank * rows
+        owner = SimpleNamespace(vocab_size=vocab, vocab_start=start, rows_per_rank=rows)
+        param = torch.nn.Parameter(torch.full((rows, 3), -1.0), requires_grad=False)
+        CandidateSelector._load_rows(owner, param, loaded)
+        expected = torch.zeros(rows, 3)
+        part = loaded[start : start + rows]
+        expected[: part.shape[0]] = part
+        assert torch.equal(param.data.view(torch.int32), expected.view(torch.int32)), (
+            rank
+        )
+
+
+@pytest.mark.parametrize("shape", [(16, 3), (18, 3), (17, 1), (17,), (17, 3, 1)])
+def test_sharded_codebook_loader_rejects_invalid_full_shape_before_writing(shape):
+    owner = SimpleNamespace(vocab_size=17, vocab_start=15, rows_per_rank=5)
+    param = torch.nn.Parameter(torch.full((5, 3), -1.0), requires_grad=False)
+    before = param.detach().clone()
+    with pytest.raises(ValueError, match=r"Expected full codebook shape.*17, 3.*got"):
+        CandidateSelector._load_rows(owner, param, torch.ones(shape))
+    assert torch.equal(param, before)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_sharded_lookup_preserves_nonzero_bits_but_can_clear_negative_zero(dtype):
+    table = torch.tensor([[1.0, -0.0], [-0.0, -2.0], [3.0, -0.0]], dtype=dtype)
+    ids = torch.arange(3)
+    shards, rows = _shards(table, 4)
+    partial = [
+        _lookup_sharded_rows(shard, ids, rank * rows, reduce=lambda x: x)
+        for rank, shard in enumerate(shards)
+    ]
+    actual = sum(partial[1:], partial[0])
+    _assert_nonzero_bits_and_zero_values(actual, table)
+    negative_zero = (table == 0) & torch.signbit(table)
+    assert negative_zero.any()
+    assert not torch.signbit(actual[negative_zero]).any()
+
+
+def test_sharded_selector_codebook_is_off_and_out_of_the_compile_key_by_default():
+    from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+
+    policy = Sm70DFlash2Config()
+    assert policy.sharded_selector_codebook is False
+    assert "sharded_selector_codebook" not in policy.graph_options()
+    policy = Sm70DFlash2Config(sharded_selector_codebook=True)
+    assert policy.graph_options()["sharded_selector_codebook"] is True
+
+
 def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):
     def init_base(self, _vllm_config, device):
         self.device = device
@@ -1122,7 +1262,7 @@ def test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice(monkeypatc
     allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "1")
-    monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", True)
+    monkeypatch.setenv("VLLM_SPEC_DUMP_ALIGNMENT", "1")
 
     speculator = DFlash2Speculator(None, torch.device("cpu"))
     shadow = speculator.get_selector_alignment_shadow()
@@ -1512,6 +1652,7 @@ def test_fused_gdn_verify_config_uses_selector_engine_contract(
 def test_only_mrv2_dflash_skips_eagle_prefix_block_drop(method, expected):
     config = SimpleNamespace(
         method=method,
+        disable_eagle_block_drop=False,
         use_eagle=lambda: True,
         use_dflash=lambda: method == "dflash",
     )
@@ -1869,17 +2010,54 @@ def test_selector_tail_split_is_sm70_only(monkeypatch, capability, num_steps, ex
 
 
 def test_noncausal_draft_cannot_enter_flash_v100_small_query_fast_path():
-    impl = SimpleNamespace(
-        use_flash_v100_decode=True,
-        smallq_decode_max_query_len=8,
-        smallq_decode_max_model_len=4096,
+    from typing import cast
+
+    from vllm.v1.attention.backends.flash_v100.config import V100AttnConfig
+    from vllm.v1.attention.backends.flash_v100.spec.verifier import (
+        VerificationConfig,
+        VerificationExecutor,
+        VerificationOps,
+    )
+
+    executor = VerificationExecutor(
+        VerificationConfig(
+            policy=cast(
+                V100AttnConfig,
+                SimpleNamespace(
+                    use_flash_v100_decode=True,
+                    smallq_decode_max_query_len=8,
+                    smallq_decode_max_model_len=4096,
+                ),
+            ),
+            scale=1.0,
+            kv_cache_dtype="auto",
+            alibi_slopes=None,
+            logits_soft_cap=0.0,
+            grouped_enabled=False,
+            grouped_batch_enabled=False,
+            grouped_max_query=0,
+            grouped_request_major_abi=0,
+            grouped_min_model_len=0,
+        ),
+        VerificationOps(
+            grouped=None,
+            fp16_grouped=None,
+            e4m3_grouped=None,
+            xqa=None,
+            window_size=None,
+            layer_info=None,
+            xqa_codec=None,
+            decode=None,
+        ),
     )
     metadata = SimpleNamespace(
         causal=False,
         query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
         max_model_len=128,
     )
-    assert not FlashAttnV100Impl._small_query_decode_enabled(impl, metadata)
+    assert not executor.small_query_enabled(metadata)
+    metadata.causal = True
+    assert executor.small_query_enabled(metadata)
 
 
 def test_dflash_attention_builders_receive_the_draft_model_config(monkeypatch):
@@ -2036,23 +2214,32 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     assert output.tolist() == [[-1] * 7]
 
 
-def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):
-    monkeypatch.setattr(flash_v100, "_is_cuda_graph_capturing", lambda _query: True)
+def test_noncausal_dflash_capture_binds_paged_prefix_attention():
+    from typing import cast
+
+    from vllm.v1.attention.backends.flash_v100.config import V100AttnConfig
+    from vllm.v1.attention.backends.flash_v100.prefill import (
+        PrefillDriverOps,
+        PrefillExecutor,
+    )
+    from vllm.v1.attention.backends.flash_v100.prefill_candidates import PrefillConfig
+    from vllm.v1.attention.backends.flash_v100.spec import attention as feature
+
     output = torch.empty(8, 1, 1)
     paged_prefix = Mock(return_value=output)
-    impl = SimpleNamespace(
-        _supports_flash_v100_path=lambda: True,
-        _validate_dflash_attention_contract=lambda _layer, _metadata: None,
-        _layer_debug_info=lambda _layer: {
-            "layer_name": "draft",
-            "is_dflash_draft_attn": True,
-        },
-        use_triton_prefill=False,
-        use_decode_scalar_paged=True,
-        use_decode_paged_prefill=False,
-        use_flash_v100_prefill_paged=True,
-        _small_query_decode_enabled=lambda _metadata: False,
-        _flash_v100_prefill_with_prefix=paged_prefix,
+    executor = PrefillExecutor(
+        PrefillConfig(
+            policy=cast(V100AttnConfig, SimpleNamespace(use_triton_prefill=False)),
+            scale=1.0,
+            kv_cache_dtype="auto",
+        ),
+        PrefillDriverOps(
+            capture_prefix_kind=feature.capture_prefix_kind,
+            record_capture_prefix=feature.record_capture_prefix,
+            small_query_enabled=lambda _metadata: False,
+        ),
+        workspace=None,
+        overrides={"_flash_v100_prefill_with_prefix": paged_prefix},
     )
     metadata = SimpleNamespace(
         max_query_len=8,
@@ -2070,8 +2257,7 @@ def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):
     query = torch.empty(8, 1, 1)
     layer = SimpleNamespace(is_dflash_draft_attn=True)
 
-    result = FlashAttnV100Impl.forward(
-        impl,
+    result = executor.forward(
         layer,
         query,
         query,
@@ -2079,6 +2265,10 @@ def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):
         torch.empty(1),
         metadata,
         output,
+        output_scale=None,
+        output_block_scale=None,
+        is_capturing=True,
+        layer_name="draft",
     )
 
     assert result is output

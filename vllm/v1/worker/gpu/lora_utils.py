@@ -31,9 +31,14 @@ class LoraState:
         req_ids: list[str],
         idx_mapping: np.ndarray,
         num_scheduled_tokens: np.ndarray,
+        num_logits: np.ndarray | None = None,
     ) -> tuple[tuple[int, ...], tuple[int, ...], set[LoRARequest]]:
         lora_ids = self.lora_ids[idx_mapping]
-        prompt_lora_mapping = tuple(lora_ids)
+        # Speculative verification can produce several logits rows per request.
+        # Token mappings still follow scheduled model tokens, independently.
+        prompt_lora_mapping = tuple(
+            lora_ids if num_logits is None else np.repeat(lora_ids, num_logits)
+        )
         token_lora_mapping = tuple(lora_ids.repeat(num_scheduled_tokens))
 
         active_lora_requests: set[LoRARequest] = set()

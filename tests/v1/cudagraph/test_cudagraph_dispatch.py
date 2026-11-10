@@ -439,8 +439,18 @@ class TestCudagraphDispatcher:
         ("max_model_len", "expected"),
         [
             (4096, (2048, 4096)),
-            (131072, (2048, 4096, 16384, 65536, 131072)),
-            (307200, (2048, 4096, 16384, 65536, 131072, 307200)),
+            (8192, (2048, 4096, 8192)),
+            (131072, (2048, 4096, 16384, 32768, 49152, 65536, 98304, 131072)),
+            (
+                307200,
+                (2048, 4096, 16384, 32768, 49152, 65536, 98304, 131072)
+                + (163840, 196608, 229376, 262144, 307200),
+            ),
+            (
+                500000,
+                (2048, 4096, 16384, 32768, 49152, 65536, 98304, 131072)
+                + (163840, 196608, 229376, 262144, 327680, 393216, 458752, 500000),
+            ),
         ],
     )
     def test_dsv4_decode_context_buckets_end_at_the_model_length(
@@ -461,6 +471,27 @@ class TestCudagraphDispatcher:
             attention_backend=None,
         )
         assert contract.compressed_context_buckets() == expected
+
+    @pytest.mark.parametrize("max_model_len", [None, 0, 2048, 2049, 4095, 16385])
+    def test_dsv4_context_bucket_boundaries(self, max_model_len):
+        contract = GraphModelContract(
+            speculative=False,
+            max_model_len=max_model_len,
+            num_heads=64,
+            num_kv_heads=1,
+            head_dim=512,
+            index_topk=512,
+            compress_ratios=(4, 128),
+            cache_dtype="fp8",
+            attention_backend=None,
+        )
+        buckets = contract.compressed_context_buckets()
+        if max_model_len is None or max_model_len <= 2048:
+            assert buckets == ()
+        else:
+            assert buckets == tuple(sorted(set(buckets)))
+            assert buckets[0] == 2048
+            assert buckets[-1] == max_model_len
 
     @pytest.mark.parametrize("speculative_tokens", [3, 5, 7])
     def test_dsv4_context_buckets_are_derived_for_mtp_on_sm70(
