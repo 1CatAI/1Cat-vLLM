@@ -326,6 +326,7 @@ class V41Indexer(nn.Module):
                 valid_tokens,
                 ratio,
                 tensor_model_parallel_all_reduce,
+                bank=getattr(store, "index_bank", None),
             )
         metadata = source_cache.metadata()
         keys = gather_index_keys(

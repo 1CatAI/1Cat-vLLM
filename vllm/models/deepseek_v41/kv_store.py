@@ -29,6 +29,11 @@ logger = init_logger(__name__)
 
 HOT_POSITIONS = int(envs.VLLM_V41_KV_HOT_POSITIONS)
 DECODE_ROWS = 8  # at most this many tokens use the selected-row buffer
+# Live-prefix index reduce (VLLM_V41_INDEX_REDUCE): the v41k kernel's
+# CTA count and its per-CTA flag words (CTA b, rank r at word b * 4 + r) in
+# front of each rank's partial scores. Mirrors kRedCtas / kRedFlags in v41k.cu.
+REDUCE_CTAS = 64
+REDUCE_FLAGS = REDUCE_CTAS * 4 * 4
 
 
 def _share_arena(size, group):
@@ -67,6 +72,75 @@ def _share_arena(size, group):
         connection.connect(path)
         connection.sendall(json.dumps((rank, nonce)).encode())
         return SharedHostArena.receive(connection)
+
+
+def _index_bank_ready(group):
+    """Every condition is the same on all TP ranks (the bank is collective)."""
+    if envs.VLLM_V41_INDEX_REDUCE != "1":
+        return False
+    communicator = getattr(group, "device_communicator", None)
+    ca = getattr(communicator, "ca_comm", None)
+    if group.world_size != 4 or ca is None or ca.disabled or not ca.fully_connected:
+        logger.warning(
+            "VLLM_V41_INDEX_REDUCE=1 needs TP4 and a fully connected custom "
+            "all-reduce; the decode index scores stay on the all-reduce"
+        )
+        return False
+    from vllm.model_executor.layers.quantization.gguf_v41_moe import (
+        _expert_major_ready,
+    )
+
+    if not (_expert_major_ready() and hasattr(torch.ops.v41k, "index_reduce_live")):
+        logger.warning(
+            "VLLM_V41_INDEX_REDUCE=1 but the loaded v41k library has no "
+            "index_reduce_live (rebuild v41k); the decode index scores stay on "
+            "the all-reduce"
+        )
+        return False
+    return True
+
+
+class V41IndexBank:
+    """INDEX_REDUCE: per-rank IPC bank for the live-prefix decode index reduce.
+
+    Each rank's buffer holds REDUCE_FLAGS bytes of per-CTA epoch flags, then
+    its partial FP16 scores [DECODE_ROWS, width] (width = the largest index
+    store, rounded up to 8 columns). index_scores_decode writes a rank's own
+    partial; v41k index_reduce_live reads all four over CUDA IPC and sums the
+    live columns. The all-reduces between two decode index calls bound rank
+    skew, so one partial slot per rank is enough.
+    """
+
+    def __init__(self, rows, device, group):
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+        from vllm.model_executor.layers.quantization.gguf_shared_prefill import (
+            _DeviceView,
+        )
+
+        self.rank = group.rank_in_group
+        self.width = (rows + 7) // 8 * 8
+        size = REDUCE_FLAGS + DECODE_ROWS * self.width * 2
+        self.pointers = tuple(
+            int(p) for p in CustomAllreduce.create_shared_buffer(size, group.cpu_group)
+        )
+        own = torch.as_tensor(
+            _DeviceView(self.pointers[self.rank], (size,), "|u1"), device=device
+        )
+        own.zero_()
+        self.own = own
+        self.partial = (
+            own[REDUCE_FLAGS:].view(torch.float16).view(DECODE_ROWS, self.width)
+        )
+        self.epochs = torch.zeros(REDUCE_CTAS, dtype=torch.int32, device=device)
+        torch.accelerator.synchronize(device)
+        group.barrier()  # every rank's flags are zero before any reduce
+        logger.info(
+            "V4.1 index reduce bank (INDEX_REDUCE): %d columns, %.1f MiB per rank",
+            self.width,
+            size / 2**20,
+        )
 
 
 @triton.jit(do_not_specialize=["HOT_ROWS"])
@@ -167,6 +241,11 @@ class V41PackedKV:
         self.staged = None  # source currently held by the staging buffer
         self.selected = torch.zeros(
             DECODE_ROWS, 512, C_ROW, dtype=torch.uint8, device=device
+        )
+        self.index_bank = (
+            V41IndexBank(max(self.rows.values()), device, group)
+            if self.sources and _index_bank_ready(group)
+            else None
         )
         logger.info(
             "V4.1 packed KV: max_len %d, host %.0f MiB, "
