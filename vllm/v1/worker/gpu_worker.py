@@ -193,6 +193,9 @@ class Worker(WorkerBase):
                 )
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._pp_send_tensors: dict[str, torch.Tensor] | None = None
+        # whether that send may still run while the next step computes
+        self._pp_send_overlaps_next_step = False
 
     def _has_ple_layers(self) -> bool:
         if not ple_offload_enabled(getattr(self, "vllm_config", None)):
@@ -1341,11 +1344,13 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        # A pending PP send whose tensors the next forward may overwrite (CUDA
+        # graph outputs) must finish before it. Eager sends own a copy because
+        # providers can return reusable workspace even outside CUDA graphs.
+        # That copy stays live until communication completes, allowing the next
+        # forward to overlap the send without overwriting its input.
+        if not self._pp_send_overlaps_next_step:
+            self._wait_pp_sends()
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -1432,9 +1437,14 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
+        self._wait_pp_sends()
+        static_transfer = self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens)
+        self._pp_send_overlaps_next_step = self._pp_send_overlaps(
+            num_scheduled_tokens, static_transfer
+        )
         # The exact SM70 B1 path sends the replicated tensor directly into
         # the next stage's persistent graph-input buffer without CPU metadata.
-        if self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens):
+        if static_transfer:
             if not self._is_static_pp_hidden_tensor_dict(
                 output.tensors, num_scheduled_tokens
             ):
@@ -1444,13 +1454,35 @@ class Worker(WorkerBase):
             self._pp_send_work = get_pp_group().isend_tensor_dict_static(output.tensors)
             logger.info_once("Default SM70 metadata-free PP hidden transfer enabled.")
         else:
+            send_tensors = output.tensors
+            if self._pp_send_overlaps_next_step:
+                self._pp_send_tensors = {
+                    name: tensor.clone() for name, tensor in send_tensors.items()
+                }
+                send_tensors = self._pp_send_tensors
             self._pp_send_work = get_pp_group().isend_tensor_dict(
-                output.tensors,
+                send_tensors,
                 all_gather_group=get_tp_group(),
                 all_gather_tensors=all_gather_tensors,
             )
 
         return None
+
+    def _pp_send_overlaps(self, num_tokens: int, static_transfer: bool) -> bool:
+        """Whether this step can send an owned copy across the next forward.
+
+        Graph-sized and static transfers keep the existing synchronization.
+        Eager outputs are not assumed to own fresh storage.
+        """
+        compilation_config = self.vllm_config.compilation_config
+        largest_graph = compilation_config.max_cudagraph_capture_size or 0
+        return not static_transfer and num_tokens > largest_graph
+
+    def _wait_pp_sends(self) -> None:
+        for handle in self._pp_send_work:
+            handle.wait()
+        self._pp_send_work = []
+        self._pp_send_tensors = None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
