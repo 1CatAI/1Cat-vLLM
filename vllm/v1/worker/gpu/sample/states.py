@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
@@ -16,8 +17,11 @@ _NP_INT64_MAX = np.iinfo(np.int64).max
 
 class SamplingStates:
     def __init__(self, max_num_reqs: int, vocab_size: int):
+        # Graph-owned views retain the cheap identity-temperature kernel.
+        self.capture_mode = False
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
+        self._topk_runtime = bind_topk_topp_runtime()
 
         self.temperature = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.top_k = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
@@ -71,7 +75,7 @@ class SamplingStates:
         idx_mapping_np: np.ndarray,
     ) -> None:
         temp_np = self.temperature.np[idx_mapping_np]
-        if np.all((temp_np == 0.0) | (temp_np == 1.0)):
+        if not self.capture_mode and np.all((temp_np == 0.0) | (temp_np == 1.0)):
             # No request requires temperature. Skip the kernel launch.
             return
 
@@ -101,7 +105,7 @@ class SamplingStates:
 
         top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
         top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
-        return apply_top_k_top_p(logits, top_k, top_p)
+        return apply_top_k_top_p(logits, top_k, top_p, runtime=self._topk_runtime)
 
     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:
         return int(np.max(self.num_logprobs[idx_mapping_np]))

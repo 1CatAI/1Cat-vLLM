@@ -6,7 +6,6 @@ from collections.abc import Callable
 import torch
 from compressed_tensors.quantization import ActivationOrdering
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MarlinLinearKernel,
@@ -80,7 +79,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
     @classmethod
     def get_min_capability(cls) -> int:
         if (
-            sm70_tm.use_turbomind(envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND)
+            sm70_tm.use_turbomind(
+                sm70_tm.layer_policy().value("compressed_tensors_turbomind")
+            )
             or sm70_tm.forces_marlin()
         ):
             return 70
@@ -229,7 +230,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if sm70_tm.should_prepare_turbomind(
             layer.weight_packed,
-            envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND,
+            sm70_tm.layer_policy().value("compressed_tensors_turbomind"),
         ):
             unsupported = []
             if self.quant_type.size_bits != 4:

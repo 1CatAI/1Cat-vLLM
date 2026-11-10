@@ -12,6 +12,18 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
+from vllm.config.sm70_triton_attention import (
+    _validate_sm70_triton_attn_input_precision as _validate_sm70_triton_attn_input_precision,  # noqa: E501
+)
+from vllm.config.sm70_triton_attention import (
+    _validate_sm70_triton_attn_tile_size as _validate_sm70_triton_attn_tile_size,
+)
+from vllm.config.sm70_triton_attention import (
+    _validate_sm70_triton_attn_warps as _validate_sm70_triton_attn_warps,
+)
+from vllm.config.sm70_triton_attention import (
+    capture_triton_attention_policy,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -776,30 +788,6 @@ def _get_tile_size(
     return 16 if element_size >= 2 else 32
 
 
-def _validate_sm70_triton_attn_tile_size(tile_size: int, name: str) -> None:
-    if tile_size == 0:
-        return
-    if tile_size <= 0 or tile_size & (tile_size - 1) != 0:
-        raise ValueError(f"{name} must be a positive power of 2 or 0")
-    if tile_size < 16 or tile_size > 128:
-        raise ValueError(f"{name} must be in [16, 128] or 0")
-
-
-def _validate_sm70_triton_attn_warps(num_warps: int) -> None:
-    if num_warps == 0:
-        return
-    if num_warps not in (1, 2, 4, 8):
-        raise ValueError("VLLM_SM70_TRITON_ATTN_NUM_WARPS must be 1, 2, 4, 8, or 0")
-
-
-def _validate_sm70_triton_attn_input_precision(value: str | None, name: str) -> str:
-    if value is None or value == "":
-        return ""
-    if value not in ("tf32", "tf32x3", "ieee"):
-        raise ValueError(f"{name} must be one of tf32, tf32x3, ieee, or empty")
-    return value
-
-
 def unified_attention(
     q,
     k,
@@ -908,50 +896,26 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
-    sm70_num_warps = 0
     sm70_prefill_num_warps = 0
     sm70_decode_num_warps = 0
     sm70_safe_defaults = False
     sm70_qk_input_precision = ""
     sm70_pv_input_precision = ""
     if current_platform.is_device_capability(70):
-        sm70_prefill_tile_size = envs.VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE
-        sm70_decode_tile_size = envs.VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE
-        sm70_num_warps = envs.VLLM_SM70_TRITON_ATTN_NUM_WARPS
-        sm70_prefill_num_warps = envs.VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS
-        sm70_decode_num_warps = envs.VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS
-        sm70_safe_defaults = envs.VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS
-        sm70_qk_input_precision = _validate_sm70_triton_attn_input_precision(
-            envs.VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION,
-            "VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION",
-        )
-        sm70_pv_input_precision = _validate_sm70_triton_attn_input_precision(
-            envs.VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION,
-            "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION",
-        )
-        _validate_sm70_triton_attn_tile_size(
-            sm70_prefill_tile_size, "VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE"
-        )
-        _validate_sm70_triton_attn_tile_size(
-            sm70_decode_tile_size, "VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE"
-        )
-        _validate_sm70_triton_attn_warps(sm70_num_warps)
-        _validate_sm70_triton_attn_warps(sm70_prefill_num_warps)
-        _validate_sm70_triton_attn_warps(sm70_decode_num_warps)
+        policy = capture_triton_attention_policy()
+        (
+            sm70_prefill_tile_size,
+            sm70_decode_tile_size,
+            sm70_prefill_num_warps,
+            sm70_decode_num_warps,
+            sm70_qk_input_precision,
+            sm70_pv_input_precision,
+        ) = policy.resolved_schedule()
+        sm70_safe_defaults = policy.safe_defaults
         if sm70_prefill_tile_size:
             TILE_SIZE_PREFILL = sm70_prefill_tile_size
         if sm70_decode_tile_size:
             TILE_SIZE_DECODE = sm70_decode_tile_size
-        if sm70_num_warps:
-            if not sm70_prefill_num_warps:
-                sm70_prefill_num_warps = sm70_num_warps
-            if not sm70_decode_num_warps:
-                sm70_decode_num_warps = sm70_num_warps
-        if sm70_safe_defaults:
-            if not sm70_prefill_num_warps:
-                sm70_prefill_num_warps = 4
-            if not sm70_decode_num_warps:
-                sm70_decode_num_warps = 8
         if (
             sm70_prefill_tile_size
             or sm70_decode_tile_size

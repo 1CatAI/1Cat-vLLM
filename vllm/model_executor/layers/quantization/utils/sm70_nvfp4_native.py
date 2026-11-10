@@ -5,16 +5,42 @@
 import torch
 
 from vllm import _sm70_ops as sm70_ops
-from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+from vllm._sm70.policy import register_policy_op
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
     _get_sm70_fp8_prefill_exact_dense_workspace,
 )
-from vllm.model_executor.layers.quantization.utils.nvfp4_qpn2_dequant import (
+from vllm.model_executor.kernels.linear.qpn.nvfp4_dequant import (
     _e4m3_value,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
 
 _scale_workspaces: dict[int, torch.Tensor] = {}
+_code_workspaces: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def clear_sm70_nvfp4_native_workspaces() -> None:
+    _scale_workspaces.clear()
+    _code_workspaces.clear()
+
+
+def _get_bundled_prefill_code_workspace(
+    weight: torch.Tensor, dense_workspace: torch.Tensor
+) -> torch.Tensor | None:
+    # Reserve before loading bundled weights. All serialized layers and their
+    # captured graphs share one compact code buffer, rather than retaining a
+    # second weight layout for each layer/graph.
+    device = weight.device.index
+    assert device is not None
+    elements = dense_workspace.numel() // 2
+    key = (device, elements)
+    workspace = _code_workspaces.get(key)
+    if workspace is None:
+        try:
+            workspace = torch.empty(elements, dtype=torch.uint8, device=weight.device)
+        except torch.OutOfMemoryError:
+            return None
+        _code_workspaces[key] = workspace
+    return workspace
 
 
 @triton.jit
@@ -29,6 +55,27 @@ def _restore_prefill_scales(Codes, Out, GlobalScale, Count: tl.constexpr):
     tl.store(Out + index, effective * 16384.0, index < Count)
 
 
+@triton.jit
+def _restore_bundled_prefill_operands(
+    Codes,
+    Scales,
+    OutCodes,
+    OutScales,
+    GlobalScale,
+    CodeCount: tl.constexpr,
+    ScaleCount: tl.constexpr,
+):
+    index = tl.program_id(0) * 1024 + tl.arange(0, 1024)
+    code = tl.load(Codes + index // 256 * 288 + index % 256, index < CodeCount, other=0)
+    tl.store(OutCodes + index, code, index < CodeCount)
+    if tl.program_id(0) * 1024 < ScaleCount:
+        raw = tl.load(
+            Scales + index // 32 * 288 + index % 32, index < ScaleCount, other=0
+        )
+        effective = (_e4m3_value(raw) * GlobalScale).to(tl.float16).to(tl.float32)
+        tl.store(OutScales + index, effective * 16384.0, index < ScaleCount)
+
+
 def _dispatch(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -38,7 +85,10 @@ def _dispatch(
     split_k: int,
     accumulator_chains: int,
     gated_silu: bool,
+    native_policy: list[str] | None = None,
 ) -> None:
+    from vllm._sm70.policy import call_native
+
     # Keep M dispatch opaque: compiled token ranges include both decode and
     # prefill. Native QPN2 codes and E4M3 scales are the only resident layout.
     if x.shape[0] <= 32:
@@ -56,7 +106,17 @@ def _dispatch(
             if gated_silu
             else sm70_ops.nvfp4_qpn2_gemm_sm70_out
         )
-        op(out, x, codes, scales, global_scale, split_k, accumulator_chains)
+        call_native(
+            op,
+            native_policy,
+            out,
+            x,
+            codes,
+            scales,
+            global_scale,
+            split_k,
+            accumulator_chains,
+        )
         return
     k = x.shape[1]
     n = out.shape[1] * (2 if gated_silu else 1)
@@ -71,19 +131,34 @@ def _dispatch(
             workspace.numel() // 16, dtype=torch.float16, device=codes.device
         )
         _scale_workspaces[device] = scale_workspace
-    _restore_prefill_scales[(triton.cdiv(scales.numel(), 1024),)](
-        scales.view(torch.uint8),
-        scale_workspace,
-        global_scale,
-        scales.numel(),
-    )
+    if codes.is_contiguous():
+        compact_codes = codes
+        _restore_prefill_scales[(triton.cdiv(scales.numel(), 1024),)](
+            scales.view(torch.uint8), scale_workspace, global_scale, scales.numel()
+        )
+    else:
+        code_workspace = _get_bundled_prefill_code_workspace(codes, workspace)
+        if code_workspace is None:
+            raise RuntimeError("Bundled QPN2 prefill workspace is unavailable")
+        compact_codes = code_workspace[: codes.numel()]
+        _restore_bundled_prefill_operands[(triton.cdiv(codes.numel(), 1024),)](
+            codes,
+            scales,
+            compact_codes,
+            scale_workspace,
+            global_scale,
+            codes.numel(),
+            scales.numel(),
+        )
     # Resolve the pointer inside the operator, never in an AOT artifact. The
     # serialized layer chain shares FP8's bounded per-device FP16 scratch.
-    sm70_ops.nvfp4_qpn4_prefill_sm70_out(
+    call_native(
+        sm70_ops.nvfp4_qpn4_prefill_sm70_out,
+        native_policy,
         out,
         workspace.data_ptr(),
         x,
-        codes.view(k, n // 2),
+        compact_codes.view(k, n // 2),
         scale_workspace[: k * n // 16].view(k // 16, n),
         global_scale,
         False,
@@ -100,13 +175,16 @@ def _dispatch_fake(
     split_k: int,
     accumulator_chains: int,
     gated_silu: bool,
+    native_policy: list[str] | None = None,
 ) -> None:
     return None
 
 
-direct_register_custom_op(
+register_policy_op(
     "sm70_nvfp4_native_dispatch",
+    "(Tensor(a!) out, Tensor x, Tensor codes, Tensor scales, float global_scale, "
+    "int split_k, int accumulator_chains, bool gated_silu, "
+    "str[]? native_policy=None) -> ()",
     _dispatch,
-    mutates_args=["out"],
-    fake_impl=_dispatch_fake,
+    _dispatch_fake,
 )

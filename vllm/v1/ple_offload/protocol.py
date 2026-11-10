@@ -33,6 +33,15 @@ class PleOffloadRegistration:
     remote_placements: dict[str, Any] = field(default_factory=dict)
     # Mapped consumers own the H2D graph node; no CUDA output IPC is needed.
     cpu_output_buffers: dict[str, torch.Tensor] | None = None
+    # GPU loading resolves result formats after the CPU spawn config freezes.
+    # Transfer only primitive geometry, never the live model/config graph.
+    result_layouts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # TP0's host-mapped verify-window tokens, published while drafting.
+    draft_ring: torch.Tensor | None = None
+    draft_ring_geometry: tuple[int, int] | None = None
+    # TP0's mapped request slot for the owner's native request lane.
+    fast_lane_request: torch.Tensor | None = None
+    fast_lane_geometry: tuple[int, int] | None = None
 
 
 @dataclass

@@ -155,6 +155,15 @@ def test_glm53_sm70_fp8_kv_layout_contract():
     assert isinstance(emitted, MLAAttentionSpec)
     assert emitted.model_version == "glm5_next"
     assert emitted.real_page_size_bytes == 64 * 520
+    # The V2 runner reshapes each KV tensor with the backend shape of the codec
+    # the spec declares, so that shape must fill the spec's page.
+    assert Glm5NextSM70SparseBackend.get_kv_cache_shape(
+        num_blocks=3,
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        cache_dtype_str=emitted.layout_cache_dtype("fp8_e4m3"),
+    ) == (3, 64, 520)
 
 
 @pytest.mark.skipif(

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from datetime import timedelta
 
 import pytest
@@ -11,6 +10,9 @@ import torch.multiprocessing as mp
 
 
 def _check_large_push(rank: int, rendezvous: str) -> None:
+    from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.collective import CollectiveNativeConfig
+    from vllm.config.execution_policy import CommunicationPolicy
     from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
     torch.accelerator.set_device_index(rank)
@@ -22,9 +24,33 @@ def _check_large_push(rank: int, rendezvous: str) -> None:
         init_method=rendezvous,
         timeout=timedelta(seconds=180),
     )
-    communicator = CustomAllreduce(dist.group.WORLD, rank, max_size=1024 * 1024)
-    assert not communicator.disabled and communicator.fully_connected
+    communicators = []
     try:
+        # Selection is captured when the communicator is constructed. Changing
+        # an environment variable after construction cannot make an A/B test.
+        for enabled in (False, True):
+            policy = CommunicationPolicy(
+                native=CollectiveNativeConfig(
+                    sm70_tp4_push_allreduce_concurrency=enabled,
+                    sm70_tp4_push_allreduce_small_messages=False,
+                    sm70_tp4_push_allreduce_qwen38_batch=False,
+                )
+            )
+            config = VllmConfig(
+                parallel_config=ParallelConfig(
+                    tensor_parallel_size=4, communication=policy
+                )
+            )
+            with set_current_vllm_config(config):
+                communicator = CustomAllreduce(
+                    dist.group.WORLD, rank, max_size=2 * 1024 * 1024
+                )
+            communicators.append(communicator)
+            assert not communicator.disabled and communicator.fully_connected
+            assert communicator._policy.native.raw(
+                "sm70_tp4_push_allreduce_concurrency"
+            ) == str(int(enabled))
+
         # Include partial batches and alternating packet lengths: the same
         # persistent two-epoch buffer must not retain a previous graph's tail.
         shapes = [(rows, 5120) for rows in (8, 16, 32, 33, 40, 48, 56, 64, 65)]
@@ -33,10 +59,7 @@ def _check_large_push(rank: int, rendezvous: str) -> None:
                 torch.empty(shape, dtype=dtype, device="cuda") for shape in shapes
             ]
             graphs, outputs, guards = [], [], []
-            for enabled in (False, True):
-                os.environ["VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY"] = str(
-                    int(enabled)
-                )
+            for communicator in communicators:
                 storage = [
                     torch.full((x.numel() + 16,), 123.0, dtype=dtype, device="cuda")
                     for x in inputs
@@ -75,7 +98,8 @@ def _check_large_push(rank: int, rendezvous: str) -> None:
                         assert bool(torch.all(storage[:8] == 123))
                         assert bool(torch.all(storage[-8:] == 123))
     finally:
-        communicator.close()
+        for communicator in reversed(communicators):
+            communicator.close()
         dist.destroy_process_group()
 
 
@@ -84,12 +108,8 @@ def test_large_push_preserves_order_tail_and_graph_replay(tmp_path, monkeypatch)
         7,
         0,
     ):
-        pytest.skip("requires an isolated NVLink-connected group of four V100 GPUs")
+        pytest.skip("requires an NVLink-connected group of four V100 GPUs")
     monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1")
-    for name in (
-        "VLLM_CUSTOM_ALLREDUCE_ALGO",
-        "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_ALGO", raising=False)
     rendezvous = (tmp_path / "large-push-rendezvous").as_uri()
     mp.spawn(_check_large_push, args=(rendezvous,), nprocs=4, join=True)

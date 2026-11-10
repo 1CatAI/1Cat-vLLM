@@ -8,11 +8,15 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -58,6 +62,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        self._ple_kernel_config = vllm_config.kernel_config
+        self._ple_input_hardware = current_platform.is_device_capability(70)
 
     def _prepare_ngram_context(
         self,
@@ -99,6 +105,51 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
+        reason = None
+        if not self._ple_kernel_config.ple_input_prepare:
+            reason = "disabled_by_kernel_config"
+        elif not self._ple_input_hardware:
+            reason = "requires_sm70"
+        elif num_reqs_padded > 4 or self.ngram_context_len > 8:
+            reason = "input_shape_has_no_calibration"
+        elif any(
+            t.dtype != torch.int32 or not t.is_cuda or not t.is_contiguous()
+            for t in (
+                query_start_loc,
+                input_batch.query_start_loc,
+                input_batch.idx_mapping,
+                req_states.num_computed_tokens.gpu,
+                req_states.all_token_ids.gpu,
+            )
+        ):
+            reason = "requires_contiguous_cuda_int32_inputs"
+        self._ple_kernel_config.ple_input_preparations["ngram_context"] = {
+            "operator": "qwen4exp_ple_input_prepare",
+            "enabled": reason is None,
+            "reason": reason,
+            "requests": input_batch.num_reqs,
+            "padded_requests": num_reqs_padded,
+            "context_length": self.ngram_context_len,
+        }
+        if reason is None:
+            from vllm.models.qwen4_exp.nvidia.sm70_ngram_input import (
+                prepare_ngram_input,
+            )
+
+            context = self.ngram_context[:num_reqs_padded]
+            prepare_ngram_input(
+                context,
+                query_start_loc,
+                input_batch.query_start_loc,
+                input_batch.idx_mapping,
+                req_states.num_computed_tokens.gpu,
+                req_states.all_token_ids.gpu,
+                input_batch.num_reqs,
+                self.ngram_eos_token_id,
+            )
+            logger.info_once("SM70 fused PLE n-gram input preparation enabled.")
+            model_inputs.update(query_start_loc=query_start_loc, ngram_context=context)
+            return model_inputs
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
         model_inputs.update(
             query_start_loc=query_start_loc,

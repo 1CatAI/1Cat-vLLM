@@ -12,9 +12,16 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.config.execution_policy import communication_policy
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
     gpu_p2p_access_check,
+    run_p2p_access_test,
+)
+from vllm.distributed.device_communicators.collective_provider import (
+    CollectiveCapabilities,
+    NativeCollectiveBindings,
+    weak_contiguous,
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
@@ -49,7 +56,7 @@ def _get_effective_allocator_conf() -> str:
 
 
 @contextmanager
-def _disable_expandable_segments_for_cuda_ipc(active: bool):
+def _disable_expandable_segments_for_cuda_ipc(active: bool, purpose: str | None = None):
     """Keep CUDA-IPC graph buffers on cudaMalloc-backed allocations.
 
     ``cudaIpcGetMemHandle`` cannot export CUDA VMM allocations created when
@@ -57,6 +64,11 @@ def _disable_expandable_segments_for_cuda_ipc(active: bool):
     environment variable. Custom all-reduce exports graph buffers through that
     legacy IPC API, so disable expandable segments for the complete capture
     and registration window while preserving every other allocator option.
+
+    While disabled, PyTorch's caching allocator also skips free blocks of
+    existing expandable segments, so every allocation made inside this window
+    is cudaMalloc-backed. Allocations made *before* the window are not.
+    Yields whether expandable segments were disabled.
     """
     allocator_conf = _get_effective_allocator_conf()
     disabled_conf, replacements = _EXPANDABLE_SEGMENTS_TRUE_PATTERN.subn(
@@ -64,16 +76,119 @@ def _disable_expandable_segments_for_cuda_ipc(active: bool):
     )
     should_disable = active and current_platform.is_cuda() and replacements > 0
     if should_disable:
-        logger.info_once(
-            "Temporarily disabling expandable_segments during custom allreduce "
-            "CUDA graph capture for CUDA IPC compatibility."
-        )
+        if purpose is None:
+            logger.info_once(
+                "Temporarily disabling expandable_segments during custom "
+                "allreduce CUDA graph capture for CUDA IPC compatibility."
+            )
+        else:
+            logger.info_once(
+                "Temporarily disabling expandable_segments during %s for CUDA "
+                "IPC compatibility.",
+                purpose,
+            )
         torch.cuda.memory._set_allocator_settings(disabled_conf)
     try:
-        yield
+        yield should_disable
     finally:
         if should_disable:
             torch.cuda.memory._set_allocator_settings(allocator_conf)
+
+
+# CUDA driver enums (cuda.h): CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE
+# and CU_STREAM_CAPTURE_MODE_RELAXED.
+_CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE = 10
+_CU_STREAM_CAPTURE_MODE_RELAXED = 2
+
+
+class _LegacyCudaIpcProbe:
+    """ctypes binding of ``cuPointerGetAttribute`` for the IPC capability bit.
+
+    Answers whether ``cudaIpcGetMemHandle`` can export the allocation behind a
+    device pointer (False for CUDA VMM / expandable-segment memory). The query
+    is a host-side metadata lookup; it is still bracketed by a relaxed
+    thread capture mode, as PyTorch does for its own calls during capture.
+    """
+
+    def __init__(self, library: str = "libcuda.so.1") -> None:
+        import ctypes
+
+        self._ctypes = ctypes
+        lib = ctypes.CDLL(library)
+        self._get_attribute = lib.cuPointerGetAttribute
+        self._get_attribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_ulonglong,
+        ]
+        self._get_attribute.restype = ctypes.c_int
+        self._exchange_mode = lib.cuThreadExchangeStreamCaptureMode
+        self._exchange_mode.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self._exchange_mode.restype = ctypes.c_int
+
+    def is_capable(self, ptr: int) -> bool | None:
+        """True/False from the driver, None when the query itself failed."""
+        ctypes = self._ctypes
+        # Zero-filled 8 bytes: correct whether the driver writes a 1-byte
+        # bool or a 4-byte int for this boolean attribute.
+        value = ctypes.c_ulonglong(0)
+        mode = ctypes.c_int(_CU_STREAM_CAPTURE_MODE_RELAXED)
+        if self._exchange_mode(ctypes.byref(mode)) != 0:
+            return None
+        try:
+            status = self._get_attribute(
+                ctypes.byref(value),
+                _CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE,
+                ptr,
+            )
+        finally:
+            self._exchange_mode(ctypes.byref(mode))
+        if status != 0:
+            return None
+        return value.value != 0
+
+
+_LEGACY_CUDA_IPC_PROBE: _LegacyCudaIpcProbe | None = None
+_LEGACY_CUDA_IPC_PROBE_FAILED = False
+
+
+def _is_legacy_cuda_ipc_capable(ptr: int) -> bool | None:
+    """Whether ``cudaIpcGetMemHandle`` can export ``ptr``; None if unknown."""
+    global _LEGACY_CUDA_IPC_PROBE, _LEGACY_CUDA_IPC_PROBE_FAILED
+    if _LEGACY_CUDA_IPC_PROBE is None and not _LEGACY_CUDA_IPC_PROBE_FAILED:
+        try:
+            _LEGACY_CUDA_IPC_PROBE = _LegacyCudaIpcProbe()
+        except (OSError, AttributeError) as exc:
+            _LEGACY_CUDA_IPC_PROBE_FAILED = True
+            logger.warning(
+                "Custom allreduce cannot query CUDA IPC capability (%s); "
+                "captured inputs are registered without the VMM check.",
+                exc,
+            )
+    if _LEGACY_CUDA_IPC_PROBE is None:
+        return None
+    return _LEGACY_CUDA_IPC_PROBE.is_capable(ptr)
+
+
+@contextmanager
+def custom_ar_ipc_safe_allocation():
+    """Allocate persistent custom all-reduce inputs outside CUDA VMM memory.
+
+    Some layers keep resident output buffers, allocated at load time, that are
+    later passed unchanged to a captured custom all-reduce (for example a
+    routed MoE output that ``all_reduce_sum2`` adds to the shared-expert
+    output). Under ``expandable_segments:True`` those buffers live in CUDA VMM
+    memory, which the graph-buffer registration cannot export. Allocations
+    made in this context use cudaMalloc segments instead, so capture needs no
+    per-call copy. It is a no-op without ``expandable_segments:True``.
+    """
+    # A capture window already holds the allocator toggle; nesting would
+    # restore expandable segments before that window ends.
+    active = current_platform.is_cuda() and not torch.cuda.is_current_stream_capturing()
+    with _disable_expandable_segments_for_cuda_ipc(
+        active, purpose="persistent custom all-reduce input allocation"
+    ):
+        yield
 
 
 def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
@@ -97,15 +212,33 @@ def _can_p2p(rank: int, world_size: int) -> bool:
     return True
 
 
-def is_weak_contiguous(inp: torch.Tensor):
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
-    )
+def _group_p2p_verified(
+    group: ProcessGroup, device_index: int, group_device_indices: list[int]
+) -> bool:
+    """Run the real CUDA IPC write test from this rank's device to every peer
+    device of the group and agree on the result within the group.
+
+    Unlike `gpu_p2p_access_check` it needs no world barrier, so ranks of other
+    pipeline stages that do not provision these collectives cannot wedge it,
+    and it tests the group's own devices rather than its rank numbers.
+    """
+    peers = [index for index in group_device_indices if index != device_index]
+    local_ok = all(run_p2p_access_test([device_index] * len(peers), peers))
+    statuses: list[bool | None] = [None] * len(group_device_indices)
+    dist.all_gather_object(statuses, local_ok, group=group)
+    return all(status is True for status in statuses)
+
+
+is_weak_contiguous = weak_contiguous
 
 
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    # Set for a capture window that disabled expandable segments; captured
+    # inputs are then checked for CUDA IPC exportability (_ipc_graph_input).
+    _capture_ipc_guard = False
+    _ipc_guard_copies = 0
+    _ipc_guard_fallbacks = 0
 
     # max_size: max supported allreduce size
     def __init__(
@@ -115,6 +248,7 @@ class CustomAllreduce:
         max_size=8192 * 1024,
         symm_mem_enabled=False,
         long_prefill_fusion_enabled=False,
+        verify_p2p=False,
     ) -> None:
         """
         Args:
@@ -122,17 +256,21 @@ class CustomAllreduce:
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bound to f"cuda:{local_rank}".
+            verify_p2p: run the real P2P access test on the group's devices
+                even when VLLM_SKIP_P2P_CHECK trusts the driver's report.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
         """
+        self._policy = communication_policy()
+        self._native = NativeCollectiveBindings(self._policy.native)
         self._IS_CAPTURING = False
         self.disabled = True
         self.long_prefill_output_ptrs: list[int] | None = None
         self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
         self.sm70_tp8_hierarchical_push_buffer_ptrs: list[int] | None = None
 
-        if not custom_ar:
+        if not custom_ar or not self._native.available:
             # disable because of missing custom allreduce library
             # e.g. in a non-GPU environment
             logger.info(
@@ -218,7 +356,7 @@ class CustomAllreduce:
         hierarchical_peer_ranks: tuple[int, ...] | None = None
         if world_size > 2 and not fully_connected:
             sm70_tp8_candidate = (
-                envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
+                self._policy.tp8_hierarchical
                 and world_size == 8
                 and device_capability is not None
                 and device_capability.major == 7
@@ -263,11 +401,17 @@ class CustomAllreduce:
         # this is expensive to compute at the first time
         # then we cache the result
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        if (
-            not tp8_hierarchical
-            and not current_platform.is_rocm()
-            and not _can_p2p(rank, world_size)
-        ):
+        if tp8_hierarchical or current_platform.is_rocm():
+            p2p_ok = True
+        elif verify_p2p:
+            p2p_ok = _group_p2p_verified(
+                self.group,
+                device.index,
+                [device_ids.index(physical) for physical in physical_device_ids],
+            )
+        else:
+            p2p_ok = _can_p2p(rank, world_size)
+        if not p2p_ok:
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "
                 "GPU P2P capability or P2P test failed. To silence this "
@@ -284,7 +428,7 @@ class CustomAllreduce:
             _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES if tp8_hierarchical else 0,
         )
         self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + meta_scratch_size,
+            self._native.meta_size() + meta_scratch_size,
             group=group,
             uncached=True,
             peer_ranks=set(hierarchical_peer_ranks)
@@ -319,18 +463,18 @@ class CustomAllreduce:
         self.world_size = world_size
         self.fully_connected = fully_connected
         self.tp8_hierarchical = tp8_hierarchical
-        self._ptr = ops.init_custom_ar(
+        self._ptr = self._native.init_custom_ar(
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
-        ops.register_buffer(self._ptr, self.buffer_ptrs)
+        self._native.register_buffer(self._ptr, self.buffer_ptrs)
         if long_prefill_fusion_enabled:
             self.long_prefill_output_ptrs = self.create_shared_buffer(
                 max_size,
                 group=group,
             )
-            ops.register_buffer(self._ptr, self.long_prefill_output_ptrs)
+            self._native.register_buffer(self._ptr, self.long_prefill_output_ptrs)
         if (
-            envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
+            self._policy.tp4_push
             and world_size == 4
             and fully_connected
             and current_platform.is_cuda()
@@ -338,24 +482,34 @@ class CustomAllreduce:
             and device_capability.major == 7
             and device_capability.minor == 0
         ):
-            push_buffer_size = ops.sm70_tp4_push_allreduce_buffer_size()
+            push_buffer_size = self._native.sm70_tp4_push_allreduce_buffer_size()
             self.sm70_tp4_push_buffer_ptrs = self.create_shared_buffer(
                 push_buffer_size,
                 group=group,
             )
-            ops.register_sm70_tp4_push_allreduce_buffer(
+            self._native.register_sm70_tp4_push_allreduce_buffer(
                 self._ptr, self.sm70_tp4_push_buffer_ptrs
             )
             mtp5_status = (
-                "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5 else "disabled"
+                "enabled"
+                if self._policy.native.registry_bool(
+                    "sm70_tp4_push_allreduce_mtp5", "1"
+                )
+                else "disabled"
             )
             qwen38_batch_status = (
                 "enabled"
-                if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH
+                if self._policy.native.registry_bool(
+                    "sm70_tp4_push_allreduce_qwen38_batch", "1"
+                )
                 else "disabled"
             )
             sum2_m1_status = (
-                "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1 else "disabled"
+                "enabled"
+                if self._policy.native.registry_bool(
+                    "sm70_tp4_push_allreduce_sum2_m1", "0"
+                )
+                else "disabled"
             )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
@@ -367,21 +521,33 @@ class CustomAllreduce:
                 sum2_m1_status,
                 mtp5_status,
             )
-        if tp8_hierarchical and envs.VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR:
+        if tp8_hierarchical and self._policy.tp8_push:
             assert hierarchical_peer_ranks is not None
-            push_buffer_size = ops.sm70_tp8_hierarchical_push_allreduce_buffer_size()
+            push_buffer_size = (
+                self._native.sm70_tp8_hierarchical_push_allreduce_buffer_size()
+            )
             self.sm70_tp8_hierarchical_push_buffer_ptrs = self.create_shared_buffer(
                 push_buffer_size,
                 group=group,
                 peer_ranks=set(hierarchical_peer_ranks),
             )
-            ops.register_sm70_tp8_hierarchical_push_allreduce_buffer(
+            self._native.register_sm70_tp8_hierarchical_push_allreduce_buffer(
                 self._ptr, self.sm70_tp8_hierarchical_push_buffer_ptrs
             )
             logger.info(
                 "SM70 TP8 hierarchical push all-reduce enabled for exact "
                 "FP16 8-KiB and 64-KiB CUDA-Graph payloads."
             )
+
+        self.capabilities = CollectiveCapabilities(
+            world_size,
+            fully_connected,
+            tp8_hierarchical,
+            self.dispatch_max_size,
+            self.max_size,
+            self.sm70_tp4_push_buffer_ptrs is not None,
+            self.long_prefill_output_ptrs is not None,
+        )
 
     @contextmanager
     def capture(self):
@@ -390,17 +556,33 @@ class CustomAllreduce:
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
-        with _disable_expandable_segments_for_cuda_ipc(not self.disabled):
+        with _disable_expandable_segments_for_cuda_ipc(not self.disabled) as ipc_guard:
+            self._IS_CAPTURING = True
+            # Inputs allocated before this window can still be VMM memory.
+            self._capture_ipc_guard = bool(ipc_guard)
             try:
-                self._IS_CAPTURING = True
                 yield
             finally:
                 self._IS_CAPTURING = False
-                if not self.disabled:
-                    self.register_graph_buffers()
+            # Register only after successful capture. On failure a peer can
+            # still be inside CUDA work: a CPU collective here hides the error
+            # and prevents the executor from terminating the failed worker.
+            if not self.disabled:
+                self.register_graph_buffers()
 
     def register_graph_buffers(self):
-        handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
+        if self._capture_ipc_guard:
+            # Logged before the IPC export so the counts survive its failure.
+            logger.info(
+                "Custom allreduce capture: %d captured input(s) were not "
+                "CUDA-IPC exportable (expandable segments) and were copied; "
+                "%d used the staging/NCCL fallback.",
+                self._ipc_guard_copies,
+                self._ipc_guard_fallbacks,
+            )
+            self._ipc_guard_copies = 0
+            self._ipc_guard_fallbacks = 0
+        handle, offset = self._native.get_graph_buffer_ipc_meta(self._ptr)
         logger.info("Registering %d cuda graph addresses", len(offset))
         # We cannot directly use `dist.all_gather_object` here
         # because it is incompatible with `gloo` backend under inference mode.
@@ -416,29 +598,36 @@ class CustomAllreduce:
         # Unpack list of tuples to tuple of lists.
         handles = cast(list[list[int]], [d[0] for d in all_data])
         offsets = cast(list[list[int]], [d[1] for d in all_data])
-        ops.register_graph_buffers(self._ptr, handles, offsets)
+        self._native.register_graph_buffers(self._ptr, handles, offsets)
+
+    def _ipc_graph_input(self, inp: torch.Tensor) -> torch.Tensor | None:
+        """Return a tensor with ``inp``'s values that the graph-buffer
+        registration can export through ``cudaIpcGetMemHandle``.
+
+        The native ops record every captured input pointer for
+        ``get_graph_buffer_ipc_meta``, which exits the process when one of
+        them is CUDA VMM memory, such as a resident buffer allocated under
+        ``expandable_segments:True`` before the capture window. Inside the
+        window a fresh copy is cudaMalloc-backed; it keeps ``inp``'s strides,
+        hence the native ops' flat element order. ``None`` means no exportable
+        copy was produced and the caller must use its staging fallback. If the
+        driver query is unavailable, ``inp`` is returned unchanged.
+        """
+        if not (
+            self._capture_ipc_guard
+            and _is_legacy_cuda_ipc_capable(inp.data_ptr()) is False
+        ):
+            return inp
+        copy = torch.empty_like(inp)
+        copy.copy_(inp)
+        if _is_legacy_cuda_ipc_capable(copy.data_ptr()) is False:
+            self._ipc_guard_fallbacks += 1
+            return None
+        self._ipc_guard_copies += 1
+        return copy
 
     def should_custom_ar(self, inp: torch.Tensor):
-        if self.disabled:
-            return False
-        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-            return False
-        inp_size = inp.numel() * inp.element_size()
-        # custom allreduce requires input byte size to be multiples of 16
-        if inp_size % 16 != 0:
-            return False
-        if not is_weak_contiguous(inp):
-            return False
-        if self.tp8_hierarchical:
-            return (
-                inp.dtype == torch.float16
-                and inp.numel() in _SM70_TP8_HIERARCHICAL_ELEMENTS
-            )
-        # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
-        if self.world_size == 2 or self.fully_connected:
-            return inp_size < self.dispatch_max_size
-        return False
+        return not self.disabled and self.capabilities.reduce(inp)
 
     def all_reduce(
         self, inp: torch.Tensor, *, out: torch.Tensor = None, registered: bool = False
@@ -452,9 +641,9 @@ class CustomAllreduce:
         if out is None:
             out = torch.empty_like(inp)
         if registered:
-            ops.all_reduce(self._ptr, inp, out, 0, 0)
+            self._native.all_reduce(self._ptr, inp, out, 0, 0)
         else:
-            ops.all_reduce(
+            self._native.all_reduce(
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
         return out
@@ -468,22 +657,16 @@ class CustomAllreduce:
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(inp_a)
-        ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
+        self._native.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
 
     def can_sm70_qwen38_hc_batch(self, branches: torch.Tensor) -> bool:
-        return bool(
-            not self.disabled
-            and self.world_size == 4
-            and self.fully_connected
-            and self.sm70_tp4_push_buffer_ptrs is not None
-            and branches.is_cuda
-            and branches.dtype == torch.float16
-            and branches.ndim == 2
-            and 2 <= branches.shape[0] <= 16
-            and branches.shape[1] == 10240
-            and branches.is_contiguous()
-            and ops.supports_sm70_qwen38_hc_batch()
+        from vllm.model_executor.models.collective_contracts import QWEN_HC_BATCH
+
+        return not self.disabled and self.capabilities.model_collective(
+            QWEN_HC_BATCH,
+            branches,
+            self._native,
         )
 
     def sm70_qwen38_hc_batch(
@@ -501,39 +684,42 @@ class CustomAllreduce:
         full_unroll: bool = False,
         fused_chain: bool = False,
     ) -> None:
-        ops.sm70_qwen38_hc_batch(
-            self._ptr,
-            branches,
-            packed_down,
-            packed_up,
-            partials,
-            lora,
-            local_output,
-            output,
-            injection,
-            round_down_partials,
-            cooperative,
-            full_unroll,
-            fused_chain,
+        from vllm.model_executor.models.collective_contracts import QWEN_HC_BATCH
+
+        self._native.call_optional_tail(
+            "sm70_qwen38_hc_batch",
+            "cta_split_warps",
+            (
+                self._ptr,
+                branches,
+                packed_down,
+                packed_up,
+                partials,
+                lora,
+                local_output,
+                output,
+                injection,
+                round_down_partials,
+                cooperative,
+                full_unroll,
+                fused_chain,
+                QWEN_HC_BATCH.fused_chain_cta_warps if fused_chain else 0,
+            ),
         )
 
     def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:
-        return bool(
-            not self.disabled
-            and self.world_size == 4
-            and self.fully_connected
-            and self.sm70_tp4_push_buffer_ptrs is not None
-            and branches.is_cuda
-            and branches.dtype == torch.float16
-            and branches.shape == (1, 10240)
-            and branches.is_contiguous()
-            and ops.supports_sm70_qwen38_hc_shard()
+        from vllm.model_executor.models.collective_contracts import QWEN_HC_SHARD
+
+        return not self.disabled and self.capabilities.model_collective(
+            QWEN_HC_SHARD,
+            branches,
+            self._native,
         )
 
     def sm70_qwen38_hc_down_allgather(
         self, local_down: torch.Tensor, gathered_down: torch.Tensor
     ) -> None:
-        ops.sm70_qwen38_hc_down_allgather(self._ptr, local_down, gathered_down)
+        self._native.sm70_qwen38_hc_down_allgather(self._ptr, local_down, gathered_down)
 
     def sm70_qwen38_hc_gate_mix(
         self,
@@ -541,18 +727,18 @@ class CustomAllreduce:
         branches: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        ops.sm70_qwen38_hc_gate_mix(self._ptr, local_gate, branches, output)
+        self._native.sm70_qwen38_hc_gate_mix(self._ptr, local_gate, branches, output)
 
     def supports_sm70_qwen38_hc_output_allgather(self) -> bool:
-        return ops.supports_sm70_qwen38_hc_output_allgather()
+        return self._native.has("sm70_qwen38_hc_output_allgather")
 
     def sm70_qwen38_hc_output_allgather(
         self, local_block: torch.Tensor, output: torch.Tensor
     ) -> None:
-        ops.sm70_qwen38_hc_output_allgather(self._ptr, local_block, output)
+        self._native.sm70_qwen38_hc_output_allgather(self._ptr, local_block, output)
 
     def supports_sm70_qwen38_hc_up_mix_allgather(self) -> bool:
-        return ops.supports_sm70_qwen38_hc_up_mix_allgather()
+        return self._native.has("sm70_qwen38_hc_up_mix_allgather")
 
     def sm70_qwen38_hc_up_mix_allgather(
         self,
@@ -561,7 +747,9 @@ class CustomAllreduce:
         branches: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        ops.sm70_qwen38_hc_up_mix_allgather(self._ptr, lora, weight, branches, output)
+        self._native.sm70_qwen38_hc_up_mix_allgather(
+            self._ptr, lora, weight, branches, output
+        )
 
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
@@ -575,9 +763,14 @@ class CustomAllreduce:
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)
         registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        if registered:
+            safe_inp = self._ipc_graph_input(inp)
+            registered = safe_inp is not None
+            if safe_inp is not None:
+                inp = safe_inp
         reg_buffer = 0 if registered else self.buffer_ptrs[self.rank]
         reg_buffer_size = 0 if registered else self.max_size
-        ops.sm70_tp2_all_reduce_gemma_rms_norm(
+        self._native.sm70_tp2_all_reduce_gemma_rms_norm(
             self._ptr,
             inp,
             residual,
@@ -596,24 +789,8 @@ class CustomAllreduce:
         residual: torch.Tensor,
         weight: torch.Tensor,
     ) -> bool:
-        return (
-            not self.disabled
-            and self.world_size == 2
-            and self.should_custom_ar(inp)
-            and inp.is_cuda
-            and inp.dtype == torch.float16
-            and inp.ndim == 2
-            and 1 <= inp.shape[0] <= 64
-            and inp.shape[1] == 5120
-            and residual.shape == inp.shape
-            and residual.dtype in (torch.float16, torch.float32)
-            and weight.ndim == 1
-            and weight.numel() == 5120
-            and weight.dtype in (torch.float16, torch.float32)
-            and inp.is_contiguous()
-            and residual.is_contiguous()
-            and weight.is_contiguous()
-            and inp.device == residual.device == weight.device
+        return not self.disabled and self.capabilities.gemma_norm(
+            inp, residual, weight, world_size=2, long=False
         )
 
     def sm70_tp4_all_reduce_gemma_rms_norm(
@@ -629,9 +806,14 @@ class CustomAllreduce:
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)
         registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        if registered:
+            safe_inp = self._ipc_graph_input(inp)
+            registered = safe_inp is not None
+            if safe_inp is not None:
+                inp = safe_inp
         reg_buffer = 0 if registered else self.buffer_ptrs[self.rank]
         reg_buffer_size = 0 if registered else self.max_size
-        ops.sm70_tp4_all_reduce_gemma_rms_norm(
+        self._native.sm70_tp4_all_reduce_gemma_rms_norm(
             self._ptr,
             inp,
             residual,
@@ -650,25 +832,8 @@ class CustomAllreduce:
         residual: torch.Tensor,
         weight: torch.Tensor,
     ) -> bool:
-        return (
-            not self.disabled
-            and self.world_size == 4
-            and self.fully_connected
-            and self.should_custom_ar(inp)
-            and inp.is_cuda
-            and inp.dtype == torch.float16
-            and inp.ndim == 2
-            and 1 <= inp.shape[0] <= 64
-            and inp.shape[1] == 5120
-            and residual.shape == inp.shape
-            and residual.dtype == torch.float32
-            and weight.ndim == 1
-            and weight.numel() == 5120
-            and weight.dtype in (torch.float16, torch.float32)
-            and inp.is_contiguous()
-            and residual.is_contiguous()
-            and weight.is_contiguous()
-            and inp.device == residual.device == weight.device
+        return not self.disabled and self.capabilities.gemma_norm(
+            inp, residual, weight, world_size=4, long=False
         )
 
     def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
@@ -694,7 +859,22 @@ class CustomAllreduce:
         graph_registered = (
             self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
         )
-        ops.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+        if graph_registered:
+            # Peers also write the shared output in place, so a copy of it
+            # would not work; stage both buffers instead when either one is
+            # not exportable.
+            safe_inp = self._ipc_graph_input(inp)
+            if safe_inp is None:
+                graph_registered = False
+            elif (
+                self._capture_ipc_guard
+                and _is_legacy_cuda_ipc_capable(normalized_out.data_ptr()) is False
+            ):
+                graph_registered = False
+                self._ipc_guard_fallbacks += 1
+            else:
+                inp = safe_inp
+        self._native.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
             self._ptr,
             inp,
             residual,
@@ -714,27 +894,8 @@ class CustomAllreduce:
         residual: torch.Tensor,
         weight: torch.Tensor,
     ) -> bool:
-        return (
-            not self.disabled
-            and self.long_prefill_output_ptrs is not None
-            and self.world_size == 4
-            and self.fully_connected
-            and inp.is_cuda
-            and inp.dtype == torch.float16
-            and inp.ndim == 2
-            and inp.shape[0] % self.world_size == 0
-            and 1 <= inp.shape[0] // self.world_size <= 2048
-            and inp.shape[1] == 5120
-            and inp.numel() * inp.element_size() <= self.max_size
-            and residual.shape == inp.shape
-            and residual.dtype == torch.float32
-            and weight.ndim == 1
-            and weight.numel() == 5120
-            and weight.dtype in (torch.float16, torch.float32)
-            and inp.is_contiguous()
-            and residual.is_contiguous()
-            and weight.is_contiguous()
-            and inp.device == residual.device == weight.device
+        return not self.disabled and self.capabilities.gemma_norm(
+            inp, residual, weight, world_size=4, long=True
         )
 
     def top1_argmax(
@@ -745,11 +906,13 @@ class CustomAllreduce:
         registered: bool = False,
     ) -> torch.Tensor:
         if out is None:
-            out = torch.empty((1,), dtype=torch.int64, device=input_pair.device)
+            out = torch.empty(
+                (input_pair.numel() // 2,), dtype=torch.int64, device=input_pair.device
+            )
         if registered:
-            ops.top1_argmax(self._ptr, input_pair, out, 0, 0)
+            self._native.top1_argmax(self._ptr, input_pair, out, 0, 0)
         else:
-            ops.top1_argmax(
+            self._native.top1_argmax(
                 self._ptr,
                 input_pair,
                 out,
@@ -771,7 +934,7 @@ class CustomAllreduce:
             raise RuntimeError("custom allreduce is disabled")
         if out is None:
             out = torch.empty_like(inp)
-        ops.tile_runtime_all_reduce(
+        self._native.tile_runtime_all_reduce(
             self._ptr,
             inp,
             out,
@@ -797,7 +960,7 @@ class CustomAllreduce:
             raise RuntimeError("custom allreduce is disabled")
         if out is None:
             out = torch.empty_like(inp)
-        ops.tile_runtime_all_reduce_engine(
+        self._native.tile_runtime_all_reduce_engine(
             self._ptr,
             inp,
             out,
@@ -822,7 +985,7 @@ class CustomAllreduce:
             raise RuntimeError("custom allreduce is disabled")
         if out is None:
             out = torch.empty_like(staging)
-        ops.tile_runtime_wait_reduce(
+        self._native.tile_runtime_wait_reduce(
             self._ptr,
             staging,
             out,
@@ -848,23 +1011,23 @@ class CustomAllreduce:
         if input.dtype not in (torch.float16, torch.float32):
             return None
 
-        tile_numel = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL
+        tile_numel = cast(int, self._policy.awq_tile_numel)
         if tile_numel <= 0 or input.numel() != tile_numel:
             return None
 
-        mode = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE
+        mode = self._policy.awq_tile_mode
         if mode == "inline":
             return self.tile_runtime_all_reduce(
                 input,
                 tile_numel=tile_numel,
-                engine_blocks=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS,
+                engine_blocks=cast(int, self._policy.awq_engine_blocks),
             )
         if mode == "engine":
             return self.tile_runtime_all_reduce_engine(
                 input,
                 tile_numel=tile_numel,
-                producer_blocks=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS,
-                reducer_blocks=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS,
+                producer_blocks=cast(int, self._policy.awq_producer_blocks),
+                reducer_blocks=cast(int, self._policy.awq_reducer_blocks),
             )
 
         logger.warning_once(
@@ -944,7 +1107,11 @@ class CustomAllreduce:
     def custom_top1_argmax(self, input_pair: torch.Tensor) -> torch.Tensor | None:
         if self.disabled:
             return None
-        if input_pair.dtype != torch.float32 or input_pair.numel() != 2:
+        if (
+            input_pair.dtype != torch.float32
+            or not 2 <= input_pair.numel() <= 256
+            or input_pair.numel() % 2 != 0
+        ):
             return None
         if not is_weak_contiguous(input_pair):
             return None
@@ -952,7 +1119,10 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.top1_argmax(input_pair, registered=True)
+                safe_pair = self._ipc_graph_input(input_pair)
+                if safe_pair is None:
+                    return self.top1_argmax(input_pair, registered=False)
+                return self.top1_argmax(safe_pair, registered=True)
             # Graph warmup still consumes the sampled token. Returning an
             # uninitialized placeholder here can change the dummy decode
             # sequence or even produce an invalid token id, so use the exact
@@ -967,7 +1137,12 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                safe_input = self._ipc_graph_input(input)
+                if safe_input is None:
+                    # The pre-registered staging buffer is cudaMalloc-backed,
+                    # so its graph registration is exportable.
+                    return self.all_reduce(input, registered=False)
+                return self.all_reduce(safe_input, registered=True)
             # Graph warmup can still feed persistent model state (KV, SSM, or
             # CUDA graph metadata buffers). Returning an uninitialized tensor
             # here can poison the state captured immediately afterwards. Keep
@@ -991,14 +1166,19 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce_sum2(input_a, input_b)
+                safe_a = self._ipc_graph_input(input_a)
+                safe_b = None if safe_a is None else self._ipc_graph_input(input_b)
+                if safe_a is None or safe_b is None:
+                    # The caller falls back to all_reduce(input_a + input_b).
+                    return None
+                return self.all_reduce_sum2(safe_a, safe_b)
             return self.all_reduce(input_a + input_b, registered=False)
         return None
 
     def close(self):
         if not self.disabled and self._ptr:
             if ops is not None:
-                ops.dispose(self._ptr)
+                self._native.dispose(self._ptr)
             self._ptr = 0
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)

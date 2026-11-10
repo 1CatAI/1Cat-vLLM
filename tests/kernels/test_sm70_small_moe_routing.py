@@ -136,3 +136,31 @@ def test_unroute_matches_torch_short_reduction_order(top_k, weight_dtype):
     torch.testing.assert_close(
         _small_unroute(down, inverse, weights), expected, rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA required"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("m", [33, 163, 164, 1000, 8192])
+def test_unroute_fallback_chunks_large_batches_exactly(device, m):
+    # Above the fused M<=32 route the fallback reduces row chunks; every
+    # output row must equal the unchunked FP32 weighted sum bit for bit.
+    torch.manual_seed(m)
+    top_k, h = 10, 2560
+    down = torch.randn(m * top_k, h, device=device).half()
+    inverse = torch.randperm(m * top_k, device=device).to(torch.int32)
+    weights = torch.rand(m, top_k, device=device)
+    reference = (
+        (down[inverse.long()].view(m, top_k, h).float() * weights[..., None]).sum(1)
+    ).half()
+    actual = _small_unroute(down, inverse, weights)
+    assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))

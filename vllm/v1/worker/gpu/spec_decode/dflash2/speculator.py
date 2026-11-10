@@ -6,13 +6,14 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.sm70_dflash2 import (
+    Sm70DFlash2Config,
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
 )
+from vllm.diagnostics import bind_diagnostics
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -357,9 +358,37 @@ def _advance_lookup_controller(
 class DFlash2Speculator(DFlashSpeculator):
     _speculator_name = "DFlash2"
 
+    def try_sample_target(
+        self,
+        model,
+        rejection_sampler,
+        hidden_states,
+        input_batch,
+        grammar_output,
+        *,
+        allow_graph=True,
+    ):
+        # Lazy feature import avoids a speculator/provider initialization cycle.
+        from .sparse_rejection import try_dflash2_sparse_target_rejection
+
+        return try_dflash2_sparse_target_rejection(
+            model,
+            self,
+            rejection_sampler,
+            hidden_states,
+            input_batch,
+            grammar_output,
+            allow_graph=allow_graph,
+        )
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
+        self._sm70_dflash2_policy = (
+            capture_sm70_dflash2_config(vllm_config) or Sm70DFlash2Config()
+        )
+        self._sm70_dflash2_policy.resolve(qualified=False)
+        self._diagnostics = bind_diagnostics(vllm_config)
+        self._trace = self._diagnostics.sampling
         self._context_kv_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._context_compute_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._context_store_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -370,10 +399,12 @@ class DFlash2Speculator(DFlashSpeculator):
         self._debug_token_dump_count = 0
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
+        assert self._sm70_dflash2_policy.proposal_temperature_scale is not None
+        assert self._sm70_dflash2_policy.proposal_top_p is not None
         self.proposal_temperature_scale = (
-            envs.VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE
+            self._sm70_dflash2_policy.proposal_temperature_scale
         )
-        self.proposal_top_p = envs.VLLM_SM70_DFLASH2_PROPOSAL_TOP_P
+        self.proposal_top_p = self._sm70_dflash2_policy.proposal_top_p
         if self.proposal_temperature_scale <= 0.0:
             raise ValueError(
                 "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE must be positive"
@@ -455,7 +486,7 @@ class DFlash2Speculator(DFlashSpeculator):
         self._alignment_candidate_ids: torch.Tensor | None = None
         self._alignment_unary_logits: torch.Tensor | None = None
         self._alignment_lattice_scores: torch.Tensor | None = None
-        if envs.VLLM_SPEC_DUMP_ALIGNMENT and sm70_dflash2_enabled(
+        if self._trace.value("alignment") and sm70_dflash2_enabled(
             "sparse_target_rejection", self._sm70_dflash2_policy
         ):
             packed_shape = (
@@ -546,15 +577,24 @@ class DFlash2Speculator(DFlashSpeculator):
             assert speculative_config.prompt_lookup_max is not None
             self._lookup_nmin = int(speculative_config.prompt_lookup_min)
             self._lookup_nmax = int(speculative_config.prompt_lookup_max)
-            self._lookup_nstrong = envs.VLLM_DFLASH2_LOOKUP_NSTRONG
-            self._lookup_agree = envs.VLLM_DFLASH2_LOOKUP_AGREE
-            self._lookup_nmin_tail = envs.VLLM_DFLASH2_LOOKUP_NMIN_TAIL
-            self._lookup_long_min = envs.VLLM_DFLASH2_LOOKUP_LONG_MIN
-            self._lookup_search = envs.VLLM_DFLASH2_LOOKUP_SEARCH
-            self._lookup_adaptive = envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
-            self._lookup_entry_streak = envs.VLLM_DFLASH2_LOOKUP_ENTRY_STREAK
-            self._lookup_sticky_steps = envs.VLLM_DFLASH2_LOOKUP_STICKY
-            self._lookup_cheap_context = envs.VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT
+            self._sm70_dflash2_policy.lookup.resolve()
+            assert self._sm70_dflash2_policy.lookup.nstrong is not None
+            self._lookup_nstrong = self._sm70_dflash2_policy.lookup.nstrong
+            assert self._sm70_dflash2_policy.lookup.agree is not None
+            self._lookup_agree = self._sm70_dflash2_policy.lookup.agree
+            assert self._sm70_dflash2_policy.lookup.nmin_tail is not None
+            self._lookup_nmin_tail = self._sm70_dflash2_policy.lookup.nmin_tail
+            assert self._sm70_dflash2_policy.lookup.long_min is not None
+            self._lookup_long_min = self._sm70_dflash2_policy.lookup.long_min
+            assert self._sm70_dflash2_policy.lookup.search is not None
+            self._lookup_search = self._sm70_dflash2_policy.lookup.search
+            self._lookup_adaptive = self._sm70_dflash2_policy.lookup.adaptive
+            assert self._sm70_dflash2_policy.lookup.entry_streak is not None
+            self._lookup_entry_streak = self._sm70_dflash2_policy.lookup.entry_streak
+            assert self._sm70_dflash2_policy.lookup.sticky is not None
+            self._lookup_sticky_steps = self._sm70_dflash2_policy.lookup.sticky
+            assert self._sm70_dflash2_policy.lookup.cheap_context is not None
+            self._lookup_cheap_context = self._sm70_dflash2_policy.lookup.cheap_context
             self._lookup_tokens = torch.zeros(
                 self.max_num_reqs,
                 self.num_speculative_steps,
@@ -628,7 +668,7 @@ class DFlash2Speculator(DFlashSpeculator):
         else:
             self._lookup_q16_rounds += 1
         if (
-            envs.VLLM_DFLASH_PROFILE
+            self._diagnostics.trace.dflash.value("profile")
             and verify_tokens != self._lookup_last_verify_tokens
         ):
             logger.info(
@@ -834,7 +874,7 @@ class DFlash2Speculator(DFlashSpeculator):
         self._capture_draft_metadata_graph(shapes)
 
     def _capture_draft_metadata_graph(self, shapes: list[tuple[int, int]]) -> None:
-        from vllm.v1.attention.backends.flash_attn_v100 import (
+        from vllm.v1.attention.backends.flash_v100 import (
             FlashAttnV100Impl,
             FlashAttnV100MetadataBuilder,
         )
@@ -861,7 +901,7 @@ class DFlash2Speculator(DFlashSpeculator):
                 if (
                     not isinstance(builder, FlashAttnV100MetadataBuilder)
                     or not builder._is_dflash_draft_model
-                    or builder._flash_draft_buffer_shape is None
+                    or builder.metadata_workspace.draft.shape is None
                 ):
                     return
                 builders.append((gid, builder))
@@ -1109,8 +1149,9 @@ class DFlash2Speculator(DFlashSpeculator):
 
         self._ngram_skipped_rounds += int(skip_query)
         if (
-            envs.VLLM_DFLASH_PROFILE
-            and self._ngram_rounds % envs.VLLM_DFLASH_PROFILE_LOG_INTERVAL == 0
+            self._diagnostics.trace.dflash.value("profile")
+            and self._ngram_rounds % self._diagnostics.trace.dflash.value("interval")
+            == 0
         ):
             eligible_count = max(assist.num_eligible, 1)
             logger.info(

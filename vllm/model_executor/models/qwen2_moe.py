@@ -34,10 +34,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen2MoeConfig
 
-import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.execution_policy import layer_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -61,6 +62,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -76,6 +78,8 @@ from .utils import (
 logger = init_logger(__name__)
 
 _SM70_FUSED_SHARED_GATE_MAX_TOKENS = 16
+# One gate block per row: concurrent MTP4 verification up to 16 requests.
+_SM70_BATCH_SHARED_GATE_MAX_TOKENS = 80
 
 
 def _sm70_dump_qwen_mlp_tensor(
@@ -87,9 +91,7 @@ def _sm70_dump_qwen_mlp_tensor(
         return tensor
     # This diagnostic piggybacks on qwen3_next's graph-buffer dump path. It is
     # intentionally env-gated so normal model execution is unchanged.
-    import os
-
-    if os.getenv("VLLM_SM70_DUMP_QWEN_MLP_INTERNALS") != "1":
+    if not capture_runtime_trace().qwen_mlp_internals:
         return tensor
     from vllm.model_executor.models.qwen3_next import _sm70_dump_qwen_layer_tensor
 
@@ -99,10 +101,10 @@ def _sm70_dump_qwen_mlp_tensor(
 def _sm70_force_shared_expert_silu_custom_op(prefix: str) -> bool:
     if ".shared_expert" not in prefix:
         return False
-    if not torch.cuda.is_available():
+    if not current_platform.is_cuda():
         return False
     try:
-        return torch.cuda.get_device_capability() == (7, 0)
+        return current_platform.is_device_capability((7, 0))
     except RuntimeError:
         return False
 
@@ -110,12 +112,13 @@ def _sm70_force_shared_expert_silu_custom_op(prefix: str) -> bool:
 def _sm70_fused_shared_expert_gate_shape_supported(
     x: torch.Tensor,
     out: torch.Tensor,
+    max_tokens: int = _SM70_FUSED_SHARED_GATE_MAX_TOKENS,
 ) -> bool:
-    """Shared shape gate; the fused dot remains M1-only at its call site."""
+    """Shared shape gate for the fused gate kernels (row bound per kernel)."""
     return bool(
         x.ndim == 2
         and out.ndim == 2
-        and 0 < x.shape[0] <= _SM70_FUSED_SHARED_GATE_MAX_TOKENS
+        and 0 < x.shape[0] <= max_tokens
         and out.shape[0] == x.shape[0]
         and x.shape[1] == 2560
         and out.shape[1] == 2560
@@ -179,7 +182,7 @@ class Qwen2MoeMLP(nn.Module):
         )
         self.expert_gate = expert_gate
         self._sm70_exact_shared_expert_gate = (
-            envs.VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION
+            layer_policy().value("shared_gate_fusion")
             and expert_gate is not None
             and prefix.endswith(".mlp.shared_expert")
             and _sm70_fused_shared_expert_gate_module_supported(
@@ -194,7 +197,7 @@ class Qwen2MoeMLP(nn.Module):
                 "SM70 Qwen3Next exact single-token shared-expert gate enabled."
             )
         self._sm70_batch_shared_expert_gate = False
-        if self._sm70_exact_shared_expert_gate and envs.VLLM_SM70_QWEN38_BATCH_FASTPATH:
+        if self._sm70_exact_shared_expert_gate and layer_policy().batch_fastpath:
             from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
                 _batch_runtime_contract,
             )
@@ -202,6 +205,13 @@ class Qwen2MoeMLP(nn.Module):
             self._sm70_batch_shared_expert_gate = _batch_runtime_contract()
 
     def forward(self, x):
+        from vllm.model_executor.layers.quantization.gguf_dense_hmma import (
+            maybe_apply_shared_expert,
+        )
+
+        segment_out = maybe_apply_shared_expert(self, x)
+        if segment_out is not None:
+            return segment_out
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
         fused_act = getattr(self.gate_up_proj, "forward_fused_silu_and_mul", None)
         out = fused_act(x) if fused_act is not None else None
@@ -216,8 +226,17 @@ class Qwen2MoeMLP(nn.Module):
         used_exact_gate = False
         if (
             self._sm70_exact_shared_expert_gate
-            and x.shape[0] == 1
-            and _sm70_fused_shared_expert_gate_shape_supported(x, out)
+            and (
+                x.shape[0] == 1
+                or (
+                    self._sm70_batch_shared_expert_gate
+                    and use_sm70_decode_graph_semantics()
+                    and x.shape[0] <= _SM70_BATCH_SHARED_GATE_MAX_TOKENS
+                )
+            )
+            and _sm70_fused_shared_expert_gate_shape_supported(
+                x, out, _SM70_BATCH_SHARED_GATE_MAX_TOKENS
+            )
         ):
             from vllm import _sm70_ops as sm70_ops
 

@@ -108,6 +108,17 @@ class CacheConfig:
     be a multiple of the resolved cache-hit alignment. This backport applies to
     aligned Mamba groups; other cache types keep their existing admission policy.
     """
+    partial_prefix_cache: bool = False
+    """Hybrid Mamba ``align`` prefix caching: also resume at request-provided
+    positions inside a block (for example the end of the last chat message),
+    from cache-owned copies of the partially filled KV page and the recurrent
+    state at that position. Without it, hits end at block boundaries."""
+    mamba_tail_checkpoint: bool = True
+    """Mamba ``align`` prefix caching: end a prompt's last prefill chunk at its
+    last cacheable boundary so a follow-up turn can reuse the whole prompt. When
+    False and the rest of the prompt fits one step, prefill it in that step
+    instead (one step fewer; the latest checkpoint is then the previous aligned
+    chunk end)."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -213,6 +224,8 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
+            "mamba_tail_checkpoint",
+            "partial_prefix_cache",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "hash_block_size",
             "mamba_page_size_padded",

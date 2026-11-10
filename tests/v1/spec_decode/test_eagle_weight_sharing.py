@@ -45,6 +45,8 @@ def test_loader_shares_target_head_without_replacing_distinct_draft(
             if own_head == "different":
                 draft.lm_head.weight.add_(1)
     original_head = getattr(draft, "lm_head", None)
+    prepared_heads = []
+    draft.prepare_sm70_draft_head = lambda: prepared_heads.append(draft.lm_head)
     # Models using a per-layer shared head must receive the same alias too.
     layer = nn.Module()
     layer.shared_head = nn.Module()
@@ -69,6 +71,7 @@ def test_loader_shares_target_head_without_replacing_distinct_draft(
     assert result.lm_head is expected
     assert layer.shared_head.head is expected
     assert result.lm_head.weight.data_ptr() == expected.weight.data_ptr()
+    assert prepared_heads == [expected]
 
 
 def test_target_head_resolution_prefers_language_model_and_keeps_fallback():

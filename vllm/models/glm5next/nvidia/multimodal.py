@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash vision tower and multimodal processor."""
 
+import math
 from collections.abc import Mapping
 from functools import partial
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -43,6 +45,14 @@ from vllm.model_executor.models.vision import (
 from vllm.models.deepseek_v4.common.ops import fused_q_kv_rmsnorm
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+if TYPE_CHECKING:
+    from vllm.transformers_utils.processors.glm5next import (
+        Glm5NextImageProcessor,
+        Glm5NextVideoProcessor,
+    )
+
+    _MediaProcessor = Glm5NextImageProcessor | Glm5NextVideoProcessor
 
 
 class Glm5NextVisionPatchEmbed(nn.Module):
@@ -349,6 +359,7 @@ class Glm5NextVisionTransformer(nn.Module):
         self,
         text_config,  # noqa: ANN001
         vision_config,
+        max_grid_side: int,
         norm_eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -388,9 +399,15 @@ class Glm5NextVisionTransformer(nn.Module):
 
         norm_layer = partial(RMSNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
+        # rot_pos_emb indexes this table by grid row and column. A fixed 8192
+        # rows read past its end on very wide or tall inputs (a 20x200000
+        # image has a 14,286-patch side), a device-side assert that kills the
+        # engine. The table covers the longest side the processors can emit;
+        # the text model's 1M positions would too, at 64 MiB on the first
+        # pipeline stage.
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
-            max_position=8192,
+            max_position=max_grid_side,
             is_neox_style=True,
             rope_parameters={"partial_rotary_factor": 0.5},
         )
@@ -612,6 +629,29 @@ class Glm5NextVisionTransformer(nn.Module):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+def _processor_pixel_budget(processor: "_MediaProcessor") -> tuple[int, int]:
+    from vllm.transformers_utils.processors.glm5next import _pixel_budget
+
+    return _pixel_budget(
+        processor.min_image_tokens,
+        processor.max_image_tokens,
+        processor.patch_size,
+        processor.merge_size,
+        processor.temporal_patch_size,
+    )
+
+
+def max_grid_side(processor: "_MediaProcessor") -> int:
+    """Longest grid side, in patches, that ``processor`` can emit.
+
+    ``smart_resize`` keeps ``t_bar * h_bar * w_bar <= max_pixels`` with
+    ``t_bar >= temporal_patch_size`` and every side at least one aligned cell,
+    so the longest side belongs to a canvas one cell high."""
+    max_pixels = _processor_pixel_budget(processor)[1]
+    cell = processor.patch_size * processor.merge_size * processor.patch_expand_factor
+    return max_pixels // (processor.temporal_patch_size * cell * processor.patch_size)
+
+
 class Glm5NextProcessingInfo(Glm4vProcessingInfo):
     """Wires up the vLLM-native processor for the multimodal checkpoint.
 
@@ -634,28 +674,40 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             self._glm5_hf_processor = proc
         return proc
 
-    def _processor_pixel_budget(self, proc) -> tuple[int, int]:
-        from vllm.transformers_utils.processors.glm5next import _pixel_budget
-
-        return _pixel_budget(
-            proc.min_image_tokens,
-            proc.max_image_tokens,
-            proc.patch_size,
-            proc.merge_size,
-            proc.temporal_patch_size,
-        )
-
     def _get_image_max_pixels(self) -> int:
         mm_kwargs = self.ctx.get_merged_mm_kwargs({})
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
+        return _processor_pixel_budget(self.get_hf_processor().image_processor)[1]
 
     def _get_video_max_pixels(self) -> int:
         mm_kwargs = self.ctx.get_merged_mm_kwargs({})
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().video_processor)[1]
+        return _processor_pixel_budget(self.get_hf_processor().video_processor)[1]
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        # The inherited square probe strands budget whenever the token
+        # ceiling is not a perfect square: with max_image_tokens=8000 the
+        # square refits to 2492x2492 (89x89 = 7921 tokens) while a
+        # 2240x2800 canvas reaches 80x100 = 8000, so the encoder cache came
+        # up short of the processor's own maximum and refused valid images
+        # (#59539). Factor the ceiling exactly instead of probing a square.
+        vision_config = self.get_hf_config().vision_config
+        factor = (
+            vision_config.patch_size
+            * vision_config.spatial_merge_size
+            * self.get_hf_processor().image_processor.patch_expand_factor
+        )
+        pixels_per_token = vision_config.temporal_patch_size * factor * factor
+        max_tokens = max(1, self._get_image_max_pixels() // pixels_per_token)
+        short_side = math.isqrt(max_tokens)
+        while max_tokens % short_side:
+            short_side -= 1
+        return ImageSize(
+            width=(max_tokens // short_side) * factor,
+            height=short_side * factor,
+        )
 
     def _get_vision_info(
         self,

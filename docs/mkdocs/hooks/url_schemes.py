@@ -81,7 +81,7 @@ class UrlSchemesPreprocessor(Preprocessor):
             slug = "tree/main" if path.is_dir() else "blob/main"
 
             path = path.relative_to(ROOT_DIR)
-            url = f"https://github.com/vllm-project/vllm/{slug}/{path}{fragment}"
+            url = f"{self.ext.repo_url}/{slug}/{path}{fragment}"
             return f"[{gh_icon} {title}]({url})"
 
         def replace_github_link(match: re.Match) -> str:
@@ -116,6 +116,7 @@ class UrlSchemesExtension(Extension):
 
     def __init__(self, **kwargs):
         self.page = None
+        self.repo_url = "https://github.com/vllm-project/vllm"
         super().__init__(**kwargs)
 
     def extendMarkdown(self, md):
@@ -129,6 +130,9 @@ _ext = UrlSchemesExtension()
 
 def on_config(config: MkDocsConfig) -> MkDocsConfig:
     """Register the URL schemes markdown extension."""
+    _ext.repo_url = str(
+        config.get("repo_url") or "https://github.com/vllm-project/vllm"
+    ).rstrip("/")
     config["markdown_extensions"].append(_ext)
     return config
 

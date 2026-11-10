@@ -250,12 +250,12 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             for output in final_res.outputs:
                 self._raise_if_error(output.finish_reason, request_id)
 
-                if request.logprobs and request.top_logprobs is not None:
+                if request.logprobs:
                     assert output.logprobs is not None, "Did not output logprobs"
                     logprobs = self._create_chat_logprobs(
                         token_ids=output.token_ids,
                         top_logprobs=output.logprobs,
-                        num_output_top_logprobs=request.top_logprobs,
+                        num_output_top_logprobs=request.top_logprobs or 0,
                         tokenizer=tokenizer,
                         return_as_token_id=request.return_token_ids,
                     )

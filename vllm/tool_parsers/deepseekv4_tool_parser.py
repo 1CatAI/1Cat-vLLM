@@ -20,7 +20,13 @@ class DeepSeekV4ToolParser(DeepSeekV32ToolParser):
     """
 
     tool_call_start_token: str = "<｜DSML｜tool_calls>"
+    # Seen from DeepSeek-V4-Flash in production (upstream issue #51914).
+    tool_call_start_token_variants: tuple[str, ...] = (
+        "<｜DSML｜toolcalls>",
+        "<｜DSML｜tool>",
+    )
     tool_call_end_token: str = "</｜DSML｜tool_calls>"
+    ignored_tool_call_tags: tuple[str, ...] = ("function_calls",)
 
     def get_structural_tag(self, request: ChatCompletionRequest):
         return get_model_structural_tag(

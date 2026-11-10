@@ -3,14 +3,111 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from vllm.models.qwen4_exp.nvidia import model as qwen4_exp_model
 from vllm.models.qwen4_exp.nvidia.model import (
     Qwen4ExpDecoderLayer,
+    Qwen4ExpForCausalLM,
     Qwen4ExpModel,
+    _Qwen4ExpPrefillSequenceModel,
 )
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    [
+        (0, False),
+        (5, False),
+        (4095, False),
+        (4096, True),
+        (4097, True),
+        (4098, True),
+        (4099, True),
+        (7344, True),
+        (9216, True),
+        (16384, True),
+        (16383, True),
+        (16385, False),
+    ],
+)
+def test_hc_sequence_prefill_entry_boundaries(monkeypatch, rows, expected):
+    from vllm.config import CUDAGraphMode
+
+    backend = torch.backends.cuda.matmul
+    monkeypatch.setattr(backend, "allow_fp16_reduced_precision_reduction", False)
+    monkeypatch.setattr(backend, "allow_fp16_accumulation", False)
+    owner = SimpleNamespace(_hc_prefill_sequence_qualified=True)
+    monkeypatch.setattr(qwen4_exp_model, "is_forward_context_available", lambda: True)
+    context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE)
+    monkeypatch.setattr(qwen4_exp_model, "get_forward_context", lambda: context)
+    ids = torch.zeros(rows, dtype=torch.int32)
+    select = Qwen4ExpForCausalLM._use_hc_prefill_sequence_rows
+    assert select(owner, ids, None, None, {}) is expected
+    context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+    assert not select(owner, ids, None, None, {})
+    context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+    assert not select(owner, ids, None, object(), {})
+    assert not select(owner, ids, None, None, {"deepstack_input_embeds": object()})
+    owner._hc_prefill_sequence_qualified = False
+    assert not select(owner, ids, None, None, {})
+
+
+def test_hc_sequence_prefill_embedding_dtype_and_missing_context(monkeypatch):
+    from vllm.config import CUDAGraphMode
+
+    backend = torch.backends.cuda.matmul
+    monkeypatch.setattr(backend, "allow_fp16_reduced_precision_reduction", False)
+    monkeypatch.setattr(backend, "allow_fp16_accumulation", False)
+    owner = SimpleNamespace(_hc_prefill_sequence_qualified=True)
+    select = Qwen4ExpForCausalLM._use_hc_prefill_sequence_rows
+    monkeypatch.setattr(qwen4_exp_model, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        qwen4_exp_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE),
+    )
+    assert select(owner, None, torch.empty(4096, 2, dtype=torch.half), None, {})
+    assert not select(owner, None, torch.empty(4096, 2, dtype=torch.bfloat16), None, {})
+    monkeypatch.setattr(qwen4_exp_model, "is_forward_context_available", lambda: False)
+    assert not select(owner, torch.zeros(4096), None, None, {})
+
+
+@pytest.mark.parametrize("reduced,accumulation", [(False, True), (True, False)])
+def test_hc_sequence_prefill_other_accumulation_policies_fall_back(
+    monkeypatch, reduced, accumulation
+):
+    backend = torch.backends.cuda.matmul
+    monkeypatch.setattr(backend, "allow_fp16_reduced_precision_reduction", reduced)
+    monkeypatch.setattr(backend, "allow_fp16_accumulation", accumulation)
+    owner = SimpleNamespace(_hc_prefill_sequence_qualified=True)
+    assert not Qwen4ExpForCausalLM._use_hc_prefill_sequence_rows(
+        owner, torch.zeros(4096), None, None, {}
+    )
+
+
+def test_hc_sequence_prefill_view_borrows_parameters_and_state():
+    class Owner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            self.register_buffer("state", torch.zeros(1))
+
+        def forward(self, ids, *args, hc_sequence_parallel=False):
+            assert hc_sequence_parallel
+            self.state.add_(1)
+            return ids * self.weight
+
+    owner = Owner()
+    cfg = SimpleNamespace(compilation_config=SimpleNamespace(mode=0))
+    view = _Qwen4ExpPrefillSequenceModel(target_model=owner, vllm_config=cfg)
+    assert list(view.parameters()) == [] and list(view.buffers()) == []
+    ids = torch.ones(1)
+    assert torch.equal(view(ids, torch.zeros(1)), ids)
+    assert torch.equal(owner.state, torch.ones(1))
+    assert view._target_model is owner
 
 
 class _AttentionHyperConnection:
@@ -135,6 +232,7 @@ def test_qsa_model_shares_one_topk_indices_buffer(monkeypatch) -> None:
         model_config=SimpleNamespace(
             hf_text_config=config,
             dtype=torch.float16,
+            quantization=None,
         ),
         parallel_config=SimpleNamespace(
             eplb_config=SimpleNamespace(num_redundant_experts=0),

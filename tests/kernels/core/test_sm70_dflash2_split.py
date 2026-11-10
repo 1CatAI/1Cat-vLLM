@@ -30,10 +30,11 @@ def _dense(q, k, v, table, length, scale):
     return torch.einsum("bhqk,khd->bqhd", scores.softmax(-1), values)
 
 
+@pytest.mark.parametrize("heads", [8, 16])
 @pytest.mark.parametrize("through_api", [False, True])
-@pytest.mark.parametrize("page", [1024, 2048])
+@pytest.mark.parametrize("page", [832, 1024, 1648, 2048])
 @pytest.mark.parametrize("scale", [1 / math.sqrt(128), 0.1])
-def test_live_window_graph(page, scale, through_api):
+def test_live_window_graph(page, scale, through_api, heads):
     from flash_attn_v100.sm70_dflash2_split import forward
 
     if through_api:
@@ -55,11 +56,15 @@ def test_live_window_graph(page, scale, through_api):
         call = forward
 
     torch.manual_seed(123)
-    capacity = 10240
-    pages = capacity // page
-    q = torch.zeros(1, 8, 8, 128, device="cuda", dtype=torch.float16)
-    k = torch.zeros(pages, page, 2, 128, device="cuda", dtype=torch.float16)
-    v = torch.empty_like(k)
+    pages = math.ceil(10240 / page)
+    capacity = pages * page
+    q = torch.zeros(1, 8, heads, 128, device="cuda", dtype=torch.float16)
+    # Match the model's interleaved K/V allocation, including noncontiguous
+    # page strides, instead of testing only independent contiguous caches.
+    kv = torch.zeros(
+        pages, 2, page, heads // 4, 128, device="cuda", dtype=torch.float16
+    )
+    k, v = kv[:, 0], kv[:, 1]
     table = torch.randperm(pages, device="cuda").int()[None]
     lengths = torch.zeros(1, device="cuda", dtype=torch.int32)
     output = torch.empty_like(q)
@@ -70,7 +75,10 @@ def test_live_window_graph(page, scale, through_api):
         call(q, k, v, table, lengths, scale, output)
     for length in (0, 8, 127, 128, 129, 1024, 2047, 2048, 2055, 4096, 8192):
         logical = torch.full(
-            (capacity, 2, 128), float("nan"), device="cuda", dtype=torch.float16
+            (capacity, heads // 4, 128),
+            float("nan"),
+            device="cuda",
+            dtype=torch.float16,
         )
         logical[:length] = 60000
         logical[max(0, length - 8 - 2047) : length] = 1
@@ -92,3 +100,61 @@ def test_live_window_graph(page, scale, through_api):
         graph.replay()
         truth = _dense(q, k, v, table, length, scale)
         torch.testing.assert_close(output.double(), truth, atol=0.001, rtol=0.002)
+
+
+@pytest.mark.parametrize("page", [832, 1648])
+def test_hybrid_split_route_without_native_symbol(monkeypatch, page):
+    from flash_attn_v100 import flash_attn_interface as interface
+    from flash_attn_v100 import sm70_dflash2_split as split
+
+    calls = []
+    original = split.forward
+
+    def record(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(split, "forward", record)
+    monkeypatch.delattr(
+        interface.flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd", raising=False
+    )
+    query = torch.randn(1, 8, 8, 128, dtype=torch.float16, device="cuda")
+    kv = torch.randn(2, 2, page, 2, 128, dtype=torch.float16, device="cuda")
+    table = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([1032], dtype=torch.int32, device="cuda")
+    output = torch.empty_like(query)
+    arguments = dict(out=output, causal=False, window_size=(2047, 2047))
+    interface.flash_attn_prefill_paged(
+        query,
+        kv[:, 0],
+        kv[:, 1],
+        table,
+        lengths,
+        dflash2_window_split=False,
+        **arguments,
+    )
+    baseline = output.clone()
+    assert calls == []
+    graph = torch.cuda.CUDAGraph()
+    interface.flash_attn_prefill_paged(
+        query,
+        kv[:, 0],
+        kv[:, 1],
+        table,
+        lengths,
+        dflash2_window_split=True,
+        **arguments,
+    )
+    with torch.cuda.graph(graph):
+        interface.flash_attn_prefill_paged(
+            query,
+            kv[:, 0],
+            kv[:, 1],
+            table,
+            lengths,
+            dflash2_window_split=True,
+            **arguments,
+        )
+    graph.replay()
+    torch.testing.assert_close(output, baseline, atol=0.001, rtol=0.002)
+    assert len(calls) == 2

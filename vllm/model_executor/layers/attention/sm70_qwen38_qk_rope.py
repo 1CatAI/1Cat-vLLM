@@ -25,7 +25,9 @@ def _e4m3_satfinite(value):
     return (code | sign).to(tl.uint8)
 
 
-@triton.jit
+# Prefill chunks can have any length. Keep length-dependent values out of the
+# specialization, or every new length compiles a kernel while a request waits.
+@triton.jit(do_not_specialize=["POS_ROW", "POS_COL", "NUM_SLOTS"])
 def _qk_norm_rope(
     QKV,
     QW,
@@ -45,11 +47,10 @@ def _qk_norm_rope(
     BLOCK_SIZE: tl.constexpr,
     CACHE_BLOCK: tl.constexpr,
     CACHE_TOKEN: tl.constexpr,
-    POS_ROW: tl.constexpr,
-    POS_COL: tl.constexpr,
+    POS_ROW: tl.int64,
+    POS_COL: tl.int64,
     CACHE_ROWS: tl.constexpr,
-    TOKENS: tl.constexpr,
-    NUM_SLOTS: tl.constexpr,
+    NUM_SLOTS: tl.int64,
     ROW: tl.constexpr,
     POS_PLANES: tl.constexpr,
     EPS: tl.constexpr,
@@ -186,7 +187,6 @@ def qk_norm_rope(
         positions.stride(0) if positions.ndim == 2 else 0,
         positions.stride(-1),
         cache.shape[0],
-        tokens,
         slots.numel() if store_cache else 0,
         qkv.stride(0),
         1 if positions.ndim == 1 else 3,
@@ -213,7 +213,9 @@ def _prepare_with_cache(
 ):
     from vllm.model_executor.layers.attention.attention import get_attention_context
     from vllm.utils.torch_utils import _resolve_layer_name
-    from vllm.v1.attention.backends.flash_attn_v100 import _split_paged_kv_cache
+    from vllm.v1.attention.backends.flash_v100.kv_layout import (
+        _split_paged_kv_cache,
+    )
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
     cache_args = {}

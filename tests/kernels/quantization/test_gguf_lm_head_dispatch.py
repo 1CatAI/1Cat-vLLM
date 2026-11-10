@@ -112,3 +112,41 @@ def test_uncalibrated_head_preserves_legacy_method(monkeypatch, weight_type):
     assert method.lm_head_capability is None
     assert not hasattr(layer, "gguf_lm_head_raw")
     assert method.native_admission["lm_head"]["reason"] == "requires_sm70"
+
+
+@pytest.mark.parametrize(
+    "source,raw_width,keep_raw", [(12, 2880, True), (14, 2100, False)]
+)
+def test_m1_canonical_head_has_one_resident_bank(
+    monkeypatch, source, raw_width, keep_raw
+):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization import gguf as module
+
+    raw = SimpleNamespace(shape=(62080, raw_width), device=torch.device("cuda"))
+    raw.detach = lambda: raw
+    layer = torch.nn.Module()
+    layer.qweight = raw
+    layer.qweight_type = SimpleNamespace(weight_type=source)
+    method = GGUFLMHeadMethod(GGUFConfig())
+    method.params_dtype = torch.float16
+    method.native_enabled, method.dense_storage = True, "canonical"
+
+    def canonical_prepare(self, target):
+        self.native_admission = {}
+        self.canonical_projections = [object()]
+
+    monkeypatch.setattr(
+        module.GGUFEmbeddingMethod, "process_weights_after_loading", canonical_prepare
+    )
+    monkeypatch.setattr(
+        module.current_platform, "is_device_capability", lambda *_: True
+    )
+    monkeypatch.setattr(module, "pad_weight_tail", lambda *_: torch.empty(0))
+    method.process_weights_after_loading(layer)
+    assert method.canonical_lm_head
+    assert hasattr(layer, "gguf_lm_head_raw") is keep_raw
+    assert method.native_admission["lm_head"]["raw_fallback"] == (
+        "outside_measured_m_band" if keep_raw else "canonical_storage_for_all_m"
+    )

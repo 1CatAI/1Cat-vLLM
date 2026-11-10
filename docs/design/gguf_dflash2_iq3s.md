@@ -406,3 +406,72 @@ correction. Retain the roughly 11 ms saving as a projection, and use a new
 same-contract graph ledger after the shared floating-projection loading fix.
 No additional full-model run or trace is needed between those integration
 boundaries. The below-12-ms objective remains unmet.
+
+## Integrated projection measurement, 2026-10-05
+
+The complete normal wheel at source
+`5620850f8119a744d0c7d3d737c40f1255dde9a5`
+(`1.5.2.dev41+g5620850f81`) includes the floating-projection loading fix,
+runtime projection dispatch and all admitted native gate/up pairs. It is
+compared with the retained normal-wheel baseline at
+`0e359c87d315931b89b7d5a774927f212d57f3b1`
+(`1.5.2.dev11+g0e359c87d3`). Both use the checkpoint hashes above and exactly
+the same sixteen prompt ID/token sequences, engine configuration and sampling
+parameters. No private native-library or Python source overlay is used.
+
+The hardware is four V100-SXM2-32GB GPUs with full pairwise NVLink,
+300 W power limits, CUDA 12.8, Torch 2.10.0+cu128 and Python 3.12.14.
+During the stable generation interval, all four GPUs remain at 1290 MHz SM
+and 877 MHz memory clocks. TP4, maximum length 262144, batch token budget
+1024, four sequence slots and GPU memory fraction 0.9 are unchanged.
+Activations and target KV remain FP16; SSM state remains FP32. Both target
+and TP4 probabilistic Q8_0 draft use FLASH_ATTN_V100, seven speculative tokens,
+async scheduling and CUDA graphs; prefix caching is disabled. Sampling is
+temperature 0.7, top-p 0.9, top-k 20, seed 123, with thinking disabled.
+
+Each input size has eight prompts and 600 output tokens per prompt. EOS is
+ignored only in this fixed-length speed fixture. Omit the first twenty full
+rounds from each request, then average equally across prompts. The interval
+between engine output timestamps measures the complete speculative round,
+including target, draft, sampling, communication and scheduling.
+
+| Input tokens | Baseline full round ms | Integrated full round ms | Saving ms | Round speedup | Actual emitted tokens/round | Pooled steady ms/output token | Pooled steady tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 34.173 | 22.220 | 11.954 | 1.538× | 2.9199 | 7.641 | 130.87 |
+| 8192 | 35.292 | 23.317 | 11.975 | 1.514× | 2.9390 | 7.970 | 125.47 |
+
+A 10,000-resample paired whole-prompt bootstrap with seed 123 gives round
+saving intervals of [11.931, 11.976] ms at 1K and [11.963, 11.990] ms at 8K.
+Integrated round intervals are [22.204, 22.235] and [23.306, 23.328] ms.
+These intervals describe prompt variation within one run, not independent
+run-to-run variability. Actual emitted-token intervals are [2.8022, 3.0514]
+and [2.8099, 3.0834]. Baseline emitted lengths are 2.9617 and 2.9745.
+The independent counter estimator, `1 + accepted drafts / draft rounds`,
+gives 2.9304 and 2.9271 for the integrated run. There is no measured increase
+in accepted length explaining the roughly 12 ms round saving.
+
+TTFT is 344.45 ms at 1K and 2687.07 ms at 8K, versus 331.00 and 2669.43 ms
+in the baseline. TTFT includes prefill and scheduling; pure prefill is not
+timed separately. The first speed request also triggers input-preparation JIT
+compilation before steady measurement. The batch budget remains 1024, so the
+8000-token prefill capability is not admitted in this matched comparison.
+
+Each rank's prepared-layer report admits eight pure IQ3_S and forty mixed
+gate/up pairs: 48 of 64 layers. The remaining twelve pure IQ3_XXS and four
+pure IQ4_XS pairs retain canonical dispatch. Unqualified projection shapes
+also retain their existing path. Full decode graphs capture token counts
+8, 16, 24 and 32; mixed execution remains piecewise.
+
+The C4 execution check produces four nonempty, reasonable 96-token outputs
+in 7.466 seconds, all ending at the length limit. First-use sampler kernels
+compile during this check, so this is not a warmed C4 throughput comparison.
+Two additional EOS-respecting prompts finish normally: the arithmetic prompt
+returns `391`, and the English prompt gives a coherent one-sentence unit-test
+explanation. This is a text-health check, not a full quality evaluation.
+
+This run does not profile or isolate the target verification graph. The
+22.22/23.32 ms values are complete speculative rounds; an approximately
+20–21 ms target-only graph remains an estimate until separately measured.
+The measured saving agrees with the roughly 12 ms projection, but its split
+between individual fixes requires a new same-contract trace. The below-12-ms
+complete-round objective remains unmet.

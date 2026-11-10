@@ -44,3 +44,77 @@ def test_dflash_verifier_cannot_bypass_its_engine_policy(tmp_path):
     assert len(violations(path)) == 1
     path.write_text('enabled = sm70_dflash2_enabled("context_pipeline", policy)\n')
     assert not violations(path)
+
+
+def test_moe_executor_cannot_reparse_legacy_policy(tmp_path):
+    path = tmp_path / "vllm/model_executor/layers/fused_moe/sm70/new_kernel.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("x = envs.VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH\n")
+    assert len(violations(path)) == 1
+    path.write_text('x = os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_GEMM")\n')
+    assert len(violations(path)) == 1
+    path.write_text('label = "VLLM_SM70_AWQ_MOE_BATCHED_GEMM"\nx = plan.w13\n')
+    assert not violations(path)
+
+
+def test_runtime_consumers_cannot_bypass_resolved_engine_policy(tmp_path):
+    path = tmp_path / "vllm" / "new_runner.py"
+    path.parent.mkdir()
+    for expression in (
+        "envs.VLLM_USE_AOT_COMPILE",
+        'os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS")',
+        'os.environ["VLLM_SM70_AWQ_WARMUP_MAX_M"]',
+        'getattr(envs, "VLLM_SM70_QWEN38_FP16_GEMV")',
+    ):
+        path.write_text(f"choice = {expression}\n")
+        assert len(violations(path)) == 1
+    path.write_text('label = "VLLM_USE_AOT_COMPILE"\nchoice = policy.aot_compile\n')
+    assert not violations(path)
+
+
+def test_diagnostics_cannot_reparse_initialized_filters(tmp_path):
+    path = tmp_path / "vllm" / "new_diagnostics.py"
+    path.parent.mkdir()
+    for expression in (
+        'os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")',
+        "envs.VLLM_SPEC_DUMP_ALIGNMENT",
+        "envs.VLLM_DFLASH_PROFILE",
+        'os.environ["VLLM_SM70_DUMP_AWQ_MOE_LABELS"]',
+    ):
+        path.write_text(f"value = {expression}\n")
+        assert violations(path)
+    path.write_text('value = diagnostics.channels["gdn_graph"].policy.directory\n')
+    assert not violations(path)
+
+
+def test_prefill_prefix_alias_is_rejected_in_execution():
+    import ast
+    from pathlib import Path
+
+    from tools.pre_commit.check_sm70_linear_policy import runtime_policy_reads
+
+    errors = runtime_policy_reads(
+        Path("vllm/v1/attention/ops/example.py"),
+        ast.parse('def forward():\n    return os.getenv("PREFIX_TORCH_EXACT_TAIL")'),
+    )
+    assert errors and "PREFIX_TORCH_EXACT_TAIL" in errors[0]
+
+
+def test_reader_aliases_and_helpers_do_not_evade_runtime_guard(tmp_path):
+    path = tmp_path / "vllm/new_runner.py"
+    path.parent.mkdir()
+    path.write_text("""
+from os import getenv as query
+from vllm import envs as flags
+alias = query
+def option(name):
+    return alias(name)
+def forward():
+    return option("VLLM_SM70_QWEN38_FP16_GEMV"), flags.VLLM_USE_AOT_COMPILE
+""")
+    assert len(violations(path)) == 2
+    path.write_text("""
+def forward(policy):
+    return policy.raw("VLLM_SM70_QWEN38_FP16_GEMV")
+""")
+    assert not violations(path)

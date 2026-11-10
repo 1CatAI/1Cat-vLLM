@@ -13,6 +13,9 @@ from vllm.config.kernel import Sm70AwqConfig
 from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import choose_mp_linear_kernel
+from vllm.model_executor.kernels.linear.mixed_precision import (
+    sm70_awq as _workspace_compat,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
     Sm70AwqLinearLayerConfig,
     TurboMindAwqLinearKernel,
@@ -127,10 +130,7 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if (
-            sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
-            or sm70_tm.forces_marlin()
-        ):
+        if sm70_tm.format_enabled("awq") or sm70_tm.forces_marlin():
             return 70
         # The default AWQ kernel only supports Turing or newer GPUs.
         return 75
@@ -203,9 +203,9 @@ class AWQConfig(QuantizationConfig):
                 current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
+                and sm70_tm.format_enabled("awq")
             ):
-                if envs.VLLM_SM70_AWQ_MOE_DISABLE:
+                if sm70_tm.format_option("awq", "moe_disable"):
                     logger.warning_once(
                         "Layer '%s' SM70 AWQ TurboMind MoE path disabled by "
                         "VLLM_SM70_AWQ_MOE_DISABLE=1. Falling back to MoeWNA16.",
@@ -484,3 +484,12 @@ class AWQLinearMethod(LinearMethodBase):
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)
+
+
+# Historical private helpers used by benchmark and workspace tooling.
+_get_sm70_awq_prefill_exact_dense_workspace = (
+    _workspace_compat._get_sm70_awq_prefill_exact_dense_workspace
+)
+_sm70_awq_prefill_dense_workspaces = (
+    _workspace_compat._sm70_awq_prefill_dense_workspaces
+)

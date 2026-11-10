@@ -9,8 +9,6 @@
 # ruff: noqa: E501
 
 
-import os
-
 import torch
 import torch.nn as nn
 
@@ -21,6 +19,7 @@ from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .cumsum import chunk_local_cumsum
 from .fused_recurrent import fused_recurrent_gated_delta_rule_fwd_kernel
+from .gdn_chunk_kernels import resolve_kda_kernels
 from .index import prepare_chunk_indices
 from .l2norm import l2norm_fwd
 from .op import exp2, log
@@ -31,47 +30,23 @@ BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
 
 
-def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
+_recompute_w_u_configs = [
+    triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
+
+_chunk_gla_o_configs = [
+    triton.Config(
+        {"BK": BK, "BV": BV},
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
-
-
-_use_sm70_kda_prefill_schedule = (
-    os.getenv("VLLM_SM70_KDA_PREFILL_SCHEDULE", "1") == "1" and _is_sm70()
-)
-_recompute_w_u_configs = (
-    [triton.Config({}, num_warps=num_warps, num_stages=2) for num_warps in [4, 8]]
-    if _use_sm70_kda_prefill_schedule
-    else [
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ]
-)
-_chunk_gla_o_configs = (
-    [
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=2)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [4, 8]
-        if BV == 64 or num_warps == 8
-    ]
-    if _use_sm70_kda_prefill_schedule
-    else [
-        triton.Config(
-            {"BK": BK, "BV": BV},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ]
-)
+    for BK in [32, 64]
+    for BV in [64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
 
 
 def fused_recurrent_kda_fwd(
@@ -1059,7 +1034,10 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
+    kernel=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if kernel is None:
+        kernel = resolve_kda_kernels().recompute
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
     BK = 64
@@ -1072,7 +1050,7 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
-    recompute_w_u_fwd_kernel[(NT, B * H)](
+    kernel[(NT, B * H)](
         q=q,
         k=k,
         qg=None,
@@ -1221,7 +1199,10 @@ def chunk_gla_fwd_o_gk(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
+    kernel=None,
 ):
+    if kernel is None:
+        kernel = resolve_kda_kernels().output
     B, T, H, K, V = *q.shape, v.shape[-1]
     BT = chunk_size
 
@@ -1232,7 +1213,7 @@ def chunk_gla_fwd_o_gk(
     def grid(meta):
         return (cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_gla_fwd_kernel_o[grid](
+    kernel[grid](
         q=q,
         v=v,
         g=g,
@@ -1414,6 +1395,7 @@ def _chunk_kda_fwd_with_cumulative_g(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
+    kernels=None,
 ):
     # `g` must already be chunk-local cumulatively-summed AND scaled by
     # RCP_LN2 (so the downstream exp2-based kernels reproduce exp(g)).
@@ -1421,6 +1403,7 @@ def _chunk_kda_fwd_with_cumulative_g(
     # calling this helper directly unless that invariant is upheld.
     # the intra Aqk is kept in fp32
     # the computation has very marginal effect on the entire throughput
+    kernels = resolve_kda_kernels(kernels)
     A, Aqk = chunk_kda_scaled_dot_kkt_fwd(
         q=q,
         k=k,
@@ -1441,6 +1424,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         gk=g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        kernel=kernels.recompute,
     )
     del A
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
@@ -1453,6 +1437,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
+        kernel=kernels.delta_h,
     )
     del w, u, kg
     o = chunk_gla_fwd_o_gk(
@@ -1466,6 +1451,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        kernel=kernels.output,
     )
     del Aqk, v_new, h
     return o, final_state
@@ -1481,6 +1467,7 @@ def chunk_kda_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
+    kernels=None,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1509,6 +1496,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        kernels=kernels,
     )
 
 
@@ -1526,6 +1514,7 @@ def chunk_kda_with_fused_gate_fwd(
     cu_seqlens: torch.Tensor | None = None,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
+    kernels=None,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1555,6 +1544,7 @@ def chunk_kda_with_fused_gate_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        kernels=kernels,
     )
 
 
@@ -1569,6 +1559,7 @@ def chunk_kda(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    kernels=None,
     **kwargs,
 ):
     if scale is None:
@@ -1588,6 +1579,7 @@ def chunk_kda(
         initial_state=initial_state.contiguous(),
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        kernels=kernels,
     )
     return o, final_state
 
@@ -1607,6 +1599,7 @@ def chunk_kda_with_fused_gate(
     cu_seqlens: torch.Tensor | None = None,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
+    kernels=None,
     **kwargs,
 ):
     """Run chunk KDA from raw gate projection using fused gate+cumsum."""
@@ -1631,6 +1624,7 @@ def chunk_kda_with_fused_gate(
         cu_seqlens=cu_seqlens,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
+        kernels=kernels,
     )
     return o, final_state
 

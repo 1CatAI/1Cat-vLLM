@@ -122,14 +122,14 @@ def test_two_engines_have_isolated_policy_and_hash(monkeypatch):
     assert first.compute_hash() != second.compute_hash()
 
 
-def test_unused_awq_policy_keeps_the_existing_graph_fingerprint():
+def test_unused_awq_policy_does_not_perturb_an_nvfp4_graph():
     cfg = KernelConfig()
     cfg.sm70_nvfp4.resolve(qualified=True)
-    # Independent pre-migration KernelConfig result for this policy. A new
-    # format must not salt NVFP4's capture key before it is actually selected.
-    assert cfg.compute_hash() == (
-        "352727bc1599123198bf6f01ec4a62c0d27ac5195a67ac088006099a88fbdef7"
-    )
+    before = cfg.compute_hash()
+    cfg.sm70_awq.enabled = False
+    cfg.sm70_awq.prefill_exact_dense = False
+    cfg.sm70_awq.native.awq_dense_tune_max_m = 5
+    assert cfg.compute_hash() == before
 
 
 @pytest.mark.parametrize(

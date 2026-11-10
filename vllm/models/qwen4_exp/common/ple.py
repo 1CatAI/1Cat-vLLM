@@ -414,6 +414,68 @@ def cap_host_budget_bytes(
     return min(budget_bytes, share)
 
 
+# Host memory kept free beside the hybrid default's pinned PLE share (engine
+# processes, checkpoint loading, page cache of the disk-backed prefill path).
+HYBRID_DEFAULT_HOST_RESERVE_BYTES = 8 << 30
+# Fraction of the PLE table that must fit in pinned host memory; the hybrid
+# placement keeps the rest in device memory beside the weights.
+HYBRID_DEFAULT_HOST_FRACTION = 0.75
+# Per-rank margin below the fair host share when the default fixes the budget.
+HYBRID_DEFAULT_RANK_MARGIN_BYTES = 2 << 30
+
+
+def ple_table_bytes(model_path: str | None) -> int | None:
+    """Checkpoint bytes of the PLE n-gram tables, from a local safetensors index."""
+    import json
+    import os
+
+    try:
+        with open(os.path.join(str(model_path), "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+        files = {f for k, f in weight_map.items() if "ngram_embedding" in k}
+        return sum(os.path.getsize(os.path.join(str(model_path), f)) for f in files)
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
+
+
+def default_hybrid_host_gib(model_path: str | None, tp_size: int) -> float | None:
+    """Per-rank pinned-host PLE budget for the hybrid default, or None for disk.
+
+    Hybrid decode gathers PLE rows on the GPU from local device and pinned-host
+    shards instead of waiting each step for the CPU worker's disk lookup
+    (Flash-Next NVFP4 MTP4 on 4x V100-32GB: 18.3 -> 15.7 ms per round). It is
+    chosen when physical memory less a reserve holds three quarters of the
+    table.
+
+    Both the choice and the budget come from physical memory. Every engine
+    process resolves these defaults, some after others pinned their shares,
+    and a budget derived per process from MemAvailable left the hybrid lane
+    crashing in its first decode graph replay; every startup with a fixed
+    budget was stable.
+    """
+    table = ple_table_bytes(model_path)
+    total = total_host_bytes()
+    if not table or total is None:
+        return None
+    if total - HYBRID_DEFAULT_HOST_RESERVE_BYTES < table * HYBRID_DEFAULT_HOST_FRACTION:
+        return None
+    ranks = max(int(tp_size), 1)
+    share = (total - ple_host_reserve_bytes(total)) // ranks
+    budget = min(table // ranks, share - HYBRID_DEFAULT_RANK_MARGIN_BYTES)
+    return round(budget / (1 << 30), 2) if budget > 0 else None
+
+
+def apply_hybrid_ple_defaults(
+    defaults, model_path: str | None, tp_size: int
+) -> float | None:
+    """Select hybrid placement when the host fits it; return its budget."""
+    host_gib = default_hybrid_host_gib(model_path, tp_size)
+    defaults["VLLM_SM70_QWEN38_HYBRID_PLE"] = "0" if host_gib is None else "1"
+    if host_gib is not None and "VLLM_QWEN4EXP_PLE_HOST_GIB" not in defaults:
+        defaults["VLLM_QWEN4EXP_PLE_HOST_GIB"] = str(host_gib)
+    return host_gib
+
+
 def env_gib_bytes(name: str) -> int | None:
     """Bytes of a GiB-valued PLE variable, or None when it is unset."""
 
@@ -425,13 +487,28 @@ def env_gib_bytes(name: str) -> int | None:
     return int(value_gib * 1024**3)
 
 
-def ple_host_budget_bytes() -> int | None:
+def _placement_gib_bytes(field: str, policy=None) -> int | None:
+    from vllm.config import get_current_vllm_config_or_none
+
+    if policy is None:
+        config = get_current_vllm_config_or_none()
+        if config is not None:
+            policy = config.offload_config.ple
+    if policy is not None:
+        return policy.gib_bytes(field)
+    # Independent pre-config compatibility entry uses the canonical alias table.
+    from vllm.config.execution_policy import PlePlacementPolicy
+
+    return env_gib_bytes(PlePlacementPolicy.aliases[field])
+
+
+def ple_host_budget_bytes(*, policy=None) -> int | None:
     """Configured host bytes per rank for the PLE table, or None to derive them."""
 
-    return env_gib_bytes("VLLM_QWEN4EXP_PLE_HOST_GIB")
+    return _placement_gib_bytes("host_gib", policy)
 
 
-def ple_host_reserve_bytes(host_total_bytes: int) -> int:
+def ple_host_reserve_bytes(host_total_bytes: int, *, policy=None) -> int:
     """Host memory the placement leaves to everything else.
 
     The engine processes, the checkpoint loading and other tenants of the
@@ -439,13 +516,13 @@ def ple_host_reserve_bytes(host_total_bytes: int) -> int:
     default keeps 7.5 GiB.
     """
 
-    reserve = env_gib_bytes("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB")
+    reserve = _placement_gib_bytes("host_reserve_gib", policy)
     if reserve is not None:
         return reserve
     return host_total_bytes // 4
 
 
-def ple_vram_reserve_bytes(device_total_bytes: int) -> int:
+def ple_vram_reserve_bytes(device_total_bytes: int, *, policy=None) -> int:
     """Device memory the automatic placement keeps free.
 
     It covers the activation peak and the graph pool, which the engine only
@@ -456,7 +533,7 @@ def ple_vram_reserve_bytes(device_total_bytes: int) -> int:
     allocator fail late.
     """
 
-    reserve = env_gib_bytes("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB")
+    reserve = _placement_gib_bytes("vram_reserve_gib", policy)
     if reserve is not None:
         return reserve
     return min(int(device_total_bytes * 0.08), 4 * 1024**3)
@@ -473,7 +550,9 @@ def ple_cascade_configured() -> bool:
     return bool(getattr(kernel, "ple_disk_cascade_active", False))
 
 
-def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:
+def check_ple_host_share(
+    text_config: Any, ranks_sharing_host: int, *, policy=None
+) -> None:
     """Refuse a configured pinned-host share the host cannot hold.
 
     Runs once before any rank starts. The ranks place their tables at the same
@@ -484,12 +563,20 @@ def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:
 
     if not getattr(text_config, "ple_layer_ids", None):
         return
-    budget = ple_host_budget_bytes()
+    budget = (
+        ple_host_budget_bytes(policy=policy)
+        if policy is not None
+        else ple_host_budget_bytes()
+    )
     available = available_host_bytes()
     total = total_host_bytes()
     if not budget or available is None or total is None:
         return
-    reserve = ple_host_reserve_bytes(total)
+    reserve = (
+        ple_host_reserve_bytes(total, policy=policy)
+        if policy is not None
+        else ple_host_reserve_bytes(total)
+    )
     share = cap_host_budget_bytes(
         budget_bytes=budget,
         available_bytes=available,

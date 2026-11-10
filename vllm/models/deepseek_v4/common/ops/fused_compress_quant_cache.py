@@ -23,6 +23,7 @@ from typing import Any
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .cache_utils import needs_software_fp8
@@ -203,9 +204,16 @@ def compress_norm_rope_store_triton(
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
     """
+    launch_options: dict[str, Any] = {}
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
+        # The large compression tile spills heavily with four warps on SM70.
+        # Spread it across more threads with a bounded register budget. Other
+        # devices retain the existing launch until independently qualified.
         num_warps = 4
+        if current_platform.is_device_capability(70):
+            num_warps = 16
+            launch_options["maxnreg"] = 128
     elif use_fp4_cache:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
         num_warps = 1
@@ -259,6 +267,7 @@ def compress_norm_rope_store_triton(
         RING_SIZE=ring_size,
         PRIVATE_HISTORY_SIZE=private_history_size,
         num_warps=num_warps,
+        **launch_options,
         **pdl_kwargs,
     )
 

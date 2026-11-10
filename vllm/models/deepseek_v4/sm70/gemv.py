@@ -5,7 +5,7 @@
 
 import torch
 
-import vllm.envs as envs
+from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -265,7 +265,7 @@ def _has_sm70_dsv4_fp13_weight_contract(weight: torch.Tensor) -> bool:
 
 
 def prepare_sm70_dsv4_fp13_gemv(layer: torch.nn.Module) -> torch.Tensor | None:
-    if not envs.VLLM_SM70_DSV4_FP13_GEMV or not getattr(
+    if not bool(layer_policy().dsv4_fp13_gemv) or not getattr(
         layer, "_sm70_dsv4_fp13_gemv", False
     ):
         return None
@@ -325,9 +325,9 @@ def sm70_fused_fp16_aux_reason(
     """Select only a fusion of the already-selected exact GEMV route."""
     if not enabled:
         return "disabled_by_kernel_config"
-    if envs.VLLM_SM70_DSV4_FP13_GEMV:
+    if bool(layer_policy().dsv4_fp13_gemv):
         return "existing_fp13_route_preserved"
-    if not envs.VLLM_SM70_DSV4_FP16_GEMV:
+    if not bool(layer_policy().dsv4_fp16_gemv):
         return "existing_exact_gemv_route_not_selected"
     if not has_sm70_dsv4_fused_fp16_aux_weight_contract(weights):
         return "requires_three_dense_fp16_projections_with_common_aligned_input"
@@ -361,8 +361,8 @@ def can_use_sm70_dsv4_fused_fp16_aux_gemv(
     rows: tuple[int, int, int],
 ) -> bool:
     return (
-        not envs.VLLM_SM70_DSV4_FP13_GEMV
-        and envs.VLLM_SM70_DSV4_FP16_GEMV
+        not bool(layer_policy().dsv4_fp13_gemv)
+        and bool(layer_policy().dsv4_fp16_gemv)
         and fused_weight is not None
         and x.is_cuda
         and current_platform.is_cuda()
@@ -439,7 +439,7 @@ def can_use_sm70_dsv4_fp16_gemv(
     weight: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> bool:
-    enabled = envs.VLLM_SM70_DSV4_FP16_GEMV or envs.VLLM_SM70_DSV4_FP13_GEMV
+    enabled = bool(layer_policy().dsv4_fp16_gemv) or bool(layer_policy().dsv4_fp13_gemv)
     return enabled and _has_sm70_dsv4_gemv_contract(x, weight, output_dtype)
 
 
@@ -450,7 +450,7 @@ def can_use_sm70_dsv4_fp13_gemv(
     output_dtype: torch.dtype,
 ) -> bool:
     return (
-        envs.VLLM_SM70_DSV4_FP13_GEMV
+        bool(layer_policy().dsv4_fp13_gemv)
         and _has_sm70_dsv4_gemv_contract(x, weight, output_dtype)
         and packed_weight is not None
         and packed_weight.dtype == torch.int32

@@ -670,6 +670,38 @@ class FlashAttentionImpl(AttentionImpl):
         self._dcp_dtype: torch.dtype | None = None
         if vllm_config is not None and self.dcp_world_size > 1:
             self._dcp_dtype = vllm_config.model_config.dtype
+        self.pack_gqa_max_query_len = (
+            vllm_config.attention_config.flash_attn_pack_gqa_max_query_len
+            if vllm_config is not None
+            else 0
+        )
+
+    def _use_packed_gqa_verify(
+        self,
+        attn_metadata: FlashAttentionMetadata,
+        key: torch.Tensor | None,
+    ) -> bool:
+        """Whether this batch takes `packed_gqa_verify_attention`.
+
+        Only uniform multi-token decode batches qualify (every request holds
+        the same number of new tokens), only on FA2, which packs GQA heads for
+        a single query token alone and ignores the descale factors.
+        """
+        query_len = attn_metadata.max_query_len
+        num_reqs = attn_metadata.query_start_loc.shape[0] - 1
+        return (
+            1 < query_len <= self.pack_gqa_max_query_len
+            and attn_metadata.num_actual_tokens == num_reqs * query_len
+            and self.num_queries_per_kv > 1
+            and self.vllm_flash_attn_version == 2
+            and attn_metadata.causal
+            and key is not None
+            and self.sliding_window == (-1, -1)
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+            and not self.batch_invariant_enabled
+        )
 
     def forward(
         self,
@@ -792,6 +824,25 @@ class FlashAttentionImpl(AttentionImpl):
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                )
+                return output
+            elif self._use_packed_gqa_verify(attn_metadata, key):
+                packed_gqa_verify_attention(
+                    output[:num_actual_tokens],
+                    query[:num_actual_tokens],
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    query_start_loc=cu_seqlens_q,
+                    seq_lens=seqused_k,
+                    max_seq_len=max_seqlen_k,
+                    query_len=max_seqlen_q,
+                    block_table=block_table,
+                    softmax_scale=self.scale,
+                    logits_soft_cap=self.logits_soft_cap,
+                    max_num_splits=attn_metadata.max_num_splits,
+                    fa_version=self.vllm_flash_attn_version,
                 )
                 return output
             else:
@@ -1134,6 +1185,91 @@ def use_cascade_attention(
 
     # Use cascade attention if it is faster than FlashDecoding.
     return cascade_time < flash_decoding_time
+
+
+def packed_gqa_verify_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    query_len: int,
+    block_table: torch.Tensor,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    max_num_splits: int,
+    fa_version: int,
+) -> None:
+    """Attention of a uniform multi-token decode batch with packed GQA heads.
+
+    Every request holds ``query_len`` new tokens whose keys and values are
+    already in the cache. FA2 packs the query heads of one KV head only for a
+    single query token, so a multi-token verify reads the KV cache once per
+    query head. Split it exactly instead: the request context, which all new
+    tokens see unmasked, with query heads x tokens as the rows of each KV
+    head, and the new tokens among themselves (causal); merge both by their
+    log-sum-exp.
+    """
+    num_tokens, num_heads, head_size = query.shape
+    num_kv_heads = key_cache.shape[-2]
+    group = num_heads // num_kv_heads
+    num_reqs = num_tokens // query_len
+    rows = query_len * group
+    # Row (token, member) of KV head k is query head k * group + member.
+    packed = (
+        query.view(num_reqs, query_len, num_kv_heads, group, head_size)
+        .transpose(2, 3)
+        .reshape(num_reqs * rows, num_kv_heads, head_size)
+    )
+    context_out, context_lse = flash_attn_varlen_func(
+        q=packed,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=query_start_loc * group,
+        max_seqlen_q=rows,
+        seqused_k=(seq_lens - query_len).clamp_min_(0),
+        max_seqlen_k=max_seq_len,
+        softmax_scale=softmax_scale,
+        causal=False,
+        block_table=block_table,
+        softcap=logits_soft_cap,
+        return_softmax_lse=True,
+        fa_version=fa_version,
+        num_splits=max_num_splits,
+    )
+    # merge_attn_states reads its inputs as dense tensors and ignores strides;
+    # with one KV head these reshapes are strided views, not copies.
+    context_out = (
+        context_out.view(num_reqs, query_len, group, num_kv_heads, head_size)
+        .transpose(2, 3)
+        .reshape(num_tokens, num_heads, head_size)
+        .contiguous()
+    )
+    context_lse = (
+        context_lse.view(num_kv_heads, num_reqs, query_len, group)
+        .permute(0, 3, 1, 2)
+        .reshape(num_heads, num_tokens)
+        .contiguous()
+    )
+    new_out, new_lse = flash_attn_varlen_func(
+        q=query,
+        k=key,
+        v=value,
+        cu_seqlens_q=query_start_loc,
+        max_seqlen_q=query_len,
+        cu_seqlens_k=query_start_loc,
+        max_seqlen_k=query_len,
+        softmax_scale=softmax_scale,
+        causal=True,
+        softcap=logits_soft_cap,
+        return_softmax_lse=True,
+        fa_version=fa_version,
+    )
+    merge_attn_states(output, context_out, context_lse, new_out, new_lse)
 
 
 def cascade_attention(

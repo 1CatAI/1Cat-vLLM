@@ -1052,7 +1052,7 @@ __global__ void flash_attention_decode_partition_kernel(
       KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
       SEQ_LEN_ROUTE == 0 && !ANCHORED_SWA &&
       std::is_same_v<PARTIAL_T, float>, "Private scalar six-head contract");
-  const int partition_idx = blockIdx.z;
+  const int partition_idx = blockIdx.x;
   const int seq_len = seq_lens[0];
   const int start_token_idx = partition_idx * PARTITION_SIZE;
   if (seq_len <= 0 || start_token_idx >= seq_len ||
@@ -1208,9 +1208,8 @@ __global__ void flash_attention_decode_reduce_kernel(
     return;
   }
 
-  extern __shared__ float shared_mem[];
-  float* max_shared = shared_mem;
-  float* weight_shared = shared_mem + max_num_partitions;
+  // The reduction footprint is independent of the served context window.
+  __shared__ float weight_shared[kThreadsPerBlock];
 
   float local_max = -1.0e20f;
   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
@@ -1218,10 +1217,10 @@ __global__ void flash_attention_decode_reduce_kernel(
         static_cast<int64_t>(batch_idx) * stats_stride0 +
         static_cast<int64_t>(head_idx) * stats_stride1 + i;
     const float m = max_logits[stats_index];
-    max_shared[i] = m;
     local_max = fmaxf(local_max, m);
   }
   const float global_max = block_reduce_max<kWarpsPerBlock>(local_max);
+  __syncthreads();
 
   float local_sum = 0.f;
   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
@@ -1229,8 +1228,7 @@ __global__ void flash_attention_decode_reduce_kernel(
         static_cast<int64_t>(batch_idx) * stats_stride0 +
         static_cast<int64_t>(head_idx) * stats_stride1 + i;
     const float weight =
-        exp_sums[stats_index] * __expf(max_shared[i] - global_max);
-    weight_shared[i] = weight;
+        exp_sums[stats_index] * __expf(max_logits[stats_index] - global_max);
     local_sum += weight;
   }
   const float global_sum = block_reduce_sum<kWarpsPerBlock>(local_sum);
@@ -1243,17 +1241,29 @@ __global__ void flash_attention_decode_reduce_kernel(
       static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
       static_cast<int64_t>(head_idx) * tmp_out_stride1;
 
-  for (int d = threadIdx.x; d < D; d += blockDim.x) {
-    float acc = 0.f;
-    for (int i = 0; i < num_partitions; ++i) {
-      acc = fmaf(weight_shared[i],
-                 static_cast<float>(
-                     tmp_out[tmp_out_base +
-                             static_cast<int64_t>(i) * tmp_out_stride2 + d]),
+  static_assert(D == kThreadsPerBlock, "One output coordinate per thread");
+  float acc = 0.f;
+  for (int tile = 0; tile < num_partitions; tile += kThreadsPerBlock) {
+    const int i = tile + threadIdx.x;
+    if (i < num_partitions) {
+      const int64_t stats_index =
+          static_cast<int64_t>(batch_idx) * stats_stride0 +
+          static_cast<int64_t>(head_idx) * stats_stride1 + i;
+      weight_shared[threadIdx.x] =
+          exp_sums[stats_index] * __expf(max_logits[stats_index] - global_max);
+    }
+    __syncthreads();
+    const int count = min(kThreadsPerBlock, num_partitions - tile);
+    for (int j = 0; j < count; ++j) {
+      acc = fmaf(weight_shared[j],
+                 static_cast<float>(tmp_out[
+                     tmp_out_base + static_cast<int64_t>(tile + j) *
+                                        tmp_out_stride2 + threadIdx.x]),
                  acc);
     }
-    out[out_base + d] = __float2half(acc * inv_global_sum);
+    __syncthreads();
   }
+  out[out_base + threadIdx.x] = __float2half(acc * inv_global_sum);
 }
 
 }  // namespace
@@ -1275,20 +1285,26 @@ at::Tensor scalar_attention_candidate(
               out.is_contiguous(), "Output shape/dtype mismatch");
   TORCH_CHECK(table.dim() == 2 && table.size(0) == 1 && table.size(1) > 0 &&
               table.scalar_type() == at::kInt && table.is_contiguous() &&
-              table.size(1) * k.size(1) <= 266240 &&
+              table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
               lengths.sizes() == at::IntArrayRef({1}) &&
               lengths.scalar_type() == at::kInt && lengths.is_contiguous() &&
               active.sizes() == at::IntArrayRef({1}) &&
               active.scalar_type() == at::kInt && active.is_contiguous(),
               "Invalid scalar q1 page/length metadata");
-  TORCH_CHECK(partial.sizes() == at::IntArrayRef({1, 6, 256, 256}) &&
+  const int64_t partitions = partial.dim() == 4 ? partial.size(2) : 0;
+  TORCH_CHECK(partitions > 0 &&
+              partitions <= (static_cast<int64_t>(INT_MAX) - 4096 + 1023) / 1024 &&
+              partial.sizes() == at::IntArrayRef({1, 6, partitions, 256}) &&
               partial.scalar_type() == at::kFloat && partial.is_contiguous() &&
-              maximum.sizes() == at::IntArrayRef({1, 6, 256}) &&
+              maximum.sizes() == at::IntArrayRef({1, 6, partitions}) &&
               sums.sizes() == maximum.sizes() &&
               maximum.scalar_type() == at::kFloat &&
               sums.scalar_type() == at::kFloat &&
               maximum.is_contiguous() && sums.is_contiguous(),
-              "Scalar q1 requires unchanged FP32 partition workspaces");
+              "Scalar q1 requires matching FP32 partition workspaces");
+  TORCH_CHECK(table.size(1) <=
+                  (partitions * 1024 + k.size(1) - 1) / k.size(1),
+              "Scalar q1 workspace does not cover the page table");
   for (const auto* t : {&k, &v, static_cast<const at::Tensor*>(&out), &table,
       &lengths, static_cast<const at::Tensor*>(&partial),
       static_cast<const at::Tensor*>(&maximum),
@@ -1303,21 +1319,21 @@ at::Tensor scalar_attention_candidate(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   flash_attention_decode_partition_kernel<256, 1024,
       flash_v100::KV_CACHE_DTYPE_FP8_E4M3, 0, false, float>
-      <<<dim3(1, 1, 256), 256, 4096, stream>>>(
+      <<<dim3(static_cast<unsigned>(partitions)), 256, 4096, stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
       partial.data_ptr<float>(), maximum.data_ptr<float>(), sums.data_ptr<float>(),
       table.data_ptr<int>(), lengths.data_ptr<int>(), active.data_ptr<int>(),
-      1, table.size(1), 256, 6, 1, k.size(1), q.stride(0), q.stride(1),
+      1, table.size(1), partitions, 6, 1, k.size(1), q.stride(0), q.stride(1),
       partial.stride(0), partial.stride(1), partial.stride(2),
       maximum.stride(0), maximum.stride(1),
       k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2),
       scale, k_scale, v_scale, -1, -1, 0, 0, 0, nullptr, 0);
   flash_attention_decode_reduce_kernel<256, 1024, 0, float>
-      <<<dim3(1, 6, 1), 256, 2 * 256 * sizeof(float), stream>>>(
+      <<<dim3(1, 6, 1), 256, 0, stream>>>(
       partial.data_ptr<float>(), maximum.data_ptr<float>(), sums.data_ptr<float>(),
       lengths.data_ptr<int>(), active.data_ptr<int>(),
-      reinterpret_cast<__half*>(out.data_ptr()), 1, 256, 6,
+      reinterpret_cast<__half*>(out.data_ptr()), 1, partitions, 6,
       partial.stride(0), partial.stride(1), partial.stride(2),
       maximum.stride(0), maximum.stride(1), out.stride(0), out.stride(1),
       0, 0, 0, 0);
@@ -1341,6 +1357,8 @@ at::Tensor sm70_scalar_attention_entry(
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
+  ops.def("sm70_scalar_attention_workspace_revision() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "sm70_scalar_attention_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor table, Tensor lengths, Tensor(a!) partial, Tensor(a!) maximum, "

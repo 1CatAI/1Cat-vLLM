@@ -12,6 +12,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.fla.ops.gdn_chunk_kernels import bind_kda_kernels
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
@@ -110,6 +111,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        self.chunk_kernels = bind_kda_kernels(vllm_config)
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
         assert kda_config is not None, "linear_attn_config must be set"
@@ -416,6 +418,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=non_spec_query_start_loc,
+                kernels=self.chunk_kernels,
             )
             # Init cache
             recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state

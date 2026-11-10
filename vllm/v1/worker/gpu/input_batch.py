@@ -73,8 +73,6 @@ class InputBatch:
     num_computed_prefill_tokens_np: np.ndarray
     # [num_reqs] CPU bool array.
     is_prefilling_np: np.ndarray
-    # [num_reqs] populated only for pipeline parallel execution.
-    max_seq_len_np: np.ndarray | None
 
     # [num_tokens_after_padding]
     input_ids: torch.Tensor
@@ -168,7 +166,6 @@ class InputBatch:
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
-            max_seq_len_np=None,
             input_ids=input_ids,
             positions=positions,
             logits_indices=logits_indices,

@@ -32,6 +32,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.activation import SwigluStepAndMul
+from vllm.model_executor.layers.fla.ops.gdn_chunk_kernels import bind_kda_kernels
 from vllm.model_executor.layers.fla.ops.kda import (
     FusedRMSNormGated,
     chunk_kda,
@@ -643,6 +644,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
         num_speculative_tokens: int = 0,
     ) -> None:
         super().__init__()
+        self.chunk_kernels = bind_kda_kernels(get_current_vllm_config())
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = config.hidden_size
         self.head_dim = config.head_dim
@@ -1091,6 +1093,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
                 safe_gate=self.safe_gate,
                 lower_bound=self.lower_bound,
                 cu_seqlens=query_start_loc,
+                kernels=self.chunk_kernels,
             )
             recurrent_state_active[state_indices] = last_state
         elif attn_metadata.num_decodes > 0:

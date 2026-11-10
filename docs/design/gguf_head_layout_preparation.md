@@ -1,0 +1,88 @@
+# Restore GGUF GDN head order during canonical preparation
+
+Head-tiled GGUF output projections currently reorder the activation on every
+forward. Affine canonical preparation can instead permute integer codes and
+all group coefficients into the model head order before TurboMind packing.
+The head dimension must divide into complete canonical groups. Other formats,
+unsupported layouts and mixed projections with an unrestorable shard retain
+the original input transform. Admission reports restoration and fallback
+reasons. This changes no decoder, activation dtype or accumulation precision.
+
+The validation fixture covers head-group factors2 and3, M1/M5/M20/M512,
+official Q6_K dequantization and changed-input CUDA graph replay. Flash-Next
+uses factor3 and head dimension128; the TP4 output shape isN2560/K1536.
+Twenty-six GPU checks cover Q4_K/Q5_K/Q6_K, both head-group factors and
+all four M sizes;15 dense-admission CPU checks pass.
+
+A CUDA graph microbenchmark cycles six distinct real Q6_K output weights,
+with alternating A/B order over eight epochs. The six packed banks exceed
+V100 L2 capacity. Existing canonical coefficient rounding versus official
+GGUF dequantization has maximum absolute error2.0981e-4 and maximum relative
+L2 error1.9500e-4 across the six banks. Permuting codes and coefficients adds
+no new weight rounding. The different column reduction order produces these
+FP16 projection differences:
+
+|M|Input permutation(us)|Restored weights(us)|Maximum output difference|Maximum relative L2|
+|---|---:|---:|---:|---:|
+|1|25.140|15.383|1.2207e-4|4.2332e-5|
+|5|17.694|15.252|2.4414e-4|2.8794e-5|
+|20|20.629|18.274|2.4414e-4|2.1349e-5|
+
+M5 saves2.441us per projection, or about0.088ms for36 projections; this is
+an operator-based estimate, not measured full-model latency. M20 saves about
+0.085ms for36 projections. The expected graph-node reduction is one copy per
+restored projection. Model checks are recorded below.
+
+Reproduce with `benchmarks/benchmark_gguf_head_layout.py MODEL.gguf OUTPUT.json`
+using the installed ordinary wheel, CUDA12.8/Torch2.10cu128, V100/SM70, FP16
+activation/weights and FP32 accumulation. The stock gguf reader cannot open
+this mixed file because Q2_0 has type42; use the project's compatibility reader.
+
+The expanded benchmark cycles all36 real output projections (29 Q6_K,
+4 Q5_K,3 Q4_K) with the same TP4N2560/K1536 geometry. Mean time per
+projection across the complete layer bank is:
+
+|M|Input permutation(us)|Restored weights(us)|Saving for all36 projections(ms)|
+|---|---:|---:|---:|
+|1|19.036|14.397|0.1670|
+|5|18.010|15.048|0.1066|
+|20|21.081|17.984|0.1115|
+
+Maximum FP16 output differences remain1.2207e-4 for M1 and2.4414e-4 for
+M5/M20. These are alternating-order CUDA graph microbenchmarks, not model
+round timings. Use `--all-output-projections` to run this complete bank.
+
+## Model check
+
+The ordinary wheel from the combined source `8a16ac46d0` runs Flash-Next
+IQ3_S with FP16 MTP4, TP4 V100, FULL graphs, FP16 KV/activations and FP32
+recurrent state. All36 output projections report restored input layouts.
+Eight natural prompts with a128-token budget produce plausible text and reach
+the length limit. Compared with the earlier600-token baseline, two128-token
+prefixes match exactly; six diverge at positions26,28,47,55,100 and123.
+These model outputs are not a bitwise-parity claim. A final600-token paired
+acceptance comparison is required after the remaining metadata changes.
+
+Independent C1 I8192/O256 probes give23.5600 and23.5698ms unobserved, with
+identical complete IDs across those controls and the23.6095ms observed arm.
+C4 I128/O600 gives49.2792ms. These are absolute measurements; the changed
+speculative trajectories do not support attributing the full difference from
+older model runs to this layout change. Operator-bank savings remain0.1066ms
+for M5 and0.1115ms for M20.
+
+Actual CPU replay entry over39 middle rounds has median69.925us,
+p90177.035us and maximum262.763us. This cohort meets the100us median
+objective, but its tail still exceeds100us. The benchmark's one-shot transfer
+diagnostic recorded no blocking-transfer stacks in this run, so those empty
+records are not evidence for a particular source call. A direct metadata
+microbenchmark is used to validate the separately scoped index-copy change.
+
+The final same-artifact 600-token pair is recorded in
+[the graph and acceptance report](flashnext_gguf_graph_parity.md#final-combined-check).
+All four target graphs contain 1,763 nodes, confirming removal of all36
+head-order copies from the preceding1,799-node graph. The combined GGUF
+run gives C1 23.2973/23.6183ms unobserved and C4 48.1459ms. Its paired
+acceptance difference versus NVFP4 is −0.957pp (95% interval −3.347 to
++0.929pp); mean acceptance length differs by −0.0383 (−0.1339 to +0.0372).
+These intervals do not prove equivalence. Projection-bank tests isolate this
+change's 0.1066ms M5 saving; model timings include the separate metadata fix.

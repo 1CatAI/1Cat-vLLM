@@ -310,15 +310,35 @@ endif()
 # _C extension
 #
 
+# CUDA activation quantization needs SM80+; use the requested Torch archs,
+# not CMake's independently detected/default architecture. Other backends
+# retain their existing source and operator registrations.
+set(VLLM_ACT_QUANT_ARCHS "")
+set(VLLM_REGISTER_DEEPGEMM_MOE_OPS ON)
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  foreach(_arch IN LISTS CUDA_ARCHS)
+    if(_arch VERSION_GREATER_EQUAL "8.0")
+      list(APPEND VLLM_ACT_QUANT_ARCHS "${_arch}")
+    endif()
+  endforeach()
+  if(NOT VLLM_ACT_QUANT_ARCHS)
+    set(VLLM_REGISTER_DEEPGEMM_MOE_OPS OFF)
+  endif()
+endif()
+
 set(VLLM_EXT_SRC
   "csrc/cuda_view.cu"
   "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
-  "csrc/quantization/activation_kernels.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
   "csrc/torch_bindings.cpp"
   "csrc/ple_disk_rows.cpp"
+  "csrc/ple_fast_lane.cpp"
+  "csrc/gguf_dmv13_pack.cpp"
   "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+if(NOT VLLM_GPU_LANG STREQUAL "CUDA")
+  list(APPEND VLLM_EXT_SRC "csrc/quantization/activation_kernels.cu")
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_EXT_SRC
@@ -362,6 +382,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_EXT_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
+  if(VLLM_ACT_QUANT_ARCHS)
+    list(APPEND VLLM_EXT_SRC "csrc/quantization/activation_kernels.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "csrc/quantization/activation_kernels.cu"
+      CUDA_ARCHS "${VLLM_ACT_QUANT_ARCHS}")
+  endif()
 
   set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS "")
   cuda_archs_loose_intersection(SM70_TURBOMIND_ARCHS "7.0" "${CUDA_ARCHS}")
@@ -408,15 +434,20 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_qpn_m1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_grouped_decode_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_gdn_input_batch_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/hc_ll_shard_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/rmsnorm_gated_exact_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_moe_fp16_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_moe_permute_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn4_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_fp16_gemv_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/bf16_weight_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_cublaslt_sm70.cpp"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gemm_runtime.cpp"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
     list(APPEND VLLM_SM70_TURBOMIND_SRCS
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dequant_sm70.cu"
@@ -424,7 +455,22 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_decode_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_grouped_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_raw_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_iq3_signed_pair_sm70.cu")
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_prefill_transcode_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dp4a_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_shared_expert_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_iq3_signed_pair_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_linear_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dmv_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dmvq_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_moe_gu_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qsa_dense_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/hcx_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gdn_verify_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/top1x_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qsa_prep_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_qkvz_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_output_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_pair_sm70.cu")
 
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
@@ -733,6 +779,9 @@ define_extension_target(
 # driver API. This causes problems when linking with earlier versions of CUDA.
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+if(VLLM_REGISTER_DEEPGEMM_MOE_OPS)
+  target_compile_definitions(_C PRIVATE VLLM_REGISTER_DEEPGEMM_MOE_OPS=1)
+endif()
 if(VLLM_REGISTER_BASIC_ACTIVATION_IN_C)
   target_compile_definitions(_C PRIVATE VLLM_REGISTER_BASIC_ACTIVATION_IN_C=1)
 endif()
@@ -805,6 +854,35 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
       "${CUTLASS_INCLUDE_DIR}"
       "${cutlass_SOURCE_DIR}/examples/41_fused_multi_head_attention"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
+    _sm70_qsa_indexer_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/qsa_indexer_sm70.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
+    _sm70_router_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/sm70_router.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
+    _sm70_qsa_device_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/qsa_device_history_sm70.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  # Host-side expert-cache lane (C++ with the CUDA runtime); prebuilt so
+  # installed wheels do not need the source tree or a JIT toolchain.
+  define_extension_target(
+    _gguf_expert_cache_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/gguf_expert_cache.cpp"
     ARCHITECTURES "70"
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)

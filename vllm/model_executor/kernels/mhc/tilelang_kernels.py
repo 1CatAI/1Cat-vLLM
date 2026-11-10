@@ -1143,6 +1143,9 @@ def hc_head_fuse_tilelang(
                 pre = pre_mix_shared[i_hc]
                 for i1_h in T.Parallel(h_block):
                     ol[i1_h] += pre * xl[i_hc, i1_h]
+            if use_fp16:
+                for i1_h in T.Parallel(h_block):
+                    ol[i1_h] = T.max(T.min(ol[i1_h], FP16_MAX), -FP16_MAX)
 
             T.copy(ol, out[i, i0_h * h_block], disable_tma=True)
 

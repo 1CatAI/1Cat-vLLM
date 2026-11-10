@@ -9,6 +9,9 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
+from vllm.distributed.device_communicators.collective_provider import (
+    CollectiveCapabilities,
+)
 from vllm.distributed.device_communicators.custom_all_reduce import (
     CustomAllreduce,
 )
@@ -47,6 +50,9 @@ def test_custom_allreduce_filters_dtype(
     communicator.fully_connected = True
     communicator.dispatch_max_size = 1024
     communicator._ptr = 0
+    communicator.capabilities = CollectiveCapabilities(
+        2, True, False, 1024, 1024, False, False
+    )
 
     assert communicator.should_custom_ar(torch.empty(16, dtype=dtype)) is expected
 

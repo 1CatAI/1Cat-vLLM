@@ -1177,7 +1177,10 @@ def parse_cuda_priority_lists() -> dict[str, list[str]]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
             continue
-        if node.name != "_get_backend_priorities":
+        if node.name not in (
+            "_get_backend_priorities",
+            "_get_backend_priorities_cached",
+        ):
             continue
 
         # Process the function body directly

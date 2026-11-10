@@ -3,11 +3,15 @@
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
+
+logger = init_logger(__name__)
 
 
 class EncoderRunner:
@@ -19,6 +23,7 @@ class EncoderRunner:
         encoder_cache: EncoderCache,
         dtype: torch.dtype,
         device: torch.device,
+        max_batch_size: int = 0,
     ):
         self.model = model
         self.max_num_tokens = max_num_tokens
@@ -26,6 +31,7 @@ class EncoderRunner:
         self.encoder_cache = encoder_cache
         self.dtype = dtype
         self.device = device
+        self.max_batch_size = max_batch_size
 
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
@@ -48,13 +54,55 @@ class EncoderRunner:
         return mm_hashes, mm_kwargs
 
     @torch.inference_mode()
+    def profile_encoder_cache(
+        self,
+        dummy_mm_inputs: list[tuple[str, MultiModalKwargsItem]],
+        budget: MultiModalBudget,
+    ) -> None:
+        """Profile multimodal encoder and temporary encoder cache memory."""
+        if (encoder_budget := budget.get_encoder_budget()) <= 0:
+            return
+
+        if not budget.mm_max_toks_per_item:
+            logger.info(
+                "Skipping encoder profiling for embedding-only mode "
+                "(all modality limits=0 with enable_mm_embeds=True).",
+            )
+            return
+
+        assert dummy_mm_inputs, "Dummy inputs should be generated for encoder profiling"
+        dummy_modality = dummy_mm_inputs[0][0]
+        max_mm_items_per_batch = len(dummy_mm_inputs)
+
+        logger.info_once(
+            "Encoder cache will be initialized with a budget of %s tokens, "
+            "and profiled with %s %s items of the maximum feature size.",
+            encoder_budget,
+            max_mm_items_per_batch,
+            dummy_modality,
+        )
+
+        dummy_encoder_outputs = self.execute_mm_encoder(dummy_mm_inputs)
+
+        sanity_check_mm_encoder_outputs(
+            dummy_encoder_outputs,
+            expected_num_items=max_mm_items_per_batch,
+        )
+        self.encoder_cache.encoder_outputs.update(
+            (f"tmp_{i}", output) for i, output in enumerate(dummy_encoder_outputs)
+        )
+
+    @torch.inference_mode()
     def execute_mm_encoder(
         self,
         mm_kwargs: list[tuple[str, MultiModalKwargsItem]],
     ) -> list[torch.Tensor]:
         encoder_outputs: list[torch.Tensor] = []
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs, device=self.device, pin_memory=False
+            mm_kwargs,
+            device=self.device,
+            pin_memory=False,
+            max_batch_size=self.max_batch_size,
         ):
             batch_outputs = self.model.embed_multimodal(**mm_kwargs_batch)
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)

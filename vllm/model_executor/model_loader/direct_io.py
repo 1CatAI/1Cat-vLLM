@@ -22,7 +22,7 @@ import json
 import mmap
 import os
 import struct
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Collection, Generator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,15 +52,24 @@ _DTYPES = {
     "I16": torch.int16,
     "I8": torch.int8,
     "U8": torch.uint8,
+    # Unsigned index tables, e.g. GLM-5.3's csf_32x2_v1 scale pages; mapped
+    # like safetensors maps them.
+    "U16": torch.uint16,
+    "U32": torch.uint32,
     "BOOL": torch.bool,
 }
 
-# `<prefix>layers.<N>.` where <prefix> is a decoder stack whose N is the global
-# layer index. MTP heads (`mtp.layers.N`) and vision towers number their own
-# layers and are always read.
-_DECODER_LAYER = re.compile(
-    r"^(?:|model\.|model\.language_model\.|language_model\.model\.)layers\.(\d+)\."
-)
+# Where checkpoints store the main decoder stack: `<prefix>layers.<N>.` with N
+# the global layer index, and `<prefix><module>.` for the modules around the
+# layers (embedding, final norm). MTP heads (`mtp.layers.N`) and vision towers
+# number their own layers, which the decoder layer filter never matches.
+_STACK_PREFIX = r"(?:|model\.|model\.language_model\.|language_model\.model\.)"
+# Where checkpoints store the language model's own modules (its LM head).
+_LANGUAGE_MODEL_PREFIX = r"(?:|language_model\.)"
+# Where checkpoints store the modules of a multimodal model beside its language
+# model (encoder towers, projectors): `model.visual.` or `visual.`.
+_MULTIMODAL_PREFIX = r"(?:|model\.)"
+_DECODER_LAYER = re.compile(rf"^{_STACK_PREFIX}layers\.(\d+)\.")
 
 
 MADV_DONTNEED = 4
@@ -87,6 +96,36 @@ def decoder_layer_filter(start: int, end: int) -> Callable[[str], bool]:
         return match is not None and not start <= int(match.group(1)) < end
 
     return outside
+
+
+def missing_module_filter(
+    stack_modules: Collection[str],
+    language_model_modules: Collection[str],
+    multimodal_modules: Collection[str],
+) -> Callable[[str], bool]:
+    """Return a predicate that is True for tensors of modules a pipeline stage
+    does not hold: *stack_modules* are children of the decoder stack (the
+    embedding, the final norm), *language_model_modules* children of the
+    language model (the LM head), *multimodal_modules* children of a
+    multimodal model (its encoder towers)."""
+    if not stack_modules and not language_model_modules and not multimodal_modules:
+        # The empty alternation would match every tensor.
+        raise ValueError("missing_module_filter needs at least one module name")
+    places = [
+        (_STACK_PREFIX, stack_modules),
+        (_LANGUAGE_MODEL_PREFIX, language_model_modules),
+        (_MULTIMODAL_PREFIX, multimodal_modules),
+    ]
+    pattern = re.compile(
+        "^(?:"
+        + "|".join(
+            rf"{prefix}(?:{'|'.join(map(re.escape, sorted(modules)))})\."
+            for prefix, modules in places
+            if modules
+        )
+        + ")"
+    )
+    return lambda name: pattern.match(name) is not None
 
 
 def _read_header(fd: int) -> tuple[dict, int]:

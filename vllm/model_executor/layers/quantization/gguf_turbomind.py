@@ -23,11 +23,16 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
     _get_affine_blas_workspace,
 )
+from vllm.model_executor.layers.quantization.gguf_fp16_projection import (
+    FP16_SOURCE_TYPES,
+    fp16_projection_capabilities,
+)
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     LATTICE_TYPES,
     LatticeGGUFProjection,
     transcode_lattice,
 )
+from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
 from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
     LUT4_TYPES,
     Lut4GGUFProjection,
@@ -74,6 +79,46 @@ def _prepared_gguf_projection(
     # Keep M-dependent policy behind an opaque op: vLLM's range compilation
     # drops Dynamo guards and would otherwise freeze the prefill branch.
     rows = x.reshape(-1, x.shape[-1]).contiguous()
+    if family == 4:
+        from .gguf_dmv import restore
+
+        output = rows.new_empty((rows.shape[0], output_size))
+        restore(
+            rows,
+            codes,
+            stats,
+            cache,
+            decoder,
+            output_size,
+            k_ld,
+            q_ld,
+            output,
+            cache_bands,
+            blas_bands,
+        )
+        return output.reshape(*x.shape[:-1], logical_size)
+    if family == 3:
+        from .gguf_dense_hmma import apply_segments, restore_and_apply
+
+        out = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
+        if rows.shape[0] <= 64:
+            apply_segments(
+                rows, [codes], [stats], [cache], [decoder], [output_size], out, [out]
+            )
+        else:
+            restore_and_apply(
+                rows,
+                codes,
+                stats,
+                cache,
+                decoder,
+                output_size,
+                out,
+                k_ld,
+                q_ld,
+                blas_bands=blas_bands,
+            )
+        return out.reshape(*x.shape[:-1], logical_size)
     if cache is not None and _supports_band(rows.shape[0], cache_bands):
         return torch.mm(rows, cache.T).reshape(*x.shape[:-1], logical_size)
     output = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
@@ -160,11 +205,34 @@ def _prepared_gguf_mixed_projection(
         )
         cache_offset += cache_count
         blas_offset += blas_count
+    if specs and all(spec[0] == 3 for spec in specs):
+        from .gguf_dense_hmma import apply_segments
+
+        ns = [spec[6] for spec in specs]
+        output = torch.empty((rows.shape[0], sum(ns)), dtype=x.dtype, device=x.device)
+        views = list(output.split(ns, dim=1))
+        apply_segments(
+            rows,
+            codes,
+            stats,
+            caches,
+            [spec[1] for spec in specs],
+            ns,
+            output,
+            views,
+            blas_bands=[bb for _, bb in policies],
+        )
+        return output.reshape(*x.shape[:-1], sum(ns))
     # Retain the calibrated per-projection policy outside measured target
     # verification sizes. This decision must use actual M inside the op.
-    direct = rows.shape[0] in (5, 20) and all(
-        not _supports_band(rows.shape[0], cb) and not _supports_band(rows.shape[0], bb)
-        for cb, bb in policies
+    direct = (
+        not any(spec[0] in (3, 4) for spec in specs)
+        and rows.shape[0] in (5, 20)
+        and all(
+            not _supports_band(rows.shape[0], cb)
+            and not _supports_band(rows.shape[0], bb)
+            for cb, bb in policies
+        )
     )
     if not direct:
         outputs = [
@@ -262,9 +330,20 @@ def mixed_projection_capabilities(projections):
 
 def apply_prepared_gguf_projections(x, projections):
     capabilities = mixed_projection_capabilities(projections)
-    if not capabilities or any(c.reason is not None for c in capabilities):
-        outputs = [projection(x) for projection in projections]
-        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+    if capabilities and all(c.reason is None for c in capabilities):
+        bindings = [p.kernel.native_ops for p in projections]
+        if all(b.owner is bindings[0].owner for b in bindings):
+            return bindings[0].invoke(
+                torch.ops.vllm.prepared_gguf_mixed_projection,
+                x,
+                *prepared_projection_arguments(projections),
+            )
+    outputs = [projection(x) for projection in projections]
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+
+
+def prepared_projection_arguments(projections):
+    """Serialize canonical storage and runtime policies for opaque operators."""
     codes: list[torch.Tensor] = []
     stats: list[torch.Tensor] = []
     caches: list[torch.Tensor | None] = []
@@ -290,7 +369,19 @@ def apply_prepared_gguf_projections(x, projections):
         )
         codes.append(projection.codes)
         stats.append(projection.stats)
-        caches.append(projection.fp16_cache)
+        if hasattr(projection, "dmv_format"):
+            family, decoder = 4, projection.dmv_format
+            cb = []
+        if hasattr(projection, "segment_format"):
+            family, decoder = 3, projection.segment_format
+            cb = []
+        caches.append(
+            projection.dmv_high
+            if family == 4
+            else projection.segment_high
+            if family == 3
+            else projection.fp16_cache
+        )
         descriptors.extend(
             (
                 family,
@@ -306,9 +397,7 @@ def apply_prepared_gguf_projections(x, projections):
         )
         cache_bands.extend(cb)
         blas_bands.extend(bb)
-    return torch.ops.vllm.prepared_gguf_mixed_projection(
-        x, codes, stats, caches, descriptors, cache_bands, blas_bands
-    )
+    return codes, stats, caches, descriptors, cache_bands, blas_bands
 
 
 def _admitted_bands(capabilities):
@@ -320,7 +409,9 @@ def _admitted_bands(capabilities):
     ]
 
 
-def prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m):
+def prepare_gguf_projections(
+    sources, act_dtype, enabled, prefill_min_m, input_layout=None, dmv_enabled=False
+):
     """Coalesce adjacent compatible shards without changing projection order."""
     groups: list[tuple[list[torch.Tensor], int]] = []
     for weight, source_type in sources:
@@ -337,27 +428,76 @@ def prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m):
             groups.append(([weight], source_type))
     projections = []
     for weights, source_type in groups:
+        raw_gdn_order = (
+            dmv_enabled and input_layout is not None and source_type in (18, 21, 23)
+        )
         projection = GGUFPreparedProjection(
             weights[0] if len(weights) == 1 else torch.cat(weights, dim=0),
             source_type,
             act_dtype,
             enabled,
             prefill_min_m,
+            input_layout=None if raw_gdn_order else input_layout,
+            dmv_enabled=dmv_enabled,
         )
+        if raw_gdn_order and hasattr(projection, "dmv_format"):
+            projection.dmv_gdn_heads = True
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
+    if dmv_enabled and any(
+        p.source_type in (12, 16, 17, 18, 21, 22, 23) and not hasattr(p, "dmv_format")
+        for p in projections
+    ):
+        reasons = [
+            getattr(p, "dmv_rejection_reason", "plane_preparation_not_qualified")
+            for p in projections
+            if not hasattr(p, "dmv_format")
+        ]
+        # Storage replacement is atomic across a fused layer. A partially
+        # replaced bank cannot be handed to a legacy canonical/native reader.
+        fallback = prepare_gguf_projections(
+            sources, act_dtype, enabled, prefill_min_m, input_layout=input_layout
+        )
+        for projection in fallback:
+            projection.dmv_rejection_reasons = reasons
+        return fallback
+    if input_layout is not None and not all(
+        projection.input_layout_restored or getattr(projection, "dmv_gdn_heads", False)
+        for projection in projections
+    ):
+        # Keep every shard in the same input order when one cannot be restored.
+        reasons = [
+            p.rejection_reason for p in projections if not p.input_layout_restored
+        ]
+        fallback = prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m)
+        for projection in fallback:
+            projection.input_layout_rejection_reasons = reasons
+        return fallback
     return projections
 
 
 class GGUFPreparedProjection(Module):
     """One mixed projection; canonical preparation never changes its row order."""
 
-    def __init__(self, weight, source_type, act_dtype, enabled, prefill_min_m):
+    def __init__(
+        self,
+        weight,
+        source_type,
+        act_dtype,
+        enabled,
+        prefill_min_m,
+        input_layout=None,
+        dmv_enabled=False,
+    ):
         super().__init__()
         self.source_type = int(source_type)
         self.enabled = enabled
         self.prefill_min_m = prefill_min_m
         self.kernel = None
+        self.input_layout = input_layout
+        self.dmv_enabled = dmv_enabled
+        self.input_layout_restored = False
+        self.input_layout_rejection_reasons = []
         self.logical_output_size = weight.shape[0]
         self.source_output_sizes = (self.logical_output_size,)
         self.output_padding = 0
@@ -372,6 +512,13 @@ class GGUFPreparedProjection(Module):
                     requires_grad=False,
                 ),
             )
+        self.fp16_capabilities = (
+            fp16_projection_capabilities(self.source_type, weight, act_dtype, enabled)
+            if self.source_type in FP16_SOURCE_TYPES
+            else ()
+        )
+        if self.fp16_capabilities:
+            self.rejection_reason = self.fp16_capabilities[0].reason
 
     def _prepare(self, weight, act_dtype):
         if not self.enabled:
@@ -405,6 +552,28 @@ class GGUFPreparedProjection(Module):
             canonical = transcode(weight.detach().cpu().numpy(), self.source_type)
         except ValueError as error:
             return f"canonical_transcode_rejected:{error}"
+        if self.input_layout is not None:
+            if not isinstance(self.input_layout, GGUFHeadTilingLayout):
+                return "input_layout_codec_unavailable"
+            if not isinstance(canonical, AffineGGUFProjection):
+                return "input_layout_requires_affine_groups"
+            head_span, remainder = divmod(
+                self.input_layout.head_dim, canonical.group_size
+            )
+            if remainder:
+                return "input_layout_cuts_canonical_group"
+            canonical = replace(
+                canonical,
+                codes=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.codes), dim=1
+                ).numpy(),
+                scales=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.scales), dim=1, head_dim=head_span
+                ).numpy(),
+                mins=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.mins), dim=1, head_dim=head_span
+                ).numpy(),
+            )
         padding = -n % 32
         if padding:
             canonical = replace(
@@ -453,7 +622,24 @@ class GGUFPreparedProjection(Module):
             config, "codes", "stats", "mins" if config.zero_points else None
         )
         self.kernel.process_weights_after_loading(self)
+        self.input_layout_restored = self.input_layout is not None
         self.output_padding = padding
+        from .gguf_dense_hmma import prepare_segment_bank, remember_descriptor
+
+        if self.dmv_enabled:
+            from .gguf_dmv import prepare_bank
+
+            if prepare_bank(self, weight, canonical):
+                return None
+        if prepare_segment_bank(self, canonical, weight.device):
+            remember_descriptor(
+                k,
+                n + padding,
+                self.segment_format,
+                self.gguf_tm_k_ld,
+                self.gguf_tm_q_ld,
+            )
+            return None
         self.cache_capabilities = dense_fp16_cache_capabilities(
             self.source_type, k, n, act_dtype, self.enabled
         )
@@ -469,8 +655,12 @@ class GGUFPreparedProjection(Module):
         result = {
             "source_type": quant_type_name(self.source_type),
             "reason": self.rejection_reason,
+            "input_layout_restored": self.input_layout_restored,
+            "input_layout_rejection_reasons": self.input_layout_rejection_reasons,
             "source_output_sizes": list(self.source_output_sizes),
         }
+        if self.fp16_capabilities:
+            result["operators"] = [asdict(c) for c in self.fp16_capabilities]
         if self.kernel is not None:
             result["kernel"] = type(self.kernel).__name__
             result["local_weight_shape"] = list(
@@ -487,11 +677,21 @@ class GGUFPreparedProjection(Module):
                         (self.kernel.capability,),
                     ),
                     *self.cache_capabilities,
+                    *([self.dmv_capability] if hasattr(self, "dmv_capability") else []),
+                    *(
+                        [self.segment_capability, self.segment_m20_capability]
+                        if hasattr(self, "segment_capability")
+                        else []
+                    ),
                 )
             ]
         return result
 
     def forward(self, x):
+        if self.fp16_capabilities and self.fp16_capabilities[0].reason is None:
+            return torch.ops.vllm.prepared_gguf_fp16_projection(
+                x, self.weight, self.source_type, self.enabled
+            )
         if self.kernel is not None:
             kernel = self.kernel
             config = kernel.config
@@ -501,13 +701,25 @@ class GGUFPreparedProjection(Module):
                 family, decoder = 1, kernel.lut_id
             else:
                 family, decoder = 2, kernel.source_type
+            if hasattr(self, "dmv_format"):
+                family, decoder = 4, self.dmv_format
+            if hasattr(self, "segment_format"):
+                family, decoder = 3, self.segment_format
             capabilities = getattr(kernel, "operator_capabilities", ())
             blas = tuple(c for c in capabilities if "blas" in c.operator)
-            return torch.ops.vllm.prepared_gguf_projection(
+            # Sampling can invoke a shared head outside the model's forward
+            # context. Borrow its prepared owner so native scratch still uses
+            # the engine budget, including during draft graph warmup.
+            return kernel.native_ops.invoke(
+                torch.ops.vllm.prepared_gguf_projection,
                 x,
                 self.codes,
                 self.stats,
-                self.fp16_cache,
+                self.dmv_high
+                if family == 4
+                else self.segment_high
+                if family == 3
+                else self.fp16_cache,
                 family,
                 decoder,
                 config.group_size,

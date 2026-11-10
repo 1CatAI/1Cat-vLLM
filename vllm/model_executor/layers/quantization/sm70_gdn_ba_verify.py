@@ -18,7 +18,9 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
         or not isinstance(ba, LinearBase)
         or not current_platform.is_device_capability(70)
         or not getattr(qkvz, "sm70_fp8_qpn8", False)
-        or x.shape != (8, 5120)
+        or x.ndim != 2
+        or x.shape[1] != 5120
+        or not 8 <= x.shape[0] <= 32
         or x.dtype != torch.float16
         or not x.is_contiguous()
         or qkvz.weight.shape != (5120, 4096)
@@ -31,10 +33,11 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
         or not hasattr(torch.ops._C, "fp8_qpn8_dispatch_ba_split_sm70_out")
     ):
         return None
+    rows = x.shape[0]
     if outputs is None:
-        qkv = x.new_empty((8, 2560))
-        z = x.new_empty((8, 1536))
-        b = x.new_empty((8, 12))
+        qkv = x.new_empty((rows, 2560))
+        z = x.new_empty((rows, 1536))
+        b = x.new_empty((rows, 12))
         a = torch.empty_like(b)
     else:
         qkv, z, b, a = outputs
@@ -43,7 +46,9 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
             or tensor.dtype != x.dtype
             or tensor.device != x.device
             or not tensor.is_contiguous()
-            for tensor, shape in zip(outputs, ((8, 2560), (8, 1536), (8, 12), (8, 12)))
+            for tensor, shape in zip(
+                outputs, ((rows, 2560), (rows, 1536), (rows, 12), (rows, 12))
+            )
         ):
             return None
     torch.ops._C.fp8_qpn8_dispatch_ba_split_sm70_out(
@@ -51,8 +56,8 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
         z,
         b,
         a,
-        x.new_empty((8, 4096)),
-        x.new_empty((8, 24)),
+        x.new_empty((rows, 4096)),
+        x.new_empty((rows, 24)),
         0,
         x,
         qkvz.weight,

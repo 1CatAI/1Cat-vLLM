@@ -241,7 +241,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
-from vllm.utils.math_utils import cdiv, round_down
+from vllm.utils.math_utils import cdiv, round_down, round_up
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -1396,9 +1396,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         model_config = vllm_config.model_config
 
         chunked_prefill_workspace_size = min(
-            # Try for 8 full length request or at least 4 pages per-request
+            # Try for 8 full length requests, never more than the scheduler can
+            # hold at once, or at least 4 pages per request. A single-sequence
+            # engine keeps one request's context per chunk; the profile run
+            # sizes the kv_b_proj output by this (GLM-5.3-Flash: 64 heads x 512
+            # x 64k tokens = 4 GiB on every pipeline stage).
             max(
-                8 * model_config.max_model_len,
+                min(8, scheduler_config.max_num_seqs) * model_config.max_model_len,
                 4 * scheduler_config.max_num_seqs * cache_config.block_size,
             ),
             # For long-context models try not to over-allocate limiting
@@ -1410,6 +1414,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             #   2*(192*128)*(64*1024) = 3gb
             # (assuming 192 QK head dim, 128 heads, and fp16)
             64 * 1024,
+            # No request holds more context than max_model_len; hybrid models
+            # raise the attention page to the mamba state page (GLM-5.3-Flash:
+            # 8576 tokens), so four pages alone would ask for 34k tokens.
+            scheduler_config.max_num_seqs * model_config.max_model_len,
         )
 
         # Enforce that we enough for at least 1 page per request
@@ -1418,7 +1426,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             scheduler_config.max_num_seqs * cache_config.block_size,
         )
 
-        return chunked_prefill_workspace_size
+        # The DCP all-gather splits the workspace evenly across its group; fewer
+        # than 8 requests of an odd max_model_len would not divide.
+        return round_up(
+            chunked_prefill_workspace_size,
+            vllm_config.parallel_config.decode_context_parallel_size,
+        )
 
     @staticmethod
     def determine_prefill_query_data_type(

@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
-    from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, KVQuantMode
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -582,6 +582,22 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # that set this retain the original logical/storage block geometry.
     uses_physical_block_table: ClassVar[bool] = False
 
+    accepts_speculative_state_metadata: bool = False
+    """Consume accepted counts and draft counts from a hybrid model state."""
+
+    def get_model_state_kwargs(self, metadata: Any, num_reqs: int) -> dict[str, Any]:
+        """Backend-owned inputs at the existing model-state metadata boundary."""
+        if not self.accepts_speculative_state_metadata:
+            return {}
+        return {
+            "num_accepted_tokens": None
+            if metadata.num_accepted_tokens is None
+            else metadata.num_accepted_tokens[:num_reqs],
+            "num_decode_draft_tokens_cpu": None
+            if metadata.num_decode_draft_tokens_cpu is None
+            else metadata.num_decode_draft_tokens_cpu[:num_reqs],
+        }
+
     @abstractmethod
     def __init__(
         self,
@@ -746,6 +762,15 @@ class AttentionImplBase(ABC, Generic[T]):
     standard AttentionImpl and MLAAttentionImpl. Does not define a forward
     method - subclasses define their own forward interfaces.
     """
+
+    def configure_kv_cache_workspace(
+        self, vllm_config: "VllmConfig", kv_cache_spec: "KVCacheSpec"
+    ) -> None:
+        """Bind optional workspace bounds before profiling and KV allocation.
+
+        Backends without a page-dependent workspace need no preparation.
+        """
+        return None
 
     # Required attributes that all impls should have
     num_heads: int

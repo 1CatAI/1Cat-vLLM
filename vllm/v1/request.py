@@ -56,6 +56,10 @@ class StreamingUpdate:
         )
 
 
+# Chunk size of the chunked recurrent (GDN/Mamba) prefill kernels.
+PREFIX_CACHE_BOUNDARY_ALIGNMENT = 64
+
+
 class Request:
     def __init__(
         self,
@@ -149,10 +153,36 @@ class Request:
         # and PP run ahead of the GPU); `num_computed_tokens` counts them
         # optimistically.
         self.num_in_flight_tokens = 0
+        self.num_in_flight_steps = 0
+        # Failed remote KV loads invalidate whole scheduled output frames.
+        # Keep this separate from AsyncScheduler's prefix-reset bookkeeping.
+        self.num_kv_load_outputs_to_discard = 0
+
+        # Prefill chunk cap the scheduler sets when it takes the request from
+        # the waiting queue (SchedulerConfig.short_prompt_chunk_tokens); zero
+        # leaves the whole token budget.
+        self.prefill_chunk_cap = 0
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
+        # Prompt positions inside a block where a partial prefix-cache entry
+        # should be kept (e.g. the end of the last chat message).
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        # Boundaries are rounded down to whole recurrent-kernel chunks, so a
+        # request resumed there chunks its prefill exactly like a cold one.
+        align = PREFIX_CACHE_BOUNDARY_ALIGNMENT
+        self.prefix_cache_boundaries: tuple[int, ...] = tuple(
+            sorted(
+                {
+                    int(b) // align * align
+                    for b in extra_args.get("prefix_cache_boundaries", ())
+                    if align <= int(b) < len(prompt_token_ids or ())
+                }
+            )
+        )
+        # Partial prefix-cache entry selected by the last cache lookup.
+        self.partial_prefix_entry: Any = None
 
         # Multi-modal related
         self.mm_features = mm_features or []

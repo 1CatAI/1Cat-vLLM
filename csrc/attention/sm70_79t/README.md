@@ -19,7 +19,13 @@ The admitted shape is FP16 Q8000 through Q8192/Hq6/Hkv1/D256, causal, scale
 1/16, with KV at least Q through 262144 and aligned to 32 tokens. The 32-token
 alignment is required by the prefix PV Tensor Core K tile; other KV lengths
 stay on the general path. Q8000 runs through its qualified 320-token
-tail specialization. Q8192 has a native 256-token tail specialization. Q8001
+tail specialization. Q8192 has a native 256-token tail specialization, and so
+does Q4096 (`sm70_d256_gqa_architecture_q4096_fwd`) for 4096-token chunks;
+Q4000 through Q4095 are leading-padded to it, and it is selected once KV
+reaches 8192 keys. Q4096 keeps its own half-height score buffer, so a
+4096-token engine reserves 384 MiB of scores instead of the 768 MiB that
+Q8000 and Q8192 share. Operator medians at KV128K/KV248K are about 62 TFLOPS
+against 68 for Q8192 and 47 for the Split-D route it replaces. Q8001
 through Q8191 are leading-padded to Q8192, which preserves bottom-right causal
 alignment while keeping the added work below 2.4%. Other shapes retain existing
 routes. For one full chunk, use a per-request long-prefill threshold of 8192.

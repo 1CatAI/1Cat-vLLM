@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from vllm import envs
+from vllm.config.execution_policy import layer_policy
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     register_layer_workspace,
+    workspace_pool,
 )
 from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm._sm70.policy import NativeBindings
+    from vllm.model_executor.kernels.linear.sm70_provider import PreparedLinearProvider
 
 U4_GROUP_SIZES = (32, 64, 128)
 GPTQ_GROUP_SIZES = (128,)
@@ -33,7 +38,7 @@ class SM70TurboMindLinearState:
     k_ld: int
     q_ld: int
     output_size: int
-    op_kind: Literal["uint4", "mxfp4", "nvfp4", "nvfp4_qpn4", "nvfp4_qpn2_dense"]
+    op_kind: Literal["uint4", "fp8", "mxfp4", "nvfp4", "nvfp4_qpn4", "nvfp4_qpn2_dense"]
     gated_silu: bool = False
     global_scale: float = 0.0
     use_scale_code: bool = False
@@ -42,6 +47,25 @@ class SM70TurboMindLinearState:
     # QPN2 launch configuration (split-K, independent accumulator chains).
     split_k: int = 0
     accumulator_chains: int = 0
+    qpn4_lazy_dense_workspace: bool = False
+    native_ops: "NativeBindings" = field(init=False, repr=False, compare=False)
+    provider: "PreparedLinearProvider" = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        from vllm._sm70.policy import NativeBindings
+        from vllm.config.sm70_native import capture_linear_native_config
+
+        family = "awq" if self.op_kind == "uint4" else self.op_kind.split("_", 1)[0]
+        self.native_ops = NativeBindings(capture_linear_native_config(family).values)
+        self.refresh_provider()
+
+    def refresh_provider(self) -> None:
+        """Bind after the final weight layout is known, including QPN2 reuse."""
+        from vllm.model_executor.kernels.linear.sm70_provider import (
+            bind_prepared_provider,
+        )
+
+        self.provider = bind_prepared_provider(self)
 
 
 # Owns the bounded allocations the registered layer workspaces refer to.
@@ -50,8 +74,8 @@ _nvfp4_qpn4_dense_workspaces: dict[tuple, torch.Tensor] = {}
 
 def clear_sm70_turbomind_workspaces() -> None:
     """Release process-global NVFP4 QPN4 dense workspaces."""
-    _nvfp4_qpn4_dense_workspaces.clear()
-    from vllm.model_executor.layers.quantization.utils.nvfp4_qpn2_dequant import (
+    workspace_pool("_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces).clear()
+    from vllm.model_executor.kernels.linear.qpn.nvfp4_dequant import (
         clear_nvfp4_qpn2_dense_workspaces,
     )
 
@@ -59,11 +83,64 @@ def clear_sm70_turbomind_workspaces() -> None:
 
 
 def quant_backend() -> SM70QuantBackend:
-    return envs.get_sm70_quant_backend()
+    return layer_policy().value("quant_backend")
 
 
 def use_turbomind(default_enabled: bool) -> bool:
-    return envs.use_sm70_turbomind(default_enabled)
+    backend = quant_backend()
+    return backend == "turbomind" or (backend == "auto" and bool(default_enabled))
+
+
+def format_option(family: str, field: str) -> bool:
+    """Loader admission from B's canonical format owner, before weight preparation.
+
+    Raw enabled flags are retained for the two historical AWQMarlin gates that
+    intentionally did not consult the shared backend selector.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.kernel import (
+        SM70_AWQ_LINEAR_ALIASES,
+        SM70_FP8_LINEAR_ALIASES,
+        SM70_LOADER_ALIASES,
+        Sm70AwqConfig,
+        Sm70Fp8Config,
+        Sm70NvFp4Config,
+    )
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is None:
+        cls = {"awq": Sm70AwqConfig, "fp8": Sm70Fp8Config, "nvfp4": Sm70NvFp4Config}[
+            family
+        ]
+        policy = cls()
+        policy.capture_inputs()
+    else:
+        policy = getattr(cfg.kernel_config, "sm70_" + family)
+    value = getattr(policy, field)
+    source = policy.sources.get(field)
+    if value is not None and (field != "enabled" or source in (None, "configuration")):
+        return bool(value)
+    aliases = dict(SM70_LOADER_ALIASES[family])
+    aliases.update(
+        {"awq": SM70_AWQ_LINEAR_ALIASES, "fp8": SM70_FP8_LINEAR_ALIASES}.get(family, {})
+    )
+    return bool(policy.legacy.value(aliases[field]))
+
+
+def format_enabled(family: str) -> bool:
+    """Explicit format configuration wins over a conflicting legacy backend."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    value = format_option(family, "enabled")
+    cfg = get_current_vllm_config_or_none()
+    if cfg is not None:
+        policy = getattr(cfg.kernel_config, "sm70_" + family)
+        if policy.enabled is not None and policy.sources.get("enabled") in (
+            None,
+            "configuration",
+        ):
+            return value
+    return use_turbomind(value)
 
 
 def use_batched_gemm_layouts() -> bool:
@@ -74,7 +151,7 @@ def use_batched_gemm_layouts() -> bool:
     do not restrict this shared policy. Small-M kernels retain their existing
     packed layouts; larger batches consume prepared TurboMind weights/scales.
     """
-    return envs.VLLM_SM70_BATCH_GEMM_LAYOUTS and is_exact_sm70_cuda_platform()
+    return bool(layer_policy().batch_gemm_layouts) and is_exact_sm70_cuda_platform()
 
 
 def use_native_qpn_layouts() -> bool:
@@ -99,8 +176,18 @@ def use_native_qpn_layouts() -> bool:
     )
 
 
+def fp8_backend_enabled() -> bool:
+    """Shared serialized/channel/ModelOpt admission to the FP8 provider."""
+    if not is_exact_sm70_cuda_platform():
+        return False
+    from vllm.config.kernel import capture_sm70_fp8_linear_config
+
+    policy = capture_sm70_fp8_linear_config()
+    return bool(policy.enabled and not policy.force_marlin)
+
+
 def forces_marlin() -> bool:
-    return envs.force_sm70_marlin()
+    return quant_backend() == "marlin"
 
 
 def is_exact_sm70_cuda(tensor: torch.Tensor, enabled: bool) -> bool:
@@ -132,15 +219,13 @@ def is_exact_sm70_cuda_platform() -> bool:
 def should_use_mxfp4_moe_turbomind() -> bool:
     """Select the native MXFP4 MoE path only on exact SM70."""
     return is_exact_sm70_cuda_platform() and use_turbomind(
-        envs.VLLM_SM70_MXFP4_TURBOMIND
+        layer_policy().value("mxfp4_turbomind")
     )
 
 
 def should_use_nvfp4_moe_turbomind() -> bool:
     """Select the native NVFP4 MoE path only on exact SM70."""
-    return is_exact_sm70_cuda_platform() and use_turbomind(
-        envs.VLLM_SM70_NVFP4_TURBOMIND
-    )
+    return is_exact_sm70_cuda_platform() and format_enabled("nvfp4")
 
 
 def should_prepare_turbomind(
@@ -260,7 +345,9 @@ def _store_state(
     meta: torch.Tensor | None,
     group_size: int,
     output_size: int,
-    op_kind: Literal["uint4", "mxfp4", "nvfp4", "nvfp4_qpn4", "nvfp4_qpn2_dense"],
+    op_kind: Literal[
+        "uint4", "fp8", "mxfp4", "nvfp4", "nvfp4_qpn4", "nvfp4_qpn2_dense"
+    ],
     gated_silu: bool = False,
     global_scale: float = 0.0,
     use_scale_code: bool = False,
@@ -268,6 +355,7 @@ def _store_state(
     prescaled_scales: bool = False,
     split_k: int = 0,
     accumulator_chains: int = 0,
+    qpn4_lazy_dense_workspace: bool = False,
 ) -> None:
     state = SM70TurboMindLinearState(
         weight=weight,
@@ -284,6 +372,7 @@ def _store_state(
         prescaled_scales=prescaled_scales,
         split_k=split_k,
         accumulator_chains=accumulator_chains,
+        qpn4_lazy_dense_workspace=qpn4_lazy_dense_workspace,
     )
     setattr(layer, STATE_ATTR, state)
 
@@ -466,9 +555,9 @@ def prepare_nvfp4_linear(
     )
 
 
-# Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu: rows up to this
-# take the QPN2 decode kernels, larger M takes the dense prefill.
-QPN2_DISPATCH_MAX_ROWS = 32
+# Compatibility export for the Python QPN2 dispatch range. Each native
+# launch remains bounded at 32 rows; the no-copy provider chunks up to 128.
+QPN2_DISPATCH_MAX_ROWS = 128
 QPN2_GROUP_SIZE = 16
 
 # Launch configurations (split-K, accumulator chains) measured on the
@@ -515,7 +604,9 @@ def pad_qpn2_output_rows(
     return padded_weight, padded_scales, physical_n
 
 
-def prepare_nvfp4_qpn2_dense_linear(layer: torch.nn.Module) -> None:
+def prepare_nvfp4_qpn2_dense_linear(
+    layer: torch.nn.Module, *, bundle_scales: bool = False
+) -> None:
     """Prepare the QPN2 prepack as the only resident layout of an NVFP4 linear.
 
     Decode (M <= ``QPN2_DISPATCH_MAX_ROWS``) runs the QPN2 kernels on it;
@@ -539,6 +630,8 @@ def prepare_nvfp4_qpn2_dense_linear(layer: torch.nn.Module) -> None:
         layer.weight.data, layer.weight_scale.data
     )
     codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(weight, scales)
+    if bundle_scales and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70"):
+        codes, qpn2_scales = sm70_ops.nvfp4_qpn2_bundle_sm70(codes, qpn2_scales)
     output_size = int(layer.weight.shape[0])
     input_size = int(layer.weight.shape[1]) * 2
     split_k, accumulator_chains = qpn2_launch_config(input_size, padded_output_size)
@@ -670,15 +763,26 @@ def apply_prepared_fp8_qpn8_linear(
     return out.reshape(x.shape[:-1] + (state.output_size,))
 
 
-def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
-    device_index = weight.device.index
-    if device_index is None:
-        device_index = torch.accelerator.current_device_index()
+def get_nvfp4_qpn4_dense_workspace(
+    weight: torch.Tensor, *, temporary: bool = False
+) -> torch.Tensor | None:
+    """Admit the bounded workspace, optionally without retaining an allocation.
+
+    Temporary admission uses the same bound as resident admission. The caller
+    must drop the probe before preparing weights; neither pool nor layer owns it.
+    """
     elements = max(NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 2)
-    cache_key = (device_index, torch.float16, elements)
-    workspace = _nvfp4_qpn4_dense_workspaces.get(cache_key)
-    if workspace is not None:
-        return workspace
+    if not temporary:
+        device_index = weight.device.index
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        cache_key = (device_index, torch.float16, elements)
+        pool = workspace_pool(
+            "_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces
+        )
+        workspace = pool.get(cache_key)
+        if workspace is not None:
+            return workspace
     try:
         workspace = torch.empty(
             (elements,),
@@ -687,20 +791,21 @@ def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
         )
     except torch.OutOfMemoryError:
         return None
-    _nvfp4_qpn4_dense_workspaces[cache_key] = workspace
+    if not temporary:
+        pool[cache_key] = workspace
     return workspace
 
 
 def prepare_nvfp4_qpn4_linear(
     layer: torch.nn.Module,
-    workspace: torch.Tensor,
+    workspace: torch.Tensor | None,
     gated_silu: bool,
 ) -> None:
     """Replace one accepted NVFP4 dense weight with memory-neutral QPN4."""
     from vllm import _sm70_ops as sm70_ops
 
     qweight = unpack_mxfp4_weight(layer.weight.data)
-    use_scale_code = gated_silu or envs.VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE
+    use_scale_code = gated_silu or format_option("nvfp4", "down_scale_code")
     global_scale = 0.0
     if use_scale_code:
         global_scale = float(layer.weight_global_scale.detach().float().item())
@@ -720,7 +825,8 @@ def prepare_nvfp4_qpn4_linear(
         packed_weight, packed_scales = sm70_ops.nvfp4_qpn4_prepare_sm70(
             qweight, fp16_scales
         )
-    register_layer_workspace(layer, workspace)
+    if workspace is not None:
+        register_layer_workspace(layer, workspace, family="nvfp4")
     _store_state(
         layer,
         packed_weight,
@@ -732,6 +838,7 @@ def prepare_nvfp4_qpn4_linear(
         gated_silu=gated_silu,
         global_scale=global_scale,
         use_scale_code=use_scale_code,
+        qpn4_lazy_dense_workspace=workspace is None,
     )
 
 
@@ -740,173 +847,20 @@ def apply_prepared_linear(
     x: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    state = getattr(layer, STATE_ATTR)
-    reshaped_x = x.reshape(-1, x.shape[-1])
-    out_shape = x.shape[:-1] + (state.output_size,)
-    kernel_output_size = state.padded_output_size or state.output_size
-    out = torch.empty(
-        (reshaped_x.shape[0], kernel_output_size),
-        dtype=x.dtype,
-        device=x.device,
+    from vllm.model_executor.kernels.linear.sm70_provider import apply_prepared
+
+    return apply_prepared(
+        getattr(layer, STATE_ATTR), x, bias, getattr(layer, "prefix", "")
     )
-    from vllm import _sm70_ops as sm70_ops
-
-    if state.op_kind == "uint4":
-        sm70_ops.awq_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "mxfp4":
-        sm70_ops.mxfp4_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "nvfp4" and state.use_scale_code:
-        sm70_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "nvfp4":
-        op = (
-            sm70_ops.nvfp4_gemm_sm70_prescaled_out
-            if state.prescaled_scales
-            else sm70_ops.nvfp4_gemm_sm70_out
-        )
-        op(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "nvfp4_qpn4":
-        if reshaped_x.dtype != torch.float16:
-            raise RuntimeError(
-                f"SM70 NVFP4 QPN4 requires float16 activations, got {reshaped_x.dtype}."
-            )
-        if reshaped_x.stride(-1) != 1:
-            reshaped_x = reshaped_x.contiguous()
-        torch.ops.vllm.sm70_nvfp4_qpn4_dispatch(
-            out,
-            layer.prefix,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.use_scale_code,
-            False,
-        )
-    elif state.op_kind == "nvfp4_qpn2_dense":
-        if reshaped_x.dtype != torch.float16:
-            raise RuntimeError(
-                "The pre-Ampere NVFP4 QPN2 path requires float16 activations, "
-                f"got {reshaped_x.dtype}."
-            )
-        if reshaped_x.stride(-1) != 1:
-            reshaped_x = reshaped_x.contiguous()
-        from vllm.model_executor.layers.quantization.utils import (
-            nvfp4_qpn2_dequant,
-        )
-
-        out = nvfp4_qpn2_dequant.nvfp4_qpn2_dispatch_linear(
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            kernel_output_size,
-            reshaped_x.shape[1],
-            state.split_k,
-            state.accumulator_chains,
-        )
-    else:
-        raise AssertionError(f"unknown SM70 TurboMind op kind: {state.op_kind}")
-    if kernel_output_size != state.output_size:
-        out = out[:, : state.output_size]
-    if state.gated_silu and state.op_kind == "nvfp4":
-        out_features = state.output_size // 2
-        out = (
-            out.reshape(reshaped_x.shape[0], out_features, 2)
-            .transpose(1, 2)
-            .reshape(reshaped_x.shape[0], state.output_size)
-        )
-    if bias is not None:
-        out.add_(bias)
-    return out.reshape(out_shape)
 
 
 def apply_prepared_fused_silu_and_mul(
     layer: torch.nn.Module,
     x: torch.Tensor,
 ) -> torch.Tensor | None:
+    from vllm.model_executor.kernels.linear.sm70_provider import apply_prepared
+
     state = getattr(layer, STATE_ATTR, None)
-    if (
-        state is None
-        or state.op_kind not in ("nvfp4", "nvfp4_qpn4")
-        or not state.gated_silu
-    ):
+    if state is None:
         return None
-    if x.dtype != torch.float16:
-        raise RuntimeError(
-            "SM70 TurboMind NVFP4 gated-SiLU requires float16 activations, "
-            f"got {x.dtype}."
-        )
-
-    reshaped_x = x.reshape(-1, x.shape[-1])
-    if reshaped_x.stride(-1) != 1:
-        reshaped_x = reshaped_x.contiguous()
-    out_features = state.output_size // 2
-    out = torch.empty(
-        (reshaped_x.shape[0], out_features),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    if reshaped_x.shape[0] == 0:
-        return out.reshape(*x.shape[:-1], out_features)
-
-    from vllm import _sm70_ops as sm70_ops
-
-    if state.op_kind == "nvfp4_qpn4":
-        torch.ops.vllm.sm70_nvfp4_qpn4_dispatch(
-            out,
-            layer.prefix,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.use_scale_code,
-            True,
-        )
-    else:
-        op = (
-            sm70_ops.nvfp4_gemm_sm70_prescaled_out
-            if state.prescaled_scales
-            else sm70_ops.nvfp4_gemm_sm70_out
-        )
-        op(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-            True,
-        )
-    return out.reshape(*x.shape[:-1], out_features)
+    return apply_prepared(state, x, None, getattr(layer, "prefix", ""), gated=True)

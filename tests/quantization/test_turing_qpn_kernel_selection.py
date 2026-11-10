@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm import envs
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.kernels import linear
 from vllm.model_executor.kernels.linear import pre_ampere_qpn as qpn
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -51,7 +51,7 @@ def engine(monkeypatch):
             fp8_qpn8_prefill_sm70_out=True,
         ),
     )
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     with set_current_vllm_config(config):
         yield config
     envs.disable_envs_cache()
@@ -247,6 +247,8 @@ def test_kernelconfig_and_legacy_disable(engine, monkeypatch):
     assert not qpn.TuringQpn8Fp8LinearKernel.can_implement(fp8_config())[0]
     engine.kernel_config.sm70_nvfp4.dense_qpn2 = True
     monkeypatch.setenv("VLLM_SM70_NVFP4_TURBOMIND", "0")
+    assert qpn.TuringQpn2NvFp4LinearKernel.can_implement(nvfp4_config())[0]
+    engine.kernel_config.sm70_nvfp4.enabled = False
     assert (
         "override" in qpn.TuringQpn2NvFp4LinearKernel.can_implement(nvfp4_config())[1]
     )
