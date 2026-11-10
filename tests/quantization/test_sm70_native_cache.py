@@ -100,3 +100,62 @@ def test_diagnostic_change_reuses_same_partition(tmp_path, native_tables, monkey
     with set_current_vllm_config(second):
         cache.import_cache(None, packed)
     assert imported[-1] == (two, b"same-calculation")
+
+
+def test_complete_policy_cache_matches_current_calculation(tmp_path, native_tables):
+    exported, _ = native_tables
+    first, second = _config(8), _config(16)
+    values = first.kernel_config.sm70_fp8.native.values
+    exported.update({(): b"legacy", values: b"selected-plans"})
+    path = str(tmp_path / "lut.bin")
+    with set_current_vllm_config(first):
+        cache.export_cache(None, path)
+        assert cache.has_matching_policy_cache(path)
+    with set_current_vllm_config(second):
+        assert not cache.has_matching_policy_cache(path)
+    Path(path + ".policy-v1").unlink()
+    with set_current_vllm_config(first):
+        assert not cache.has_matching_policy_cache(path)
+
+
+def test_dynamic_dispatch_imports_only_complete_policy_cache(
+    tmp_path, native_tables, monkeypatch
+):
+    import torch
+
+    from vllm.model_executor.warmup import awq_sm70_warmup as warmup
+
+    exported, imported = native_tables
+    first, second = _config(8), _config(16)
+    values = first.kernel_config.sm70_fp8.native.values
+    exported.update({(): b"legacy", values: b"selected-plans"})
+    path = str(tmp_path / "lut.bin")
+    monkeypatch.setattr(warmup, "_resolve_lut_path", lambda device: path)
+    monkeypatch.setattr(
+        torch.ops._C, "sm70_gemm_import_cache", lambda *args: None, raising=False
+    )
+    with set_current_vllm_config(first):
+        cache.export_cache(None, path)
+        assert warmup._load_lut_cache(torch.device("cpu"), skip_import=True) == 2
+    assert imported == [((), b"legacy"), (values, b"selected-plans")]
+    imported.clear()
+    with set_current_vllm_config(second):
+        assert warmup._load_lut_cache(torch.device("cpu"), skip_import=True) == 0
+    assert imported == []
+
+
+def test_warmup_uses_worker_configuration_and_restores_outer_scope(monkeypatch):
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.model_executor.warmup import awq_sm70_warmup as warmup
+
+    outer, current = _config(8), _config(16)
+    observed = []
+    monkeypatch.setattr(
+        warmup,
+        "_sm70_awq_warmup_impl",
+        lambda worker: observed.append(get_current_vllm_config_or_none()),
+    )
+    with set_current_vllm_config(outer):
+        warmup.sm70_awq_warmup(SimpleNamespace(vllm_config=current))
+        assert get_current_vllm_config_or_none() is outer
+    assert observed == [current]

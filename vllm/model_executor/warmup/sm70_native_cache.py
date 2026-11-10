@@ -61,6 +61,22 @@ def _key(values):
     return hashlib.sha256(json.dumps(calculation).encode()).hexdigest()
 
 
+def has_matching_policy_cache(path: str) -> bool:
+    """Whether an explicit table covers every current calculation policy."""
+    policies = _policies()
+    if policies == ((),):
+        return False
+    partition_path = Path(path + ".policy-v1")
+    source = partition_path if partition_path.exists() else Path(path)
+    payload = source.read_bytes()
+    if not payload.startswith(_MAGIC):
+        return False
+    partitions = json.loads(payload[len(_MAGIC) :])
+    return isinstance(partitions, dict) and all(
+        _key(values) in partitions for values in policies
+    )
+
+
 def import_cache(device_hint, path: str) -> int:
     policies = _policies()
     partition_path = Path(path + ".policy-v1")

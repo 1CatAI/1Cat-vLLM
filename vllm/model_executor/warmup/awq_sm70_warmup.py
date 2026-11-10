@@ -13,6 +13,7 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings
+from vllm.config import set_current_vllm_config
 from vllm.config.sm70_moe import (
     capture_mxfp4_moe_config,
     capture_nvfp4_moe_config,
@@ -125,19 +126,22 @@ def _load_lut_cache(device: torch.device, skip_import: bool = False) -> int:
     path = _resolve_lut_path(device)
     if path is None or not hasattr(torch.ops._C, "sm70_gemm_import_cache"):
         return 0
-    if skip_import:
-        logger.info(
-            "Skipping SM70 GEMM LUT import for dynamic quant dispatch "
-            "(path=%s, device=%s).",
-            path,
-            device,
-        )
-        return 0
     if not Path(path).exists():
         logger.info("No SM70 GEMM LUT cache found at %s for device %s.", path, device)
         return 0
     device_hint = torch.empty(0, dtype=torch.uint8, device=device)
     try:
+        # An explicitly supplied, complete policy-scoped table fixes the
+        # measured split-K choices across restarts. Untagged or mismatched
+        # tables retain the dynamic dispatch warmup behavior.
+        if skip_import and not sm70_native_cache.has_matching_policy_cache(path):
+            logger.info(
+                "Skipping SM70 GEMM LUT import for dynamic quant dispatch "
+                "(path=%s, device=%s).",
+                path,
+                device,
+            )
+            return 0
         return int(sm70_native_cache.import_cache(device_hint, path))
     except Exception as exc:
         logger.warning("SM70 GEMM LUT import failed from %s (%s).", path, exc)
@@ -1227,6 +1231,13 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
 
 
 def sm70_awq_warmup(worker: Worker) -> None:
+    # Bind the same native owner and calculation policies used by forwards.
+    # Worker RPC warmup runs outside the model-loading configuration scope.
+    with set_current_vllm_config(worker.vllm_config):
+        _sm70_awq_warmup_impl(worker)
+
+
+def _sm70_awq_warmup_impl(worker: Worker) -> None:
     if not worker.vllm_config.kernel_config.sm70_runtime.value("awq_warmup"):
         return
     if not hasattr(torch.ops._C, "awq_gemm_sm70_out"):
