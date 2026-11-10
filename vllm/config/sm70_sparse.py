@@ -79,6 +79,8 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
     """Score workspace budget; retain the qualified 64 MiB default."""
     qsa_prefill_tp_rows: bool = False
     """Partition eligible replicated QSA prefill scoring across four TP ranks."""
+    qsa_dcp_grouped_page4: bool = False
+    """Opt in to grouped page4 DCP partial attention; retains FP16 partial rounding."""
     qsa_decode_partition_topk: bool = False
     """Reuse exact local/merged Top-K stages for qualified M5/M10 decode rows."""
     qsa_cublas_min_rows: int | None = None
@@ -176,6 +178,11 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
             or any(field.startswith("qsa_") for field in self.hash_fields)
         ):
             factors["qsa_prefill_tp_rows"] = True
+        if self.qsa_dcp_grouped_page4 and (
+            self.hash_fields is None
+            or any(field.startswith("qsa_") for field in self.hash_fields)
+        ):
+            factors["qsa_dcp_grouped_page4"] = True
         if self.qsa_decode_partition_topk and (
             self.hash_fields is None
             or any(field.startswith("qsa_") for field in self.hash_fields)
