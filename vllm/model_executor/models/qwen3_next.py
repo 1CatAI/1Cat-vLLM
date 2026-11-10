@@ -412,15 +412,14 @@ class Qwen3NextAttention(nn.Module):
             and current_platform.is_device_capability(
                 70, device_id=torch.accelerator.current_device_index()
             )
-            and tp_size == 4
             and model_config is not None
             and model_config.dtype == torch.float16
             and model_config.quantization == "compressed-tensors"
             and config.model_type == "qwen3_5_text"
             and _is_dflash2_spec_config(get_current_vllm_config())
             and self.attn_output_gate
-            and self.num_heads == 6
-            and self.num_kv_heads == 1
+            and self.num_kv_heads > 0
+            and self.num_heads == 6 * self.num_kv_heads
             and self.head_dim == 256
             and getattr(self.rotary_emb, "rotary_dim", None) == 64
             and getattr(self.rotary_emb, "mrope_interleaved", False)
@@ -470,8 +469,12 @@ class Qwen3NextAttention(nn.Module):
         )
 
         if self.sm70_qk_rope_prep:
-            q = torch.empty((qkv.shape[0], 1536), device=qkv.device, dtype=qkv.dtype)
-            k = torch.empty((qkv.shape[0], 256), device=qkv.device, dtype=qkv.dtype)
+            q = torch.empty(
+                (qkv.shape[0], self.q_size), device=qkv.device, dtype=qkv.dtype
+            )
+            k = torch.empty(
+                (qkv.shape[0], self.kv_size), device=qkv.device, dtype=qkv.dtype
+            )
             gate = torch.empty_like(q)
             torch.ops.vllm.sm70_qwen38_qk_norm_rope_cache(
                 qkv,

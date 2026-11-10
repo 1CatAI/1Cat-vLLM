@@ -110,21 +110,27 @@ def test_qwen35_gdn_split_graph_replay_reads_current_projection_values():
 
 
 @pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize(
-    "num_rows", [1, 4, 5, 7, 8, 10, 15, 20, 25, 30, 33, 35, 39, 40]
+    "num_rows", [1, 4, 5, 7, 8, 10, 15, 20, 25, 30, 33, 35, 39, 40, 64]
 )
-def test_qwen35_combined_split_preserves_tails_across_graph_replay(compiled, num_rows):
+def test_qwen35_combined_split_preserves_tails_across_graph_replay(
+    compiled, num_rows, tp
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the Qwen3.5 GDN split kernel")
 
-    # Real TP4 NVFP4 geometry: 4120 logical columns in a 4128-column row.
-    # Both input arguments alias this allocation, and b/a start at an offset.
-    storage = torch.empty((num_rows, 4128), dtype=torch.float16, device="cuda")
-    projection = storage[:, :4120]
+    qkv, z, ba = 10240 // tp, 6144 // tp, 48 // tp
+    qkvz = qkv + z
+    logical = qkvz + 2 * ba
+    physical = (logical + 31) // 32 * 32
+    # Both arguments alias a padded native projection; b/a start at an offset.
+    storage = torch.empty((num_rows, physical), dtype=torch.float16, device="cuda")
+    projection = storage[:, :logical]
 
     def split(values):
         return _sm70_materialize_qwen35_gdn_splits(
-            values, values[:, 4096:4120], 2560, 1536, 12
+            values, values[:, qkvz:logical], qkv, z, ba
         )
 
     if compiled:
@@ -137,23 +143,23 @@ def test_qwen35_combined_split_preserves_tails_across_graph_replay(compiled, num
         actual = split(projection)
         # The consumer may overwrite QKV in the same graph. Tail outputs must
         # be independent snapshots, including the two small gating vectors.
-        projection[:, :2560].zero_()
+        projection[:, :qkv].zero_()
 
     for seed in (41, 42, 43):
         torch.manual_seed(seed)
         storage.normal_()
         expected = [
             projection[:, start:end].clone()
-            for start, end in ((2560, 4096), (4096, 4108), (4108, 4120))
+            for start, end in ((qkv, qkvz), (qkvz, qkvz + ba), (qkvz + ba, logical))
         ]
-        padding = storage[:, 4120:].clone()
+        padding = storage[:, logical:].clone()
         graph.replay()
         torch.cuda.synchronize()
         for result, reference in zip(actual, expected):
             assert result.is_contiguous()
             assert torch.equal(result.view(torch.uint8), reference.view(torch.uint8))
-        assert torch.count_nonzero(projection[:, :2560]) == 0
-        assert torch.equal(storage[:, 4120:], padding)
+        assert torch.count_nonzero(projection[:, :qkv]) == 0
+        assert torch.equal(storage[:, logical:], padding)
 
 
 @pytest.mark.parametrize("num_rows", [1, 8])

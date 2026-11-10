@@ -22,13 +22,19 @@ def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
     return current_platform.is_device_capability(70, device_id=device_id)
 
 
+@torch.compiler.assume_constant_result
+def _sm70_gated_norm_max_rows() -> int:
+    capacity = getattr(torch.ops._C, "sm70_rmsnorm_gated_exact_max_rows", None)
+    return int(capacity()) if capacity is not None else 768
+
+
 def _sm70_gated_norm_shape_supported(
     x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
 ) -> bool:
     return bool(
         z is not None
         and x.ndim == 2
-        and 1 <= x.shape[0] <= 768  # 64 tokens x 12 local heads
+        and 1 <= x.shape[0] <= _sm70_gated_norm_max_rows()
         and x.shape[1] == 128
         and z.shape == x.shape
         and weight.shape == (128,)

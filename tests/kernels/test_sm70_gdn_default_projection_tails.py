@@ -38,6 +38,7 @@ def test_default_forward_tail_route(monkeypatch, m):
         value_dim=6144,
         tp_size=4,
         num_v_heads=48,
+        head_k_dim=128,
         head_v_dim=128,
         _output_projection=lambda core, z, out, count: outputs.append(z),
     )

@@ -76,6 +76,12 @@ def _restore_bundled_prefill_operands(
         tl.store(OutScales + index, effective * 16384.0, index < ScaleCount)
 
 
+@torch.compiler.assume_constant_result
+def _native_decode_rows() -> int:
+    capacity = getattr(torch.ops._C, "nvfp4_qpn2_max_rows_sm70", None)
+    return int(capacity()) if capacity is not None else 32
+
+
 def _dispatch(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -91,7 +97,7 @@ def _dispatch(
 
     # Keep M dispatch opaque: compiled token ranges include both decode and
     # prefill. Native QPN2 codes and E4M3 scales are the only resident layout.
-    if x.shape[0] <= 32:
+    if x.shape[0] <= _native_decode_rows():
         # Retune only the single-request gated shape; preserve the admitted
         # two-chain batch reductions for concurrent requests.
         if (

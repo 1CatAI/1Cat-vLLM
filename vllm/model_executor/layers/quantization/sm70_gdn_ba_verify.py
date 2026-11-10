@@ -8,6 +8,15 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.platforms import current_platform
 
 
+def _gdn_ba_shard_supported(qkvz_width: int, heads: int) -> bool:
+    if heads <= 0 or qkvz_width != heads * 1024 // 3 or heads % 3:
+        return False
+    if qkvz_width == 4096:
+        return True  # Original binary contract.
+    revision = getattr(torch.ops._C, "fp8_qpn8_ba_split_geometry_revision", None)
+    return revision is not None and revision() >= 1
+
+
 def apply_gdn_ba_verify(layer, x, outputs=None):
     qkvz = layer.in_proj_qkvz
     ba = layer.in_proj_ba
@@ -17,15 +26,25 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
         or not isinstance(qkvz, LinearBase)
         or not isinstance(ba, LinearBase)
         or not current_platform.is_device_capability(70)
-        or not getattr(qkvz, "sm70_fp8_qpn8", False)
+    ):
+        return None
+    heads = layer.num_v_heads // layer.tp_size
+    z_width = heads * layer.head_v_dim
+    qkv_width = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
+    width = qkv_width + z_width
+    if (
+        not getattr(qkvz, "sm70_fp8_qpn8", False)
         or x.ndim != 2
         or x.shape[1] != 5120
         or not 2 <= x.shape[0] <= 32
         or x.dtype != torch.float16
         or not x.is_contiguous()
-        or qkvz.weight.shape != (5120, 4096)
-        or qkvz.weight_scale_inv.shape != (1, 4096)
-        or ba.weight.shape != (24, 5120)
+        or layer.head_k_dim != 128
+        or layer.head_v_dim != 128
+        or not _gdn_ba_shard_supported(width, heads)
+        or qkvz.weight.shape != (5120, width)
+        or qkvz.weight_scale_inv.shape != (1, width)
+        or ba.weight.shape != (2 * heads, 5120)
         or ba.weight.dtype != torch.float16
         or not ba.weight.is_contiguous()
         or layer.gqa_interleaved_layout
@@ -51,9 +70,9 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
             out.copy_(part)
         return outputs
     if outputs is None:
-        qkv = x.new_empty((rows, 2560))
-        z = x.new_empty((rows, 1536))
-        b = x.new_empty((rows, 12))
+        qkv = x.new_empty((rows, qkv_width))
+        z = x.new_empty((rows, z_width))
+        b = x.new_empty((rows, heads))
         a = torch.empty_like(b)
     else:
         qkv, z, b, a = outputs
@@ -63,7 +82,8 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
             or tensor.device != x.device
             or not tensor.is_contiguous()
             for tensor, shape in zip(
-                outputs, ((rows, 2560), (rows, 1536), (rows, 12), (rows, 12))
+                outputs,
+                ((rows, qkv_width), (rows, z_width), (rows, heads), (rows, heads)),
             )
         ):
             return None
@@ -77,8 +97,8 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
         z,
         b,
         a,
-        x.new_empty((rows, 4096)),
-        x.new_empty((rows, 24)),
+        x.new_empty((rows, width)),
+        x.new_empty((rows, 2 * heads)),
         0,
         x,
         qkvz.weight,

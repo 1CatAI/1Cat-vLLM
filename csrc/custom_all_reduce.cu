@@ -558,7 +558,7 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
 
 namespace {
 
-template <int kWorldSize>
+template <int kWorldSize, bool EightWarpOrder = false>
 void sm70_all_reduce_gemma_rms_norm_impl(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,
@@ -661,15 +661,21 @@ void sm70_all_reduce_gemma_rms_norm_impl(
       if (!benchmark_reference && fa->sm70_push_norm_batch_ready(num_tokens)) {
         k16_out = vllm::sm70::k16_twin_for(normalized_out, k16_twin);
       }
+    } else {
+      if (!benchmark_reference && num_tokens > 8) {
+        k16_out = vllm::sm70::k16_twin_for(normalized_out, k16_twin);
+      }
     }
     if (weight.scalar_type() == at::ScalarType::Float) {
-      fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, float>(
+      fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, float,
+                                        EightWarpOrder>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
           residual_out_ptr, num_tokens, hidden_size, epsilon_f,
           benchmark_reference, k16_out);
     } else {
-      fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, half>(
+      fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, half,
+                                        EightWarpOrder>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
           residual_out_ptr, num_tokens, hidden_size, epsilon_f,
@@ -695,6 +701,25 @@ void sm70_all_reduce_gemma_rms_norm_impl(
 }
 
 }  // namespace
+
+void sm70_all_reduce_gemma_rms_norm(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon) {
+  TORCH_CHECK_EQ(residual.scalar_type(), at::ScalarType::Float);
+  const auto* fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  if (fa->world_size_ == 2) {
+    sm70_all_reduce_gemma_rms_norm_impl<2, true>(
+        _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
+        reg_buffer_sz_bytes, epsilon);
+  } else {
+    TORCH_CHECK_EQ(fa->world_size_, 4);
+    sm70_all_reduce_gemma_rms_norm_impl<4>(
+        _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
+        reg_buffer_sz_bytes, epsilon);
+  }
+}
 
 void sm70_tp2_all_reduce_gemma_rms_norm(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,

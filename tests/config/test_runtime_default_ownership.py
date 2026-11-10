@@ -120,6 +120,27 @@ def apply(cfg, monkeypatch, capability=70):
     finalize_runtime_policy_hashes(cfg)
 
 
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_qualified_mtp_collective_default_preserves_overrides(
+    monkeypatch, tp, override
+):
+    cfg = engine(tp=tp, spec="mtp")
+    cfg.model_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+    if override is not None:
+        cfg.parallel_config.communication.gemma_rms_tp2 = override
+    apply(cfg, monkeypatch)
+    assert cfg.parallel_config.communication.value("gemma_rms_tp2") is (
+        True if override is None else override
+    )
+
+
+def test_unqualified_model_keeps_collective_default(monkeypatch):
+    cfg = engine(tp=2, spec="mtp")
+    apply(cfg, monkeypatch)
+    assert not cfg.parallel_config.communication.value("gemma_rms_tp2")
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_engines_do_not_inherit_auto_defaults(monkeypatch, reverse):
     fast = engine(spec="mtp")

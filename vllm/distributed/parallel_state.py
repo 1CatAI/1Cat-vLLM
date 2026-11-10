@@ -156,6 +156,25 @@ def all_reduce_sum2_fake(
     return torch.empty_like(tensor_a)
 
 
+def all_reduce_gemma_rms_norm(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    if group.device_communicator is None:
+        raise ValueError("No device communicator found")
+    fused_op = getattr(group.device_communicator, "all_reduce_gemma_rms_norm", None)
+    if fused_op is None:
+        raise RuntimeError("Device communicator lacks fused all-reduce RMSNorm")
+    return fused_op(tensor, residual, weight, epsilon)
+
+
 def sm70_tp2_all_reduce_gemma_rms_norm(
     tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -172,7 +191,7 @@ def sm70_tp2_all_reduce_gemma_rms_norm(
     )
 
 
-def sm70_tp2_all_reduce_gemma_rms_norm_fake(
+def all_reduce_gemma_rms_norm_fake(
     tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -421,9 +440,15 @@ direct_register_custom_op(
 )
 
 direct_register_custom_op(
+    op_name="all_reduce_gemma_rms_norm",
+    op_func=all_reduce_gemma_rms_norm,
+    fake_impl=all_reduce_gemma_rms_norm_fake,
+)
+
+direct_register_custom_op(
     op_name="sm70_tp2_all_reduce_gemma_rms_norm",
     op_func=sm70_tp2_all_reduce_gemma_rms_norm,
-    fake_impl=sm70_tp2_all_reduce_gemma_rms_norm_fake,
+    fake_impl=all_reduce_gemma_rms_norm_fake,
 )
 
 direct_register_custom_op(

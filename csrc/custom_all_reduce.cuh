@@ -1231,26 +1231,79 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
   }
 }
 
+// The opaque FP32-residual Gemma norm uses an eight-warp reduction. Share its
+// arithmetic across peer-pull and peer-push collectives, including explicit
+// FMA and cast boundaries. The caller publishes values and synchronizes first,
+// then synchronizes again before consuming inverse_rms.
+__device__ __forceinline__ void sm70_gemma_eight_warp_inverse(
+    const float* shared_values, float* warp_sum, float& inverse_rms,
+    float epsilon) {
+  constexpr int Width = 5120;
+  const int tid = threadIdx.x;
+  if (tid < 256) {
+    float v[24] = {};
+#pragma unroll
+    for (int chunk = 0; chunk < 3; ++chunk) {
+      int col = tid * 8 + chunk * 2048;
+      if (col < Width) {
+        float4 s0 = reinterpret_cast<const float4*>(shared_values + col)[0];
+        float4 s1 = reinterpret_cast<const float4*>(shared_values + col)[1];
+        v[chunk * 8] = s0.x;
+        v[chunk * 8 + 1] = s0.y;
+        v[chunk * 8 + 2] = s0.z;
+        v[chunk * 8 + 3] = s0.w;
+        v[chunk * 8 + 4] = s1.x;
+        v[chunk * 8 + 5] = s1.y;
+        v[chunk * 8 + 6] = s1.z;
+        v[chunk * 8 + 7] = s1.w;
+      }
+    }
+    float variance = __fmul_rn(v[1], v[1]);
+    variance = __fmaf_rn(v[0], v[0], variance);
+#pragma unroll
+    for (int i = 2; i < 16; ++i) variance = __fmaf_rn(v[i], v[i], variance);
+#pragma unroll
+    for (int i = 16; i < 24; ++i)
+      variance = __fadd_rn(__fmul_rn(v[i], v[i]), variance);
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+      variance =
+          __fadd_rn(variance, __shfl_xor_sync(0xffffffff, variance, offset));
+    if ((tid & 31) == 0) warp_sum[tid / 32] = variance;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float partial[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      partial[i] = __fadd_rn(warp_sum[i], warp_sum[i + 4]);
+    float total = __fadd_rn(__fadd_rn(partial[0], partial[2]),
+                            __fadd_rn(partial[1], partial[3]));
+    float mean = __fmaf_rn(total, 1.0f / Width, epsilon), inv;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(mean));
+    inverse_rms = inv;
+  }
+}
+
 // This prototype deliberately stays narrow: it mirrors the FP32 Gemma RMSNorm
 // reduction order for a [tokens, 5120] FP16 projection. Each CTA handles one
 // row, retains the normal all-reduce peer order, and applies only its local
 // residual after the peer reduction.
-template <int Threads, int ngpus, typename ResidualT, typename WeightT>
-__global__ void __launch_bounds__(Threads, 1)
-    sm70_peer_reduce_gemma_rms_norm(RankData* _dp, RankSignals sg,
-                                    Signal* self_sg,
-                                    const ResidualT* __restrict__ residual,
-                                    const WeightT* __restrict__ weight,
-                                    half* __restrict__ normalized_out,
-                                    float* __restrict__ residual_out, int rank,
-                                    float epsilon) {
+template <int Threads, int ngpus, typename ResidualT, typename WeightT,
+          bool EightWarpOrder = false>
+__global__ void __launch_bounds__(Threads, 1) sm70_peer_reduce_gemma_rms_norm(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const ResidualT* __restrict__ residual, const WeightT* __restrict__ weight,
+    half* __restrict__ normalized_out, float* __restrict__ residual_out,
+    int rank, float epsilon, half* k16_out, int num_tokens) {
   using P = typename packed_t<half>::P;
   using A = typename packed_t<half>::A;
   constexpr int kPackedWidth = P::size;
   constexpr int kVarianceVectorWidth = 4;
 
-  __shared__ float residual_values[kSm70GemmaRmsNormHiddenSize];
+  __shared__ __align__(16) float residual_values[kSm70GemmaRmsNormHiddenSize];
   __shared__ float inverse_rms;
+  __shared__ float warp_sum[8];
   using BlockReduce = cub::BlockReduce<float, Threads>;
   __shared__ typename BlockReduce::TempStorage reduce_store;
 
@@ -1278,23 +1331,29 @@ __global__ void __launch_bounds__(Threads, 1)
   }
   __syncthreads();
 
-  // Match rms_norm_kernel<float, 4, 2>: each thread consumes vector indices
-  // tid, tid + blockDim.x, ... and CUB reduces the resulting partial sums.
-  float variance = 0.0f;
-  for (int vector_idx = tid;
-       vector_idx < kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
-       vector_idx += blockDim.x) {
-    const int element_offset = vector_idx * kVarianceVectorWidth;
+  if constexpr (EightWarpOrder) {
+    sm70_gemma_eight_warp_inverse(residual_values, warp_sum, inverse_rms,
+                                  epsilon);
+  } else {
+    // Match rms_norm_kernel<float, 4, 2>: each thread consumes vector indices
+    // tid, tid + blockDim.x, ... and CUB reduces the resulting partial sums.
+    float variance = 0.0f;
+    for (int vector_idx = tid;
+         vector_idx < kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
+         vector_idx += blockDim.x) {
+      const int element_offset = vector_idx * kVarianceVectorWidth;
 #pragma unroll
-    for (int i = 0; i < kVarianceVectorWidth; ++i) {
-      const float value = residual_values[element_offset + i];
-      variance += value * value;
+      for (int i = 0; i < kVarianceVectorWidth; ++i) {
+        const float value = residual_values[element_offset + i];
+        variance += value * value;
+      }
     }
-  }
-  variance = BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
+    variance =
+        BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
 
-  if (tid == 0) {
-    inverse_rms = rsqrtf(variance / kSm70GemmaRmsNormHiddenSize + epsilon);
+    if (tid == 0) {
+      inverse_rms = rsqrtf(variance / kSm70GemmaRmsNormHiddenSize + epsilon);
+    }
   }
   __syncthreads();
 
@@ -1307,8 +1366,15 @@ __global__ void __launch_bounds__(Threads, 1)
       const int column = element_offset + i;
       const float gemma_weight =
           sm70_gemma_rms_norm_to_float(weight[column]) + 1.0f;
-      normalized_out[row_offset + column] =
+      const half value =
           __float2half_rn(residual_values[column] * inverse_rms * gemma_weight);
+      normalized_out[row_offset + column] = value;
+      if (k16_out != nullptr) {
+        const size_t index =
+            (static_cast<size_t>(column / 16) * num_tokens + row) * 16 +
+            column % 16;
+        k16_out[index] = value;
+      }
     }
   }
 
@@ -1939,48 +2005,8 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
   reinterpret_cast<float4*>(residual_out)[pack * 2 + 1] =
       make_float4(values[4], values[5], values[6], values[7]);
   __syncthreads();
-  if (tid < 256) {
-    float v[24] = {};
-#pragma unroll
-    for (int chunk = 0; chunk < 3; ++chunk) {
-      int col = tid * 8 + chunk * 2048;
-      if (col < Width) {
-        float4 s0 = reinterpret_cast<const float4*>(shared_values + col)[0];
-        float4 s1 = reinterpret_cast<const float4*>(shared_values + col)[1];
-        v[chunk * 8] = s0.x;
-        v[chunk * 8 + 1] = s0.y;
-        v[chunk * 8 + 2] = s0.z;
-        v[chunk * 8 + 3] = s0.w;
-        v[chunk * 8 + 4] = s1.x;
-        v[chunk * 8 + 5] = s1.y;
-        v[chunk * 8 + 6] = s1.z;
-        v[chunk * 8 + 7] = s1.w;
-      }
-    }
-    float variance = __fmul_rn(v[1], v[1]);
-    variance = __fmaf_rn(v[0], v[0], variance);
-#pragma unroll
-    for (int i = 2; i < 16; ++i) variance = __fmaf_rn(v[i], v[i], variance);
-#pragma unroll
-    for (int i = 16; i < 24; ++i)
-      variance = __fadd_rn(__fmul_rn(v[i], v[i]), variance);
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-      variance =
-          __fadd_rn(variance, __shfl_xor_sync(0xffffffff, variance, offset));
-    if ((tid & 31) == 0) warp_sum[tid / 32] = variance;
-  }
-  __syncthreads();
+  sm70_gemma_eight_warp_inverse(shared_values, warp_sum, inverse, epsilon);
   if (tid == 0) {
-    float partial[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      partial[i] = __fadd_rn(warp_sum[i], warp_sum[i + 4]);
-    float total = __fadd_rn(__fadd_rn(partial[0], partial[2]),
-                            __fadd_rn(partial[1], partial[3]));
-    float mean = __fmaf_rn(total, 1.0f / Width, epsilon), inv;
-    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(mean));
-    inverse = inv;
     meta->generation[row] = generation;
   }
   __syncthreads();
@@ -2873,7 +2899,8 @@ class CustomAllreduce {
            fully_connected_ && sm70_tp4_push_buffers_registered_;
   }
 
-  template <int ngpus, typename ResidualT, typename WeightT>
+  template <int ngpus, typename ResidualT, typename WeightT,
+            bool EightWarpOrder = false>
   void sm70_allreduce_gemma_rms_norm(
       cudaStream_t stream, half* input, const ResidualT* residual,
       const WeightT* weight, half* normalized_out, float* residual_out,
@@ -3002,16 +3029,17 @@ class CustomAllreduce {
                                       ResidualT, WeightT>
           <<<num_tokens, kSm70GemmaRmsNormThreads, 0, stream>>>(
               ptrs, sg_, self_sg_, residual, weight, normalized_out,
-              residual_out, rank_, epsilon);
+              residual_out, rank_, epsilon, k16_out, num_tokens);
       return;
     }
 
     const int threads = sm70_gemma_rms_norm_threads(policy_);
-#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                          \
-  sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT>     \
-      <<<num_tokens, THREADS, 0, stream>>>(ptrs, sg_, self_sg_, residual, \
-                                           weight, normalized_out,        \
-                                           residual_out, rank_, epsilon)
+#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                               \
+  sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT,          \
+                                  EightWarpOrder>                              \
+      <<<num_tokens, THREADS, 0, stream>>>(                                    \
+          ptrs, sg_, self_sg_, residual, weight, normalized_out, residual_out, \
+          rank_, epsilon, k16_out, num_tokens)
     switch (threads) {
       case 256:
         VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(256);

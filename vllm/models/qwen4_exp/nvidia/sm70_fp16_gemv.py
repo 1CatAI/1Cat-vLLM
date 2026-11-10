@@ -98,15 +98,18 @@ def _qwen38_gdn_projection_split_kernel(
 
 def _split_gdn_projection_outputs(qkvz, ba):
     m = qkvz.shape[0]
-    out = tuple(qkvz.new_empty((m, n)) for n in (2560, 1536, 12, 12))
-    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(4096, 256))](
+    heads = ba.shape[1] // 2
+    z_width = heads * 128
+    qkv_width = qkvz.shape[1] - z_width
+    out = tuple(qkvz.new_empty((m, n)) for n in (qkv_width, z_width, heads, heads))
+    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(qkvz.shape[1], 256))](
         qkvz,
         ba,
         *out,
-        QKV=2560,
-        Z=1536,
-        B=12,
-        A=12,
+        QKV=qkv_width,
+        Z=z_width,
+        B=heads,
+        A=heads,
         BLOCK=256,
         COPY_QKV=True,
         num_warps=4,
@@ -118,19 +121,22 @@ def _split_gdn_projection_outputs(qkvz, ba):
 def _split_gdn_projection_tails(qkvz, ba, z_out):
     """Copy z/b/a together while preserving the input QKV view and stride."""
     m = qkvz.shape[0]
-    qkv = qkvz[:, :2560]
-    b, a = (qkvz.new_empty((m, 12)) for _ in range(2))
-    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(4096, 256))](
+    heads = ba.shape[1] // 2
+    z_width = heads * 128
+    qkv_width = qkvz.shape[1] - z_width
+    qkv = qkvz[:, :qkv_width]
+    b, a = (qkvz.new_empty((m, heads)) for _ in range(2))
+    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(qkvz.shape[1], 256))](
         qkvz,
         ba,
         qkv,
         z_out,
         b,
         a,
-        QKV=2560,
-        Z=1536,
-        B=12,
-        A=12,
+        QKV=qkv_width,
+        Z=z_width,
+        B=heads,
+        A=heads,
         BLOCK=256,
         COPY_QKV=False,
         num_warps=4,
@@ -147,8 +153,10 @@ def _can_fuse_gdn_projection_split(qkvz: torch.Tensor, ba: torch.Tensor) -> bool
         and _is_packed_row_major(qkvz)
         and _is_packed_row_major(ba)
         and qkvz.shape[0] > 1
-        and qkvz.shape[1] == 4096
-        and ba.shape == (qkvz.shape[0], 24)
+        and ba.shape[0] == qkvz.shape[0]
+        and 0 < ba.shape[1] <= 256
+        and ba.shape[1] % 6 == 0
+        and qkvz.shape[1] * 3 == ba.shape[1] * 512
         and qkvz.dtype == ba.dtype == torch.float16
         and qkvz.is_cuda
         and ba.is_cuda

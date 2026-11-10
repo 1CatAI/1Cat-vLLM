@@ -606,11 +606,7 @@ class Sm70PushGemmaRMSNormPattern(BasePattern):
         super().__init__(dtype, device)
         self.group_name = get_tp_group().unique_name
         self.epsilon = epsilon
-        self.collective = (
-            torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm
-            if tp_size == 2
-            else torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm
-        )
+        self.collective = torch.ops.vllm.all_reduce_gemma_rms_norm
 
     def get_inputs(self) -> list[torch.Tensor]:
         return [self.empty(8, 5120), self.empty_f32(8, 5120), self.empty(5120)]

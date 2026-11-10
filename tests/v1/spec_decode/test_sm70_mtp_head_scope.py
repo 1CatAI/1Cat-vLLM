@@ -9,6 +9,31 @@ from torch import nn
 from vllm.models.qwen4_exp.nvidia import sm70_mtp_head as head_ops
 
 
+@pytest.mark.parametrize("world", [1, 2, 4, 8])
+def test_refined_and_bounded_heads_use_the_actual_vocab_shard(monkeypatch, world):
+    from vllm.model_executor.models import qwen3_5_mtp_sm70_head as shared
+
+    monkeypatch.setattr(
+        shared, "get_tp_group", lambda: SimpleNamespace(world_size=world)
+    )
+    rows = 248320 // world
+    shard = SimpleNamespace(
+        org_vocab_start_index=(world - 1) * rows,
+        org_vocab_end_index=world * rows,
+        num_added_elements=0,
+        num_org_vocab_padding=0,
+    )
+    head = SimpleNamespace(
+        embedding_dim=5120, org_vocab_size=248320, shard_indices=shard
+    )
+    assert shared._mtp_head_shard_rows(head) == rows
+    shard.num_org_vocab_padding = 1
+    assert shared._mtp_head_shard_rows(head) is None
+    shard.num_org_vocab_padding = 0
+    shard.org_vocab_end_index -= 1
+    assert shared._mtp_head_shard_rows(head) is None
+
+
 def test_missing_pipeline_head_skips_draft_preparation():
     assert head_ops.prepare_mtp_qpn8_head(nn.Module()) is None
 
@@ -66,7 +91,9 @@ def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
         _sm70_draft_head=None,
         lm_head=target_head,
         vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(sm70_draft_hot_vocab=True),
+            kernel_config=SimpleNamespace(
+                sm70_draft_hot_vocab=True, sm70_draft_hot_vocab_ids="test-ids.pt"
+            ),
             compilation_config=SimpleNamespace(runtime=GraphPolicy(dual_compile=False)),
         ),
     )
@@ -75,8 +102,9 @@ def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
     )
     seen = []
 
-    def prepare_head(head, hot_vocab):
+    def prepare_head(head, hot_vocab, hot_vocab_ids):
         assert hot_vocab
+        assert hot_vocab_ids == "test-ids.pt"
         seen.append(head)
         return draft_view
 

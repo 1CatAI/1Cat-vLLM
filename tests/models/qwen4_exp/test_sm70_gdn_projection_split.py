@@ -30,11 +30,12 @@ def metadata(rows, width, **overrides):
 
 
 @pytest.mark.parametrize("rows", (0, 1, 2, 3, 4, 8, 16, 17, 32, 64, 127, 256, 4096))
-def test_admission_has_no_max_batch_binding(monkeypatch, rows):
+@pytest.mark.parametrize("heads", [12, 24])
+def test_admission_has_no_max_batch_binding(monkeypatch, rows, heads):
     monkeypatch.setenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1")
     monkeypatch.setattr(module.current_platform, "is_device_capability", lambda _: True)
     assert module._can_fuse_gdn_projection_split(
-        metadata(rows, 4096), metadata(rows, 24)
+        metadata(rows, heads * 1024 // 3), metadata(rows, heads * 2)
     ) == (rows > 1)
 
 

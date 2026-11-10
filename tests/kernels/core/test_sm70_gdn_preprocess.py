@@ -33,24 +33,29 @@ from vllm.platforms import current_platform
         (5, -1, 5, 3, 4096, 7),
     ],
 )
-def test_conv_gate_zero(tokens, slot, accepted, length, row_stride, state_length):
+@pytest.mark.parametrize("tp", [2, 4])
+def test_conv_gate_zero(tokens, slot, accepted, length, row_stride, state_length, tp):
     torch.manual_seed(17)
+    channels, heads = 10240 // tp, 48 // tp
+    row_stride *= 4 // tp
     raw = torch.randn(tokens, row_stride, device="cuda", dtype=torch.float16) * 0.1
-    reference = raw.clone()[:, :2560]
-    candidate = raw.clone()[:, :2560]
-    state = torch.randn(1, state_length, 2560, device="cuda", dtype=torch.float16) * 0.1
+    reference = raw.clone()[:, :channels]
+    candidate = raw.clone()[:, :channels]
+    state = (
+        torch.randn(1, state_length, channels, device="cuda", dtype=torch.float16) * 0.1
+    )
     reference_state = state.clone().transpose(-1, -2)
     candidate_state = state.clone().transpose(-1, -2)
-    weight = torch.randn(2560, 4, device="cuda", dtype=torch.float16) * 0.1
-    a = torch.randn(tokens, 12, device="cuda", dtype=torch.float16)
+    weight = torch.randn(channels, 4, device="cuda", dtype=torch.float16) * 0.1
+    a = torch.randn(tokens, heads, device="cuda", dtype=torch.float16)
     b = torch.randn_like(a)
-    a_log = torch.randn(12, device="cuda")
-    bias = torch.randn(12, device="cuda")
+    a_log = torch.randn(heads, device="cuda")
+    bias = torch.randn(heads, device="cuda")
     slots = torch.tensor([slot], device="cuda", dtype=torch.int32)
     counts = torch.tensor([accepted], device="cuda", dtype=torch.int32)
     cu = torch.tensor([0, length], device="cuda", dtype=torch.int32)
     out = torch.full(
-        (tokens, 12, 128), float("nan"), device="cuda", dtype=torch.float16
+        (tokens, heads, 128), float("nan"), device="cuda", dtype=torch.float16
     )
     causal_conv1d_update(
         reference,
@@ -92,7 +97,8 @@ def test_conv_gate_zero(tokens, slot, accepted, length, row_stride, state_length
 )
 @pytest.mark.parametrize("tokens", [1, 3, 5, 7, 8])
 @pytest.mark.parametrize("batch", [1, 2, 3, 8])
-def test_requests_in_padded_metadata(tokens, batch):
+@pytest.mark.parametrize("tp", [2, 4])
+def test_requests_in_padded_metadata(tokens, batch, tp):
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -100,16 +106,17 @@ def test_requests_in_padded_metadata(tokens, batch):
     )
 
     rows = batch * tokens
+    channels, heads = 10240 // tp, 48 // tp
     padded_requests = batch + 3
-    qkv = torch.empty(rows, 2560, device="cuda", dtype=torch.float16)
-    a = torch.empty(rows, 12, device="cuda", dtype=torch.float16)
+    qkv = torch.empty(rows, channels, device="cuda", dtype=torch.float16)
+    a = torch.empty(rows, heads, device="cuda", dtype=torch.float16)
     b = torch.empty_like(a)
-    state = torch.empty(batch, 10, 2560, device="cuda", dtype=torch.float16).transpose(
-        -1, -2
-    )
+    state = torch.empty(
+        batch, 10, channels, device="cuda", dtype=torch.float16
+    ).transpose(-1, -2)
     layer = SimpleNamespace(
         enable_sm70_dflash2_fused_gdn_verify=True,
-        tp_size=4,
+        tp_size=tp,
         num_k_heads=16,
         num_v_heads=48,
         head_k_dim=128,
@@ -117,7 +124,7 @@ def test_requests_in_padded_metadata(tokens, batch):
         gqa_interleaved_layout=False,
         activation="silu",
         conv1d=SimpleNamespace(
-            weight=torch.empty(2560, 1, 4, device="cuda", dtype=torch.float16),
+            weight=torch.empty(channels, 1, 4, device="cuda", dtype=torch.float16),
             bias=None,
         ),
     )
@@ -228,27 +235,31 @@ def test_conv_gate_zero_changed_metadata_graph(tokens):
 )
 @pytest.mark.parametrize("tokens", [1, 3, 5, 8])
 @pytest.mark.parametrize("batch", [2, 3, 8, 32])
-def test_conv_gate_zero_request_isolation_and_graph(batch, tokens):
+@pytest.mark.parametrize("tp", [2, 4])
+def test_conv_gate_zero_request_isolation_and_graph(batch, tokens, tp):
     torch.manual_seed(29)
     rows = batch * tokens
-    raw = torch.randn(rows, 4096, device="cuda", dtype=torch.float16) * 0.1
-    reference, candidate = raw.clone()[:, :2560], raw.clone()[:, :2560]
+    channels, heads, stride = 10240 // tp, 48 // tp, 16384 // tp
+    raw = torch.randn(rows, stride, device="cuda", dtype=torch.float16) * 0.1
+    reference, candidate = raw.clone()[:, :channels], raw.clone()[:, :channels]
     original_state = (
-        torch.randn(batch + 2, tokens + 4, 2560, device="cuda", dtype=torch.float16)
+        torch.randn(batch + 2, tokens + 4, channels, device="cuda", dtype=torch.float16)
         * 0.1
     )
     reference_state = original_state.clone().transpose(-1, -2)
     candidate_state = original_state.clone().transpose(-1, -2)
-    weight = torch.randn(2560, 4, device="cuda", dtype=torch.float16) * 0.1
-    a, b = [torch.randn(rows, 12, device="cuda", dtype=torch.float16) for _ in range(2)]
-    a_log, bias = torch.randn(12, device="cuda"), torch.randn(12, device="cuda")
+    weight = torch.randn(channels, 4, device="cuda", dtype=torch.float16) * 0.1
+    a, b = [
+        torch.randn(rows, heads, device="cuda", dtype=torch.float16) for _ in range(2)
+    ]
+    a_log, bias = torch.randn(heads, device="cuda"), torch.randn(heads, device="cuda")
     index_storage = torch.zeros(batch, tokens, device="cuda", dtype=torch.int32)
     slots = index_storage[:, 0]
     slots.copy_(torch.randperm(batch, device="cuda").int())
     counts = torch.arange(batch, device="cuda", dtype=torch.int32) % tokens + 1
     lengths = torch.full((batch,), tokens, device="cuda", dtype=torch.int32)
     cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * tokens
-    out = torch.empty(rows, 12, 128, device="cuda", dtype=torch.float16)
+    out = torch.empty(rows, heads, 128, device="cuda", dtype=torch.float16)
 
     def run():
         return conv_gate_zero(
@@ -282,8 +293,8 @@ def test_conv_gate_zero_request_isolation_and_graph(batch, tokens):
         cu[1:] = lengths.cumsum(0)
         a.add_(0.125)
         b.mul_(0.875)
-        reference.copy_(raw[:, :2560])
-        candidate.copy_(raw[:, :2560])
+        reference.copy_(raw[:, :channels])
+        candidate.copy_(raw[:, :channels])
         reference_state.copy_(original_state.transpose(-1, -2))
         candidate_state.copy_(original_state.transpose(-1, -2))
         out.fill_(float("nan"))

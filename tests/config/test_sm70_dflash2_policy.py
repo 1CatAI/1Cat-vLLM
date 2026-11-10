@@ -147,10 +147,12 @@ def test_graph_options_affect_dflash_hash_and_ignore_unused_mtp_policy(field):
         (4, torch.float16, 2560, 1536, 12, None),
         (33, torch.float16, 2560, 1536, 12, None),
         (0, torch.float16, 2560, 1536, 12, "query_rows"),
-        (41, torch.float16, 2560, 1536, 12, "query_rows"),
-        (45, torch.float16, 2560, 1536, 12, "query_rows"),
+        (41, torch.float16, 2560, 1536, 12, None),
+        (64, torch.float16, 2560, 1536, 12, None),
         (8, torch.bfloat16, 2560, 1536, 12, "dtype"),
-        (8, torch.float16, 5120, 3072, 24, "local_tail_layout"),
+        (8, torch.float16, 5120, 3072, 24, None),
+        (64, torch.float16, 5120, 3072, 24, None),
+        (8, torch.float16, 5120, 3072, 12, "local_tail_layout"),
     ),
 )
 def test_combined_copy_capability_is_local_layout(rows, dtype, qkv, z, ba, reason):

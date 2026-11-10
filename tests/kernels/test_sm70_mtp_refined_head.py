@@ -7,10 +7,26 @@ import pytest
 import torch
 
 from vllm.model_executor.models.qwen3_5_mtp_refined_head import (
+    _draft_candidate_count,
     _rerank_candidates,
     _select_candidates,
     prepare_mtp_refined_head,
 )
+
+
+@pytest.fixture(autouse=True)
+def fp32_gemm_reduction_policy():
+    # Match the worker's high-precision policy, including large-vocabulary GEMMs.
+    matmul = torch.backends.cuda.matmul
+    reduced = matmul.allow_fp16_reduced_precision_reduction
+    accumulate = getattr(matmul, "allow_fp16_accumulation", None)
+    matmul.allow_fp16_reduced_precision_reduction = False
+    if accumulate is not None:
+        matmul.allow_fp16_accumulation = False
+    yield
+    matmul.allow_fp16_reduced_precision_reduction = reduced
+    if accumulate is not None:
+        matmul.allow_fp16_accumulation = accumulate
 
 
 def test_refined_head_cpu_fallback():
@@ -22,12 +38,15 @@ def test_refined_head_cpu_fallback():
 
 
 @pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("vocab", [62080, 65536, 65537, 124160])
 @pytest.mark.parametrize("kind", ["random", "zero", "nonfinite", "negative_infinity"])
-def test_refined_head_candidate_order(rows, kind):
+@pytest.mark.parametrize("keep", [32, 64])
+def test_refined_head_candidate_order(rows, vocab, kind, keep):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
     torch.manual_seed(653)
-    logits = torch.randn(rows, 62080, device="cuda", dtype=torch.float16)
+    logits = torch.randn(rows, vocab, device="cuda", dtype=torch.float16)
+    logits[:, -1] = 100  # Exercise IDs beyond the compact key's range.
     if kind == "zero":
         logits.fill_(-1)
         logits[:, :100] = 0
@@ -37,9 +56,33 @@ def test_refined_head_candidate_order(rows, kind):
         logits[:, 200:220] = float("nan")
     elif kind == "negative_infinity":
         logits.fill_(-float("inf"))
-    expected = torch.argsort(logits, dim=-1, descending=True, stable=True)[:, :32]
-    actual = _select_candidates(logits)
+    expected = torch.argsort(logits, dim=-1, descending=True, stable=True)[:, :keep]
+    actual = _select_candidates(logits, keep)
     assert torch.equal(actual.long(), expected)
+
+
+@pytest.mark.parametrize("vocab,keep", [(62080, 32), (124160, 64), (248320, 128)])
+def test_draft_candidate_budget_follows_vocabulary_share(vocab, keep):
+    assert _draft_candidate_count(vocab) == keep
+    assert keep * (248320 // vocab) == 128
+
+
+@pytest.mark.parametrize("rows", [1, 5, 8])
+def test_wider_draft_shortlist_preserves_original_weight_scores(rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    torch.manual_seed(71328)
+    weight = torch.randn(124160, 5120, device="cuda", dtype=torch.float16)
+    x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16)
+    dense = torch.nn.functional.linear(x, weight)
+    ids32 = _select_candidates(dense, 32)
+    ids64 = _select_candidates(dense, 64)
+    assert torch.equal(ids32, ids64[:, :32])
+    scores = torch.empty(rows, 64, device="cuda", dtype=torch.float16)
+    torch.ops._C.sm70_fp16_candidate_scores_out(scores, x, weight, ids64)
+    assert torch.equal(
+        scores.view(torch.int16), dense.gather(1, ids64.long()).view(torch.int16)
+    )
 
 
 def test_refined_head_rerank_ties_and_replay():
@@ -63,8 +106,9 @@ def test_refined_head_rerank_ties_and_replay():
         )
 
 
-@pytest.mark.parametrize("rows", [1, 5, 8, 9, 17, 32, 33, 40, 64])
-def test_fp16_candidate_scores_match_dense_tensor_core_order(rows):
+@pytest.mark.parametrize("rows", [*range(1, 10), 17, 32, 33, 40, 64])
+@pytest.mark.parametrize("vocab", [62080, 124160])
+def test_fp16_candidate_scores_preserve_precision_and_dense_fallback(rows, vocab):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
     operation = getattr(torch.ops._C, "sm70_fp16_candidate_scores_out", None)
@@ -72,9 +116,9 @@ def test_fp16_candidate_scores_match_dense_tensor_core_order(rows):
         pytest.skip("requires the candidate scoring operator")
     assert operation is not None
     torch.manual_seed(71328)
-    weight = torch.randn(62080, 5120, device="cuda", dtype=torch.float16)
+    weight = torch.randn(vocab, 5120, device="cuda", dtype=torch.float16)
     x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16)
-    ids = torch.randint(0, 62080, (rows, 32), device="cuda", dtype=torch.int32)
+    ids = torch.randint(0, vocab, (rows, 32), device="cuda", dtype=torch.int32)
     scores = torch.empty(rows, 32, device="cuda", dtype=torch.float16)
     operation(scores, x, weight, ids)
     graph = torch.cuda.CUDAGraph()
@@ -83,10 +127,9 @@ def test_fp16_candidate_scores_match_dense_tensor_core_order(rows):
     for cycle in range(32):
         x.normal_().mul_(0.1 if cycle < 16 else 2)
         graph.replay()
-        # The reference head uses the dense WMMA reduction. Pad the one-row
-        # oracle so cuBLAS keeps that path independently of GEMV heuristics.
-        dense_input = x.expand(8, -1).contiguous() if rows == 1 else x
-        dense = torch.nn.functional.linear(dense_input, weight)[:rows]
+        assert not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        assert not torch.backends.cuda.matmul.allow_fp16_accumulation
+        dense = torch.nn.functional.linear(x, weight)
         expected = dense.gather(1, ids.long())
         assert torch.equal(scores.view(torch.int16), expected.view(torch.int16))
 

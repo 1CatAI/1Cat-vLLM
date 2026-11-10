@@ -181,12 +181,9 @@ __global__ void fp8_qpn8_silu_and_mul_sm70_kernel(
 __global__ void fp8_qpn8_ba_split_copy_sm70_kernel(
     const half* __restrict__ qkvz, const half* __restrict__ ba,
     half* __restrict__ qkv, half* __restrict__ z, half* __restrict__ b,
-    half* __restrict__ a, int m) {
-  constexpr int kQkvN = 2560;
-  constexpr int kZN = 1536;
-  constexpr int kQkvzN = kQkvN + kZN;
-  constexpr int kBAN = 24;
-  constexpr int kOutputN = kQkvzN + kBAN;
+    half* __restrict__ a, int m, int kQkvN, int kZN, int kBAN) {
+  const int kQkvzN = kQkvN + kZN;
+  const int kOutputN = kQkvzN + kBAN;
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= m * kOutputN) {
     return;
@@ -537,9 +534,11 @@ __global__ __launch_bounds__(
   if constexpr (FusedBA) {
     const int tiles = n / 32;
     if (blockIdx.x >= tiles) {
-      vllm::sm70::fused_ba_tile<kPhysicalWarps>(input, fused_ba,
-                                                &reduction_storage[0][0][0],
-                                                (blockIdx.x - tiles) * 8, k, m);
+      const int column_tiles = (fused_ba.ba_n + 31) / 32;
+      const int tile = blockIdx.x - tiles;
+      vllm::sm70::fused_ba_tile<kPhysicalWarps>(
+          input, fused_ba, &reduction_storage[0][0][0],
+          (tile / column_tiles) * 8, k, m, (tile % column_tiles) * 32);
       return;
     }
   }
@@ -1796,11 +1795,15 @@ void fp8_qpn8_gemm_ba_split_sm70_out(torch::Tensor qkv_out, torch::Tensor z_out,
                   qkv_out.get_device() == ba_weight.get_device(),
               "fp8_qpn8_gemm_ba_split_sm70_out: tensors must share one device");
 
+  TORCH_CHECK(input.dim() == 2 && codes.dim() == 2 && qkv_out.dim() == 2 &&
+              ba_weight.dim() == 2);
   const int64_t k = input.size(1);
-  constexpr int64_t n = 4096;
-  constexpr int64_t qkv_n = 2560;
-  constexpr int64_t z_n = n - qkv_n;
-  constexpr int64_t ba_n = 24;
+  const int64_t n = codes.size(1);
+  const int64_t qkv_n = qkv_out.size(1);
+  const int64_t z_n = n - qkv_n;
+  const int64_t ba_n = ba_weight.size(0);
+  TORCH_CHECK(n > 0 && n % 32 == 0 && qkv_n > 0 && z_n > 0 &&
+              qkv_n + z_n == n && ba_n > 0 && ba_n % 2 == 0);
   TORCH_CHECK(
       input.dim() == 2 && input.size(0) == 1 && (k == 2560 || k == 5120),
       "fp8_qpn8_gemm_ba_split_sm70_out: expected K=2560 or 5120");
@@ -1843,11 +1846,15 @@ static void fp8_qpn8_dispatch_ba_split_sm70_impl(
     torch::Tensor a_out, torch::Tensor qkvz_staging, torch::Tensor ba_staging,
     int64_t dense_weight_ptr, torch::Tensor input, torch::Tensor codes,
     torch::Tensor group_scales, torch::Tensor ba_weight, bool masked_rows) {
+  TORCH_CHECK(input.dim() == 2 && codes.dim() == 2 && qkv_out.dim() == 2 &&
+              ba_weight.dim() == 2);
   const int64_t k = input.size(1);
-  constexpr int64_t n = 4096;
-  constexpr int64_t qkv_n = 2560;
-  constexpr int64_t z_n = n - qkv_n;
-  constexpr int64_t ba_n = 24;
+  const int64_t n = codes.size(1);
+  const int64_t qkv_n = qkv_out.size(1);
+  const int64_t z_n = n - qkv_n;
+  const int64_t ba_n = ba_weight.size(0);
+  TORCH_CHECK(n > 0 && n % 64 == 0 && qkv_n > 0 && z_n > 0 &&
+              qkv_n + z_n == n && ba_n > 0 && ba_n % 2 == 0);
   const int64_t m = input.size(0);
   TORCH_CHECK(input.dim() == 2 && (k == 2560 || k == 5120) && m >= 1,
               "fp8_qpn8_dispatch_ba_split_sm70_out: bad input shape");
@@ -1907,7 +1914,7 @@ static void fp8_qpn8_dispatch_ba_split_sm70_impl(
     static std::once_flag route_log_once;
     std::call_once(route_log_once, []() {
       std::fprintf(stderr,
-                   "SM70 GDN QPN8 N4096 + FP16 b/a N24 split C++ route "
+                   "SM70 GDN channel QPN8 + FP16 b/a split C++ route "
                    "enabled.\n");
       std::fflush(stderr);
     });
@@ -1962,7 +1969,8 @@ static void fp8_qpn8_dispatch_ba_split_sm70_impl(
         m == 32
             ? fp8_qpn8_m32_twophase_sm70_kernel<16, true, false, true, true>
             : fp8_qpn8_m32_twophase_sm70_kernel<16, true, false, false, true>;
-    kernel<<<static_cast<int>(n / 32 + (m + 7) / 8), 256, 0, stream>>>(
+    const int ba_tiles = ((m + 7) / 8) * ((ba_n + 31) / 32);
+    kernel<<<static_cast<int>(n / 32 + ba_tiles), 256, 0, stream>>>(
         codes.data_ptr<uint8_t>(),
         reinterpret_cast<const half*>(group_scales.data_ptr<at::Half>()),
         packed_ptr, reinterpret_cast<half*>(qkv_out.data_ptr<at::Half>()),
@@ -1986,7 +1994,8 @@ static void fp8_qpn8_dispatch_ba_split_sm70_impl(
       reinterpret_cast<half*>(qkv_out.data_ptr<at::Half>()),
       reinterpret_cast<half*>(z_out.data_ptr<at::Half>()),
       reinterpret_cast<half*>(b_out.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(a_out.data_ptr<at::Half>()), static_cast<int>(m));
+      reinterpret_cast<half*>(a_out.data_ptr<at::Half>()), static_cast<int>(m),
+      static_cast<int>(qkv_n), static_cast<int>(z_n), static_cast<int>(ba_n));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2611,6 +2620,8 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor group_scales, Tensor ba_weight) -> ()");
   ops.impl("fp8_qpn8_gemm_ba_split_sm70_out", torch::kCUDA,
            &fp8_qpn8_gemm_ba_split_sm70_out);
+  ops.def("fp8_qpn8_ba_split_geometry_revision() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "fp8_qpn8_dispatch_ba_split_sm70_out(Tensor(a!) qkv_out, Tensor(b!) "
       "z_out, Tensor(c!) b_out, Tensor(d!) a_out, Tensor(e!) qkvz_staging, "

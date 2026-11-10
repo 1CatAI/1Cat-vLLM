@@ -751,6 +751,47 @@ class CustomAllreduce:
             self._ptr, lora, weight, branches, output
         )
 
+    def can_all_reduce_gemma_rms_norm(self, inp, residual, weight) -> bool:
+        return bool(
+            not self.disabled
+            and self.world_size in (2, 4)
+            and residual.dtype == torch.float32
+            and self._native.has("all_reduce_gemma_rms_norm")
+            and self.capabilities.gemma_norm(
+                inp, residual, weight, world_size=self.world_size, long=False
+            )
+        )
+
+    def all_reduce_gemma_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.can_all_reduce_gemma_rms_norm(inp, residual, weight):
+            raise RuntimeError("Ordered all-reduce RMSNorm is unavailable")
+        normalized_out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual)
+        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        if registered:
+            safe_inp = self._ipc_graph_input(inp)
+            registered = safe_inp is not None
+            if safe_inp is not None:
+                inp = safe_inp
+        self._native.all_reduce_gemma_rms_norm(
+            self._ptr,
+            inp,
+            residual,
+            weight,
+            normalized_out,
+            residual_out,
+            0 if registered else self.buffer_ptrs[self.rank],
+            0 if registered else self.max_size,
+            epsilon,
+        )
+        return normalized_out, residual_out
+
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
         inp: torch.Tensor,

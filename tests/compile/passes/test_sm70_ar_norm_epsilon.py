@@ -57,11 +57,7 @@ def test_sm70_push_norm_matches_config_epsilon(
             torch.float16, "cpu", pattern_epsilon, tp
         ).register(patterns)
         assert patterns.apply(graph.graph) == expected_matches
-        collective = (
-            torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm.default
-            if tp == 2
-            else torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm.default
-        )
+        collective = torch.ops.vllm.all_reduce_gemma_rms_norm.default
         fused = [n for n in graph.graph.nodes if n.target == collective]
         assert len(fused) == expected_matches
         if fused:

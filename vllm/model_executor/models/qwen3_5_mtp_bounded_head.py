@@ -8,8 +8,9 @@ covers arbitrary FP32 accumulation order and FP16 input subnormal flushing
 for both projections. FP64 preparation rounds these positive coefficients
 upward. Runtime bounds include input-norm and coarse-score rounding.
 
-Candidates are selected by their upper bounds and scored in the original
-Tensor Core order. A winner must strictly exceed every discarded upper
+Candidates are selected by their upper bounds and scored from original weights
+with FP32 Tensor Cores. The bounds include FP32 reduction-order differences.
+A winner must strictly exceed every discarded upper
 bound across TP ranks. Other rows execute the complete original-weight
 projection before the normal global argmax. The device mask is graph-safe.
 """
@@ -25,15 +26,17 @@ import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings, call_native, register_policy_op
 from vllm.config.sm70_native import capture_linear_native_config
-from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 from vllm.model_executor.models.qwen3_5_mtp_refined_head import (
     _finish,
+    _score_id_keys,
     _select_candidates,
 )
+from vllm.model_executor.models.qwen3_5_mtp_sm70_head import _mtp_head_shard_rows
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -125,17 +128,21 @@ def _certify(Gathered, Flags, GlobalPairs, Ranks: tl.constexpr):
 
 
 @triton.jit
-def _masked_max_tiles(Dense, Flags, Scratch, Vocab: tl.constexpr, Tiles: tl.constexpr):
+def _masked_max_tiles(
+    Dense,
+    Flags,
+    Scratch,
+    Vocab: tl.constexpr,
+    Tiles: tl.constexpr,
+    WideIds: tl.constexpr,
+):
     row, tile = tl.program_id(0), tl.program_id(1)
     if tl.load(Flags + row) == 0:
         col = tile * 1024 + tl.arange(0, 1024)
         value = tl.load(Dense + row * Vocab + col, col < Vocab, -float("inf"))
-        bits = value.to(tl.uint16, bitcast=True).to(tl.uint32)
-        ordered = tl.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits ^ 0x8000)
-        ordered = tl.where(value == 0, 0x8000, ordered)
-        ordered = tl.where(value != value, 0xFFFF, ordered)
-        keys = ((ordered.to(tl.int32) - 0x8000) << 16) | (65535 - col).to(tl.int32)
-        keys = tl.where(col < Vocab, keys, -2147483648)
+        keys = _score_id_keys(value, col, WideIds)
+        sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+        keys = tl.where(col < Vocab, keys, sentinel)
         tl.store(Scratch + row * Tiles + tile, tl.max(keys, 0))
 
 
@@ -149,17 +156,21 @@ def _masked_max_finish(
     Vocab: tl.constexpr,
     Tiles: tl.constexpr,
     Start: tl.constexpr,
+    Block: tl.constexpr,
+    WideIds: tl.constexpr,
 ):
     row = tl.program_id(0)
     if tl.load(Flags + row) != 0:
         value = tl.load(GlobalPairs + row * 2)
         token = tl.load(GlobalPairs + row * 2 + 1)
     else:
-        offsets = tl.arange(0, 64)
+        offsets = tl.arange(0, Block)
+        sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
         key = tl.max(
-            tl.load(Scratch + row * Tiles + offsets, offsets < Tiles, -2147483648), 0
+            tl.load(Scratch + row * Tiles + offsets, offsets < Tiles, sentinel), 0
         )
-        local_id = 65535 - (key & 65535)
+        id_mask: tl.constexpr = 0xFFFFFFFF if WideIds else 65535
+        local_id = id_mask - (key & id_mask)
         value = tl.load(Dense + row * Vocab + local_id).to(tl.float32)
         token = (local_id + Start).to(tl.float32)
     tl.store(Output + row * 2, value)
@@ -239,11 +250,26 @@ def _bounded_pair(x, weight, codes, scales, coefficients, start, native_policy=(
     dense = torch.empty_like(coarse)
     torch.ops._C.sm70_fp16_masked_head_out(dense, x, weight, flags)
     tiles = triton.cdiv(vocab, 1024)
-    scratch = torch.empty(rows, tiles, device=x.device, dtype=torch.int32)
+    wide_ids = vocab > 65536
+    scratch = torch.empty(
+        rows, tiles, device=x.device, dtype=torch.int64 if wide_ids else torch.int32
+    )
     output = torch.empty_like(pairs)
-    _masked_max_tiles[(rows, tiles)](dense, flags, scratch, vocab, tiles, num_warps=4)
+    _masked_max_tiles[(rows, tiles)](
+        dense, flags, scratch, vocab, tiles, wide_ids, num_warps=4
+    )
     _masked_max_finish[(rows,)](
-        dense, flags, scratch, global_pairs, output, vocab, tiles, start, num_warps=2
+        dense,
+        flags,
+        scratch,
+        global_pairs,
+        output,
+        vocab,
+        tiles,
+        start,
+        triton.next_power_of_2(tiles),
+        wide_ids,
+        num_warps=2,
     )
     return output, flags, upper
 
@@ -332,7 +358,8 @@ def prepare_mtp_bounded_target_head(
         not isinstance(weight, torch.Tensor)
         or not weight.is_cuda
         or weight.dtype != torch.float16
-        or tuple(weight.shape) != (62080, 5120)
+        or weight.ndim != 2
+        or weight.shape[1] != 5120
         or not weight.is_contiguous()
         or shard is None
         or not isinstance(
@@ -344,12 +371,13 @@ def prepare_mtp_bounded_target_head(
         or speculative is None
         or speculative.method != "mtp"
         or speculative.draft_sample_method == "probabilistic"
-        or getattr(shard, "num_added_elements", 0)
-        or getattr(shard, "num_org_vocab_padding", 0)
-        or shard.org_vocab_end_index - shard.org_vocab_start_index != 62080
+        or _mtp_head_shard_rows(head) != weight.shape[0]
     ):
         return None
-    if get_tp_group().world_size != 4:
+    # Old extensions only accept the original shard width. Keep their dense
+    # fallback instead of admitting a wider shard to an incompatible binary.
+    revision = getattr(torch.ops._C, "sm70_fp16_head_vocab_revision", None)
+    if weight.shape[0] != 62080 and (revision is None or revision() < 1):
         return None
     state = getattr(head, "_sm70_lm_head_state", None)
     if any(

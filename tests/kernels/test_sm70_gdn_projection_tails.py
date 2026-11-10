@@ -71,6 +71,8 @@ def test_input_core_tail_route_keeps_recurrent_operands(monkeypatch, m):
         key_dim=2048,
         value_dim=6144,
         tp_size=4,
+        num_v_heads=48,
+        head_k_dim=128,
         head_v_dim=128,
     )
     monkeypatch.setattr(gdn, "_resolve_layer_name", lambda name: name)

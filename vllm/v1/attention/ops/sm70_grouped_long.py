@@ -32,7 +32,7 @@ BUILTIN_OP = "sm70_grouped_long_fwd"
 # route was qualified with. The source digest names that layout so a rebuilt
 # kernel cannot silently inherit the workspace identity of a different one.
 BUILTIN_SOURCE_SHA256 = (
-    "0e1d5fdda2f8b58bdf7d3823f662e9de00774566b96a5ad3648bd7f0a04c7373"
+    "ba703fad0906d23d4cb121385e70fa5447320572f4206687f6997963ba089b23"
 )
 # Every B1 verifier tail width uses the long-context graph contract at this
 # capacity; q1 additionally has the compact scalar tail.
@@ -215,6 +215,11 @@ def resolve_long_attention(policy=None, capacity: int | None = None):
     )
     if revision is not None:
         manifest = {**manifest, "query_rows_revision": int(revision())}
+    kv_revision = getattr(
+        torch.ops._vllm_fa2_C, "sm70_grouped_long_kv_heads_revision", None
+    )
+    if kv_revision is not None:
+        manifest = {**manifest, "kv_heads_revision": int(kv_revision())}
     return operator, manifest
 
 
@@ -294,6 +299,7 @@ def wrap_long_attention(fallback):
     model = getattr(config, "model_config", None)
     model_capacity = getattr(model, "max_model_len", None)
     variable_request_rows = manifest.get("query_rows_revision", 1) >= 2
+    parallel_kv_heads = manifest.get("kv_heads_revision", 0) >= 1
 
     def run(
         q, k, v, table, row_lengths, *, out, softmax_scale, k_scale=1.0, v_scale=1.0
@@ -365,24 +371,25 @@ def wrap_long_attention(fallback):
         stream = torch.cuda.current_stream(q.device).cuda_stream
         key = (manifest["source_sha256"], bucket, 80, q.device, stream)
         bank = _WORKSPACES.setdefault(key, [])
+        panels = batch_size * (k.shape[2] if parallel_kv_heads else 1)
         # Full graphs replay in stream order, just like successive layers.
         # Reuse a larger request panel for smaller captures. Keep older panels
         # alive when growing: an earlier graph may still reference them.
         for partial, lse in bank:
-            if partial.shape[0] >= batch_size:
+            if partial.shape[0] >= panels:
                 break
         else:
             partial = torch.empty(
-                (batch_size, 80, 8, 6, 256), dtype=torch.float32, device=q.device
+                (panels, 80, 8, 6, 256), dtype=torch.float32, device=q.device
             )
             lse = torch.empty(
-                (batch_size, 80, 8, 6, 2), dtype=torch.float32, device=q.device
+                (panels, 80, 8, 6, 2), dtype=torch.float32, device=q.device
             )
             bank.append((partial, lse))
-        if batch_size == 1:
+        if panels == 1:
             partial, lse = partial[0], lse[0]
         else:
-            partial, lse = partial[:batch_size], lse[:batch_size]
+            partial, lse = partial[:panels], lse[:panels]
         return run_six_head_groups(
             operator,
             q,
@@ -396,6 +403,7 @@ def wrap_long_attention(fallback):
             float(softmax_scale),
             float(k_scale),
             float(v_scale),
+            parallel_kv_heads=parallel_kv_heads,
         )
 
     if variable_request_rows and (
@@ -408,14 +416,14 @@ def wrap_long_attention(fallback):
     return run
 
 
-def run_six_head_groups(operator, q, k, v, out, *args):
+def run_six_head_groups(operator, q, k, v, out, *args, parallel_kv_heads=False):
     """Reuse the validated six-head kernel without copying the paged KV cache.
 
-    Each group retains the original reduction order. The shared workspace is
-    consumed serially on the current stream; graph capture retains the small
-    query/output buffers used for the individual groups.
+    Rebuilt operators parallelize KV heads in one grid and own a workspace
+    panel per head/request. Older binaries consume one shared panel serially;
+    graph capture retains their per-group query/output buffers.
     """
-    if k.shape[2] == 1:
+    if k.shape[2] == 1 or parallel_kv_heads:
         return operator(q, k, v, out, *args)
     for head in range(k.shape[2]):
         group_q = q[:, head * 6 : (head + 1) * 6].contiguous()

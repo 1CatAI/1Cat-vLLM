@@ -34,6 +34,10 @@ def _conv_gate_zero_kernel(
     STATE_DIM: tl.constexpr,
     STATE_TOKEN: tl.constexpr,
     CACHE_LINES: tl.constexpr,
+    QKV_WIDTH: tl.constexpr,
+    VALUE_WIDTH: tl.constexpr,
+    HEADS: tl.constexpr,
+    BLOCK_HEADS: tl.constexpr,
     TOKENS: tl.constexpr,
     STATE_LENGTH: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
@@ -47,14 +51,14 @@ def _conv_gate_zero_kernel(
     # The old allocation zeroes padded output rows too. Keep that contract,
     # including invalid state slots, before the convolution's early returns.
     tl.store(
-        Core + row[:, None] * 1536 + feature[None, :],
+        Core + row[:, None] * VALUE_WIDTH + feature[None, :],
         0,
-        (token[:, None] < TOKENS) & (feature[None, :] < 1536),
+        (token[:, None] < TOKENS) & (feature[None, :] < VALUE_WIDTH),
     )
     if tl.program_id(1) < TOKENS:
-        head = tl.arange(0, 16)
-        mask = head < 12
-        offset = (request * TOKENS + tl.program_id(1)) * 12 + head
+        head = tl.arange(0, BLOCK_HEADS)
+        mask = head < HEADS
+        offset = (request * TOKENS + tl.program_id(1)) * HEADS + head
         a_log = tl.load(ALog + head, mask=mask, other=0)
         a = tl.load(A + offset, mask=mask, other=0)
         b = tl.load(B + offset, mask=mask, other=0)
@@ -78,7 +82,7 @@ def _conv_gate_zero_kernel(
         None,
         X,
         BATCH,
-        2560,
+        QKV_WIDTH,
         TOKENS,
         STATE_LENGTH,
         CACHE_LINES,
@@ -124,22 +128,29 @@ def conv_gate_zero(
 ):
     """Dispatch proves a complete verifier batch and its state layouts."""
     rows = qkv.shape[0]
+    channels = qkv.shape[1]
+    heads = core_out.shape[1]
+    value_width = heads * core_out.shape[2]
     batch = state_indices.numel()
     assert batch > 0 and rows % batch == 0
     tokens = rows // batch
-    assert 1 <= tokens <= 8 and qkv.shape == (rows, 2560) and qkv.stride(1) == 1
+    assert 1 <= tokens <= 8 and channels > 0 and qkv.stride(1) == 1
     assert qkv.dtype == state.dtype == weight.dtype == torch.float16
-    assert weight.shape == (2560, 4)
-    assert core_out.shape == (rows, 12, 128) and core_out.is_contiguous()
-    assert state.shape[1] == 2560 and state.shape[2] >= tokens + 2
-    assert a.shape == b.shape == (rows, 12) and a.is_contiguous() and b.is_contiguous()
+    assert weight.shape == (channels, 4)
+    assert core_out.shape == (rows, heads, 128) and core_out.is_contiguous()
+    assert 0 < value_width <= channels
+    assert state.shape[1] == channels and state.shape[2] >= tokens + 2
+    assert (
+        a.shape == b.shape == (rows, heads) and a.is_contiguous() and b.is_contiguous()
+    )
+    assert a_log.shape == bias.shape == (heads,)
     assert state_indices.shape == accepted.shape == (batch,)
     assert cu.shape == (batch + 1,) and accepted.is_contiguous() and cu.is_contiguous()
     # Match causal_conv1d_update: speculative history uses width-1 plus
     # tokens-1 entries even when the physical cache has a longer stride.
-    g = torch.empty((1, rows, 12), dtype=torch.float32, device=qkv.device)
+    g = torch.empty((1, rows, heads), dtype=torch.float32, device=qkv.device)
     beta = torch.empty_like(g)
-    _conv_gate_zero_kernel[(batch, triton.cdiv(2560, channel_tile))](
+    _conv_gate_zero_kernel[(batch, max(tokens, triton.cdiv(channels, channel_tile)))](
         qkv,
         weight,
         state,
@@ -159,6 +170,10 @@ def conv_gate_zero(
         *weight.stride(),
         *state.stride(),
         state.shape[0],
+        channels,
+        value_width,
+        heads,
+        triton.next_power_of_2(heads),
         tokens,
         tokens + 2,
         triton.next_power_of_2(tokens),

@@ -7,6 +7,8 @@
 #include <torch/library.h>
 #include <torch/types.h>
 
+#include <climits>
+
 namespace {
 template <bool Silu>
 __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
@@ -50,8 +52,8 @@ __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
 void rmsnorm_gated_exact(torch::Tensor out, torch::Tensor x, torch::Tensor z,
                          torch::Tensor weight, double eps, bool silu) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 128 &&
-                  x.size(0) >= 1 && x.size(0) <= 768,
-              "SM70 exact gated RMSNorm requires CUDA [1..768, 128]");
+                  x.size(0) >= 1 && x.size(0) <= INT_MAX / 128,
+              "SM70 exact gated RMSNorm requires CUDA [rows, 128]");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
@@ -83,6 +85,8 @@ void rmsnorm_gated_exact(torch::Tensor out, torch::Tensor x, torch::Tensor z,
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_C, m) {
+  m.def("sm70_rmsnorm_gated_exact_max_rows() -> int",
+        []() -> int64_t { return INT_MAX / 128; });
   m.def(
       "sm70_rmsnorm_gated_exact_out(Tensor(a!) out, Tensor x, Tensor z, "
       "Tensor weight, float eps, bool silu) -> ()");
