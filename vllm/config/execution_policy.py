@@ -361,6 +361,13 @@ class LayerExecutionPolicy(ExecutionPolicy):
             deferred_errors=self.provider_errors,
         )
         super().resolve()
+        if self.sources.get("mhc_fused_post_dot") == "default":
+            # Resolve the effective default before hashing/worker transfer.
+            self.mhc_fused_post_dot = True
+        if self.sources.get("mhc_native_verify") == "default":
+            self.mhc_native_verify = True
+        if self.sources.get("mhc_pre_threads") == "default":
+            self.mhc_pre_threads = 1024
         from vllm import envs
 
         if "dense_log_enabled" not in self.sources:
