@@ -47,29 +47,32 @@ def _qk_norm_rope(
     BLOCK_SIZE: tl.constexpr,
     CACHE_BLOCK: tl.constexpr,
     CACHE_TOKEN: tl.constexpr,
+    CACHE_HEAD: tl.constexpr,
     POS_ROW: tl.int64,
     POS_COL: tl.int64,
     CACHE_ROWS: tl.constexpr,
     NUM_SLOTS: tl.int64,
     ROW: tl.constexpr,
+    Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
     POS_PLANES: tl.constexpr,
     EPS: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
     col = tl.arange(0, 256)
-    if head < 6:
+    if head < Q_HEADS:
         source = QKV + token * ROW + head * 512
         weight = QW
-        destination = QOut + token * 1536 + head * 256
+        destination = QOut + token * Q_HEADS * 256 + head * 256
     else:
-        source = QKV + token * ROW + 3072
+        source = QKV + token * ROW + Q_HEADS * 512 + (head - Q_HEADS) * 256
         weight = KW
-        destination = KOut + token * 256
+        destination = KOut + token * KV_HEADS * 256 + (head - Q_HEADS) * 256
     if STORE_GATE:  # noqa: SIM102 - eliminate the optional pointer at compile time
-        if head < 6:
+        if head < Q_HEADS:
             gate = tl.load(QKV + token * ROW + head * 512 + 256 + col)
-            tl.store(GateOut + token * 1536 + head * 256 + col, gate)
+            tl.store(GateOut + token * Q_HEADS * 256 + head * 256 + col, gate)
     values = tl.load(source + col).to(tl.float32)
     variance = tl.sum(values * values, 0) / 256.0
     inverse = tl.rsqrt(variance + EPS)
@@ -109,13 +112,18 @@ def _qk_norm_rope(
                 + (slot % BLOCK_SIZE) * CACHE_TOKEN
                 + col
             )
-            if head == 6:
+            if head >= Q_HEADS:
+                head_offset = (head - Q_HEADS) * CACHE_HEAD
                 scaled = tl.div_rn(processed.to(tl.float32), tl.load(KScale))
-                tl.store(KCache + offset, _e4m3_satfinite(scaled))
-            elif head == 0:
-                value = tl.load(QKV + token * ROW + 3328 + col).to(tl.float32)
+                tl.store(KCache + offset + head_offset, _e4m3_satfinite(scaled))
+            elif head < KV_HEADS:
+                head_offset = head * CACHE_HEAD
+                value = tl.load(
+                    QKV + token * ROW + Q_HEADS * 512 + (KV_HEADS + head) * 256 + col
+                ).to(tl.float32)
                 tl.store(
-                    VCache + offset, _e4m3_satfinite(tl.div_rn(value, tl.load(VScale)))
+                    VCache + offset + head_offset,
+                    _e4m3_satfinite(tl.div_rn(value, tl.load(VScale))),
                 )
 
 
@@ -135,7 +143,12 @@ def qk_norm_rope(
     k_out=None,
     gate_out=None,
 ):
-    assert qkv.ndim == 2 and qkv.shape[1] == 3584 and qkv.dtype == torch.float16
+    assert qkv.ndim == 2 and qkv.dtype == torch.float16
+    # The qualified family has six query heads per KV head. The local shard
+    # owns Q+gate, K and V; token count and TP degree do not select a kernel.
+    assert qkv.shape[1] > 0 and qkv.shape[1] % (14 * 256) == 0
+    kv_heads = qkv.shape[1] // (14 * 256)
+    q_heads = 6 * kv_heads
     tokens = qkv.shape[0]
     assert qkv.stride(1) == 1
     assert q_weight.shape == k_weight.shape == (256,)
@@ -147,7 +160,7 @@ def qk_norm_rope(
     store_cache = key_cache is not None
     if store_cache:
         assert key_cache.shape == value_cache.shape and key_cache.ndim == 4
-        assert key_cache.shape[2:] == (1, 256)
+        assert key_cache.shape[2:] == (kv_heads, 256)
         assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
         assert key_cache.dtype == value_cache.dtype == torch.uint8
         assert slots.ndim == 1 and slots.dtype == torch.int64
@@ -156,16 +169,18 @@ def qk_norm_rope(
     q = (
         q_out
         if q_out is not None
-        else torch.empty((tokens, 1536), device=qkv.device, dtype=qkv.dtype)
+        else torch.empty((tokens, q_heads * 256), device=qkv.device, dtype=qkv.dtype)
     )
     k = (
         k_out
         if k_out is not None
-        else torch.empty((tokens, 256), device=qkv.device, dtype=qkv.dtype)
+        else torch.empty((tokens, kv_heads * 256), device=qkv.device, dtype=qkv.dtype)
     )
-    assert q.shape == (tokens, 1536) and k.shape == (tokens, 256)
+    assert q.shape == (tokens, q_heads * 256) and k.shape == (tokens, kv_heads * 256)
     assert q.is_contiguous() and k.is_contiguous()
-    _qk_norm_rope[(tokens, 7)](
+    if gate_out is not None:
+        assert gate_out.shape == q.shape and gate_out.is_contiguous()
+    _qk_norm_rope[(tokens, q_heads + kv_heads)](
         qkv,
         q_weight,
         k_weight,
@@ -184,11 +199,14 @@ def qk_norm_rope(
         key_cache.shape[1] if store_cache else 0,
         key_cache.stride(0) if store_cache else 0,
         key_cache.stride(1) if store_cache else 0,
+        key_cache.stride(2) if store_cache else 0,
         positions.stride(0) if positions.ndim == 2 else 0,
         positions.stride(-1),
         cache.shape[0],
         slots.numel() if store_cache else 0,
         qkv.stride(0),
+        q_heads,
+        kv_heads,
         1 if positions.ndim == 1 else 3,
         eps,
         # Two warps with four contiguous channels per lane reproduce the
@@ -218,6 +236,8 @@ def _prepare_with_cache(
     )
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
+    kv_heads = k_out.shape[1] // 256
+    q_width = q_out.shape[1]
     cache_args = {}
     if slots is not None and kv_cache.numel() > 0:
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)
@@ -226,7 +246,7 @@ def _prepare_with_cache(
             and key_cache.dtype == value_cache.dtype == torch.uint8
             and key_cache.ndim == value_cache.ndim == 4
             and key_cache.shape == value_cache.shape
-            and key_cache.shape[2:] == (1, 256)
+            and key_cache.shape[2:] == (kv_heads, 256)
             and key_cache.stride() == value_cache.stride()
             and key_cache.stride(3) == 1
             and slots.ndim == 1
@@ -257,8 +277,8 @@ def _prepare_with_cache(
         # Keep the standard writer for a cache layout not handled above.
         layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
             layer,
-            k_out.view(-1, 1, 256),
-            qkv[:, 3328:].view(-1, 1, 256),
+            k_out.view(-1, kv_heads, 256),
+            qkv[:, q_width * 2 + kv_heads * 256 :].view(-1, kv_heads, 256),
             kv_cache,
             slots,
         )

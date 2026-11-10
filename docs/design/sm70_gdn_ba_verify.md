@@ -44,6 +44,11 @@ The same owners handle these changes:
   six-query-head group retains its compensated FP32 reduction and owns a
   workspace panel. Older extensions retain serial grouping and its query/output
   copies. There is no KV conversion between the two schedules.
+- Query/key normalization, rotary embedding and KV publication also share the
+  existing GQA6 preparation kernel. Local query/KV head counts determine its
+  grid, output widths and cache offsets. FP32 normalization/rotary arithmetic,
+  FP16 output rounding and E4M3 writer bytes are retained. Other cache layouts
+  keep the standard writer; padded tokens and invalid slots do not publish KV.
 - Refined draft and bounded target heads use the full vocabulary shard.
   Candidate and dense-fallback ranking use wider IDs when a shard exceeds
   65536 rows. The target still certifies against every discarded bound and
@@ -60,15 +65,17 @@ The same owners handle these changes:
   can publish the existing K16 activation layout for downstream projections.
   The FP32-residual boundary shares the original eight-warp norm arithmetic;
   historical TP2 CUB-norm and TP4 op names stay compatible. The qualified model
-  enables the existing TP2 fusion policy automatically, preserving overrides. TP4 row admission follows the native capacity rather than a list
-  of speculative batch sizes.
+  enables the existing TP2 fusion policy automatically, preserving overrides.
+  TP4 row admission follows the native capacity rather than a list of
+  speculative batch sizes.
 - Local argmax and compact token all-gather already consume the communicator's
   TP size. They retain their shared selection and stable token-ID tie breaking.
 
 The native-layout QPN2 entry reports its row capacity instead of imposing a
 separate Python M32 limit. Shared-TurboMind dispatch retains its native M1–32
-subset and the original larger-row TurboMind fallback. Older extensions retain M32 admission; rows beyond the loaded
-operator's capacity use the existing bounded prefill workspace. Gated N128
+subset and the original larger-row TurboMind fallback. Older extensions retain
+M32 admission; rows beyond the loaded operator's capacity use the existing
+bounded prefill workspace. Gated N128
 normalization similarly reports its native indexing capacity, with the older
 extension's limit retained when the capability query is absent.
 
