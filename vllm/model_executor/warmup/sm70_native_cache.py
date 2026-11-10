@@ -122,6 +122,14 @@ def export_cache(device_hint, path: str) -> int:
     return records
 
 
+def freeze_tuning(device_hint) -> int:
+    """Make each policy partition's measured plan final on this device."""
+    return sum(
+        int(NativeBindings(values).sm70_gemm_freeze_tuning(device_hint))
+        for values in _policies()
+    )
+
+
 def packed_cache_bytes(path: Path) -> bytes:
     partitions = Path(str(path) + ".policy-v1")
     return (partitions if partitions.exists() else path).read_bytes()

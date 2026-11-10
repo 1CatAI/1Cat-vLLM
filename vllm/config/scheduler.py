@@ -176,11 +176,15 @@ class SchedulerConfig:
     checking the first chunk. Prevents over-admission and KV cache thrashing
     with chunked prefill."""
 
+    pp_keep_batch: bool | None = None
+    """Opt-in V1 persistent-batch retention across empty pipeline steps."""
+
     sm70_async_queue_depth: int | None = Field(default=None, ge=0)
     """Override no-PP asynchronous queue depth; zero preserves the old default."""
     sm70_inputs: LegacyInputs = Field(default_factory=LegacyInputs, init=False)
     """Initialization snapshot for deferred scheduler override errors."""
     sm70_aliases: ClassVar[dict[str, str]] = {
+        "pp_keep_batch": "VLLM_PP_KEEP_BATCH",
         "sm70_async_queue_depth": "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH",
     }
 
@@ -190,7 +194,10 @@ class SchedulerConfig:
     def sm70_queue_depth(self) -> int:
         if self.sm70_async_queue_depth is not None:
             return self.sm70_async_queue_depth
-        return self.sm70_inputs.value(self.sm70_aliases["sm70_async_queue_depth"])
+        return self.legacy_scheduler_value("sm70_async_queue_depth")
+
+    def legacy_scheduler_value(self, field: str) -> Any:
+        return self.sm70_inputs.value(self.sm70_aliases[field])
 
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
@@ -276,6 +283,8 @@ class SchedulerConfig:
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
         self.capture_sm70_inputs()
+        if self.pp_keep_batch is None:
+            self.pp_keep_batch = self.legacy_scheduler_value("pp_keep_batch")
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
