@@ -1309,58 +1309,13 @@ def _load_chat_template(
 
 _cached_load_chat_template = lru_cache(_load_chat_template)
 
-# The most recently resolved chat template source, so
-# `POST /v1/internal/reload` can re-read it. Deliberately not an mtime stat per
-# request -- the template is re-read only when the endpoint is called, so the
-# request path pays nothing.
-_HOT_CHAT_TEMPLATE_SOURCE: str | None = None
-
 
 def load_chat_template(
     chat_template: Path | str | None,
     *,
     is_literal: bool = False,
 ) -> str | None:
-    global _HOT_CHAT_TEMPLATE_SOURCE
-    resolved = _cached_load_chat_template(chat_template, is_literal=is_literal)
-    # Record only file-backed sources: inline and built-in templates have no
-    # file to re-read.
-    if not is_literal and chat_template is not None:
-        try:
-            if isinstance(chat_template, Path) or (
-                isinstance(chat_template, str) and Path(chat_template).is_file()
-            ):
-                _HOT_CHAT_TEMPLATE_SOURCE = str(chat_template)
-        except (OSError, ValueError):
-            pass
-    return resolved
-
-
-def force_reload_chat_template() -> str | None:
-    """Re-read the chat template from disk for the hot-reload endpoint.
-
-    Returns the re-read template, or None when there is no file-backed source
-    (the caller then skips pushing it). A read failure keeps the last good
-    result and never raises, so a bad edit cannot take the server down.
-    """
-    source = _HOT_CHAT_TEMPLATE_SOURCE
-    if source is None:
-        return None
-    try:
-        with open(source, encoding="utf-8") as handle:
-            content = handle.read()
-    except OSError:
-        logger.exception("chat template hot-reload failed to read %s", source)
-        return None
-    # Drop the cache so ordinary requests pick up the new content too.
-    _cached_load_chat_template.cache_clear()
-    logger.warning(
-        "Chat template hot-reloaded from %s (%d bytes). "
-        "Note: an edited template invalidates the prompt prefix cache.",
-        source,
-        len(content),
-    )
-    return content
+    return _cached_load_chat_template(chat_template, is_literal=is_literal)
 
 
 def _get_interleaved_text_prompt(

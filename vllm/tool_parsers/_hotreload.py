@@ -1,110 +1,157 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Hot-reload tool parser implementations without restarting the engine.
+"""Prepare parser implementations privately before publishing a generation.
 
-Iterating on a tool parser normally means restarting the engine, because
-loading the model takes minutes. This module makes the edit -> test loop fast
-for deployments that serve from a mutable source tree.
-
-Design:
-
-- The HTTP endpoint ``POST /v1/internal/reload`` (see
-  ``entrypoints/serve/toolparser/api_router.py``) calls :func:`reload_now`,
-  which reloads the already-imported ``vllm.tool_parsers.*`` modules, refreshes
-  the ``ToolParserManager`` registry, and bumps a version counter.
-- The hot path costs one integer comparison: :func:`current_version` against a
-  cached value. Modules are never re-stat-ed and nothing is reloaded per
-  request.
-
-Limitations: only modules that are already imported get reloaded, and requests
-already in flight finish on the old classes.
+Only trusted, already imported implementation modules are re-executed. Stable
+parser base classes and serving classes are never reloaded or patched. Old
+requests keep their classes and module globals, including after a failed edit.
 """
 
 from __future__ import annotations
 
-import importlib
-import logging
+import builtins
+import importlib.util
 import sys
 import threading
+from dataclasses import dataclass
+from types import ModuleType
+from typing import TYPE_CHECKING
 
-logger = logging.getLogger(__name__)
-
-# Reloaded before the parsers themselves: shared helpers that parsers import at
-# module scope, so reloading them first means the parsers below pick up the new
-# objects.
-_PREREQUISITE_MODULES = (
-    "vllm.tool_parsers.utils",
-    "vllm.tool_parsers.qwen_xml_tool_grammar",
-)
-
-_PARSER_PACKAGE = "vllm.tool_parsers."
+if TYPE_CHECKING:
+    from vllm.tool_parsers import ToolParserManager
 
 _VERSION = 0
-_LOCK = threading.Lock()
+reload_lock = threading.RLock()
+_PACKAGE = "vllm.tool_parsers"
+_BASE = _PACKAGE + ".abstract_tool_parser"
 
 
 def current_version() -> int:
-    """Current reload version. Compare against a cached value on the hot path."""
     return _VERSION
 
 
-def _loaded_parser_modules() -> list[str]:
-    """Every already-imported ``vllm.tool_parsers.*`` module, prerequisites first."""
-    names = [
-        name
-        for name in sys.modules
-        if name.startswith(_PARSER_PACKAGE)
-        and name != _PARSER_PACKAGE
-        and not name.endswith("_hotreload")
-    ]
-    prereq = [n for n in _PREREQUISITE_MODULES if n in names]
-    rest = sorted(n for n in names if n not in prereq)
-    return prereq + rest
+def _implementation_modules():
+    return {
+        name: module
+        for name, module in dict(sys.modules).items()
+        if name.startswith(_PACKAGE + ".")
+        and name not in (_BASE, __name__)
+        and module is not None
+        and not hasattr(module, "__path__")
+    }
 
 
-def _refresh_registry() -> None:
-    """Point the lazy registry at the freshly reloaded class objects."""
-    try:
-        from vllm.tool_parsers import ToolParserManager
+@dataclass
+class ParserReload:
+    manager: type[ToolParserManager]
+    modules: dict[str, ModuleType]
+    version: int
 
-        for name, entry in list(ToolParserManager.lazy_parsers.items()):
-            module_path, class_name = entry
-            module = sys.modules.get(module_path)
-            cls = getattr(module, class_name, None) if module is not None else None
-            if cls is not None:
-                ToolParserManager.tool_parsers[name] = cls
-    except Exception:
-        logger.exception("tool parser hot-reload registry refresh failed")
+    def replacement(self, cls):
+        if cls is None:
+            return None
+        module = self.modules.get(cls.__module__)
+        if module is None:
+            return cls
+        from vllm.tool_parsers import ToolParser
+
+        replacement = getattr(module, cls.__name__)
+        if not isinstance(replacement, type) or not issubclass(replacement, ToolParser):
+            raise TypeError(f"Invalid reloaded parser {cls.__module__}.{cls.__name__}")
+        return replacement
+
+
+def prepare_reload() -> ParserReload:
+    """Called under reload_lock; never mutate a live module or registry."""
+    from vllm.tool_parsers import ToolParserManager
+
+    class Manager(ToolParserManager):
+        tool_parsers = dict(ToolParserManager.tool_parsers)
+        lazy_parsers = dict(ToolParserManager.lazy_parsers)
+
+    loaded = dict(sys.modules)
+    originals = _implementation_modules()
+    modules: dict[str, ModuleType] = {}
+    proxies: dict[str, ModuleType] = {}
+    for name in ("vllm", _PACKAGE, _BASE):
+        proxy = ModuleType(name)
+        proxy.__dict__.update(vars(loaded[name]))
+        proxies[name] = proxy
+    proxies["vllm"].__dict__["tool_parsers"] = proxies[_PACKAGE]
+    proxies[_PACKAGE].__dict__["abstract_tool_parser"] = proxies[_BASE]
+    proxies[_PACKAGE].__dict__["ToolParserManager"] = Manager
+    proxies[_BASE].__dict__["ToolParserManager"] = Manager
+
+    def isolated_import(name, globals=None, locals=None, fromlist=(), level=0):
+        absolute = (
+            importlib.util.resolve_name("." * level + name, globals["__package__"])
+            if level
+            else name
+        )
+        if absolute in originals:
+            module = stage(absolute)
+            return module if fromlist else proxies["vllm"]
+        if absolute in proxies:
+            module = proxies[absolute]
+            for item in fromlist or ():
+                child = absolute + "." + item
+                if child in originals:
+                    setattr(module, item, stage(child))
+            return module if fromlist else proxies["vllm"]
+        if absolute.startswith(_PACKAGE + "."):
+            raise ValueError(f"New parser dependency requires a restart: {absolute}")
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    def stage(name):
+        if name in modules:
+            return modules[name]
+        old = originals[name]
+        spec = old.__spec__
+        source = spec.loader.get_source(name) if spec and spec.loader else None
+        if source is None:
+            raise ValueError(f"No reloadable Python source for {name}")
+        module = ModuleType(name)
+        module.__dict__.update(
+            {
+                "__file__": old.__file__,
+                "__spec__": spec,
+                "__package__": old.__package__,
+                "__loader__": old.__loader__,
+                "__builtins__": dict(vars(builtins), __import__=isolated_import),
+            }
+        )
+        modules[name] = module
+        setattr(proxies[_PACKAGE], name.rsplit(".", 1)[1], module)
+        exec(compile(source, old.__file__, "exec"), module.__dict__)
+        return module
+
+    for name in sorted(originals):
+        stage(name)
+    for name, (module_name, class_name) in Manager.lazy_parsers.items():
+        if module_name in modules:
+            Manager.tool_parsers[name] = getattr(modules[module_name], class_name)
+    prepared = ParserReload(Manager, modules, _VERSION)
+    Manager.tool_parsers = {
+        name: prepared.replacement(cls) for name, cls in Manager.tool_parsers.items()
+    }
+    return prepared
+
+
+def publish_reload(prepared: ParserReload) -> dict:
+    """Publish only a complete generation, while holding reload_lock."""
+    global _VERSION
+    from vllm.tool_parsers import ToolParserManager
+
+    if prepared.version != _VERSION:
+        raise RuntimeError("Parser generation changed during reload")
+    ToolParserManager.tool_parsers = prepared.manager.tool_parsers
+    ToolParserManager.lazy_parsers = prepared.manager.lazy_parsers
+    if prepared.modules:
+        _VERSION += 1
+    return {"reloaded": sorted(prepared.modules), "version": _VERSION}
 
 
 def reload_now(force: bool = True) -> dict:
-    """Reload the tool parser modules and refresh the registry.
-
-    Args:
-        force: reload unconditionally. Kept as a parameter so callers can later
-            add an mtime-based skip without changing the signature.
-
-    Returns:
-        ``{"reloaded": [...], "version": <new version>}``
-    """
-    global _VERSION
-    reloaded: list[str] = []
-    with _LOCK:
-        for name in _loaded_parser_modules():
-            mod = sys.modules.get(name)
-            if mod is None:
-                continue
-            try:
-                importlib.reload(mod)
-                reloaded.append(name)
-            except Exception:
-                # Keep the old module rather than take the server down over a
-                # typo in the file being edited.
-                logger.exception("tool parser hot-reload failed for %s", name)
-        if reloaded:
-            _refresh_registry()
-            _VERSION += 1
-            logger.warning(
-                "tool parser hot-reloaded (v%d): %s", _VERSION, reloaded
-            )
-    return {"reloaded": reloaded, "version": _VERSION}
+    """Compatibility entry; failed preparation publishes nothing."""
+    with reload_lock:
+        return publish_reload(prepare_reload())

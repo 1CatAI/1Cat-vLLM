@@ -58,13 +58,12 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_tokenize_router(app)
 
-    # `POST /v1/internal/reload`: hot-reload tool parsers, serving classes and
-    # the chat template without an engine restart.
-    from vllm.entrypoints.serve.toolparser.api_router import (
-        attach_router as attach_toolparser_router,
-    )
+    if envs.VLLM_SERVER_DEV_MODE:
+        from vllm.entrypoints.serve.toolparser.api_router import (
+            attach_router as attach_toolparser_router,
+        )
 
-    attach_toolparser_router(app)
+        attach_toolparser_router(app)
 
     from .instrumentator import register_instrumentator_api_routers
 
