@@ -964,8 +964,8 @@ void validate_fp8_inputs(const torch::Tensor& qweight,
               "fp8_sm70_prepare: scales must be float32.");
   TORCH_CHECK(qweight.dim() == 2, "fp8_sm70_prepare: qweight must be 2D.");
   TORCH_CHECK(scales.dim() == 2, "fp8_sm70_prepare: scales must be 2D.");
-  TORCH_CHECK(group_size == 128,
-              "fp8_sm70_prepare: only group_size=128 is supported.");
+  TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+              "fp8_sm70_prepare: only group_size=32, 64 or 128 is supported.");
 }
 
 void validate_f16_weight(const torch::Tensor& weight, const char* op_name) {
@@ -3690,15 +3690,20 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
 
   const int64_t n = qweight.size(0);
   const int64_t k = qweight.size(1);
-  TORCH_CHECK(k % 8 == 0 && n % 8 == 0,
-              "fp8_sm70_prepare: K and N must be multiples of 8.");
+  TORCH_CHECK(k > 0 && n > 0, "fp8_sm70_prepare: K and N must be positive.");
+  // K chunks span complete quantization groups; HMMA-884 B packs N in
+  // 32-column groups (PackingImpl). Partial groups can corrupt packing or
+  // wedge split-K completion even when the CTA tile appears feasible.
+  TORCH_CHECK(k % group_size == 0 && n % 32 == 0,
+              "fp8_sm70_prepare: K must be a multiple of group_size and N a "
+              "multiple of 32.");
   const bool channelwise_scales = scales.size(0) == n && scales.size(1) == 1;
   const bool blockwise_scales =
       scales.size(0) == (n + group_size - 1) / group_size &&
       scales.size(1) == (k + group_size - 1) / group_size;
   TORCH_CHECK(channelwise_scales || blockwise_scales,
               "fp8_sm70_prepare: expected [N, 1] channel scales or "
-              "[ceil(N/128), ceil(K/128)] block scales.");
+              "[ceil(N/group_size), ceil(K/group_size)] block scales.");
 
   const auto converters = turbomind::gemm::GetConverters(
       turbomind::kHalf, turbomind::kFloat8_e4m3, turbomind::kHalf, true, 70);
@@ -4268,8 +4273,8 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
               "fp8_gemm_sm70: scales must be float16.");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16,
               "fp8_gemm_sm70: output must be float16.");
-  TORCH_CHECK(group_size == 128,
-              "fp8_gemm_sm70: only group_size=128 is supported.");
+  TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+              "fp8_gemm_sm70: only group_size=32, 64 or 128 is supported.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_feats));
   const int device = in_feats.get_device();
@@ -4278,6 +4283,9 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   const int64_t m = in_feats.size(0);
   const int64_t k = in_feats.size(1);
   const int64_t n = tm_weight.size(1);
+  TORCH_CHECK(k > 0 && n > 0 && k % group_size == 0 && n % 32 == 0,
+              "fp8_gemm_sm70: positive K must be a multiple of group_size and "
+              "N a multiple of 32.");
   TORCH_CHECK(tm_weight.size(0) == k, "fp8_gemm_sm70: weight shape mismatch.");
   TORCH_CHECK(tm_scales.size(0) == (k + group_size - 1) / group_size,
               "fp8_gemm_sm70: scale groups mismatch.");
