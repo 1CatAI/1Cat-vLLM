@@ -296,6 +296,11 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
         }
     if phase == "collectives":
         args = (cfg.model_config, cfg.speculative_config, cfg.parallel_config)
+        if is_sm70 and _is_sm70_mtp_verifier_contract(*args):
+            # The model's opaque FP32-residual norm has the same contract on
+            # every admitted shard. The pass checks the active communicator;
+            # explicit typed/legacy overrides keep their normal precedence.
+            defaults.setdefault("VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION", "1")
         _configure_sm70_glm5_dflash_tp4_push_allreduce(
             *args, is_sm70=is_sm70, defaults=defaults
         )

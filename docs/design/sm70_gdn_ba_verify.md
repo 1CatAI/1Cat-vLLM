@@ -56,15 +56,18 @@ The same owners handle these changes:
   every M1–8 width and the dense fallback above the fast-row capacity.
 - Collective admission uses communicator capabilities. The two-peer pull
   reduction and four-peer push transport remain topology-specific internals;
-  both provide fused all-reduce/Gemma RMSNorm and can publish the existing K16
-  activation layout for downstream projections. Their historical op names stay
-  compatible. TP4 row admission follows the native capacity rather than a list
+  both provide fused all-reduce/Gemma RMSNorm through one graph boundary and
+  can publish the existing K16 activation layout for downstream projections.
+  The FP32-residual boundary shares the original eight-warp norm arithmetic;
+  historical TP2 CUB-norm and TP4 op names stay compatible. The qualified model
+  enables the existing TP2 fusion policy automatically, preserving overrides. TP4 row admission follows the native capacity rather than a list
   of speculative batch sizes.
 - Local argmax and compact token all-gather already consume the communicator's
   TP size. They retain their shared selection and stable token-ID tie breaking.
 
-Native QPN2 decode reports its row capacity instead of imposing a separate
-Python M32 limit. Older extensions retain M32 admission; rows beyond the loaded
+The native-layout QPN2 entry reports its row capacity instead of imposing a
+separate Python M32 limit. Shared-TurboMind dispatch retains its native M1–32
+subset and the original larger-row TurboMind fallback. Older extensions retain M32 admission; rows beyond the loaded
 operator's capacity use the existing bounded prefill workspace. Gated N128
 normalization similarly reports its native indexing capacity, with the older
 extension's limit retained when the capability query is absent.

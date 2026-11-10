@@ -13,6 +13,9 @@ def _check_tp2_norm_handoff(rank: int, rendezvous: str) -> None:
     from vllm import _custom_ops as ops
     from vllm import _sm70_ops as linear_ops
     from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+    from vllm.model_executor.layers.layernorm import (
+        _sm70_dflash2_gemma_fused_add_rms_norm,
+    )
 
     torch.accelerator.set_device_index(rank)
     torch.set_num_threads(1)
@@ -38,12 +41,12 @@ def _check_tp2_norm_handoff(rank: int, rendezvous: str) -> None:
             residual = torch.zeros_like(x, dtype=torch.float32)
             weight = torch.zeros(5120, device="cuda", dtype=torch.float32)
             ca.custom_all_reduce(x)
-            ca.sm70_tp2_all_reduce_gemma_rms_norm(x, residual, weight, 1e-6)
+            ca.all_reduce_gemma_rms_norm(x, residual, weight, 1e-6)
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
             with ca.capture(), torch.cuda.graph(graph):
                 for _ in range(17):
-                    normalized, state = ca.sm70_tp2_all_reduce_gemma_rms_norm(
+                    normalized, state = ca.all_reduce_gemma_rms_norm(
                         x, residual, weight, 1e-6
                     )
                     ca.custom_all_reduce(x)
@@ -63,12 +66,16 @@ def _check_tp2_norm_handoff(rank: int, rendezvous: str) -> None:
                 dist.barrier()
                 graph.replay()
                 reduced = ca.custom_all_reduce(x)
-                expected_state = reduced.float() + residual
+                expected, expected_state = _sm70_dflash2_gemma_fused_add_rms_norm(
+                    reduced, residual, weight, 1e-6
+                )
                 expected_fp32 = torch.empty_like(expected_state)
                 ops.rms_norm(expected_fp32, expected_state, weight + 1, 1e-6)
-                expected = expected_fp32.half()
                 assert torch.equal(state, expected_state)
-                torch.testing.assert_close(normalized, expected, atol=2e-6, rtol=0.001)
+                assert torch.equal(normalized, expected)
+                torch.testing.assert_close(
+                    normalized, expected_fp32.half(), atol=2e-6, rtol=0.001
+                )
                 if rows <= 40:
                     clone_projection = torch.empty_like(projected)
                     linear_ops.fp8_qpn8_gemm_sm70_out(
@@ -149,7 +156,7 @@ def _check_push_norm(rank: int, rendezvous: str, algorithm: str | None) -> None:
             residual = residual_storage[:rows]
             weight = torch.zeros(5120, device="cuda", dtype=dtype)
             ca.custom_all_reduce(x)
-            ca.sm70_tp4_all_reduce_gemma_rms_norm(x, residual, weight, 1e-6)
+            ca.all_reduce_gemma_rms_norm(x, residual, weight, 1e-6)
             torch.accelerator.synchronize()
             dist.barrier()
             graphs, outputs = [], []
@@ -158,13 +165,13 @@ def _check_push_norm(rank: int, rendezvous: str, algorithm: str | None) -> None:
                 with ca.capture(), torch.cuda.graph(graph):
                     for _ in range(140):
                         if fused:
-                            output = ca.sm70_tp4_all_reduce_gemma_rms_norm(
+                            output = ca.all_reduce_gemma_rms_norm(
                                 x, residual, weight, 1e-6
                             )
                             # Separate packets must survive interleaved ordinary AR.
                             ca.custom_all_reduce(x)
                             if rows != 8:
-                                ca.sm70_tp4_all_reduce_gemma_rms_norm(
+                                ca.all_reduce_gemma_rms_norm(
                                     storage[:8], residual_storage[:8], weight, 1e-6
                                 )
                         else:
@@ -209,7 +216,7 @@ def _check_push_norm(rank: int, rendezvous: str, algorithm: str | None) -> None:
                 lo = torch.nextafter(oracle, torch.full_like(oracle, -float("inf")))
                 hi = torch.nextafter(oracle, torch.full_like(oracle, float("inf")))
                 assert bool(torch.all((actual >= lo) & (actual <= hi)))
-                eager, eager_residual = ca.sm70_tp4_all_reduce_gemma_rms_norm(
+                eager, eager_residual = ca.all_reduce_gemma_rms_norm(
                     x, residual, weight, 1e-6
                 )
                 torch.accelerator.synchronize()

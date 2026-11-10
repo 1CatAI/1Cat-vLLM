@@ -508,6 +508,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 return out
         return self.all_reduce(input_a + input_b)
 
+    def all_reduce_gemma_rms_norm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ca_comm = self.ca_comm
+        if (
+            self.use_custom_allreduce
+            and ca_comm is not None
+            and ca_comm.can_all_reduce_gemma_rms_norm(input_, residual, weight)
+        ):
+            return ca_comm.all_reduce_gemma_rms_norm(input_, residual, weight, epsilon)
+        if (
+            self.use_custom_allreduce
+            and ca_comm is not None
+            and ca_comm.sm70_tp4_push_buffer_ptrs is not None
+            and ca_comm.can_sm70_tp4_all_reduce_gemma_rms_norm(input_, residual, weight)
+        ):
+            return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(
+                input_, residual, weight, epsilon
+            )
+        from vllm.model_executor.layers.layernorm import (
+            _sm70_dflash2_gemma_fused_add_rms_norm,
+        )
+
+        return _sm70_dflash2_gemma_fused_add_rms_norm(
+            self.all_reduce(input_), residual, weight, epsilon
+        )
+
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
         input_: torch.Tensor,
@@ -541,30 +572,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_, residual, weight, epsilon
         )
 
-    def sm70_tp4_all_reduce_gemma_rms_norm(
-        self,
-        input_: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        ca_comm = self.ca_comm
-        if (
-            self.use_custom_allreduce
-            and ca_comm is not None
-            and ca_comm.sm70_tp4_push_buffer_ptrs is not None
-            and ca_comm.can_sm70_tp4_all_reduce_gemma_rms_norm(input_, residual, weight)
-        ):
-            return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(
-                input_, residual, weight, epsilon
-            )
-        from vllm.model_executor.layers.layernorm import (
-            _sm70_dflash2_gemma_fused_add_rms_norm,
-        )
-
-        return _sm70_dflash2_gemma_fused_add_rms_norm(
-            self.all_reduce(input_), residual, weight, epsilon
-        )
+    # Historical graph entry remains an alias of the shared ordered boundary.
+    sm70_tp4_all_reduce_gemma_rms_norm = all_reduce_gemma_rms_norm
 
     def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
         self,
