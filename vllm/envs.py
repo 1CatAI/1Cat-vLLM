@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from vllm.envs_metadata import bind_env_names, env_var, warn_deprecated_once
 
 if TYPE_CHECKING:
+    VLLM_SM70_PHASE_SEPARATION: bool
+    VLLM_SM70_PHASE_DECODE_SHARE: float
+    VLLM_SM70_PHASE_MAX_WAIT_MS: float
+    VLLM_SM70_PHASE_LOG_INTERVAL: int
     VLLM_KV_RETENTION_ABS_CAP: float
     VLLM_KV_RETENTION_ENABLED: bool
     VLLM_KV_RETENTION_GRACE: float
@@ -1475,6 +1479,64 @@ def _get_weight_load_max_split_scope() -> bool:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_SM70_PHASE_SEPARATION": env_var(
+        lambda: os.getenv("VLLM_SM70_PHASE_SEPARATION", "0").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Separate resident decode and prefill phases in synchronous PP1 "
+            "chunked text generation. Cache recovery keeps its normal path. "
+            "Default OFF; set 1 to opt in."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_DECODE_SHARE": env_var(
+        lambda: float(os.getenv("VLLM_SM70_PHASE_DECODE_SHARE", "0.4766")),
+        description=(
+            "Target share of wall-clock time given to the decode phase when "
+            "phase separation is on. The credit earn rate is "
+            "share/(1-share), so this is NOT the rate itself."
+        ),
+        category="configuration",
+        declared_default="0.4766",
+        effective_default="0.4766",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_MAX_WAIT_MS": env_var(
+        lambda: float(os.getenv("VLLM_SM70_PHASE_MAX_WAIT_MS", "300")),
+        description=(
+            "Hard ceiling on how long a decoder may go unserved while prefill "
+            "phases run, in milliseconds. The wait a client actually observes "
+            "is this plus one prefill step, since the guard can only be "
+            "evaluated at a step boundary."
+        ),
+        category="configuration",
+        declared_default="300.0",
+        effective_default="300.0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_LOG_INTERVAL": env_var(
+        lambda: int(os.getenv("VLLM_SM70_PHASE_LOG_INTERVAL", "0")),
+        description=(
+            "Emit a phase-pattern line every N engine steps. 0 = silent. "
+            "Diagnostic only: the configured knob is a time share, but this "
+            "line reports the realised decode:prefill step ratio."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=False,
+    ),
     "VLLM_KV_RETENTION_ABS_CAP": env_var(
         lambda: float(os.getenv("VLLM_KV_RETENTION_ABS_CAP", "0.60")),
         description=(
@@ -20507,6 +20569,10 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_SM70_PHASE_SEPARATION",
+        "VLLM_SM70_PHASE_DECODE_SHARE",
+        "VLLM_SM70_PHASE_MAX_WAIT_MS",
+        "VLLM_SM70_PHASE_LOG_INTERVAL",
         "VLLM_KV_RETENTION_ABS_CAP",
         "VLLM_KV_RETENTION_ENABLED",
         "VLLM_KV_RETENTION_GRACE",

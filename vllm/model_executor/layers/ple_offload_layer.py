@@ -22,7 +22,7 @@ never maps the complete embedding table.
 
 import functools
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -159,6 +159,46 @@ class CpuGpuSemaphore:
         )
 
 
+class _EarlyResultRelease:
+    """Mapped semaphores armed by one connector for one eager forward."""
+
+    def __init__(self, flags: Iterable[int]) -> None:
+        self.flags = set(flags)
+        self.released: set[int] = set()
+
+
+# The custom op only receives tensors. Address lookup keeps each connector's
+# release state separate when workers/engines share a process or host thread.
+_early_result_releases: dict[int, _EarlyResultRelease] = {}
+
+
+def begin_early_result_release(
+    active: bool, flags: Iterable[int] = ()
+) -> _EarlyResultRelease | None:
+    """Arm or disarm the mapped early release for the next forward."""
+    if not active:
+        return None
+    state = _EarlyResultRelease(flags)
+    if any(flag in _early_result_releases for flag in state.flags):
+        raise RuntimeError("PLE result already armed for an unfinished forward")
+    for flag in state.flags:
+        _early_result_releases[flag] = state
+    return state
+
+
+def finish_early_result_release(state: _EarlyResultRelease | None) -> set[int]:
+    """Disarm and return the flag addresses that the forward already reset."""
+    if state is None:
+        return set()
+    released = set(state.released)
+    for flag in state.flags:
+        if _early_result_releases.get(flag) is state:
+            del _early_result_releases[flag]
+    state.flags.clear()
+    state.released.clear()
+    return released
+
+
 # ---------------------------------------------------------------------------
 # Custom op: vllm::ple_offload_wait
 # ---------------------------------------------------------------------------
@@ -176,7 +216,7 @@ def _ple_offload_wait_impl(
     cpu_output_buffer: torch.Tensor | None = None,
     num_tokens: int = 0,
 ) -> None:
-    """Wait for the CPU result without releasing its output buffer."""
+    """Wait for the CPU result; release a mapped result only when armed."""
     stream = torch.cuda.current_stream()
     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
     dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())
@@ -207,6 +247,21 @@ def _ple_offload_wait_impl(
             ),
             "cuMemcpyHtoDAsync(PLE consumer result)",
         )
+        release_state = _early_result_releases.get(sem_flag_tensor.data_ptr())
+        if release_state is not None and not torch.cuda.is_current_stream_capturing():
+            # The consumer copy above is the only read of the mapped result.
+            # Releasing it in stream order lets the worker gather the next
+            # chunk while this forward still runs.
+            _cuda_check(
+                cuda_driver.cuStreamWriteValue32(
+                    cuda_stream,
+                    dev_ptr,
+                    CpuGpuSemaphore.RESET_VALUE,
+                    0,
+                ),
+                "cuStreamWriteValue32(early release)",
+            )
+            release_state.released.add(sem_flag_tensor.data_ptr())
 
 
 def _ple_offload_wait_fake(

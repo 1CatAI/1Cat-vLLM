@@ -31,8 +31,9 @@ def test_early_phase_preserves_ple_request_ownership(mode, capability, ple, expe
         calls.append("inputs")
         return inputs
 
-    def prepare_forward(reqs, tokens, dummy_run):
-        assert (reqs, tokens, dummy_run) == (1, 5, False)
+    def prepare_forward(reqs, tokens, dummy_run, cpu_inputs, eager_forward):
+        assert (reqs, tokens, dummy_run, cpu_inputs) == (1, 5, False, None)
+        assert eager_forward == (mode == CUDAGraphMode.NONE)
         calls.append("ple")
 
     runner = SimpleNamespace(
@@ -41,7 +42,9 @@ def test_early_phase_preserves_ple_request_ownership(mode, capability, ple, expe
         ),
         req_states=None,
         _ple_offload_connector=(
-            SimpleNamespace(prepare_forward=prepare_forward) if ple else None
+            SimpleNamespace(prepare_forward=prepare_forward, early_prefill=False)
+            if ple
+            else None
         ),
     )
     batch = SimpleNamespace(num_reqs=1, num_tokens_after_padding=5)
