@@ -162,3 +162,40 @@ def test_request_rows_graph_matches_independent_requests(batch, width):
                 1.25,
             )
         assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("query_rows", [1, 5, 8])
+def test_all_finite_e4m3_value_codes(query_rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    from vllm.v1.attention.ops.sm70_grouped_long import resolve_long_attention
+
+    operator, manifest = resolve_long_attention()
+    if manifest is None or manifest.get("query_rows_revision", 1) < 2:
+        pytest.skip("requires runtime query-row native revision 2")
+    codes = torch.arange(256, device="cuda", dtype=torch.uint8)
+    codes[[127, 255]] = 0
+    cache = torch.zeros(1, 2, 2048, 1, 256, device="cuda", dtype=torch.uint8)
+    cache[:, 1] = codes
+    keys, values = cache.unbind(1)
+    query = torch.zeros(query_rows, 6, 256, device="cuda", dtype=torch.float16)
+    output = torch.empty_like(query)
+    table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+    lengths = torch.arange(query_rows, device="cuda", dtype=torch.int32) % 2 + 1
+    partial = torch.empty(80, 8, 6, 256, device="cuda")
+    statistics = torch.empty(80, 8, 6, 2, device="cuda")
+    operator(
+        query,
+        keys,
+        values,
+        output,
+        table,
+        lengths,
+        partial,
+        statistics,
+        0.0625,
+        1.0,
+        1.0,
+    )
+    expected = codes.view(torch.float8_e4m3fn).half().expand_as(output)
+    assert torch.equal(output, expected)

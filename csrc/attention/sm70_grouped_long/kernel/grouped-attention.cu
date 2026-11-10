@@ -721,7 +721,7 @@ fp8_e4m3fn_vector_to_half8_fast(const uint64_t raw) {
       fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 48)));
 }
 
-__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
+__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lookup(
     const uint64_t raw, const uint16_t* __restrict__ lut) {
   return make_uint4(
       static_cast<uint32_t>(lut[static_cast<uint8_t>(raw)]) |
@@ -732,6 +732,38 @@ __device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
           (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 40)]) << 16),
       static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 48)]) |
           (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 56)]) << 16));
+}
+
+// Each input byte occupies the low half of a separate 16-bit lane.
+__device__ __forceinline__ uint32_t fp8_e4m3fn_expanded_pair_to_half2_bits(
+    const uint32_t expanded) {
+  union {
+    uint32_t bits;
+    __half2 values;
+  } pair;
+  pair.bits = ((expanded & 0x007f007fu) << 7) |
+              ((expanded & 0x00800080u) << 8);
+  pair.values = __hmul2(pair.values, __float2half2_rn(256.0f));
+  return pair.bits;
+}
+
+__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
+    const uint64_t raw, const uint16_t* __restrict__ lut) {
+  const uint32_t low = static_cast<uint32_t>(raw);
+  const uint32_t high = static_cast<uint32_t>(raw >> 32);
+  // Detect either signed NaN code across all eight bytes. Each masked byte
+  // is below 0x80, so packed subtraction identifies a zero byte by its borrow.
+  const uint32_t low_check = (low ^ 0x7f7f7f7fu) & 0x7f7f7f7fu;
+  const uint32_t high_check = (high ^ 0x7f7f7f7fu) & 0x7f7f7f7fu;
+  if (((low_check - 0x01010101u) | (high_check - 0x01010101u)) & 0x80808080u)
+    return fp8_e4m3fn_vector_to_half8_lookup(raw, lut);
+  // Byte permutations expand two codes at once. The exact half2 scaling
+  // handles finite normals, subnormals and signed zeros.
+  return make_uint4(
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(low, 0, 0x4140)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(low, 0, 0x4342)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(high, 0, 0x4140)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(high, 0, 0x4342)));
 }
 
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,

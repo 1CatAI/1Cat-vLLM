@@ -3605,10 +3605,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def _can_use_sm70_gdn_preprocess(self, mixed_qkv, a, b, conv_state, metadata):
-        # Restrict the first admission to a complete single-request verifier.
-        # Mixed batches, padding with fewer actual tokens, and trees retain the
-        # existing convolution/gating path.
+        # Complete verifier batches share one physical query capacity per request.
+        # Device query offsets still describe live, shortened and empty requests.
         tokens = metadata.num_actual_tokens
+        requests = metadata.num_spec_decodes
         return bool(
             self.enable_sm70_dflash2_fused_gdn_verify
             and current_platform.is_device_capability(70)
@@ -3620,20 +3620,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.conv1d.bias is None
             and self.activation in ("silu", "swish")
             and metadata.num_prefills == metadata.num_decodes == 0
-            and metadata.num_spec_decodes == 1
-            and 1 <= tokens <= 8
+            and requests > 0
+            and tokens % requests == 0
+            and 1 <= tokens // requests <= 8
             and metadata.spec_sequence_masks is not None
             and metadata.ddtree_parent_ids is None
             and metadata.spec_query_start_loc is not None
             and metadata.spec_query_start_loc.ndim == 1
-            and metadata.spec_query_start_loc.numel() >= 2
+            and metadata.spec_query_start_loc.numel() >= requests + 1
+            and metadata.spec_query_start_loc.is_contiguous()
             and metadata.spec_state_indices_tensor is not None
             and metadata.spec_state_indices_tensor.ndim == 2
-            and metadata.spec_state_indices_tensor.shape[0] >= 1
-            and metadata.spec_state_indices_tensor.shape[1] == tokens
+            and metadata.spec_state_indices_tensor.shape[0] >= requests
+            and metadata.spec_state_indices_tensor.shape[1] == tokens // requests
             and metadata.spec_state_slot_selectors is not None
             and metadata.spec_state_slot_selectors.ndim == 1
-            and metadata.spec_state_slot_selectors.numel() >= 1
+            and metadata.spec_state_slot_selectors.numel() >= requests
+            and metadata.spec_state_slot_selectors.is_contiguous()
             and metadata.spec_query_start_loc.dtype == torch.int32
             and metadata.spec_state_indices_tensor.dtype == torch.int32
             and metadata.spec_state_slot_selectors.dtype == torch.int32
@@ -3647,7 +3650,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and conv_state.dtype == torch.float16
             and conv_state.ndim == 3
             and conv_state.shape[1] == 2560
-            and conv_state.shape[2] >= tokens + 2
+            and conv_state.shape[2] >= tokens // requests + 2
             and self.conv1d.weight.shape == (2560, 1, 4)
             and self.conv1d.weight.dtype == torch.float16
         )
@@ -3971,9 +3974,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv,
                 conv_state,
                 conv_weights,
-                spec_state_indices_tensor[:1, 0],
-                spec_state_slot_selectors[:1],
-                spec_query_start_loc[:2],
+                spec_state_indices_tensor[: attn_metadata.num_spec_decodes, 0],
+                spec_state_slot_selectors[: attn_metadata.num_spec_decodes],
+                spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
                 self.A_log,
                 a,
                 b,
@@ -5346,9 +5349,9 @@ def qwen_gdn_attention_core_spec_commit(
                 mixed_qkv,
                 conv_state,
                 conv_weights,
-                spec_state_indices_tensor[:1, 0],
-                spec_state_slot_selectors[:1],
-                spec_query_start_loc[:2],
+                spec_state_indices_tensor[: attn_metadata.num_spec_decodes, 0],
+                spec_state_slot_selectors[: attn_metadata.num_spec_decodes],
+                spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
                 self.A_log,
                 a,
                 b,

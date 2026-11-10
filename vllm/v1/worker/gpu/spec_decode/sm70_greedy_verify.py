@@ -78,7 +78,7 @@ def maybe_sample_greedy(
     sampler,
     rejection_sampler,
     capability_enabled: bool,
-    verify_enabled: bool,
+    verify_enabled: bool | None,
     sample_hidden_states,
     input_batch,
     grammar_output,
