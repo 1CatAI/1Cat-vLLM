@@ -435,6 +435,8 @@ multiprocess==0.70.16
     #   evaluate
 mypy-extensions==1.0.0
     # via black
+narwhals==2.28.0
+    # via plotly
 networkx==3.2.1
     # via
     #   scikit-image
@@ -631,7 +633,7 @@ platformdirs==4.3.6
     #   black
     #   pooch
     #   virtualenv
-plotly==5.24.1
+plotly==6.9.0
     # via
     #   -r requirements/test/cuda.in
     #   genai-perf
@@ -963,7 +965,6 @@ tenacity==9.1.2
     # via
     #   gpt-oss
     #   lm-eval
-    #   plotly
 tensorizer==2.12.1
     # via -r requirements/test/cuda.in
 termcolor==3.1.0
