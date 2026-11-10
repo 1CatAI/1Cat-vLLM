@@ -11,10 +11,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("group", [32, 64, 128])
-@pytest.mark.parametrize("rows", [1, 8, 17, 32, 65])
-@pytest.mark.parametrize("n,k", [(256, 256), (264, 272)])
-def test_e4m3_group_sizes_against_fp64_and_graph(group, rows, n, k):
+def _check_e4m3_projection(group, rows, n, k):
     import vllm._C  # noqa: F401
 
     torch.manual_seed(group + rows + n)
@@ -63,6 +60,22 @@ def test_e4m3_group_sizes_against_fp64_and_graph(group, rows, n, k):
 
 
 @pytest.mark.parametrize("group", [32, 64, 128])
+@pytest.mark.parametrize("rows", [1, 8, 17, 32, 65])
+@pytest.mark.parametrize("n,k", [(256, 256), (288, 384)])
+def test_e4m3_group_sizes_against_fp64_and_graph(group, rows, n, k):
+    _check_e4m3_projection(group, rows, n, k)
+
+
+@pytest.mark.parametrize(
+    "group,n,k",
+    [(32, 2560, 160), (32, 1152, 288), (32, 864, 1152), (64, 320, 2560)],
+)
+@pytest.mark.parametrize("rows", [1, 5, 40])
+def test_e4m3_actual_projection_shapes(group, n, k, rows):
+    _check_e4m3_projection(group, rows, n, k)
+
+
+@pytest.mark.parametrize("group", [32, 64, 128])
 @pytest.mark.parametrize("rows", [5, 33])
 def test_e4m3_group_sizes_fused_gate(group, rows):
     import vllm._C  # noqa: F401
@@ -95,26 +108,52 @@ def test_e4m3_unsupported_group_is_rejected(group):
 
 
 @pytest.mark.parametrize("group", [32, 64, 128])
-def test_e4m3_eight_column_k_tail_is_rejected_before_dispatch(group):
+@pytest.mark.parametrize("k", [264, 272])
+def test_e4m3_partial_k_group_is_rejected_before_dispatch(group, k):
     import vllm._C  # noqa: F401
 
-    weight = torch.empty(256, 264, device="cuda", dtype=torch.float8_e4m3fn)
+    weight = torch.empty(256, k, device="cuda", dtype=torch.float8_e4m3fn)
     scales = torch.ones(256, 1, device="cuda")
-    with pytest.raises(RuntimeError, match="multiple of 16"):
+    with pytest.raises(RuntimeError, match="multiple of group_size"):
         torch.ops._C.fp8_sm70_prepare(weight, scales, group, False)
     # Protect the execution API too, including buffers packed by an older
-    # native library which admitted an unsupported eight-column K tail.
-    with pytest.raises(RuntimeError, match="multiple of 16"):
+    # native library which admitted an unsupported partial K group.
+    with pytest.raises(RuntimeError, match="multiple of group_size"):
         torch.ops._C.fp8_gemm_sm70_out(
             torch.empty(1, 256, device="cuda", dtype=torch.float16),
-            torch.empty(1, 264, device="cuda", dtype=torch.float16),
-            torch.empty(264, 256, device="cuda", dtype=torch.uint8),
+            torch.empty(1, k, device="cuda", dtype=torch.float16),
+            torch.empty(k, 256, device="cuda", dtype=torch.uint8),
             torch.empty(
-                (264 + group - 1) // group, 256, device="cuda", dtype=torch.float16
+                (k + group - 1) // group, 256, device="cuda", dtype=torch.float16
             ),
             group,
-            264,
+            k,
             256,
+            False,
+        )
+
+
+@pytest.mark.parametrize("group", [32, 64, 128])
+@pytest.mark.parametrize("n", [264, 272, 280])
+def test_e4m3_partial_packed_column_is_rejected(group, n):
+    import vllm._C  # noqa: F401
+
+    with pytest.raises(RuntimeError, match="multiple of 32"):
+        torch.ops._C.fp8_sm70_prepare(
+            torch.empty(n, 384, device="cuda", dtype=torch.float8_e4m3fn),
+            torch.ones(n, 1, device="cuda"),
+            group,
+            False,
+        )
+    with pytest.raises(RuntimeError, match="multiple of 32"):
+        torch.ops._C.fp8_gemm_sm70_out(
+            torch.empty(1, n, device="cuda", dtype=torch.float16),
+            torch.empty(1, 384, device="cuda", dtype=torch.float16),
+            torch.empty(384, n, device="cuda", dtype=torch.uint8),
+            torch.empty(384 // group, n, device="cuda", dtype=torch.float16),
+            group,
+            384,
+            n,
             False,
         )
 

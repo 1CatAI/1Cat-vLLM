@@ -3691,11 +3691,12 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
   const int64_t n = qweight.size(0);
   const int64_t k = qweight.size(1);
   TORCH_CHECK(k > 0 && n > 0, "fp8_sm70_prepare: K and N must be positive.");
-  // Every registered E4M3 kernel needs at least a 16-column K tile.
-  // Reject unsupported geometry before the dispatcher can abort on an empty
-  // feasible-kernel set; an eight-column K tail is not implemented.
-  TORCH_CHECK(k % 16 == 0 && n % 8 == 0,
-              "fp8_sm70_prepare: K must be a multiple of 16 and N of 8.");
+  // K chunks span complete quantization groups; HMMA-884 B packs N in
+  // 32-column groups (PackingImpl). Partial groups can corrupt packing or
+  // wedge split-K completion even when the CTA tile appears feasible.
+  TORCH_CHECK(k % group_size == 0 && n % 32 == 0,
+              "fp8_sm70_prepare: K must be a multiple of group_size and N a "
+              "multiple of 32.");
   const bool channelwise_scales = scales.size(0) == n && scales.size(1) == 1;
   const bool blockwise_scales =
       scales.size(0) == (n + group_size - 1) / group_size &&
@@ -4282,8 +4283,9 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   const int64_t m = in_feats.size(0);
   const int64_t k = in_feats.size(1);
   const int64_t n = tm_weight.size(1);
-  TORCH_CHECK(k > 0 && n > 0 && k % 16 == 0 && n % 8 == 0,
-              "fp8_gemm_sm70: positive K must be a multiple of 16 and N of 8.");
+  TORCH_CHECK(k > 0 && n > 0 && k % group_size == 0 && n % 32 == 0,
+              "fp8_gemm_sm70: positive K must be a multiple of group_size and "
+              "N a multiple of 32.");
   TORCH_CHECK(tm_weight.size(0) == k, "fp8_gemm_sm70: weight shape mismatch.");
   TORCH_CHECK(tm_scales.size(0) == (k + group_size - 1) / group_size,
               "fp8_gemm_sm70: scale groups mismatch.");
