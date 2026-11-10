@@ -57,6 +57,12 @@ def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
 
 
+def _timing_usage_fields(usage: UsageInfo | None) -> dict[str, dict[str, float]]:
+    if usage is not None and usage.timings is not None:
+        return {"timings": usage.timings}
+    return {}
+
+
 def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
     """Anthropic `cache_read_input_tokens`, when the engine measured a hit."""
     if usage is not None and usage.prompt_tokens_details is not None:
@@ -542,6 +548,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                 input_tokens=_anthropic_input_tokens(generator.usage),
                 output_tokens=generator.usage.completion_tokens,
                 **_cache_usage_fields(generator.usage),
+                **_timing_usage_fields(generator.usage),
             ),
             kv_transfer_params=generator.kv_transfer_params,
         )
@@ -735,6 +742,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     if origin_chunk.usage
                                     else 0,
                                     **_cache_usage_fields(origin_chunk.usage),
+                                    **_timing_usage_fields(origin_chunk.usage),
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)

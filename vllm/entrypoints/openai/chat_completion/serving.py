@@ -57,6 +57,7 @@ from vllm.entrypoints.openai.engine.serving import (
     clamp_prompt_logprobs,
     drop_misaligned_logprobs,
 )
+from vllm.entrypoints.openai.engine.usage import get_request_usage_timings
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_stop_tokens_for_assistant_actions,
@@ -646,8 +647,15 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        # Kept so the final usage can carry the engine's per-request breakdown.
+        # The stats object is attached to every output, but only the finished
+        # one holds a complete set of timestamps.
+        last_metrics = None
         try:
             async for res in result_generator:
+                if getattr(res, "metrics", None) is not None:
+                    last_metrics = res.metrics
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -1106,6 +1114,11 @@ class OpenAIServingChat(OpenAIServing):
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens
                     )
+                # Engine-authoritative per-request timings. Omitted when the
+                # engine collected no stats for this request.
+                final_usage.timings = get_request_usage_timings(
+                    last_metrics, num_choices=num_choices
+                )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1543,6 +1556,13 @@ class OpenAIServingChat(OpenAIServing):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
             )
+        # Engine-authoritative per-request timings. Without this a
+        # non-streaming caller has no prefill/decode split at all, and any
+        # consumer that derives rates from a token stream sees the whole
+        # request as one point in time.
+        usage.timings = get_request_usage_timings(
+            getattr(final_res, "metrics", None), num_choices=len(choices)
+        )
 
         request_metadata.final_usage_info = usage
 

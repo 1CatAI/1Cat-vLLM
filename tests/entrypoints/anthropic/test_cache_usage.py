@@ -23,19 +23,21 @@ def serving():
     return serving
 
 
-def _usage(details):
+def _usage(details, timings=None):
     return UsageInfo(
         prompt_tokens=24,
         completion_tokens=3,
         total_tokens=27,
         prompt_tokens_details=details,
+        timings=timings,
     )
 
 
 @pytest.mark.parametrize(
     "details", [None, {}, {"cached_tokens": 0}, {"cached_tokens": 16}]
 )
-def test_full_response_cache_usage(serving, details):
+@pytest.mark.parametrize("timings", [None, {"queue_s": 0.0, "ttft_s": 0.125}])
+def test_full_response_cache_usage(serving, details, timings):
     response = ChatCompletionResponse(
         id="chatcmpl-cache-test",
         model="test-model",
@@ -44,7 +46,7 @@ def test_full_response_cache_usage(serving, details):
                 index=0, message=ChatMessage(role="assistant", content="hello")
             )
         ],
-        usage=_usage(details),
+        usage=_usage(details, timings),
     )
     result = serving.messages_full_converter(response)
 
@@ -60,6 +62,8 @@ def test_full_response_cache_usage(serving, details):
     assert serialized["role"] == "assistant"
     assert result.content[0].text == "hello"
     assert result.stop_reason == "end_turn"
+    assert result.usage.timings == timings
+    assert ("timings" in serialized["usage"]) == (timings is not None)
 
 
 @pytest.mark.parametrize(
@@ -72,14 +76,15 @@ def test_full_response_cache_usage(serving, details):
         (None, {"cached_tokens": 16}),
     ],
 )
-def test_stream_response_cache_usage(serving, initial_details, final_details):
+@pytest.mark.parametrize("timings", [None, {"queue_s": 0.0, "ttft_s": 0.125}])
+def test_stream_response_cache_usage(serving, initial_details, final_details, timings):
     async def source():
         for details in [initial_details, final_details]:
             chunk = ChatCompletionStreamResponse(
                 id="chatcmpl-cache-test",
                 model="test-model",
                 choices=[],
-                usage=_usage(details),
+                usage=_usage(details, timings),
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
@@ -111,6 +116,12 @@ def test_stream_response_cache_usage(serving, initial_details, final_details):
         else:
             assert usage["cache_read_input_tokens"] == expected
         assert "cache_creation_input_tokens" not in usage
+        # message_start reports zero output tokens; complete phase timings
+        # belong to the final message_delta, even if its source was prefilled.
+        if timings is None or output_tokens == 0:
+            assert "timings" not in usage
+        else:
+            assert usage["timings"] == timings
 
 
 def test_stream_without_usage_preserves_zero_counts(serving):
