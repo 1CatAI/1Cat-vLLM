@@ -173,11 +173,16 @@ def _can_implement_sm70_combined_gdn_split(
     ba_size: int,
 ) -> tuple[bool, str | None]:
     """The measured copy schedule depends on local tails, not model width or TP."""
-    if not 1 <= num_tokens <= 40:
+    if num_tokens <= 0:
         return False, "query_rows"
     if dtype != torch.float16:
         return False, "dtype"
-    if (qkv_size, z_size, ba_size) != (2560, 1536, 12):
+    if (
+        ba_size <= 0
+        or z_size != ba_size * 128
+        or qkv_size * 3 != z_size * 5
+        or triton.next_power_of_2(z_size) > 65536
+    ):
         return False, "local_tail_layout"
     return True, None
 

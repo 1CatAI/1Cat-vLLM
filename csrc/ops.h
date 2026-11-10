@@ -294,6 +294,7 @@ void fp8_gemm_sm70_prescaled_m1_out(torch::Tensor out, torch::Tensor _in_feats,
                                     int64_t group_size, int64_t k_ld,
                                     int64_t q_ld);
 
+int64_t nvfp4_qpn2_max_rows_sm70();
 std::vector<torch::Tensor> nvfp4_qpn2_prepare_sm70(torch::Tensor weight_packed,
                                                    torch::Tensor weight_scale);
 

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("rows", [1, 8, 16, 24, 32, 64, 256])
+@pytest.mark.parametrize("rows", [1, 8, 16, 24, 32, 40, 64, 65, 256])
 @pytest.mark.parametrize("bundled", [False, True])
 @torch.inference_mode()
 def test_native_decode_and_prefill_basis(rows, bundled):

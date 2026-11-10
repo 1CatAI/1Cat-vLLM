@@ -44,7 +44,9 @@ def _sm70_qwen_gdn_rmsnorm_gated_configured_impl(
         and current_platform.is_device_capability(70)
         and x.is_cuda
         and x.dtype == torch.float16
-        and x.shape == (12, 128)
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.shape[1] == 128
         and x.is_contiguous()
         and z.is_cuda
         and z.device == x.device
@@ -61,7 +63,7 @@ def _sm70_qwen_gdn_rmsnorm_gated_configured_impl(
         and activation in ("silu", "swish")
     ):
         out = torch.empty_like(x)
-        _sm70_gdn_rmsnorm_gated_onepass_kernel[(12,)](
+        _sm70_gdn_rmsnorm_gated_onepass_kernel[(x.shape[0],)](
             x,
             z,
             weight,

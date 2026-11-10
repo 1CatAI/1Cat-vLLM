@@ -32,13 +32,13 @@ template <int Warps>
 __device__ __forceinline__ void fused_ba_tile(const half* input,
                                               const Sm70FusedBa& ba,
                                               float* partial, int first_row,
-                                              int k, int m) {
+                                              int k, int m, int first_col = 0) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int quadpair = (lane >> 2) & 3;
   const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int row = first_row + local_row;
-  const int column = quadpair * 8 + local_row;
+  const int column = first_col + quadpair * 8 + local_row;
   const int per_warp = (k >> 4) / Warps;
   float accum[2][8] = {};
   for (int group = warp * per_warp; group < (warp + 1) * per_warp; ++group) {
@@ -71,7 +71,7 @@ __device__ __forceinline__ void fused_ba_tile(const half* input,
   __syncthreads();
   for (int e = threadIdx.x; e < 256; e += blockDim.x) {
     const int out_row = first_row + e / 32;
-    const int out_col = e % 32;
+    const int out_col = first_col + e % 32;
     if (out_row >= m || out_col >= ba.ba_n) continue;
     float sum = 0.0f;
 #pragma unroll
@@ -114,8 +114,11 @@ __global__ void qpn_pair_m16_kernel(const uint8_t* __restrict__ codes,
   if constexpr (FusedBA) {
     const int pairs = width / 64;
     if (blockIdx.x >= pairs) {
+      const int column_tiles = (fused_ba.ba_n + 31) / 32;
+      const int tile = blockIdx.x - pairs;
       fused_ba_tile<Split>(input, fused_ba, reinterpret_cast<float*>(storage),
-                           (blockIdx.x - pairs) * 8, k, m);
+                           (tile / column_tiles) * 8, k, m,
+                           (tile % column_tiles) * 32);
       return;
     }
   }
@@ -260,7 +263,8 @@ void launch_qpn_pair_m16_fused_ba(torch::Tensor out, torch::Tensor input,
   torch::Tensor packed;
   auto* a = k16_packed_input(input, packed, stream);
   const int m = static_cast<int>(input.size(0));
-  kernel<<<width / 64 + (m + 7) / 8, 32 * Split, kShared, stream>>>(
+  const int ba_tiles = ((m + 7) / 8) * ((fused_ba.ba_n + 31) / 32);
+  kernel<<<width / 64 + ba_tiles, 32 * Split, kShared, stream>>>(
       reinterpret_cast<const uint8_t*>(codes.data_ptr()), scales.data_ptr(), a,
       reinterpret_cast<half*>(out.data_ptr<at::Half>()), nullptr, width,
       static_cast<int>(input.size(1)), m, 1.0f, fused_ba);

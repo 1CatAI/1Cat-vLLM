@@ -1236,14 +1236,11 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
 // row, retains the normal all-reduce peer order, and applies only its local
 // residual after the peer reduction.
 template <int Threads, int ngpus, typename ResidualT, typename WeightT>
-__global__ void __launch_bounds__(Threads, 1)
-    sm70_peer_reduce_gemma_rms_norm(RankData* _dp, RankSignals sg,
-                                    Signal* self_sg,
-                                    const ResidualT* __restrict__ residual,
-                                    const WeightT* __restrict__ weight,
-                                    half* __restrict__ normalized_out,
-                                    float* __restrict__ residual_out, int rank,
-                                    float epsilon) {
+__global__ void __launch_bounds__(Threads, 1) sm70_peer_reduce_gemma_rms_norm(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const ResidualT* __restrict__ residual, const WeightT* __restrict__ weight,
+    half* __restrict__ normalized_out, float* __restrict__ residual_out,
+    int rank, float epsilon, half* k16_out, int num_tokens) {
   using P = typename packed_t<half>::P;
   using A = typename packed_t<half>::A;
   constexpr int kPackedWidth = P::size;
@@ -1307,8 +1304,15 @@ __global__ void __launch_bounds__(Threads, 1)
       const int column = element_offset + i;
       const float gemma_weight =
           sm70_gemma_rms_norm_to_float(weight[column]) + 1.0f;
-      normalized_out[row_offset + column] =
+      const half value =
           __float2half_rn(residual_values[column] * inverse_rms * gemma_weight);
+      normalized_out[row_offset + column] = value;
+      if (k16_out != nullptr) {
+        const size_t index =
+            (static_cast<size_t>(column / 16) * num_tokens + row) * 16 +
+            column % 16;
+        k16_out[index] = value;
+      }
     }
   }
 
@@ -3002,16 +3006,16 @@ class CustomAllreduce {
                                       ResidualT, WeightT>
           <<<num_tokens, kSm70GemmaRmsNormThreads, 0, stream>>>(
               ptrs, sg_, self_sg_, residual, weight, normalized_out,
-              residual_out, rank_, epsilon);
+              residual_out, rank_, epsilon, k16_out, num_tokens);
       return;
     }
 
     const int threads = sm70_gemma_rms_norm_threads(policy_);
-#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                          \
-  sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT>     \
-      <<<num_tokens, THREADS, 0, stream>>>(ptrs, sg_, self_sg_, residual, \
-                                           weight, normalized_out,        \
-                                           residual_out, rank_, epsilon)
+#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                               \
+  sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT>          \
+      <<<num_tokens, THREADS, 0, stream>>>(                                    \
+          ptrs, sg_, self_sg_, residual, weight, normalized_out, residual_out, \
+          rank_, epsilon, k16_out, num_tokens)
     switch (threads) {
       case 256:
         VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(256);

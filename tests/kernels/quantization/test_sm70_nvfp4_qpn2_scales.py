@@ -6,6 +6,159 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("rows", [32, 33, 40, 64, 65])
+@pytest.mark.parametrize("capacity", [None, 64])
+def test_native_decode_follows_the_loaded_row_capacity(monkeypatch, rows, capacity):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.utils import (
+        sm70_nvfp4_native as module,
+    )
+
+    native = SimpleNamespace()
+    if capacity is not None:
+        native.nvfp4_qpn2_max_rows_sm70 = lambda: capacity
+    monkeypatch.setattr(torch.ops, "_C", native)
+    calls = []
+    monkeypatch.setattr(
+        module.sm70_ops, "nvfp4_qpn2_gemm_sm70_out", lambda *a, **k: calls.append(True)
+    )
+    monkeypatch.setattr(
+        module, "_get_sm70_fp8_prefill_exact_dense_workspace", lambda _: None
+    )
+    x, out = torch.empty(rows, 128, device="meta"), torch.empty(rows, 32, device="meta")
+    codes = torch.empty(32, 64, dtype=torch.uint8, device="meta")
+    if rows <= (capacity or 32):
+        module._dispatch(out, x, codes, codes, 0.001, 8, 2, False)
+        assert calls == [True]
+    else:
+        with pytest.raises(RuntimeError, match="prefill workspace"):
+            module._dispatch(out, x, codes, codes, 0.001, 8, 2, False)
+        assert not calls
+
+
+@pytest.mark.parametrize("k,n", [(5120, 7168), (5120, 8256), (3072, 5120)])
+@pytest.mark.parametrize("global_scale", [2**-20, 0.000502813432831, 0.5])
+def test_wider_shared_projection_basis_keeps_original_weights(k, n, global_scale):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    from vllm import _sm70_ops as ops
+
+    torch.manual_seed(195)
+    logical = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
+    raw = (
+        torch.tensor([0, 2**-9, 0.5, 1.5, 7, 24, 192, 448], device="cuda")
+        .to(torch.float8_e4m3fn)
+        .repeat(n, k // 128)
+    )
+    compact = torch.ops._C.nvfp4_qpn2_prepare_scales_sm70(raw)
+    tm, tm_scales, meta = torch.ops._C.nvfp4_sm70_prepare(
+        logical.T.contiguous(),
+        (raw.float() * global_scale).half().T.contiguous(),
+        16,
+        False,
+    )
+    x = torch.zeros(5, k, device="cuda", dtype=torch.float16)
+    output = x.new_empty(5, n)
+
+    def run():
+        ops.nvfp4_qpn2_tm_dispatch_sm70_out(
+            output,
+            x,
+            tm,
+            compact,
+            global_scale,
+            16,
+            2,
+            tm_scales,
+            16,
+            int(meta[0]),
+            int(meta[1]),
+            False,
+            0,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda")
+    for shift in (0, 17):
+        columns = (
+            torch.tensor([0, k // 4 - 1, k // 2, k // 2 + 1, k - 1], device="cuda")
+            + shift
+        ) % k
+        x.zero_()
+        x[torch.arange(5, device="cuda"), columns] = 1
+        graph.replay()
+        code = logical[:, columns].long()
+        scale = (raw.float() * global_scale).half()[:, columns // 16]
+        expected = (
+            (magnitudes[code & 7] * torch.where(code & 8 != 0, -1, 1) * scale.float())
+            .half()
+            .T
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("packed_k", [2176, 4352, 768])
+def test_bundled_down_selection_uses_local_geometry(packed_k):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.kernels.linear.qpn.nvfp4 import _bundled_down_layout
+
+    config = SimpleNamespace(
+        policy=SimpleNamespace(bundled_down_decode=True), gated_silu=False
+    )
+    layer = SimpleNamespace(
+        prefix="model.layers.0.mlp.down_proj",
+        weight=torch.empty(5120, packed_k, device="meta"),
+    )
+    assert _bundled_down_layout(layer, config)
+    config.gated_silu = True
+    assert not _bundled_down_layout(layer, config)
+    config.gated_silu = False
+    layer.prefix = "model.layers.0.mlp.other_proj"
+    assert not _bundled_down_layout(layer, config)
+
+
+@pytest.mark.parametrize(
+    "rows,k", [(1, 4352), (5, 4352), (1, 8704), (5, 8704), (8, 8704)]
+)
+def test_bundled_down_geometry_preserves_effective_weights_and_replay(rows, k):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    from vllm import _sm70_ops as ops
+
+    torch.manual_seed(508)
+    n = 5120
+    packed = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8)
+    raw_scales = torch.randint(1, 24, (n, k // 16), device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    codes, scales = ops.nvfp4_qpn2_prepare_sm70(packed, raw_scales)
+    bundled, bundled_scales = ops.nvfp4_qpn2_bundle_sm70(codes, scales)
+    x = torch.randn(rows, k, device="cuda", dtype=torch.float16)
+    actual, expected = [x.new_empty(rows, n) for _ in range(2)]
+
+    def run():
+        ops.nvfp4_qpn2_gemm_sm70_out(
+            actual, x, bundled, bundled_scales, 0.000502813432831, 16, 2
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for amplitude in (0.0, 0.125, 2.0):
+        x.normal_().mul_(amplitude)
+        ops.nvfp4_qpn2_gemm_sm70_out(
+            expected, x, codes, scales, 0.000502813432831, 16, 2
+        )
+        graph.replay()
+        assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("rows", [5, 40])
 @pytest.mark.parametrize("native_policy", [("policy-token",), ["policy-token"]])
 def test_bundled_down_preserves_wrapper_policy(rows, native_policy, monkeypatch):
@@ -47,13 +200,15 @@ def test_bundled_down_preserves_wrapper_policy(rows, native_policy, monkeypatch)
 
 
 @pytest.mark.parametrize("global_scale", [2**-20, 0.000502813432831, 0.5])
-def test_shared_mtp_gate_preserves_scale_range(global_scale):
+@pytest.mark.parametrize("n", [8704, 17408])
+def test_shared_mtp_gate_preserves_scale_range(global_scale, n):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
     import vllm._C  # noqa: F401
 
-    n, k = 8704, 5120
-    logical = torch.arange(n * k, device="cuda").remainder(16).byte().reshape(n, k)
+    k = 5120
+    torch.manual_seed(905)
+    logical = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
     packed = logical[:, ::2] | (logical[:, 1::2] << 4)
     raw = torch.tensor([0, 2**-9, 0.5, 1.5, 7, 24, 192, 448], device="cuda")
     raw = raw.to(torch.float8_e4m3fn).repeat(n, k // 128)
@@ -64,6 +219,7 @@ def test_shared_mtp_gate_preserves_scale_range(global_scale):
         16,
         False,
     )
+    k_ld, q_ld = int(meta[0]), int(meta[1])
     padded = torch.zeros(8, k, device="cuda", dtype=torch.float16)
     padded[torch.arange(5), torch.arange(5) * 17] = 1
     outputs = []
@@ -79,13 +235,27 @@ def test_shared_mtp_gate_preserves_scale_range(global_scale):
             2,
             tm_scales,
             16,
-            int(meta[0]),
-            int(meta[1]),
+            k_ld,
+            q_ld,
             True,
             0,
         )
         outputs.append(out)
     assert torch.equal(outputs[0][:5].view(torch.int16), outputs[1].view(torch.int16))
+    # A basis input selects original effective weights directly, independently
+    # of the projection's packing, row stride and FP32 reduction schedule.
+    columns = torch.arange(5, device="cuda") * 17
+    code = logical[:, columns].long()
+    magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda")
+    scale = (raw.float() * global_scale).half()[:, columns // 16]
+    projected = (
+        (magnitudes[code & 7] * torch.where(code & 8 != 0, -1, 1) * scale.float())
+        .half()
+        .T
+    )
+    gate, up = projected.chunk(2, dim=1)
+    silu = (gate.float() / (1 + torch.exp(-gate.float()))).half()
+    torch.testing.assert_close(outputs[1], silu * up, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

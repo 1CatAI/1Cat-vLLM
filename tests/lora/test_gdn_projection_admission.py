@@ -15,8 +15,12 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
 
 
 @pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("wrapped", [False, True])
-def test_gdn_direct_output_requires_the_native_row_projection(monkeypatch, wrapped):
+@pytest.mark.parametrize("tp,rows", [(2, 1), (2, 5), (2, 17), (2, 40), (4, 8)])
+def test_gdn_direct_output_requires_the_native_row_projection(
+    monkeypatch, wrapped, tp, rows
+):
     monkeypatch.setattr(
         gdn.current_platform, "is_device_capability", lambda *a, **k: True
     )
@@ -32,7 +36,7 @@ def test_gdn_direct_output_requires_the_native_row_projection(monkeypatch, wrapp
         projection.reduce_results = False
         projection.sm70_fp8_qpn8 = True
         projection.scheme = object.__new__(CompressedTensorsW8A16Fp8)
-    output = torch.empty((8, 5120), dtype=torch.float16)
+    output = torch.empty((rows, 5120), dtype=torch.float16)
     expected = torch.full_like(output, 0.25)
     calls = []
 
@@ -46,7 +50,8 @@ def test_gdn_direct_output_requires_the_native_row_projection(monkeypatch, wrapp
     owner = SimpleNamespace(
         prefix="audit.gdn",
         enable_sm70_dflash2_fused_gdn_verify=True,
-        tp_size=4,
+        tp_size=tp,
+        hidden_size=5120,
         out_proj=projection,
         _compute_output_projection=compute,
     )
@@ -55,7 +60,7 @@ def test_gdn_direct_output_requires_the_native_row_projection(monkeypatch, wrapp
         torch.empty(0),
         torch.empty(0),
         output,
-        8,
+        rows,
     )
     assert len(calls) == 1
     assert calls[0] is (None if wrapped else output)

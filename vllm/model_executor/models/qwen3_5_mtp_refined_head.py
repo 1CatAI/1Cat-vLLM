@@ -18,9 +18,11 @@ import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings, call_native, register_policy_op
 from vllm.config.sm70_native import capture_linear_native_config
-from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
-from vllm.model_executor.models.qwen3_5_mtp_sm70_head import _hot_rows
+from vllm.model_executor.models.qwen3_5_mtp_sm70_head import (
+    _hot_rows,
+    _mtp_head_shard_rows,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -33,6 +35,24 @@ _MAX_ROWS = 8
 
 
 @triton.jit
+def _score_id_keys(values, offsets, WideIds: tl.constexpr):
+    # Wider vocabulary shards need 32 ID bits. Keep the compact key for
+    # smaller shards, without aliasing tokens when the head is less sharded.
+    # Signed zeros share a rank, and NaNs precede finite scores.
+    bits = values.to(tl.uint16, bitcast=True).to(tl.uint32)
+    ordered = tl.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits ^ 0x8000)
+    ordered = tl.where(values == 0, 0x8000, ordered)
+    ordered = tl.where(values != values, 0xFFFF, ordered)
+    if WideIds:
+        keys = ((ordered.to(tl.int64) - 0x8000) << 32) | (
+            0xFFFFFFFF - offsets.to(tl.int64)
+        )
+    else:
+        keys = ((ordered.to(tl.int32) - 0x8000) << 16) | (65535 - offsets).to(tl.int32)
+    return keys
+
+
+@triton.jit
 def _topk_tiles(
     Logits,
     Scratch,
@@ -40,20 +60,16 @@ def _topk_tiles(
     Tiles: tl.constexpr,
     Keep: tl.constexpr,
     Block: tl.constexpr,
+    WideIds: tl.constexpr,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     offsets = tile * Block + tl.arange(0, Block)
     values = tl.load(
         Logits + row * Vocab + offsets, offsets < Vocab, other=-float("inf")
     )
-    # An FP16 score and a shard-local ID fit in one signed 32-bit key.
-    # Signed zeros share a rank, and NaNs precede finite scores.
-    bits = values.to(tl.uint16, bitcast=True).to(tl.uint32)
-    ordered = tl.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits ^ 0x8000)
-    ordered = tl.where(values == 0, 0x8000, ordered)
-    ordered = tl.where(values != values, 0xFFFF, ordered)
-    keys = ((ordered.to(tl.int32) - 0x8000) << 16) | (65535 - offsets).to(tl.int32)
-    keys = tl.where(offsets < Vocab, keys, -2147483648)
+    keys = _score_id_keys(values, offsets, WideIds)
+    sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+    keys = tl.where(offsets < Vocab, keys, sentinel)
     selected = tl.topk(keys, Keep)
     lane = tl.arange(0, Keep)
     tl.store(Scratch + row * Tiles * Keep + tile * Keep + lane, selected)
@@ -61,13 +77,20 @@ def _topk_tiles(
 
 @triton.jit
 def _topk_merge(
-    Scratch, Ids, Count: tl.constexpr, Keep: tl.constexpr, Block: tl.constexpr
+    Scratch,
+    Ids,
+    Count: tl.constexpr,
+    Keep: tl.constexpr,
+    Block: tl.constexpr,
+    WideIds: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, Block)
-    keys = tl.load(Scratch + row * Count + offsets, offsets < Count, -2147483648)
+    sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+    keys = tl.load(Scratch + row * Count + offsets, offsets < Count, sentinel)
     keys = tl.topk(keys, Keep)
-    ids = 65535 - (keys & 65535)
+    id_mask: tl.constexpr = 0xFFFFFFFF if WideIds else 65535
+    ids = id_mask - (keys & id_mask)
     lane = tl.arange(0, Keep)
     tl.store(Ids + row * Keep + lane, ids.to(tl.int32))
 
@@ -108,17 +131,26 @@ def _finish(
 def _select_candidates(logits):
     keep = _CANDIDATES
     rows, vocab = logits.shape
-    assert vocab <= 65536
+    assert 32 <= vocab <= 2147483647
+    wide_ids = vocab > 65536
     tiles = triton.cdiv(vocab, 1024)
-    scratch = torch.empty(rows, tiles * keep, device=logits.device, dtype=torch.int32)
+    scratch = torch.empty(
+        rows,
+        tiles * keep,
+        device=logits.device,
+        dtype=torch.int64 if wide_ids else torch.int32,
+    )
     ids = torch.empty(rows, keep, device=logits.device, dtype=torch.int32)
-    _topk_tiles[(rows, tiles)](logits, scratch, vocab, tiles, keep, 1024, num_warps=4)
+    _topk_tiles[(rows, tiles)](
+        logits, scratch, vocab, tiles, keep, 1024, wide_ids, num_warps=4
+    )
     _topk_merge[(rows,)](
         scratch,
         ids,
         tiles * keep,
         keep,
         triton.next_power_of_2(tiles * keep),
+        wide_ids,
         num_warps=8,
     )
     return ids
@@ -203,26 +235,27 @@ class MTPRefinedHead(nn.Module):
         self.shard_indices = head.shard_indices
         self.start = self.shard_indices.org_vocab_start_index
         rows = self.shard_indices.org_vocab_end_index - self.start
-        assert rows == 62080 and head.embedding_dim == 5120
+        assert rows == _mtp_head_shard_rows(head)
+        width = head.embedding_dim
         ids = torch.arange(rows, device=head.weight.device, dtype=torch.int64)
         self.reference_mma = head.weight.dtype == torch.float16 and tuple(
             head.weight.shape
         ) == (rows, 5120)
         # A dense head already owns the exact effective weights. Share its
-        # storage and retain the reference Tensor Core accumulation order.
+        # storage and score it with the existing FP32 Tensor Core chain.
         dense = head.weight.detach() if self.reference_mma else _hot_rows(head, ids)
         self.register_buffer("dense", dense, persistent=False)
         global_scale = float(dense.abs().max().float().clamp_min(1e-12) / 2688)
         self.global_scale = global_scale
-        packed = torch.empty(rows, 2560, device=dense.device, dtype=torch.uint8)
+        packed = torch.empty(rows, width // 2, device=dense.device, dtype=torch.uint8)
         raw_scales = torch.empty(
-            rows, 320, device=dense.device, dtype=torch.float8_e4m3fn
+            rows, width // 16, device=dense.device, dtype=torch.float8_e4m3fn
         )
         thresholds = torch.tensor(
             [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=dense.device
         )
         for begin in range(0, rows, 512):
-            values = dense[begin : begin + 512].float().reshape(-1, 320, 16)
+            values = dense[begin : begin + 512].float().reshape(-1, width // 16, 16)
             scale = (values.abs().amax(-1) / 6 / global_scale).to(torch.float8_e4m3fn)
             effective = (scale.float() * global_scale).half().float().clamp_min(1e-12)
             code = torch.bucketize(
@@ -279,7 +312,7 @@ class MTPRefinedHead(nn.Module):
 def prepare_mtp_refined_head(
     head: nn.Module, vllm_config: VllmConfig
 ) -> MTPRefinedHead | None:
-    """Prepare the measured TP4, H5120, 248320-token greedy MTP contract."""
+    """Prepare the qualified head using its actual vocabulary shard width."""
     weight = getattr(head, "weight", None)
     shard = getattr(head, "shard_indices", None)
     speculative = vllm_config.speculative_config
@@ -295,21 +328,23 @@ def prepare_mtp_refined_head(
         or speculative is None
         or speculative.method != "mtp"
         or speculative.draft_sample_method == "probabilistic"
-        or getattr(head, "embedding_dim", 0) != 5120
-        or getattr(shard, "num_added_elements", 0)
-        or getattr(shard, "num_org_vocab_padding", 0)
-        or shard.org_vocab_end_index - shard.org_vocab_start_index != 62080
+        or _mtp_head_shard_rows(head) is None
     ):
-        return None
-    if get_tp_group().world_size != 4:
         return None
     if weight.dtype == torch.float16 and not hasattr(
         torch.ops._C, "sm70_fp16_candidate_scores_out"
     ):
         logger.warning_once(
-            "SM70 refined FP16 draft heads require the reference-order "
+            "SM70 refined FP16 draft heads require the FP32 Tensor Core "
             "candidate scoring operator. Using the original head."
         )
+        return None
+    revision = getattr(torch.ops._C, "sm70_fp16_head_vocab_revision", None)
+    if (
+        weight.dtype == torch.float16
+        and shard.org_vocab_end_index - shard.org_vocab_start_index > 65536
+        and (revision is None or revision() < 1)
+    ):
         return None
     if any(
         not hasattr(torch.ops._C, name)

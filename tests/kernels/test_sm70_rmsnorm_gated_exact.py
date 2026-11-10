@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm.model_executor.kernels.norm import sm70 as provider
 from vllm.model_executor.layers.layernorm import (
     RMSNormGated,
     _sm70_gated_norm_shape_supported,
@@ -11,11 +12,13 @@ from vllm.model_executor.layers.layernorm import (
 from vllm.platforms import current_platform
 
 
-@pytest.mark.parametrize("rows", [1, 12, 60, 120, 192, 240, 480, 768, 769])
-def test_shape_admission(rows):
+@pytest.mark.parametrize("rows", [1, 12, 60, 120, 240, 480, 768, 769, 960, 1536, 1537])
+@pytest.mark.parametrize("capacity", [768, 1536])
+def test_shape_admission(monkeypatch, rows, capacity):
+    monkeypatch.setattr(provider, "_sm70_gated_norm_max_rows", lambda: capacity)
     x = torch.empty(rows, 128, dtype=torch.float16)
     w = torch.empty(128, dtype=torch.float16)
-    assert _sm70_gated_norm_shape_supported(x, x, w) == (rows <= 768)
+    assert _sm70_gated_norm_shape_supported(x, x, w) == (rows <= capacity)
     assert not _sm70_gated_norm_shape_supported(x, None, w)
     assert not _sm70_gated_norm_shape_supported(x.float(), x, w)
     assert not _sm70_gated_norm_shape_supported(x[:, :127], x[:, :127], w[:127])
@@ -43,7 +46,9 @@ def assert_bits(actual, expected):
     )
 
 
-@pytest.mark.parametrize("rows", [1, 12, 24, 48, 60, 96, 120, 192, 240, 480, 768])
+@pytest.mark.parametrize(
+    "rows", [1, 12, 24, 48, 60, 96, 120, 192, 240, 480, 768, 960, 1536]
+)
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
 def test_changed_graph_inputs_and_canaries(
     rows, activation, monkeypatch, default_vllm_config

@@ -661,6 +661,10 @@ void sm70_all_reduce_gemma_rms_norm_impl(
       if (!benchmark_reference && fa->sm70_push_norm_batch_ready(num_tokens)) {
         k16_out = vllm::sm70::k16_twin_for(normalized_out, k16_twin);
       }
+    } else {
+      if (!benchmark_reference && num_tokens > 8) {
+        k16_out = vllm::sm70::k16_twin_for(normalized_out, k16_twin);
+      }
     }
     if (weight.scalar_type() == at::ScalarType::Float) {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, float>(

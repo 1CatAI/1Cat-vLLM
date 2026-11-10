@@ -10,6 +10,7 @@
 #include <ATen/ops/mm.h>
 #include <ATen/ops/where.h>
 #include <limits>
+#include <climits>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 
@@ -166,7 +167,7 @@ void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
   TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && ids.dim() == 2 &&
               scores.dim() == 2);
   TORCH_CHECK(input.size(1) == 5120 && weight.size(1) == 5120 &&
-              weight.size(0) > 0 && weight.size(0) <= 65536);
+              weight.size(0) > 0 && weight.size(0) <= INT_MAX);
   TORCH_CHECK(input.size(0) >= 1 && ids.size(0) == input.size(0) &&
               scores.sizes() == ids.sizes() && ids.size(1) >= 1 &&
               ids.size(1) <= 256);
@@ -268,11 +269,11 @@ namespace {
 template <int Prefetch>
 __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
     half* scores, const half* input, const half* weight, const int* certified,
-    int rows) {
+    int rows, int vocab) {
   constexpr int kRowsPerTile = 8;
   const int row_base = blockIdx.x * kRowsPerTile;
   input += static_cast<int64_t>(row_base) * 5120;
-  scores += static_cast<int64_t>(row_base) * 62080;
+  scores += static_cast<int64_t>(row_base) * vocab;
   certified += row_base;
   rows = min(rows - row_base, kRowsPerTile);
   bool needed = false;
@@ -317,7 +318,8 @@ __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
     int column = blockIdx.y * 32 + ((lane >> 2) & 3) * 8 + (index & 1) +
                  (((lane >> 1) & 1) << 1) + ((index >> 2) << 2);
     if (row < rows && certified[row] == 0)
-      scores[row * 62080 + column] = __float2half_rn(accum[index]);
+      scores[static_cast<int64_t>(row) * vocab + column] =
+          __float2half_rn(accum[index]);
   }
 }
 
@@ -328,9 +330,11 @@ void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
   TORCH_CHECK(scores.is_cuda() && input.is_cuda() && weight.is_cuda() &&
               certified.is_cuda());
   TORCH_CHECK(input.dim() == 2 && input.size(0) >= 1 && input.size(1) == 5120);
-  TORCH_CHECK(weight.sizes() == at::IntArrayRef({62080, 5120}));
+  TORCH_CHECK(weight.dim() == 2 && weight.size(1) == 5120 &&
+              weight.size(0) > 0 && weight.size(0) % 32 == 0);
+  const int64_t vocab = weight.size(0);
   TORCH_CHECK(scores.dim() == 2 && scores.size(0) == input.size(0) &&
-              scores.size(1) == 62080);
+              scores.size(1) == vocab);
   TORCH_CHECK(certified.dim() == 1 && certified.numel() == input.size(0));
   TORCH_CHECK(
       input.scalar_type() == at::kHalf && weight.scalar_type() == at::kHalf &&
@@ -350,11 +354,12 @@ void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
   }
   const int64_t row_tiles = (input.size(0) + 7) / 8;
   TORCH_CHECK(row_tiles <= properties->maxGridSize[0]);
-  fp16_masked_head_sm70_kernel<8>
-      <<<dim3(row_tiles, 1940), 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<half*>(scores.data_ptr()),
-          reinterpret_cast<const half*>(input.data_ptr()),
-          reinterpret_cast<const half*>(weight.data_ptr()),
-          certified.data_ptr<int>(), input.size(0));
+  TORCH_CHECK(vocab / 32 <= properties->maxGridSize[1]);
+  fp16_masked_head_sm70_kernel<8><<<dim3(row_tiles, vocab / 32), 32, 0,
+                                    at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<half*>(scores.data_ptr()),
+      reinterpret_cast<const half*>(input.data_ptr()),
+      reinterpret_cast<const half*>(weight.data_ptr()),
+      certified.data_ptr<int>(), input.size(0), vocab);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

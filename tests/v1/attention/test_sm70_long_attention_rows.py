@@ -78,3 +78,34 @@ def test_native_row_revision_preserves_served_context(monkeypatch):
     assert operator is native
     assert manifest["max_context"] == 1048576
     assert manifest["query_rows_revision"] == 2
+
+
+@pytest.mark.parametrize(
+    "batch,heads,revision", [(1, 2, 0), (1, 2, 1), (8, 2, 1), (2, 1, 1)]
+)
+def test_kv_head_panels_follow_the_loaded_operator(monkeypatch, batch, heads, revision):
+    native, fallback = Mock(), Mock()
+    manifest = dict(
+        module.BUILTIN_MANIFEST, query_rows_revision=2, kv_heads_revision=revision
+    )
+    monkeypatch.setattr(module, "resolve_long_attention", lambda: (native, manifest))
+    monkeypatch.setattr(module, "long_attention_max_batch_size", lambda _: 65535)
+    monkeypatch.setattr(module, "long_attention_page_supported", lambda *args: True)
+    monkeypatch.setattr(module, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda _: SimpleNamespace(cuda_stream=0)
+    )
+    monkeypatch.setattr(module, "_WORKSPACES", {})
+    operation = module.wrap_long_attention(fallback)
+    q = torch.empty(batch * 5, 6 * heads, 256, dtype=torch.float16, device="meta")
+    k = torch.empty(1, 2048, heads, 256, dtype=torch.uint8, device="meta")
+    table = torch.empty(batch, 16, dtype=torch.int32, device="meta")
+    lengths = torch.empty(batch * 5, dtype=torch.int32, device="meta")
+    operation(q, k, k, table, lengths, out=q, softmax_scale=0.0625)
+    panels = batch * (heads if revision else 1)
+    assert native.call_count == (1 if revision else heads)
+    assert native.call_args.args[0].shape[1] == 6 * (heads if revision else 1)
+    workspace = native.call_args.args[6]
+    assert workspace.numel() == panels * 80 * 8 * 6 * 256
+    fallback.assert_not_called()

@@ -9,6 +9,98 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
+def _check_tp2_norm_handoff(rank: int, rendezvous: str) -> None:
+    from vllm import _custom_ops as ops
+    from vllm import _sm70_ops as linear_ops
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+
+    torch.accelerator.set_device_index(rank)
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=rendezvous,
+        timeout=timedelta(seconds=120),
+    )
+    ca = CustomAllreduce(
+        dist.group.WORLD, torch.device("cuda", rank), max_size=1024 * 1024
+    )
+    assert not ca.disabled
+    torch.manual_seed(817)
+    matrix = torch.randn(2048, 5120, device="cuda").to(torch.float8_e4m3fn)
+    codes, scales = linear_ops.fp8_qpn8_prepare_sm70(
+        matrix, torch.full((2048, 1), 0.01, device="cuda")
+    )
+    try:
+        for rows in (1, 5, 8, 9, 16, 17, 32, 40, 64):
+            x = torch.zeros(rows, 5120, device="cuda", dtype=torch.float16)
+            residual = torch.zeros_like(x, dtype=torch.float32)
+            weight = torch.zeros(5120, device="cuda", dtype=torch.float32)
+            ca.custom_all_reduce(x)
+            ca.sm70_tp2_all_reduce_gemma_rms_norm(x, residual, weight, 1e-6)
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with ca.capture(), torch.cuda.graph(graph):
+                for _ in range(17):
+                    normalized, state = ca.sm70_tp2_all_reduce_gemma_rms_norm(
+                        x, residual, weight, 1e-6
+                    )
+                    ca.custom_all_reduce(x)
+                if rows <= 40:  # Raw QPN8 GEMM's row capacity.
+                    projected = torch.empty(rows, 2048, device="cuda", dtype=x.dtype)
+                    linear_ops.fp8_qpn8_gemm_sm70_out(
+                        projected, normalized, codes, scales, 16, 2, True, False
+                    )
+            for cycle in range(6):
+                torch.manual_seed(819 + cycle * 2 + rank)
+                x.normal_().mul_(0.125 if cycle < 3 else 32)
+                torch.manual_seed(901 + cycle)
+                residual.normal_()
+                weight.normal_(0, 0.05)
+                if cycle == 0:
+                    x.fill_(65504 if rank == 0 else -65504)
+                dist.barrier()
+                graph.replay()
+                reduced = ca.custom_all_reduce(x)
+                expected_state = reduced.float() + residual
+                expected_fp32 = torch.empty_like(expected_state)
+                ops.rms_norm(expected_fp32, expected_state, weight + 1, 1e-6)
+                expected = expected_fp32.half()
+                assert torch.equal(state, expected_state)
+                torch.testing.assert_close(normalized, expected, atol=2e-6, rtol=0.001)
+                if rows <= 40:
+                    clone_projection = torch.empty_like(projected)
+                    linear_ops.fp8_qpn8_gemm_sm70_out(
+                        clone_projection,
+                        normalized.clone(),
+                        codes,
+                        scales,
+                        16,
+                        2,
+                        True,
+                        False,
+                    )
+                    assert torch.equal(projected, clone_projection)
+    finally:
+        ca.close()
+        dist.destroy_process_group()
+
+
+def test_sm70_tp2_norm_publishes_compatible_k16_activations(tmp_path):
+    if torch.accelerator.device_count() != 2 or torch.cuda.get_device_capability() != (
+        7,
+        0,
+    ):
+        pytest.skip("requires two isolated NVLink V100 GPUs")
+    mp.spawn(
+        _check_tp2_norm_handoff,
+        args=((tmp_path / "tp2-norm").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
+
+
 def _check_push_norm(rank: int, rendezvous: str, algorithm: str | None) -> None:
     from vllm import _sm70_ops as linear_ops
     from vllm.distributed.device_communicators.custom_all_reduce import (

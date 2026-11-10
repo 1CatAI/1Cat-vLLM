@@ -13,6 +13,21 @@ from vllm.model_executor.models.qwen3_5_mtp_refined_head import (
 )
 
 
+@pytest.fixture(autouse=True)
+def fp32_gemm_reduction_policy():
+    # Match the worker's high-precision policy, including large-vocabulary GEMMs.
+    matmul = torch.backends.cuda.matmul
+    reduced = matmul.allow_fp16_reduced_precision_reduction
+    accumulate = getattr(matmul, "allow_fp16_accumulation", None)
+    matmul.allow_fp16_reduced_precision_reduction = False
+    if accumulate is not None:
+        matmul.allow_fp16_accumulation = False
+    yield
+    matmul.allow_fp16_reduced_precision_reduction = reduced
+    if accumulate is not None:
+        matmul.allow_fp16_accumulation = accumulate
+
+
 def test_refined_head_cpu_fallback():
     head = torch.nn.Module()
     head.weight = torch.nn.Parameter(torch.zeros(1))
@@ -22,12 +37,14 @@ def test_refined_head_cpu_fallback():
 
 
 @pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("vocab", [62080, 65536, 65537, 124160])
 @pytest.mark.parametrize("kind", ["random", "zero", "nonfinite", "negative_infinity"])
-def test_refined_head_candidate_order(rows, kind):
+def test_refined_head_candidate_order(rows, vocab, kind):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
     torch.manual_seed(653)
-    logits = torch.randn(rows, 62080, device="cuda", dtype=torch.float16)
+    logits = torch.randn(rows, vocab, device="cuda", dtype=torch.float16)
+    logits[:, -1] = 100  # Exercise IDs beyond the compact key's range.
     if kind == "zero":
         logits.fill_(-1)
         logits[:, :100] = 0
@@ -64,7 +81,7 @@ def test_refined_head_rerank_ties_and_replay():
 
 
 @pytest.mark.parametrize("rows", [1, 5, 8, 9, 17, 32, 33, 40, 64])
-def test_fp16_candidate_scores_match_dense_tensor_core_order(rows):
+def test_fp16_candidate_scores_preserve_precision_and_dense_fallback(rows):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
     operation = getattr(torch.ops._C, "sm70_fp16_candidate_scores_out", None)
@@ -72,9 +89,10 @@ def test_fp16_candidate_scores_match_dense_tensor_core_order(rows):
         pytest.skip("requires the candidate scoring operator")
     assert operation is not None
     torch.manual_seed(71328)
-    weight = torch.randn(62080, 5120, device="cuda", dtype=torch.float16)
+    vocab = 124160 if rows in (1, 5, 8, 17) else 62080
+    weight = torch.randn(vocab, 5120, device="cuda", dtype=torch.float16)
     x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16)
-    ids = torch.randint(0, 62080, (rows, 32), device="cuda", dtype=torch.int32)
+    ids = torch.randint(0, vocab, (rows, 32), device="cuda", dtype=torch.int32)
     scores = torch.empty(rows, 32, device="cuda", dtype=torch.float16)
     operation(scores, x, weight, ids)
     graph = torch.cuda.CUDAGraph()
@@ -86,9 +104,18 @@ def test_fp16_candidate_scores_match_dense_tensor_core_order(rows):
         # The reference head uses the dense WMMA reduction. Pad the one-row
         # oracle so cuBLAS keeps that path independently of GEMV heuristics.
         dense_input = x.expand(8, -1).contiguous() if rows == 1 else x
+        assert not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        assert not torch.backends.cuda.matmul.allow_fp16_accumulation
         dense = torch.nn.functional.linear(dense_input, weight)[:rows]
         expected = dense.gather(1, ids.long())
-        assert torch.equal(scores.view(torch.int16), expected.view(torch.int16))
+        if vocab <= 65536 or rows > 8:
+            assert torch.equal(scores.view(torch.int16), expected.view(torch.int16))
+        else:
+            # Compare original-weight FP32 scoring to FP64. A split-K cuBLAS
+            # reference can round the same dot product to a neighboring half;
+            # its rounding boundaries are not an exact contract for new shards.
+            oracle = (x.double()[:, None] * weight[ids.long()].double()).sum(-1)
+            assert (scores.double() - oracle).norm() <= 2**-11 * oracle.norm() + 2**-14
 
 
 def test_fp16_candidate_scores_invalid_ids_are_bounded():

@@ -473,28 +473,27 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
 
 // Small-row projections use the shared TurboMind codes and compact scales.
 // Narrow output tiles expose more CTAs for the short GDN/attention projections.
-template <int K, int TileColumns>
+template <int K, int TileColumns, int SplitK>
 __global__
-__launch_bounds__(TileColumns*(K == 1536 ? 8 : 16), 64 / TileColumns) void nvfp4_qpn2_projection_sm70_kernel(
+__launch_bounds__(TileColumns* SplitK, 64 / TileColumns) void nvfp4_qpn2_projection_sm70_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
-    const half* __restrict__ input, half* __restrict__ output, int n, int m,
-    float global_scale) {
-  constexpr int SplitK = K == 1536 ? 8 : 16;
+    const half* __restrict__ input, half* __restrict__ output, int n, int k,
+    int m, float global_scale) {
   nvfp4_qpn2_accumulate_sm70<SplitK, 2, 1, true, false, false, 4, true,
-                             TileColumns>(codes, scales, input, output, n, K, m,
-                                          global_scale);
+                             TileColumns>(codes, scales, input, output, n,
+                                          K > 0 ? K : k, m, global_scale);
 }
 
 // Static native layouts keep two CTAs resident and retain the original K
 // partitions. Scale rebias removes a decode multiply without changing weights.
-template <int N, int K, bool BundledScales>
+template <int K, bool BundledScales>
 __global__
 __launch_bounds__(512, 2) void nvfp4_qpn2_native_projection_sm70_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
-    const half* __restrict__ input, half* __restrict__ output, int m,
-    float global_scale) {
+    const half* __restrict__ input, half* __restrict__ output, int n, int k,
+    int m, float global_scale) {
   nvfp4_qpn2_accumulate_sm70<16, 2, 1, false, false, BundledScales, 4, true>(
-      codes, scales, input, output, N, K, m, global_scale);
+      codes, scales, input, output, n, K > 0 ? K : k, m, global_scale);
 }
 
 template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false,
@@ -641,10 +640,10 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
 __global__
 __launch_bounds__(512, 2) void nvfp4_qpn2_gated_projection_sm70_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ group_scales,
-    const half* __restrict__ input, half* __restrict__ output, int m,
-    float global_scale) {
+    const half* __restrict__ input, half* __restrict__ output, int hidden,
+    int m, float global_scale) {
   nvfp4_qpn2_gated_accumulate_sm70<8, 2, 1, true, false, 8, true>(
-      codes, group_scales, input, output, 4352, 5120, m, global_scale);
+      codes, group_scales, input, output, hidden, 5120, m, global_scale);
 }
 
 // Qualified M8 native gate/up shares A registers across both projections.
@@ -744,16 +743,20 @@ void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
                 RowTiles == 1) {
     if (global_scale > 0 && global_scale <= 65504.0f / (16384.0f * 480.0f)) {
       if constexpr (BundledScales) {
-        if (m <= kQpn2RowsPerCta && k == 4352 && n == 5120) {
-          nvfp4_qpn2_native_projection_sm70_kernel<5120, 4352, true>
-              <<<grid, 512, 0, stream>>>(codes, scales, input, output, m,
-                                         global_scale);
+        if (m <= kQpn2RowsPerCta && k % 256 == 0) {
+          // Constant-width tuning and other complete K partitions share the
+          // same two-resident-CTA implementation and accumulation schedule.
+          auto kernel =
+              k == 4352 ? nvfp4_qpn2_native_projection_sm70_kernel<4352, true>
+                        : nvfp4_qpn2_native_projection_sm70_kernel<0, true>;
+          kernel<<<grid, 512, 0, stream>>>(codes, scales, input, output, n, k,
+                                           m, global_scale);
           return;
         }
       } else {
-        if (m <= kQpn2RowsPerCta && k == 5120 && n == 62080) {
-          nvfp4_qpn2_native_projection_sm70_kernel<62080, 5120, false>
-              <<<grid, 512, 0, stream>>>(codes, scales, input, output, m,
+        if (m <= kQpn2RowsPerCta && k == 5120) {
+          nvfp4_qpn2_native_projection_sm70_kernel<5120, false>
+              <<<grid, 512, 0, stream>>>(codes, scales, input, output, n, k, m,
                                          global_scale);
           return;
         }
@@ -768,22 +771,31 @@ void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
         global_scale <= 65504.0f / (16384.0f * 480.0f)) {
       if constexpr (SplitK == 8) {
         if (k == 1536 && n == 5120) {
-          nvfp4_qpn2_projection_sm70_kernel<1536, 16>
+          nvfp4_qpn2_projection_sm70_kernel<1536, 16, 8>
               <<<dim3(row_blocks, n / 16), 128, 0, stream>>>(
-                  codes, scales, input, output, n, m, global_scale);
+                  codes, scales, input, output, n, k, m, global_scale);
           return;
         }
       }
       if constexpr (SplitK == 16) {
-        if (k == 5120 && n == 4128) {
-          nvfp4_qpn2_projection_sm70_kernel<5120, 32><<<grid, 512, 0, stream>>>(
-              codes, scales, input, output, n, m, global_scale);
+        const int sms =
+            at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        if (k == 5120 && (n % 64 != 0 || n / 32 >= 2 * sms)) {
+          nvfp4_qpn2_projection_sm70_kernel<5120, 32, 16>
+              <<<grid, 512, 0, stream>>>(codes, scales, input, output, n, k, m,
+                                         global_scale);
           return;
         }
-        if (k == 5120 && n == 3584) {
-          nvfp4_qpn2_projection_sm70_kernel<5120, 16>
+        if (k == 5120) {
+          nvfp4_qpn2_projection_sm70_kernel<5120, 16, 16>
               <<<dim3(row_blocks, n / 16), 256, 0, stream>>>(
-                  codes, scales, input, output, n, m, global_scale);
+                  codes, scales, input, output, n, k, m, global_scale);
+          return;
+        }
+        if (k < 4096 && k % 256 == 0) {
+          nvfp4_qpn2_projection_sm70_kernel<0, 16, 16>
+              <<<dim3(row_blocks, n / 16), 256, 0, stream>>>(
+                  codes, scales, input, output, n, k, m, global_scale);
           return;
         }
       }
@@ -822,12 +834,12 @@ void launch_qpn2_gated(const uint8_t* codes, const uint8_t* scales,
   const dim3 grid = TurboMindLayout ? dim3(row_blocks, hidden / 32)
                                     : dim3(hidden / 32, row_blocks);
   if constexpr (TurboMindLayout && SplitK == 8 && NAcc == 2 && RowTiles == 1) {
-    if (m <= kQpn2RowsPerCta && k == 5120 && hidden == 4352) {
+    if (m <= kQpn2RowsPerCta && k == 5120) {
       // 480 bounds the decoder even for the reserved E4M3 code. Larger
       // global scales retain the general path to avoid intermediate overflow.
       if (global_scale > 0 && global_scale <= 65504.0f / (16384.0f * 480.0f)) {
         nvfp4_qpn2_gated_projection_sm70_kernel<<<grid, 512, 0, stream>>>(
-            codes, scales, input, output, m, global_scale);
+            codes, scales, input, output, hidden, m, global_scale);
         return;
       }
       nvfp4_qpn2_gated_sm70_kernel<8, 2, 1, true, BundledScales, 8>
@@ -906,6 +918,8 @@ void check_qpn2_tensors(const torch::Tensor& out, const torch::Tensor& input,
 }
 
 }  // namespace
+
+int64_t nvfp4_qpn2_max_rows_sm70() { return kQpn2MaxRows; }
 
 std::vector<torch::Tensor> nvfp4_qpn2_prepare_sm70(torch::Tensor weight_packed,
                                                    torch::Tensor weight_scale) {
@@ -1323,6 +1337,7 @@ void nvfp4_qpn2_shared_decode_sm70_out(
 // before paying for a complete vLLM rebuild. Production registers these
 // operators centrally in torch_bindings.cpp.
 TORCH_LIBRARY_FRAGMENT(_C, ops) {
+  ops.def("nvfp4_qpn2_max_rows_sm70() -> int", &nvfp4_qpn2_max_rows_sm70);
   ops.def(
       "nvfp4_qpn2_prepare_sm70(Tensor weight_packed, Tensor weight_scale) -> "
       "Tensor[]");
@@ -1345,6 +1360,7 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
 // Register a private namespace so the extended-M candidate can race the
 // installed production operators without replacing vllm._C.
 TORCH_LIBRARY_FRAGMENT(_qpn2_candidate, ops) {
+  ops.def("max_rows() -> int", &nvfp4_qpn2_max_rows_sm70);
   ops.def("prepare(Tensor weight_packed, Tensor weight_scale) -> Tensor[]");
   ops.def("bundle(Tensor codes, Tensor scales) -> Tensor[]");
   ops.impl("bundle", torch::kCUDA, &nvfp4_qpn2_bundle_sm70);

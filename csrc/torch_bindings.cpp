@@ -735,6 +735,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor weight, Tensor certified) -> ()");
   ops.impl("sm70_fp16_masked_head_out", torch::kCUDA,
            &sm70_fp16_masked_head_out);
+  ops.def("sm70_fp16_head_vocab_revision() -> int",
+          []() -> int64_t { return 1; });
 
   ops.def(
       "fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales, str? "
@@ -867,6 +869,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp8_gemm_sm70_prescaled_m1_out", torch::kCUDA,
            vllm::sm70::with_policy(&fp8_gemm_sm70_prescaled_m1_out));
 
+  ops.def("nvfp4_qpn2_max_rows_sm70() -> int", &nvfp4_qpn2_max_rows_sm70);
   ops.def(
       "nvfp4_qpn2_prepare_sm70(Tensor weight_packed, Tensor weight_scale, "
       "str? native_policy=None ) -> "

@@ -45,6 +45,19 @@ def compact_scales_allowed(policy: Sm70NvFp4Config) -> bool:
     )
 
 
+def _bundled_down_layout(layer, config) -> bool:
+    return bool(
+        config.policy.bundled_down_decode
+        and not config.gated_silu
+        and getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
+        and layer.weight.ndim == 2
+        and layer.weight.shape[0] > 0
+        and layer.weight.shape[0] % 32 == 0
+        and layer.weight.shape[1] > 0
+        and layer.weight.shape[1] % 64 == 0
+    )
+
+
 _SM70_NVFP4_QPN4_REQUIRED_OPS = (
     "nvfp4_qpn4_prepare_sm70",
     "nvfp4_qpn4_prepare_scale_code_sm70",
@@ -204,7 +217,10 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             and self.config.policy.prefill
             and self.config.policy.shared_weight
             and self.config.policy.shared_scales
-            and sm70_tm.use_native_qpn_layouts()
+            and (
+                sm70_tm.use_native_qpn_layouts()
+                or _bundled_down_layout(layer, self.config)
+            )
             # QPN4's FP4 representation scales FP16 group factors by 2**14.
             # Preserve generic fallback if even the largest E4M3 scale could
             # overflow that representation.
@@ -224,7 +240,10 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             n = (layer.weight.shape[0] + 31) // 32 * 32
             if workspace is not None and workspace.numel() >= k * n:
                 bundle_scales = (
-                    (k, n) in {(5120, 8704), (4352, 5120)}
+                    (
+                        (k, n) in {(5120, 8704), (4352, 5120)}
+                        or _bundled_down_layout(layer, self.config)
+                    )
                     and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
                     and sm70_nvfp4_native._get_bundled_prefill_code_workspace(
                         layer.weight, workspace
@@ -270,9 +289,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             )
         if (
             qpn2_shared
-            and self.config.policy.bundled_down_decode
-            and not self.config.gated_silu
-            and tuple(layer.weight.shape) == (5120, 2176)
+            and _bundled_down_layout(layer, self.config)
             and current_platform.is_device_capability(70)
             and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
         ):

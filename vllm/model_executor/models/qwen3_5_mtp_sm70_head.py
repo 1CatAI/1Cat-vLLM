@@ -35,6 +35,31 @@ _DEFAULT_RANKING = (
 )
 
 
+def _mtp_head_shard_rows(head: nn.Module) -> int | None:
+    """The qualified H5120 head, with a complete, unpadded vocabulary shard."""
+    shard = getattr(head, "shard_indices", None)
+    if (
+        shard is None
+        or getattr(head, "embedding_dim", 0) != 5120
+        or getattr(head, "org_vocab_size", 0) != 248320
+        or getattr(shard, "num_added_elements", 0)
+        or getattr(shard, "num_org_vocab_padding", 0)
+    ):
+        return None
+    rows = shard.org_vocab_end_index - shard.org_vocab_start_index
+    # Both proposal packers write N32 tiles; the model owns qualification,
+    # while the actual shard determines the native projection width.
+    if (
+        rows <= 0
+        or rows % 32
+        or rows * get_tp_group().world_size != 248320
+        or not 0 <= shard.org_vocab_start_index < shard.org_vocab_end_index <= 248320
+        or shard.org_vocab_start_index % rows
+    ):
+        return None
+    return rows
+
+
 def load_hot_ranking(path: str) -> torch.Tensor:
     """Token ids, most frequent first: a .pt ranking asset, .npy, or one id per line."""
     if path.endswith(".pt"):

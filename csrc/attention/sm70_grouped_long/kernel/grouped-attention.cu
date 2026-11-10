@@ -2219,7 +2219,8 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
     const int64_t v_token_stride, const int64_t v_head_stride,
     const float qk_scale, const float v_scale,
     const uint32_t* __restrict__ sparse_token_masks = nullptr,
-    const int num_groups = 1, const int* row_lengths = nullptr) {
+    const int num_groups = 1, const int* row_lengths = nullptr,
+    const int kv_heads = 1) {
   constexpr int kGroupedVerifyBlockN =
       GroupedE4M3SmemLayout<PACKED_ROWS, 256>::kContextTile;
   constexpr int kGroupedVerifyKVStride =
@@ -2248,10 +2249,11 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
                         std::is_same_v<PARTIAL_T, float>),
       "probability compensation is isolated to E4M3 FP32 groups");
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
-  const int head_group = blockIdx.x;
+  const int head_group = blockIdx.x % Traits::kHeadGroups;
+  const int kv_head = blockIdx.x / Traits::kHeadGroups;
   const int split_id = blockIdx.y;
   const int group_idx = blockIdx.z;
-  if (head_group >= Traits::kHeadGroups || split_id >= Traits::kSplits ||
+  if (kv_head >= kv_heads || split_id >= Traits::kSplits ||
       group_idx >= num_groups || query_len <= 0 ||
       query_len > MAX_QUERY_TOKENS ||
       query_len * Traits::kHeadsPerCta > kGroupedVerifyRows) {
@@ -2265,12 +2267,20 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
   }
 
   if constexpr (!SPARSE_PAGE4) {
-    partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
+    const int64_t panel = static_cast<int64_t>(group_idx) * kv_heads + kv_head;
+    partial_out += panel * Traits::kSplits *
                    MAX_QUERY_TOKENS * kGroupedVerifyHeads *
                    kGroupedVerifyHeadDim;
-    partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
+    partial_lse += panel * Traits::kSplits *
                    MAX_QUERY_TOKENS * kGroupedVerifyHeads *
                    (ROW_SEQLENS ? 2 : 1);
+  }
+
+  // The public multi-KV entry uses byte caches. Offset the shared six-head
+  // computation to its KV head without packing queries or copying outputs.
+  if (kv_head != 0) {
+    k_cache = static_cast<const uint8_t*>(k_cache) + kv_head * k_head_stride;
+    v_cache = static_cast<const uint8_t*>(v_cache) + kv_head * v_head_stride;
   }
 
   int total_kv = seq_lens[group_idx];
@@ -2393,7 +2403,8 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
               (ROW_SEQLENS ? query_len : MAX_QUERY_TOKENS) +
           token_idx;
       shared_q_vec[shared_offset] = __ldg(
-          q_vec + (query_row * kGroupedVerifyHeads + head_idx) * kVecsPerRow +
+          q_vec + ((query_row * kv_heads + kv_head) * kGroupedVerifyHeads +
+                   head_idx) * kVecsPerRow +
           vec_col);
     } else {
       shared_q_vec[shared_offset] = make_uint4(0, 0, 0, 0);
@@ -3193,22 +3204,24 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     const PARTIAL_T* __restrict__ partial_out,
     const float* __restrict__ partial_lse, const int* __restrict__ seq_lens,
     __half* __restrict__ out, const int query_len,
-    const int* row_lengths = nullptr) {
+    const int* row_lengths = nullptr, const int kv_heads = 1) {
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int token_idx = blockIdx.x;
-  const int head_idx = blockIdx.y;
+  const int head_idx = blockIdx.y % kGroupedVerifyHeads;
+  const int kv_head = blockIdx.y / kGroupedVerifyHeads;
   const int request_idx = blockIdx.z;
-  if (token_idx >= query_len || head_idx >= kGroupedVerifyHeads) {
+  if (token_idx >= query_len || kv_head >= kv_heads) {
     return;
   }
-  partial_out += static_cast<int64_t>(request_idx) * Traits::kSplits *
+  const int64_t panel = static_cast<int64_t>(request_idx) * kv_heads + kv_head;
+  partial_out += panel * Traits::kSplits *
                  MAX_QUERY_TOKENS * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
-  partial_lse += static_cast<int64_t>(request_idx) * Traits::kSplits *
+  partial_lse += panel * Traits::kSplits *
                  MAX_QUERY_TOKENS * kGroupedVerifyHeads *
                  (ROW_SEQLENS ? 2 : 1);
   seq_lens += request_idx;
-  out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
-         kGroupedVerifyHeadDim;
+  out += (static_cast<int64_t>(request_idx) * query_len * kv_heads + kv_head) *
+         kGroupedVerifyHeads * kGroupedVerifyHeadDim;
 
   if constexpr (ROW_SEQLENS) {
     row_lengths += static_cast<int64_t>(request_idx) * query_len;
@@ -3222,7 +3235,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     // Padding may leave every partial unwritten. Never read stale workspace.
     if (row_lengths[token_idx] <= 0) {
       for (int d = threadIdx.x; d < kGroupedVerifyHeadDim; d += blockDim.x)
-        out[(token_idx * kGroupedVerifyHeads + head_idx) *
+        out[(token_idx * kv_heads * kGroupedVerifyHeads + head_idx) *
                 kGroupedVerifyHeadDim +
             d] = __float2half_rn(0.0f);
       return;
@@ -3296,7 +3309,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
         }
       }
     }
-    out[(token_idx * kGroupedVerifyHeads + head_idx) * kGroupedVerifyHeadDim +
+    out[(token_idx * kv_heads * kGroupedVerifyHeads + head_idx) * kGroupedVerifyHeadDim +
         d] = __float2half_rn(accumulator);
   }
 }
@@ -4813,13 +4826,13 @@ at::Tensor private_grouped_e4m3_fp32_paged(
     float scale, float k_scale, float v_scale) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
                   q.is_contiguous() && q.dim() == 3 && q.size(0) >= 1 &&
-                  q.size(1) == 6 && q.size(2) == 256,
-              "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [rows,6,256]");
+                  q.size(1) > 0 && q.size(1) % 6 == 0 && q.size(2) == 256,
+              "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [rows,6*Hkv,256]");
   TORCH_CHECK(
-      k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 && k.size(1) > 0 &&
+      k.dim() == 4 && k.size(2) * 6 == q.size(1) && k.size(3) == 256 && k.size(1) > 0 &&
           k.size(1) % 16 == 0 && k.scalar_type() == at::kByte &&
           v.scalar_type() == at::kByte && v.sizes() == k.sizes(),
-      "E4M3 grouped FP32 requires supported uint8 paged KV [pages,page,1,256]");
+      "E4M3 grouped FP32 requires supported uint8 paged KV [pages,page,Hkv,256]");
   const int64_t batch_size = block_table.dim() == 2 ? block_table.size(0) : 0;
   TORCH_CHECK(
       block_table.dim() == 2 && batch_size >= 1 &&
@@ -4835,12 +4848,13 @@ at::Tensor private_grouped_e4m3_fp32_paged(
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,
               "E4M3 grouped FP32 output must be contiguous FP16 and Q-shaped");
+  const int64_t panels = batch_size * k.size(2);
   const bool workspace_shapes =
-      batch_size == 1
+      panels == 1
           ? (partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
              lse.sizes() == at::IntArrayRef({80, 8, 6, 2}))
-          : (partial.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 256}) &&
-             lse.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 2}));
+          : (partial.sizes() == at::IntArrayRef({panels, 80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({panels, 80, 8, 6, 2}));
   TORCH_CHECK(workspace_shapes && partial.is_contiguous() &&
                   partial.scalar_type() == at::kFloat && lse.is_contiguous() &&
                   lse.scalar_type() == at::kFloat,
@@ -4874,6 +4888,9 @@ at::Tensor private_grouped_e4m3_fp32_paged(
               "E4M3 grouped FP32 supports SM70 only");
   TORCH_CHECK(batch_size <= properties->maxGridSize[2],
               "request count exceeds the device grid capacity");
+  TORCH_CHECK(k.size(2) <= properties->maxGridSize[0] &&
+              q.size(1) <= properties->maxGridSize[1],
+              "head count exceeds the device grid capacity");
   // A contiguous FP16 view can start at a half-element storage offset.
   // The shared-Q feed uses uint4 loads; only those exceptional views need
   // an aligned, stream-local copy. Ordinary model Q keeps the original path.
@@ -4927,21 +4944,21 @@ at::Tensor private_grouped_e4m3_fp32_paged(
                            kCompensatedSmemBytes));
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-  kernel<<<dim3(1, 80, static_cast<unsigned>(batch_size)),
+  kernel<<<dim3(k.size(2), 80, static_cast<unsigned>(batch_size)),
            kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
       reinterpret_cast<const __half*>(aligned_q.data_ptr()), k.data_ptr(),
       v.data_ptr(), block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
       partial.data_ptr<float>(), lse.data_ptr<float>(), query_len,
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      static_cast<int>(batch_size), row_lengths.data_ptr<int>());
+      static_cast<int>(batch_size), row_lengths.data_ptr<int>(), k.size(2));
   flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
-      <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
+      <<<dim3(query_len, q.size(1), static_cast<unsigned>(batch_size)),
          kGroupedVerifyHeadDim, 0, stream>>>(
           partial.data_ptr<float>(), lse.data_ptr<float>(),
           row_lengths.data_ptr<int>(),
           reinterpret_cast<__half*>(out.data_ptr()), query_len,
-          row_lengths.data_ptr<int>());
+          row_lengths.data_ptr<int>(), k.size(2));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -5102,6 +5119,8 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
   });
   ops.def("sm70_grouped_long_query_rows_revision() -> int",
           []() -> int64_t { return 2; });
+  ops.def("sm70_grouped_long_kv_heads_revision() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "sm70_grouped_long_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor block_table, Tensor row_lengths, Tensor(a!) partial, "

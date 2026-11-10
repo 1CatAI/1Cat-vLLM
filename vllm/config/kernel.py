@@ -269,10 +269,11 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     shared_weight: bool | None = None
     """Share packed codes with TurboMind instead of retaining a second copy."""
     bundled_down_decode: bool = False
-    """Retain an additional bundled QPN2 copy for K4352/N5120 down projections.
+    """Use adjacent QPN2 codes/scales for compatible local down projections.
 
-    The small-row route uses adjacent codes/scales. Qwen3.8-27B TP4 requires
-    approximately 0.70 GB per GPU for its 56 NVFP4 down projections.
+    Qualified prefill/shared-weight routes retain this single native packing
+    and restore bounded prefill scratch. Other routes retain an additional
+    bundled copy beside their existing layout.
     """
     shared_scales: bool | None = None
     """Allow compact scales when batch layouts and native ABI permit them."""
