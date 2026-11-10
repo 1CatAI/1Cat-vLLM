@@ -13,14 +13,11 @@ import torch
 from vllm.config.execution_policy import flash_v100_options
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.v1.attention.ops.sm70_grouped import model_context_limit
 
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
 
-# Capacity the shipped operator was qualified for. This is a claim about the
-# compiled kernel, not a service limit: the graph bound the route is captured at
-# is the smaller of this and the context the model is actually served with, so a
-# deployment with a different window is routed on its own value and the operator
-# is never asked for more context than it was admitted for.
+# Compatibility capacity of binaries predating the dynamic-context ABI.
 BUILTIN_MAX_CONTEXT = 262144
 MANIFEST_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST"
 DISABLE_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION"
@@ -35,7 +32,7 @@ BUILTIN_OP = "sm70_grouped_long_fwd"
 # route was qualified with. The source digest names that layout so a rebuilt
 # kernel cannot silently inherit the workspace identity of a different one.
 BUILTIN_SOURCE_SHA256 = (
-    "e98db3a38dfae231ec164c3e14c9e755f362af9c089dcc36331b32b7b8d8e55f"
+    "1d91f30dcac2359d4e19c56e8b3c17f99cd82e4dfac6eda39e6505e58a1f7e5d"
 )
 # Every B1 verifier tail width uses the long-context graph contract at this
 # capacity; q1 additionally has the compact scalar tail.
@@ -133,6 +130,40 @@ def long_attention_capability(manifest) -> int:
     return capability
 
 
+def builtin_dynamic_context(*, scalar: bool = False) -> bool:
+    """The loaded DSO, including each independently built operator, owns its ABI."""
+    name = (
+        "sm70_scalar_attention_workspace_revision"
+        if scalar
+        else "sm70_grouped_long_context_revision"
+    )
+    revision = (
+        getattr(torch.ops._vllm_fa2_C, name, None)
+        if builtin_long_attention() is not None
+        else None
+    )
+    return revision is not None and revision() >= 1
+
+
+def builtin_context_limit(capacity: int | None = None, *, scalar: bool = False) -> int:
+    """Resolve the served window against the loaded operator's workspace ABI."""
+    capacity = model_context_limit(capacity, fallback=BUILTIN_MAX_CONTEXT)
+    return (
+        capacity
+        if builtin_dynamic_context(scalar=scalar)
+        else min(capacity, BUILTIN_MAX_CONTEXT)
+    )
+
+
+def context_table_supported(table, page_size: int, capacity: int) -> bool:
+    """The graph's served window admits its page-rounded table, never wider."""
+    return (
+        table.ndim == 2
+        and page_size > 0
+        and 0 < table.shape[1] <= (capacity + page_size - 1) // page_size
+    )
+
+
 def long_attention_query_rows(manifest) -> tuple[int, ...]:
     """The query widths the route admits, mirroring the native [2, 8] check."""
     query_rows = tuple(manifest.get("query_rows", [8]))
@@ -158,7 +189,7 @@ def long_attention_contract(manifest, capacity: int | None = None):
     )
 
 
-def resolve_long_attention(policy=None):
+def resolve_long_attention(policy=None, capacity: int | None = None):
     """The route in effect: an explicit manifest candidate, else the shipped one."""
     policy = flash_v100_options() if policy is None else policy
     if not long_attention_enabled(policy):
@@ -169,20 +200,22 @@ def resolve_long_attention(policy=None):
     operator = builtin_long_attention()
     if operator is None:
         return None, None
+    capability = builtin_context_limit(capacity)
+    manifest = dict(BUILTIN_MANIFEST, max_context=capability)
     logger.info_once(
         "Using the shipped SM70 E4M3 q8 long-context route (%s): capability=%d "
         "query_rows=%s; 80 splits, compensated FP32 state.",
         BUILTIN_OP,
-        BUILTIN_MAX_CONTEXT,
+        capability,
         BUILTIN_QUERY_ROWS,
         scope="process",
     )
-    return operator, BUILTIN_MANIFEST
+    return operator, manifest
 
 
 def long_attention_graph_contract(capacity: int | None = None, *, policy=None):
     """The captured bound for ``capacity``, or ``(None, ())`` when route is off."""
-    _, manifest = resolve_long_attention(policy)
+    _, manifest = resolve_long_attention(policy, capacity)
     if manifest is None:
         return None, ()
     return long_attention_contract(manifest, capacity)
@@ -267,6 +300,7 @@ def wrap_long_attention(fallback):
             and q.shape[1] > 0
             and q.shape[2] == 256
             and k.ndim == 4
+            and context_table_supported(table, k.shape[1], capability)
             and table.is_contiguous()
             and row_lengths.ndim == 1
             and row_lengths.shape[0] == q.shape[0]

@@ -5095,7 +5095,7 @@ at::Tensor private_grouped_e4m3_fp32_paged(
       block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
           block_table.is_contiguous() &&
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
-          block_table.size(1) * k.size(1) <= 266240 &&
+          block_table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
           q.size(0) % batch_size == 0 &&
           (batch_size == 1
                ? (q.size(0) >= 2 && q.size(0) <= 8)
@@ -5230,7 +5230,7 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
       block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
           block_table.is_contiguous() &&
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
-          block_table.size(1) * k.size(1) <= 266240 &&
+          block_table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
           q.size(0) % batch_size == 0 &&
           (batch_size == 1 ? (q.size(0) >= 2 && q.size(0) <= 8)
                            : q.size(0) == batch_size * 8) &&
@@ -5344,6 +5344,10 @@ at::Tensor sm70_grouped_fp16_entry(const at::Tensor& q, const at::Tensor& k,
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
+  ops.def("sm70_grouped_fp16_context_revision() -> int",
+          []() -> int64_t { return 1; });
+  ops.def("sm70_grouped_long_context_revision() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "sm70_grouped_fp16_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor block_table, Tensor row_lengths, Tensor(b!) partial, "

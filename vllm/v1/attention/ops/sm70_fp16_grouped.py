@@ -13,10 +13,22 @@ from vllm.v1.attention.ops.sm70_grouped import MAX_CONTEXT as MAX_CONTEXT
 from vllm.v1.attention.ops.sm70_grouped import (
     grouped_fp16_fp32_reason as grouped_fp16_fp32_reason,
 )
+from vllm.v1.attention.ops.sm70_grouped import model_context_limit
 from vllm.v1.attention.ops.sm70_workspaces import workspace_cache
 
 OPERATOR = "sm70_grouped_fp16_fwd"
 _WORKSPACES: dict[tuple, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+
+
+def grouped_context_limit() -> int:
+    """FP16 owns its capacity independently of the E4M3 long/scalar providers."""
+    revision = getattr(
+        torch.ops._vllm_fa2_C, "sm70_grouped_fp16_context_revision", None
+    )
+    if revision is None or revision() < 1:
+        return MAX_CONTEXT
+    capacity = workspace_cache("grouped_fp16_context", {}).get("capacity")
+    return model_context_limit(capacity, fallback=MAX_CONTEXT)
 
 
 def clear_grouped_fp16_workspaces():
@@ -30,6 +42,11 @@ def load_grouped_fp16_fp32():
 
     ensure_fa2_library_loaded()
     operator = getattr(torch.ops._vllm_fa2_C, OPERATOR, None)
+    if operator is not None:
+        # Model initialization owns the config; forwards borrow its resources.
+        workspace_cache("grouped_fp16_context", {})["capacity"] = model_context_limit(
+            fallback=MAX_CONTEXT
+        )
     return _run if operator is not None else None
 
 
