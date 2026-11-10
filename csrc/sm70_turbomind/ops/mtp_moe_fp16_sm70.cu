@@ -45,7 +45,8 @@ __device__ __forceinline__ uint4 load_weight8(const void* weight,
 // Preserve the tuned BM2 Triton kernel's sequential FP32 FMA order and
 // FP16 projection boundaries. In particular, W2 applies the router weight
 // before the FP16 store; moe_sum still reduces the ten stored FP16 routes.
-template <int N, int K, int BN, int BK, bool Weighted, bool Packed = false>
+template <int N, int K, int BN, int BK, bool Weighted, bool Packed = false,
+          bool Bf16 = false>
 __global__ void mtp_moe_fp16_tile_kernel(const half* x, const void* w,
                                          const int32_t* ids,
                                          const float* weights,
@@ -82,7 +83,12 @@ __global__ void mtp_moe_fp16_tile_kernel(const half* x, const void* w,
     if (t < BN) {
 #pragma unroll
       for (int k = 0; k < BK; ++k)
-        acc = __fmaf_rn(input[k], __half2float(tile[t][k]), acc);
+        if constexpr (Bf16) {
+          const auto bits = __half_as_ushort(tile[t][k]);
+          acc = __fmaf_rn(input[k], __uint_as_float(uint32_t(bits) << 16), acc);
+        } else {
+          acc = __fmaf_rn(input[k], __half2float(tile[t][k]), acc);
+        }
     }
     __syncthreads();
   }
@@ -215,6 +221,52 @@ void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+void mtp_moe_bf16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
+                      torch::Tensor ids, torch::Tensor weights,
+                      torch::Tensor padded, bool down) {
+  TORCH_CHECK(x.is_cuda(), "SM70 MTP MoE requires CUDA tensors");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "MTP BF16 MoE is SM70 only");
+  for (const auto& tensor : {out, x, w, ids, weights, padded}) {
+    TORCH_CHECK(tensor.device() == x.device() && tensor.is_contiguous(),
+                "MTP BF16 MoE requires same-device contiguous tensors");
+  }
+  TORCH_CHECK(out.scalar_type() == at::kHalf && x.scalar_type() == at::kHalf &&
+                  w.scalar_type() == at::kBFloat16 &&
+                  ids.scalar_type() == at::kInt &&
+                  weights.scalar_type() == at::kFloat &&
+                  padded.scalar_type() == at::kInt,
+              "Invalid MTP BF16 MoE dtypes");
+  TORCH_CHECK(weights.dim() == 2 && weights.size(1) == 10 &&
+                  weights.size(0) >= 1 && weights.size(0) <= 80,
+              "MTP BF16 MoE requires M1..80, topk=10");
+  const int m = weights.size(0), n = down ? 2560 : 320, k = down ? 160 : 2560;
+  TORCH_CHECK(w.sizes() == at::IntArrayRef({512, n, k}) &&
+                  x.sizes() == at::IntArrayRef({down ? m * 10 : m, k}) &&
+                  out.sizes() == at::IntArrayRef({m, 10, n}) &&
+                  ids.sizes() == at::IntArrayRef({m * 10}) &&
+                  padded.numel() == 1,
+              "Invalid MTP BF16 MoE geometry");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
+              "MTP BF16 MoE requires 16-byte aligned weights");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* xp = reinterpret_cast<const half*>(x.data_ptr());
+  const auto* wp = reinterpret_cast<const half*>(w.data_ptr());
+  const auto* ip = ids.data_ptr<int32_t>();
+  const auto* tp = weights.data_ptr<float>();
+  const auto* pp = padded.data_ptr<int32_t>();
+  auto* op = reinterpret_cast<half*>(out.data_ptr());
+  if (down) {
+    mtp_moe_fp16_tile_kernel<2560, 160, 64, 64, true, false, true>
+        <<<dim3(40, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
+  } else {
+    mtp_moe_fp16_tile_kernel<320, 2560, 32, 128, false, false, true>
+        <<<dim3(10, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 void mtp_moe_u13_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
                      torch::Tensor ids, torch::Tensor weights,
                      torch::Tensor padded, bool down) {
@@ -267,6 +319,9 @@ void mtp_moe_u13_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
 
 TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
+      "sm70_mtp_moe_bf16_out(Tensor(a!) out, Tensor x, Tensor w, Tensor ids, "
+      "Tensor weights, Tensor padded, bool down) -> ()");
+  m.def(
       "sm70_mtp_moe_u13_out(Tensor(a!) out, Tensor x, Tensor w, Tensor ids, "
       "Tensor weights, Tensor padded, bool down) -> ()");
   m.def(
@@ -274,6 +329,7 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
       "Tensor weights, Tensor padded, bool down) -> ()");
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
+  m.impl("sm70_mtp_moe_bf16_out", &mtp_moe_bf16_out);
   m.impl("sm70_mtp_moe_u13_out", &mtp_moe_u13_out);
   m.impl("sm70_mtp_moe_fp16_out", &mtp_moe_fp16_out);
 }
