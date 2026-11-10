@@ -332,6 +332,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # ParallelLMHead does not inherit LinearBase. Bind the same per-layer
+        # snapshots once during preparation, before any provider can return.
+        if not hasattr(layer, "_layer_execution_policy"):
+            layer._layer_execution_policy = layer_policy()
+        if not hasattr(layer, "_layer_trace"):
+            layer._layer_trace = capture_runtime_trace()
         if current_platform.is_cpu():
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
@@ -369,19 +375,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         from vllm.model_executor.kernels.linear import sm70_dense as dense_provider
 
-        # `_layer_execution_policy` / `_layer_trace` are only assigned in
-        # LinearBase.__init__. ParallelLMHead derives from
-        # VocabParallelEmbedding rather than LinearBase, so it has neither when
-        # it goes through the dense provider, and weight loading dies with
-        # AttributeError. Fall back to the global accessors: LinearBase only
-        # stores a snapshot of layer_policy() anyway, so the semantics match.
-        _policy = getattr(layer, "_layer_execution_policy", None) or layer_policy()
-        _trace = getattr(layer, "_layer_trace", None) or capture_runtime_trace()
         state = dense_provider.DenseLinearState(
             layer.weight,
             prefix=getattr(layer, "prefix", ""),
-            policy=_policy,
-            trace=_trace,
+            policy=layer._layer_execution_policy,
+            trace=layer._layer_trace,
             forbidden=getattr(layer, "_sm70_f16_forbidden", False),
             max_m=getattr(layer, "_sm70_f16_max_m", None),
             glm_cublaslt=getattr(layer, "_sm70_glm53_tp8_cublaslt", False),
@@ -393,7 +391,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             input_parallel=getattr(layer, "input_is_parallel", True),
             suffix_allowed=is_layer_sm70_f16_dense(
                 getattr(layer, "prefix", ""),
-                policy=_policy,
+                policy=layer._layer_execution_policy,
             ),
         )
 
@@ -429,12 +427,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
-        # As above: ParallelLMHead has no _layer_trace.
-        if getattr(layer, "_layer_trace", None) is not None and layer._layer_trace.unquant_debug and x.dim() >= 2:
+        if layer._layer_trace.unquant_debug and x.dim() >= 2:
             x_2d = x.reshape(-1, x.shape[-1])
             log_fn = (
                 logger.info
-                if x_2d.size(0) <= layer_policy().dense_max_m
+                if x_2d.size(0) <= layer._layer_execution_policy.dense_max_m
                 else logger.info_once
             )
             log_fn(

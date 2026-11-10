@@ -65,12 +65,17 @@ _SLIDING_ATTENTION = "sliding_attention"
 
 
 def _dflash_context_projection_dtype(projection: nn.Module) -> torch.dtype | None:
+    method = getattr(projection, "quant_method", None)
+    kernel = getattr(method, "kernel", None)
+    dtype = getattr(kernel, "input_dtype", None)
+    if dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return dtype
     weight = getattr(projection, "weight", None)
     if weight is not None and weight.is_floating_point():
         return weight.dtype
     # Packed weights have no floating weight parameter. Their quantization
     # method declares the projection operand dtype independently of storage.
-    dtype = getattr(getattr(projection, "quant_method", None), "params_dtype", None)
+    dtype = getattr(method, "params_dtype", None)
     return dtype if dtype in (torch.float16, torch.bfloat16, torch.float32) else None
 
 
@@ -1116,22 +1121,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         # AWQ target paths can surface fp32 auxiliary states even when the
         # draft projection is initialized in fp16. Match the FC weight dtype
         # before dispatching the linear kernel.
-        #
-        # A quantized fc (compressed-tensors NVFP4 on SM70 TurboMind) exposes
-        # only an **empty uint8 weight stub** after prepare_nvfp4_linear, whose
-        # dtype is not the activation dtype the kernel wants.
-        # _dflash_context_projection_dtype() therefore falls back to
-        # quant_method.params_dtype (= model_config.dtype), while the SM70
-        # NVFP4 GEMM requires float16 activations and fails warmup with
-        # "nvfp4_gemm_sm70: input must be float16.". Test for the empty stub
-        # instead: empty means force float16.
-        fc_weight = getattr(self.model.fc, "weight", None)
-        if fc_weight is not None and fc_weight.numel() == 0:
-            projection_dtype = torch.float16
-        elif fc_weight is not None:
-            projection_dtype = fc_weight.dtype
-        else:
-            projection_dtype = None
+        projection_dtype = _dflash_context_projection_dtype(self.model.fc)
         if projection_dtype is not None and hidden_states.dtype != projection_dtype:
             hidden_states = hidden_states.to(dtype=projection_dtype)
         result = self.model.fc(hidden_states)
