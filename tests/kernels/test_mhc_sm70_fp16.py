@@ -765,8 +765,8 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise(
     ),
     reason="NVIDIA V100/SM70 required",
 )
-@pytest.mark.parametrize("n_splits", [1, 2, 4, 16])
-@pytest.mark.parametrize("num_tokens", [64, 257])
+@pytest.mark.parametrize("n_splits", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("num_tokens", [255, 256, 257])
 def test_mhc_sm70_prenorm_row_staging_matches_column_grid_bitwise(
     monkeypatch: pytest.MonkeyPatch, num_tokens: int, n_splits: int
 ) -> None:
@@ -780,9 +780,9 @@ def test_mhc_sm70_prenorm_row_staging_matches_column_grid_bitwise(
     fn = torch.randn(outputs, hidden, device=device)
 
     def run(min_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-        monkeypatch.setattr(mhc_triton, "_SM70_MHC_ROW_STAGING_MIN_TOKENS", min_tokens)
-        mul = torch.empty(n_splits, num_tokens, outputs, device=device)
-        sqrsum = torch.empty(n_splits, num_tokens, device=device)
+        monkeypatch.setattr(mhc_triton, "_MHC_ROW_STAGING_MIN_TOKENS", min_tokens)
+        mul = torch.full((n_splits, num_tokens, outputs), torch.nan, device=device)
+        sqrsum = torch.full((n_splits, num_tokens), torch.nan, device=device)
         mhc_triton.sm70_mhc_prenorm_staging(x, fn, mul, sqrsum)
         return mul, sqrsum
 
@@ -790,3 +790,46 @@ def test_mhc_sm70_prenorm_row_staging_matches_column_grid_bitwise(
     row_mul, row_sqrsum = run(0)
     torch.testing.assert_close(row_mul, column_mul, rtol=0, atol=0)
     torch.testing.assert_close(row_sqrsum, column_sqrsum, rtol=0, atol=0)
+    assert torch.isfinite(row_mul).all()
+    assert torch.isfinite(row_sqrsum).all()
+
+
+@pytest.mark.parametrize(
+    "tokens,hidden,outputs,splits,expected",
+    [
+        (255, 16384, 24, 4, "columns"),
+        (256, 16384, 24, 4, "rows"),
+        (257, 16384, 24, 4, "rows"),
+        (2048, 16384, 24, 8, "rows"),
+        (64, 16384, 32, 4, "columns"),
+        (257, 16384, 32, 4, "columns"),
+        (257, 8192, 24, 4, "columns"),
+        (257, 16384, 24, 32, "columns"),
+        (257, 16384, 0, 4, "columns"),
+    ],
+)
+def test_mhc_prenorm_row_dispatch_retains_unqualified_fallbacks(
+    monkeypatch, tokens, hidden, outputs, splits, expected
+):
+    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
+    calls = []
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append(self.name)
+
+    monkeypatch.setattr(mhc_triton, "_mhc_prenorm_staging_rows_kernel", Kernel("rows"))
+    monkeypatch.setattr(
+        mhc_triton, "_sm70_mhc_prenorm_staging_kernel", Kernel("columns")
+    )
+    monkeypatch.setattr(mhc_triton, "_sm70_mhc_sqrsum_staging_kernel", Kernel("norm"))
+    mhc_triton.sm70_mhc_prenorm_staging(
+        torch.empty(tokens, hidden, dtype=torch.float16),
+        torch.empty(outputs, hidden, dtype=torch.float32),
+        torch.empty(splits, tokens, outputs),
+        torch.empty(splits, tokens),
+    )
+    assert calls == [expected]

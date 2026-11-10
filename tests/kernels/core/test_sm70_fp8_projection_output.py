@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from vllm import _sm70_ops as ops
+from vllm._sm70.policy import NativeBindings
+from vllm.config.sm70_native import capture_linear_native_config
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A16Fp8,
 )
@@ -32,6 +34,8 @@ def test_graph_projection_writes_destination():
         sm70_fp8_qpn8_prefetch=False,
     )
     scheme = object.__new__(CompressedTensorsW8A16Fp8)
+    # process_weights_after_loading binds the native ops; this test skips it.
+    scheme.native_ops = NativeBindings(capture_linear_native_config("fp8").values)
     x = torch.randn(8, 1536, device="cuda", dtype=torch.float16)
     backing = torch.full((10, 5120), float("nan"), device="cuda", dtype=x.dtype)
     output = backing[1:9]

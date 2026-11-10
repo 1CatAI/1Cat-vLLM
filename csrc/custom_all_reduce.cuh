@@ -206,6 +206,14 @@ constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
+// Concurrent MTP4 verification batches of Qwen4Exp/Flash-Next (H2560): two or
+// more requests of five rows each, up to the persistent buffer capacity.
+inline bool sm70_qwen4exp_verify_batch_bytes(size_t bytes) {
+  constexpr size_t request_bytes = 5 * 2560 * sizeof(half);
+  return bytes % request_bytes == 0 && bytes >= 2 * request_bytes &&
+         bytes <= kSm70Tp4PushAllreduceMaxBytes;
+}
+
 inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
                                           size_t bytes,
                                           bool allow_generic = false) {
@@ -257,6 +265,14 @@ inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
       }
     }
     return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
+  }
+  if (batch_enabled && sm70_qwen4exp_verify_batch_bytes(bytes)) {
+    // The push kernels stride over the payload, so larger batches reuse the
+    // persistent per-block epochs.
+    return static_cast<int>(
+        std::min<size_t>(kSm70Tp4PushAllreduceBlocks,
+                         (bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
+                             (kSm70Tp4PushAllreduceThreads * 16)));
   }
   const char* mtp5 =
       policy.raw(CollectivePolicyField::sm70_tp4_push_allreduce_mtp5);
@@ -1951,8 +1967,8 @@ template <typename WeightT, int Rows>
 __global__
 __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm_batch(
     vllm::RankData buffers, const half* input, const float* residual,
-    const WeightT* weight, half* output, float* residual_out, int rank,
-    const void* local_buffer, float epsilon) {
+    const WeightT* weight, half* output, half* k16_output, float* residual_out,
+    int rank, const void* local_buffer, float epsilon) {
   constexpr int Threads = 128, Parts = kSm70PushNormParts;
   constexpr int Width = kSm70GemmaRmsNormHiddenSize;
   constexpr int Groups = kSm70PushNormRows;
@@ -2123,6 +2139,17 @@ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm_batch(
                    : "l"(reinterpret_cast<P*>(output) + pack[j]), "r"(words[0]),
                      "r"(words[1]), "r"(words[2]), "r"(words[3])
                    : "memory");
+      if (k16_output != nullptr) {
+        const int row = group + j * Groups, slice = column / P::size;
+        asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                     :
+                     : "l"(reinterpret_cast<P*>(k16_output) +
+                           (static_cast<size_t>(slice >> 1) * Rows + row) * 2 +
+                           (slice & 1)),
+                       "r"(words[0]), "r"(words[1]), "r"(words[2]),
+                       "r"(words[3])
+                     : "memory");
+      }
     }
   }
 }
@@ -2573,14 +2600,18 @@ class CustomAllreduce {
 #undef KL
   }
 
+  // Whether sm70_allreduce_gemma_rms_norm will write k16_out for these rows.
+  bool sm70_push_norm_batch_ready(int num_tokens) const {
+    return (num_tokens == 16 || num_tokens == 24 || num_tokens == 32) &&
+           fully_connected_ && sm70_tp4_push_buffers_registered_;
+  }
+
   template <int ngpus, typename ResidualT, typename WeightT>
-  void sm70_allreduce_gemma_rms_norm(cudaStream_t stream, half* input,
-                                     const ResidualT* residual,
-                                     const WeightT* weight,
-                                     half* normalized_out, float* residual_out,
-                                     int num_tokens, int hidden_size,
-                                     float epsilon,
-                                     bool benchmark_reference = false) {
+  void sm70_allreduce_gemma_rms_norm(
+      cudaStream_t stream, half* input, const ResidualT* residual,
+      const WeightT* weight, half* normalized_out, float* residual_out,
+      int num_tokens, int hidden_size, float epsilon,
+      bool benchmark_reference = false, half* k16_out = nullptr) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2617,11 +2648,12 @@ class CustomAllreduce {
       if ((num_tokens == 16 || num_tokens == 24 || num_tokens == 32) &&
           !benchmark_reference && fully_connected_ &&
           sm70_tp4_push_buffers_registered_) {
-#define VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(ROWS)                              \
-  sm70_push_allreduce_gemma_rms_norm_batch<WeightT, ROWS>                   \
-      <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,     \
-                               weight, normalized_out, residual_out, rank_, \
-                               sm70_tp4_push_buffers_.ptrs[rank_], epsilon)
+#define VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(ROWS)                                \
+  sm70_push_allreduce_gemma_rms_norm_batch<WeightT, ROWS>                     \
+      <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,       \
+                               weight, normalized_out, k16_out, residual_out, \
+                               rank_, sm70_tp4_push_buffers_.ptrs[rank_],     \
+                               epsilon)
         if (num_tokens == 16) {
           VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(16);
         } else if (num_tokens == 24) {
@@ -2764,7 +2796,8 @@ class CustomAllreduce {
           (batch == nullptr || std::strcmp(batch, "1") == 0) &&
           (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
-           bytes == kSm70Tp4PushAllreduceBytes);
+           bytes == kSm70Tp4PushAllreduceBytes ||
+           sm70_qwen4exp_verify_batch_bytes(bytes));
       const char* batch_fastpath =
           policy_.raw(CollectivePolicyField::sm70_qwen38_batch_fastpath);
       const bool qwen38_m2 = bytes == kSm70Tp4PushAllreduceQwen38M2Bytes &&

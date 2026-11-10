@@ -23,15 +23,29 @@ class MixedPrefillBudget:
         max_tokens: int,
         target_ms: float,
         min_tokens: int = 0,
+        block_size: int | None = None,
     ) -> None:
         self.max_tokens = max_tokens
         self.target_ms = target_ms
         self.min_tokens = min(min_tokens, max_tokens)
+        self.block_size = block_size
         self.tokens = max(min(512, max_tokens), self.min_tokens)
         self.ms_per_token: float | None = None
         # Decayed sums for the fit elapsed = fixed + per_token * tokens:
         # weight, x, y, x*x and x*y.
         self._fit = [0.0] * 5
+
+    @property
+    def budget(self) -> int:
+        """Schedule whole state blocks without rounding the learned controller.
+
+        Budgets below one block stay unchanged. Use a block-aligned floor when
+        setting ``min_tokens``; the returned budget never falls below it.
+        """
+        tokens = self.tokens
+        if self.block_size and tokens >= self.block_size:
+            tokens = tokens // self.block_size * self.block_size
+        return max(tokens, self.min_tokens)
 
     def _affine_budget(self) -> float | None:
         """Budget from the fixed-plus-linear step cost, once chunks differ.

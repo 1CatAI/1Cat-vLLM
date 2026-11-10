@@ -86,18 +86,20 @@ def test_sm70_v2_mtp_profile_composes_target_verifier(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("global_first", "pp_last", "tp_rank", "expected"),
+    ("global_first", "pp_last", "tp_rank"),
     [
-        pytest.param(False, True, 0, True, id="pp2-last-stage-leader"),
-        pytest.param(False, True, 1, False, id="pp2-last-stage-tp1"),
-        pytest.param(True, False, 0, False, id="pp2-first-stage"),
+        pytest.param(False, True, 0, id="pp2-last-stage-leader"),
+        pytest.param(False, True, 1, id="pp2-last-stage-tp1"),
+        pytest.param(True, False, 0, id="pp2-first-stage"),
     ],
 )
-def test_sm70_v2_mtp_profile_reports_from_last_pp_stage(
-    monkeypatch, global_first, pp_last, tp_rank, expected
+def test_sm70_v2_mtp_profile_reports_on_every_rank(
+    monkeypatch, global_first, pp_last, tp_rank
 ):
-    """Regression for #414: profiling is enabled on the last PP stage only,
-    so the report must not be gated on the global first rank."""
+    """Regression for #414: the report must not be gated on the global first
+    rank. Profiling is enabled on the last PP stage only (see
+    test_sm70_v2_mtp_profile_gate), and an enabled V2 profiler reports from
+    every TP rank so TP stragglers stay visible."""
 
     class FakeEvent:
         def elapsed_time(self, end: "FakeEvent") -> float:
@@ -130,7 +132,7 @@ def test_sm70_v2_mtp_profile_reports_from_last_pp_stage(
     runner._step_profiler.report(ctx)
 
     assert runner._step_profiler.totals["target_forward"] == 1.0
-    assert bool(messages) is expected
+    assert messages
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

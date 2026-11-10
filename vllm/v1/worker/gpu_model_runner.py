@@ -2164,6 +2164,50 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    def _pp_prepend_accepted_drafts(
+        self,
+        req_id: str,
+        req_state: CachedRequestState,
+        req_index: int | None,
+        num_computed_tokens: int,
+        sent_token_ids: list[int],
+        all_token_ids: dict[str, list[int]],
+    ) -> list[int]:
+        """Non-last PP rank, non-async scheduling: rebuild the tokens sampled
+        since this rank's last update.
+
+        The scheduler sends only the tokens at ``num_computed_tokens`` onward
+        (the bonus token after a spec-decode step). The accepted drafts before
+        it, positions ``[req_state.num_tokens, num_computed_tokens)``, are the
+        previous step's scheduled drafts. Without them ``output_token_ids``
+        skips the drafts and ``token_ids_cpu`` gets the bonus token broadcast
+        over every accepted position, which corrupts the token history this
+        rank feeds the model.
+        """
+        num_accepted = num_computed_tokens - req_state.num_tokens
+        if num_accepted <= 0:
+            return sent_token_ids
+        full = all_token_ids.get(req_id)
+        if full is not None:
+            if len(full) < num_computed_tokens:
+                raise RuntimeError(
+                    f"PP spec decode: full token history is shorter than "
+                    f"num_computed_tokens for request {req_id}"
+                )
+            return list(full[req_state.num_tokens : num_computed_tokens]) + list(
+                sent_token_ids
+            )
+        prev_spec = (
+            self.input_batch.spec_token_ids[req_index] if req_index is not None else []
+        )
+        if num_accepted <= len(prev_spec):
+            return list(prev_spec[:num_accepted]) + list(sent_token_ids)
+        raise RuntimeError(
+            f"PP spec decode: accepted draft token(s) missing for request {req_id}; "
+            f"needed {num_accepted}, held {len(prev_spec)}. "
+            "The scheduler and runner disagree about token-history ownership."
+        )
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -2400,15 +2444,25 @@ class GPUModelRunner(
                 if not req_data.new_token_ids:
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
                     new_token_ids: list[int] = []
+                    num_sent_tokens = 0
                 else:
                     # Non-async scheduling with PP: The scheduler sends
                     # sampled token ids back because there's no direct communication
                     # between the first-stage worker and the last-stage worker.
                     new_token_ids = req_data.new_token_ids[i]
+                    num_sent_tokens = len(new_token_ids)
+                    new_token_ids = self._pp_prepend_accepted_drafts(
+                        req_id,
+                        req_state,
+                        req_index,
+                        num_computed_tokens,
+                        new_token_ids,
+                        req_data.all_token_ids,
+                    )
                     # Add the sampled token(s) from the previous step (if any).
                     # This doesn't include "unverified" tokens like spec tokens.
                     num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                        num_computed_tokens + num_sent_tokens - req_state.num_tokens
                     )
                     if num_new_tokens == 1:
                         # Avoid slicing list in most common case.
@@ -2477,7 +2531,7 @@ class GPUModelRunner(
                 # according to num_computed_tokens.
                 end_token_index = max(
                     start_token_index,
-                    num_computed_tokens + len(new_token_ids),
+                    num_computed_tokens + num_sent_tokens,
                 )
                 if end_token_index > start_token_index:
                     if new_token_ids:
@@ -4417,7 +4471,7 @@ class GPUModelRunner(
         return cu_num_tokens
 
     def _compute_prev_positions(self, num_reqs: int) -> None:
-        """Build prev_positions mapping: current pos -> previous pos (-1 if new).
+        """Map current decode rows to previous rows (-1 for new or prefill).
 
         Populates self.prev_positions.np[:num_reqs] with the mapping.
         """
@@ -4429,7 +4483,14 @@ class GPUModelRunner(
             return
 
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
+            # KV-load recovery can rewind an existing request into its prompt.
+            # Its last input must come from the prompt, not a discarded sample.
+            prev_positions[i] = (
+                prev_req_id_to_index.get(req_id, -1)
+                if self.input_batch.num_computed_tokens_cpu[i]
+                >= self.input_batch.num_prompt_tokens[i]
+                else -1
+            )
 
     def _apply_ddtree_position_overrides(
         self,
@@ -9396,6 +9457,11 @@ class GPUModelRunner(
                 trace_output_ms = (time.perf_counter() - trace_output_t0) * 1000.0
 
         if not self.use_async_scheduling:
+            if (
+                spec_config is not None
+                and self.parallel_config.pipeline_parallel_size > 1
+            ):
+                output.set_draft_token_ids(self.take_draft_token_ids())
             if self.routed_experts_initialized:
                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
                 # synchronized by ``_to_list``'s event.synchronize(), so

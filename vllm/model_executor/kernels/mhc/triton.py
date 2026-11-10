@@ -74,7 +74,7 @@ def _sm70_mhc_prenorm_staging_kernel(
 
 
 @triton.jit
-def _sm70_mhc_prenorm_staging_rows_kernel(
+def _mhc_prenorm_staging_rows_kernel(
     x_ptr,
     fn_ptr,
     out_ptr,
@@ -110,10 +110,11 @@ def _sm70_mhc_prenorm_staging_rows_kernel(
         )
 
 
-# The per-column grid re-reads x once per output column. From this many rows
-# up, the row kernel wins on V100 (GLM-5.3 K=16384 N=24, T=2048: 2.2-2.7x);
-# below it the per-column grid's extra parallelism wins (T=8, 1 split: 36 vs 57 us).
-_SM70_MHC_ROW_STAGING_MIN_TOKENS = 64
+# Reusing x helps larger batches, but serializing columns reduces parallelism.
+# Paired measurements qualify the 16384 x 24 geometry from 256 rows. Smaller
+# batches and other geometries retain the column grid (including N=32 at T=64,
+# where row staging is slower). This changes no reduction or precision policy.
+_MHC_ROW_STAGING_MIN_TOKENS = 256
 
 
 def sm70_mhc_prenorm_staging(
@@ -147,8 +148,13 @@ def sm70_mhc_prenorm_staging(
     if k_per_split & (k_per_split - 1):
         raise ValueError("SM70 mHC prenorm split size must be a power of two")
 
-    if x.shape[0] >= _SM70_MHC_ROW_STAGING_MIN_TOKENS and fn.shape[0] > 0:
-        _sm70_mhc_prenorm_staging_rows_kernel[(x.shape[0], n_splits)](
+    if (
+        x.shape[0] >= _MHC_ROW_STAGING_MIN_TOKENS
+        and x.shape[1] == 16384
+        and fn.shape[0] == 24
+        and n_splits in (1, 2, 4, 8, 16)
+    ):
+        _mhc_prenorm_staging_rows_kernel[(x.shape[0], n_splits)](
             x,
             fn,
             gemm_out_mul,

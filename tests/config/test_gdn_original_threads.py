@@ -8,11 +8,13 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
+from vllm.config import gdn as gdn_config
 from vllm.config.gdn import GdnConfig
 from vllm.model_executor.layers.fla.ops.sm70 import gdn_prefill
 
 
 def test_policy_snapshot_hash_and_inactive_backend(monkeypatch):
+    monkeypatch.setattr(gdn_config, "_tilelang_nvcc_available", lambda: True)
     policies = [GdnConfig(original_prefill_threads=value) for value in (None, 128, 256)]
     for p in policies:
         p.resolve()
@@ -97,3 +99,33 @@ def test_unqualified_family_tensor_uses_original_core(monkeypatch, change):
         )
         == 128
     )
+
+
+@pytest.mark.parametrize("toolkit", ["nvcc", "runtime_only", "missing"])
+def test_original_prefill_needs_a_cuda_toolkit(monkeypatch, tmp_path, toolkit):
+    """A bare wheel install has no nvcc for TileLang: use the prebuilt prefill."""
+    home = tmp_path / "cuda"
+    if toolkit != "missing":
+        (home / "lib64").mkdir(parents=True)
+    if toolkit == "nvcc":
+        (home / "bin").mkdir()
+        (home / "bin" / "nvcc").write_text("")
+    monkeypatch.setenv("CUDA_HOME", str(home))
+    for name in (
+        "VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL",
+        "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    policy = GdnConfig()
+    policy.resolve()
+    assert policy.original_prefill is (toolkit == "nvcc")
+    assert policy.sources["original_prefill"] == (
+        "default" if toolkit == "nvcc" else "default:no_nvcc"
+    )
+
+    # An explicit request keeps the original path; the JIT error is then
+    # the user's to resolve.
+    monkeypatch.setenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL", "1")
+    policy = GdnConfig()
+    policy.resolve()
+    assert policy.original_prefill is True

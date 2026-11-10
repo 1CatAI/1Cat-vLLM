@@ -460,7 +460,7 @@ class TestGPTOSSChat:
         )
 
         msg = tool_choice_none.choices[0].message
-        assert len(msg.tool_calls) == 0
+        assert msg.tool_calls is None
 
 
 class TestGPTOSSSpeculativeChat:
@@ -2068,6 +2068,89 @@ async def test_streaming_n_gt1_independent_tool_parsers():
         assert parsed_args == {"city": "Tokyo"}, (
             f"Choice {choice_idx}: expected {{'city': 'Tokyo'}}, got {parsed_args}"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_prompt_tokens_details_reports_zero_cached_tokens(stream: bool):
+    """With --enable-prompt-tokens-details, a prompt without prefix-cache hit
+    must report cached_tokens=0 instead of omitting prompt_tokens_details."""
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    models = OpenAIServingModels(
+        engine_client=mock_engine,
+        base_model_paths=BASE_MODEL_PATHS,
+    )
+    serving_chat = OpenAIServingChat(
+        mock_engine,
+        models,
+        response_role="assistant",
+        openai_serving_render=_build_serving_render(mock_engine, models.registry),
+        chat_template=CHAT_TEMPLATE,
+        chat_template_content_format="auto",
+        request_logger=None,
+        enable_prompt_tokens_details=True,
+    )
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "test"}],
+        stream=stream,
+        stream_options={"include_usage": True} if stream else None,
+    )
+
+    async def result_generator():
+        yield RequestOutput(
+            request_id="test-req",
+            prompt="test",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="Hi",
+                    token_ids=[4],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+            num_cached_tokens=0,
+        )
+
+    generator_kwargs = dict(
+        request=request,
+        result_generator=result_generator(),
+        request_id="test-req",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=get_tokenizer(MODEL_NAME),
+        request_metadata=RequestResponseMetadata(
+            request_id="test-req",
+            model_name=MODEL_NAME,
+        ),
+    )
+    if stream:
+        usage = None
+        async for chunk_str in serving_chat.chat_completion_stream_generator(
+            **generator_kwargs
+        ):
+            if chunk_str.startswith("data: ") and "[DONE]" not in chunk_str:
+                data = json.loads(chunk_str[6:].strip())
+                if data.get("usage"):
+                    usage = data["usage"]
+        assert usage is not None
+        assert usage["prompt_tokens_details"] == {"cached_tokens": 0}
+    else:
+        response = await serving_chat.chat_completion_full_generator(**generator_kwargs)
+        assert isinstance(response, ChatCompletionResponse)
+        assert response.usage.prompt_tokens_details is not None
+        assert response.usage.prompt_tokens_details.cached_tokens == 0
 
 
 class TestCreateRemainingArgsDelta:

@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.envs import VLLM_ENFORCE_STRICT_TOOL_CALLING
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
@@ -25,6 +26,7 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
+from vllm.tool_parsers.qwen_xml_tool_grammar import adjust_qwen_xml_tool_request
 from vllm.tool_parsers.structural_tag_registry import (
     get_enable_structured_outputs_in_reasoning,
     get_model_structural_tag,
@@ -120,6 +122,45 @@ class Qwen3CoderToolParser(ToolParser):
         self.accumulated_params = {}
         self.streaming_request = None
         self.json_tool_calls_streamed = 0
+        # Closed <tool_call> blocks without a function header hold no call, so
+        # the block index runs ahead of current_tool_index by this count, and
+        # content is searched for new tool markers only after the last one.
+        self.skipped_tool_blocks = 0
+        self.content_search_start = 0
+
+    def _current_tool_block(self) -> int:
+        """Index of the <tool_call> block the streaming parser is in."""
+        return self.current_tool_index + self.skipped_tool_blocks
+
+    def _skip_tool_block(
+        self, current_text: str, block_end_idx: int
+    ) -> DeltaMessage | None:
+        """Leave a closed block without a function header and stream the
+        text after it, so neither content nor later calls are lost."""
+        self.skipped_tool_blocks += 1
+        self.content_search_start = block_end_idx + len(self.tool_call_end_token)
+        # A buffered/speculative delta can contain many closed empty blocks.
+        # Scan those iteratively so recovery does not consume Python frames.
+        starts = self._tool_start_positions(current_text)
+        while self._current_tool_block() < len(starts):
+            start = starts[self._current_tool_block()]
+            end = current_text.find(self.tool_call_end_token, start)
+            if end == -1:
+                return self._stream_current_tool_block(current_text)
+            block = current_text[start : end + len(self.tool_call_end_token)]
+            if self.tool_call_prefix in block:
+                return self._stream_current_tool_block(current_text)
+            self.skipped_tool_blocks += 1
+            self.content_search_start = end + len(self.tool_call_end_token)
+
+        self.is_tool_call_started = False
+        # Nothing after the block has been emitted yet: while inside it, the
+        # parser swallowed every delta, also text after its end.
+        tail = current_text[self.content_search_start :]
+        held_prefix = self._trailing_tool_marker_prefix(current_text)
+        if held_prefix:
+            tail = tail[: -len(held_prefix)]
+        return DeltaMessage(content=tail) if tail else None
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -392,6 +433,19 @@ class Qwen3CoderToolParser(ToolParser):
             return pending_and_delta[: -len(current_prefix)]
         return pending_and_delta
 
+    def _complete_unstreamed_arguments(self, tool_text: str) -> str | None:
+        """Arguments of a function that closed before any of them were sent."""
+        if self.streamed_args_for_tool[self.current_tool_index]:
+            return None
+        func_start = tool_text.find(self.tool_call_prefix) + len(self.tool_call_prefix)
+        func_content_end = tool_text.find(self.function_end_token, func_start)
+        if func_content_end == -1:
+            return None
+        parsed_tool = self._parse_xml_function_call(
+            tool_text[func_start:func_content_end]
+        )
+        return parsed_tool.function.arguments if parsed_tool is not None else None
+
     def _finish_streaming_function(self, tool_text: str) -> None:
         """Finalize one streamed XML function and its JSON argument state."""
         self.json_closed = True
@@ -618,7 +672,7 @@ class Qwen3CoderToolParser(ToolParser):
         if self.json_closed and not self.in_function:
             # Check if this tool call has ended
             tool_ends = current_text.count(self.tool_call_end_token)
-            if tool_ends > self.current_tool_index:
+            if tool_ends > self._current_tool_block():
                 # This tool has ended, advance to next
                 self.current_tool_index += 1
                 self.header_sent = False
@@ -629,7 +683,7 @@ class Qwen3CoderToolParser(ToolParser):
 
                 # Check if there are more tool calls
                 tool_starts = current_text.count(self.tool_call_start_token)
-                if self.current_tool_index >= tool_starts:
+                if self._current_tool_block() >= tool_starts:
                     # No more tool calls
                     self.is_tool_call_started = False
                 # Continue processing next tool
@@ -641,8 +695,10 @@ class Qwen3CoderToolParser(ToolParser):
             tool_start_candidates = [
                 pos
                 for pos in (
-                    current_text.find(self.tool_call_start_token),
-                    current_text.find(self.tool_call_prefix),
+                    current_text.find(
+                        self.tool_call_start_token, self.content_search_start
+                    ),
+                    current_text.find(self.tool_call_prefix, self.content_search_start),
                 )
                 if pos != -1
             ]
@@ -676,17 +732,20 @@ class Qwen3CoderToolParser(ToolParser):
                 # Normal content, no tool call
                 return DeltaMessage(content=delta_text)
 
+        return self._stream_current_tool_block(current_text)
+
+    def _stream_current_tool_block(self, current_text: str) -> DeltaMessage | None:
+        """Stream the progress of the <tool_call> block the parser is in."""
         # Check if we're between tool calls (waiting for next one)
         # Count tool calls we've seen vs processed
         tool_start_positions = self._tool_start_positions(current_text)
         tool_starts_count = len(tool_start_positions)
-        if self.current_tool_index >= tool_starts_count:
+        if self._current_tool_block() >= tool_starts_count:
             # We're past all tool calls, shouldn't be here
             return None
 
         # We're in a tool call, find the current tool call portion
-        # Need to find the correct tool call based on current_tool_index
-        tool_start_idx = tool_start_positions[self.current_tool_index]
+        tool_start_idx = tool_start_positions[self._current_tool_block()]
         # Find where this tool call ends (or current position if not ended yet)
         tool_end_idx = current_text.find(self.tool_call_end_token, tool_start_idx)
         if tool_end_idx == -1:
@@ -764,6 +823,10 @@ class Qwen3CoderToolParser(ToolParser):
                             )
                         ]
                     )
+            elif tool_end_idx != -1:
+                # Empty or malformed block: it closed without a function
+                # header, so no call will ever start in it.
+                return self._skip_tool_block(current_text, tool_end_idx)
             return None
 
         # We've sent header, now handle function body
@@ -775,6 +838,30 @@ class Qwen3CoderToolParser(ToolParser):
             # json_started from what was actually streamed.
             if not self.json_started:
                 self.json_started = True
+                complete_arguments = self._complete_unstreamed_arguments(tool_text)
+                if complete_arguments is not None:
+                    # A burst completed the function after its header was sent.
+                    # Emit the whole body with the brace: the stream may end
+                    # before another delta brings the parser back here.
+                    self.json_closed = True
+                    self.in_function = False
+                    self.accumulated_params = {}
+                    self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                        complete_arguments
+                    )
+                    self.streamed_args_for_tool[self.current_tool_index] = (
+                        complete_arguments
+                    )
+                    return DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_index,
+                                function=DeltaFunctionCall(
+                                    arguments=complete_arguments
+                                ),
+                            )
+                        ]
+                    )
                 self.streamed_args_for_tool[self.current_tool_index] += "{"
                 return DeltaMessage(
                     tool_calls=[
@@ -918,6 +1005,14 @@ class Qwen3CoderToolParser(ToolParser):
                 return result
 
         return None
+
+    def adjust_request(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        if adjust_qwen_xml_tool_request(request, logger):
+            return request
+        return super().adjust_request(request)
 
     def get_structural_tag(self, request: ChatCompletionRequest):
         return get_model_structural_tag(

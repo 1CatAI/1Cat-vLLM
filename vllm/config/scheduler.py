@@ -101,6 +101,19 @@ class SchedulerConfig:
     purely adaptive budget. Actual scheduled chunks remain subject to the
     existing token and recurrent-state limits."""
 
+    short_prompt_chunk_tokens: int = Field(default=0, ge=0)
+    """Prefill chunk size for requests whose uncached prompt part is shorter
+    than short_prompt_threshold; longer ones take the whole
+    max_num_batched_tokens per chunk. With pipeline parallelism a prompt of few
+    chunks spends much of its prefill filling and draining the pipeline, which
+    small chunks shorten, while long prompts gain from large chunks that read
+    the weights less often per token. Zero disables it."""
+
+    short_prompt_threshold: int = Field(default=0, ge=0)
+    """Uncached prompt tokens below which a request is prefilled in chunks of
+    short_prompt_chunk_tokens. Decided once, when the request is scheduled
+    from the waiting queue."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -325,6 +338,22 @@ class SchedulerConfig:
                 self.max_num_batched_tokens,
                 self.max_num_seqs * max_model_len,
             )
+
+        if (self.short_prompt_chunk_tokens > 0) != (self.short_prompt_threshold > 0):
+            raise ValueError(
+                "short_prompt_chunk_tokens and short_prompt_threshold are set together."
+            )
+        if self.short_prompt_chunk_tokens > 0:
+            if not self.enable_chunked_prefill:
+                raise ValueError(
+                    "Chunked prefill must be enabled to set short_prompt_chunk_tokens."
+                )
+            if self.short_prompt_chunk_tokens >= self.max_num_batched_tokens:
+                raise ValueError(
+                    f"short_prompt_chunk_tokens ({self.short_prompt_chunk_tokens}) "
+                    "must be smaller than max_num_batched_tokens "
+                    f"({self.max_num_batched_tokens})."
+                )
 
         if self.max_num_partial_prefills > 1:
             if not self.enable_chunked_prefill:

@@ -203,8 +203,9 @@ template <int Split, bool Gated, bool FullRows = false,
 __global__
 __launch_bounds__(256, FullRows ? 2 : 1) void nvfp4_qpn2_m32_twophase_sm70_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
-    const half* __restrict__ input, half* __restrict__ output, int width, int k,
-    int m, float global_scale) {
+    const half* __restrict__ input, half* __restrict__ output,
+    half* __restrict__ k16_output, int width, int k, int m,
+    float global_scale) {
   // A full row tile needs no input/output masking. Bound register usage so
   // prefetching does not remove the second resident CTA on SM70.
   if constexpr (FullRows) m = 32;
@@ -318,6 +319,12 @@ __launch_bounds__(256, FullRows ? 2 : 1) void nvfp4_qpn2_m32_twophase_sm70_kerne
           }
           output[static_cast<size_t>(row) * width + blockIdx.y * 32 + e % 32] =
               result;
+          if constexpr (Gated) {
+            if (k16_output != nullptr) {
+              k16_output[vllm::sm70::k16_half_index(
+                  row, blockIdx.y * 32 + e % 32, m)] = result;
+            }
+          }
         }
       }
     }
@@ -875,20 +882,16 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
     if (m > 16 && m <= 32 && k >= 4096 && n >= 2048 && n % 32 == 0 &&
         split_k == 16 && accumulator_chains == 2) {
-      auto packed_input = torch::empty_like(input);
+      torch::Tensor packed_input;
       auto* packed_ptr =
-          reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
-      constexpr int kThreads = 256;
-      vllm::sm70::pack_k16_input<<<
-          (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-          input_ptr, packed_ptr, m, k);
+          vllm::sm70::k16_packed_input(input, packed_input, stream);
       auto kernel = m == 32
                         ? nvfp4_qpn2_m32_twophase_sm70_kernel<
                               16, false, true, TurboMindLayout, BundledScales>
                         : nvfp4_qpn2_m32_twophase_sm70_kernel<
                               16, false, false, TurboMindLayout, BundledScales>;
       kernel<<<dim3(1, n / 32), 256, 0, stream>>>(
-          code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m,
+          code_ptr, scale_ptr, packed_ptr, output_ptr, nullptr, n, k, m,
           static_cast<float>(global_scale));
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
@@ -975,22 +978,20 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
     if (m > 16 && m <= 32 && k >= 4096 && hidden >= 2048 && hidden % 32 == 0 &&
         split_k == 8 && accumulator_chains == 2) {
-      auto packed_input = torch::empty_like(input);
+      torch::Tensor packed_input, twin;
       auto* packed_ptr =
-          reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
-      constexpr int kThreads = 256;
-      vllm::sm70::pack_k16_input<<<
-          (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-          input_ptr, packed_ptr, m, k);
+          vllm::sm70::k16_packed_input(input, packed_input, stream);
+      half* k16_output = vllm::sm70::k16_twin_for(out, twin);
       auto kernel = m == 32
                         ? nvfp4_qpn2_m32_twophase_sm70_kernel<
                               8, true, true, TurboMindLayout, BundledScales>
                         : nvfp4_qpn2_m32_twophase_sm70_kernel<
                               8, true, false, TurboMindLayout, BundledScales>;
       kernel<<<dim3(1, hidden / 32), 256, 0, stream>>>(
-          code_ptr, scale_ptr, packed_ptr, output_ptr, hidden, k, m,
+          code_ptr, scale_ptr, packed_ptr, output_ptr, k16_output, hidden, k, m,
           static_cast<float>(global_scale));
       C10_CUDA_KERNEL_LAUNCH_CHECK();
+      if (k16_output != nullptr) vllm::sm70::k16_publish(out, twin);
       return;
     }
   }

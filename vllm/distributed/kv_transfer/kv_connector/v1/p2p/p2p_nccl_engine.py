@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import msgpack
+import regex as re
 import torch
 import zmq
 
@@ -32,6 +33,20 @@ from vllm.utils.torch_utils import current_stream
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEM_POOL_SIZE_GB = 32
+
+
+def _kv_key(request_id: str) -> str:
+    """Normalize a request id for use as a KV tensor-cache key.
+
+    The engine's input processor (``InputProcessor.assign_request_id``)
+    appends a per-request random suffix (``-<8 hex chars>``) to every
+    request id. The suffix is generated independently on each instance,
+    so raw ids must never be used to build tensor keys
+    (``request_id#layer_name``): the prefill and decode sides would derive
+    different keys and the decode side would block forever waiting for
+    tensors that never arrive.
+    """
+    return re.sub(r"-[0-9a-f]{8}$", "", request_id)
 
 
 @contextmanager
@@ -392,6 +407,18 @@ class P2pNcclEngine:
                     )
             elif data["cmd"] == "PUT":
                 tensor_id = data["tensor_id"]
+                connection = self.comms.get(remote_address.decode())
+                if connection is None:
+                    # Reject stale peers before allocating a tensor. Publish
+                    # the failed load so waiting consumers can recompute it.
+                    self.router_socket.send_multipart([remote_address, b"1"])
+                    logger.warning(
+                        "PUT from unknown communicator %s", remote_address.decode()
+                    )
+                    with self.recv_store_cv:
+                        self.recv_store[tensor_id] = None
+                        self.recv_store_cv.notify_all()
+                    continue
                 try:
                     with torch.cuda.stream(self.recv_stream):
                         tensor = torch.empty(
@@ -399,25 +426,6 @@ class P2pNcclEngine:
                             dtype=getattr(torch, data["dtype"]),
                             device=self.device,
                         )
-                    self.router_socket.send_multipart([remote_address, b"0"])
-                    comm, rank = self.comms[remote_address.decode()]
-                    self.recv(comm, tensor, rank ^ 1, self.recv_stream)
-                    tensor_size = tensor.element_size() * tensor.numel()
-                    if self.buffer_size + tensor_size > self.buffer_size_threshold:
-                        # Store Tensor in memory pool
-                        addr = self.pool.store_tensor(tensor)
-                        tensor = (addr, tensor.dtype, tensor.shape)
-                        logger.warning(
-                            "🔴[PUT]Recv Tensor, Out Of Threshold, "
-                            "%s👈%s, data:%s, addr:%d",
-                            self.zmq_address,
-                            remote_address.decode(),
-                            data,
-                            addr,
-                        )
-                    else:
-                        self.buffer_size += tensor_size
-
                 except torch.cuda.OutOfMemoryError:
                     self.router_socket.send_multipart([remote_address, b"1"])
                     tensor = None
@@ -427,14 +435,41 @@ class P2pNcclEngine:
                         remote_address.decode(),
                         data,
                     )
+                else:
+                    self.router_socket.send_multipart([remote_address, b"0"])
+                    comm, rank = connection
+                    self.recv(comm, tensor, rank ^ 1, self.recv_stream)
+                    tensor_size = tensor.element_size() * tensor.numel()
+                    if self.buffer_size + tensor_size > self.buffer_size_threshold:
+                        # The sender has already received its acknowledgement;
+                        # a local spill failure must not send a second reply.
+                        try:
+                            addr = self.pool.store_tensor(tensor)
+                        except (torch.cuda.OutOfMemoryError, ValueError):
+                            logger.exception("Failed to spill KV tensor %s", tensor_id)
+                            tensor = None
+                        else:
+                            tensor = (addr, tensor.dtype, tensor.shape)
+                    else:
+                        self.buffer_size += tensor_size
 
                 with self.recv_store_cv:
                     self.recv_store[tensor_id] = tensor
-                    self.have_received_tensor_id(tensor_id)
-                    self.recv_store_cv.notify()
+                    if tensor is not None:
+                        self.have_received_tensor_id(tensor_id)
+                    self.recv_store_cv.notify_all()
 
             elif data["cmd"] == "GET":
                 tensor_id = data["tensor_id"]
+                connection = self.comms.get(remote_address.decode())
+                if connection is None:
+                    self.router_socket.send_multipart(
+                        [remote_address, msgpack.dumps({"ret": 1})]
+                    )
+                    logger.warning(
+                        "GET from unknown communicator %s", remote_address.decode()
+                    )
+                    continue
                 with self.send_store_cv:
                     tensor = self.send_store.pop(tensor_id, None)
                     if tensor is not None:
@@ -452,7 +487,7 @@ class P2pNcclEngine:
                 self.router_socket.send_multipart([remote_address, msgpack.dumps(data)])
 
                 if data["ret"] == 0:
-                    comm, rank = self.comms[remote_address.decode()]
+                    comm, rank = connection
                     self.send(comm, tensor.to(self.device), rank ^ 1, self.send_stream)
             else:
                 logger.warning(
@@ -553,16 +588,19 @@ class P2pNcclEngine:
 
         # Clear the buffer upon request completion.
         for request_id in finished_req_ids:
+            norm_id = _kv_key(request_id)
             for layer_name in no_compile_layers:
-                tensor_id = request_id + "#" + layer_name
+                tensor_id = norm_id + "#" + layer_name
                 if tensor_id in self.recv_store:
                     with self.recv_store_cv:
                         tensor = self.recv_store.pop(tensor_id, None)
-                        self.send_request_id_to_tensor_ids.pop(request_id, None)
-                        self.recv_request_id_to_tensor_ids.pop(request_id, None)
                     if isinstance(tensor, tuple):
                         addr, _, _ = tensor
                         self.pool.free(addr)
+            # Producer bookkeeping also needs cleanup when no receive tensors
+            # or attention layers remain.
+            self.send_request_id_to_tensor_ids.pop(norm_id, None)
+            self.recv_request_id_to_tensor_ids.pop(norm_id, None)
 
         # TODO:Retrieve requests that have already sent the KV cache.
         finished_sending: set[str] = set()

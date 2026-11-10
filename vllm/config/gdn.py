@@ -3,7 +3,9 @@
 
 """Initialized GDN computation policy and legacy input provenance."""
 
+import importlib.metadata
 import os
+import shutil
 from dataclasses import fields
 from typing import ClassVar, Literal
 
@@ -13,6 +15,9 @@ from vllm.config.gdn_projection import GdnProjectionConfig
 from vllm.config.gdn_schedule import GdnScheduleConfig
 from vllm.config.gdn_state import GdnStateConfig
 from vllm.config.utils import config, hash_factors
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 GDN_LEGACY_FIELDS = {
     "packed_recurrent_decode": "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE",
@@ -34,6 +39,28 @@ GDN_NATIVE_ALIASES = {
 GDN_FALLBACK_ALIASES = {
     "original_prefill": "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG",
 }
+
+
+def _tilelang_nvcc_available() -> bool:
+    """Whether TileLang's JIT will find an ``nvcc`` to compile with.
+
+    Follows ``tilelang.env._find_cuda_home``: ``CUDA_HOME``/``CUDA_PATH``, then
+    ``nvcc`` on ``PATH``, then the ``nvidia-cuda-nvcc`` wheel, then
+    ``/usr/local/cuda``. A runtime-only CUDA install has the directory but no
+    compiler, so the chosen home must contain ``bin/nvcc``.
+    """
+    home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if home:
+        return os.path.isfile(os.path.join(home, "bin", "nvcc"))
+    if shutil.which("nvcc"):
+        return True
+    try:
+        files = importlib.metadata.files("nvidia-cuda-nvcc") or []
+    except importlib.metadata.PackageNotFoundError:
+        files = []
+    if any(file.name == "nvcc" for file in files):
+        return True
+    return os.path.isfile("/usr/local/cuda/bin/nvcc")
 
 
 @config
@@ -145,6 +172,21 @@ class GdnConfig:
                 if raw is None
                 else raw.strip().lower() not in ("0", "false", "no", "off", "")
             )
+            if (
+                field == "original_prefill"
+                and raw is None
+                and value
+                and not _tilelang_nvcc_available()
+            ):
+                # The original prefill JIT-compiles with nvcc on first use. A
+                # bare wheel install has none; the prebuilt prefill needs none.
+                logger.warning_once(
+                    "No CUDA toolkit (nvcc) found for TileLang; GDN prefill "
+                    "uses the prebuilt kernel. Set CUDA_HOME to a toolkit to "
+                    "use the original TileLang prefill."
+                )
+                value = False
+                source = "default:no_nvcc"
             setattr(self, field, value)
             self.sources[field] = source
         if self.native_verify is None:

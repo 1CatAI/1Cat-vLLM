@@ -8,6 +8,7 @@
 #include <torch/all.h>
 
 #include "custom_all_reduce.cuh"
+#include "sm70_turbomind/ops/activation_pack_sm70.cuh"
 #if !defined(USE_ROCM)
   #include "sm70_qwen38_hc_batch.cuh"
 #endif
@@ -650,19 +651,28 @@ void sm70_all_reduce_gemma_rms_norm_impl(
 
   if (residual.scalar_type() == at::ScalarType::Float) {
     auto residual_ptr = reinterpret_cast<const float*>(residual.data_ptr());
+    // The batch kernel writes the K16 twin the next projection would pack.
+    torch::Tensor k16_twin;
+    half* k16_out = nullptr;
+    if constexpr (kWorldSize == 4) {
+      if (!benchmark_reference && fa->sm70_push_norm_batch_ready(num_tokens)) {
+        k16_out = vllm::sm70::k16_twin_for(normalized_out, k16_twin);
+      }
+    }
     if (weight.scalar_type() == at::ScalarType::Float) {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, float>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
           residual_out_ptr, num_tokens, hidden_size, epsilon_f,
-          benchmark_reference);
+          benchmark_reference, k16_out);
     } else {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, half>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
           residual_out_ptr, num_tokens, hidden_size, epsilon_f,
-          benchmark_reference);
+          benchmark_reference, k16_out);
     }
+    if (k16_out != nullptr) vllm::sm70::k16_publish(normalized_out, k16_twin);
   } else if constexpr (kWorldSize == 2) {
     auto residual_ptr = reinterpret_cast<const half*>(residual.data_ptr());
     if (weight.scalar_type() == at::ScalarType::Float) {

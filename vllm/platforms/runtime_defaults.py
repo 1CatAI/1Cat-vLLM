@@ -130,16 +130,26 @@ def checkpoint_kv_quant_allowed(cfg: VllmConfig) -> bool:
 
 
 def _apply_sm70_qwen38_disk_ple_defaults(
-    parallel_config: ParallelConfig, *, defaults
-) -> None:
-    """Keep PLE disk-backed and complete its late-bound parallel config."""
-    defaults["VLLM_SM70_QWEN38_HYBRID_PLE"] = "0"
+    parallel_config: ParallelConfig, *, defaults, model: str | None = None
+) -> float | None:
+    """Keep PLE disk-backed and complete its late-bound parallel config.
+
+    When the host can pin the table of ``model``, decode reads local
+    device/host shards (hybrid placement) while prefill keeps the CPU/disk
+    path. Returns the per-rank pinned-host budget, or None for disk only.
+    """
+    from vllm.models.qwen4_exp.common.ple import apply_hybrid_ple_defaults
+
+    host_gib = apply_hybrid_ple_defaults(
+        defaults, model, parallel_config.tensor_parallel_size
+    )
     defaults["VLLM_PLE_CPU_OFFLOAD"] = "1"
     defaults["VLLM_PLE_DISK_OFFLOAD"] = "1"
     # ParallelConfig is validated before these model-aware defaults are
     # applied, so initialize the endpoint that its validator would have
     # created for an explicit PLE configuration.
     parallel_config.ensure_ple_offload_ipc_path()
+    return host_gib
 
 
 def _ple_disk_cascade_cuda_supported() -> bool:
@@ -486,12 +496,21 @@ def apply_runtime_policy_defaults(self):
                 )
             )
         ):
-            _apply_sm70_qwen38_disk_ple_defaults(
-                self.parallel_config, defaults=defaults
+            # Host KV already holds history in pinned memory, and the device
+            # shards of a hybrid PLE table leave its state pool too little VRAM.
+            host_kv = self.kernel_config.qsa_host_kv
+            host_gib = _apply_sm70_qwen38_disk_ple_defaults(
+                self.parallel_config,
+                defaults=defaults,
+                model=None if host_kv else self.model_config.model,
             )
             logger.info_once(
-                "Auto-enabling disk-mmap PLE for the SM70 Qwen3.8 "
-                "dual-compile lane: bounded result staging, no resident table."
+                "Auto-enabling %s PLE for the SM70 Qwen3.8 dual-compile lane: %s.",
+                "disk-mmap" if host_gib is None else "hybrid",
+                "bounded result staging, no resident table"
+                if host_gib is None
+                else f"decode gathers {host_gib} GiB pinned-host/device shards "
+                "per rank, prefill reads the disk-backed table",
             )
     if self.speculative_config is not None:
         policy = self.speculative_config.sm70_dflash2

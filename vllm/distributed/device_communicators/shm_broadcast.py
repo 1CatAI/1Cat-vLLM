@@ -5,6 +5,7 @@ import pickle
 import sys
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -47,6 +48,16 @@ if TYPE_CHECKING:
     from _typeshed import SizedBuffer
 
 VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
+# Cap on how long an idle reader parks before re-reading the authoritative SHM
+# written-flag. Bounds lost-notify recovery latency to ~5s while the periodic
+# wakeup stays negligible (one flag check per reader every 5s).
+SHM_READER_RECHECK_INTERVAL_MS = 5000
+
+
+# How often a busy reader polls its notify socket. CONFLATE keeps one message,
+# but libzmq still queues an internal command per notification until the socket
+# is polled, so a reader that never goes idle would grow without bound.
+SHM_NOTIFY_POLL_INTERVAL_S = 2.0
 
 from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
 
@@ -130,6 +141,8 @@ class SpinCondition:
         if is_reader:
             # Time of last shm buffer read
             self.last_read = time.monotonic()
+            # Time a busy reader last polled the notify socket
+            self.last_notify_poll = self.last_read
 
             # Time to keep busy-looping on the shm buffer before going idle
             self.busy_loop_s = busy_loop_s
@@ -172,6 +185,12 @@ class SpinCondition:
 
     def record_read(self):
         self.last_read = time.monotonic()
+        if self.last_read - self.last_notify_poll >= SHM_NOTIFY_POLL_INTERVAL_S:
+            self.last_notify_poll = self.last_read
+            # poll() makes libzmq process the queued commands; a bare recv()
+            # returns the pending message without doing so.
+            if self.local_notify_socket.poll(timeout=0):
+                self.local_notify_socket.recv(flags=zmq.NOBLOCK, copy=False)
 
     def cancel(self):
         # Sends cancellation ping that will cause the reader to wake up.
@@ -362,6 +381,12 @@ class Handle:
     remote_addr_ipv6: bool = False
 
 
+def _close_zmq(context: zmq.Context, sockets: list[zmq.Socket]) -> None:
+    for socket in sockets:
+        socket.close(linger=0)
+    context.term()
+
+
 class MessageQueue:
     def __init__(
         self,
@@ -451,8 +476,25 @@ class MessageQueue:
             remote_subscribe_addr=remote_subscribe_addr,
             remote_addr_ipv6=remote_addr_ipv6,
         )
+        self._close_zmq_on_collect(context)
 
         logger.debug("vLLM message queue communication handle: %s", self.handle)
+
+    def _close_zmq_on_collect(self, context: zmq.Context) -> None:
+        # pyzmq's Context.__del__ can block forever in term() when the context
+        # and its sockets are collected in the same GC cycle, so the finalizer
+        # keeps them alive and closes the sockets before terminating.
+        sockets = [self.local_socket, self.remote_socket]
+        if self._spin_condition is not None:
+            sockets += [
+                self._spin_condition.local_notify_socket,
+                self._spin_condition.read_cancel_socket,
+                self._spin_condition.write_cancel_socket,
+            ]
+        finalizer = weakref.finalize(
+            self, _close_zmq, context, [s for s in sockets if s is not None]
+        )
+        finalizer.atexit = False  # type: ignore[misc]
 
     def export_handle(self) -> Handle:
         return self.handle
@@ -503,6 +545,7 @@ class MessageQueue:
             self._spin_condition = None  # type: ignore
 
         self.shutting_down = False
+        self._close_zmq_on_collect(context)
         return self
 
     def wait_until_ready(self):
@@ -631,25 +674,22 @@ class MessageQueue:
             self.n_warning = 1
             self.timeout = timeout
 
-        def timeout_ms(self) -> int | None:
-            """Returns a timeout that is:
+        def timeout_ms(self) -> int:
+            """Returns a timeout, capped at the recheck interval, that is:
             - min(time to deadline, time to next warning) if we're logging warnings
             - time to deadline, if we're not logging warnings
-            - None if the timeout is None and we're not logging warnings
+            - recheck interval if the timeout is None and we're not logging warnings
             - raise TimeoutError if we are past the deadline
             """
-            warning_wait_time = self.warning_wait_time_ms
+            wait_ms = SHM_READER_RECHECK_INTERVAL_MS
+            if self.warning_wait_time_ms is not None:
+                wait_ms = min(wait_ms, self.warning_wait_time_ms)
             if self.timeout is None:
-                return warning_wait_time
-
+                return wait_ms
             time_left_ms = int((self.deadline - time.monotonic()) * 1000)
             if time_left_ms <= 0:
                 raise TimeoutError
-
-            if warning_wait_time and warning_wait_time < time_left_ms:
-                return warning_wait_time
-
-            return time_left_ms
+            return min(wait_ms, time_left_ms)
 
         def should_warn(self) -> bool:
             """Returns true if it's time to log a warning for a timeout that is not
@@ -710,18 +750,18 @@ class MessageQueue:
                 # found a block that is not read by this reader
                 # let caller read from the buffer
                 with self.buffer.get_data(self.current_idx) as buf:
-                    yield buf
-
-                # caller has read from the buffer
-                # set the read flag
-                metadata_buffer[self.local_reader_rank + 1] = 1
-                # Memory fence ensures the read flag is visible to the writer.
-                # Without this, writer may not see our read completion and
-                # could wait indefinitely for all readers to finish.
-                memory_fence()
-                self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
-
-                self._spin_condition.record_read()
+                    try:
+                        yield buf
+                    finally:
+                        # caller has read from the buffer; set the read flag.
+                        metadata_buffer[self.local_reader_rank + 1] = 1
+                        # Memory fence ensures the read flag is visible to the writer.
+                        # Without this, writer may not see our read completion and
+                        # could wait indefinitely for all readers to finish.
+                        memory_fence()
+                        next_idx = self.current_idx + 1
+                        self.current_idx = next_idx % self.buffer.max_chunks
+                        self._spin_condition.record_read()
                 break
 
     def enqueue(self, obj, timeout: float | None = None):

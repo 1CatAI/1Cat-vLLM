@@ -17,6 +17,7 @@ from vllm.model_executor.models.shared_weights import (
     get_target_lm_head as get_target_lm_head,
 )
 from vllm.platforms import current_platform
+from vllm.runtime_resources import share_runtime_resources
 
 logger = init_logger(__name__)
 
@@ -73,6 +74,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             else vllm_config.cache_config
         ),
     )
+    share_runtime_resources(draft_vllm_config, vllm_config)
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
             vllm_config=draft_vllm_config, model_config=draft_model_config
