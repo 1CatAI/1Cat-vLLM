@@ -23,6 +23,7 @@ from typing import Any
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .cache_utils import needs_software_fp8
@@ -203,23 +204,22 @@ def compress_norm_rope_store_triton(
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
     """
+    launch_options: dict[str, Any] = {}
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
-        # The driver reserves the biggest stack of any kernel for every thread
-        # of the card. With 4 warps this kernel gets 32 registers from ptxas on
-        # Volta and spills 11.7 KB per thread: 2 GiB on a Tesla V100, 0.7 GiB on
-        # a Quadro RTX 8000. 16 warps spread the tiles over more threads, and
-        # 128 registers is what 512 threads may hold (1.4 KB of stack).
-        num_warps = 16
-        maxnreg = 128
+        # The large compression tile spills heavily with four warps on SM70.
+        # Spread it across more threads with a bounded register budget. Other
+        # devices retain the existing launch until independently qualified.
+        num_warps = 4
+        if current_platform.is_device_capability(70):
+            num_warps = 16
+            launch_options["maxnreg"] = 128
     elif use_fp4_cache:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
         num_warps = 1
-        maxnreg = None
     else:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
-        maxnreg = None
 
     kernel[(num_actual,)](
         # state cache
@@ -267,7 +267,7 @@ def compress_norm_rope_store_triton(
         RING_SIZE=ring_size,
         PRIVATE_HISTORY_SIZE=private_history_size,
         num_warps=num_warps,
-        maxnreg=maxnreg,
+        **launch_options,
         **pdl_kwargs,
     )
 
