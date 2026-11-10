@@ -28,7 +28,11 @@ class GraphModelContract:
         )
 
     def compressed_context_buckets(self):
-        if not isinstance(self.index_topk, int) or not self.compress_ratios:
+        if (
+            not isinstance(self.max_model_len, int)
+            or not isinstance(self.index_topk, int)
+            or not self.compress_ratios
+        ):
             return ()
         short = self.index_topk * min(self.compress_ratios)
         if short <= 0 or self.max_model_len <= short:

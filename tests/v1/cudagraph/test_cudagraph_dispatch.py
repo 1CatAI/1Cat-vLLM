@@ -472,6 +472,27 @@ class TestCudagraphDispatcher:
         )
         assert contract.compressed_context_buckets() == expected
 
+    @pytest.mark.parametrize("max_model_len", [None, 0, 2048, 2049, 4095, 16385])
+    def test_dsv4_context_bucket_boundaries(self, max_model_len):
+        contract = GraphModelContract(
+            speculative=False,
+            max_model_len=max_model_len,
+            num_heads=64,
+            num_kv_heads=1,
+            head_dim=512,
+            index_topk=512,
+            compress_ratios=(4, 128),
+            cache_dtype="fp8",
+            attention_backend=None,
+        )
+        buckets = contract.compressed_context_buckets()
+        if max_model_len is None or max_model_len <= 2048:
+            assert buckets == ()
+        else:
+            assert buckets == tuple(sorted(set(buckets)))
+            assert buckets[0] == 2048
+            assert buckets[-1] == max_model_len
+
     @pytest.mark.parametrize("speculative_tokens", [3, 5, 7])
     def test_dsv4_context_buckets_are_derived_for_mtp_on_sm70(
         self, monkeypatch, speculative_tokens
@@ -1011,6 +1032,16 @@ def test_negative_graph_variant_uses_an_isolated_pool():
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:
+    @pytest.fixture(autouse=True)
+    def capture_stream(self):
+        # Earlier CUDA tests may restore the default stream. Capture owns a
+        # non-default stream instead of relying on process-wide test order.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            yield
+            stream.synchronize()
+
     def setup_method(self):
         self.vllm_config = _create_vllm_config(CompilationConfig())
         self.model = SimpleMLP().to(DEVICE_TYPE)
