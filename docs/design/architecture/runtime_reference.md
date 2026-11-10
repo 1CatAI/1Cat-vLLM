@@ -11,7 +11,8 @@ identify initialization/hash code; they do not evaluate its semantics.
 
 | Type | Owner paths | Lifecycle / hash methods | Source |
 | --- | --- | --- | --- |
-| `vllm.config.attention.AttentionConfig` | attention_config | compute_hash: [vllm/config/attention.py](../../../vllm/config/attention.py#L101) | [vllm/config/attention.py](../../../vllm/config/attention.py#L16) |
+| `vllm.config.attention.AttentionConfig` | attention_config | compute_hash: [vllm/config/attention.py](../../../vllm/config/attention.py#L121) | [vllm/config/attention.py](../../../vllm/config/attention.py#L33) |
+| `vllm.config.attention.V41IndexTiledPolicy` | attention_config.v41_index_tiled | resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L29); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/attention.py](../../../vllm/config/attention.py#L17) |
 | `vllm.config.cache.CacheConfig` | cache_config | compute_hash: [vllm/config/cache.py](../../../vllm/config/cache.py#L207) | [vllm/config/cache.py](../../../vllm/config/cache.py#L43) |
 | `vllm.config.compilation.CUDAGraphMode` | compilation_config.cudagraph_mode |  | [vllm/config/compilation.py](../../../vllm/config/compilation.py#L54) |
 | `vllm.config.compilation.CompilationConfig` | compilation_config | compute_hash: [vllm/config/compilation.py](../../../vllm/config/compilation.py#L790); __post_init__: [vllm/config/compilation.py](../../../vllm/config/compilation.py#L916) | [vllm/config/compilation.py](../../../vllm/config/compilation.py#L391) |
