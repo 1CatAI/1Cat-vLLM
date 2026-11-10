@@ -113,7 +113,7 @@ def _hash_subject(method, policy):
         draft_token_map=None,
         use_dflash_family=lambda: method == "dflash",
         use_dspark=lambda: False,
-        use_dflash_ddtree=lambda: False,
+        uses_tree_verification=lambda: False,
     )
 
 
