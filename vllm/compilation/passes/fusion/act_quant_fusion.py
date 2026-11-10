@@ -30,12 +30,16 @@ FP4_DTYPE = torch.uint8
 
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
 
-# silu_and_mul_quant is only registered when activation_kernels.cu is compiled
-# in (SM80+ builds); SM70-only builds compile the registrations out, so this
-# fusion is skipped entirely (mirror of the nvfp4 hasattr check below).
-silu_and_mul_quant_supported = current_platform.is_cuda() and hasattr(
-    torch.ops._C, "silu_and_mul_quant"
-)
+
+# Mixed CUDA wheels may register this op for SM80+ while running on a
+# pre-SM80 device. Operator availability alone does not qualify the fusion.
+def _supports_static_fp8_silu_mul_quant() -> bool:
+    return hasattr(torch.ops._C, "silu_and_mul_quant") and (
+        not current_platform.is_cuda() or current_platform.has_device_capability(80)
+    )
+
+
+silu_and_mul_quant_supported = _supports_static_fp8_silu_mul_quant()
 FUSED_OPS: dict[QuantKey, OpOverload] = {}
 if silu_and_mul_quant_supported:
     FUSED_OPS[kFp8StaticTensorSym] = torch.ops._C.silu_and_mul_quant.default  # noqa: E501
