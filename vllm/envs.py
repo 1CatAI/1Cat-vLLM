@@ -338,6 +338,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
+    VLLM_STARTUP_LOG_FILE: str | None = None
     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = True
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
@@ -433,6 +434,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
+    VLLM_V41_SUM2_PUSH_ANY: bool = False
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = True
@@ -4454,6 +4456,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("DFlash2 verifier",),
         user_visible=True,
     ),
+    "VLLM_STARTUP_LOG_FILE": env_var(
+        lambda: os.getenv("VLLM_STARTUP_LOG_FILE"),
+        description=(
+            "Path for the separate startup log file. Startup lines are "
+            "mirrored here until 'Application startup complete' is seen, then "
+            "the handler detaches. Disabled when unset; logs are appended "
+            "so starting another API process does not truncate an active log."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": env_var(
         lambda: os.getenv("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None),
         description=(
@@ -6536,22 +6553,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MHC_NATIVE_VERIFY", "0"))),
         description=(
-            "Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited "
-            "model and topology contracts enable it while the global default "
-            "remains off."
+            "SM70 mHC native path; the layer policy resolves the "
+            "unset default at initialization and honors explicit overrides."
         ),
         category="configuration",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the legacy getter; True after layer policy resolution; "
+            "explicit overrides retained"
         ),
         automatic_conditions=(
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
-            ),
+            "vllm/config/execution_policy.py:LayerExecutionPolicy.resolve",
         ),
         acceleration_paths=("SM70 FP16 linear",),
         user_visible=False,
@@ -6561,22 +6573,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8", "0"))),
         description=(
-            "Fixed-shape SM70 q8 mHC post+dot kernel. The global default "
-            "remains off; audited GLM-5.3 verifier contracts enable the "
-            "bitwise-qualified path."
+            "SM70 mHC native path; the layer policy resolves the "
+            "unset default at initialization and honors explicit overrides."
         ),
         category="configuration",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the legacy getter; True after layer policy resolution; "
+            "explicit overrides retained"
         ),
         automatic_conditions=(
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
-            ),
+            "vllm/config/execution_policy.py:LayerExecutionPolicy.resolve",
         ),
         acceleration_paths=("SM70 FP16 linear",),
         user_visible=False,
@@ -6646,21 +6653,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GLM_MHC_PRE_THREADS": env_var(
         lambda: int(os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS", "256")),
         description=(
-            "SM70: glm mhc pre threads. The consumer locations and unset "
+            "SM70: glm mhc pre threads. Unset, the GLM-5.3 route uses 1024 "
+            "above one token (128 at one). The consumer locations and unset "
             "defaults are listed below."
         ),
         category="tuning",
         declared_default="256",
         effective_default=(
-            "256; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "256 at the legacy getter; 1024 after layer policy resolution; "
+            "explicit overrides retained"
         ),
         automatic_conditions=(
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1024' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
-            ),
+            "vllm/config/execution_policy.py:LayerExecutionPolicy.resolve",
         ),
         acceleration_paths=("SM70 FP16 linear",),
         user_visible=False,
@@ -6959,6 +6963,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    "VLLM_V41_SUM2_PUSH_ANY": env_var(
+        lambda: bool(int(os.getenv("VLLM_V41_SUM2_PUSH_ANY", "0"))),
+        description=(
+            "Admit aligned FP16 sum2 messages up to 80 KiB to the existing "
+            "push kernel on captured, fully connected SM70 TP4 communicators."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
@@ -20338,6 +20355,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_STARTUP_LOG_FILE",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",

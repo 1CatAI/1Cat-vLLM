@@ -11,6 +11,7 @@ These tests cover:
   E) Indexer fused Triton kernel: compress+norm+rope+quant+insert
 """
 
+import importlib
 import math
 from types import SimpleNamespace
 
@@ -707,7 +708,7 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
     [(512, 4, False), (512, 128, False), (128, 4, False)],
 )
 def test_private_compressor_ring_matches_paged_state_bytes(
-    head_dim: int, compress_ratio: int, use_fp4_cache: bool
+    head_dim: int, compress_ratio: int, use_fp4_cache: bool, monkeypatch
 ):
     """The SM70 private-state gather must preserve final cache bytes exactly."""
     torch.manual_seed(19)
@@ -823,6 +824,24 @@ def test_private_compressor_ring_matches_paged_state_bytes(
     )
 
     assert torch.equal(private_output, paged_output)
+
+    if head_dim == 512 and current_platform.is_device_capability(70):
+        legacy_output = torch.zeros_like(paged_output)
+        module = importlib.import_module(
+            "vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache"
+        )
+        # Keep the real SM70 software codec; change only the launch choice.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                module.current_platform, "is_device_capability", lambda _: False
+            )
+            compress_norm_rope_store_triton(
+                state_cache=state_cache,
+                kv_cache=legacy_output,
+                use_private_state=False,
+                **common_kwargs,
+            )
+        assert torch.equal(paged_output, legacy_output)
 
     if compress_ratio == 128:
         dense_state = torch.empty(

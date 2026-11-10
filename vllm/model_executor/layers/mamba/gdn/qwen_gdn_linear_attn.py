@@ -2885,6 +2885,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and output.shape == (8, 5120)
             and output.dtype == torch.float16
             and output.is_contiguous()
+            # This direct native write bypasses adapter-aware forward methods.
+            and isinstance(self.out_proj, RowParallelLinear)
             and self.out_proj.bias is None
             and not self.out_proj.reduce_results
             and getattr(self.out_proj, "sm70_fp8_qpn8", False)

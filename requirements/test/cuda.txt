@@ -1055,7 +1055,7 @@ triton==3.6.0
     # via torch
 tritonclient==2.64.0
     # via -r requirements/test/cuda.in
-typepy==2.0.0
+typepy==1.3.5
     # via
     #   dataproperty
     #   pytablewriter

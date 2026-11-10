@@ -26,6 +26,191 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _chunk_policy(enabled):
+    from vllm.config.sm70_native import Sm70NativeConfig
+
+    policy = Sm70NativeConfig(fp8_qpn8_m32_chunked=enabled)
+    policy.resolve("fp8")
+    return "sm70:1:" + "".join(f"{len(value)}:{value}" for value in policy.values)
+
+
+def _native_block_policy():
+    from vllm.config.sm70_native import Sm70NativeConfig
+
+    policy = Sm70NativeConfig(fp8_qpn8_m32_chunked=True, fp8_qpn8_m32_native=True)
+    policy.resolve("fp8")
+    return "sm70:1:" + "".join(f"{len(value)}:{value}" for value in policy.values)
+
+
+@pytest.mark.parametrize("rows", [9, 16, 17, 31, 32])
+@pytest.mark.parametrize("gated", [False, True])
+def test_block_dispatch_chunked_policy_and_graph(rows, gated):
+    import vllm._C  # noqa: F401
+
+    torch.manual_seed(297)
+    k, n = 512, 256
+    weight = (torch.randn(n, k, device="cuda") * 8).to(torch.float8_e4m3fn)
+    scales = torch.rand(n // 128, k // 128, device="cuda") * 0.01 + 0.002
+    codes, packed = torch.ops._C.fp8_qpn8_prepare_sm70(weight, scales)
+    x = torch.empty(rows, k, device="cuda", dtype=torch.float16)
+    out = x.new_empty(rows, n // 2 if gated else n)
+    reference = torch.empty_like(out)
+    workspace = x.new_full((k, n), float("nan"))
+    token = _chunk_policy(True)
+    small = (
+        torch.ops._C.fp8_qpn8_gated_pair_sm70_out
+        if gated
+        else torch.ops._C.fp8_qpn8_gemm_sm70_out
+    )
+
+    def call():
+        torch.ops._C.fp8_qpn8_dispatch_sm70_out(
+            out,
+            workspace.data_ptr(),
+            x,
+            codes,
+            packed,
+            8,
+            2,
+            False,
+            gated,
+            native_policy=token,
+        )
+
+    x.normal_(0, 0.1)
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for amplitude in (0.1, 0.3, 0.0):
+        x.normal_(0, amplitude)
+        for start in range(0, rows, 8):
+            small(
+                reference[start : start + 8],
+                x[start : start + 8],
+                codes,
+                packed,
+                8,
+                2,
+                True,
+                False,
+            )
+        for invoke in (call, graph.replay):
+            out.fill_(float("nan"))
+            invoke()
+            assert torch.isfinite(out).all()
+            # Chunking preserves the established small-row reduction order.
+            assert torch.equal(out.view(torch.int16), reference.view(torch.int16))
+            # Admission must avoid full-matrix reconstruction, including replay.
+            assert workspace.isnan().all()
+
+
+@pytest.mark.parametrize("rows", [17, 24, 31, 32])
+@pytest.mark.parametrize("gated", [False, True])
+def test_block_dispatch_native_policy_and_graph(rows, gated):
+    import vllm._C  # noqa: F401
+
+    torch.manual_seed(297)
+    k, n = 512, 256
+    weight = (torch.randn(n, k, device="cuda") * 8).to(torch.float8_e4m3fn)
+    scales = torch.rand(n // 128, k // 128, device="cuda") * 0.01 + 0.002
+    codes, packed = torch.ops._C.fp8_qpn8_prepare_sm70(weight, scales)
+    x = torch.empty(rows, k, device="cuda", dtype=torch.float16)
+    out = x.new_empty(rows, n // 2 if gated else n)
+    reference = torch.empty_like(out)
+    workspace = x.new_full((k, n), float("nan"))
+    token = _native_block_policy()
+    split = 8 if gated else 16
+    small = (
+        torch.ops._C.fp8_qpn8_gated_pair_sm70_out
+        if gated
+        else torch.ops._C.fp8_qpn8_gemm_sm70_out
+    )
+
+    def call():
+        torch.ops._C.fp8_qpn8_dispatch_sm70_out(
+            out,
+            workspace.data_ptr(),
+            x,
+            codes,
+            packed,
+            split,
+            2,
+            False,
+            gated,
+            native_policy=token,
+        )
+
+    x.normal_(0, 0.1)
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for amplitude in (0.1, 0.3, 0.0):
+        x.normal_(0, amplitude)
+        for start in range(0, rows, 8):
+            small(
+                reference[start : start + 8],
+                x[start : start + 8],
+                codes,
+                packed,
+                split,
+                2,
+                True,
+                False,
+            )
+        for invoke in (call, graph.replay):
+            out.fill_(float("nan"))
+            invoke()
+            assert torch.isfinite(out).all()
+            # Chunking preserves the established small-row reduction order.
+            assert torch.equal(out.view(torch.int16), reference.view(torch.int16))
+            # Admission must avoid full-matrix reconstruction, including replay.
+            assert workspace.isnan().all()
+
+
+@pytest.mark.parametrize(
+    "enabled,rows,split,chains,gated",
+    [
+        (None, 9, 8, 2, False),
+        (False, 32, 8, 2, True),
+        (True, 33, 8, 2, False),
+        (True, 17, 3, 2, False),
+        (True, 17, 12, 1, False),
+        (True, 17, 32, 2, True),
+    ],
+)
+def test_block_dispatch_retains_prefill_fallback(enabled, rows, split, chains, gated):
+    import vllm._C  # noqa: F401
+
+    layer, _ = _layer(256, 512)
+    codes, packed = torch.ops._C.fp8_qpn8_prepare_sm70(
+        layer.weight, layer.weight_scale_inv
+    )
+    x = torch.randn(rows, 512, device="cuda", dtype=torch.float16) * 0.1
+    out = x.new_empty(rows, 128 if gated else 256)
+    reference = torch.empty_like(out)
+    workspace = x.new_full((512, 256), float("nan"))
+    torch.ops._C.fp8_qpn8_prefill_sm70_out(
+        reference, workspace.data_ptr(), x, codes, packed, gated
+    )
+    workspace.fill_(float("nan"))
+    torch.ops._C.fp8_qpn8_dispatch_sm70_out(
+        out,
+        workspace.data_ptr(),
+        x,
+        codes,
+        packed,
+        split,
+        chains,
+        False,
+        gated,
+        native_policy=_chunk_policy(enabled),
+    )
+    assert torch.isfinite(workspace).all()
+    torch.testing.assert_close(out, reference, rtol=0, atol=0)
+
+
 def _config(n: int, k: int) -> FP8ScaledMMLinearLayerConfig:
     return FP8ScaledMMLinearLayerConfig(
         weight_quant_key=kFp8Static128BlockSym,

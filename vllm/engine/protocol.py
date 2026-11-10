@@ -79,8 +79,13 @@ class EngineClient(ABC):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        keepalive: bool = False,
     ) -> AsyncGenerator[RequestOutput, None]:
-        """Generate outputs for a request."""
+        """Generate outputs for a request.
+
+        Set ``keepalive=True`` only from callers that know how to skip the
+        ``STREAM_KEEPALIVE`` sentinel; it makes long idle gaps emit one.
+        """
         ...
 
     @abstractmethod

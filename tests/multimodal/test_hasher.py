@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import struct
 import uuid
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +11,8 @@ import torch
 from PIL import Image, ImageDraw
 
 from vllm.multimodal.hasher import MultiModalHasher
+from vllm.multimodal.image import normalize_image
+from vllm.multimodal.media import ImageMediaIO, MediaWithBytes
 
 pytestmark = pytest.mark.cpu_test
 
@@ -109,3 +113,45 @@ def test_hash_image_exif_id():
     assert hasher.hash_kwargs(image=image1) == hasher.hash_kwargs(image=id.bytes)
     # second image has non-UUID in ImageID, so it should hash to the image data
     assert hasher.hash_kwargs(image=image2) == hasher.hash_kwargs(image=image2a)
+
+
+def test_hash_image_malformed_exif():
+    # Test that images with malformed EXIF headers (e.g. invalid TIFF header)
+    # do not raise an unhandled exception during hashing and fall back to image data.
+    buf = BytesIO()
+    Image.new("RGB", (64, 48)).save(buf, "JPEG")
+    jpg = buf.getvalue()
+    rest = jpg[2:]
+    rest = rest[2 + struct.unpack(">H", rest[2:4])[0] :]
+    payload = b"Exif\x00\x00XXXX\x00\x00\x00\x08" + bytes(32)
+    data = b"\xff\xd8\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload + rest
+
+    image = normalize_image(Image.open(BytesIO(data)))
+    image.load()
+
+    hasher = MultiModalHasher
+    # Should hash without raising SyntaxError or any other exception
+    hash_val = hasher.hash_kwargs(image=image)
+    assert isinstance(hash_val, str) and len(hash_val) > 0
+
+    # Also verify MediaWithBytes wrapping the image with malformed EXIF
+    media_item = MediaWithBytes(image, data)
+    hash_media = hasher.hash_kwargs(image=media_item)
+    assert isinstance(hash_media, str) and len(hash_media) > 0
+
+
+@pytest.mark.parametrize("mode", ["RGB", "RGBA", "P"])
+def test_hash_loaded_png_with_malformed_exif(mode):
+    """The chat API path (load_bytes, then hashing) survives a PNG whose eXIf
+    chunk has no valid TIFF header, whatever mode conversion it takes, and
+    hashes the original bytes."""
+    buf = BytesIO()
+    Image.new(mode, (16, 8)).save(buf, "PNG", exif=b"Exif\x00\x00" + bytes(8))
+    data = buf.getvalue()
+
+    media = ImageMediaIO().load_bytes(data)
+
+    # Same original bytes around an image without EXIF give the same hash.
+    reference = MediaWithBytes(Image.new("RGB", (1, 1)), data)
+    hasher = MultiModalHasher
+    assert hasher.hash_kwargs(image=media) == hasher.hash_kwargs(image=reference)

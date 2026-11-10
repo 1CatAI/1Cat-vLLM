@@ -92,6 +92,29 @@ def test_native_sentinel_and_diagnostics(monkeypatch):
     assert unset.compute_hash() == empty.compute_hash()
 
 
+@pytest.mark.parametrize("value", ["", "2", "true", "invalid"])
+def test_sum2_generic_push_rejects_invalid_legacy_value(monkeypatch, value):
+    monkeypatch.setenv("VLLM_V41_SUM2_PUSH_ANY", value)
+    with pytest.raises(ValueError, match="VLLM_V41_SUM2_PUSH_ANY must be 0 or 1"):
+        CollectiveNativeConfig().resolve()
+
+
+def test_sum2_generic_push_is_owned_and_topology_hashed(monkeypatch):
+    monkeypatch.delenv("VLLM_V41_SUM2_PUSH_ANY", raising=False)
+    default = CollectiveNativeConfig()
+    enabled = CollectiveNativeConfig(sm70_tp4_sum2_push_any=True)
+    for policy in (default, enabled):
+        policy.resolve()
+    assert default.raw("sm70_tp4_sum2_push_any") is None
+    assert enabled.raw("sm70_tp4_sum2_push_any") == "1"
+    monkeypatch.setenv("VLLM_V41_SUM2_PUSH_ANY", "0")
+    assert _transfer(enabled).raw("sm70_tp4_sum2_push_any") == "1"
+    for tp in (1, 2, 4, 8):
+        for policy in (default, enabled):
+            policy.finalize_hash(tp, True)
+        assert (default.compute_hash() != enabled.compute_hash()) == (tp == 4)
+
+
 def test_parent_and_native_hierarchy_have_one_effective_value():
     policy = CommunicationPolicy(
         native=CollectiveNativeConfig(sm70_tp8_hierarchical_custom_ar=True)

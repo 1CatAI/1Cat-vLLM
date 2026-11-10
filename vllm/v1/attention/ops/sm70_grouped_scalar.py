@@ -11,6 +11,9 @@ from vllm.logger import init_logger
 from vllm.v1.attention.kv_codecs import FP8_E4M3, resolve_kv_codec
 from vllm.v1.attention.ops.sm70_grouped_long import (
     BUILTIN_MAX_CONTEXT,
+    builtin_context_limit,
+    builtin_dynamic_context,
+    context_table_supported,
     load_attention_library,
     long_attention_capability,
     resolve_long_attention,
@@ -57,8 +60,19 @@ def scalar_tail_attention_available() -> bool:
     return builtin_scalar_tail_attention() is not None
 
 
-@lru_cache(maxsize=4)
 def load_scalar_tail_attention(manifest_name: str, device: torch.device):
+    _, long_manifest = resolve_long_attention()
+    if long_manifest is None:
+        return None
+    return _load_scalar_tail_attention(
+        manifest_name, device, long_attention_capability(long_manifest)
+    )
+
+
+@lru_cache(maxsize=4)
+def _load_scalar_tail_attention(
+    manifest_name: str, device: torch.device, capability: int
+):
     if manifest_name:
         module, manifest = load_attention_library(manifest_name)
     else:
@@ -66,19 +80,19 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         if operator is None:
             raise ValueError("The compact scalar tail operator is not compiled in")
         builtin = type("_Builtin", (), {"run": operator})
-        module, manifest = builtin, BUILTIN_SCALAR_MANIFEST
+        module, manifest = (
+            builtin,
+            dict(
+                BUILTIN_SCALAR_MANIFEST,
+                max_context=builtin_context_limit(capability, scalar=True),
+            ),
+        )
     # The tail rides the long-context graph variant, so it is only meaningful
     # while that route is on, and the kernel has to cover every bound the graph
     # can be captured at -- which never exceeds the long-context capability.
-    _, long_manifest = resolve_long_attention()
-    if long_manifest is None:
-        logger.info_once(
-            "SM70 compact scalar tail attention is inactive: the E4M3 "
-            "long-context route is disabled.",
-            scope="process",
-        )
+    if not manifest_name and manifest["max_context"] < capability:
+        # A new grouped DSO must not widen an old scalar workspace ABI.
         return None
-    capability = long_attention_capability(long_manifest)
     if not (
         manifest.get("share_kv_six_heads")
         and manifest.get("compact_page_map")
@@ -91,17 +105,22 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         )
     # Allocate before memory profiling and graph capture. Model layers execute
     # serially on the worker stream; all target graphs retain this same storage.
+    dynamic = not manifest_name and builtin_dynamic_context(scalar=True)
+    if not dynamic and capability > BUILTIN_MAX_CONTEXT:
+        raise ValueError("Scalar capacity requires the dynamic workspace ABI")
+    partitions = (capability + 1023) // 1024 if dynamic else 256
     buffers = (
-        torch.empty((1, 6, 256, 256), dtype=torch.float32, device=device),
-        torch.empty((1, 6, 256), dtype=torch.float32, device=device),
-        torch.empty((1, 6, 256), dtype=torch.float32, device=device),
-        torch.full((1,), 256, dtype=torch.int32, device=device),
+        torch.empty((1, 6, partitions, 256), dtype=torch.float32, device=device),
+        torch.empty((1, 6, partitions), dtype=torch.float32, device=device),
+        torch.empty((1, 6, partitions), dtype=torch.float32, device=device),
+        torch.full((1,), partitions, dtype=torch.int32, device=device),
     )
     logger.info_once(
         "Loaded SM70 compact scalar tail attention: module=%s SHA256=%s; "
-        "256 partitions, FP32 numerator/max/sum.",
+        "%d partitions, FP32 numerator/max/sum.",
         manifest["module_name"],
         manifest["library_sha256"],
+        partitions,
         scope="process",
     )
 
@@ -131,7 +150,7 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         bucket = getattr(descriptor, "attention_context_bucket", None)
         if not (
             bucket is not None
-            and bucket <= capability
+            and 0 < bucket <= capability
             and q.ndim == 3
             and q.shape[0] == 1
             and q.shape[1] > 0
@@ -140,6 +159,7 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             and q.device == device
             and q.is_contiguous()
             and k.ndim == 4
+            and context_table_supported(table, k.shape[1], capability)
             and (
                 k.shape[1] >= SCALAR_MIN_PAGE_SIZE
                 if not manifest_name
@@ -174,3 +194,8 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         return True
 
     return run
+
+
+load_scalar_tail_attention.cache_clear = (  # type: ignore[attr-defined]
+    _load_scalar_tail_attention.cache_clear
+)

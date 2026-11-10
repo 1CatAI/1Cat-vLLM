@@ -5,13 +5,14 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import product as iprod
-from typing import Any
+from typing import Any, cast
 
 import torch
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
@@ -21,6 +22,7 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionImplBase,
     AttentionMetadataBuilder,
     MultipleOf,
 )
@@ -37,6 +39,24 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+
+def configure_attention_workspace(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> None:
+    """Bind backend workspace bounds from resolved physical cache pages."""
+    layers = get_layers_from_vllm_config(
+        vllm_config, cast(type[Any], AttentionLayerBase)
+    )
+    for group in kv_cache_groups:
+        for name in group.layer_names:
+            impl = getattr(layers.get(name), "impl", None)
+            if not isinstance(impl, AttentionImplBase):
+                continue
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[name]
+            impl.configure_kv_cache_workspace(vllm_config, spec)
 
 
 # Shared host pools stay mapped and registered for the worker's lifetime.

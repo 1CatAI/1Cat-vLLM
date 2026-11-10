@@ -224,6 +224,7 @@ class _RejectionGraph:
         self.prefix = torch.cuda.CUDAGraph(keep_graph=True)
         self.reference = torch.cuda.CUDAGraph(keep_graph=True)
         self.compact = torch.cuda.CUDAGraph(keep_graph=True)
+        self.sampler.sampling_states.capture_mode = True
         self.prepare(hidden, batch, sparse)
 
     def prepare(self, hidden, batch, sparse):
@@ -460,7 +461,6 @@ def try_graph_rejection(
         id(model),
         id(speculator),
         hidden.dtype,
-        bool(np.any(states.temperature.np[idx] != 1.0)),
         bool(np.any(states.top_p.np[idx] != 1.0)),
         rejection.sampler.use_fp64_gumbel,
         penalties,

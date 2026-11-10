@@ -5,7 +5,7 @@
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -43,6 +43,14 @@ def translate_error_response(response: ErrorResponse) -> JSONResponse:
     return JSONResponse(
         status_code=response.error.code, content=anthropic_error.model_dump()
     )
+
+
+# The Anthropic endpoints need a HEAD probe too, or a health check pointed at
+# /v1/messages gets 405 and marks the instance dead.
+@router.head("/v1/messages")
+@router.head("/v1/messages/count_tokens")
+async def _head_messages() -> Response:
+    return Response(status_code=200)
 
 
 @router.post(

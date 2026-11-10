@@ -21,6 +21,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.deepseek_v41_compression import V41C2State
 from vllm.model_executor.kernels.mhc.deepseek_v41 import (
     collapse_hc,
@@ -66,6 +67,8 @@ from .cache import V41LatentCache
 from .contract import validate_runtime_geometry
 from .norm import short_rms_norm
 from .quant_rope import apply_rope, attention_qdq, rope_table
+
+logger = init_logger(__name__)
 
 _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
 _ROUTER_FUSED = envs.VLLM_V41_ROUTER_FUSED == "1"
@@ -753,6 +756,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 torch.device("cuda", torch.accelerator.current_device_index()),
                 get_tp_group(),
             )
+        # Packed KV shares the same session-prefix lifetime as device state.
+        self._v41_shared = shared
+        self._v41_hot_refill_logged = False
         self.norm = V41Norm(c.hidden_size)
         for name, shape, dtype in (
             ("token_map", (c.vocab_size,), torch.int32),
@@ -963,6 +969,19 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 state.partial.zero_()
                 state.position.fill_(cached)
                 state.metadata[2] = 0
+        # 1Cat #1341: past the hot ring's size, the previous request's rows past
+        # the hit (answer + rejected drafts) sit in slots readers treat as
+        # current. Refill those slots from the host copy.
+        store = self._v41_shared.store
+        if store is not None:
+            copied = store.refill_hot(cached)
+            if not self._v41_hot_refill_logged:
+                self._v41_hot_refill_logged = True
+                logger.info(
+                    "Session hit at %d refilled %d hot rows",
+                    cached,
+                    copied,
+                )
 
     def output_budget(self, max_tokens, prompt_tokens):
         # CPU request lists can contain optimistic placeholders under async

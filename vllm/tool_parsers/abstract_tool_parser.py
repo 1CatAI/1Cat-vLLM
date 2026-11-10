@@ -58,6 +58,10 @@ class ToolParser:
     # required/named tool_choice, treating them the same as "auto".
     supports_required_and_named: bool = True
 
+    # Parsers used in concrete-class identity checks must retain their
+    # canonical implementation class until the serving process restarts.
+    supports_hot_reload: bool = True
+
     def __init__(
         self,
         tokenizer: TokenizerLike,

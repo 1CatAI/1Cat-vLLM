@@ -292,6 +292,7 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
             partial_prefix_cache=self.cache_config.partial_prefix_cache,
+            num_speculative_tokens=self.num_spec_tokens,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -328,6 +329,8 @@ class Scheduler(SchedulerInterface):
         self.mamba_state_block_size = (
             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
         )
+        if self.need_mamba_block_aligned_split:
+            self.mixed_prefill_budget.block_size = self.mamba_state_block_size
         # Sparse admission only retains replay/shared-prefix and periodic
         # boundaries. Materializing discarded states must not split the whole
         # model's prefill into one-state-block forwards. Mixed alignments still
@@ -667,7 +670,7 @@ class Scheduler(SchedulerInterface):
                 0,
                 min(
                     tokens,
-                    self.mixed_prefill_budget.tokens - used,
+                    self.mixed_prefill_budget.budget - used,
                     token_budget - reserve,
                 ),
             )
@@ -1397,7 +1400,7 @@ class Scheduler(SchedulerInterface):
                 else 0
             ),
             mixed_prefill_budget=(
-                self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
+                self.mixed_prefill_budget.budget if control_mixed_prefill else 0
             ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
@@ -1481,6 +1484,7 @@ class Scheduler(SchedulerInterface):
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
+            request.num_in_flight_steps += 1
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
@@ -1879,6 +1883,7 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(req_id)
             if request is not None:
                 request.num_in_flight_tokens -= num_tokens_scheduled
+                request.num_in_flight_steps -= 1
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
@@ -1890,6 +1895,13 @@ class Scheduler(SchedulerInterface):
                 # cache transfer in KV connector), the aborted request will not
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
+                continue
+
+            if request.num_kv_load_outputs_to_discard > 0:
+                # Recovery can overlap already dispatched decode steps. Drop
+                # their entire output before applying speculative rejection or
+                # changing the new replay's placeholder/computed-token state.
+                request.num_kv_load_outputs_to_discard -= 1
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -2996,5 +3008,20 @@ class Scheduler(SchedulerInterface):
 
         # Mark async requests with KV load failures for retry once loading completes
         self.failed_recving_kv_req_ids |= async_failed_req_ids
+        if self.scheduler_config.async_scheduling:
+            for req_id in sync_failed_req_ids:
+                request = self.requests[req_id]
+                # This failed output is skipped by update_from_output. Other
+                # dispatched frames still return, but all depend on the failed
+                # prefix. Count frames rather than speculative token slots.
+                request.num_kv_load_outputs_to_discard = max(
+                    0,
+                    request.num_in_flight_steps - int(req_id in num_scheduled_tokens),
+                )
+                # The failed prefix invalidates every older frame, including
+                # frames already marked by a forced prefix-cache reset.
+                request.async_tokens_to_discard = 0
+                request.num_output_placeholders = 0
+                request.spec_token_ids = []
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids

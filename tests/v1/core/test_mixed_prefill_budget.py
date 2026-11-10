@@ -73,6 +73,27 @@ def test_floor_holds_on_slow_steps_and_growth_starts_from_it():
     assert budget.tokens > 1632
 
 
+def test_budget_rounds_to_state_blocks_without_stalling_growth():
+    budget = MixedPrefillBudget(8192, 1000, block_size=1632)
+    assert budget.budget == 512
+    seen = []
+    for _ in range(20):
+        n = budget.budget
+        budget.update(MixedPrefillTiming(n, 16, n, n * 0.1))
+        seen.append(budget.budget)
+    assert seen == sorted(seen)
+    assert all(b < 1632 or b % 1632 == 0 for b in seen)
+    assert budget.budget == 8160
+
+
+def test_rounded_budget_retains_the_configured_floor():
+    budget = MixedPrefillBudget(8192, 250, min_tokens=1632, block_size=1632)
+    for _ in range(5):
+        budget.update(MixedPrefillTiming(1632, 16, 1632, 700))
+    assert budget.budget == 1632
+    assert budget.tokens >= budget.budget
+
+
 def _converge(budget, fixed_ms, ms_per_token, steps=40):
     for _ in range(steps):
         n = budget.tokens

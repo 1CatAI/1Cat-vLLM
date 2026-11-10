@@ -432,6 +432,8 @@ class CapturedFlashOptions:
                         raw = self.legacy_inputs[self.legacy_aliases[field][0]]
                     value = native_value(parser.removeprefix("native:"), raw, default)
                 elif parser in ("int", "threshold", "partition"):
+                    if value is None and parser == "int":
+                        continue
                     assert isinstance(value, str)
                     try:
                         value = int(value)
@@ -754,6 +756,13 @@ class FlashV100Options(CapturedFlashOptions):
     """Retained VLLM_FLASH_V100_DECODE_USE_XQA input."""
     fp8_prefill_bridge: bool | None = None
     """Retained VLLM_FLASH_V100_FP8_PREFILL_BRIDGE input."""
+    fp8_bridge_head_groups: int | None = None
+    """FP8 bridge KV-head groups; unset selects an engine-budgeted policy.
+    Explicit values below one and non-divisors retain the unsplit bridge."""
+    fp8_bridge_workspace_bytes: int | None = Field(default=None, ge=0)
+    """Automatic bridge conversion/scratch cap; unset uses 1/32 of the worker's
+    configured GPU-memory allowance. Explicit groups override the cap; zero
+    selects native FP8 attention."""
     smallq_decode_use_xqa: bool | None = None
     """Retained VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA input."""
     prefill_prefix_decode_rows: bool | None = None
@@ -1048,6 +1057,16 @@ class FlashV100Options(CapturedFlashOptions):
         ),
         "decode_use_xqa": ("VLLM_FLASH_V100_DECODE_USE_XQA", "eq1", "1"),
         "fp8_prefill_bridge": ("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "ne0", "1"),
+        "fp8_bridge_head_groups": (
+            "VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS",
+            "int",
+            None,
+        ),
+        "fp8_bridge_workspace_bytes": (
+            "VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES",
+            "int",
+            None,
+        ),
         "smallq_decode_use_xqa": ("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "eq1", "1"),
         "prefill_prefix_decode_rows": (
             "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS",

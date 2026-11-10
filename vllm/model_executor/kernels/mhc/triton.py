@@ -73,6 +73,50 @@ def _sm70_mhc_prenorm_staging_kernel(
         )
 
 
+@triton.jit
+def _mhc_prenorm_staging_rows_kernel(
+    x_ptr,
+    fn_ptr,
+    out_ptr,
+    sqrsum_ptr,
+    x_stride_t,
+    fn_stride_n,
+    out_stride_s,
+    out_stride_t,
+    sqrsum_stride_s,
+    sqrsum_stride_t,
+    N: tl.constexpr,
+    K_PER_SPLIT: tl.constexpr,
+    SQRSUM_MULT: tl.constexpr,
+):
+    # One program per (token, split) loads x once and walks every output column.
+    # The per-column FP32 tl.sum and the split boundaries are unchanged, so the
+    # results are bitwise equal to the per-column grid.
+    token_idx = tl.program_id(0)
+    split_idx = tl.program_id(1)
+    offsets = split_idx * K_PER_SPLIT + tl.arange(0, K_PER_SPLIT)
+    x = tl.load(x_ptr + token_idx * x_stride_t + offsets).to(tl.float32)
+    sqrsum = tl.sum(x * x, axis=0) * SQRSUM_MULT
+    tl.store(
+        sqrsum_ptr + split_idx * sqrsum_stride_s + token_idx * sqrsum_stride_t,
+        sqrsum,
+    )
+    for output_idx in tl.static_range(N):
+        weight = tl.load(fn_ptr + output_idx * fn_stride_n + offsets).to(tl.float32)
+        dot = tl.sum(x * weight, axis=0)
+        tl.store(
+            out_ptr + split_idx * out_stride_s + token_idx * out_stride_t + output_idx,
+            dot,
+        )
+
+
+# Reusing x helps larger batches, but serializing columns reduces parallelism.
+# Paired measurements qualify the 16384 x 24 geometry from 256 rows. Smaller
+# batches and other geometries retain the column grid (including N=32 at T=64,
+# where row staging is slower). This changes no reduction or precision policy.
+_MHC_ROW_STAGING_MIN_TOKENS = 256
+
+
 def sm70_mhc_prenorm_staging(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -103,6 +147,30 @@ def sm70_mhc_prenorm_staging(
     k_per_split = x.shape[1] // n_splits
     if k_per_split & (k_per_split - 1):
         raise ValueError("SM70 mHC prenorm split size must be a power of two")
+
+    if (
+        x.shape[0] >= _MHC_ROW_STAGING_MIN_TOKENS
+        and x.shape[1] == 16384
+        and fn.shape[0] == 24
+        and n_splits in (1, 2, 4, 8, 16)
+    ):
+        _mhc_prenorm_staging_rows_kernel[(x.shape[0], n_splits)](
+            x,
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            x.stride(0),
+            fn.stride(0),
+            gemm_out_mul.stride(0),
+            gemm_out_mul.stride(1),
+            gemm_out_sqrsum.stride(0),
+            gemm_out_sqrsum.stride(1),
+            N=fn.shape[0],
+            K_PER_SPLIT=k_per_split,
+            SQRSUM_MULT=sqrsum_mult,
+            num_warps=8,
+        )
+        return
 
     # Larger partials lose occupancy when x stays live for both reductions.
     # Preserve the separate norm launch for those existing split choices.
@@ -427,7 +495,8 @@ def sm70_mhc_pre_norm_from_staging(
         raise TypeError("SM70 mHC staging kernel requires FP16 norm weights")
 
     policy = layer_policy()
-    use_native_verify = num_tokens == 8 and policy.mhc_native_verify
+    # Initialization owns defaults, explicit overrides and calculation hashes.
+    use_native_verify = 2 <= num_tokens <= 8 and policy.mhc_native_verify
     if num_tokens == 1 or use_native_verify:
         if not hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
             raise RuntimeError(
@@ -435,7 +504,9 @@ def sm70_mhc_pre_norm_from_staging(
                 "Rebuild vLLM from source with CUDA arch 7.0."
             )
         if use_native_verify:
-            logger.info_once("SM70 GLM mHC native CUDA q8 final stage enabled.")
+            logger.info_once(
+                "SM70 GLM mHC native CUDA final stage enabled for 2-8 tokens."
+            )
         else:
             logger.info_once("SM70 GLM mHC native CUDA decode final stage enabled.")
         sm70_ops.sm70_glm_mhc_pre_norm_out(
@@ -454,7 +525,7 @@ def sm70_mhc_pre_norm_from_staging(
             hc_post_mult_value,
             sinkhorn_repeat,
             norm_eps,
-            threads=policy.mhc_pre_threads,
+            threads=128 if num_tokens == 1 else policy.mhc_pre_threads,
         )
         return
 

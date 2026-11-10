@@ -363,6 +363,7 @@ class VocabParallelEmbedding(PluggableLayer):
 
         # Keep the input dimensions.
         tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = tp_rank
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
