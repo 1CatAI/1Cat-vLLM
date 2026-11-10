@@ -70,13 +70,18 @@ def _routes(monkeypatch, context):
 def _inputs(context, rows, page=2048, batch=1, heads=1):
     torch.manual_seed(20261106 + rows + batch)
     pages = (context + page - 1) // page
-    storage = (
-        torch.randn(
-            batch * pages, 2, page, heads, 256, device="cuda", dtype=torch.float16
-        )
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8)
+    storage = torch.empty(
+        batch * pages, 2, page, heads, 256, device="cuda", dtype=torch.uint8
     )
+    # Keep construction memory bounded even for sixteen independent 1M caches.
+    # The FP64 oracle still consumes these exact quantized KV values.
+    for start in range(0, batch * pages, 64):
+        target = storage[start : start + 64]
+        target.copy_(
+            torch.randn(target.shape, device="cuda", dtype=torch.float16)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
     k, v = storage.unbind(1)
     q = torch.randn(batch * rows, heads * 6, 256, device="cuda", dtype=torch.float16)
     table = torch.randperm(batch * pages, device="cuda").int().reshape(batch, pages)
