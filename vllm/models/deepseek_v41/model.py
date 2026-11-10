@@ -756,7 +756,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 torch.device("cuda", torch.accelerator.current_device_index()),
                 get_tp_group(),
             )
-        # Handle for restore_prefix (VLLM_V41_HOT_REFILL, 1Cat #1341).
+        # Packed KV shares the same session-prefix lifetime as device state.
         self._v41_shared = shared
         self._v41_hot_refill_logged = False
         self.norm = V41Norm(c.hidden_size)
@@ -973,13 +973,12 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         # the hit (answer + rejected drafts) sit in slots readers treat as
         # current. Refill those slots from the host copy.
         store = self._v41_shared.store
-        if envs.VLLM_V41_HOT_REFILL == "1" and store is not None:
+        if store is not None:
             copied = store.refill_hot(cached)
             if not self._v41_hot_refill_logged:
                 self._v41_hot_refill_logged = True
                 logger.info(
-                    "VLLM_V41_HOT_REFILL=1 active: session hit at %d refilled "
-                    "%d hot rows",
+                    "Session hit at %d refilled %d hot rows",
                     cached,
                     copied,
                 )

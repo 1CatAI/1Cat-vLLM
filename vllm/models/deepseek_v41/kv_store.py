@@ -206,12 +206,13 @@ class V41PackedKV:
         as current. The host copy (rank 0 writes every row) is authoritative
         for the rows before the hit. Returns the number of rows copied.
         """
+        if cached < 0:
+            raise ValueError("cached prefix length must be nonnegative")
         copied = 0
         for source, ratio in self.sources.items():
             hi = cached // ratio - 1  # last row completed before the hit
             rows = self.hot_rows[source]
-            # stale rows (at most ~133 past hi) cannot wrap yet
-            if hi < 0 or hi + 256 < rows:
+            if hi < 0:
                 continue
             lo = max(0, hi - rows + 1)
             n, start = hi - lo + 1, lo % rows
