@@ -16,8 +16,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import uvloop
-from fastapi import FastAPI, HTTPException
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import State
 from starlette.responses import Response
@@ -30,18 +29,13 @@ from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.server_utils import (
-    engine_error_handler,
-    exception_handler,
-    generation_error_handler,
     get_uvicorn_log_config,
-    http_exception_handler,
     lifespan,
     log_response,
-    validation_exception_handler,
+    register_exception_handlers,
 )
 from vllm.entrypoints.sagemaker.api_router import sagemaker_standards_bootstrap
 from vllm.entrypoints.serve.elastic_ep.middleware import (
@@ -64,7 +58,6 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import is_valid_ipv6_address
 from vllm.utils.system_utils import decorate_logs, set_ulimit
-from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -180,13 +173,10 @@ def build_app(
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
 
-    # Global HEAD probe. Load balancers and K8s readiness probes commonly use
-    # HEAD / to check liveness; without a route vLLM answers 405, the probe
-    # declares the pod dead and traffic is drained. Answer 200 on every path
-    # without running any request logic.
+    # Process liveness only; /health retains the engine readiness check and
+    # unknown paths retain their normal status codes.
     @app.head("/")
-    @app.head("/{path:path}")
-    async def _head_probe(path: str = "") -> Response:  # noqa: ARG001
+    async def _head_probe() -> Response:
         return Response(status_code=200)
 
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
@@ -264,12 +254,7 @@ def build_app(
         allow_headers=args.allowed_headers,
     )
 
-    app.exception_handler(HTTPException)(http_exception_handler)
-    app.exception_handler(RequestValidationError)(validation_exception_handler)
-    app.exception_handler(EngineGenerateError)(engine_error_handler)
-    app.exception_handler(EngineDeadError)(engine_error_handler)
-    app.exception_handler(GenerationError)(generation_error_handler)
-    app.exception_handler(Exception)(exception_handler)
+    register_exception_handlers(app)
 
     # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
     if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:
@@ -680,13 +665,9 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     decorate_logs("APIServer", skip_if_decorated=True)
 
-    # Reclaim stale compile cache and /dev/shm offload leftovers **before any
-    # worker starts**. Triple-gated: this switch x VLLM_DISABLE_COMPILE_CACHE=1
-    # (reuse off) x every GPU idle. Inert under the default configuration
-    # (reuse on); files that are still mapped are never removed.
-    from vllm._sm70_startup_cleanup import sm70_startup_cleanup
+    from vllm.logger import _StartupLogHandler
 
-    sm70_startup_cleanup()
+    _StartupLogHandler.install()
 
     # Interrupt initialization if SIGTERM arrives before uvicorn installs its
     # own signal handlers. Once uvicorn is running it replaces this.
@@ -703,6 +684,10 @@ async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Run a single API server worker."""
+
+    from vllm.logger import _StartupLogHandler
+
+    _StartupLogHandler.install()
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
@@ -728,12 +713,6 @@ if __name__ == "__main__":
     # NOTE(simon):
     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
     # entrypoints.
-    # Mirror startup logs to a separate file. The handler detaches itself once
-    # "Application startup complete" is seen, so there is no runtime cost.
-    from vllm.logger import _StartupLogHandler
-
-    _StartupLogHandler.truncate()
-    _StartupLogHandler.install()
     cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server."

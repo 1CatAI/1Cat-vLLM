@@ -46,22 +46,6 @@ class OpenAIModelRegistry:
     def is_base_model(self, model_name: str) -> bool:
         return any(model.name == model_name for model in self.base_model_paths)
 
-    def _compute_context_window(self) -> tuple[int | None, int | None]:
-        """Derive (context_window, max_output_tokens) from max_model_len.
-
-        Used for the advertised capabilities on the model card. The longer the
-        context, the more headroom generation needs -- long-context requests
-        tend to produce longer outputs too.
-        """
-        max_model_len = self.model_config.max_model_len
-        if max_model_len is None:
-            return None, None
-        if max_model_len < 50000:
-            return int(max_model_len * 0.9), int(max_model_len * 0.1)
-        if max_model_len < 100000:
-            return int(max_model_len * 0.85), int(max_model_len * 0.15)
-        return int(max_model_len * 0.8), int(max_model_len * 0.2)
-
     async def check_model(self, model_name: str | None) -> ErrorResponse | None:
         """Return an ErrorResponse if model_name is not served, else None."""
         if not model_name or self.is_base_model(model_name):
@@ -76,14 +60,11 @@ class OpenAIModelRegistry:
     async def show_available_models(self) -> ModelList:
         """Show available models (base models only)."""
         max_model_len = self.model_config.max_model_len
-        context_window, max_output_tokens = self._compute_context_window()
         return ModelList(
             data=[
                 ModelCard(
                     id=base_model.name,
                     max_model_len=max_model_len,
-                    context_window=context_window,
-                    max_output_tokens=max_output_tokens,
                     root=base_model.model_path,
                     permission=[ModelPermission()],
                 )

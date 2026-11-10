@@ -342,61 +342,47 @@ def _trace_calls(log_path, root_dir, frame, event, arg=None):
     return partial(_trace_calls, log_path, root_dir)
 
 
-class _StartupLogHandler(logging.Handler):
-    """Mirror vLLM's startup logs into a dedicated file.
+class _StartupLogHandler(logging.FileHandler):
+    """Opt-in startup mirror, detached by Uvicorn's readiness log."""
 
-    A cold start can take several minutes, and its log lines end up interleaved
-    with runtime traffic in one large file. Diagnosing a failed start then means
-    scrolling through tens of thousands of lines. This handler writes a copy of
-    the vLLM logger's messages to its own file and detaches itself as soon as
-    "Application startup complete" is seen, so there is no runtime cost.
-
-    The path defaults to `/tmp/log/vllm-starting-log.txt` and can be overridden
-    with `VLLM_STARTUP_LOG_FILE`.
-    """
-
-    _default_log_file = "/tmp/log/vllm-starting-log.txt"
-    _installed = False
-
-    @staticmethod
-    def _path() -> str:
-        import vllm.envs as envs
-
-        return envs.VLLM_STARTUP_LOG_FILE or _StartupLogHandler._default_log_file
-
-    def __init__(self):
-        super().__init__(level=logging.DEBUG)
-        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+    _installed = None
+    _loggers = ("vllm", "uvicorn.error")
 
     def emit(self, record: logging.LogRecord) -> None:
-        try:
-            msg = self.format(record)
-            with open(self._path(), "a") as f:
-                f.write(msg + "\n")
-            if "Application startup complete" in msg:
-                self._remove()
-        except Exception:
-            self.handleError(record)
+        super().emit(record)
+        if (
+            record.name == "uvicorn.error"
+            and record.getMessage() == "Application startup complete."
+        ):
+            self.close()
 
-    def _remove(self) -> None:
-        logging.getLogger("vllm").removeHandler(self)
-        _StartupLogHandler._installed = False
+    def close(self) -> None:
+        for name in self._loggers:
+            logging.getLogger(name).removeHandler(self)
+        if type(self)._installed is self:
+            type(self)._installed = None
+        super().close()
 
-    @staticmethod
-    def install() -> None:
-        if _StartupLogHandler._installed:
+    @classmethod
+    def install(cls) -> None:
+        from vllm import envs
+
+        path = envs.VLLM_STARTUP_LOG_FILE
+        if cls._installed is not None or not path:
             return
-        logging.getLogger("vllm").addHandler(_StartupLogHandler())
-        _StartupLogHandler._installed = True
-
-    @staticmethod
-    def truncate() -> None:
         try:
-            os.makedirs(os.path.dirname(_StartupLogHandler._path()), exist_ok=True)
-            with open(_StartupLogHandler._path(), "w"):
-                pass
-        except Exception:
-            pass
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            handler = cls(path, mode="a", encoding="utf-8")
+        except OSError as error:
+            logging.getLogger("vllm").warning(
+                "Cannot open startup log %s: %s", path, error
+            )
+            return
+        cls._installed = handler
+        for name in cls._loggers:
+            logging.getLogger(name).addHandler(handler)
 
 
 def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
