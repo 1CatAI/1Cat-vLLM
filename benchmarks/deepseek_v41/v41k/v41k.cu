@@ -1171,12 +1171,13 @@ __global__ void fp8_reduce(half* out, const float* partials, const half* bias,
 }
 
 // ---- v5: aligned activations (int8 qs as two int4 + float scale arrays) ----
-__global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
-                                  float* __restrict__ ds,
-                                  const half* __restrict__ x, int K) {
-  // one warp per 32-element group
+// one warp per 32-element group
+__device__ __forceinline__ void q8_aligned_row(int8_t* __restrict__ qs,
+                                               float* __restrict__ ds,
+                                               const half* __restrict__ x,
+                                               int K, int row) {
   const int g = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  const int lane = threadIdx.x % 32, row = blockIdx.y, groups = K / 32;
+  const int lane = threadIdx.x % 32, groups = K / 32;
   if (g >= groups) return;
   const float v = __half2float(x[int64_t(row) * K + g * 32 + lane]);
   float m = fabsf(v);
@@ -1186,6 +1187,78 @@ __global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
   qs[(int64_t(row) * groups + g) * 32 + lane] =
       m == 0.f ? 0 : int8_t(roundf(v / d));
   if (!lane) ds[int64_t(row) * groups + g] = __half2float(__float2half_rn(d));
+}
+
+__global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
+                                  float* __restrict__ ds,
+                                  const half* __restrict__ x, int K) {
+  q8_aligned_row(qs, ds, x, K, blockIdx.y);
+}
+
+// The moe_plan plan (same entries, same values, other entries untouched) from
+// registers: each lane holds routes lane and lane + 32 and compares them with
+// every route broadcast by shuffle, so there is no shared memory and no serial
+// first-occurrence scan. One full warp calls it.
+__device__ __forceinline__ void plan_warp(int* __restrict__ plan,
+                                          const int* __restrict__ ids,
+                                          int routes) {
+  const int lane = threadIdx.x % 32;
+  int e[2], c[2] = {0, 0}, cnt[2] = {0, 0}, q0[2];
+  bool live[2];
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int r = lane + 32 * h;
+    e[h] = r < routes ? ids[r] : -1;
+    live[h] = r < routes && e[h] >= 0;  // id < 0: route dropped
+    q0[h] = r;
+  }
+  for (int q = 0; q < routes; ++q) {
+    const int v = __shfl_sync(0xffffffffU, q < 32 ? e[0] : e[1], q & 31);
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int r = lane + 32 * h;
+      if (live[h] && v == e[h]) {
+        if (q < r) {
+          ++c[h];  // earlier routes of this expert
+          q0[h] = min(q0[h], q);
+        } else {
+          ++cnt[h];  // this and later routes of this expert
+        }
+      }
+    }
+  }
+  const bool first0 = live[0] && c[0] == 0, first1 = live[1] && c[1] == 0;
+  const unsigned b0 = __ballot_sync(0xffffffffU, first0);
+  const unsigned b1 = __ballot_sync(0xffffffffU, first1);
+  const unsigned below = (1u << lane) - 1u;
+  const int own0 = __popc(b0 & below), own1 = __popc(b0) + __popc(b1 & below);
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    // distinct index of this route's expert = own index of its first route
+    const int u0 = __shfl_sync(0xffffffffU, own0, q0[h] & 31);
+    const int u1 = __shfl_sync(0xffffffffU, own1, q0[h] & 31);
+    const int u = q0[h] < 32 ? u0 : u1, r = lane + 32 * h;
+    if (!live[h]) continue;
+    if (c[h] < 6) plan[73 + 6 * u + c[h]] = r;
+    if (c[h] == 0) {
+      plan[1 + u] = e[h];
+      plan[37 + u] = cnt[h] < 6 ? cnt[h] : 6;
+    }
+  }
+  if (lane == 0) plan[0] = __popc(b0) + __popc(b1);
+}
+
+// q8_aligned for rows 0..M-1 (grid y 1..M) plus the expert plan (grid y 0, one
+// warp), so the plan needs no launch of its own and overlaps the quantization.
+__global__ void q8_plan_kernel(int8_t* __restrict__ qs, float* __restrict__ ds,
+                               const half* __restrict__ x, int K,
+                               int* __restrict__ plan,
+                               const int* __restrict__ ids, int routes) {
+  if (blockIdx.y == 0) {
+    if (blockIdx.x == 0 && threadIdx.x < 32) plan_warp(plan, ids, routes);
+    return;
+  }
+  q8_aligned_row(qs, ds, x, K, blockIdx.y - 1);
 }
 
 __device__ __forceinline__ void load_q8(const int8_t* qs, const float* ds,
@@ -2554,6 +2627,245 @@ torch::Tensor v41k_table(int64_t type, torch::Device device) {
   return out;
 }
 
+// ---- EXPERT_FAST (VLLM_V41_EXPERT_FAST=1): v41k_fast.cuh ------------------
+#include "v41k_fast.cuh"
+#include "v41k_fast_gu.cuh"
+
+torch::Tensor v41k_fast_table(int64_t type, torch::Device device) {
+  int words = 0;
+  if (type == 16)
+    words = v41k_fast::FastBook<16>::kWords;
+  else if (type == 17)
+    words = v41k_fast::FastBook<17>::kWords;
+  else if (type == 29)
+    words = v41k_fast::FastBook<29>::kWords;
+  else
+    TORCH_CHECK(false, "fast_table: type must be 16, 17 or 29");
+  const at::cuda::OptionalCUDAGuard guard(device);
+  auto out = torch::empty({words}, torch::dtype(torch::kInt32).device(device));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto* p = reinterpret_cast<uint32_t*>(out.data_ptr());
+  const int blocks = (words + 255) / 256;
+  if (type == 16) v41k_fast::build_fast_table<16><<<blocks, 256, 0, stream>>>(p);
+  if (type == 17) v41k_fast::build_fast_table<17><<<blocks, 256, 0, stream>>>(p);
+  if (type == 29) v41k_fast::build_fast_table<29><<<blocks, 256, 0, stream>>>(p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+// Shared-memory carveout: the smallest sm_70 configuration (0/8/16/32/64/96
+// KB) that holds one CTA, leaving the rest of the 128 KB to L1 (weights and
+// the gathered activations).
+template <class F>
+static void v41k_fast_carveout(F* kernel) {
+  cudaFuncAttributes attr;
+  C10_CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
+  const int need = int(attr.sharedSizeBytes) + 1024;  // + per-CTA reserve
+  int kb = 96;
+  for (int c : {8, 16, 32, 64, 96})
+    if (c * 1024 >= need) {
+      kb = c;
+      break;
+    }
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributePreferredSharedMemoryCarveout, kb * 100 / 96));
+}
+
+// One (Type, M) instantiation: carveout set once, then the launch.
+template <int T, int M>
+static void v41k_down_rows_fast_launch(half* out, const uint8_t* gathered,
+                                       const uint8_t* down, int row_stride,
+                                       int rows_local, int row_base,
+                                       const uint32_t* fbook, int classes,
+                                       const int* plan, cudaStream_t stream) {
+  static bool carved = false;
+  if (!carved) {
+    v41k_fast_carveout(v41k_fast::down_rows_fast<T, M>);
+    carved = true;
+  }
+  v41k_fast::down_rows_fast<T, M>
+      <<<rows_local / v41k_fast::kDnRows, 32 * v41k_fast::kDnWarps, 0,
+         stream>>>(out, gathered, down, row_stride, rows_local, row_base,
+                   fbook, classes, plan);
+}
+
+template <int T>
+static void v41k_down_rows_fast_m(int tokens, half* out,
+                                  const uint8_t* gathered, const uint8_t* down,
+                                  int row_stride, int rows_local, int row_base,
+                                  const uint32_t* fbook, int classes,
+                                  const int* plan, cudaStream_t stream) {
+#define V41K_DNF(M)                                                         \
+  v41k_down_rows_fast_launch<T, M>(out, gathered, down, row_stride,         \
+                                   rows_local, row_base, fbook, classes,    \
+                                   plan, stream)
+  switch (tokens) {
+    case 1: V41K_DNF(1); break;
+    case 2: V41K_DNF(2); break;
+    case 3: V41K_DNF(3); break;
+    case 4: V41K_DNF(4); break;
+    case 5: V41K_DNF(5); break;
+    default: V41K_DNF(6); break;
+  }
+#undef V41K_DNF
+}
+
+// Bitwise-identical replacement for down_rows(..., rows = 4, dn_warps, ...)
+// with classes = 8 if dn_warps == 8 else 4: same arguments minus rows /
+// dn_warps, fbook = fast_table(dtype). M = out.size(0) tokens x top-6 routes,
+// gathered = 4 rank slots of (routes * 648 + 255) / 256 * 256 bytes.
+void v41k_down_rows_fast(torch::Tensor out, torch::Tensor gathered,
+                         int64_t rank_stride, int64_t routes,
+                         torch::Tensor down, int64_t dtype, int64_t row_base,
+                         torch::Tensor fbook, int64_t classes,
+                         torch::Tensor plan) {
+  const at::cuda::OptionalCUDAGuard guard(out.device());
+  TORCH_CHECK(dtype == 16 || dtype == 17 || dtype == 29,
+              "down_rows_fast: dtype must be 16, 17 or 29");
+  TORCH_CHECK(out.dim() == 2 && down.dim() == 3, "down_rows_fast: shapes");
+  const int tokens = out.size(0), rows_local = down.size(1);
+  const int bb = dtype == 16 ? 66 : dtype == 17 ? 74 : 56;
+  TORCH_CHECK(classes == 4 || classes == 8, "down_rows_fast: classes 4 or 8");
+  TORCH_CHECK(tokens >= 1 && tokens <= 6 && routes == 6 * int64_t(tokens),
+              "down_rows_fast: M = 1..6 tokens x top-6 routes");
+  TORCH_CHECK(rank_stride == (routes * 648 + 255) / 256 * 256,
+              "down_rows_fast: rank_stride must be (routes * 648 + 255) / 256 "
+              "* 256");
+  TORCH_CHECK(rows_local % v41k_fast::kDnRows == 0 && 4 * rows_local == 5120 &&
+                  row_base >= 0 && row_base < 5120 &&
+                  row_base % rows_local == 0 && down.size(2) == 9 * bb &&
+                  down.is_contiguous() && down.scalar_type() == torch::kUInt8,
+              "down_rows_fast: down must be [E, 1280, 9 blocks] uint8, "
+              "row_base a rank multiple of 1280");
+  TORCH_CHECK(out.size(1) == 5120 && out.scalar_type() == torch::kHalf &&
+                  out.is_contiguous(),
+              "down_rows_fast: out must be contiguous [M, 5120] half");
+  TORCH_CHECK(gathered.scalar_type() == torch::kUInt8 &&
+                  gathered.is_contiguous() &&
+                  gathered.numel() >= 4 * rank_stride,
+              "down_rows_fast: gathered must hold 4 rank slots");
+  TORCH_CHECK(fbook.scalar_type() == torch::kInt32 &&
+                  fbook.numel() == (dtype == 16   ? v41k_fast::FastBook<16>::kWords
+                                    : dtype == 17 ? v41k_fast::FastBook<17>::kWords
+                                                  : v41k_fast::FastBook<29>::kWords),
+              "down_rows_fast: fbook must be fast_table(dtype)");
+  TORCH_CHECK(plan.scalar_type() == torch::kInt32 && plan.numel() >= 289 &&
+                  plan.is_contiguous(),
+              "down_rows_fast: plan");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(gathered.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(down.data_ptr()) % 8 == 0,
+              "down_rows_fast: gathered must be 16-byte and down 8-byte "
+              "aligned");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto* o = reinterpret_cast<half*>(out.data_ptr());
+  const auto* g = gathered.data_ptr<uint8_t>();
+  const auto* w = down.data_ptr<uint8_t>();
+  const auto* b = reinterpret_cast<const uint32_t*>(fbook.data_ptr());
+  const int* pl = plan.data_ptr<int>();
+  const int rs = int(down.size(2));
+  if (dtype == 16)
+    v41k_down_rows_fast_m<16>(tokens, o, g, w, rs, rows_local, int(row_base),
+                              b, int(classes), pl, stream);
+  else if (dtype == 17)
+    v41k_down_rows_fast_m<17>(tokens, o, g, w, rs, rows_local, int(row_base),
+                              b, int(classes), pl, stream);
+  else
+    v41k_down_rows_fast_m<29>(tokens, o, g, w, rs, rows_local, int(row_base),
+                              b, int(classes), pl, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int T>
+static void v41k_gate_up_fast_launch(int grid, int8_t* hq, float* hd,
+                                     const int8_t* xq, const float* xd,
+                                     const float* prob, const uint8_t* gate,
+                                     const uint8_t* up, int row_stride,
+                                     const uint32_t* fbook, const int* plan,
+                                     cudaStream_t stream) {
+  static bool carved = false;
+  if (!carved) {
+    v41k_fast_carveout(v41k_fast::gate_up_fast<T>);
+    carved = true;
+  }
+  v41k_fast::gate_up_fast<T><<<grid, 512, 0, stream>>>(
+      hq, hd, xq, xd, prob, gate, up, row_stride, fbook, plan);
+}
+
+// Bitwise-identical replacement for gate_up7 (build_plan = true: moe_plan
+// first) and gate_up7p (build_plan = false: plan from q8_plan): same
+// arguments, fbook = fast_table(gtype) in place of the old book. Persistent
+// grid of min(SMs, 18 * routes) CTAs; CTAs past 18 * nu exit at once.
+void v41k_gate_up_fast(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+                       torch::Tensor hd, torch::Tensor ids32,
+                       torch::Tensor prob, torch::Tensor gate,
+                       torch::Tensor up, int64_t gtype, torch::Tensor fbook,
+                       torch::Tensor plan, bool build_plan) {
+  const at::cuda::OptionalCUDAGuard guard(xq.device());
+  TORCH_CHECK(gtype == 16 || gtype == 17 || gtype == 29,
+              "gate_up_fast: gtype must be 16, 17 or 29");
+  const int routes = ids32.numel();
+  const int bb = gtype == 16 ? 66 : gtype == 17 ? 74 : 56;
+  TORCH_CHECK(ids32.scalar_type() == torch::kInt32 && routes >= 6 &&
+                  routes <= 36 && routes % 6 == 0,
+              "gate_up_fast: ids32 must be int32, M = 1..6 tokens x top-6");
+  const int64_t tokens = routes / 6;
+  TORCH_CHECK(plan.scalar_type() == torch::kInt32 && plan.is_contiguous() &&
+                  plan.numel() >= 73 + 216,
+              "gate_up_fast: plan");
+  TORCH_CHECK(gate.dim() == 3 && up.sizes() == gate.sizes() &&
+                  gate.size(1) == 576 && gate.size(2) == 20 * bb &&
+                  gate.is_contiguous() && up.is_contiguous() &&
+                  gate.scalar_type() == torch::kUInt8 &&
+                  up.scalar_type() == torch::kUInt8,
+              "gate_up_fast: gate / up must be contiguous [E, 576, 20 blocks] "
+              "uint8");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(gate.data_ptr()) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(up.data_ptr()) % 8 == 0,
+              "gate_up_fast: gate / up must be 8-byte aligned");
+  TORCH_CHECK(xq.scalar_type() == torch::kChar && xq.is_contiguous() &&
+                  xq.numel() >= tokens * 5120 &&
+                  xd.scalar_type() == torch::kFloat && xd.is_contiguous() &&
+                  xd.numel() >= tokens * 160,
+              "gate_up_fast: xq / xd must hold M x 160 Q8 groups");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(xq.data_ptr()) % 16 == 0,
+              "gate_up_fast: xq must be 16-byte aligned");
+  TORCH_CHECK(hq.scalar_type() == torch::kChar && hq.is_contiguous() &&
+                  hq.numel() >= int64_t(routes) * 576 &&
+                  hd.scalar_type() == torch::kFloat && hd.is_contiguous() &&
+                  hd.numel() >= int64_t(routes) * 18 &&
+                  prob.scalar_type() == torch::kFloat &&
+                  prob.numel() >= routes,
+              "gate_up_fast: hq / hd / prob sizes");
+  TORCH_CHECK(fbook.scalar_type() == torch::kInt32 &&
+                  fbook.numel() == (gtype == 16   ? v41k_fast::FastBook<16>::kWords
+                                    : gtype == 17 ? v41k_fast::FastBook<17>::kWords
+                                                  : v41k_fast::FastBook<29>::kWords),
+              "gate_up_fast: fbook must be fast_table(gtype)");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto i8 = [](torch::Tensor& t) {
+    return reinterpret_cast<int8_t*>(t.data_ptr());
+  };
+  int* pl = plan.data_ptr<int>();
+  if (build_plan)
+    v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int grid = std::min(sms, 18 * routes);
+  const auto* b = reinterpret_cast<const uint32_t*>(fbook.data_ptr());
+#define V41K_GUF(T)                                                          \
+  v41k_gate_up_fast_launch<T>(grid, i8(hq), hd.data_ptr<float>(), i8(xq),    \
+                              xd.data_ptr<float>(), prob.data_ptr<float>(),  \
+                              gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), \
+                              int(gate.size(2)), b, pl, stream)
+  if (gtype == 16)
+    V41K_GUF(16);
+  else if (gtype == 17)
+    V41K_GUF(17);
+  else
+    V41K_GUF(29);
+#undef V41K_GUF
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void v41k_gate_up(torch::Tensor down_in, torch::Tensor x, torch::Tensor ids32,
                   torch::Tensor prob, torch::Tensor gate, torch::Tensor up,
                   int64_t type, torch::Tensor book, int64_t lanes) {
@@ -2870,6 +3182,21 @@ void v41k_fp8_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor w,
                          : nullptr,
         M, N, split);
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// q8_aligned plus the moe_plan plan for ids32 in the same launch.
+void v41k_q8_plan(torch::Tensor qs, torch::Tensor ds, torch::Tensor x,
+                  torch::Tensor ids32, torch::Tensor plan) {
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  const int M = x.size(0), K = x.size(1), routes = ids32.numel();
+  TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
+  TORCH_CHECK(ids32.is_contiguous() && plan.is_contiguous());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  v41k::q8_plan_kernel<<<dim3((K / 32 + 7) / 8, M + 1), 256, 0, stream>>>(
+      reinterpret_cast<int8_t*>(qs.data_ptr()), ds.data_ptr<float>(),
+      reinterpret_cast<const half*>(x.data_ptr()), K, plan.data_ptr<int>(),
+      ids32.data_ptr<int>(), routes);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -3301,10 +3628,11 @@ void v41k_swap_combined(torch::Tensor b0, torch::Tensor b1, torch::Tensor b2,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
-                   torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
-                   torch::Tensor gate, torch::Tensor up, int64_t gtype,
-                   torch::Tensor gbook, torch::Tensor plan) {
+static void gate_up7_impl(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+                          torch::Tensor hd, torch::Tensor ids32,
+                          torch::Tensor prob, torch::Tensor gate,
+                          torch::Tensor up, int64_t gtype, torch::Tensor gbook,
+                          torch::Tensor plan, bool build_plan) {
   const at::cuda::OptionalCUDAGuard guard(xq.device());
   const int routes = ids32.numel();
   TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
@@ -3313,7 +3641,8 @@ void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
     return reinterpret_cast<int8_t*>(t.data_ptr());
   };
   int* pl = plan.data_ptr<int>();
-  v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
+  if (build_plan)
+    v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
 #define V41K_GU7R(T)                                                           \
   v41k::gate_up_em5<T><<<dim3(18, routes), 512, 0, stream>>>(                  \
       i8(hq), hd.data_ptr<float>(), i8(xq), xd.data_ptr<float>(),              \
@@ -3327,6 +3656,23 @@ void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
   else
     V41K_GU7R(29);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+                   torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
+                   torch::Tensor gate, torch::Tensor up, int64_t gtype,
+                   torch::Tensor gbook, torch::Tensor plan) {
+  gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,
+                true);
+}
+
+// gate_up7 with the plan already built by q8_plan (VLLM_V41_PLAN_FUSE).
+void v41k_gate_up7p(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+                    torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
+                    torch::Tensor gate, torch::Tensor up, int64_t gtype,
+                    torch::Tensor gbook, torch::Tensor plan) {
+  gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,
+                false);
 }
 
 void v41k_down_rows(torch::Tensor out, torch::Tensor gathered,
@@ -3443,6 +3789,17 @@ TORCH_LIBRARY(v41k, m) {
       "plan) -> ()",
       &v41k_down_rows);
   m.def("table(int type, Device device) -> Tensor", &v41k_table);
+  m.def("fast_table(int type, Device device) -> Tensor", &v41k_fast_table);
+  m.def(
+      "down_rows_fast(Tensor(a!) out, Tensor gathered, int rank_stride, "
+      "int routes, Tensor down, int dtype, int row_base, Tensor fbook, "
+      "int classes, Tensor plan) -> ()",
+      &v41k_down_rows_fast);
+  m.def(
+      "gate_up_fast(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, "
+      "Tensor ids32, Tensor prob, Tensor gate, Tensor up, int gtype, "
+      "Tensor fbook, Tensor(c!) plan, bool build_plan) -> ()",
+      &v41k_gate_up_fast);
   m.def(
       "gate_up(Tensor(a!) down_in, Tensor x, Tensor ids32, Tensor prob, "
       "Tensor gate, Tensor up, int type, Tensor book, int lanes) -> ()",
@@ -3458,6 +3815,15 @@ TORCH_LIBRARY(v41k, m) {
       &v41k_diag);
   m.def("q8_aligned(Tensor(a!) qs, Tensor(b!) ds, Tensor x) -> ()",
         &v41k_q8_aligned);
+  m.def(
+      "q8_plan(Tensor(a!) qs, Tensor(b!) ds, Tensor x, Tensor ids32, "
+      "Tensor(c!) plan) -> ()",
+      &v41k_q8_plan);
+  m.def(
+      "gate_up7p(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "
+      "ids32, Tensor prob, "
+      "Tensor gate, Tensor up, int gtype, Tensor gbook, Tensor plan) -> ()",
+      &v41k_gate_up7p);
   m.def(
       "moe5(Tensor(a!) out, Tensor xq, Tensor xd, Tensor(b!) hq, Tensor(c!) "
       "hd, Tensor ids32, "
