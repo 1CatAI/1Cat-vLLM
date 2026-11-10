@@ -27,7 +27,6 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
-from vllm.v1.attention.ops.sm70_grouped_long import BUILTIN_MAX_CONTEXT
 from vllm.v1.kv_cache_interface import PrefixAnchoredSWASpec
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
@@ -129,20 +128,14 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             and getattr(spec_config, "draft_model_config", None)
             is self.vllm_config.model_config
         )
-        batch_context_supported = (
+        self._batch_context_routing_enabled = (
             self._graph_policy.batch_context_routing
             and self._graph_policy.decode_partition_size is None
+            and spec_config is None
             and _routing.batch_context_routing_cache_dtype_supported(
                 getattr(cache_config, "cache_dtype", None), policy=self._graph_policy
             )
             and batch_context_shape_supported
-        )
-        self._batch_context_routing_enabled = (
-            batch_context_supported and spec_config is None
-        )
-        self._scalar_context_routing_enabled = (
-            batch_context_supported
-            and 0 < model_config.max_model_len <= BUILTIN_MAX_CONTEXT
         )
         self.initialize_spec_state(spec_config)
         # Prefix-anchored SWA: persistent per-request prompt-length buffer so
@@ -290,14 +283,6 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 getattr(common_attn_metadata, "cudagraph_graph_variant", None),
             )
         )
-        if (
-            getattr(self, "_scalar_context_routing_enabled", False)
-            and common_attn_metadata.num_reqs > 0
-            and common_attn_metadata.max_query_len == 1
-        ):
-            # Capture the full served envelope. Native wave kernels select the
-            # active partition width from device lengths on every replay.
-            flash_metadata.flash_v100_batch_context_routing = True
 
     def _attach_decode_shape_hints(
         self,
