@@ -292,6 +292,7 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
             partial_prefix_cache=self.cache_config.partial_prefix_cache,
+            num_speculative_tokens=self.num_spec_tokens,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.

@@ -195,6 +195,35 @@ class V41PackedKV:
             )
 
     # -- readers --------------------------------------------------------
+    def refill_hot(self, cached):
+        """Session hit at `cached`: rewrite the hot slots of the rows before
+        the hit (1Cat #1341).
+
+        Readers take slot c % hot_rows as row c for c in
+        (newest - hot_rows, newest]. The previous request wrote rows past the
+        hit (its answer and up to 4 rejected drafts); once the ring has wrapped
+        those sit in the slots of rows ~hot_rows back, which the readers treat
+        as current. The host copy (rank 0 writes every row) is authoritative
+        for the rows before the hit. Returns the number of rows copied.
+        """
+        if cached < 0:
+            raise ValueError("cached prefix length must be nonnegative")
+        copied = 0
+        for source, ratio in self.sources.items():
+            hi = cached // ratio - 1  # last row completed before the hit
+            rows = self.hot_rows[source]
+            if hi < 0:
+                continue
+            lo = max(0, hi - rows + 1)
+            n, start = hi - lo + 1, lo % rows
+            first = min(n, rows - start)
+            hot, host = self.hot[source], self.host[source]
+            hot[start : start + first].copy_(host[lo : lo + first], non_blocking=True)
+            if n > first:
+                hot[: n - first].copy_(host[lo + first : hi + 1], non_blocking=True)
+            copied += n
+        return copied
+
     def fill_selected(self, source, topk, positions):
         """Decode: copy each token's selected rows (hot or host) into `selected`."""
         tokens = topk.shape[0]
