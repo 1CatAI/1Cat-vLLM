@@ -423,6 +423,10 @@ class Sm70NativeConfig:
                 value = "1" if value else "0"
             else:
                 value = str(value)
+            if field == "fp8_tune_small_shapes" and value == UNSET:
+                # Pin the default across native-library versions and include
+                # the effective choice in the engine's graph fingerprint.
+                value = "0"
             values.append(value)
             self.sources[field] = source
         # Legacy combined FASTPATH is an OR, including when a stage alias is 0.
