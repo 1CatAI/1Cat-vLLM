@@ -681,7 +681,14 @@ class CollectiveNativeConfig:
                 )
                 value = os.environ.get(alias, default)
                 self.sources[field] = alias if alias in os.environ else "default"
-            values.append(str(int(value) if isinstance(value, bool) else value))
+            serialized = str(int(value) if isinstance(value, bool) else value)
+            if field == "sm70_tp4_sum2_push_any" and serialized not in (
+                "\x1f",
+                "0",
+                "1",
+            ):
+                raise ValueError("VLLM_V41_SUM2_PUSH_ANY must be 0 or 1")
+            values.append(serialized)
         self.values = tuple(values)
 
     def resolve_for_owners(self, overrides, *, layers=None, trace=None):
