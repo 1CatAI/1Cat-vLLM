@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize("group", [32, 64, 128])
 @pytest.mark.parametrize("rows", [1, 8, 17, 32, 65])
-@pytest.mark.parametrize("n,k", [(256, 256), (264, 264)])
+@pytest.mark.parametrize("n,k", [(256, 256), (264, 272)])
 def test_e4m3_group_sizes_against_fp64_and_graph(group, rows, n, k):
     import vllm._C  # noqa: F401
 
@@ -92,3 +92,41 @@ def test_e4m3_unsupported_group_is_rejected(group):
     scales = torch.ones(256, 1, device="cuda")
     with pytest.raises(RuntimeError, match="group_size"):
         torch.ops._C.fp8_sm70_prepare(weight, scales, group, False)
+
+
+@pytest.mark.parametrize("group", [32, 64, 128])
+def test_e4m3_eight_column_k_tail_is_rejected_before_dispatch(group):
+    import vllm._C  # noqa: F401
+
+    weight = torch.empty(256, 264, device="cuda", dtype=torch.float8_e4m3fn)
+    scales = torch.ones(256, 1, device="cuda")
+    with pytest.raises(RuntimeError, match="multiple of 16"):
+        torch.ops._C.fp8_sm70_prepare(weight, scales, group, False)
+    # Protect the execution API too, including buffers packed by an older
+    # native library which admitted an unsupported eight-column K tail.
+    with pytest.raises(RuntimeError, match="multiple of 16"):
+        torch.ops._C.fp8_gemm_sm70_out(
+            torch.empty(1, 256, device="cuda", dtype=torch.float16),
+            torch.empty(1, 264, device="cuda", dtype=torch.float16),
+            torch.empty(264, 256, device="cuda", dtype=torch.uint8),
+            torch.empty(
+                (264 + group - 1) // group, 256, device="cuda", dtype=torch.float16
+            ),
+            group,
+            264,
+            256,
+            False,
+        )
+
+
+@pytest.mark.parametrize("n,k", [(0, 256), (256, 0)])
+def test_e4m3_empty_weight_is_rejected(n, k):
+    import vllm._C  # noqa: F401
+
+    with pytest.raises(RuntimeError, match="positive"):
+        torch.ops._C.fp8_sm70_prepare(
+            torch.empty(n, k, device="cuda", dtype=torch.float8_e4m3fn),
+            torch.ones(n, 1, device="cuda"),
+            32,
+            False,
+        )
