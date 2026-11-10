@@ -248,12 +248,15 @@ class LoggingStatLogger(StatLoggerBase):
         log_parts.extend(
             [
                 "GPU KV cache usage: %.1f%%",
+                "Warm blocks: %d/%d",
                 "Prefix cache hit rate: %.1f%%",
             ]
         )
         log_args.extend(
             [
                 self.last_scheduler_stats.kv_cache_usage * 100,
+                self.last_scheduler_stats.warm_blocks,
+                self.last_scheduler_stats.warm_block_cap,
                 self.prefix_caching_metrics.hit_rate * 100,
             ]
         )
@@ -524,6 +527,32 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.gauge_kv_cache_usage = create_metric_per_engine(
             gauge_kv_cache_usage, per_engine_labelvalues
+        )
+
+        # Account for reclaimable retained history separately from allocations.
+        self.gauge_warm_blocks = create_metric_per_engine(
+            self._gauge_cls(
+                name="vllm:warm_blocks",
+                documentation=(
+                    "Blocks retained for prefix reuse. They are not in the free "
+                    "queue and are excluded from allocated kv_cache_usage_perc."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            ),
+            per_engine_labelvalues,
+        )
+        self.gauge_warm_block_cap = create_metric_per_engine(
+            self._gauge_cls(
+                name="vllm:warm_block_cap",
+                documentation=(
+                    "History-block high watermark for age-independent trimming "
+                    "outside the grace window; the absolute cap bounds all ages."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            ),
+            per_engine_labelvalues,
         )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1079,6 +1108,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.gauge_warm_blocks[engine_idx].set(scheduler_stats.warm_blocks)
+            self.gauge_warm_block_cap[engine_idx].set(scheduler_stats.warm_block_cap)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

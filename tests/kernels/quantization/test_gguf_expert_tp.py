@@ -33,8 +33,9 @@ def weights():
     return packed
 
 
-@pytest.mark.parametrize("m", [1, 8, 64])
-def test_independent_expert_types_and_q2_conversion_preserve_tp4_ffn(m):
+@pytest.mark.parametrize("m", [1, 5, 20, 64])
+@pytest.mark.parametrize("original", [False, True])
+def test_independent_expert_types_and_q2_conversion_preserve_tp4_ffn(m, original):
     packed = weights()
     decoded = {
         shard: torch.from_numpy(dequantize(data, value)).half().cuda()
@@ -69,7 +70,7 @@ def test_independent_expert_types_and_q2_conversion_preserve_tp4_ffn(m):
         with torch.device("cuda"):
             method.create_weights(layer, 2, 256, 160, torch.float16)
         for shard, (value, data) in packed.items():
-            if value == 42:
+            if value == 42 and not original:
                 value, data = 3, q2_0_to_q4_1(data)
             prefix = "w2" if shard == "w2" else "w13"
             method.load_expert(

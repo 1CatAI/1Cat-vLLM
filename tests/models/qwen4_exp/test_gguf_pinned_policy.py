@@ -106,6 +106,8 @@ def test_connector_only_skips_requests_for_owned_local_decode(
         _all_pinned_decode=pinned,
         _ple_policy=SimpleNamespace(hybrid=False),
         _launch=lambda *a: calls.append(a),
+        early_prefill=False,
+        _host_result_regions={},
     )
     module.PleOffloadConnector.prepare_forward(
         connector, 4, 20, dummy_run=False, use_local_model=local_model

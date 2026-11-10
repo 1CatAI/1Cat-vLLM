@@ -14,6 +14,20 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from vllm.envs_metadata import bind_env_names, env_var, warn_deprecated_once
 
 if TYPE_CHECKING:
+    VLLM_SM70_PHASE_SEPARATION: bool
+    VLLM_SM70_PHASE_DECODE_SHARE: float
+    VLLM_SM70_PHASE_MAX_WAIT_MS: float
+    VLLM_SM70_PHASE_LOG_INTERVAL: int
+    VLLM_KV_RETENTION_ABS_CAP: float
+    VLLM_KV_RETENTION_ENABLED: bool
+    VLLM_KV_RETENTION_GRACE: float
+    VLLM_KV_RETENTION_HARD_CAP: float
+    VLLM_KV_RETENTION_P25: int
+    VLLM_KV_RETENTION_P35: int
+    VLLM_KV_RETENTION_P50: int
+    VLLM_KV_RETENTION_P65: int
+    VLLM_KV_RETENTION_P80: int
+    VLLM_KV_RETENTION_SOFT_CAP: float
     VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 32
     VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES: int = 64 * 1024 * 1024
     VLLM_SM70_DEBUG: set[str] = set()
@@ -301,7 +315,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL: int = 128
     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS: int = 4
     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS: int = 0
-    VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
+    VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = False
     VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
     VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
@@ -1465,6 +1479,185 @@ def _get_weight_load_max_split_scope() -> bool:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_SM70_PHASE_SEPARATION": env_var(
+        lambda: os.getenv("VLLM_SM70_PHASE_SEPARATION", "0").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Separate resident decode and prefill phases in synchronous PP1 "
+            "chunked text generation. Cache recovery keeps its normal path. "
+            "Default OFF; set 1 to opt in."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_DECODE_SHARE": env_var(
+        lambda: float(os.getenv("VLLM_SM70_PHASE_DECODE_SHARE", "0.4766")),
+        description=(
+            "Target share of wall-clock time given to the decode phase when "
+            "phase separation is on. The credit earn rate is "
+            "share/(1-share), so this is NOT the rate itself."
+        ),
+        category="configuration",
+        declared_default="0.4766",
+        effective_default="0.4766",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_MAX_WAIT_MS": env_var(
+        lambda: float(os.getenv("VLLM_SM70_PHASE_MAX_WAIT_MS", "300")),
+        description=(
+            "Hard ceiling on how long a decoder may go unserved while prefill "
+            "phases run, in milliseconds. The wait a client actually observes "
+            "is this plus one prefill step, since the guard can only be "
+            "evaluated at a step boundary."
+        ),
+        category="configuration",
+        declared_default="300.0",
+        effective_default="300.0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_LOG_INTERVAL": env_var(
+        lambda: int(os.getenv("VLLM_SM70_PHASE_LOG_INTERVAL", "0")),
+        description=(
+            "Emit a phase-pattern line every N engine steps. 0 = silent. "
+            "Diagnostic only: the configured knob is a time share, but this "
+            "line reports the realised decode:prefill step ratio."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 scheduler phase separation",),
+        user_visible=False,
+    ),
+    "VLLM_KV_RETENTION_ABS_CAP": env_var(
+        lambda: float(os.getenv("VLLM_KV_RETENTION_ABS_CAP", "0.60")),
+        description=(
+            "Ceiling the grace window cannot cross, as a fraction of the "
+            "history blocks. Bounds how much of the pool retention may hold "
+            "during a sustained burst of freshly released blocks."
+        ),
+        category="configuration",
+        declared_default="0.6",
+        effective_default="0.6",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_ENABLED": env_var(
+        lambda: os.getenv("VLLM_KV_RETENTION_ENABLED", "0").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Opt into warm KV history-block retention using cache_config.retention. "
+            "The default free queue already preserves valid prefix hashes until "
+            "allocation needs their blocks. Warm retention changes eviction priority."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 warm-block KV retention",),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_GRACE": env_var(
+        lambda: float(os.getenv("VLLM_KV_RETENTION_GRACE", "60")),
+        description=(
+            "Seconds a warm block is protected from trimming after it was last "
+            "touched, regardless of hit count. Prevents a block that a request "
+            "used moments ago from being evicted for being new to the pool."
+        ),
+        category="configuration",
+        declared_default="60.0",
+        effective_default="60.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_HARD_CAP": env_var(
+        lambda: float(os.getenv("VLLM_KV_RETENTION_HARD_CAP", "0.35")),
+        description=(
+            "Warm-table hard ceiling as a fraction of the history blocks. Above "
+            "it, entries are trimmed oldest-first down to the soft cap "
+            "regardless of age."
+        ),
+        category="configuration",
+        declared_default="0.35",
+        effective_default="0.35",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P25": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P25", "21600")),
+        description="Warm-block retention seconds while KV usage < 25%.",
+        category="configuration",
+        declared_default="21600",
+        effective_default="21600",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P35": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P35", "7200")),
+        description="Warm-block retention seconds while KV usage < 35%.",
+        category="configuration",
+        declared_default="7200",
+        effective_default="7200",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P50": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P50", "3600")),
+        description="Warm-block retention seconds while KV usage < 50%.",
+        category="configuration",
+        declared_default="3600",
+        effective_default="3600",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P65": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P65", "1800")),
+        description="Warm-block retention seconds while KV usage < 65%.",
+        category="configuration",
+        declared_default="1800",
+        effective_default="1800",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_P80": env_var(
+        lambda: int(os.getenv("VLLM_KV_RETENTION_P80", "600")),
+        description="Warm-block retention seconds while KV usage < 80%.",
+        category="configuration",
+        declared_default="600",
+        effective_default="600",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_RETENTION_SOFT_CAP": env_var(
+        lambda: float(os.getenv("VLLM_KV_RETENTION_SOFT_CAP", "0.25")),
+        description=(
+            "Warm-table target size as a fraction of the history blocks. Above "
+            "it, entries that have outlived the current retention tier are "
+            "trimmed; entries still inside their window are kept."
+        ),
+        category="configuration",
+        declared_default="0.25",
+        effective_default="0.25",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE": env_var(
         lambda: int(os.getenv("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "32")),
         description=(
@@ -4900,14 +5093,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         replacement="parallel_config.communication.awq_overlap_kernel_reducer_blocks=0",
     ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "0"))),
         description=(
             "SM70: fp8 tune small shapes. The consumer locations and unset "
             "defaults are listed below."
         ),
         category="configuration",
-        declared_default="True",
-        effective_default="True",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
@@ -20376,6 +20569,20 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_SM70_PHASE_SEPARATION",
+        "VLLM_SM70_PHASE_DECODE_SHARE",
+        "VLLM_SM70_PHASE_MAX_WAIT_MS",
+        "VLLM_SM70_PHASE_LOG_INTERVAL",
+        "VLLM_KV_RETENTION_ABS_CAP",
+        "VLLM_KV_RETENTION_ENABLED",
+        "VLLM_KV_RETENTION_GRACE",
+        "VLLM_KV_RETENTION_HARD_CAP",
+        "VLLM_KV_RETENTION_P25",
+        "VLLM_KV_RETENTION_P35",
+        "VLLM_KV_RETENTION_P50",
+        "VLLM_KV_RETENTION_P65",
+        "VLLM_KV_RETENTION_P80",
+        "VLLM_KV_RETENTION_SOFT_CAP",
         "VLLM_STARTUP_LOG_FILE",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
