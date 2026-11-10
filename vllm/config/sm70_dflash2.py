@@ -250,6 +250,14 @@ class Sm70DFlash2Config:
     """Multiplier for probabilistic proposal temperature; positive."""
     proposal_top_p: float | None = None
     """Nucleus probability for draft proposals, in (0, 1]."""
+    sharded_selector_codebook: bool = False
+    """Shard the candidate selector's two vocabulary codebooks across TP ranks.
+
+    Each rank keeps 1/TP of the rows; a lookup reads the owner's rows and an
+    all-reduce preserves finite nonzero values bitwise on every rank. Zero
+    values are equal, but their sign may change when adding +0. Saves
+    (TP-1)/TP of the codebooks' memory per GPU for one small all-reduce per
+    codebook and draft step. Configuration only, no environment alias."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)
     """Initialization sources, excluded from graph options."""
 
@@ -362,6 +370,9 @@ class Sm70DFlash2Config:
             result["lookup"] = {
                 field: getattr(self.lookup, field) for field in self.lookup.aliases
             }
+        # Listed only when on, so the default keeps existing compile keys.
+        if self.sharded_selector_codebook:
+            result["sharded_selector_codebook"] = True
         return result
 
 
