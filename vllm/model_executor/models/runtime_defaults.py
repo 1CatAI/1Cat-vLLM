@@ -40,6 +40,18 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
+def _is_sm70_mtp_verifier_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    from vllm.model_executor.models.config import sm70_mtp_verifier_qualified
+
+    return sm70_mtp_verifier_qualified(
+        model_config, speculative_config, parallel_config
+    )
+
+
 def _configure_sm70_dflash2_graph_cache(
     model_config: Any,
     speculative_config: Any,
@@ -276,6 +288,12 @@ def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
 
 def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
     defaults.phase = f"model.{phase}"
+    if phase == "verifier":
+        args = (cfg.model_config, cfg.speculative_config, cfg.parallel_config)
+        return {
+            "qualified": is_sm70 and _is_sm70_dflash2_verifier_contract(*args),
+            "mtp_qualified": is_sm70 and _is_sm70_mtp_verifier_contract(*args),
+        }
     if phase == "collectives":
         args = (cfg.model_config, cfg.speculative_config, cfg.parallel_config)
         _configure_sm70_glm5_dflash_tp4_push_allreduce(
@@ -403,3 +421,22 @@ def uses_mtp_weight_policy(model, spec):
     return getattr(spec, "method", None) == "mtp" and getattr(
         text, "model_type", None
     ) in ("qwen3_5_text", "qwen3_5_moe_text")
+
+
+def prefer_native_mtp_runner(cfg) -> bool:
+    spec = cfg.speculative_config
+    if spec is None or spec.method != "mtp" or cfg.model_config is None:
+        return False
+    architectures = set(getattr(cfg.model_config, "architectures", []) or [])
+    if not architectures & {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+    }:
+        return False
+    from vllm.platforms import current_platform
+
+    try:
+        capability = current_platform.get_device_capability()
+    except Exception:
+        return False
+    return capability is not None and (capability.major, capability.minor) == (7, 0)

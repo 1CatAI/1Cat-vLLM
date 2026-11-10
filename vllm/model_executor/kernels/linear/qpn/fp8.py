@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import torch
 
 from vllm import _sm70_ops as sm70_ops
-from vllm._sm70.policy import NativeBindings
+from vllm._sm70.policy import NativeBindings, call_native
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import Sm70Fp8Config
 from vllm.logger import init_logger
@@ -1259,3 +1259,62 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
             and len(output_partition_sizes) == 2
             and output_partition_sizes[0] == output_partition_sizes[1]
         )
+
+
+_QPN8_ROW_BLOCK = 32
+_QPN8_ROW_BLOCKS_MAX = 4 * _QPN8_ROW_BLOCK
+_QPN8_NATIVE_ROWS_MAX = 40
+
+
+def dispatch_channel_rows(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+    native_policy: list[str] | None = None,
+) -> None:
+    # Resolve scratch storage inside the opaque op. Passing its data_ptr as an
+    # integer from apply_weights embeds a process-local address in AOT artifacts.
+    # Weight preparation already reserves this shared, bounded workspace.
+    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    if workspace is None:
+        raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
+    rows = x.shape[0]
+    if _QPN8_NATIVE_ROWS_MAX < rows <= _QPN8_ROW_BLOCKS_MAX:
+        # Without the batch TurboMind copy, 41..128 rows would take the dense
+        # prefill route (FP16 dequantization plus cuBLAS, about five bytes of
+        # traffic per weight). Up to four 32-row QPN8 launches read the FP8
+        # codes once each and give each row the same per-row arithmetic.
+        for begin in range(0, rows, _QPN8_ROW_BLOCK):
+            end = min(begin + _QPN8_ROW_BLOCK, rows)
+            call_native(
+                sm70_ops.fp8_qpn8_dispatch_sm70_out,
+                native_policy,
+                out[begin:end],
+                workspace.data_ptr(),
+                x[begin:end],
+                codes,
+                scales,
+                split_k,
+                accumulator_chains,
+                prefetch_codes,
+                gated_silu,
+            )
+        return
+    call_native(
+        sm70_ops.fp8_qpn8_dispatch_sm70_out,
+        native_policy,
+        out,
+        workspace.data_ptr(),
+        x,
+        codes,
+        scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        gated_silu,
+    )

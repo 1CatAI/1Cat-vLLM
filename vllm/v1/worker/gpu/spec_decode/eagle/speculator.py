@@ -138,6 +138,10 @@ class EagleSpeculator(TargetSamplingHooks):
         self.arange = torch.arange(
             self.max_num_reqs + 1, dtype=torch.int32, device="cpu"
         )
+        self._draft_seq_lens_max_cpu = torch.full(
+            (self.max_num_reqs,), self.max_model_len, dtype=torch.int32
+        )
+        self._draft_seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
         self.supports_mm_inputs = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
             self.draft_model_config
@@ -709,6 +713,19 @@ class EagleSpeculator(TargetSamplingHooks):
         query_start_loc_cpu = torch.clamp(
             self.arange[: num_reqs_padded + 1], max=num_reqs
         )
+        upper = getattr(self, "_draft_seq_lens_cpu_upper_bound", None)
+        if upper is None or upper.numel() < num_reqs:
+            # Capture and dummy runs: the longest sequence any request can reach.
+            upper = self._draft_seq_lens_max_cpu[:num_reqs_padded]
+        elif upper.numel() < num_reqs_padded:
+            upper = torch.cat(
+                [
+                    upper[:num_reqs],
+                    self._draft_seq_lens_max_cpu[num_reqs:num_reqs_padded],
+                ]
+            )
+        else:
+            upper = upper[:num_reqs_padded]
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
@@ -727,6 +744,7 @@ class EagleSpeculator(TargetSamplingHooks):
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=self.kv_cache_config,
+            seq_lens_cpu_upper_bound=upper,
         )
         return attn_metadata
 
@@ -832,6 +850,16 @@ class EagleSpeculator(TargetSamplingHooks):
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
+        # Draft steps advance each request by at most num_speculative_steps
+        # positions past the target step. A CPU upper bound lets the attention
+        # builders pick their routes without a device-to-host seq_lens sync,
+        # which stalled every draft step and broke single-graph capture.
+        upper = getattr(input_batch, "seq_lens_cpu_upper_bound", None)
+        self._draft_seq_lens_cpu_upper_bound = (
+            torch.clamp(upper + self.num_speculative_steps, max=self.max_model_len)
+            if isinstance(upper, torch.Tensor)
+            else None
+        )
 
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of eagle's input_ids and

@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 
 
 def _check_push_norm(rank: int, rendezvous: str) -> None:
+    from vllm import _sm70_ops as linear_ops
     from vllm.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -30,16 +31,25 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
         dist.group.WORLD, torch.device("cuda", rank), max_size=1024 * 1024
     )
     assert not ca.disabled and ca.fully_connected and ca.sm70_tp4_push_buffer_ptrs
+    torch.manual_seed(717)
+    projection_weight = torch.randn(2048, 5120, device="cuda").to(torch.float8_e4m3fn)
+    projection_scales = torch.full((2048, 1), 0.01, device="cuda")
+    codes, scales = linear_ops.fp8_qpn8_prepare_sm70(
+        projection_weight, projection_scales
+    )
     try:
-        # One to four eight-row verifier blocks; the batched rows use their
-        # own packets and must not disturb the interleaved eight-row route.
+        # MTP and DFlash retain independent packets across changing batch sizes.
         for rows, dtype in [
             (rows, dtype)
-            for rows in (8, 16, 24, 32)
+            for rows in (1, 3, 5, 8, 9, 16, 17, 25, 32, 33, 40, 63, 64)
             for dtype in (torch.float16, torch.float32)
         ]:
-            x = torch.zeros(rows, 5120, device="cuda", dtype=torch.float16)
-            residual = torch.zeros_like(x, dtype=torch.float32)
+            storage = torch.zeros(
+                max(rows, 8), 5120, device="cuda", dtype=torch.float16
+            )
+            residual_storage = torch.zeros_like(storage, dtype=torch.float32)
+            x = storage[:rows]
+            residual = residual_storage[:rows]
             weight = torch.zeros(5120, device="cuda", dtype=dtype)
             ca.custom_all_reduce(x)
             ca.sm70_tp4_all_reduce_gemma_rms_norm(x, residual, weight, 1e-6)
@@ -58,7 +68,7 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
                             ca.custom_all_reduce(x)
                             if rows != 8:
                                 ca.sm70_tp4_all_reduce_gemma_rms_norm(
-                                    x[:8], residual[:8], weight, 1e-6
+                                    storage[:8], residual_storage[:8], weight, 1e-6
                                 )
                         else:
                             output = _sm70_dflash2_gemma_fused_add_rms_norm(
@@ -66,11 +76,12 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
                             )
                 graphs.append(graph)
                 outputs.append(output)
-            for cycle in range(8):
+            for cycle in range(12):
+                amplitude = (2**-8, 0.125, 4, 32, 128, 512)[cycle % 6]
                 torch.manual_seed(3104 + cycle * 4 + rank)
-                x.normal_().mul_(0.125)
+                x.normal_().mul_(amplitude)
                 torch.manual_seed(4104 + cycle)
-                residual.normal_().mul_(0.125)
+                residual.normal_().mul_(amplitude)
                 weight.normal_().mul_(0.05)
                 if cycle == 0:
                     x.zero_()
@@ -84,9 +95,10 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
                     for _ in range(61):
                         graph.replay()
                 torch.accelerator.synchronize()
-                _, expected_residual = outputs[0]
+                expected, expected_residual = outputs[0]
                 actual, actual_residual = outputs[1]
                 assert torch.equal(actual_residual, expected_residual)
+                assert torch.equal(actual, expected)
                 values = expected_residual.double()
                 oracle = values * torch.rsqrt(
                     values.square().mean(-1, keepdim=True) + 1e-6
@@ -101,6 +113,26 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
                 torch.accelerator.synchronize()
                 assert torch.equal(eager, actual)
                 assert torch.equal(eager_residual, actual_residual)
+                if rows in (16, 32):
+                    # A fused producer may publish K16 activations for the next
+                    # projection. A clone forces an independent pack, detecting
+                    # a stale or unwritten published buffer after route changes.
+                    projected = torch.empty(rows, 2048, device="cuda", dtype=x.dtype)
+                    reference_projection = torch.empty_like(projected)
+                    linear_ops.fp8_qpn8_gemm_sm70_out(
+                        projected, eager, codes, scales, 16, 2, True, False
+                    )
+                    linear_ops.fp8_qpn8_gemm_sm70_out(
+                        reference_projection,
+                        eager.clone(),
+                        codes,
+                        scales,
+                        16,
+                        2,
+                        True,
+                        False,
+                    )
+                    assert torch.equal(projected, reference_projection)
             del graphs, outputs
     finally:
         ca.close()

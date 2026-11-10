@@ -484,8 +484,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.use_custom_allreduce
             and ca_comm is not None
             and ca_comm.sm70_tp4_push_buffer_ptrs is not None
-            # One to four eight-row verifier blocks take the push kernels.
-            and input_.shape[0] in (8, 16, 24, 32)
+            # Five-row and eight-row verifier blocks take the push kernels.
+            and input_.shape[0] in (5, 8, 10, 15, 16, 20, 24, 30, 32, 40)
             and ca_comm.can_sm70_tp4_all_reduce_gemma_rms_norm(input_, residual, weight)
         ):
             return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(

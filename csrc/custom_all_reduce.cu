@@ -612,9 +612,12 @@ void sm70_all_reduce_gemma_rms_norm_impl(
   auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
   // The push path consumes the original pointer directly, including in graphs.
   // Legacy pull paths still require IPC registration or a staging copy.
-  const bool push_norm = kWorldSize == 4 && inp.size(0) == 8 &&
-                         fa->fully_connected_ &&
-                         fa->sm70_tp4_push_buffers_registered_;
+  const bool push_norm =
+      kWorldSize == 4 && fa->fully_connected_ &&
+      fa->sm70_tp4_push_buffers_registered_ &&
+      (inp.size(0) == 8 ||
+       (!benchmark_reference && (fa->sm70_push_norm_mtp_ready(inp.size(0)) ||
+                                 fa->sm70_push_norm_batch_ready(inp.size(0)))));
   if (push_norm) {
     reg_buffer = inp.data_ptr();
   } else if (reg_buffer) {

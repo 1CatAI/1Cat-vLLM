@@ -736,7 +736,9 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         # Split the independent V columns across more CTAs for this q8 case.
         BV = 2
     if (
-        (N, T, H, HV, K, V) == (1, 8, 4, 12, 128, 128)
+        N == 1
+        and 1 <= T <= 8
+        and (H, HV, K, V) == (4, 12, 128, 128)
         and (BV, num_warps) == (8, 1)
         and match_recurrent_schedule
         and match_recurrent_numerics
@@ -752,12 +754,14 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     ):
         # Independent V tiles share the unchanged K128 reduction. Smaller
         # one-warp tiles shorten the single-request verifier's register
-        # dependency chains; output and all eight snapshots stay bitwise
+        # dependency chains; output and every snapshot stay bitwise
         # identical. Batched requests retain their qualified geometry.
         BV = 2
     if (
         2 <= N <= 32
-        and (T, H, HV, K, V) == (N * 8, 4, 12, 128, 128)
+        and T % N == 0
+        and 1 <= T // N <= 8
+        and (H, HV, K, V) == (4, 12, 128, 128)
         and (BV, num_warps) == ((16, 1) if N < 4 else (32, 1))
         and match_recurrent_schedule
         and match_recurrent_numerics
@@ -771,15 +775,18 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device, schedule=schedule)
         and not schedule.recurrent_override
     ):
-        # The q8 verifier writes eight FP32 state snapshots per request.
+        # The verifier writes one FP32 state snapshot per speculative row.
         # BV32 overfills each one-warp tile as batch grows. Admit the
         # operator family, including non-power-of-two batches such as N6,
         # rather than selected service concurrency counts. Larger batches
         # retain BV32, where the extra CTAs no longer help. BV8 keeps the
         # same K reduction and recurrence while exposing more independent
         # V tiles; output and every stored state remain bitwise identical.
-        # Two or three requests fill the GPU only with BV4 tiles.
         BV = 4 if N < 4 else 8
+        if T // N <= 5:
+            # Shorter recurrences reach their best occupancy at smaller
+            # tiles for batches of up to five requests.
+            BV = 2 if N <= 3 else 4 if N <= 5 else 8
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 

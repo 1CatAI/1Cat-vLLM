@@ -20,7 +20,7 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
         or not getattr(qkvz, "sm70_fp8_qpn8", False)
         or x.ndim != 2
         or x.shape[1] != 5120
-        or not 8 <= x.shape[0] <= 32
+        or not 2 <= x.shape[0] <= 32
         or x.dtype != torch.float16
         or not x.is_contiguous()
         or qkvz.weight.shape != (5120, 4096)
@@ -34,6 +34,22 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
     ):
         return None
     rows = x.shape[0]
+    masked_rows = hasattr(torch.ops._C, "fp8_qpn8_dispatch_ba_masked_sm70_out")
+    if rows < 8 and not masked_rows:
+        # MTP verifies 1 + drafts < 8 rows. Below eight the native route
+        # splits into QPN8 plus a cuBLAS b/a GEMM and a copy; zero rows pad
+        # the block to the fused M8 launch, which reads the weights once.
+        padded = x.new_zeros((8, x.shape[1]))
+        padded[:rows] = x
+        fused = apply_gdn_ba_verify(layer, padded)
+        if fused is None:
+            return None
+        qkv, z, b, a = (part[:rows] for part in fused)
+        if outputs is None:
+            return qkv, z, b, a
+        for out, part in zip(outputs, (qkv, z, b, a)):
+            out.copy_(part)
+        return outputs
     if outputs is None:
         qkv = x.new_empty((rows, 2560))
         z = x.new_empty((rows, 1536))
@@ -51,7 +67,12 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
             )
         ):
             return None
-    torch.ops._C.fp8_qpn8_dispatch_ba_split_sm70_out(
+    op = (
+        torch.ops._C.fp8_qpn8_dispatch_ba_masked_sm70_out
+        if rows < 8
+        else torch.ops._C.fp8_qpn8_dispatch_ba_split_sm70_out
+    )
+    op(
         qkv,
         z,
         b,

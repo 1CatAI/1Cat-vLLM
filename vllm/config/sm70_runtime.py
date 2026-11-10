@@ -4,7 +4,7 @@
 """Initialization-only compatibility for runner lifecycle policy."""
 
 import os
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from pydantic import Field
@@ -19,6 +19,9 @@ from vllm.config.flash_v100 import FlashV100Diagnostics
 from vllm.config.sm70_dflash2 import DFlashDiagnosticsConfig
 from vllm.config.turboquant_runtime import TurboQuantDiagnostics
 from vllm.config.utils import config
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 def resolve_legacy_fields(
@@ -481,3 +484,52 @@ def capture_spec_decode_trace():
 
 def target_trace_min_position() -> int:
     return capture_spec_decode_trace().resolve(required=True).target_min_position
+
+
+_SM70_BATCH_GEMM_DEFAULTS = {
+    # Common dense-operator policy, independent of model name, checkpoint
+    # quantization, speculative method/width and service concurrency. Local
+    # operators retain their dtype/layout/shape checks and small-M routes.
+    "VLLM_SM70_BATCH_GEMM_LAYOUTS": "1",
+    "VLLM_SM70_AWQ_WARMUP_MAX_M": "64",
+    "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": "64",
+    "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": "64",
+}
+
+
+# Below this per-device capacity the second batch layout of each FP8 projection
+# (about 2.2 GiB per rank for the 27B at TP4) costs more KV capacity than its
+# M33..64 speed returns: a 16 GB card then admits only four short requests at
+# once. Those rows run as up to four 32-row QPN8 launches instead.
+_SM70_BATCH_LAYOUT_MIN_DEVICE_BYTES = 20 * 2**30
+
+
+def _min_participating_device_bytes(cfg: "VllmConfig") -> int | None:
+    from vllm.platforms import current_platform
+    from vllm.platforms.runtime_defaults import _participating_cuda_device_ids
+
+    devices = _participating_cuda_device_ids(cfg)
+    try:
+        return min(current_platform.get_device_total_memory(d) for d in devices)
+    except Exception:
+        return None
+
+
+def _apply_sm70_batch_gemm_defaults(
+    *, is_sm70: bool, defaults, device_bytes: int | None = None
+) -> tuple[str, ...]:
+    """Enable shared SM70 batch operators without overriding explicit settings."""
+    if not is_sm70:
+        return ()
+    applied = []
+    for env_name, env_value in _SM70_BATCH_GEMM_DEFAULTS.items():
+        if (
+            env_name == "VLLM_SM70_BATCH_GEMM_LAYOUTS"
+            and device_bytes is not None
+            and device_bytes < _SM70_BATCH_LAYOUT_MIN_DEVICE_BYTES
+        ):
+            env_value = "0"
+        if env_name not in defaults:
+            defaults[env_name] = env_value
+            applied.append(env_name)
+    return tuple(applied)

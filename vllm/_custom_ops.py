@@ -3050,6 +3050,13 @@ def sm70_tp2_all_reduce_gemma_rms_norm(
     )
 
 
+def custom_ar_verifier_norm_rows_supported(namespace, rows: int) -> bool:
+    """Older native extensions support only the eight-row verifier layouts."""
+    return rows not in (5, 10, 15, 20, 30, 40) or hasattr(
+        namespace, "sm70_tp4_all_reduce_gemma_rms_norm_mtp"
+    )
+
+
 def sm70_tp4_all_reduce_gemma_rms_norm(
     fa: int,
     inp: torch.Tensor,

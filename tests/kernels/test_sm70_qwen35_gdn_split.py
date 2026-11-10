@@ -40,7 +40,7 @@ def test_qwen35_gdn_split_new_lengths_reuse_the_compiled_kernel():
     assert compiled() == before
 
 
-@pytest.mark.parametrize("num_rows", [1, 8, 32])
+@pytest.mark.parametrize("num_rows", [1, 5, 8, 10, 15, 20, 25, 30, 32, 35, 40])
 def test_qwen35_gdn_split_materialization_is_bitwise_exact(num_rows: int):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the Qwen3.5 GDN split kernel")
@@ -110,13 +110,16 @@ def test_qwen35_gdn_split_graph_replay_reads_current_projection_values():
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_qwen35_combined_split_preserves_tails_across_graph_replay(compiled):
+@pytest.mark.parametrize(
+    "num_rows", [1, 4, 5, 7, 8, 10, 15, 20, 25, 30, 33, 35, 39, 40]
+)
+def test_qwen35_combined_split_preserves_tails_across_graph_replay(compiled, num_rows):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the Qwen3.5 GDN split kernel")
 
     # Real TP4 NVFP4 geometry: 4120 logical columns in a 4128-column row.
     # Both input arguments alias this allocation, and b/a start at an offset.
-    storage = torch.empty((8, 4128), dtype=torch.float16, device="cuda")
+    storage = torch.empty((num_rows, 4128), dtype=torch.float16, device="cuda")
     projection = storage[:, :4120]
 
     def split(values):

@@ -59,6 +59,7 @@ def engine(*, model="qwen", tp=4, pp=1, spec=None, **graph):
     )
     architecture = "Glm5NextForCausalLM" if model == "glm" else "Qwen4ExpForCausalLM"
     model_cfg = NS(
+        model=None,
         architecture=architecture,
         architectures=[architecture],
         hf_text_config=text,

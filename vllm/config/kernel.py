@@ -268,6 +268,12 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     """Enable the existing bounded QPN2 prefill dispatcher."""
     shared_weight: bool | None = None
     """Share packed codes with TurboMind instead of retaining a second copy."""
+    bundled_down_decode: bool = False
+    """Retain an additional bundled QPN2 copy for K4352/N5120 down projections.
+
+    The small-row route uses adjacent codes/scales. Qwen3.8-27B TP4 requires
+    approximately 0.70 GB per GPU for its 56 NVFP4 down projections.
+    """
     shared_scales: bool | None = None
     """Allow compact scales when batch layouts and native ABI permit them."""
     prefill_min_m: int | None = None
@@ -859,6 +865,12 @@ class KernelConfig:
     per line). With ``sm70_draft_hot_vocab`` > 0, the draft keeps the first
     that many ranked ids, each rank reading its own vocabulary shard."""
 
+    sm70_mtp_draft_qpn8: bool = True
+    """Requantize the Qwen3.5/3.8 native MTP drafter's decoder projections to
+    channel-QPN8 on SM70. Only draft proposals change; verification uses the
+    target's own weights. Measured on the 27B: 15.7 -> 15.1 ms per MTP4 round
+    with unchanged acceptance."""
+
     sm70_draft_single_graph: bool = False
     """Capture all MTP draft decode steps, including their slot mappings and
     attention metadata, as one CUDA graph instead of one replay per step."""
@@ -875,9 +887,25 @@ class KernelConfig:
     """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
     instead of an all-gather."""
 
-    sm70_greedy_verify: bool = False
+    sm70_mtp_refined_head: bool = False
+    """Use full-vocabulary NVFP4 draft proposals with original-weight reranking
+    on SM70 TP4 Qwen3.5/3.8 MTP. Each rank retains 32 candidates and about
+    0.18 GB of proposal weights. Materializing a quantized head adds about
+    0.64 GB, while a dense FP16 head shares its existing storage. Candidate
+    screening can change draft acceptance."""
+
+    sm70_mtp_bounded_target_head: bool = False
+    """Use bounded FP8 vocabulary search for the dense FP16 target head on
+    SM70 TP4 Qwen3.5/3.8 MTP with up to eight rows. Score candidates with
+    original FP16 weights and execute a full-vocabulary device fallback for
+    inconclusive bounds. Additional search storage is about 0.32 GB per rank."""
+
+    sm70_greedy_verify: bool | None = None
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
-    gathering full-vocabulary logits for the rejection sampler."""
+    gathering full-vocabulary logits for the rejection sampler. By default,
+    enable this for the SM70 Qwen3.5/3.8 native MTP contract. Requests needing
+    penalties, logprobs, grammar masks or random sampling retain the dense path.
+    Explicit false keeps dense verification."""
 
     sm70_sparse_target_sampling: bool = False
     """Verify argmax drafts of top-k 20 sampled requests from TP-local target
@@ -1088,6 +1116,15 @@ class KernelConfig:
         if isinstance(value, str):
             return value.lower().replace("-", "_")
         return value
+
+    def prefer_speculative_runner(self, cfg) -> bool:
+        from vllm.model_executor.models.runtime_defaults import prefer_native_mtp_runner
+
+        return prefer_native_mtp_runner(cfg)
+
+    def resolve_speculative_defaults(self, cfg) -> None:
+        if self.sm70_greedy_verify is None:
+            self.sm70_greedy_verify = self.prefer_speculative_runner(cfg)
 
     def resolve_attention_history(self, cfg) -> bool:
         from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv

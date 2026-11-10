@@ -22,6 +22,9 @@ from vllm.platforms import current_platform
         (8, 0, 1, 0, 4096, 10),
         (8, -1, 4, 8, 2560, 10),
         (8, -1, 8, 4, 4096, 10),
+        (1, 0, 1, 1, 2560, 3),
+        (3, 0, 2, 3, 4096, 5),
+        (7, -1, 5, 4, 2560, 9),
         (5, 0, 1, 5, 2560, 7),
         (5, 0, 5, 5, 4096, 7),
         (5, 0, 4, 3, 2560, 10),
@@ -87,15 +90,16 @@ def test_conv_gate_zero(tokens, slot, accepted, length, row_stride, state_length
 @pytest.mark.skipif(
     not current_platform.is_device_capability(70), reason="SM70 verifier"
 )
-def test_single_request_in_padded_metadata():
+@pytest.mark.parametrize("tokens", [1, 3, 5, 7, 8])
+def test_single_request_in_padded_metadata(tokens):
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         QwenGatedDeltaNetAttention,
     )
 
-    qkv = torch.empty(8, 2560, device="cuda", dtype=torch.float16)
-    a = torch.empty(8, 12, device="cuda", dtype=torch.float16)
+    qkv = torch.empty(tokens, 2560, device="cuda", dtype=torch.float16)
+    a = torch.empty(tokens, 12, device="cuda", dtype=torch.float16)
     b = torch.empty_like(a)
     state = torch.empty(1, 10, 2560, device="cuda", dtype=torch.float16).transpose(
         -1, -2
@@ -118,11 +122,13 @@ def test_single_request_in_padded_metadata():
         num_prefills=0,
         num_decodes=0,
         num_spec_decodes=1,
-        num_actual_tokens=8,
+        num_actual_tokens=tokens,
         spec_sequence_masks=torch.empty(8, device="cuda", dtype=torch.bool),
         ddtree_parent_ids=None,
         spec_query_start_loc=torch.empty(9, device="cuda", dtype=torch.int32),
-        spec_state_indices_tensor=torch.empty(8, 8, device="cuda", dtype=torch.int32),
+        spec_state_indices_tensor=torch.empty(
+            8, tokens, device="cuda", dtype=torch.int32
+        ),
         spec_state_slot_selectors=torch.empty(8, device="cuda", dtype=torch.int32),
     )
     can_use = QwenGatedDeltaNetAttention._can_use_sm70_gdn_preprocess
@@ -137,7 +143,7 @@ def test_single_request_in_padded_metadata():
 @pytest.mark.skipif(
     not current_platform.is_device_capability(70), reason="SM70 verifier"
 )
-@pytest.mark.parametrize("tokens", [5, 8])
+@pytest.mark.parametrize("tokens", [1, 3, 5, 7, 8])
 def test_conv_gate_zero_changed_metadata_graph(tokens):
     torch.manual_seed(23)
     raw = torch.randn(tokens, 4096, device="cuda", dtype=torch.float16) * 0.1

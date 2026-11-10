@@ -148,6 +148,12 @@ def prepare_channel_qpn8_weight(
 
 def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     """Quantize one admitted FP16 weight and retain only its QPN8 layout."""
+    from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+        prepare_mtp_draft_qpn8,
+    )
+
+    if prepare_mtp_draft_qpn8(layer):
+        return True
     if getattr(layer, _STATE_ATTR, False):
         return True
     if not layer_policy().value("online_qpn8") or not _exact_runtime_contract():
@@ -224,6 +230,13 @@ def maybe_apply_online_qpn8(
     bias: torch.Tensor | None,
 ) -> torch.Tensor | None:
     """Run a prepared channel-QPN8 projection, or return ``None``."""
+    from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+        apply_mtp_draft_qpn8,
+    )
+
+    draft_output = apply_mtp_draft_qpn8(layer, x, bias)
+    if draft_output is not None:
+        return draft_output
     if not getattr(layer, _STATE_ATTR, False):
         return None
     k = int(layer._sm70_qwen4_exp_online_qpn8_k)

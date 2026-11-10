@@ -173,7 +173,7 @@ def _can_implement_sm70_combined_gdn_split(
     ba_size: int,
 ) -> tuple[bool, str | None]:
     """The measured copy schedule depends on local tails, not model width or TP."""
-    if num_tokens != 8:
+    if not 1 <= num_tokens <= 40:
         return False, "query_rows"
     if dtype != torch.float16:
         return False, "dtype"
@@ -533,7 +533,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
                     ba_size,
                 )
                 logger.info_once(
-                    "SM70 DFlash2 combined QKVZBA q8 split route hit.",
+                    "SM70 short-window combined QKVZBA split route hit.",
                     scope="local",
                 )
             else:
@@ -1025,6 +1025,7 @@ class Qwen3_5ForCausalLMBase(
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self._sm70_target_head: nn.Module | None = None
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -1073,8 +1074,20 @@ class Qwen3_5ForCausalLMBase(
         positions = torch.arange(len(input_tokens), dtype=torch.long, device="cpu")
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    def prepare_loaded_linear_weights(self) -> None:
+        self._sm70_target_head = None
+        if self.vllm_config.kernel_config.sm70_mtp_bounded_target_head:
+            from vllm.model_executor.models.qwen3_5_mtp_bounded_head import (
+                prepare_mtp_bounded_target_head,
+            )
+
+            self._sm70_target_head = prepare_mtp_bounded_target_head(
+                self.lm_head, self.vllm_config
+            )
+
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        head = self._sm70_target_head or self.lm_head
+        return self.logits_processor.get_top_tokens(head, hidden_states)
 
     def get_topk_tokens_and_logits(
         self,
@@ -1283,6 +1296,9 @@ class Qwen3_5ForConditionalGeneration(
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)
+
+    def prepare_loaded_linear_weights(self) -> None:
+        self.language_model.prepare_loaded_linear_weights()
 
     def get_topk_tokens_and_logits(
         self,

@@ -141,6 +141,7 @@ __global__ void nvfp4_qpn2_restore_tm_scales_kernel(half* output,
   output[index] = __float2half_rn(__fmul_rn(__half2float(raw), global_scale));
 }
 
+template <bool RebiasedScale = false>
 __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
                                                half2 output[4]) {
   constexpr unsigned kSign = 0x80008000u;
@@ -152,12 +153,15 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
   values[3] = (packed & kSign) | ((packed >> 3) & kExponentMantissa);
 #pragma unroll
   for (int index = 0; index < 4; ++index) {
-    // Undo the FP4 exponent bias on the code, not on its scale. Scaling
-    // the scale by 2^14 first loses subnormals and can overflow even when
-    // the final dequantized weights are finite.
-    const half2 code = __hmul2(*reinterpret_cast<half2*>(&values[index]),
-                               __float2half2_rn(16384.0f));
-    output[index] = __hmul2(code, scale);
+    const half2 raw = *reinterpret_cast<half2*>(&values[index]);
+    if constexpr (RebiasedScale) {
+      // The admitted scale range makes this power-of-two rescaling exact,
+      // including FP16 subnormals. Both paths round the final product once.
+      output[index] = __hmul2(raw, __hmul2(scale, __float2half2_rn(16384.0f)));
+    } else {
+      const half2 code = __hmul2(raw, __float2half2_rn(16384.0f));
+      output[index] = __hmul2(code, scale);
+    }
   }
 }
 
@@ -333,20 +337,30 @@ __launch_bounds__(256, FullRows ? 2 : 1) void nvfp4_qpn2_m32_twophase_sm70_kerne
 }
 
 template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false,
-          bool CacheCodes = false, bool BundledScales = false>
-__global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
-                                       const uint8_t* __restrict__ group_scales,
-                                       const half* __restrict__ input,
-                                       half* __restrict__ output, int n, int k,
-                                       int m, float global_scale) {
+          bool CacheCodes = false, bool BundledScales = false, int KUnroll = 4,
+          bool RebiasedScale = false, int TileColumns = 32>
+__device__ __forceinline__ void nvfp4_qpn2_accumulate_sm70(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ group_scales,
+    const half* __restrict__ input, half* __restrict__ output, int n, int k,
+    int m, float global_scale) {
   static_assert(RowTiles == 1 || RowTiles == 2,
                 "NVFP4 QPN2 supports one or two 8-row tiles");
-  __shared__ float partials[SplitK][RowTiles * 256];
+  static_assert(TileColumns == 16 || TileColumns == 32);
+  constexpr int QuadsPerTile = TileColumns / 8;
+  __shared__ float partials[SplitK][RowTiles * 8 * TileColumns];
 
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int tile = TurboMindLayout ? blockIdx.y : blockIdx.x;
   const int quadpair = (lane >> 2) & 3;
+  // A 16-column tile assigns two logical K partitions to each warp.
+  // Preserve every partition's MMA chain and ascending reduction order.
+  const int warp =
+      (threadIdx.x >> 5) * (32 / TileColumns) + quadpair / QuadsPerTile;
+  const int output_tile = TurboMindLayout ? blockIdx.y : blockIdx.x;
+  const int tile = output_tile * TileColumns / 32;
+  const int mapped_lane =
+      (lane & 19) | ((quadpair % QuadsPerTile +
+                      (output_tile % (32 / TileColumns)) * QuadsPerTile)
+                     << 2);
   const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int row_base =
       (TurboMindLayout ? blockIdx.x : blockIdx.y) * kQpn2RowsPerCta * RowTiles;
@@ -354,11 +368,11 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
   const Nvfp4Qpn2CodeReader<TurboMindLayout, CacheCodes, BundledScales> reader(
-      codes, tile, groups_k16, lane);
+      codes, tile, groups_k16, mapped_lane);
   const uint8_t* scale_ptr =
       (BundledScales ? codes + 256 : group_scales) +
       static_cast<size_t>(tile) * groups_k16 * (BundledScales ? 288 : 32) +
-      lane;
+      mapped_lane;
 
   float accum[RowTiles][NAcc][8];
 #pragma unroll
@@ -372,7 +386,7 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
     }
   }
 
-#pragma unroll 4
+#pragma unroll KUnroll
   for (int group = group_begin; group < group_begin + groups_per_warp;
        ++group) {
     const uint2 packed = reader.load(group);
@@ -381,8 +395,8 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
                                                     (BundledScales ? 288 : 32)),
                               global_scale);
     half2 weights[8];
-    dequant_e2m1x8(packed.x, scale, weights);
-    dequant_e2m1x8(packed.y, scale, weights + 4);
+    dequant_e2m1x8<RebiasedScale>(packed.x, scale, weights);
+    dequant_e2m1x8<RebiasedScale>(packed.y, scale, weights + 4);
 
     const unsigned* b = reinterpret_cast<const unsigned*>(weights);
 #pragma unroll
@@ -423,31 +437,70 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
                              ((lane & 16) ? 4 : 0) + (lane & 1);
       const int output_col =
           (index & 1) | (((lane >> 1) & 1) << 1) | ((index >> 2) << 2);
-      partials[warp][output_row * 32 + quadpair * 8 + output_col] =
-          accum[row_tile][0][index];
+      partials[warp][output_row * TileColumns + (quadpair % QuadsPerTile) * 8 +
+                     output_col] = accum[row_tile][0][index];
     }
   }
   __syncthreads();
 
-  for (int element = threadIdx.x; element < RowTiles * 256;
+  for (int element = threadIdx.x; element < RowTiles * 8 * TileColumns;
        element += blockDim.x) {
     float value = 0.0f;
 #pragma unroll
     for (int k_warp = 0; k_warp < SplitK; ++k_warp) {
       value += partials[k_warp][element];
     }
-    const int output_row = row_base + (element >> 5);
-    const int output_col = element & 31;
+    const int output_row = row_base + (element / TileColumns);
+    const int output_col = element % TileColumns;
     if (output_row < m) {
-      output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
-          __float2half(value);
+      output[static_cast<size_t>(output_row) * n + output_tile * TileColumns +
+             output_col] = __float2half(value);
     }
   }
 }
 
 template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false,
-          bool BundledScales = false>
-__global__ void nvfp4_qpn2_gated_sm70_kernel(
+          bool CacheCodes = false, bool BundledScales = false, int KUnroll = 4>
+__global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
+                                       const uint8_t* __restrict__ group_scales,
+                                       const half* __restrict__ input,
+                                       half* __restrict__ output, int n, int k,
+                                       int m, float global_scale) {
+  nvfp4_qpn2_accumulate_sm70<SplitK, NAcc, RowTiles, TurboMindLayout,
+                             CacheCodes, BundledScales, KUnroll>(
+      codes, group_scales, input, output, n, k, m, global_scale);
+}
+
+// Small-row projections use the shared TurboMind codes and compact scales.
+// Narrow output tiles expose more CTAs for the short GDN/attention projections.
+template <int K, int TileColumns>
+__global__
+__launch_bounds__(TileColumns*(K == 1536 ? 8 : 16), 64 / TileColumns) void nvfp4_qpn2_projection_sm70_kernel(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+    const half* __restrict__ input, half* __restrict__ output, int n, int m,
+    float global_scale) {
+  constexpr int SplitK = K == 1536 ? 8 : 16;
+  nvfp4_qpn2_accumulate_sm70<SplitK, 2, 1, true, false, false, 4, true,
+                             TileColumns>(codes, scales, input, output, n, K, m,
+                                          global_scale);
+}
+
+// Static native layouts keep two CTAs resident and retain the original K
+// partitions. Scale rebias removes a decode multiply without changing weights.
+template <int N, int K, bool BundledScales>
+__global__
+__launch_bounds__(512, 2) void nvfp4_qpn2_native_projection_sm70_kernel(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+    const half* __restrict__ input, half* __restrict__ output, int m,
+    float global_scale) {
+  nvfp4_qpn2_accumulate_sm70<16, 2, 1, false, false, BundledScales, 4, true>(
+      codes, scales, input, output, N, K, m, global_scale);
+}
+
+template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false,
+          bool BundledScales = false, int KUnroll = 4,
+          bool RebiasedScale = false>
+__device__ __forceinline__ void nvfp4_qpn2_gated_accumulate_sm70(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ group_scales,
     const half* __restrict__ input, half* __restrict__ output, int hidden,
     int k, int m, float global_scale) {
@@ -488,7 +541,7 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
     }
   }
 
-#pragma unroll 4
+#pragma unroll KUnroll
   for (int group = group_begin; group < group_begin + groups_per_warp;
        ++group) {
     const uint2 packed = reader.load(group);
@@ -497,8 +550,8 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
                                                     (BundledScales ? 288 : 32)),
                               global_scale);
     half2 weights[8];
-    dequant_e2m1x8(packed.x, scale, weights);
-    dequant_e2m1x8(packed.y, scale, weights + 4);
+    dequant_e2m1x8<RebiasedScale>(packed.x, scale, weights);
+    dequant_e2m1x8<RebiasedScale>(packed.y, scale, weights + 4);
 
     const unsigned* b = reinterpret_cast<const unsigned*>(weights);
 #pragma unroll
@@ -569,6 +622,29 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
              output_col] = __hmul(silu, up_half);
     }
   }
+}
+
+template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false,
+          bool BundledScales = false, int KUnroll = 4,
+          bool RebiasedScale = false>
+__global__ void nvfp4_qpn2_gated_sm70_kernel(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ group_scales,
+    const half* __restrict__ input, half* __restrict__ output, int hidden,
+    int k, int m, float global_scale) {
+  nvfp4_qpn2_gated_accumulate_sm70<SplitK, NAcc, RowTiles, TurboMindLayout,
+                                   BundledScales, KUnroll, RebiasedScale>(
+      codes, group_scales, input, output, hidden, k, m, global_scale);
+}
+
+// Two resident CTAs hide memory latency for the 136-tile gate/up grid.
+// Keep the generic entry's register allocation independent of this shape.
+__global__
+__launch_bounds__(512, 2) void nvfp4_qpn2_gated_projection_sm70_kernel(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ group_scales,
+    const half* __restrict__ input, half* __restrict__ output, int m,
+    float global_scale) {
+  nvfp4_qpn2_gated_accumulate_sm70<8, 2, 1, true, false, 8, true>(
+      codes, group_scales, input, output, 4352, 5120, m, global_scale);
 }
 
 // Qualified M8 native gate/up shares A registers across both projections.
@@ -664,6 +740,63 @@ void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
   // Reusing it before traversing N improves cache locality without repacking.
   const dim3 grid =
       TurboMindLayout ? dim3(row_blocks, n / 32) : dim3(n / 32, row_blocks);
+  if constexpr (!TurboMindLayout && SplitK == 16 && NAcc == 2 &&
+                RowTiles == 1) {
+    if (global_scale > 0 && global_scale <= 65504.0f / (16384.0f * 480.0f)) {
+      if constexpr (BundledScales) {
+        if (m <= kQpn2RowsPerCta && k == 4352 && n == 5120) {
+          nvfp4_qpn2_native_projection_sm70_kernel<5120, 4352, true>
+              <<<grid, 512, 0, stream>>>(codes, scales, input, output, m,
+                                         global_scale);
+          return;
+        }
+      } else {
+        if (m <= kQpn2RowsPerCta && k == 5120 && n == 62080) {
+          nvfp4_qpn2_native_projection_sm70_kernel<62080, 5120, false>
+              <<<grid, 512, 0, stream>>>(codes, scales, input, output, m,
+                                         global_scale);
+          return;
+        }
+      }
+    }
+  }
+  if constexpr (TurboMindLayout && !BundledScales && NAcc == 2 &&
+                RowTiles == 1) {
+    // The exact power-of-two scale rebias cannot overflow in this range,
+    // including the reserved E4M3 code interpreted as 480 by this decoder.
+    if (m <= kQpn2RowsPerCta && global_scale > 0 &&
+        global_scale <= 65504.0f / (16384.0f * 480.0f)) {
+      if constexpr (SplitK == 8) {
+        if (k == 1536 && n == 5120) {
+          nvfp4_qpn2_projection_sm70_kernel<1536, 16>
+              <<<dim3(row_blocks, n / 16), 128, 0, stream>>>(
+                  codes, scales, input, output, n, m, global_scale);
+          return;
+        }
+      }
+      if constexpr (SplitK == 16) {
+        if (k == 5120 && n == 4128) {
+          nvfp4_qpn2_projection_sm70_kernel<5120, 32><<<grid, 512, 0, stream>>>(
+              codes, scales, input, output, n, m, global_scale);
+          return;
+        }
+        if (k == 5120 && n == 3584) {
+          nvfp4_qpn2_projection_sm70_kernel<5120, 16>
+              <<<dim3(row_blocks, n / 16), 256, 0, stream>>>(
+                  codes, scales, input, output, n, m, global_scale);
+          return;
+        }
+      }
+    }
+  }
+  if constexpr (TurboMindLayout && SplitK == 16 && NAcc == 2 && RowTiles == 1) {
+    if (m <= kQpn2RowsPerCta && k == 4352 && n == 5120) {
+      nvfp4_qpn2_sm70_kernel<16, 2, 1, true, false, BundledScales, 8>
+          <<<grid, 512, 0, stream>>>(codes, scales, input, output, n, k, m,
+                                     global_scale);
+      return;
+    }
+  }
   if constexpr (TurboMindLayout) {
     // Cache the TP4 GDN/attention output weights (3.75 MiB). The larger
     // QKV and MLP projections retain streaming loads; caching regresses them.
@@ -688,6 +821,21 @@ void launch_qpn2_gated(const uint8_t* codes, const uint8_t* scales,
   const int row_blocks = (m + kRowsPerCta - 1) / kRowsPerCta;
   const dim3 grid = TurboMindLayout ? dim3(row_blocks, hidden / 32)
                                     : dim3(hidden / 32, row_blocks);
+  if constexpr (TurboMindLayout && SplitK == 8 && NAcc == 2 && RowTiles == 1) {
+    if (m <= kQpn2RowsPerCta && k == 5120 && hidden == 4352) {
+      // 480 bounds the decoder even for the reserved E4M3 code. Larger
+      // global scales retain the general path to avoid intermediate overflow.
+      if (global_scale > 0 && global_scale <= 65504.0f / (16384.0f * 480.0f)) {
+        nvfp4_qpn2_gated_projection_sm70_kernel<<<grid, 512, 0, stream>>>(
+            codes, scales, input, output, m, global_scale);
+        return;
+      }
+      nvfp4_qpn2_gated_sm70_kernel<8, 2, 1, true, BundledScales, 8>
+          <<<grid, 512, 0, stream>>>(codes, scales, input, output, hidden, k, m,
+                                     global_scale);
+      return;
+    }
+  }
   nvfp4_qpn2_gated_sm70_kernel<SplitK, NAcc, RowTiles, TurboMindLayout,
                                BundledScales>
       <<<grid, (64 * SplitK), 0, stream>>>(codes, scales, input, output, hidden,

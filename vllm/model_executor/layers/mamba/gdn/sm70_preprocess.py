@@ -120,7 +120,7 @@ def conv_gate_zero(
 ):
     """Exact-shape entry; dispatch proves the verifier and state layouts."""
     tokens = qkv.shape[0]
-    assert tokens in (5, 8) and qkv.shape == (tokens, 2560) and qkv.stride(1) == 1
+    assert 1 <= tokens <= 8 and qkv.shape == (tokens, 2560) and qkv.stride(1) == 1
     assert qkv.dtype == state.dtype == weight.dtype == torch.float16
     assert weight.shape == (2560, 4)
     assert core_out.shape == (tokens, 12, 128) and core_out.is_contiguous()
