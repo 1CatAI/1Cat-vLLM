@@ -3,7 +3,7 @@
 """CPU tests for the kpool tail slot mapping (no GPU required).
 
 The kpool tail cache is a 1-block-per-request circular ring addressed by
-``pos % kpool`` (``KpoolTailSpec`` / ``KpoolTailManager``: exactly one block
+``pos % ring`` (``KpoolTailSpec`` / ``KpoolTailManager``: exactly one block
 allocated per request, never grown, so only column 0 of its block table is
 ever written; the rest stays zero-initialized).
 
@@ -227,6 +227,34 @@ def test_builder_build_falls_back_without_positions():
     assert meta.slot_mapping is cam.slot_mapping
 
 
+@pytest.mark.parametrize(
+    "num_speculative_tokens, ring", [(0, 4), (1, 8), (4, 8), (7, 16), (13, 32)]
+)
+def test_tail_ring_divides_the_attention_block(num_speculative_tokens, ring):
+    """A ring of kpool * cdiv(kpool + num_spec, kpool) would be 12 slots with
+    7 draft tokens. 12 does not divide the 640-token KDA attention block, so
+    the scheduler block would grow to their lcm and prefix-cache hits would be
+    cut down to multiples of 1920."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.models.glm5next.nvidia.attention import Glm5NextTailCache
+
+    with set_current_vllm_config(VllmConfig()):
+        cache = Glm5NextTailCache(
+            head_dim=128,
+            dtype=torch.bfloat16,
+            prefix="tail",
+            cache_config=SimpleNamespace(block_size=640),
+            index_kpool=KPOOL,
+        )
+    spec = cache.get_kv_cache_spec(
+        SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    )
+
+    assert spec.block_size == spec.sliding_window == ring
+    assert ring >= KPOOL + num_speculative_tokens
+    assert 640 % ring == 0
+
+
 # ---------------------------------------------------------------------------
 # Index-level mirror of the tail kernels: seed / stash / pool completion
 # (addressing replicated from kpool_compress.py's Triton kernels).
@@ -234,31 +262,30 @@ def test_builder_build_falls_back_without_positions():
 
 
 class TailRingMirror:
-    """Mirror of _kpool_tail_seed_kernel / _kpool_decode_update_batched_kernel
-    addressing: block = tail_slot // kpool, ring offset = pos % kpool; a pool
-    completing at pos reads ring slots (pool_start + s) % kpool and uses the
-    current token's own K/score for the last member."""
+    """Mirror of the tail-ring addressing in _kpool_tail_seed_kernel and
+    _kpool_decode_update_batched_kernel."""
 
-    def __init__(self, num_blocks, kpool=KPOOL):
+    def __init__(self, num_blocks, kpool=KPOOL, ring=None):
         self.kpool = kpool
-        self.k = torch.full((num_blocks, kpool, 3), float("nan"))
-        self.s = torch.full((num_blocks, kpool, 3), float("nan"))
+        self.ring = ring or kpool
+        self.k = torch.full((num_blocks, self.ring, 3), float("nan"))
+        self.s = torch.full((num_blocks, self.ring, 3), float("nan"))
 
     def stash(self, tail_slot, pos, k, s):
-        blk, off = tail_slot // self.kpool, pos % self.kpool
+        blk, off = tail_slot // self.ring, pos % self.ring
         self.k[blk, off] = k
         self.s[blk, off] = s
 
     seed = stash  # the seed kernel writes with the same addressing
 
     def complete(self, tail_slot, pos, k, s):
-        blk = tail_slot // self.kpool
+        blk = tail_slot // self.ring
         start = pos - (self.kpool - 1)
         kk = torch.stack(
-            [self.k[blk, (start + i) % self.kpool] for i in range(self.kpool)]
+            [self.k[blk, (start + i) % self.ring] for i in range(self.kpool)]
         )
         ss = torch.stack(
-            [self.s[blk, (start + i) % self.kpool] for i in range(self.kpool)]
+            [self.s[blk, (start + i) % self.ring] for i in range(self.kpool)]
         )
         kk[-1], ss[-1] = k, s  # is_current for the completing token
         w = torch.softmax(ss, dim=0)
@@ -329,3 +356,35 @@ def test_interleaved_decode_pollution_legacy_vs_circular():
 
     # The circular mapping keeps the rings isolated under interleaving.
     torch.testing.assert_close(circular, ground_truth)
+
+
+@pytest.mark.parametrize("ring_pools", [1, 2])
+def test_rejected_completing_draft_needs_ring_slots(ring_pools):
+    """With a one-pool ring, the drafts behind a rejected pool-completing draft
+    overwrote the pool's earlier keys, so its redo compressed wrong keys."""
+    ring_size = ring_pools * KPOOL
+    truth = TailRingMirror(num_blocks=2, ring=ring_size)
+    ring = TailRingMirror(num_blocks=2, ring=ring_size)
+    block = 1
+
+    def slot(pos):
+        return block * ring_size + pos % ring_size
+
+    for pos in range(4, 7):
+        truth.stash(slot(pos), pos, *token_kv(0, pos))
+        ring.stash(slot(pos), pos, *token_kv(0, pos))
+    expected = truth.complete(slot(7), 7, *token_kv(0, 7))
+
+    # Draft 7 completes the pool and is rejected. With a one-pool ring, drafts
+    # 8..10 overwrite the slots of positions 4..6, which are read by the redo
+    # of 7.
+    for pos in range(7, 11):
+        k, s = token_kv(9, pos)  # draft values
+        if pos % KPOOL == KPOOL - 1:
+            ring.complete(slot(pos), pos, k, s)
+        ring.stash(slot(pos), pos, k, s)
+    redo = ring.complete(slot(7), 7, *token_kv(0, 7))
+    if ring_pools == 1:
+        assert not torch.allclose(redo, expected)
+    else:
+        torch.testing.assert_close(redo, expected)
