@@ -200,6 +200,50 @@ def test_online_qpn8_apply_uses_prepared_state(monkeypatch):
     assert calls[0][-1] is False
 
 
+@pytest.mark.parametrize(
+    "rows,compiling", [(1, False), (8, False), (17, False), (8, True), (17, True)]
+)
+def test_linear_respects_requantized_weights_with_old_fp16_cache(
+    monkeypatch, rows, compiling
+):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    layer = torch.nn.Module()
+    layer.register_buffer("weight", torch.zeros((32, 128), dtype=torch.uint8))
+    layer.register_buffer(
+        "_sm70_dflash2_fp16_packed", torch.empty(32, 128, dtype=torch.float16)
+    )
+    layer._sm70_dflash2_fp16_geometry = (16, 16)
+    layer._sm70_mtp_draft_qpn8_ready = True
+    layer._sm70_mtp_draft_qpn8_shape = (32, 128)
+    layer._sm70_mtp_draft_qpn8_config = (4, 2, False)
+    layer.register_buffer("_sm70_mtp_draft_qpn8_scales", torch.ones(32))
+    calls = []
+
+    def dispatch(output, x, weight, scales, *configuration):
+        assert weight is layer.weight
+        calls.append(x.shape[0])
+        output.fill_(2)
+
+    def stale_fp16_dispatch(*args):
+        pytest.fail("The cached FP16 layout belongs to replaced weights")
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
+    monkeypatch.setattr(
+        torch.ops.vllm, "sm70_ct_fp8_qpn8_dispatch", dispatch, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "sm70_dflash2_fp16_dispatch_out",
+        stale_fp16_dispatch,
+        raising=False,
+    )
+    x = torch.ones(rows, 128, dtype=torch.float16)
+    output = UnquantizedLinearMethod().apply(layer, x)
+    assert calls == [rows]
+    assert torch.equal(output, torch.full((rows, 32), 2, dtype=torch.float16))
+
+
 def test_fused_hc_uses_prepared_partials_without_global_lookup(monkeypatch):
     down = torch.nn.Module()
     up = torch.nn.Module()

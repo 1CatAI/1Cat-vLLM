@@ -15,6 +15,11 @@ import os
 import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.config.sm70_runtime import (
+    _SM70_BATCH_GEMM_DEFAULTS,  # noqa: F401 - compatibility export
+    _apply_sm70_batch_gemm_defaults,
+    _min_participating_device_bytes,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -31,17 +36,6 @@ _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 # Mixed steps that join a short prompt to the resident verifier rows. Without
 # a piecewise graph each such step pays the eager launch cost of every layer.
 _SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES = (64, 96, 128, 160, 192, 256)
-
-
-_SM70_BATCH_GEMM_DEFAULTS = {
-    # Common dense-operator policy, independent of model name, checkpoint
-    # quantization, speculative method/width and service concurrency. Local
-    # operators retain their dtype/layout/shape checks and small-M routes.
-    "VLLM_SM70_BATCH_GEMM_LAYOUTS": "1",
-    "VLLM_SM70_AWQ_WARMUP_MAX_M": "64",
-    "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": "64",
-    "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": "64",
-}
 
 
 def _participating_cuda_device_ids(cfg: VllmConfig) -> tuple[int, ...]:
@@ -98,18 +92,6 @@ def _any_participating_device_is_pre_ampere(cfg: VllmConfig) -> bool:
     return _any_participating_device_is_capability(
         cfg, (7, 0)
     ) or _any_participating_device_is_capability(cfg, (7, 5))
-
-
-def _apply_sm70_batch_gemm_defaults(*, is_sm70: bool, defaults) -> tuple[str, ...]:
-    """Enable shared SM70 batch operators without overriding explicit settings."""
-    if not is_sm70:
-        return ()
-    applied = []
-    for env_name, env_value in _SM70_BATCH_GEMM_DEFAULTS.items():
-        if env_name not in defaults:
-            defaults[env_name] = env_value
-            applied.append(env_name)
-    return tuple(applied)
 
 
 def checkpoint_kv_quant_allowed(cfg: VllmConfig) -> bool:
@@ -264,18 +246,18 @@ def _sm70_speculative_cudagraph_capture_sizes(
 def apply_runtime_policy_defaults(self):
     from vllm.config.policy_defaults import PolicyDefaults
     from vllm.model_executor.models.runtime_defaults import (
-        _is_sm70_dflash2_verifier_contract,
         _is_sm70_qwen38_decode_compile_contract,
     )
     from vllm.platforms import current_platform
 
     defaults = PolicyDefaults(self)
+    is_sm70 = current_platform.is_cuda() and _any_participating_device_is_capability(
+        self, (7, 0)
+    )
     for env_name in _apply_sm70_batch_gemm_defaults(
-        is_sm70=(
-            current_platform.is_cuda()
-            and _any_participating_device_is_capability(self, (7, 0))
-        ),
+        is_sm70=is_sm70,
         defaults=defaults,
+        device_bytes=_min_participating_device_bytes(self) if is_sm70 else None,
     ):
         logger.info_once(
             "Auto-setting %s=%s for SM70 batch GEMM. "
@@ -514,15 +496,10 @@ def apply_runtime_policy_defaults(self):
             )
     if self.speculative_config is not None:
         policy = self.speculative_config.sm70_dflash2
-        policy.resolve(
-            qualified=(
-                current_platform.is_cuda()
-                and _any_participating_device_is_capability(self, (7, 0))
-                and _is_sm70_dflash2_verifier_contract(
-                    self.model_config, self.speculative_config, self.parallel_config
-                )
-            )
+        qualification = self.apply_model_runtime_defaults(
+            defaults, "verifier", is_sm70=is_sm70
         )
+        policy.resolve(**qualification)
         if (
             self.model_config is not None
             and self.model_config.quantization == "fp8"

@@ -531,6 +531,12 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        if vllm_config.kernel_config.sm70_mtp_draft_qpn8:
+            from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+                mark_mtp_draft_qpn8,
+            )
+
+            mark_mtp_draft_qpn8(self.model)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
@@ -588,12 +594,40 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def prepare_sm70_draft_head(self) -> None:
+        # Called by the Eagle loader after the target head is shared and
+        # before KV allocation, so the hot pack is resident before sizing.
+        hot = self.vllm_config.kernel_config.sm70_draft_hot_vocab
+        logger.info_once("SM70 MTP draft head preparation: hot vocabulary %d.", hot)
+        if getattr(self, "_sm70_draft_head", None) is not None:
+            return
+        if hot <= 0:
+            if self.vllm_config.kernel_config.sm70_mtp_refined_head:
+                from vllm.model_executor.models.qwen3_5_mtp_refined_head import (
+                    prepare_mtp_refined_head,
+                )
+
+                self._sm70_draft_head = prepare_mtp_refined_head(
+                    self.lm_head, self.vllm_config
+                )
+            return
+        from vllm.model_executor.models.qwen3_5_mtp_sm70_head import (
+            prepare_mtp_hot_qpn8_head,
+        )
+
+        self._sm70_draft_head = prepare_mtp_hot_qpn8_head(
+            self.lm_head,
+            hot,
+            self.vllm_config.kernel_config.sm70_draft_hot_vocab_ids,
+        )
+
     def get_top_tokens(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        head = getattr(self, "_sm70_draft_head", None) or self.lm_head
+        return self.logits_processor.get_top_tokens(head, hidden_states)
 
     @staticmethod
     def _draft_weight_name(name: str) -> str | None:

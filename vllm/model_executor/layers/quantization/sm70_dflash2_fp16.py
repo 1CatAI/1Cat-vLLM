@@ -73,6 +73,8 @@ def apply_dflash2_fp16_m8(
     packed = getattr(layer, "_sm70_dflash2_fp16_packed", None)
     if (
         packed is None
+        # A later preparation stage may select a quantized weight layout.
+        or layer.weight.dtype != torch.float16
         or bias is not None
         or getattr(layer, "_sm70_f16_prepared", False)
         or envs.VLLM_BATCH_INVARIANT

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("rows", [9, 15, 16, 17, 24, 31, 32])
+@pytest.mark.parametrize("rows", [9, 15, 16, 17, 24, 31, 32, 33, 35, 39, 40])
 @pytest.mark.parametrize(
     "k,n,split",
     [(1536, 5120, 12), (4096, 2048, 16), (4352, 5120, 16), (5120, 3584, 16)],
@@ -56,7 +56,7 @@ def test_qpn8_m32_changed_input_graph(rows, k, n, split):
             assert torch.equal(out.view(torch.int16), reference.view(torch.int16))
 
 
-@pytest.mark.parametrize("rows", [9, 15, 16, 17, 24, 31, 32])
+@pytest.mark.parametrize("rows", [9, 15, 16, 17, 24, 31, 32, 33, 35, 39, 40])
 @pytest.mark.parametrize("k,width", [(4096, 2048), (5120, 4352)])
 def test_qpn8_m32_gated_changed_input_graph(rows, k, width):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):

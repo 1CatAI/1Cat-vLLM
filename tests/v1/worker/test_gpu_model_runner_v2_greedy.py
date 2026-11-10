@@ -16,6 +16,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 def _sampler() -> Sampler:
     sampler = object.__new__(Sampler)
     sampler.compute_nans = False
+    sampler.greedy_token_fastpath = sampler_module.envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH
     sampler.sampling_states = SimpleNamespace(
         temperature=SimpleNamespace(np=np.array([0.0, 0.0], dtype=np.float32)),
         max_num_logprobs=lambda _indices: -1,
@@ -138,3 +139,22 @@ def test_sm70_v2_greedy_fastpath_rejects_non_equivalent_sampling(
         sampler.bad_words_state.num_bad_words.np[1] = 1
 
     assert not sampler.can_use_sm70_greedy_token_fastpath(input_batch)
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+@pytest.mark.parametrize("requested", [None, False, True])
+def test_greedy_verify_default_preserves_explicit_choice(
+    monkeypatch, qualified, requested
+):
+    from vllm.config import DeviceConfig, KernelConfig, VllmConfig
+
+    monkeypatch.setattr(
+        KernelConfig, "prefer_speculative_runner", lambda self, cfg: qualified
+    )
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        kernel_config=KernelConfig(sm70_greedy_verify=requested),
+    )
+    assert config.kernel_config.sm70_greedy_verify is (
+        qualified if requested is None else requested
+    )

@@ -415,3 +415,30 @@ def test_declared_group_limits_generate_admission_cases(monkeypatch, codec, cont
                 layout="explicit_groups" if explicit else "request_rows",
             )
             assert (reason is None) == (groups <= contract.max_groups)
+
+
+@pytest.mark.parametrize("batch", [2, 3, 4, 7, 8, 16, 32])
+@pytest.mark.parametrize("width", range(2, 9))
+def test_runtime_request_rows_follow_loaded_provider(monkeypatch, batch, width):
+    monkeypatch.setattr(
+        grouped, "graph_policy", lambda: SimpleNamespace(decode_partition_size=None)
+    )
+    inputs = scenario(FP8_E4M3, batch, batch * width)
+    instance, q, k, v, table, lengths, metadata, out = inputs
+    instance.flash_attn_grouped_e4m3_fp32_paged = SimpleNamespace(
+        request_query_rows=tuple(range(2, 9)), max_batch_size=65535
+    )
+    metadata.query_start_loc_cpu = torch.arange(batch + 1) * width
+    assert (
+        grouped.grouped_fp32_reason(
+            FP8_E4M3, instance, q, k, v, table, lengths, metadata, out=out
+        )
+        is None
+    )
+    metadata.query_start_loc_cpu[1] -= 1
+    assert (
+        grouped.grouped_fp32_reason(
+            FP8_E4M3, instance, q, k, v, table, lengths, metadata, out=out
+        )
+        == "request_query_layout"
+    )

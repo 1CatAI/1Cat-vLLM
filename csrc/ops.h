@@ -204,6 +204,10 @@ void sm70_dflash2_fp16_m8_out(torch::Tensor output, torch::Tensor input,
 void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
                                     torch::Tensor packed, torch::Tensor weight,
                                     int64_t tile, int64_t warps);
+void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
+                                    torch::Tensor weight, torch::Tensor ids);
+void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor certified);
 
 std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
                                                  torch::Tensor scales);
@@ -233,6 +237,12 @@ void fp8_qpn8_gemm_ba_split_sm70_out(torch::Tensor qkv_out, torch::Tensor z_out,
                                      torch::Tensor ba_weight);
 
 void fp8_qpn8_dispatch_ba_split_sm70_out(
+    torch::Tensor qkv_out, torch::Tensor z_out, torch::Tensor b_out,
+    torch::Tensor a_out, torch::Tensor qkvz_staging, torch::Tensor ba_staging,
+    int64_t dense_weight_ptr, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor group_scales, torch::Tensor ba_weight);
+
+void fp8_qpn8_dispatch_ba_masked_sm70_out(
     torch::Tensor qkv_out, torch::Tensor z_out, torch::Tensor b_out,
     torch::Tensor a_out, torch::Tensor qkvz_staging, torch::Tensor ba_staging,
     int64_t dense_weight_ptr, torch::Tensor input, torch::Tensor codes,

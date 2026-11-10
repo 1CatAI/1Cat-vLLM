@@ -268,6 +268,26 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             qpn2_codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
                 qpn2_weight, qpn2_weight_scale
             )
+        if (
+            qpn2_shared
+            and self.config.policy.bundled_down_decode
+            and not self.config.gated_silu
+            and tuple(layer.weight.shape) == (5120, 2176)
+            and current_platform.is_device_capability(70)
+            and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
+        ):
+            from vllm.model_executor.layers.quantization.utils import (
+                sm70_nvfp4_native,  # noqa: F401
+            )
+
+            codes, scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
+                layer.weight.data, layer.weight_scale.data
+            )
+            codes, scales = sm70_ops.nvfp4_qpn2_bundle_sm70(codes, scales)
+            layer.register_buffer("sm70_nvfp4_bundled_down", codes, persistent=False)
+            layer.register_buffer(
+                "sm70_nvfp4_bundled_down_scales", scales, persistent=False
+            )
         qpn2_global_scale = float(layer.weight_global_scale.item())
         qpn2_prefill_enabled = False
         if self.config.policy.prefill:
@@ -393,6 +413,29 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 split_k,
                 nacc,
                 gated_silu,
+                state.native_ops.arguments,
+            )
+        elif getattr(layer, "sm70_nvfp4_bundled_down", None) is not None:
+            state.native_ops.invoke(
+                torch.ops.vllm.sm70_nvfp4_bundled_down_dispatch,
+                out_2d,
+                x_2d,
+                layer.sm70_nvfp4_bundled_down,
+                layer.sm70_nvfp4_bundled_down_scales,
+                state.weight,
+                layer.sm70_nvfp4_qpn2_scales,
+                float(layer.sm70_nvfp4_qpn2_global_scale),
+                split_k,
+                nacc,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+                gated_silu,
+                layer.sm70_nvfp4_qpn2_prefill_min_m
+                if layer.sm70_nvfp4_qpn2_prefill_enabled
+                else 0,
+                state.prescaled_scales,
                 state.native_ops.arguments,
             )
         elif getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):

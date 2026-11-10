@@ -8,6 +8,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <ATen/ops/mm.h>
+#include <ATen/ops/where.h>
+#include <limits>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 
@@ -80,6 +82,120 @@ __global__ void dflash2_fp16_m8_kernel(half* __restrict__ output,
 
 }  // namespace
 
+namespace {
+
+// Score one gathered vocabulary row with the dense WMMA head's single FP32
+// accumulator chain. A parallel dot reduction changes FP16 rounding at ties.
+__global__ void fp16_candidate_scores_sm70_kernel(
+    half* __restrict__ scores, const half* __restrict__ input,
+    const half* __restrict__ weight, const int* __restrict__ ids,
+    int vocabulary, int candidates) {
+  constexpr int Width = 5120;
+  constexpr int PrefetchGroups = 4;
+  const int row = blockIdx.x;
+  const int candidate = blockIdx.y;
+  const int lane = threadIdx.x;
+  const int token = ids[row * candidates + candidate];
+  if (token < 0 || token >= vocabulary) {
+    if (lane == 0) {
+      scores[row * candidates + candidate] = __ushort_as_half(0x7e00);
+    }
+    return;
+  }
+
+  __shared__ __align__(16) half activation[Width];
+  __shared__ __align__(16) half candidate_weight[Width];
+  const half* weight_row = weight + static_cast<int64_t>(token) * Width;
+  for (int vector = lane; vector < Width / 8; vector += 32) {
+    reinterpret_cast<uint4*>(activation)[vector] =
+        __ldg(reinterpret_cast<const uint4*>(input + row * Width) + vector);
+    reinterpret_cast<uint4*>(candidate_weight)[vector] =
+        __ldg(reinterpret_cast<const uint4*>(weight_row) + vector);
+  }
+  __syncwarp();
+
+  float accumulator[8] = {};
+  for (int first = 0; first < Width / 16; first += PrefetchGroups) {
+    uint4 weight_first[PrefetchGroups];
+    uint4 weight_second[PrefetchGroups];
+#pragma unroll
+    for (int group = 0; group < PrefetchGroups; ++group) {
+      weight_first[group] = make_uint4(0, 0, 0, 0);
+      weight_second[group] = make_uint4(0, 0, 0, 0);
+      if (lane == 0) {
+        const half* address = candidate_weight + (first + group) * 16;
+        weight_first[group] = *reinterpret_cast<const uint4*>(address);
+        weight_second[group] = *reinterpret_cast<const uint4*>(address + 8);
+      }
+    }
+#pragma unroll
+    for (int group = 0; group < PrefetchGroups; ++group) {
+      uint4 input_first = make_uint4(0, 0, 0, 0);
+      uint4 input_second = make_uint4(0, 0, 0, 0);
+      if ((lane & 19) == 0) {
+        const half* address = activation + (first + group) * 16;
+        input_first = *reinterpret_cast<const uint4*>(address);
+        input_second = *reinterpret_cast<const uint4*>(address + 8);
+      }
+      MMA(accumulator, input_first.x, input_first.y, weight_first[group].x,
+          weight_first[group].y);
+      MMA(accumulator, input_first.z, input_first.w, weight_first[group].z,
+          weight_first[group].w);
+      MMA(accumulator, input_second.x, input_second.y, weight_second[group].x,
+          weight_second[group].y);
+      MMA(accumulator, input_second.z, input_second.w, weight_second[group].z,
+          weight_second[group].w);
+    }
+  }
+  if (lane == 0) {
+    scores[row * candidates + candidate] = __float2half_rn(accumulator[0]);
+  }
+}
+
+}  // namespace
+
+void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
+                                    torch::Tensor weight, torch::Tensor ids) {
+  TORCH_CHECK(scores.is_cuda() && input.is_cuda() && weight.is_cuda() &&
+              ids.is_cuda());
+  TORCH_CHECK(
+      scores.scalar_type() == at::kHalf && input.scalar_type() == at::kHalf &&
+      weight.scalar_type() == at::kHalf && ids.scalar_type() == at::kInt);
+  TORCH_CHECK(scores.is_contiguous() && input.is_contiguous() &&
+              weight.is_contiguous() && ids.is_contiguous());
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && ids.dim() == 2 &&
+              scores.dim() == 2);
+  TORCH_CHECK(input.size(1) == 5120 && weight.size(1) == 5120 &&
+              weight.size(0) > 0 && weight.size(0) <= 65536);
+  TORCH_CHECK(input.size(0) >= 1 && ids.size(0) == input.size(0) &&
+              scores.sizes() == ids.sizes() && ids.size(1) >= 1 &&
+              ids.size(1) <= 256);
+  TORCH_CHECK(input.device() == weight.device() &&
+              input.device() == scores.device() &&
+              input.device() == ids.device());
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0);
+  TORCH_CHECK(input.size(0) <= properties->maxGridSize[0]);
+  if (input.size(0) > 8) {
+    // cuBLAS can select a different accumulator schedule for larger batches.
+    // Keep the candidate scores identical to the caller's dense projection.
+    auto dense = at::mm(input, weight.t());
+    auto bounded_ids = ids.clamp(0, weight.size(0) - 1).to(torch::kInt64);
+    scores.copy_(dense.gather(1, bounded_ids));
+    scores.masked_fill_(ids.lt(0).logical_or(ids.ge(weight.size(0))),
+                        std::numeric_limits<float>::quiet_NaN());
+    return;
+  }
+  fp16_candidate_scores_sm70_kernel<<<dim3(input.size(0), ids.size(1)), 32, 0,
+                                      at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<half*>(scores.data_ptr()),
+      reinterpret_cast<const half*>(input.data_ptr()),
+      reinterpret_cast<const half*>(weight.data_ptr()), ids.data_ptr<int>(),
+      weight.size(0), ids.size(1));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void sm70_dflash2_fp16_m8_out(torch::Tensor output, torch::Tensor input,
                               torch::Tensor packed, int64_t tile,
                               int64_t warps) {
@@ -143,4 +259,102 @@ void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
   // does not erase the M8 decode route.
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   at::mm_out(output, input, weight.t());
+}
+
+namespace {
+// Certified rows preserve their output storage. Other rows execute the
+// complete original-weight projection with its single accumulator chain.
+
+template <int Prefetch>
+__global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
+    half* scores, const half* input, const half* weight, const int* certified,
+    int rows) {
+  constexpr int kRowsPerTile = 8;
+  const int row_base = blockIdx.x * kRowsPerTile;
+  input += static_cast<int64_t>(row_base) * 5120;
+  scores += static_cast<int64_t>(row_base) * 62080;
+  certified += row_base;
+  rows = min(rows - row_base, kRowsPerTile);
+  bool needed = false;
+#pragma unroll
+  for (int row = 0; row < 8; ++row) {
+    if (row < rows && certified[row] == 0) needed = true;
+  }
+  if (!needed) return;
+  int lane = threadIdx.x;
+  int column = blockIdx.y * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) +
+               ((lane & 16) ? 4 : 0);
+  int input_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  bool active = input_row < rows && certified[input_row] == 0;
+  const half* weight_row = weight + static_cast<int64_t>(column) * 5120;
+  float accum[8] = {};
+  for (int first = 0; first < 320; first += Prefetch) {
+    uint4 first_weight[Prefetch], second_weight[Prefetch];
+#pragma unroll
+    for (int group = 0; group < Prefetch; ++group) {
+      const half* address = weight_row + (first + group) * 16;
+      first_weight[group] = __ldcs(reinterpret_cast<const uint4*>(address));
+      second_weight[group] =
+          __ldcs(reinterpret_cast<const uint4*>(address + 8));
+    }
+#pragma unroll
+    for (int group = 0; group < Prefetch; ++group) {
+      uint4 a0 = make_uint4(0, 0, 0, 0), a1 = make_uint4(0, 0, 0, 0);
+      if (active) {
+        const half* address = input + input_row * 5120 + (first + group) * 16;
+        a0 = __ldg(reinterpret_cast<const uint4*>(address));
+        a1 = __ldg(reinterpret_cast<const uint4*>(address + 8));
+      }
+      MMA(accum, a0.x, a0.y, first_weight[group].x, first_weight[group].y);
+      MMA(accum, a0.z, a0.w, first_weight[group].z, first_weight[group].w);
+      MMA(accum, a1.x, a1.y, second_weight[group].x, second_weight[group].y);
+      MMA(accum, a1.z, a1.w, second_weight[group].z, second_weight[group].w);
+    }
+  }
+#pragma unroll
+  for (int index = 0; index < 8; ++index) {
+    int row = (index & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+    int column = blockIdx.y * 32 + ((lane >> 2) & 3) * 8 + (index & 1) +
+                 (((lane >> 1) & 1) << 1) + ((index >> 2) << 2);
+    if (row < rows && certified[row] == 0)
+      scores[row * 62080 + column] = __float2half_rn(accum[index]);
+  }
+}
+
+}  // namespace
+
+void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor certified) {
+  TORCH_CHECK(scores.is_cuda() && input.is_cuda() && weight.is_cuda() &&
+              certified.is_cuda());
+  TORCH_CHECK(input.dim() == 2 && input.size(0) >= 1 && input.size(1) == 5120);
+  TORCH_CHECK(weight.sizes() == at::IntArrayRef({62080, 5120}));
+  TORCH_CHECK(scores.dim() == 2 && scores.size(0) == input.size(0) &&
+              scores.size(1) == 62080);
+  TORCH_CHECK(certified.dim() == 1 && certified.numel() == input.size(0));
+  TORCH_CHECK(
+      input.scalar_type() == at::kHalf && weight.scalar_type() == at::kHalf &&
+      scores.scalar_type() == at::kHalf && certified.scalar_type() == at::kInt);
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() &&
+              scores.is_contiguous() && certified.is_contiguous());
+  TORCH_CHECK(input.device() == weight.device() &&
+              input.device() == scores.device() &&
+              input.device() == certified.device());
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0);
+  if (input.size(0) > 8) {
+    auto dense = at::mm(input, weight.t());
+    at::where_out(scores, certified.eq(0).unsqueeze(1), dense, scores);
+    return;
+  }
+  const int64_t row_tiles = (input.size(0) + 7) / 8;
+  TORCH_CHECK(row_tiles <= properties->maxGridSize[0]);
+  fp16_masked_head_sm70_kernel<8>
+      <<<dim3(row_tiles, 1940), 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<half*>(scores.data_ptr()),
+          reinterpret_cast<const half*>(input.data_ptr()),
+          reinterpret_cast<const half*>(weight.data_ptr()),
+          certified.data_ptr<int>(), input.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

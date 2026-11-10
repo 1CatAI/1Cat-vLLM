@@ -200,10 +200,24 @@ constexpr size_t kSm70PushNormBatchMetaBytes = 2048;
 static_assert(sizeof(Sm70PushNormBatchMeta) <= kSm70PushNormBatchMetaBytes);
 constexpr size_t kSm70PushNormBatchOffset =
     kSm70PushNormPacketOffset + kSm70PushNormMetaBytes;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70MtpNormOffset =
     kSm70PushNormBatchOffset + kSm70PushNormBatchMetaBytes +
     kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
         kSm70Tp4PushAllreduceM32Bytes;
+
+// MTP verifier batches keep independent epochs when the active row count
+// changes.
+constexpr int kSm70MtpNormRows = 64;
+constexpr size_t kSm70MtpNormMetaBytes = 4096;
+struct alignas(8) Sm70MtpNormMeta {
+  uint32_t generation[kSm70MtpNormRows];
+  uint64_t partial[kSm70MtpNormRows][4];
+};
+static_assert(sizeof(Sm70MtpNormMeta) <= kSm70MtpNormMetaBytes);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70MtpNormOffset + kSm70MtpNormMetaBytes +
+    kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
+        kSm70MtpNormRows * kSm70GemmaRmsNormHiddenSize * sizeof(half);
 
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
@@ -876,6 +890,21 @@ __global__ void __launch_bounds__(512, 1)
   sm70_pack32_barrier_at_end<ngpus>(sg, self_sg, rank);
 }
 
+// Match the per-partition accumulation order of the TP4 two-stage reduction.
+template <typename P, typename A>
+DINLINE P sm70_push_reduce_partition(P (&values)[4], int owner) {
+  switch (owner) {
+    case 1:
+      return sm70_push_reduce<P, 4, A, 1>(values);
+    case 2:
+      return sm70_push_reduce<P, 4, A, 2>(values);
+    case 3:
+      return sm70_push_reduce<P, 4, A, 3>(values);
+    default:
+      return sm70_push_reduce<P, 4, A>(values);
+  }
+}
+
 template <int ngpus, bool RotatedOrder = false>
 __global__ void __launch_bounds__(1024, 1)
     sm70_cross_device_reduce_1stage_push(RankData push_buffers,
@@ -936,19 +965,8 @@ __global__ void __launch_bounds__(1024, 1)
       // Match that FP32 addition order, including cancellation and signed zero.
       const int partition = offset / (packed_size / ngpus);
       const int owner = partition < ngpus ? partition : ngpus - 1;
-      switch (owner) {
-        case 1:
-          reduced = sm70_push_reduce<P, ngpus, A, 1>(peer_values);
-          break;
-        case 2:
-          reduced = sm70_push_reduce<P, ngpus, A, 2>(peer_values);
-          break;
-        case 3:
-          reduced = sm70_push_reduce<P, ngpus, A, 3>(peer_values);
-          break;
-        default:
-          reduced = sm70_push_reduce<P, ngpus, A>(peer_values);
-      }
+      static_assert(ngpus == 4);
+      reduced = sm70_push_reduce_partition<P, A>(peer_values, owner);
     } else {
       reduced = sm70_push_reduce<P, ngpus, A>(peer_values);
     }
@@ -1808,8 +1826,198 @@ using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 
-// All 40 CTAs fit on SM70. The row leader waits only for four local
-// partial reductions; no grid-wide synchronization is required.
+// Each rank reduces one quarter of a row and broadcasts the rounded sum.
+// Keep the reference rank order and eight-warp RMS variance tree.
+template <typename Weight, int Rank>
+__global__
+__launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
+    RankData buffers, const half* __restrict__ input,
+    const float* __restrict__ residual, const Weight* __restrict__ weight,
+    half* __restrict__ output, half* __restrict__ k16_output,
+    float* __restrict__ residual_out, const void* local_buffer, float epsilon,
+    bool rotated_order) {
+  constexpr int Width = 5120, Stride = kSm70MtpNormRows * Width / 8;
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const int pack = row * 640 + tid, column = tid * 8;
+  char* local = const_cast<char*>(reinterpret_cast<const char*>(local_buffer));
+  auto* meta = reinterpret_cast<volatile Sm70MtpNormMeta*>(local);
+  const uint32_t generation = meta->generation[row] + 1;
+  const int epoch = (generation & 1) * 4 * Stride;
+  char* data = local + kSm70MtpNormMetaBytes;
+  P own = reinterpret_cast<const P*>(input)[pack];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) sm70_push_escape_sentinel(own.data[i]);
+  const int owner = tid / 160;
+  if (owner != Rank) {
+    char* destination =
+        const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[owner])) +
+        kSm70MtpNormMetaBytes;
+    sm70_push_store_volatile_16b(
+        own, destination + (epoch + Rank * Stride) * sizeof(P), pack);
+  }
+  P empty;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    *reinterpret_cast<uint16_t*>(&empty.data[i]) =
+        kSm70Tp4PushAllreduceSentinel;
+  P sum;
+  if (owner == Rank) {
+    P peers[4];
+    while (true) {
+      bool missing = false;
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        if (peer == Rank) {
+          peers[peer] = own;
+        } else {
+          sm70_push_load_volatile_16b(
+              peers[peer], data + (epoch + peer * Stride) * sizeof(P), pack);
+#pragma unroll
+          for (int i = 0; i < 8; ++i)
+            missing |= sm70_push_is_sentinel(peers[peer].data[i]);
+        }
+      }
+      if (!missing) break;
+    }
+    if (rotated_order) {
+      const int partition_owner = pack / (gridDim.x * 160);
+      sum = sm70_push_reduce_partition<P, A>(peers, partition_owner);
+    } else {
+      sum = sm70_push_reduce<P, 4, A>(peers);
+    }
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      if (peer != Rank)
+        sm70_push_store_volatile_16b(
+            empty, data + (epoch + peer * Stride) * sizeof(P), pack);
+    }
+    P published = sum;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sm70_push_escape_sentinel(published.data[i]);
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      if (peer != Rank) {
+        char* destination = const_cast<char*>(reinterpret_cast<const char*>(
+                                buffers.ptrs[peer])) +
+                            kSm70MtpNormMetaBytes;
+        // The destination's own channel is unused by the scatter phase.
+        sm70_push_store_volatile_16b(
+            published, destination + (epoch + peer * Stride) * sizeof(P), pack);
+      }
+    }
+  } else {
+    while (true) {
+      sm70_push_load_volatile_16b(
+          sum, data + (epoch + Rank * Stride) * sizeof(P), pack);
+      bool missing = false;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) missing |= sm70_push_is_sentinel(sum.data[i]);
+      if (!missing) break;
+    }
+    sm70_push_store_volatile_16b(
+        empty, data + (epoch + Rank * Stride) * sizeof(P), pack);
+  }
+  const float4 ra = reinterpret_cast<const float4*>(residual)[pack * 2];
+  const float4 rb = reinterpret_cast<const float4*>(residual)[pack * 2 + 1];
+  const float rv[8] = {ra.x, ra.y, ra.z, ra.w, rb.x, rb.y, rb.z, rb.w};
+  float values[8];
+  __shared__ __align__(16) float shared_values[Width];
+  __shared__ float warp_sum[8];
+  __shared__ float inverse;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    values[i] = __fadd_rn(__half2float(sum.data[i]), rv[i]);
+  }
+  reinterpret_cast<float4*>(shared_values)[tid * 2] =
+      make_float4(values[0], values[1], values[2], values[3]);
+  reinterpret_cast<float4*>(shared_values)[tid * 2 + 1] =
+      make_float4(values[4], values[5], values[6], values[7]);
+  reinterpret_cast<float4*>(residual_out)[pack * 2] =
+      make_float4(values[0], values[1], values[2], values[3]);
+  reinterpret_cast<float4*>(residual_out)[pack * 2 + 1] =
+      make_float4(values[4], values[5], values[6], values[7]);
+  __syncthreads();
+  if (tid < 256) {
+    float v[24] = {};
+#pragma unroll
+    for (int chunk = 0; chunk < 3; ++chunk) {
+      int col = tid * 8 + chunk * 2048;
+      if (col < Width) {
+        float4 s0 = reinterpret_cast<const float4*>(shared_values + col)[0];
+        float4 s1 = reinterpret_cast<const float4*>(shared_values + col)[1];
+        v[chunk * 8] = s0.x;
+        v[chunk * 8 + 1] = s0.y;
+        v[chunk * 8 + 2] = s0.z;
+        v[chunk * 8 + 3] = s0.w;
+        v[chunk * 8 + 4] = s1.x;
+        v[chunk * 8 + 5] = s1.y;
+        v[chunk * 8 + 6] = s1.z;
+        v[chunk * 8 + 7] = s1.w;
+      }
+    }
+    float variance = __fmul_rn(v[1], v[1]);
+    variance = __fmaf_rn(v[0], v[0], variance);
+#pragma unroll
+    for (int i = 2; i < 16; ++i) variance = __fmaf_rn(v[i], v[i], variance);
+#pragma unroll
+    for (int i = 16; i < 24; ++i)
+      variance = __fadd_rn(__fmul_rn(v[i], v[i]), variance);
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+      variance =
+          __fadd_rn(variance, __shfl_xor_sync(0xffffffff, variance, offset));
+    if ((tid & 31) == 0) warp_sum[tid / 32] = variance;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float partial[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      partial[i] = __fadd_rn(warp_sum[i], warp_sum[i + 4]);
+    float total = __fadd_rn(__fadd_rn(partial[0], partial[2]),
+                            __fadd_rn(partial[1], partial[3]));
+    float mean = __fmaf_rn(total, 1.0f / Width, epsilon), inv;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(mean));
+    inverse = inv;
+    meta->generation[row] = generation;
+  }
+  __syncthreads();
+  float weights[8];
+  if constexpr (std::is_same_v<Weight, float>) {
+    float4 w0 = reinterpret_cast<const float4*>(weight + column)[0];
+    float4 w1 = reinterpret_cast<const float4*>(weight + column)[1];
+    weights[0] = w0.x;
+    weights[1] = w0.y;
+    weights[2] = w0.z;
+    weights[3] = w0.w;
+    weights[4] = w1.x;
+    weights[5] = w1.y;
+    weights[6] = w1.z;
+    weights[7] = w1.w;
+  } else {
+    P packed_weight = reinterpret_cast<const P*>(weight)[tid];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      weights[i] = __half2float(packed_weight.data[i]);
+  }
+  P normalized;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    float w = weights[i] + 1.0f;
+    normalized.data[i] =
+        __float2half_rn(__fmul_rn(__fmul_rn(values[i], inverse), w));
+  }
+  reinterpret_cast<P*>(output)[pack] = normalized;
+  if (k16_output != nullptr) {
+    const size_t packed_offset =
+        (static_cast<size_t>(tid >> 1) * gridDim.x + row) * 2 + (tid & 1);
+    reinterpret_cast<P*>(k16_output)[packed_offset] = normalized;
+  }
+}
+
+// The eight-row DFlash route uses five CTAs per row.
 template <typename WeightT, bool Reference = false>
 __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
     vllm::RankData buffers, const half* input, const float* residual,
@@ -2362,9 +2570,13 @@ class CustomAllreduce {
     auto* batch_data = static_cast<char*>(ptrs[rank_]) +
                        kSm70PushNormBatchOffset + kSm70PushNormBatchMetaBytes;
     CUDACHECK(cudaMemset(batch_data, kSm70Tp4PushAllreduceSentinelByte,
-                         kSm70Tp4PushAllreduceBufferBytes -
-                             kSm70PushNormBatchOffset -
+                         kSm70MtpNormOffset - kSm70PushNormBatchOffset -
                              kSm70PushNormBatchMetaBytes));
+    auto* mtp_data = static_cast<char*>(ptrs[rank_]) + kSm70MtpNormOffset +
+                     kSm70MtpNormMetaBytes;
+    CUDACHECK(cudaMemset(mtp_data, kSm70Tp4PushAllreduceSentinelByte,
+                         kSm70Tp4PushAllreduceBufferBytes - kSm70MtpNormOffset -
+                             kSm70MtpNormMetaBytes));
     sm70_tp4_push_buffers_registered_ = true;
   }
 
@@ -2656,6 +2868,11 @@ class CustomAllreduce {
            fully_connected_ && sm70_tp4_push_buffers_registered_;
   }
 
+  bool sm70_push_norm_mtp_ready(int num_tokens) const {
+    return num_tokens >= 1 && num_tokens <= kSm70MtpNormRows &&
+           fully_connected_ && sm70_tp4_push_buffers_registered_;
+  }
+
   template <int ngpus, typename ResidualT, typename WeightT>
   void sm70_allreduce_gemma_rms_norm(
       cudaStream_t stream, half* input, const ResidualT* residual,
@@ -2680,18 +2897,77 @@ class CustomAllreduce {
     }
 
     if constexpr (ngpus == 4 && std::is_same_v<ResidualT, float>) {
+      if (!benchmark_reference && sm70_push_norm_mtp_ready(num_tokens)) {
+        const char* algorithm =
+            policy_.raw(CollectivePolicyField::custom_allreduce_algo);
+        bool rotated_order =
+            static_cast<size_t>(num_tokens) * hidden_size * sizeof(half) >=
+            512 * 1024;
+        if (algorithm != nullptr) {
+          if (std::strcmp(algorithm, "1stage") == 0 ||
+              std::strcmp(algorithm, "oneshot") == 0) {
+            rotated_order = false;
+          } else if (std::strcmp(algorithm, "2stage") == 0 ||
+                     std::strcmp(algorithm, "twoshot") == 0) {
+            rotated_order = true;
+          } else {
+            throw std::runtime_error("Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: " +
+                                     std::string(algorithm));
+          }
+        }
+        RankData mtp_buffers{};
+        for (int peer = 0; peer < 4; ++peer) {
+          mtp_buffers.ptrs[peer] =
+              static_cast<const char*>(sm70_tp4_push_buffers_.ptrs[peer]) +
+              kSm70MtpNormOffset;
+        }
+        switch (rank_) {
+          case 0:
+            sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 0>
+                <<<num_tokens, 640, 0, stream>>>(
+                    mtp_buffers, input, residual, weight, normalized_out,
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
+            break;
+          case 1:
+            sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 1>
+                <<<num_tokens, 640, 0, stream>>>(
+                    mtp_buffers, input, residual, weight, normalized_out,
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
+            break;
+          case 2:
+            sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 2>
+                <<<num_tokens, 640, 0, stream>>>(
+                    mtp_buffers, input, residual, weight, normalized_out,
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
+            break;
+          case 3:
+            sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 3>
+                <<<num_tokens, 640, 0, stream>>>(
+                    mtp_buffers, input, residual, weight, normalized_out,
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
+            break;
+        }
+        return;
+      }
       if (num_tokens == kSm70PushNormRows && fully_connected_ &&
           sm70_tp4_push_buffers_registered_) {
+        const int blocks = num_tokens * kSm70PushNormParts;
         if (benchmark_reference) {
           sm70_push_allreduce_gemma_rms_norm<WeightT, true>
-              <<<40, 128, 0, stream>>>(
+              <<<blocks, 128, 0, stream>>>(
                   sm70_tp4_push_buffers_, input, residual, weight,
                   normalized_out, residual_out, rank_,
                   sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
         } else {
-          sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
-              sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
-              residual_out, rank_, sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
+          sm70_push_allreduce_gemma_rms_norm<WeightT>
+              <<<blocks, 128, 0, stream>>>(
+                  sm70_tp4_push_buffers_, input, residual, weight,
+                  normalized_out, residual_out, rank_,
+                  sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
         }
         return;
       }

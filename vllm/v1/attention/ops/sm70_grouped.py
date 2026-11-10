@@ -182,6 +182,9 @@ def grouped_fp32_reason(
     parent_seq = None if explicit else getattr(metadata, "seq_lens", None)
     groups = parent.shape[0] if parent is not None and parent.ndim == 2 else 0
     rows = q.shape[0] if q.ndim == 3 else 0
+    operator = getattr(instance, contract.operator_attr, None)
+    request_query_rows = getattr(operator, "request_query_rows", (GROUP_ROWS,))
+    max_groups = getattr(operator, "max_batch_size", contract.max_groups)
     if explicit and (
         not 1 <= groups <= contract.max_groups or rows != groups * GROUP_ROWS
     ):
@@ -189,7 +192,11 @@ def grouped_fp32_reason(
     # Preserve the native revision query, including its legacy eager evaluation
     # for batched request metadata before the operator/policy guards.
     batch_supported = True
-    if contract.batch_revision is not None and groups > 1:
+    if (
+        contract.batch_revision is not None
+        and groups > 1
+        and not hasattr(operator, "request_query_rows")
+    ):
         module_name, function_name, revision = contract.batch_revision
         capability = _import_symbol(module_name, function_name)
         batch_supported = capability(revision)
@@ -211,13 +218,31 @@ def grouped_fp32_reason(
         return "causal_or_window"
     if parent is None or parent.ndim != 2:
         return "request_metadata"
-    if not 1 <= groups <= contract.max_groups:
+    if not 1 <= groups <= max_groups:
         return "request_group_count"
     if not (
         (groups == 1 and 2 <= rows <= GROUP_ROWS)
-        or (groups > 1 and rows == groups * GROUP_ROWS)
+        or (groups > 1 and rows % groups == 0 and rows // groups in request_query_rows)
     ):
         return "query_rows"
+    if groups > 1 and (
+        hasattr(operator, "request_query_rows") or rows != groups * GROUP_ROWS
+    ):
+        starts = getattr(metadata, "query_start_loc_cpu", None)
+        # Runtime-packed batches must retain request boundaries. CUDA graph
+        # capture supplies these CPU starts before replay; ragged eager input
+        # keeps the existing general fallback until explicitly packed.
+        if (
+            starts is None
+            or starts.device.type != "cpu"
+            or starts.numel() < groups + 1
+            or int(starts[0]) != 0
+            or int(starts[groups]) != rows
+            or not bool(
+                (starts[1 : groups + 1] - starts[:groups] == rows // groups).all()
+            )
+        ):
+            return "request_query_layout"
     if (
         q.shape[1:] != (contract.query_heads, 256)
         if contract.query_heads is not None

@@ -188,3 +188,69 @@ register_policy_op(
     _dispatch,
     _dispatch_fake,
 )
+
+
+def _bundled_down_dispatch(
+    out,
+    x,
+    codes,
+    bundled_scales,
+    tm_weight,
+    scales,
+    global_scale,
+    split_k,
+    accumulator_chains,
+    tm_scales,
+    group_size,
+    k_ld,
+    q_ld,
+    gated_silu,
+    min_prefill_m,
+    prescaled_scales,
+    native_policy=None,
+):
+    if 1 <= x.shape[0] <= 8 and not gated_silu:
+        sm70_ops.nvfp4_qpn2_gemm_sm70_out(
+            out,
+            x,
+            codes,
+            bundled_scales,
+            global_scale,
+            split_k,
+            accumulator_chains,
+            native_policy=native_policy,
+        )
+        return
+    sm70_ops.nvfp4_qpn2_tm_dispatch_sm70_out(
+        out,
+        x,
+        tm_weight,
+        scales,
+        global_scale,
+        split_k,
+        accumulator_chains,
+        tm_scales,
+        group_size,
+        k_ld,
+        q_ld,
+        gated_silu,
+        min_prefill_m,
+        prescaled_scales,
+        native_policy=native_policy,
+    )
+
+
+def _bundled_down_dispatch_fake(*args, **kwargs):
+    return None
+
+
+register_policy_op(
+    "sm70_nvfp4_bundled_down_dispatch",
+    "(Tensor(a!) out, Tensor x, Tensor codes, Tensor bundled_scales, "
+    "Tensor tm_weight, Tensor scales, float global_scale, int split_k, "
+    "int accumulator_chains, Tensor tm_scales, int group_size, int k_ld, "
+    "int q_ld, bool gated_silu, int min_prefill_m, bool prescaled_scales, "
+    "str[]? native_policy=None) -> ()",
+    _bundled_down_dispatch,
+    _bundled_down_dispatch_fake,
+)

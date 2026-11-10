@@ -24,6 +24,9 @@ from vllm.model_executor.kernels.linear.qpn.fp8 import (
     _missing_sm70_fp8_qpn8_ops,
     _try_sm70_fp8_prescaled_decode_scales,
 )
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
+    dispatch_channel_rows as _sm70_ct_fp8_qpn8_dispatch,
+)
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
@@ -51,38 +54,6 @@ from vllm.platforms import current_platform
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 logger = init_logger(__name__)
-
-
-def _sm70_ct_fp8_qpn8_dispatch(
-    out: torch.Tensor,
-    x: torch.Tensor,
-    codes: torch.Tensor,
-    scales: torch.Tensor,
-    split_k: int,
-    accumulator_chains: int,
-    prefetch_codes: bool,
-    gated_silu: bool,
-    native_policy: list[str] | None = None,
-) -> None:
-    # Resolve scratch storage inside the opaque op. Passing its data_ptr as an
-    # integer from apply_weights embeds a process-local address in AOT artifacts.
-    # Weight preparation already reserves this shared, bounded workspace.
-    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
-    if workspace is None:
-        raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
-    call_native(
-        sm70_ops.fp8_qpn8_dispatch_sm70_out,
-        native_policy,
-        out,
-        workspace.data_ptr(),
-        x,
-        codes,
-        scales,
-        split_k,
-        accumulator_chains,
-        prefetch_codes,
-        gated_silu,
-    )
 
 
 def _sm70_ct_fp8_qpn8_dispatch_fake(

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SM70 single-request verifier convolution, gating and output initialization."""
+"""SM70 verifier convolution, gating and output initialization across requests."""
 
 import torch
 
@@ -25,6 +25,8 @@ def _conv_gate_zero_kernel(
     B,
     Bias,
     Core,
+    BATCH,
+    INDEX_STRIDE: tl.constexpr,
     X_ROW: tl.constexpr,
     W_ROW: tl.constexpr,
     W_COL: tl.constexpr,
@@ -38,19 +40,21 @@ def _conv_gate_zero_kernel(
     NP2_STATE: tl.constexpr,
     CHANNEL_TILE: tl.constexpr,
 ):
+    request = tl.program_id(0)
     feature = tl.program_id(1) * CHANNEL_TILE + tl.arange(0, CHANNEL_TILE)
     token = tl.arange(0, BLOCK_TOKENS)
+    row = request * TOKENS + token
     # The old allocation zeroes padded output rows too. Keep that contract,
     # including invalid state slots, before the convolution's early returns.
     tl.store(
-        Core + token[:, None] * 1536 + feature[None, :],
+        Core + row[:, None] * 1536 + feature[None, :],
         0,
         (token[:, None] < TOKENS) & (feature[None, :] < 1536),
     )
     if tl.program_id(1) < TOKENS:
         head = tl.arange(0, 16)
         mask = head < 12
-        offset = tl.program_id(1) * 12 + head
+        offset = (request * TOKENS + tl.program_id(1)) * 12 + head
         a_log = tl.load(ALog + head, mask=mask, other=0)
         a = tl.load(A + offset, mask=mask, other=0)
         b = tl.load(B + offset, mask=mask, other=0)
@@ -73,7 +77,7 @@ def _conv_gate_zero_kernel(
         None,
         None,
         X,
-        1,
+        BATCH,
         2560,
         TOKENS,
         STATE_LENGTH,
@@ -86,7 +90,7 @@ def _conv_gate_zero_kernel(
         STATE_SEQ,
         STATE_DIM,
         STATE_TOKEN,
-        1,
+        INDEX_STRIDE,
         0,
         1,
         X_ROW,
@@ -118,22 +122,24 @@ def conv_gate_zero(
     channel_tile=64,
     num_warps=2,
 ):
-    """Exact-shape entry; dispatch proves the verifier and state layouts."""
-    tokens = qkv.shape[0]
-    assert tokens in (5, 8) and qkv.shape == (tokens, 2560) and qkv.stride(1) == 1
+    """Dispatch proves a complete verifier batch and its state layouts."""
+    rows = qkv.shape[0]
+    batch = state_indices.numel()
+    assert batch > 0 and rows % batch == 0
+    tokens = rows // batch
+    assert 1 <= tokens <= 8 and qkv.shape == (rows, 2560) and qkv.stride(1) == 1
     assert qkv.dtype == state.dtype == weight.dtype == torch.float16
     assert weight.shape == (2560, 4)
-    assert core_out.shape == (tokens, 12, 128) and core_out.is_contiguous()
+    assert core_out.shape == (rows, 12, 128) and core_out.is_contiguous()
     assert state.shape[1] == 2560 and state.shape[2] >= tokens + 2
-    assert (
-        a.shape == b.shape == (tokens, 12) and a.is_contiguous() and b.is_contiguous()
-    )
-    assert state_indices.shape == accepted.shape == (1,) and cu.shape == (2,)
+    assert a.shape == b.shape == (rows, 12) and a.is_contiguous() and b.is_contiguous()
+    assert state_indices.shape == accepted.shape == (batch,)
+    assert cu.shape == (batch + 1,) and accepted.is_contiguous() and cu.is_contiguous()
     # Match causal_conv1d_update: speculative history uses width-1 plus
     # tokens-1 entries even when the physical cache has a longer stride.
-    g = torch.empty((1, tokens, 12), dtype=torch.float32, device=qkv.device)
+    g = torch.empty((1, rows, 12), dtype=torch.float32, device=qkv.device)
     beta = torch.empty_like(g)
-    _conv_gate_zero_kernel[(1, triton.cdiv(2560, channel_tile))](
+    _conv_gate_zero_kernel[(batch, triton.cdiv(2560, channel_tile))](
         qkv,
         weight,
         state,
@@ -147,6 +153,8 @@ def conv_gate_zero(
         b,
         bias,
         core_out,
+        batch,
+        state_indices.stride(0),
         qkv.stride(0),
         *weight.stride(),
         *state.stride(),

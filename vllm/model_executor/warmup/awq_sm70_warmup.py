@@ -129,19 +129,22 @@ def _load_lut_cache(device: torch.device, skip_import: bool = False) -> int:
     path = _resolve_lut_path(device)
     if path is None or not hasattr(torch.ops._C, "sm70_gemm_import_cache"):
         return 0
-    if skip_import:
-        logger.info(
-            "Skipping SM70 GEMM LUT import for dynamic quant dispatch "
-            "(path=%s, device=%s).",
-            path,
-            device,
-        )
-        return 0
     if not Path(path).exists():
         logger.info("No SM70 GEMM LUT cache found at %s for device %s.", path, device)
         return 0
     device_hint = torch.empty(0, dtype=torch.uint8, device=device)
     try:
+        # Restore recorded split-K choices from an explicitly supplied table
+        # for the effective policy. Shape coverage can still grow unless tuning
+        # is frozen. Untagged or mismatched tables keep dynamic warmup behavior.
+        if skip_import and not sm70_native_cache.has_matching_policy_cache(path):
+            logger.info(
+                "Skipping SM70 GEMM LUT import for dynamic quant dispatch "
+                "(path=%s, device=%s).",
+                path,
+                device,
+            )
+            return 0
         return int(sm70_native_cache.import_cache(device_hint, path))
     except Exception as exc:
         logger.warning("SM70 GEMM LUT import failed from %s (%s).", path, exc)

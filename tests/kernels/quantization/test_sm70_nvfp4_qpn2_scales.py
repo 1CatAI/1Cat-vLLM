@@ -6,6 +6,88 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("rows", [5, 40])
+@pytest.mark.parametrize("native_policy", [("policy-token",), ["policy-token"]])
+def test_bundled_down_preserves_wrapper_policy(rows, native_policy, monkeypatch):
+    from vllm.model_executor.layers.quantization.utils import sm70_nvfp4_native
+
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(kwargs["native_policy"])
+
+    name = (
+        "nvfp4_qpn2_gemm_sm70_out" if rows <= 8 else "nvfp4_qpn2_tm_dispatch_sm70_out"
+    )
+    monkeypatch.setattr(sm70_nvfp4_native.sm70_ops, name, record)
+    x = torch.empty(rows, 4352, dtype=torch.float16)
+    out = torch.empty(rows, 5120, dtype=torch.float16)
+    codes = torch.empty(0, dtype=torch.uint8)
+    scales = torch.empty(0, dtype=torch.float16)
+    sm70_nvfp4_native._bundled_down_dispatch(
+        out,
+        x,
+        codes,
+        codes,
+        codes,
+        codes,
+        0.001,
+        16,
+        2,
+        scales,
+        16,
+        0,
+        0,
+        False,
+        0,
+        False,
+        native_policy,
+    )
+    assert len(calls) == 1 and calls[0] is native_policy
+
+
+@pytest.mark.parametrize("global_scale", [2**-20, 0.000502813432831, 0.5])
+def test_shared_mtp_gate_preserves_scale_range(global_scale):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    import vllm._C  # noqa: F401
+
+    n, k = 8704, 5120
+    logical = torch.arange(n * k, device="cuda").remainder(16).byte().reshape(n, k)
+    packed = logical[:, ::2] | (logical[:, 1::2] << 4)
+    raw = torch.tensor([0, 2**-9, 0.5, 1.5, 7, 24, 192, 448], device="cuda")
+    raw = raw.to(torch.float8_e4m3fn).repeat(n, k // 128)
+    _, scales = torch.ops._C.nvfp4_qpn2_prepare_sm70(packed, raw)
+    tm, tm_scales, meta = torch.ops._C.nvfp4_sm70_prepare(
+        logical.T.contiguous(),
+        (raw.float() * global_scale).half().T.contiguous(),
+        16,
+        False,
+    )
+    padded = torch.zeros(8, k, device="cuda", dtype=torch.float16)
+    padded[torch.arange(5), torch.arange(5) * 17] = 1
+    outputs = []
+    for rows in (8, 5):
+        out = torch.empty(rows, n // 2, device="cuda", dtype=torch.float16)
+        torch.ops._C.nvfp4_qpn2_tm_dispatch_sm70_out(
+            out,
+            padded[:rows],
+            tm,
+            scales,
+            global_scale,
+            8,
+            2,
+            tm_scales,
+            16,
+            int(meta[0]),
+            int(meta[1]),
+            True,
+            0,
+        )
+        outputs.append(out)
+    assert torch.equal(outputs[0][:5].view(torch.int16), outputs[1].view(torch.int16))
+
+
 @pytest.mark.parametrize(
     "global_scale", [0.000156947542564, 0.000502813432831, 2**-20, 0.5]
 )

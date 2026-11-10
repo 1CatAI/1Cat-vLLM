@@ -731,6 +731,11 @@ class VllmConfig:
         if is_mrv2_dflash or has_draft_vocab:
             return True
 
+        # The model adapter qualifies its speculative metadata, graphs and
+        # sampling contract before selecting the runner.
+        if self.kernel_config.prefer_speculative_runner(self):
+            return True
+
         if not self._is_default_v2_model_runner_model():
             return False
 
@@ -1147,6 +1152,8 @@ class VllmConfig:
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
+
+        self.kernel_config.resolve_speculative_defaults(self)
 
         if self.kernel_config.resolve_attention_history(self):
             policy = self.kernel_config

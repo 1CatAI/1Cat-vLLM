@@ -725,6 +725,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "packed, Tensor weight, int tile, int warps) -> ()");
   ops.impl("sm70_dflash2_fp16_dispatch_out", torch::kCUDA,
            &sm70_dflash2_fp16_dispatch_out);
+  ops.def(
+      "sm70_fp16_candidate_scores_out(Tensor(a!) scores, Tensor input, "
+      "Tensor weight, Tensor ids) -> ()");
+  ops.impl("sm70_fp16_candidate_scores_out", torch::kCUDA,
+           &sm70_fp16_candidate_scores_out);
+  ops.def(
+      "sm70_fp16_masked_head_out(Tensor(a!) scores, Tensor input, "
+      "Tensor weight, Tensor certified) -> ()");
+  ops.impl("sm70_fp16_masked_head_out", torch::kCUDA,
+           &sm70_fp16_masked_head_out);
 
   ops.def(
       "fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales, str? "
@@ -780,6 +790,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> ()");
   ops.impl("fp8_qpn8_dispatch_ba_split_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&fp8_qpn8_dispatch_ba_split_sm70_out));
+  // Capability-bearing alias keeps source overlays on older wheels padded.
+  ops.def(
+      "fp8_qpn8_dispatch_ba_masked_sm70_out(Tensor(a!) qkv_out, Tensor(b!) "
+      "z_out, Tensor(c!) b_out, Tensor(d!) a_out, Tensor(e!) qkvz_staging, "
+      "Tensor(f!) ba_staging, int dense_weight_ptr, Tensor input, Tensor "
+      "codes, Tensor group_scales, Tensor ba_weight, str? native_policy=None "
+      ") -> ()");
+  ops.impl("fp8_qpn8_dispatch_ba_masked_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&fp8_qpn8_dispatch_ba_masked_sm70_out));
 
   ops.def(
       "fp8_qpn8_gated_pair_sm70_out(Tensor(a!) out, Tensor input, "
@@ -1666,6 +1685,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "residual, Tensor weight, Tensor! normalized_out, Tensor! residual_out, "
       "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
   custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm", torch::kCUDA,
+                 &sm70_tp4_all_reduce_gemma_rms_norm);
+  custom_ar.def(
+      "sm70_tp4_all_reduce_gemma_rms_norm_mtp(int fa, Tensor inp, Tensor "
+      "residual, Tensor weight, Tensor! normalized_out, Tensor! residual_out, "
+      "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
+  custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm_mtp", torch::kCUDA,
                  &sm70_tp4_all_reduce_gemma_rms_norm);
   custom_ar.def(
       "sm70_tp4_all_reduce_gemma_rms_norm_reference(int fa, Tensor inp, Tensor "

@@ -110,9 +110,10 @@ def _hash_subject(method, policy):
         sampling_policy=SpeculativeSamplingPolicy(),
         mtp_expert_quantization=None,
         draft_model_config=None,
+        draft_token_map=None,
         use_dflash_family=lambda: method == "dflash",
         use_dspark=lambda: False,
-        use_dflash_ddtree=lambda: False,
+        uses_tree_verification=lambda: False,
     )
 
 
@@ -134,8 +135,20 @@ def test_graph_options_affect_dflash_hash_and_ignore_unused_mtp_policy(field):
 @pytest.mark.parametrize(
     "rows,dtype,qkv,z,ba,reason",
     (
+        (5, torch.float16, 2560, 1536, 12, None),
         (8, torch.float16, 2560, 1536, 12, None),
-        (4, torch.float16, 2560, 1536, 12, "query_rows"),
+        (10, torch.float16, 2560, 1536, 12, None),
+        (15, torch.float16, 2560, 1536, 12, None),
+        (20, torch.float16, 2560, 1536, 12, None),
+        (25, torch.float16, 2560, 1536, 12, None),
+        (30, torch.float16, 2560, 1536, 12, None),
+        (35, torch.float16, 2560, 1536, 12, None),
+        (40, torch.float16, 2560, 1536, 12, None),
+        (4, torch.float16, 2560, 1536, 12, None),
+        (33, torch.float16, 2560, 1536, 12, None),
+        (0, torch.float16, 2560, 1536, 12, "query_rows"),
+        (41, torch.float16, 2560, 1536, 12, "query_rows"),
+        (45, torch.float16, 2560, 1536, 12, "query_rows"),
         (8, torch.bfloat16, 2560, 1536, 12, "dtype"),
         (8, torch.float16, 5120, 3072, 24, "local_tail_layout"),
     ),

@@ -22,6 +22,9 @@ from vllm.platforms import current_platform
         (8, 0, 1, 0, 4096, 10),
         (8, -1, 4, 8, 2560, 10),
         (8, -1, 8, 4, 4096, 10),
+        (1, 0, 1, 1, 2560, 3),
+        (3, 0, 2, 3, 4096, 5),
+        (7, -1, 5, 4, 2560, 9),
         (5, 0, 1, 5, 2560, 7),
         (5, 0, 5, 5, 4096, 7),
         (5, 0, 4, 3, 2560, 10),
@@ -87,17 +90,21 @@ def test_conv_gate_zero(tokens, slot, accepted, length, row_stride, state_length
 @pytest.mark.skipif(
     not current_platform.is_device_capability(70), reason="SM70 verifier"
 )
-def test_single_request_in_padded_metadata():
+@pytest.mark.parametrize("tokens", [1, 3, 5, 7, 8])
+@pytest.mark.parametrize("batch", [1, 2, 3, 8])
+def test_requests_in_padded_metadata(tokens, batch):
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         QwenGatedDeltaNetAttention,
     )
 
-    qkv = torch.empty(8, 2560, device="cuda", dtype=torch.float16)
-    a = torch.empty(8, 12, device="cuda", dtype=torch.float16)
+    rows = batch * tokens
+    padded_requests = batch + 3
+    qkv = torch.empty(rows, 2560, device="cuda", dtype=torch.float16)
+    a = torch.empty(rows, 12, device="cuda", dtype=torch.float16)
     b = torch.empty_like(a)
-    state = torch.empty(1, 10, 2560, device="cuda", dtype=torch.float16).transpose(
+    state = torch.empty(batch, 10, 2560, device="cuda", dtype=torch.float16).transpose(
         -1, -2
     )
     layer = SimpleNamespace(
@@ -117,27 +124,35 @@ def test_single_request_in_padded_metadata():
     metadata = SimpleNamespace(
         num_prefills=0,
         num_decodes=0,
-        num_spec_decodes=1,
-        num_actual_tokens=8,
-        spec_sequence_masks=torch.empty(8, device="cuda", dtype=torch.bool),
+        num_spec_decodes=batch,
+        num_actual_tokens=rows,
+        spec_sequence_masks=torch.empty(
+            padded_requests, device="cuda", dtype=torch.bool
+        ),
         ddtree_parent_ids=None,
-        spec_query_start_loc=torch.empty(9, device="cuda", dtype=torch.int32),
-        spec_state_indices_tensor=torch.empty(8, 8, device="cuda", dtype=torch.int32),
-        spec_state_slot_selectors=torch.empty(8, device="cuda", dtype=torch.int32),
+        spec_query_start_loc=torch.empty(
+            padded_requests + 1, device="cuda", dtype=torch.int32
+        ),
+        spec_state_indices_tensor=torch.empty(
+            padded_requests, tokens, device="cuda", dtype=torch.int32
+        ),
+        spec_state_slot_selectors=torch.empty(
+            padded_requests, device="cuda", dtype=torch.int32
+        ),
     )
     can_use = QwenGatedDeltaNetAttention._can_use_sm70_gdn_preprocess
     assert can_use(layer, qkv, a, b, state, metadata)
-    metadata.num_spec_decodes = 2
+    metadata.num_spec_decodes = batch + 1
     assert not can_use(layer, qkv, a, b, state, metadata)
-    metadata.num_spec_decodes = 1
-    metadata.num_actual_tokens = 4
+    metadata.num_spec_decodes = batch
+    metadata.num_actual_tokens = rows - 1
     assert not can_use(layer, qkv, a, b, state, metadata)
 
 
 @pytest.mark.skipif(
     not current_platform.is_device_capability(70), reason="SM70 verifier"
 )
-@pytest.mark.parametrize("tokens", [5, 8])
+@pytest.mark.parametrize("tokens", [1, 3, 5, 7, 8])
 def test_conv_gate_zero_changed_metadata_graph(tokens):
     torch.manual_seed(23)
     raw = torch.randn(tokens, 4096, device="cuda", dtype=torch.float16) * 0.1
@@ -184,6 +199,93 @@ def test_conv_gate_zero_changed_metadata_graph(tokens):
         candidate.copy_(raw[:, :2560])
         reference_state.copy_(original.transpose(-1, -2))
         candidate_state.copy_(original.transpose(-1, -2))
+        out.fill_(float("nan"))
+        causal_conv1d_update(
+            reference,
+            reference_state,
+            weight,
+            None,
+            "silu",
+            conv_state_indices=slots,
+            num_accepted_tokens=counts,
+            query_start_loc=cu,
+            max_query_len=tokens,
+            validate_data=False,
+        )
+        g, beta = fused_gdn_gating(a_log, a, b, bias, beta_dtype=torch.float32)
+        graph.replay()
+        assert torch.equal(reference.view(torch.int16), candidate.view(torch.int16))
+        assert torch.equal(
+            reference_state.view(torch.int16), candidate_state.view(torch.int16)
+        )
+        assert torch.equal(g.view(torch.int32), candidate_g.view(torch.int32))
+        assert torch.equal(beta.view(torch.int32), candidate_beta.view(torch.int32))
+        assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(70), reason="SM70 verifier"
+)
+@pytest.mark.parametrize("tokens", [1, 3, 5, 8])
+@pytest.mark.parametrize("batch", [2, 3, 8, 32])
+def test_conv_gate_zero_request_isolation_and_graph(batch, tokens):
+    torch.manual_seed(29)
+    rows = batch * tokens
+    raw = torch.randn(rows, 4096, device="cuda", dtype=torch.float16) * 0.1
+    reference, candidate = raw.clone()[:, :2560], raw.clone()[:, :2560]
+    original_state = (
+        torch.randn(batch + 2, tokens + 4, 2560, device="cuda", dtype=torch.float16)
+        * 0.1
+    )
+    reference_state = original_state.clone().transpose(-1, -2)
+    candidate_state = original_state.clone().transpose(-1, -2)
+    weight = torch.randn(2560, 4, device="cuda", dtype=torch.float16) * 0.1
+    a, b = [torch.randn(rows, 12, device="cuda", dtype=torch.float16) for _ in range(2)]
+    a_log, bias = torch.randn(12, device="cuda"), torch.randn(12, device="cuda")
+    index_storage = torch.zeros(batch, tokens, device="cuda", dtype=torch.int32)
+    slots = index_storage[:, 0]
+    slots.copy_(torch.randperm(batch, device="cuda").int())
+    counts = torch.arange(batch, device="cuda", dtype=torch.int32) % tokens + 1
+    lengths = torch.full((batch,), tokens, device="cuda", dtype=torch.int32)
+    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * tokens
+    out = torch.empty(rows, 12, 128, device="cuda", dtype=torch.float16)
+
+    def run():
+        return conv_gate_zero(
+            candidate,
+            candidate_state,
+            weight,
+            slots,
+            counts,
+            cu,
+            a_log,
+            a,
+            b,
+            bias,
+            out,
+        )
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _, candidate_g, candidate_beta = run()
+    for phase in ("full", "shortened", "invalid_slot"):
+        if phase == "shortened":
+            lengths[::2] = 0
+            lengths[1::2] = tokens - 1
+            counts.fill_(tokens)
+        elif phase == "invalid_slot":
+            lengths.fill_(tokens)
+            slots[-1] = -1
+        cu[0] = 0
+        cu[1:] = lengths.cumsum(0)
+        a.add_(0.125)
+        b.mul_(0.875)
+        reference.copy_(raw[:, :2560])
+        candidate.copy_(raw[:, :2560])
+        reference_state.copy_(original_state.transpose(-1, -2))
+        candidate_state.copy_(original_state.transpose(-1, -2))
         out.fill_(float("nan"))
         causal_conv1d_update(
             reference,
