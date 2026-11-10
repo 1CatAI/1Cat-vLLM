@@ -3,16 +3,15 @@
 """Inference-only Qwen3_5 MTP model."""
 
 import copy
-import os
 import typing
 from collections.abc import Callable, Iterable
 
 import torch
 from torch import nn
 
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.execution_policy import layer_policy
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -58,8 +57,9 @@ _SM70_MTP_DENSE_F16_SUFFIXES = {
 }
 
 
-def _parse_sm70_mtp_dense_f16_allowlist() -> set[str]:
-    raw = envs.VLLM_SM70_MTP_DENSE_F16_ALLOWLIST
+def _parse_sm70_mtp_dense_f16_allowlist(policy=None) -> set[str]:
+    policy = layer_policy() if policy is None else policy
+    raw = policy.mtp_dense_allowlist
     if raw is None:
         return set(_SM70_MTP_DENSE_F16_SUFFIXES)
     lowered = raw.strip().lower()
@@ -68,11 +68,12 @@ def _parse_sm70_mtp_dense_f16_allowlist() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
-def _mark_sm70_mtp_dense_f16_modules(model: nn.Module) -> None:
-    if not envs.VLLM_SM70_MTP_DENSE_F16_FASTPATH:
+def _mark_sm70_mtp_dense_f16_modules(model: nn.Module, policy=None) -> None:
+    policy = layer_policy() if policy is None else policy
+    if not policy.value("mtp_dense_fastpath"):
         return
 
-    suffixes = _parse_sm70_mtp_dense_f16_allowlist()
+    suffixes = _parse_sm70_mtp_dense_f16_allowlist(policy)
     if not suffixes:
         return
 
@@ -123,10 +124,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = model_config.hf_text_config
 
         self.config = config
+        self._runtime_trace = vllm_config.observability_config.runtime_trace
 
         self.vocab_size = config.vocab_size
 
-        if envs.VLLM_DEBUG_MTP_LOAD:
+        if self._runtime_trace.value("mtp_load"):
             logger.warning(
                 "Qwen3_5MultiTokenPredictor init quant_config=%s",
                 type(quant_config).__name__ if quant_config is not None else "None",
@@ -183,7 +185,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.pre_fc_norm_embedding = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        _mark_sm70_mtp_dense_f16_modules(self)
+        _mark_sm70_mtp_dense_f16_modules(self, layer_policy(vllm_config))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -396,13 +398,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
-        if envs.VLLM_DEBUG_MTP_LOAD:
+        if self._runtime_trace.value("mtp_load"):
             logger.warning(
                 "Qwen3_5MultiTokenPredictor loaded %d tensors into %d params",
                 len(loaded_params),
                 len(params_dict),
             )
-            if envs.VLLM_DEBUG_MTP_LOAD_VERBOSE:
+            if self._runtime_trace.value("mtp_load_verbose"):
                 missing_params = sorted(set(params_dict.keys()) - loaded_params)
                 if missing_params:
                     logger.warning(
@@ -476,11 +478,10 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
             )
 
         self.quant_config = vllm_config.quant_config
-        self.share_target_io_weights = (
-            os.getenv("VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS", "1") != "0"
-        )
+        policy = layer_policy(vllm_config)
+        self.share_target_io_weights = policy.mtp_share_io_weights
         mtp_vllm_config = vllm_config
-        keep_quant = os.getenv("VLLM_QWEN35_MTP_KEEP_QUANT", "0") == "1"
+        keep_quant = policy.mtp_keep_quant
         if (
             self.quant_config is not None
             and not keep_quant

@@ -8,6 +8,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.config.execution_policy import flash_v100_policy
 from vllm.config.vllm import VllmConfig, checkpoint_kv_quant_allowed
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -171,7 +172,7 @@ def _init_kv_cache_quant(
                 current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and envs.VLLM_SM70_FLASH_ATTN_V100
+                and flash_v100_policy().enabled
             )
             # Lazy import: the quantization package imports Attention at module
             # scope, so importing it here avoids a circular import.

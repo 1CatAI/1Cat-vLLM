@@ -66,7 +66,12 @@ def test_single_request_cutoff_ties_preserve_dense_tokens(
         seeds=SimpleNamespace(gpu=seeds),
     )
     sampler = SimpleNamespace(
-        sampling_states=states, use_fp64_gumbel=use_fp64, apply_sampling_params=process
+        sampling_states=states,
+        use_fp64_gumbel=use_fp64,
+        apply_sampling_params=process,
+        penalties_state=SimpleNamespace(
+            use_penalty=np.zeros(int(mapping_np.max()) + 1, dtype=bool)
+        ),
     )
     rejection = SimpleNamespace(sampler=sampler, num_speculative_steps=steps)
     batch = SimpleNamespace(
@@ -85,15 +90,15 @@ def test_single_request_cutoff_ties_preserve_dense_tokens(
 
     class Speculator:
         draft_logits = draft_dense
+        _trace = SimpleNamespace(value=lambda name: False)
 
         def get_sparse_draft_logits(self):
             return draft_ids, draft_scores
 
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
     monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *args: True)
-    monkeypatch.setattr(sparse_rejection.envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
     monkeypatch.setattr(
-        sparse_rejection, "_supports_sparse_sampling_contract", lambda *args: True
+        sparse_rejection, "_supports_sparse_sampling_contract", lambda *a, **k: True
     )
     fallback = Mock(return_value=target)
 
@@ -219,7 +224,12 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
         seeds=SimpleNamespace(gpu=seeds),
     )
     sampler = SimpleNamespace(
-        sampling_states=states, use_fp64_gumbel=use_fp64, apply_sampling_params=process
+        sampling_states=states,
+        use_fp64_gumbel=use_fp64,
+        apply_sampling_params=process,
+        penalties_state=SimpleNamespace(
+            use_penalty=np.zeros(int(mapping_np.max()) + 1, dtype=bool)
+        ),
     )
     rejection = SimpleNamespace(sampler=sampler, num_speculative_steps=steps)
     batch = SimpleNamespace(
@@ -238,17 +248,15 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
 
     class Speculator:
         draft_logits = draft_dense
+        _trace = SimpleNamespace(value=lambda name: False)
 
         def get_sparse_draft_logits(self):
             return draft_ids, draft_scores
 
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
+    monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *args: True)
     monkeypatch.setattr(
-        sparse_rejection.envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True
-    )
-    monkeypatch.setattr(sparse_rejection.envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
-    monkeypatch.setattr(
-        sparse_rejection, "_supports_sparse_sampling_contract", lambda *args: True
+        sparse_rejection, "_supports_sparse_sampling_contract", lambda *a, **k: True
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (7, 0))
     fallback = Mock(return_value=target)

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -367,22 +368,82 @@ def test_ple_host_allocation_failure_keeps_materialization_retryable(monkeypatch
     _patch_tp(monkeypatch, rank=0, world_size=1)
     monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: 4 * 8)
     layer = _pinned_layer(num_embeddings=8)
-    empty = torch.empty
+    pin = ple_module._pin_host_tensor_exact
 
-    def failing_empty(*args, **kwargs):
-        if kwargs.get("pin_memory"):
-            raise RuntimeError("injected pinned allocation failure")
-        return empty(*args, **kwargs)
+    def failing_pin(tensor):
+        raise RuntimeError("injected pinned allocation failure")
 
-    monkeypatch.setattr(ple_module.torch, "empty", failing_empty)
+    monkeypatch.setattr(ple_module, "_pin_host_tensor_exact", failing_pin)
     with pytest.raises(RuntimeError, match="injected pinned allocation failure"):
         layer.materialize_tables()
     assert layer.ple_device_table is None
     assert layer.ple_host_storage is None
     assert layer._device_table_ptr == 0
-    monkeypatch.setattr(ple_module.torch, "empty", empty)
+    monkeypatch.setattr(ple_module, "_pin_host_tensor_exact", pin)
     layer.materialize_tables()
     assert (layer._device_rows, layer._host_rows) == (4, 4)
+    assert layer.ple_host_storage is not None
+    assert layer.ple_host_storage.is_pinned()
+
+
+class _FakeCudart:
+    """Records cudaHostRegister/Unregister calls instead of making them."""
+
+    def __init__(self, register_error: int = 0) -> None:
+        self.calls: list[tuple] = []
+        self.register_error = register_error
+
+    def cudaHostRegister(self, ptr, size, flags):
+        self.calls.append(("register", ptr, size, flags))
+        return SimpleNamespace(value=self.register_error)
+
+    def cudaHostUnregister(self, ptr):
+        self.calls.append(("unregister", ptr))
+        return SimpleNamespace(value=0)
+
+
+def _patch_cudart(
+    monkeypatch: pytest.MonkeyPatch, *, register_error: int = 0, pinned: bool
+) -> _FakeCudart:
+    cudart = _FakeCudart(register_error)
+    monkeypatch.setattr(ple_module.torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: pinned)
+    return cudart
+
+
+def test_exact_pin_registers_exactly_the_tensor_bytes(monkeypatch) -> None:
+    # 3 rows x 8 bytes: pin_memory=True would round this up to 32 bytes.
+    cudart = _patch_cudart(monkeypatch, pinned=True)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+    ptr = host.data_ptr()
+
+    ple_module._pin_host_tensor_exact(host)
+
+    assert cudart.calls == [("register", ptr, 24, 0x01 | 0x02)]
+    # The registration lives exactly as long as the table.
+    del host
+    gc.collect()
+    assert cudart.calls[-1] == ("unregister", ptr)
+
+
+def test_exact_pin_raises_when_registration_fails(monkeypatch) -> None:
+    cudart = _patch_cudart(monkeypatch, register_error=2, pinned=False)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(RuntimeError, match="cudaHostRegister"):
+        ple_module._pin_host_tensor_exact(host)
+    assert [call[0] for call in cudart.calls] == ["register"]
+
+
+def test_exact_pin_refuses_a_table_torch_does_not_see_as_pinned(monkeypatch) -> None:
+    # get_cuda_view_from_cpu_tensor would otherwise copy the whole table.
+    cudart = _patch_cudart(monkeypatch, pinned=False)
+    host = torch.empty((3, 8), dtype=torch.float8_e4m3fn)
+    ptr = host.data_ptr()
+
+    with pytest.raises(RuntimeError, match="not pinned"):
+        ple_module._pin_host_tensor_exact(host)
+    assert cudart.calls == [("register", ptr, 24, 0x01 | 0x02), ("unregister", ptr)]
 
 
 @pytest.mark.parametrize(
@@ -734,7 +795,7 @@ def test_ngram_embedding_disk_offload_allocates_only_meta_table(
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
-    monkeypatch.setattr(ple_module.envs, "VLLM_PLE_DISK_OFFLOAD", True)
+    monkeypatch.setenv("VLLM_PLE_DISK_OFFLOAD", "1")
     monkeypatch.setattr(ple_module.envs, "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", 0)
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
     config = SimpleNamespace(
@@ -819,6 +880,10 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     # Off unless a test maps real file-backed shards: releasing the pages of
     # anonymous memory would destroy it.
     module._release_disk_pages = False
+    # No engine config around the module: the default row-gather policy, nothing
+    # to record the admission in.
+    module._kernel_config = None
+    module._disk_row_gather = True
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
@@ -1041,7 +1106,7 @@ def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
     nn.Module.__init__(module)
     module._offload_model_dtype = torch.float16
     weight_scale = torch.tensor([0.25], dtype=torch.bfloat16)
-    monkeypatch.setattr(ple_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: False)
     monkeypatch.setattr(
         torch.accelerator,
@@ -1290,6 +1355,7 @@ def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
     module._packed_gguf = False
+    module.layer_name = "model.layers.0.ple"
     module.embedding_dim = 1
     module.head_dim = 1
     module.ngram_size = 2
@@ -1336,6 +1402,12 @@ def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
         ([0, 2, 2, 4], 7),
         ([0, 16], 16),
         ([0, 16], 17),
+        ([0, 5, 10, 15, 20], 20),
+        ([0, 64], 64),
+        ([0, 60, 65], 65),
+        ([0, 0, 5, 5, 20], 20),
+        ([0, 5, 10, 15, 18], 20),
+        ([0, 32], 32),
     ],
 )
 def test_ngram_cpu_small_ids_match_torch_with_eos_and_padding(
@@ -1348,9 +1420,10 @@ def test_ngram_cpu_small_ids_match_torch_with_eos_and_padding(
     module.ngram_size = 3
     module.heads_per_ngram = 8
     module.ngram_heads = 16
+    module._packed_result_layout = {"enabled": True}
     module.eos_token_id = 248044
-    module.register_buffer("positions_buffer", torch.arange(64))
-    module.register_buffer("padded_buffer", torch.empty(4, 64, dtype=torch.long))
+    module.register_buffer("positions_buffer", torch.arange(128))
+    module.register_buffer("padded_buffer", torch.empty(4, 128, dtype=torch.long))
     module.register_buffer(
         "layer_multipliers",
         torch.tensor([3229177723303, 2164907095717, 1840338581269]),
@@ -1391,6 +1464,7 @@ def test_ngram_fp8_cpu_offload_preserves_quantized_output(
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
     module._packed_gguf = False
+    module.layer_name = "model.layers.0.ple"
     module.embedding_dim = 2
     module.head_dim = 2
     module.ngram_size = 2

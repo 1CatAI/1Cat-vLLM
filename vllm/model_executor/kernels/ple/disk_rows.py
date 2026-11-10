@@ -5,26 +5,75 @@
 import ctypes
 import statistics
 import sys
+import threading
 import time
+import weakref
 from collections.abc import Sequence
 
 import numpy as np
 import torch
+
+_cache_lock = threading.Lock()
+_cache_allocated_bytes = 0
+
+
+def _release_cache(bytes_: int) -> None:
+    global _cache_allocated_bytes
+    with _cache_lock:
+        _cache_allocated_bytes -= bytes_
 
 
 class MappedRowGatherKernel:
     """Prefetch selected cold pages and gather into the caller's output."""
 
     def __init__(
-        self, pointers: Sequence[int], shard_size: int, num_rows: int, row_bytes: int
+        self,
+        pointers: Sequence[int],
+        shard_size: int,
+        num_rows: int,
+        row_bytes: int,
+        cache_bytes: int = 0,
     ):
         self.pointers = torch.tensor(pointers, dtype=torch.int64, device="cpu")
         self.shard_size = shard_size
         self.num_rows = num_rows
         self.row_bytes = row_bytes
         self.operator = torch.ops._C.ple_disk_gather_u8
+        self._apply_lock = threading.Lock()
+        self.cache_ids = self.cache_rows = None
+        self.cache_bytes = 0
+        global _cache_allocated_bytes
+        if cache_bytes and hasattr(torch.ops._C, "ple_disk_cached_gather_u8"):
+            with _cache_lock:
+                capacity = min(
+                    num_rows,
+                    max(0, cache_bytes - _cache_allocated_bytes) // (row_bytes + 8),
+                )
+                if capacity:
+                    self.cache_ids = torch.full((capacity,), -1, dtype=torch.int64)
+                    self.cache_rows = torch.empty(
+                        (capacity, row_bytes), dtype=torch.uint8
+                    )
+                    self.cache_bytes = capacity * (row_bytes + 8)
+                    _cache_allocated_bytes += self.cache_bytes
+                    weakref.finalize(self, _release_cache, self.cache_bytes)
 
     def apply(self, ids: torch.Tensor, output: torch.Tensor) -> None:
+        if self.cache_ids is not None:
+            # The offload runner is normally serial. Keep key/payload publication
+            # safe when qualification or external callers use another thread.
+            with self._apply_lock:
+                torch.ops._C.ple_disk_cached_gather_u8(
+                    ids,
+                    self.pointers,
+                    self.shard_size,
+                    self.num_rows,
+                    self.row_bytes,
+                    output,
+                    self.cache_ids,
+                    self.cache_rows,
+                )
+            return
         self.operator(
             ids, self.pointers, self.shard_size, self.num_rows, self.row_bytes, output
         )
@@ -65,6 +114,7 @@ class MappedRowGatherKernel:
         # additionally be measured in the model or with physical cold pages.
         return {
             "byte_check": True,
+            "cache_bytes": self.cache_bytes,
             "warm_startup_us": [statistics.median(samples) for samples in timings],
             "warm_samples_us": timings,
         }
@@ -78,6 +128,7 @@ def prepare_mapped_row_gather(
     row_bytes: int,
     file_backed: bool,
     enabled: bool,
+    cache_bytes: int = 0,
 ) -> tuple[MappedRowGatherKernel | None, dict]:
     if not enabled:
         return None, {"selected": None, "reason": "disabled_by_policy"}
@@ -89,7 +140,9 @@ def prepare_mapped_row_gather(
 
     if not hasattr(torch.ops._C, "ple_disk_gather_u8"):
         return None, {"selected": None, "reason": "native_operator_unavailable"}
-    kernel = MappedRowGatherKernel(pointers, shard_size, num_rows, row_bytes)
+    kernel = MappedRowGatherKernel(
+        pointers, shard_size, num_rows, row_bytes, cache_bytes
+    )
     try:
         measurement = kernel.qualify()
     except (RuntimeError, AssertionError) as error:

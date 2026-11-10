@@ -1,0 +1,14 @@
+[
+  {"name": "decode_auto_eager", "query": 1, "context": 32768, "head": 256, "gqa": 6, "page": 832, "codec": "auto", "spec": "none", "graph": false, "required_routes": ["decode_xqa_paged"], "performance_role": null},
+  {"name": "decode_auto_graph", "query": 1, "context": 32768, "head": 256, "gqa": 6, "page": 832, "codec": "auto", "spec": "none", "graph": true, "required_routes": ["decode_xqa_paged"], "performance_role": "decode_xqa"},
+  {"name": "decode_fp8_e4m3_eager", "query": 1, "context": 32768, "head": 256, "gqa": 6, "page": 832, "codec": "fp8_e4m3", "spec": "none", "graph": false, "required_routes": ["decode_xqa_paged"], "performance_role": null},
+  {"name": "decode_fp8_e4m3_graph", "query": 1, "context": 32768, "head": 256, "gqa": 6, "page": 832, "codec": "fp8_e4m3", "spec": "none", "graph": true, "required_routes": ["decode_xqa_paged"], "performance_role": "decode_xqa"},
+  {"name": "prefill8192_eager", "query": 8192, "context": 8192, "head": 256, "gqa": 6, "page": 832, "codec": "auto", "spec": "none", "graph": false, "required_routes": ["prefill_no_prefix_dense_flash", "prefill_dense_d256_gqa_79t_fp32_q8192"], "performance_role": "prefill_75t"},
+  {"name": "prefill8192_graph", "query": 8192, "context": 8192, "head": 256, "gqa": 6, "page": 832, "codec": "auto", "spec": "none", "graph": true, "required_routes": ["prefill_no_prefix_dense_flash"], "performance_role": null},
+  {"name": "prefix8192_e4m3", "query": 8192, "context": 16384, "head": 256, "gqa": 6, "page": 832, "codec": "fp8_e4m3", "spec": "none", "graph": false, "required_routes": ["fp8_kv_prefill_prefix", "prefill_prefix_flash"]},
+  {"name": "dflash2_auto", "query": 8, "context": 72, "head": 256, "gqa": 6, "page": 832, "codec": "auto", "spec": "dflash2", "graph": true, "required_routes": ["prefill_smallq_fp16_grouped_fp32"]},
+  {"name": "dflash2_fp8_e4m3", "query": 8, "context": 72, "head": 256, "gqa": 6, "page": 832, "codec": "fp8_e4m3", "spec": "dflash2", "graph": true, "required_routes": ["prefill_smallq_e4m3_grouped_fp32"]},
+  {"name": "ddtree_eager", "query": 7, "context": 71, "head": 256, "gqa": 6, "page": 832, "codec": "auto", "spec": "ddtree", "graph": false, "required_routes": ["prefill_ddtree_triton"]},
+  {"name": "ddtree_graph", "query": 7, "context": 71, "head": 256, "gqa": 6, "page": 832, "codec": "auto", "spec": "ddtree", "graph": true, "required_routes": ["prefill_ddtree_triton"]},
+  {"name": "mtp_smallq", "query": 5, "context": 69, "head": 256, "gqa": 6, "page": 832, "codec": "auto", "spec": "mtp", "graph": true, "required_routes": ["prefill_smallq_fp16_grouped_fp32"]}
+]

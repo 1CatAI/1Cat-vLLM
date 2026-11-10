@@ -5,6 +5,9 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm.distributed.device_communicators.collective_provider import (
+    CollectiveCapabilities,
+)
 from vllm.distributed.device_communicators.custom_all_reduce import (
     CustomAllreduce,
     _sm70_tp8_hierarchical_peer_ranks,
@@ -42,6 +45,9 @@ def test_sm70_tp8_hierarchical_dispatch_accepts_exact_fp16_shapes(
     communicator.disabled = False
     communicator._ptr = 0
     communicator.tp8_hierarchical = True
+    communicator.capabilities = CollectiveCapabilities(
+        8, False, True, 8192 * 1024, 8192 * 1024, False, False
+    )
 
     assert communicator.should_custom_ar(torch.empty(elements, dtype=torch.float16))
 
@@ -63,6 +69,9 @@ def test_sm70_tp8_hierarchical_dispatch_rejects_other_contracts(
     communicator.disabled = False
     communicator._ptr = 0
     communicator.tp8_hierarchical = True
+    communicator.capabilities = CollectiveCapabilities(
+        8, False, True, 8192 * 1024, 8192 * 1024, False, False
+    )
 
     assert not communicator.should_custom_ar(torch.empty(elements, dtype=dtype))
 

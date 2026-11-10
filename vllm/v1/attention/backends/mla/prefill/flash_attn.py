@@ -38,7 +38,7 @@ def _flash_v100_dense_prefill_lse_usable() -> bool:
     if not _is_sm70_flash_v100_platform():
         return False
     try:
-        from vllm.v1.attention.backends.flash_attn_v100 import (
+        from vllm.v1.attention.backends.flash_v100 import (
             flash_v100_dense_prefill_lse_available,
         )
     except ImportError:
@@ -195,7 +195,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             if float(kwargs.get("softcap", 0.0)) != 0.0:
                 raise ValueError("SM70 Flash-V100 MLA prefill does not support softcap")
 
-            from vllm.v1.attention.backends.flash_attn_v100 import (
+            from vllm.v1.attention.backends.flash_v100 import (
                 flash_v100_dense_prefill_lse,
             )
 

@@ -23,7 +23,12 @@ def test_default_forward_tail_route(monkeypatch, m):
         operands.append((kwargs["mixed_qkv"], kwargs["b"], kwargs["a"]))
         return kwargs["core_attn_out"]
 
+    from vllm.config.gdn import GdnConfig
+
+    policy = GdnConfig()
+    policy.resolve()
     layer = SimpleNamespace(
+        gdn_policy=policy,
         prefix="test",
         in_proj_qkvz=lambda _: (q, None),
         in_proj_ba=lambda _: (ba, None),

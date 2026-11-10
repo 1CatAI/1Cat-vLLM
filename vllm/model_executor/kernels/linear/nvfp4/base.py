@@ -28,6 +28,9 @@ class NvFp4LinearKernel(ABC):
     match for the current hardware.
     """
 
+    # Operand dtype required by this provider, independent of packed weights.
+    input_dtype: torch.dtype | None = None
+
     def __init__(self, config: NvFp4LinearLayerConfig) -> None:
         assert self.can_implement(config)[0]
         assert self.is_supported()[0]

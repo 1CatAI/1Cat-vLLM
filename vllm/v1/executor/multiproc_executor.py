@@ -27,6 +27,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.execution_policy import ple_policy
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -174,7 +175,46 @@ class MultiprocExecutor(Executor):
 
             # For CPU backend only, to setup OpenMP threads affinity
             cpu_omp_manager = OMPProcessManager(self.vllm_config)
-            for local_rank in range(self.local_world_size):
+            if inherited_fds is None and current_platform.is_cuda():
+                # A spawned worker only receives its arguments after it has
+                # started the interpreter and imported vLLM (~15 s), so
+                # starting workers one after another serializes that import.
+                # Start them concurrently; the OMP setup is CPU-only.
+                from concurrent.futures import ThreadPoolExecutor
+
+                def start(local_rank: int) -> UnreadyWorkerProcHandle:
+                    global_rank = global_start_rank + local_rank
+                    return WorkerProc.make_worker_process(
+                        vllm_config=self.vllm_config,
+                        local_rank=local_rank,
+                        rank=global_rank,
+                        distributed_init_method=distributed_init_method,
+                        input_shm_handle=scheduler_output_handle,
+                        shared_worker_lock=shared_worker_lock,
+                        is_driver_worker=self._is_driver_worker(global_rank),
+                        inherited_fds=None,
+                    )
+
+                with ThreadPoolExecutor(self.local_world_size) as pool:
+                    futures = [
+                        pool.submit(start, r) for r in range(self.local_world_size)
+                    ]
+                    for future in futures:
+                        # Record each started worker so a failure still
+                        # terminates the others.
+                        try:
+                            unready_workers.append(future.result())
+                        except Exception:
+                            for other in futures:
+                                if other is not future and not other.exception():
+                                    handle = other.result()
+                                    if handle not in unready_workers:
+                                        unready_workers.append(handle)
+                            raise
+            for local_rank in range(
+                0 if not unready_workers else self.local_world_size,
+                self.local_world_size,
+            ):
                 global_rank = global_start_rank + local_rank
                 is_driver_worker = self._is_driver_worker(global_rank)
                 with cpu_omp_manager.configure_omp_envs(
@@ -478,7 +518,7 @@ class MultiprocExecutor(Executor):
         # PP requires PP-size concurrent batches to fill the pipeline.
         pp_size = self.parallel_config.pipeline_parallel_size
         if pp_size <= 1 and self.scheduler_config.async_scheduling:
-            return max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH)
+            return max(2, self.scheduler_config.sm70_queue_depth())
         return pp_size
 
     def _get_output_rank(self) -> int:
@@ -613,9 +653,9 @@ class WorkerProc:
 
         # Load model
         self.worker.init_device()
-        if ple_offload_enabled(vllm_config) and not envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        if ple_offload_enabled(vllm_config) and not ple_policy(vllm_config).hybrid:
             self.worker.spawn_ple_offload()
-        elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        elif ple_policy(vllm_config).hybrid:
             self.worker.prepare_ple_offload_spawn()
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
@@ -625,7 +665,7 @@ class WorkerProc:
             self.worker.elastic_ep_execute("load_model")
         else:
             self.worker.load_model()
-        if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        if ple_policy(vllm_config).hybrid:
             # Hybrid mode retains a large pinned shard in every TP worker.
             # Load those shards before the file-backed PLE worker scans the
             # checkpoint so startup does not create avoidable memory pressure.
@@ -653,7 +693,9 @@ class WorkerProc:
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
-        enable_envs_cache()
+        from vllm.config.policy_defaults import engine_policy_aliases
+
+        enable_envs_cache(exclude=engine_policy_aliases(vllm_config))
 
     @staticmethod
     def make_worker_process(

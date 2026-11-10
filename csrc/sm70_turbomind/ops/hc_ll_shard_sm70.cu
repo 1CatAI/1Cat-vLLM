@@ -34,6 +34,13 @@ __device__ __forceinline__ void mma(float (&d)[8], uint32_t a0, uint32_t a1,
         "+f"(d[6]), "+f"(d[7])
       : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
 }
+__device__ __forceinline__ uint4 ordered_weight_load(const uint4* p) {
+  uint4 v;
+  asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+}
 __device__ __forceinline__ float sigm(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
@@ -81,7 +88,7 @@ __device__ __forceinline__ uint32_t tag_of(unsigned seq) {
 // ---------------------------------------------------------------- down
 // grid (3 tiles, S splits). Tile-last CTA reduces split-K, pushes LL words to
 // self/r^1/r^2, then forwards r^1's tile to r^2.
-template <int S, int WARPS>
+template <int S, int WARPS, bool OPTIMIZED = false>
 __global__ void __launch_bounds__(32 * WARPS)
     down3(const half* __restrict__ x, const half* __restrict__ wd,
           float* __restrict__ part, unsigned* __restrict__ cnt, Peer pr,
@@ -111,14 +118,29 @@ __global__ void __launch_bounds__(32 * WARPS)
   const int col = quad * 8 + r;
   const int kbase = s * KC + warp * KW;
   const half* w = wd + static_cast<size_t>(tile) * KD * 32;
+  uint4 wlo[G], whi[G];
+  if constexpr (OPTIMIZED) {
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      const int kg = (kbase + g * 16) >> 4;
+      wlo[g] = ordered_weight_load(
+          reinterpret_cast<const uint4*>(w + (kg * 64 + col) * 8));
+      whi[g] = ordered_weight_load(
+          reinterpret_cast<const uint4*>(w + (kg * 64 + 32 + col) * 8));
+    }
+    __syncwarp();
+  }
   float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int g = 0; g < G; ++g) {
     const int k = kbase + g * 16, kg = k >> 4;
     const uint4 lo =
-        __ldg(reinterpret_cast<const uint4*>(w + (kg * 64 + col) * 8));
-    const uint4 hi =
-        __ldg(reinterpret_cast<const uint4*>(w + (kg * 64 + 32 + col) * 8));
+        OPTIMIZED
+            ? wlo[g]
+            : __ldg(reinterpret_cast<const uint4*>(w + (kg * 64 + col) * 8));
+    const uint4 hi = OPTIMIZED ? whi[g]
+                               : __ldg(reinterpret_cast<const uint4*>(
+                                     w + (kg * 64 + 32 + col) * 8));
     uint4 a = make_uint4(0, 0, 0, 0), b = a;
     if (r < M) {
       a = *reinterpret_cast<const uint4*>(x + r * KD + k);
@@ -203,7 +225,7 @@ __global__ void __launch_bounds__(32 * WARPS)
 
 // ---------------------------------------------------------------- up
 // 80 CTAs; CTA t owns hidden cols [640r + 8t, +8) for the 4 branches.
-template <int WARPS>
+template <int WARPS, bool OPTIMIZED = false>
 __global__ void __launch_bounds__(32 * WARPS)
     up3(const uint32_t* __restrict__ ll_lora, const half* __restrict__ wu,
         const half* __restrict__ x, unsigned* __restrict__ cnt, Peer pr,
@@ -244,7 +266,7 @@ __global__ void __launch_bounds__(32 * WARPS)
         __ldg(reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8));
   }
   // Prologue: poll the full LL lora (written by down3 on all ranks).
-  __shared__ __align__(16) half ls[8][320];
+  __shared__ __align__(16) half ls[8][320 + (OPTIMIZED ? 8 : 0)];
   const uint32_t dtag =
       tag_of(ld_vol(down_seq));  // down3 already advanced its seq
   for (int idx = threadIdx.x; idx < M * 80; idx += blockDim.x) {
@@ -374,7 +396,8 @@ Peer make_peer(const std::vector<int64_t>& ll, torch::Tensor seq,
 
 void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
                          torch::Tensor cnt, std::vector<int64_t> ll,
-                         torch::Tensor seq, int64_t rank, int64_t variant) {
+                         torch::Tensor seq, int64_t rank, int64_t variant,
+                         bool optimized_loads) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
                   x.size(0) >= 1 && x.size(0) <= 20 && x.size(1) == 10240 &&
                   x.is_contiguous(),
@@ -403,32 +426,36 @@ void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
   auto st = at::cuda::getCurrentCUDAStream().stream();
   Peer p = make_peer(ll, seq, rank);
   auto c = reinterpret_cast<unsigned*>(cnt.data_ptr<int>());
-#define D(S, W)                                                                \
-  down3<S, W><<<dim3(3 * ((M + 7) / 8), S), 32 * W, 0, st>>>(                  \
+#define D(S, W, O)                                                             \
+  down3<S, W, O><<<dim3(3 * ((M + 7) / 8), S), 32 * W, 0, st>>>(               \
       reinterpret_cast<const half*>(x.data_ptr()),                             \
       reinterpret_cast<const half*>(wd.data_ptr()), part.data_ptr<float>(), c, \
       p, M)
   switch (variant) {
     case 0:
-      D(20, 4);
+      D(20, 4, false);
       break;
     case 1:
-      D(20, 8);
+      if (optimized_loads) {
+        D(20, 8, true);
+      } else {
+        D(20, 8, false);
+      }
       break;
     case 2:
-      D(40, 4);
+      D(40, 4, false);
       break;
     case 3:
-      D(40, 8);
+      D(40, 8, false);
       break;
     case 4:
-      D(10, 8);
+      D(10, 8, false);
       break;
     case 5:
-      D(20, 16);
+      D(20, 16, false);
       break;
     case 6:
-      D(10, 16);
+      D(10, 16, false);
       break;
     default:
       TORCH_CHECK(false);
@@ -441,7 +468,8 @@ void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
                        torch::Tensor cnt, std::vector<int64_t> ll,
                        torch::Tensor seq, torch::Tensor down_seq, int64_t rank,
                        torch::Tensor out, torch::Tensor lora_out,
-                       torch::Tensor inj_out, int64_t warps) {
+                       torch::Tensor inj_out, int64_t warps,
+                       bool optimized_loads) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
                   x.size(0) >= 1 && x.size(0) <= 20 && x.size(1) == 10240 &&
                   x.is_contiguous(),
@@ -476,8 +504,8 @@ void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
   auto st = at::cuda::getCurrentCUDAStream().stream();
   Peer p = make_peer(ll, seq, rank);
   auto c = reinterpret_cast<unsigned*>(cnt.data_ptr<int>());
-#define U(W)                                                       \
-  up3<W><<<80 * ((M + 7) / 8), 32 * W, 0, st>>>(                   \
+#define U(W, O)                                                    \
+  up3<W, O><<<80 * ((M + 7) / 8), 32 * W, 0, st>>>(                \
       reinterpret_cast<const uint32_t*>(ll_lora),                  \
       reinterpret_cast<const half*>(wu.data_ptr()),                \
       reinterpret_cast<const half*>(x.data_ptr()), c, p,           \
@@ -487,10 +515,14 @@ void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
       reinterpret_cast<half*>(inj_out.data_ptr()), M)
   switch (warps) {
     case 4:
-      U(4);
+      U(4, false);
       break;
     case 5:
-      U(5);
+      if (optimized_loads) {
+        U(5, true);
+      } else {
+        U(5, false);
+      }
       break;
     default:
       TORCH_CHECK(false);

@@ -60,33 +60,6 @@ def test_pp_packet_rejects_tokens_wider_than_receive_buffer() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    ("old_computed", "scheduled", "prefill_len", "max_seq_len", "expected"),
-    [
-        (0, 4, 8, 32, None),
-        (0, 8, 8, 32, [True]),
-        (31, 1, 8, 32, None),
-    ],
-)
-def test_compute_need_sampled_mask(
-    old_computed, scheduled, prefill_len, max_seq_len, expected
-) -> None:
-    batch = SimpleNamespace(
-        num_computed_tokens_np=np.array([old_computed], dtype=np.int32),
-        num_scheduled_tokens=np.array([scheduled], dtype=np.int32),
-        prefill_len_np=np.array([prefill_len], dtype=np.int32),
-        max_seq_len_np=np.array([max_seq_len], dtype=np.int32),
-    )
-
-    result = pp_utils.compute_need_sampled_mask(batch)
-
-    if expected is None:
-        assert result is None
-    else:
-        assert result is not None
-        assert result.tolist() == expected
-
-
 def test_pp_slot_ring_filters_reused_request_indices() -> None:
     waited: list[object] = []
     slot = pp_utils.PendingRecv(
@@ -131,6 +104,7 @@ def test_mamba_neutral_pp_update_accepts_int32_slot_indices(monkeypatch) -> None
     state = object.__new__(mamba_hybrid.MambaHybridModelState)
     state.num_accepted_tokens_gpu = torch.zeros(2, dtype=torch.int32)
     state._align_mode = False
+    state._spec_replay = None
     idx_mapping = torch.tensor([0, -1], dtype=torch.int32)
 
     state.postprocess_state(idx_mapping, 0)

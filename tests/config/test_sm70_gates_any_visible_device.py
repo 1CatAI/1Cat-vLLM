@@ -13,7 +13,7 @@ import torch
 from vllm import platforms
 from vllm.config import (
     CacheConfig,
-    ModelConfig,
+    DeviceConfig,
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
@@ -154,9 +154,8 @@ def _patch_visible_devices(monkeypatch, capabilities: list[tuple[int, int]]):
 
 
 def _build_vllm_config(pp_size: int = 1) -> VllmConfig:
-    model_config = ModelConfig(model="facebook/opt-125m", dtype="float16", seed=42)
     return VllmConfig(
-        model_config=model_config,
+        device_config=DeviceConfig(device="cpu"),
         cache_config=CacheConfig(
             block_size=16, gpu_memory_utilization=0.9, cache_dtype="auto"
         ),
@@ -164,7 +163,7 @@ def _build_vllm_config(pp_size: int = 1) -> VllmConfig:
             max_num_seqs=10,
             max_num_batched_tokens=512,
             max_model_len=512,
-            is_encoder_decoder=model_config.is_encoder_decoder,
+            is_encoder_decoder=False,
         ),
         parallel_config=ParallelConfig(
             pipeline_parallel_size=pp_size,
@@ -192,12 +191,17 @@ def test_sm70_baseline_defaults_follow_any_visible_device(
     and Ampere and later must stay clean."""
     _patch_visible_devices(monkeypatch, capabilities)
 
-    _build_vllm_config(pp_size)
-
-    applied = {name for name in BASELINE_ENV if os.environ.get(name) == "1"}
-    assert (applied == set(BASELINE_ENV)) is expected
-    if not expected:
-        assert not applied
+    original = dict(os.environ)
+    cfg = _build_vllm_config(pp_size)
+    assert dict(os.environ) == original
+    for field in ("packed_recurrent_decode", "flashqla_decode"):
+        assert (
+            cfg.kernel_config.gdn.sources.get(field) == "platform baseline"
+        ) is expected
+    assert (
+        cfg.kernel_config.layer_execution.sources["gemma_compile_native"]
+        == "default:platform.runtime"
+    ) is expected
 
 
 @pytest.mark.parametrize(

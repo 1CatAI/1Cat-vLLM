@@ -93,3 +93,12 @@ def test_fp16_grouped_rejects_unqualified_batch_and_row_counts():
     assert reason(scenario(5, 40)) == "request_group_count"
     assert reason(scenario(4, 20)) == "query_rows"
     assert reason(scenario(1, 1)) == "query_rows"
+
+
+def test_fp16_grouped_admits_the_fp8_checkpoint_page():
+    inputs = scenario()
+    page = 800
+    strides = (page * 256, 256, 256, 1)
+    inputs[2] = descriptor((316, page, 1, 256), strides=strides)
+    inputs[3] = descriptor((316, page, 1, 256), strides=strides)
+    assert reason(inputs) is None

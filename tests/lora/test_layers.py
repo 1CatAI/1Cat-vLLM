@@ -445,6 +445,15 @@ def test_lm_head_logits_processor(
             expected_results.append(result)
         expected_result = torch.cat(expected_results)
 
+        rtol, atol = TOLERANCES[lora_result.dtype]
+        torch.testing.assert_close(lora_result, expected_result, rtol=rtol, atol=atol)
+        # Exercise the public forward path as well as the projection helper:
+        # the wrapper must provide the base processor's logit transforms.
+        forward_result = lora_logits_processor(linear, torch.cat(inputs))
+        torch.testing.assert_close(
+            forward_result, expected_result, rtol=rtol, atol=atol
+        )
+
         # Check that resetting the lora weights succeeds
 
         for slot_idx in range(max_loras):

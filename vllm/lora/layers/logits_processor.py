@@ -189,6 +189,22 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         logits = logits[:, : self.base_layer.vocab_size]
         return logits
 
+    def _apply_logits_transforms(
+        self, logits: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        return self.base_layer._apply_logits_transforms(logits)
+
+    # Sparse target paths project with the base lm_head only; the model runner
+    # uses them only for batches without an active LoRA request.
+    def get_topk_tokens_and_logits(self, *args, **kwargs):
+        return self.base_layer.get_topk_tokens_and_logits(*args, **kwargs)
+
+    def get_topk_tokens_and_logits_with_fallback(self, *args, **kwargs):
+        return self.base_layer.get_topk_tokens_and_logits_with_fallback(*args, **kwargs)
+
+    def get_compact_target_probe_with_fallback(self, *args, **kwargs):
+        return self.base_layer.get_compact_target_probe_with_fallback(*args, **kwargs)
+
     def forward(self, *args, **kwargs):
         return type(self.base_layer).forward(self, *args, **kwargs)
 

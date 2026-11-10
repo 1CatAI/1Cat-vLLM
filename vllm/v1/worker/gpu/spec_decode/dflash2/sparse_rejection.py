@@ -5,16 +5,15 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm.config.sm70_dflash2 import (
     sm70_dflash2_enabled,
 )
+from vllm.diagnostics import write_payload
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
@@ -26,6 +25,11 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
 
+# Preserve the public compatibility name while the outcome belongs to the protocol.
+from vllm.v1.worker.gpu.spec_decode.target_sampling import (
+    ComputedTargetLogits as DFlash2LogitsFallback,
+)
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -35,15 +39,111 @@ logger = init_logger(__name__)
 
 _TARGET_TOP_K = 20
 _TARGET_PROBE_K = 64
-_SELECTOR_ALIGNMENT_DUMP_COUNT = 0
-_SELECTOR_ALIGNMENT_STEP = 0
 
 
-@dataclass(frozen=True)
-class DFlash2LogitsFallback:
-    """A completed dense projection; non-gather ranks may have no logits."""
+@triton.jit
+def _penalize_probe_kernel(
+    values,
+    ids,
+    floors,
+    row_stride: tl.constexpr,
+    expanded_idx_mapping,
+    token_ids,
+    expanded_local_pos,
+    repetition_penalty,
+    frequency_penalty,
+    presence_penalty,
+    prompt_bin_mask,
+    prompt_bin_mask_stride,
+    output_bin_counts,
+    output_bin_counts_stride,
+    width: tl.constexpr,
+    block: tl.constexpr,
+):
+    # The same arithmetic as _penalties_kernel, on the probe's candidates only.
+    row = tl.program_id(0)
+    col = tl.arange(0, block)
+    mask = col < width
+    logits = tl.load(values + row * row_stride + col, mask, float("inf"))
+    # Every token outside the probe ranks at or below its smallest logit before
+    # penalties, and these penalties never raise a logit.
+    tl.store(floors + row, tl.min(logits, 0))
 
-    logits: torch.Tensor | None
+    request = tl.load(expanded_idx_mapping + row)
+    rep_penalty = tl.load(repetition_penalty + request)
+    freq_penalty = tl.load(frequency_penalty + request)
+    pres_penalty = tl.load(presence_penalty + request)
+    use_rep_penalty = rep_penalty != 1.0
+    if not (use_rep_penalty or freq_penalty != 0.0 or pres_penalty != 0.0):
+        return
+
+    tokens = tl.load(ids + row * row_stride + col, mask, 0)
+    counts = tl.load(
+        output_bin_counts + request * output_bin_counts_stride + tokens, mask, 0
+    )
+    # Earlier rows of this request verify draft tokens that count as output.
+    pos = tl.load(expanded_local_pos + row)
+    start = row - pos
+    for prev_pos in tl.range(pos):
+        prev_token = tl.load(token_ids + start + prev_pos + 1)
+        counts = counts + (tokens == prev_token).to(tl.int32)
+    output_mask = counts > 0
+
+    if use_rep_penalty:
+        packed = tl.load(
+            prompt_bin_mask + request * prompt_bin_mask_stride + tokens // 32, mask, 0
+        )
+        in_prompt = ((packed >> (tokens % 32)) & 1).to(tl.int1)
+        scale = tl.where(in_prompt | output_mask, rep_penalty, 1.0)
+        logits *= tl.where(logits > 0, 1.0 / scale, scale)
+    logits -= freq_penalty * counts
+    logits -= pres_penalty * output_mask
+    tl.store(values + row * row_stride + col, logits, mask)
+
+
+def _penalize_probe(
+    values: torch.Tensor,
+    ids: torch.Tensor,
+    penalties_state: Any,
+    expanded_idx_mapping: torch.Tensor,
+    token_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+) -> torch.Tensor:
+    """Penalize probe logits in place and return each row's pre-penalty floor.
+
+    The caller re-sorts the probe and passes the floor to the cutoff guard.
+    """
+    rows, width = values.shape
+    floors = torch.empty(rows, device=values.device, dtype=torch.float32)
+    _penalize_probe_kernel[(rows,)](
+        values,
+        ids,
+        floors,
+        values.stride(0),
+        expanded_idx_mapping,
+        token_ids,
+        expanded_local_pos,
+        penalties_state.repetition_penalty.gpu,
+        penalties_state.frequency_penalty.gpu,
+        penalties_state.presence_penalty.gpu,
+        penalties_state.prompt_bin_mask,
+        penalties_state.prompt_bin_mask.stride(0),
+        penalties_state.output_bin_counts,
+        penalties_state.output_bin_counts.stride(0),
+        width,
+        triton.next_power_of_2(width),
+        num_warps=1,
+    )
+    return floors
+
+
+def _monotone_penalties(penalties_state: Any, idx: np.ndarray) -> bool:
+    """Whether every request's penalties can only lower logits."""
+    return bool(
+        np.all(penalties_state.repetition_penalty.np[idx] >= 1.0)
+        and np.all(penalties_state.frequency_penalty.np[idx] >= 0.0)
+        and np.all(penalties_state.presence_penalty.np[idx] >= 0.0)
+    )
 
 
 @triton.jit
@@ -53,10 +153,12 @@ def _compact_target_reference_rows_kernel(
     top_ps,
     row_to_request,
     reference_rows,
+    floors,
     row_stride: tl.constexpr,
     width: tl.constexpr,
     top_k: tl.constexpr,
     block: tl.constexpr,
+    has_floor: tl.constexpr,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, block)
@@ -66,7 +168,11 @@ def _compact_target_reference_rows_kernel(
     values = tl.load(probe + row * row_stride + col, col < width, -float("inf"))
     first = tl.load(probe + row * row_stride) / temperature
     cutoff = tl.load(probe + row * row_stride + top_k - 1) / temperature
-    last = tl.load(probe + row * row_stride + width - 1) / temperature
+    if has_floor:
+        # Penalized probes: unprobed tokens may reach the pre-penalty floor.
+        last = tl.load(floors + row) / temperature
+    else:
+        last = tl.load(probe + row * row_stride + width - 1) / temperature
     logits = values / temperature
     keep = (col < width) & (logits >= cutoff)
     logits = tl.where(keep, logits, -float("inf"))
@@ -97,6 +203,7 @@ def _compact_target_reference_flags(
     temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
+    floors: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute graph-capturable fallback flags with the request-slot map."""
     rows, width = probe.shape
@@ -107,10 +214,12 @@ def _compact_target_reference_flags(
         top_ps,
         row_to_request,
         result,
+        probe if floors is None else floors,
         probe.stride(0),
         width,
         _TARGET_TOP_K,
         triton.next_power_of_2(width),
+        floors is not None,
         num_warps=1,
     )
     return result
@@ -121,10 +230,13 @@ def _compact_target_reference_rows_gpu(
     temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
+    floors: torch.Tensor | None = None,
 ) -> np.ndarray:
     """Copy only fallback decisions, preserving the request-slot parameter map."""
     return (
-        _compact_target_reference_flags(probe, temperatures, top_ps, row_to_request)
+        _compact_target_reference_flags(
+            probe, temperatures, top_ps, row_to_request, floors
+        )
         .cpu()
         .numpy()
     )
@@ -250,29 +362,13 @@ def _sample_reference_requests(
 
 
 def _parse_alignment_steps(raw_steps: str | None) -> set[int] | None:
-    if not raw_steps:
-        return None
-    steps: set[int] = set()
+    from vllm.config.diagnostic_dump import parse_int_filter
+
     try:
-        for item in raw_steps.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if "-" in item:
-                start_text, end_text = item.split("-", 1)
-                start = int(start_text)
-                end = int(end_text)
-                if start < 0 or end < start:
-                    return set()
-                steps.update(range(start, end + 1))
-            else:
-                step = int(item)
-                if step < 0:
-                    return set()
-                steps.add(step)
+        result = parse_int_filter(raw_steps, strict=True)
     except ValueError:
         return set()
-    return steps
+    return None if result is None else set(result)
 
 
 def _safe_dump_tag(raw_tag: str) -> str:
@@ -302,17 +398,19 @@ def _maybe_dump_selector_alignment(
     num_sampled: torch.Tensor,
 ) -> None:
     """Dump one exact B1 selector/target alignment record when requested."""
-    if not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+    if not speculator._trace.value("alignment"):
         return
     if _diagnostic_rank() != 0:
         return
 
-    global _SELECTOR_ALIGNMENT_DUMP_COUNT, _SELECTOR_ALIGNMENT_STEP
-    _SELECTOR_ALIGNMENT_STEP += 1
-    if _SELECTOR_ALIGNMENT_DUMP_COUNT >= envs.VLLM_SPEC_DUMP_ALIGNMENT_LIMIT:
+    counts = speculator._diagnostics.counters
+    step = counts.get("selector_alignment_steps", 0) + 1
+    counts["selector_alignment_steps"] = step
+    saved = counts.get("selector_alignment_dumps", 0)
+    if saved >= speculator._trace.value("alignment_limit"):
         return
-    selected_steps = _parse_alignment_steps(envs.VLLM_SPEC_DUMP_ALIGNMENT_STEPS)
-    if selected_steps is not None and _SELECTOR_ALIGNMENT_STEP not in selected_steps:
+    selected_steps = speculator._trace.selected_steps
+    if selected_steps is not None and step not in selected_steps:
         return
 
     shadow = speculator.get_selector_alignment_shadow()
@@ -330,7 +428,7 @@ def _maybe_dump_selector_alignment(
         payload = {
             "format": "dflash2_selector_alignment_v1",
             "rank": _diagnostic_rank(),
-            "step": _SELECTOR_ALIGNMENT_STEP,
+            "step": step,
             "request_state": req_state,
             "selector_top_k": speculator.selector_top_k,
             "num_speculative_steps": speculator.num_speculative_steps,
@@ -355,26 +453,34 @@ def _maybe_dump_selector_alignment(
             "sampled_token_ids": sampled.detach().cpu(),
             "num_sampled": num_sampled.detach().cpu(),
         }
-        _SELECTOR_ALIGNMENT_DUMP_COUNT += 1
-        dump_dir = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR", "/tmp")
-        os.makedirs(dump_dir, exist_ok=True)
-        tag = _safe_dump_tag(os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_TAG", ""))
+        saved += 1
+        counts["selector_alignment_dumps"] = saved
+        dump_dir = speculator._trace.alignment_directory
+        tag = speculator._trace.safe_tag
         tag_part = f"{tag}_" if tag else ""
-        dump_path = os.path.join(
+        dump_path = write_payload(
             dump_dir,
             f"spec_alignment_dflash2_selector_{tag_part}pid{os.getpid()}_"
-            f"step{_SELECTOR_ALIGNMENT_STEP:06d}_"
-            f"{_SELECTOR_ALIGNMENT_DUMP_COUNT}.pt",
+            f"step{step:06d}_"
+            f"{saved}.pt",
+            payload,
+            speculator._diagnostics.engine_tag,
         )
-        torch.save(payload, dump_path)
         logger.warning("Dumped DFlash2 selector alignment diagnostics to %s", dump_path)
 
 
 def _supports_sparse_sampling_contract(
     rejection_sampler: RejectionSampler,
     input_batch: InputBatch,
+    *,
+    allow_penalties: bool = False,
 ) -> bool:
-    """Whether compact logits preserve every requested sampling transform."""
+    """Whether compact logits preserve every requested sampling transform.
+
+    With allow_penalties, the caller penalizes its wide probe and guards the
+    cutoff with the pre-penalty floor, which needs that probe: at least two
+    logit rows over a large vocabulary.
+    """
     if rejection_sampler.rejection_sample_method != "standard":
         return False
     # Every request must be in the uniform decode verifier phase. The compact
@@ -397,7 +503,13 @@ def _supports_sparse_sampling_contract(
     if np.any(states.min_p.np[idx] != 0.0):
         return False
 
-    if np.any(sampler.penalties_state.use_penalty[idx]):
+    penalties = sampler.penalties_state
+    if np.any(penalties.use_penalty[idx]) and not (
+        allow_penalties
+        and int(input_batch.cu_num_logits_np[-1]) >= 2
+        and getattr(states, "vocab_size", 0) >= 32768
+        and _monotone_penalties(penalties, idx)
+    ):
         return False
     if np.any(sampler.logit_bias_state.use_logit_bias[idx]):
         return False
@@ -435,13 +547,15 @@ def try_dflash2_sparse_target_rejection(
         return None
     if not hasattr(model, "get_topk_tokens_and_logits"):
         return None
-    if not _supports_sparse_sampling_contract(rejection_sampler, input_batch):
+    if not _supports_sparse_sampling_contract(
+        rejection_sampler, input_batch, allow_penalties=True
+    ):
         return None
 
     sparse_draft_logits = speculator.get_sparse_draft_logits()
     if sparse_draft_logits is None:
         return None
-    if allow_graph and not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+    if allow_graph and not speculator._trace.value("alignment"):
         from .sampler_graph import try_graph_rejection
 
         result = try_graph_rejection(
@@ -480,6 +594,18 @@ def try_dflash2_sparse_target_rejection(
         target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
             sample_hidden_states, probe_k
         )
+    floors = None
+    penalties = rejection_sampler.sampler.penalties_state
+    if np.any(penalties.use_penalty[idx]):
+        # The contract admits penalties only on this wide, tie-retaining probe.
+        floors = _penalize_probe(
+            target_topk_logits,
+            target_topk_ids,
+            penalties,
+            input_batch.expanded_idx_mapping,
+            input_batch.input_ids[input_batch.logits_indices],
+            input_batch.expanded_local_pos,
+        )
     if retain_ties:
         target_topk_logits, target_topk_ids = sort_topk_with_vocab_ties(
             target_topk_logits,
@@ -495,6 +621,7 @@ def try_dflash2_sparse_target_rejection(
             states.temperature.gpu,
             states.top_p.gpu,
             input_batch.expanded_idx_mapping,
+            floors,
         )
     else:
         num_logits = np.diff(input_batch.cu_num_logits_np)
@@ -554,7 +681,7 @@ def try_dflash2_sparse_target_rejection(
         )
         sampled.index_copy_(0, reqs, dense_sampled)
         num_sampled.index_copy_(0, reqs, dense_num_sampled)
-    if envs.VLLM_SPEC_DUMP_ALIGNMENT:
+    if speculator._trace.value("alignment"):
         _maybe_dump_selector_alignment(
             speculator=speculator,
             rejection_sampler=rejection_sampler,

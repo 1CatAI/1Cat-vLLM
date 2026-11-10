@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm._sm70.policy import NativeBindings
+from vllm.config.sm70_native import capture_linear_native_config
 from vllm.model_executor.kernels.gguf import GGUFDecoderFamily, GGUFOperatorCapability
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import LATTICE_TYPES
 from vllm.model_executor.layers.quantization.utils import replace_parameter
@@ -13,7 +15,7 @@ from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-from .sm70_gguf import _get_affine_blas_workspace
+from .sm70_gguf import _bind_affine_blas_workspace
 
 # Matched Flash-Next and 27B TP4 sweeps; unmeasured descriptors retain fused MMA.
 # The narrow expert crossover is nonmonotonic, so it has two intervals.
@@ -63,6 +65,7 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.native_ops = NativeBindings(capture_linear_native_config("gguf").values)
         if getattr(layer, "_gguf_tm_lattice_prepared", False):
             return
         codes, scales, _, _ = self._get_weight_params(layer)
@@ -86,12 +89,8 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
             reason = "operator_missing:gguf_lattice_blas_sm70_out"
         elif bands is None:
             reason = "local_shape_has_no_prefill_calibration"
-        else:
-            workspace = _get_affine_blas_workspace(weight)
-            if workspace is None:
-                reason = "prefill_workspace_allocation_failed"
-            else:
-                layer.gguf_tm_blas_workspace = workspace[: k * n].view(k, n)
+        elif not _bind_affine_blas_workspace(layer, weight, k, n):
+            reason = "prefill_workspace_allocation_failed"
         self.prefill_capabilities = tuple(
             GGUFOperatorCapability(
                 GGUFDecoderFamily.LATTICE,
@@ -127,7 +126,7 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
                 self.config.group_size,
             )
         else:
-            torch.ops._C.gguf_lattice_gemm_sm70_out(
+            self.native_ops.gguf_lattice_gemm_sm70_out(
                 output,
                 rows,
                 getattr(layer, self.w_q_name),

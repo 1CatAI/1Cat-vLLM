@@ -60,18 +60,28 @@ def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
     from vllm.models.qwen4_exp.nvidia import mtp
 
     target_head, draft_view = object(), object()
-    model = SimpleNamespace(_sm70_draft_head=None, lm_head=target_head)
+    from vllm.config.execution_policy import GraphPolicy
+
+    model = SimpleNamespace(
+        _sm70_draft_head=None,
+        lm_head=target_head,
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(sm70_draft_hot_vocab=True),
+            compilation_config=SimpleNamespace(runtime=GraphPolicy(dual_compile=False)),
+        ),
+    )
     model.prepare_sm70_draft_head = lambda: mtp.Qwen4ExpMTP.prepare_sm70_draft_head(
         model
     )
     seen = []
 
-    def prepare_head(head):
+    def prepare_head(head, hot_vocab):
+        assert hot_vocab
         seen.append(head)
         return draft_view
 
     monkeypatch.setattr(head_ops, "prepare_mtp_qpn8_head", prepare_head)
-    monkeypatch.setattr(mtp.envs, "VLLM_SM70_QWEN38_DUAL_COMPILE", False)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "0")
     prepare = mtp.Qwen4ExpMTP.prepare_sm70_decode_graph_model
     assert not prepare(model)
     assert not prepare(model)

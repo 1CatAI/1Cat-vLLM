@@ -4,7 +4,8 @@
 import pytest
 import torch
 
-from vllm.model_executor.layers.fla.ops import fused_recurrent, fused_sigmoid_gating
+from vllm.config.gdn_schedule import GdnScheduleConfig
+from vllm.model_executor.layers.fla.ops import fused_sigmoid_gating
 
 
 @pytest.mark.parametrize("accepted", [1, 4, 8])
@@ -29,6 +30,9 @@ def test_verify_tile_preserves_output_and_every_state_snapshot(
     cu = torch.tensor([0, 8], device="cuda", dtype=torch.int32)
     initial = torch.randn(11, 12, 128, 128, device="cuda")
 
+    schedule = GdnScheduleConfig()
+    schedule.resolve()
+
     def apply(state, output):
         fused_sigmoid_gating.fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
             a_log,
@@ -50,12 +54,13 @@ def test_verify_tile_preserves_output_and_every_state_snapshot(
             precomputed_beta=beta,
             match_recurrent_schedule=True,
             match_recurrent_numerics=True,
+            schedule=schedule,
         )
 
     graphs, states, outputs = [], [], []
     for legacy in (True, False):
         # The existing legacy override suppresses automatic tile admission.
-        monkeypatch.setattr(fused_recurrent, "_SM70_FLA_HAS_LEGACY_OVERRIDE", legacy)
+        schedule.recurrent_override = legacy
         state = initial.clone()
         output = torch.empty(8, 1, 12, 128, device="cuda", dtype=torch.float16)
         apply(state, output)

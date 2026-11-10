@@ -1,0 +1,206 @@
+{
+  "baseline": "eb5a87b6ae03ad448d687a4dc133b3fc38b17e8a",
+  "candidate_file_hashes": {
+    "tests/config/test_tensor_diagnostic_ownership.py": "f5d8d246c6f06638b349ef7aadc335fc81edd4646ffcddc54936777e7c6c1868",
+    "tests/kernels/core/test_engine_diagnostic_capture.py": "602bcb58825ec81b2cd75fab703d813fd65bd81aa7f1a68dc0e362c36c35e57a",
+    "tests/tools/test_check_sm70_linear_policy.py": "bad868cbf73718a8ba189bec778ad6c529585714d6e7f2890762956868713abe",
+    "tests/v1/spec_decode/test_dspark.py": "325095f93cf21aee9bceb10336232c41242d962b02c65a5d66a5ebf43795a179",
+    "tools/pre_commit/check_sm70_linear_policy.py": "40f04af87fc77d4e29a1b29e3f2de078526d34760c65e8b95dd65a76aecbadb3",
+    "tools/pre_commit/layering_baseline.json": "c32b8d50b3e82fb9b30fe3ed4e6dc40e8298a6bd9538fb4c95ca1ca205aaf047",
+    "vllm/config/diagnostic_dump.py": "50e0b0c9debbc815da2422381c9604ebdc77f1df1996e076be6d008450efc80b",
+    "vllm/config/diagnostic_sampling.py": "22279e3ea6b3826b9e3c72e353dbc79d0eb928752966d2beda642be96d4aa57c",
+    "vllm/config/policy_defaults.py": "80cd9deebf5abb7900dad4da75c17e5eb4a975d034b226212852d5bfbb0853f2",
+    "vllm/config/sm70_dflash2.py": "2a0b951cafe95500fd5f4dd38dc47910e6feb27350fabeb56b57fdce7767972e",
+    "vllm/config/sm70_moe.py": "98b1ee406fc14140c789359248651a781d967715e19b117272ea24cd2f7debfa",
+    "vllm/config/sm70_runtime.py": "6a2cb46d9ef0f9936cb40fdfa6ca22df2f2e6850d53b5e7fa054bd21f296dacd",
+    "vllm/config/speculative.py": "48780f5e5ca914c1709fdde0c31edcb212c47d365c4f8c7b5f37bebb77355689",
+    "vllm/config/vllm.py": "1b73bca5cf9fde3c816596e2b54032ba0fefbdc34567efa59fef612f9040dfc9",
+    "vllm/diagnostics.py": "21a941eb618a47600fa217cea5cbb6196cc204879afec2519b45864945e0ba42",
+    "vllm/model_executor/layers/fla/ops/gdn_diagnostics.py": "a3fae2db83ea1547cfe3a3c99487fc31750988fabe51f0772c6e9de9f7f1b3b1",
+    "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": "cb0a118af49b3a9857ba48435c3f79c823054fa69466f3107510ba4e7e1a8e8f",
+    "vllm/model_executor/layers/fused_moe/sm70/diagnostics.py": "44e87ecb8d1b585415e19b9d7b3efe8ce6d650425c1444d5ed17265856de23a2",
+    "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": "5824d31dcbb848839e84d9e9c94d6659d385e6b8a1c6bb59af6f1231584ed670",
+    "vllm/model_executor/models/qwen3_next.py": "099927441ea89f6990bb5ee772cfa7e71fa83868bdc901fd8a9ce5db9132cbd3",
+    "vllm/models/deepseek_v4/nvidia/dspark.py": "8a3e4cc49ad147dbd0ecca2e2e6334ae2a289f120d50e3ae52bc210bad94bd1d",
+    "vllm/runtime_resources.py": "03b1f4bcd65403b6e5e8f13b0bac73dfd95490d7f79d2ece20138af4f5b47e37",
+    "vllm/v1/sample/rejection_sampler.py": "bf3d4883bb46948d1a7a15476491538bde60e33d3080597161a73250a769bd51",
+    "vllm/v1/sample/sampler.py": "7fb34b67114cd4585f674093b0833eea683d3db24c707fcbd51527667f6b3050",
+    "vllm/v1/spec_decode/dflash.py": "eecbae9ea817d9d6af213dc0ece4a1b0f44aec7910f9a009aa97a0ff823292e7",
+    "vllm/v1/spec_decode/dspark.py": "736984fe32b71b9cff978a6283304f91199f0a54edb34d8ce9c4633337593866",
+    "vllm/v1/spec_decode/llm_base_proposer.py": "fce5ed11c65b28dba4adbf89bc40d527c559ca024b097dc3f63dac7dd391a12d",
+    "vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py": "fed09594f6831321867d5b1039ed689f796e7ca1c1a2f4f1f3bcc4090c9f0a7e",
+    "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py": "343590af928e928ff4d886f2584973fb3ea53eb2d41186544f94d16a43077e55",
+    "vllm/v1/worker/gpu_model_runner.py": "d62886d7c8aef37d787cad2cfa060b826a70c6338f68f4fdb7b1e5cfee2bca82"
+  },
+  "contract": {
+    "host": "54633",
+    "gpu_index": 2,
+    "tensor_shape": [
+      8,
+      128
+    ],
+    "dtype": "float16",
+    "tensor_parallel": 1,
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "driver": "580.173.02",
+    "model": null,
+    "procedure": "3 alternating rounds; 9 medians per process; CUDA graphs contain 64 observations, 100 replays; host enqueue 200 calls; admission 10000 calls",
+    "native": "unchanged normal installed vLLM extensions; no LD_PRELOAD or private library overlay"
+  },
+  "native_hashes": "46d5abe030c305419894cb6954b82064ab3bf6423b3a99e5c3705feac5951954  baseline/vllm/_C.abi3.so\n9c7a68d983c614adf0745dea388bedf44182ec13ea3034f586ba35a86a568341  baseline/vllm/_C_gguf.abi3.so\nc42b90d3b06b463e11f5e8bb16ec2adbabdee0d58482c0b20945baf9a3f468bf  baseline/vllm/_C_stable_libtorch.abi3.so\na6d0bc084bb4066309675fda9964069e6df90d923d33c83282eb51247d45b689  baseline/vllm/_h3_flashattn_C.cpython-312-x86_64-linux-gnu.so\n0b55d9c140ddee0d95e24d742e1b452d7a67e1ea214c34a24bc9c7cd46833593  baseline/vllm/_h3_flashinfer_C.cpython-312-x86_64-linux-gnu.so\n16c3beb6d0cfa4c45c5cba74c6ba3fb111b6335f49d9c192330a7f6fae52f4af  baseline/vllm/_h3_w8a16_C.cpython-312-x86_64-linux-gnu.so\n4c671824b05e69741be29c39d70c0285062facc4ed9b90d0efba2536a23c7fe3  baseline/vllm/_moe_C.abi3.so\n2f349a87522cb6b829e7298f4048d94d9560af6eff5667a1b666a9b9838c9004  baseline/vllm/_sm70_exact_reduce_C.cpython-312-x86_64-linux-gnu.so\nbe4ae680262bc27b1294641983acea4b74f48af253001682514a76b82934659c  baseline/vllm/_sm70_sampler_C.abi3.so\n720e3f6a241117670f0f6232866f1975e001c6bf9e07d0e540218ee99e3b1618  baseline/vllm/_sm70_sparse_attention_C.cpython-312-x86_64-linux-gnu.so\n58367705682cdba48923ebb6c80daf9151eec709c43083c38fc459ed3a933cf2  baseline/vllm/cumem_allocator.abi3.so\nd64a64fd4df8635ad3b866a9d297e69ff979a4de49958feb52799dbf84201585  baseline/vllm/spinloop.abi3.so\n",
+  "runs": [
+    {
+      "lane": "baseline",
+      "round": "1",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "enabled": false,
+          "gpu_us": 1.0769599676132202,
+          "host_us": 37.45263,
+          "predicate_us": 0.5756352,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        },
+        {
+          "enabled": true,
+          "gpu_us": 2.1454399824142456,
+          "host_us": 64.797955,
+          "predicate_us": 2.2560376,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        }
+      ]
+    },
+    {
+      "lane": "baseline",
+      "round": "2",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "enabled": false,
+          "gpu_us": 1.080320030450821,
+          "host_us": 40.291489999999996,
+          "predicate_us": 0.545124,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        },
+        {
+          "enabled": true,
+          "gpu_us": 2.1488000452518463,
+          "host_us": 65.81275,
+          "predicate_us": 2.185883,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        }
+      ]
+    },
+    {
+      "lane": "baseline",
+      "round": "3",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "enabled": false,
+          "gpu_us": 1.0822399705648422,
+          "host_us": 38.220005,
+          "predicate_us": 0.5691769000000001,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        },
+        {
+          "enabled": true,
+          "gpu_us": 2.1491199731826782,
+          "host_us": 61.70964,
+          "predicate_us": 2.2289413,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        }
+      ]
+    },
+    {
+      "lane": "candidate",
+      "round": "1",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "enabled": false,
+          "gpu_us": 1.0795199871063232,
+          "host_us": 32.71648,
+          "predicate_us": 0.4258223,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        },
+        {
+          "enabled": true,
+          "gpu_us": 2.1503999829292297,
+          "host_us": 60.203269999999996,
+          "predicate_us": 0.6619609000000001,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        }
+      ]
+    },
+    {
+      "lane": "candidate",
+      "round": "2",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "enabled": false,
+          "gpu_us": 1.0788799822330475,
+          "host_us": 28.726145,
+          "predicate_us": 0.4411574,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        },
+        {
+          "enabled": true,
+          "gpu_us": 2.1459199488162994,
+          "host_us": 52.35667,
+          "predicate_us": 0.6428619,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        }
+      ]
+    },
+    {
+      "lane": "candidate",
+      "round": "3",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "enabled": false,
+          "gpu_us": 1.0806400328874588,
+          "host_us": 35.52525,
+          "predicate_us": 0.4319513,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        },
+        {
+          "enabled": true,
+          "gpu_us": 2.1516799926757812,
+          "host_us": 64.52853,
+          "predicate_us": 0.6438446,
+          "peak_extra_bytes": 2048,
+          "sha256": "26ed2d597a5dcaa46c123fa04d2bb8ab1dd9c1f55b4c8b33e84be24a86f388a9"
+        }
+      ]
+    }
+  ],
+  "correctness": "7 GPU tests passed, including dual-engine capture/replay, buffer replacement address retention, non-aliasing schema/fake and AOT checks. All measured SHA256 outputs match.",
+  "retained_failure": "First queued GPU job loaded the earlier archived source lacking a typing.Any import. It failed at collection before GPU execution. Corrected complete source overlay passed; stale log retained."
+}

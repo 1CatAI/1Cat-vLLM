@@ -10,6 +10,8 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
+from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -37,8 +39,6 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
-
-_DFLASH_KPOOL_COORD_TRACE_SEEN = False
 
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
@@ -275,7 +275,6 @@ def sparse_attn_indexer_kpool(
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
 ) -> torch.Tensor:
-    global _DFLASH_KPOOL_COORD_TRACE_SEEN
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
@@ -386,7 +385,7 @@ def sparse_attn_indexer_kpool(
                 )
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
-                # ``pos % kpool`` within the request's tail block. Processing
+                # ``pos % ring`` within the request's tail block. Processing
                 # only the batch's trailing tokens would miss all but the last
                 # request in a multi-request prefill.
                 if (
@@ -591,7 +590,7 @@ def sparse_attn_indexer_kpool(
         # Spec verification groups tokens by request and preserves position
         # order so each token is stashed before the next completes its pool.
         # Positions must remain token-granular because the kernel derives the
-        # pool phase and tail index from ``pos % kpool``.
+        # pool phase from ``pos % kpool`` and the ring slot from ``pos % ring``.
         if (
             index_kpool > 1
             and gate_score is not None
@@ -668,7 +667,7 @@ def sparse_attn_indexer_kpool(
             # Paged tail cache replaces the transient _DECODE_TAIL ring. Group
             # the tail group's token-granular slot_mapping per-request, mirroring
             # dec_slot / dec_pos, so the kernel gets each request's current-token
-            # tail slot (block * kpool + pos % kpool).
+            # tail slot (block * ring + pos % ring).
             if tail_meta is not None:
                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
             if tail_meta is None or tail_kv_cache is None:
@@ -851,12 +850,11 @@ def sparse_attn_indexer_kpool(
                 dec_seq = dec_seq.to(torch.int32)
             out = expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
             if (
-                os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE", "0") == "1"
-                and not _DFLASH_KPOOL_COORD_TRACE_SEEN
+                capture_runtime_trace().dflash.coord_exact_one
+                and not diagnostic_history("kpool_coord_trace").get("seen", False)
                 and 1 < out.shape[0] <= 8
                 and positions is not None
-                and int(positions[0].item())
-                >= int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8"))
+                and int(positions[0].item()) >= target_trace_min_position()
             ):
                 logger.warning(
                     "DFLASH_KPOOL_COORD_TRACE positions=%s dec_seq=%s "
@@ -867,7 +865,7 @@ def sparse_attn_indexer_kpool(
                     pool_topk[:, :8].detach().cpu().tolist(),
                     out[:, :24].detach().cpu().tolist(),
                 )
-                _DFLASH_KPOOL_COORD_TRACE_SEEN = True
+                diagnostic_history("kpool_coord_trace")["seen"] = True
         else:
             out = topk_dst
 

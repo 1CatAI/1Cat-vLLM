@@ -11,7 +11,6 @@ import torch.multiprocessing as mp
 
 
 def _check_medium_reduce(rank: int, rendezvous: str) -> None:
-    from vllm import envs
     from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
     torch.accelerator.set_device_index(rank)
@@ -23,8 +22,17 @@ def _check_medium_reduce(rank: int, rendezvous: str) -> None:
         init_method=rendezvous,
         timeout=timedelta(seconds=120),
     )
-    communicator = CustomAllreduce(dist.group.WORLD, rank, max_size=1024 * 1024)
-    assert not communicator.disabled and communicator.fully_connected
+    communicators = {}
+    # Policy is an immutable communicator input. Construct the three original
+    # algorithm choices before capture and retain each opaque owner's buffers.
+    for mode in ("1stage", "2stage", None):
+        if mode is None:
+            os.environ.pop("VLLM_CUSTOM_ALLREDUCE_ALGO", None)
+        else:
+            os.environ["VLLM_CUSTOM_ALLREDUCE_ALGO"] = mode
+        comm = CustomAllreduce(dist.group.WORLD, rank, max_size=1024 * 1024)
+        assert not comm.disabled and comm.fully_connected
+        communicators[mode] = comm
     try:
         for dtype in (torch.float16, torch.float32):
             for size in (393200, 393216, 491520, 524272, 524288, 655360):
@@ -37,13 +45,10 @@ def _check_medium_reduce(rank: int, rendezvous: str) -> None:
                 # The diagnostic override retains the original sum order on
                 # either side of the 512-KiB algorithm boundary.
                 for reference in (True, False):
-                    if reference:
-                        os.environ["VLLM_CUSTOM_ALLREDUCE_ALGO"] = (
-                            "1stage" if size < 524288 else "2stage"
-                        )
-                    else:
-                        os.environ.pop("VLLM_CUSTOM_ALLREDUCE_ALGO", None)
-                    envs.disable_envs_cache()
+                    mode = (
+                        ("1stage" if size < 524288 else "2stage") if reference else None
+                    )
+                    communicator = communicators[mode]
                     storage = [
                         torch.full((x.numel() + 16,), 123.0, dtype=dtype, device="cuda")
                         for x in inputs
@@ -84,19 +89,17 @@ def _check_medium_reduce(rank: int, rendezvous: str) -> None:
                             assert bool(torch.all(storage[:8] == 123))
                             assert bool(torch.all(storage[-8:] == 123))
                     # Also validate the uncaptured registered-buffer path.
-                    os.environ["VLLM_CUSTOM_ALLREDUCE_ALGO"] = (
-                        "1stage" if size < 524288 else "2stage"
-                    )
-                    expected = communicator.all_reduce(inputs[0], registered=False)
-                    os.environ.pop("VLLM_CUSTOM_ALLREDUCE_ALGO", None)
-                    actual = communicator.all_reduce(inputs[0], registered=False)
+                    reference = communicators["1stage" if size < 524288 else "2stage"]
+                    expected = reference.all_reduce(inputs[0], registered=False)
+                    actual = communicators[None].all_reduce(inputs[0], registered=False)
                     torch.accelerator.synchronize()
                     assert torch.equal(
                         actual.view(torch.uint8), expected.view(torch.uint8)
                     )
                 del graphs, outputs, guards, inputs
     finally:
-        communicator.close()
+        for communicator in communicators.values():
+            communicator.close()
         dist.destroy_process_group()
 
 

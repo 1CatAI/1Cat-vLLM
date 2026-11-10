@@ -102,6 +102,8 @@ class PleShortConvAttentionBackend(ShortConvAttentionBackend):
 
 
 class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
+    accepts_speculative_state_metadata = True
+
     metadata_cls = PleShortConvAttentionMetadata
     # Spec-decode requires a uniform (multi-token) decode batch for full
     # CUDA graph capture, matching the GDN backend.

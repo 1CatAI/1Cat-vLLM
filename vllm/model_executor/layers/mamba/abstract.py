@@ -13,6 +13,15 @@ from vllm.v1.attention.selector import get_mamba_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 
+def _commits_speculative_state_by_replay(vllm_config) -> bool:
+    """Speculative GDN states are recomputed instead of stored per position."""
+    from vllm.model_executor.layers.mamba.gdn.spec_replay import (
+        spec_replay_enabled,
+    )
+
+    return spec_replay_enabled(vllm_config)
+
+
 class MambaBase(AttentionLayerBase):
     """
     Base class for Mamba-like layers which support the v1 engine.
@@ -60,6 +69,7 @@ class MambaBase(AttentionLayerBase):
             num_speculative_blocks=(
                 vllm_config.speculative_config.num_speculative_state_tokens()
                 if vllm_config.speculative_config
+                and not _commits_speculative_state_by_replay(vllm_config)
                 else 0
             ),
         )

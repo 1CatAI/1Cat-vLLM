@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.v1.core import kv_cache_utils
@@ -33,7 +34,9 @@ def test_kpool_tail_admission_uses_in_flight_keyword() -> None:
     )
 
 
-def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch):
+# Ring 4 without speculation, 16 with 7 draft tokens (kpool 4).
+@pytest.mark.parametrize("tail_ring", [4, 16])
+def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch, tail_ring):
     monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
     model_config = SimpleNamespace(
         max_model_len=32768,
@@ -77,12 +80,12 @@ def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch):
                 compress_ratio=4,
             )
             specs[f"{prefix}.indexer.tail_cache"] = KpoolTailSpec(
-                block_size=4,
+                block_size=tail_ring,
                 num_kv_heads=1,
                 head_size=256,
                 head_size_v=0,
                 dtype=torch.bfloat16,
-                sliding_window=4,
+                sliding_window=tail_ring,
             )
         else:
             specs[prefix] = mamba_spec
@@ -103,7 +106,11 @@ def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch):
         if group.kv_cache_spec.prefix_cacheable
     ]
     assert min(participating_block_sizes) == block_size
-    assert min(group.kv_cache_spec.block_size for group in groups) == 4
+    assert min(group.kv_cache_spec.block_size for group in groups) == tail_ring
+    # The ring's page must fit the indexer page it is padded to and shares.
+    (tail_group,) = [g for g in groups if g.layer_names[0] in tail_names]
+    tail_specs = tail_group.kv_cache_spec.kv_cache_specs.values()
+    assert all(spec.page_size_bytes == idx_page for spec in tail_specs)
 
     bytes_per_block = 11 * (mla_page + idx_page)
     cache_config = kv_cache_utils.get_kv_cache_config_from_groups(

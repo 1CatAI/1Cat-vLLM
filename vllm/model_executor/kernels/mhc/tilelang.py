@@ -3,7 +3,7 @@
 import torch
 
 import vllm._sm70_ops as sm70_ops
-from vllm import envs
+from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -781,7 +781,7 @@ def mhc_fused_post_pre_tilelang(
         current_platform.get_device_capability() if current_platform.is_cuda() else None
     )
     use_sm70_fp32_stage = (
-        envs.VLLM_SM70_DSV4_MHC_FP32_STAGE
+        layer_policy().value("mhc_fp32_stage")
         and use_small_fma
         and use_fp16
         and capability is not None
@@ -797,10 +797,9 @@ def mhc_fused_post_pre_tilelang(
     )
     use_sm70_fused_post_dot_q8 = (
         use_sm70_fp32_stage
-        and envs.VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8
-        and num_tokens == 8
-        and tile_n == 12
-        and n_splits == 4
+        and layer_policy().mhc_fused_post_dot
+        and 1 <= num_tokens <= 8
+        and n_splits in (4, 8)
     )
     use_sm70_triton_large = (
         norm_weight is not None
@@ -859,7 +858,8 @@ def mhc_fused_post_pre_tilelang(
             # Six outputs per CTA is the lowest-latency native SM70 variant.
             native_tile_n = 6
             logger.info_once(
-                "SM70 GLM mHC fused q8 post+dot path enabled (tile_n=%d).",
+                "SM70 GLM mHC fused native post+dot enabled for 1-8 tokens "
+                "(tile_n=%d).",
                 native_tile_n,
             )
             sm70_ops.sm70_glm_mhc_post_dot_q8_out(

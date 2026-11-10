@@ -13,11 +13,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm.config import get_current_vllm_config
+from vllm.config.execution_policy import layer_policy
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    register_layer_workspace,
+    workspace_pool,
+)
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
@@ -95,12 +99,13 @@ def _workspace(weight: torch.Tensor) -> torch.Tensor:
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     key = (device_index, weight.dtype)
-    workspace = _workspaces.get(key)
+    pool = workspace_pool("online_qpn8", _workspaces)
+    workspace = pool.get(key)
     if workspace is None:
         workspace = torch.empty(
             (_WORKSPACE_ELEMENTS,), dtype=torch.float16, device=weight.device
         )
-        _workspaces[key] = workspace
+        pool[key] = workspace
     return workspace
 
 
@@ -108,14 +113,15 @@ def _hc_workspace(weight: torch.Tensor) -> torch.Tensor:
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    partials = _hc_partials.get(device_index)
+    pool = workspace_pool("online_qpn8_hc", _hc_partials)
+    partials = pool.get(device_index)
     if partials is None:
         partials = torch.empty(
             (32 * _HC_DOWN_PADDED_N,),
             dtype=torch.float32,
             device=weight.device,
         )
-        _hc_partials[device_index] = partials
+        pool[device_index] = partials
     return partials
 
 
@@ -144,7 +150,7 @@ def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     """Quantize one admitted FP16 weight and retain only its QPN8 layout."""
     if getattr(layer, _STATE_ATTR, False):
         return True
-    if not envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8 or not _exact_runtime_contract():
+    if not layer_policy().value("online_qpn8") or not _exact_runtime_contract():
         return False
     if any(not hasattr(torch.ops._C, name) for name in _REQUIRED_OPS):
         raise RuntimeError(
@@ -177,6 +183,7 @@ def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
 
     codes, scales = prepare_channel_qpn8_weight(weight_for_quant)
     workspace = _workspace(weight)
+    register_layer_workspace(layer, workspace, family="fp8")
 
     replace_parameter(layer, "weight", codes)
     replace_parameter(layer, "weight_scale_inv", scales)
@@ -192,7 +199,7 @@ def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     layer._sm70_qwen4_exp_online_qpn8_workspace_ptr = workspace.data_ptr()
     if prefix.endswith(_HC_DOWN_SUFFIX):
         # Resolve the shared scratch tensor while weights are prepared. Looking
-        # it up through the process-global dictionary from forward makes
+        # it up through a workspace dictionary from forward makes
         # TorchDynamo emit a dictionary clear/update, which cudagraph rejects
         # as a module-state mutation.
         layer.register_buffer(
@@ -231,9 +238,9 @@ def maybe_apply_online_qpn8(
     if not x_2d.is_contiguous():
         x_2d = x_2d.contiguous()
     out = torch.empty((x_2d.size(0), n), dtype=x.dtype, device=x.device)
-    sm70_ops.fp8_qpn8_dispatch_sm70_out(
+    torch.ops.vllm.sm70_fp8_qpn8_dispatch(
         out,
-        int(layer._sm70_qwen4_exp_online_qpn8_workspace_ptr),
+        layer.prefix,
         x_2d,
         getattr(layer, _CODES_ATTR),
         getattr(layer, _SCALES_ATTR),
@@ -289,14 +296,14 @@ def maybe_apply_fused_hc(
     down_staging = xn.new_empty((m, _HC_DOWN_PADDED_N))
     lora_staging = xn.new_empty((m, 320))
     gate_staging = xn.new_empty((m, 10240))
-    sm70_ops.fp8_qpn8_hc_dispatch_sm70_out(
+    torch.ops.vllm.sm70_online_qpn8_hc_dispatch(
         block_out,
         injection_out,
         down_staging,
         lora_staging,
         gate_staging,
         partials,
-        down_workspace_ptr,
+        down_layer.prefix,
         xn,
         getattr(down_layer, _CODES_ATTR),
         getattr(down_layer, _SCALES_ATTR),

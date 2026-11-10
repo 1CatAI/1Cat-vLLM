@@ -1,6 +1,6 @@
 site_name: vLLM
 site_url: !ENV READTHEDOCS_CANONICAL_URL
-repo_url: https://github.com/vllm-project/vllm
+repo_url: https://github.com/1CatAI/1Cat-vLLM
 edit_uri: edit/main/docs/
 exclude_docs: |
   argparse

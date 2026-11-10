@@ -105,6 +105,10 @@ class SingleTypeKVCacheManager(ABC):
         # Cache-hit alignment, set by the coordinator (its ``lcm_block_size``).
         self.alignment_tokens: int | None = None
         self.mamba_replay_lookbehind = False
+        # The coordinator's ``prefix_cache_retention_interval``: a positive
+        # value keeps a Mamba state every that many tokens, which a sliding
+        # window must also keep its run for.
+        self.retention_interval: int | None = None
 
     def take_pending_boundary_state_offloads(
         self,
@@ -270,7 +274,8 @@ class SingleTypeKVCacheManager(ABC):
         if num_external_computed_tokens > 0:
             # Allocate new blocks for external computed tokens.
             allocated_blocks = self.block_pool.get_new_blocks(
-                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks),
+                self.kv_cache_group_id,
             )
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) in (
@@ -303,7 +308,9 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks, self.kv_cache_group_id
+            )
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) in (
                 FullAttentionSpec,
@@ -318,6 +325,17 @@ class SingleTypeKVCacheManager(ABC):
         ids = self.new_block_ids
         self.new_block_ids = []
         return ids
+
+    def num_hashed_full_blocks(self, request: Request, num_tokens: int) -> int:
+        """Full blocks within ``num_tokens`` whose block hash exists. Lookahead
+        hashes trail the tokens by one, so the block ending at the last token
+        has no hash until the next token arrives."""
+        num_hashed_blocks = (
+            len(request.block_hashes)
+            * self.block_pool.hash_block_size
+            // self.block_size
+        )
+        return min(num_tokens // self.block_size, num_hashed_blocks)
 
     def cache_blocks(
         self,
@@ -340,7 +358,7 @@ class SingleTypeKVCacheManager(ABC):
                 future cache hit.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
-        num_full_blocks = num_tokens // self.block_size
+        num_full_blocks = self.num_hashed_full_blocks(request, num_tokens)
 
         if num_cached_blocks >= num_full_blocks:
             return
@@ -476,7 +494,7 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         first_block: int,
         last_block: int,
-        hold: tuple[int, int] | None = None,
+        hold: Sequence[tuple[int, int]] = (),
         reuse_first: bool = False,
     ) -> None:
         """Free blocks in ``[first_block, last_block)`` and replace with null_block.
@@ -485,8 +503,8 @@ class SingleTypeKVCacheManager(ABC):
         earlier blocks in the range were nulled in a prior call.
 
         Args:
-            hold: Block range ``[start, end)`` whose cached entries keep normal
-                eviction priority: the window a repeat of this prompt needs.
+            hold: Block ranges ``[start, end)`` whose cached entries keep normal
+                eviction priority: the windows a later prompt can resume from.
                 Other expired sliding-window blocks can be reused immediately.
             reuse_first: Hand the freed blocks out again before other free
                 blocks (see ``BlockPool.free_blocks``).
@@ -506,7 +524,7 @@ class SingleTypeKVCacheManager(ABC):
                 # should also have been set to null blocks by the previous calls
                 # to this function.
                 break
-            if hold is not None and hold[0] <= i < hold[1]:
+            if any(start <= i < end for start, end in hold):
                 replay.append(blocks[i])
             else:
                 freed.append(blocks[i])
@@ -518,43 +536,50 @@ class SingleTypeKVCacheManager(ABC):
             # the real-held SWA capacity used by admission and pool sizing.
             self.block_pool.free_blocks(replay)
 
-    def _cached_window_at_last_boundary(
-        self, num_prompt_tokens: int | None
-    ) -> tuple[int, int] | None:
-        """Block range a repeat of this prompt will look up, or ``None``.
+    def _cached_windows(self, num_prompt_tokens: int | None) -> list[tuple[int, int]]:
+        """Block ranges a later prompt can resume from.
 
         A hit ends on an ``alignment_tokens`` boundary and, for a sliding
         window, consults only the blocks ``reachable_block_mask`` caches there:
         the ``need``-wide run ending at that boundary, shifted by one when
-        EAGLE peeks past it. Once outside the live attention window, these
-        blocks retain normal cache priority; all other expired blocks are
-        reused first. This preserves the bounded SWA admission reservation.
+        EAGLE peeks past it. Two kinds of boundary can serve a hit: the last
+        one of the prompt, which a repeat looks up, and each Mamba state a
+        positive ``retention_interval`` keeps, which a prompt sharing only an
+        earlier part resumes from. Once outside the live attention window,
+        these blocks retain normal cache priority; all other expired blocks
+        are reused first. This preserves the bounded SWA admission reservation.
         """
         if (
             not self.enable_caching
             or num_prompt_tokens is None
             or self.reuse_window is None
         ):
-            return None
+            return []
         alignment = self.alignment_tokens or self.block_size
         # Lookup recomputes the final token and EAGLE's last matched page.
         # A sparse Mamba checkpoint can require one whole alignment earlier.
         if self.mamba_replay_lookbehind:
-            boundary = max(0, num_prompt_tokens // alignment - 1) * alignment
+            last = max(0, num_prompt_tokens // alignment - 1) * alignment
         else:
             last_match = (
                 num_prompt_tokens - 1 - (self.block_size if self.use_eagle else 0)
             )
-            boundary = max(0, last_match // alignment) * alignment
-        if boundary <= 0:
-            return None
+            last = max(0, last_match // alignment) * alignment
+        boundaries = {last} if last > 0 else set()
+        if self.retention_interval:
+            boundaries.update(
+                range(self.retention_interval, last, self.retention_interval)
+            )
         need = cdiv(self.reuse_window - 1, self.block_size)
         shift = 0
         if self.use_eagle:
             need += 1
             shift = 1
-        end = boundary // self.block_size + shift
-        return (max(0, end - need), end)
+        windows = []
+        for boundary in sorted(boundaries):
+            end = boundary // self.block_size + shift
+            windows.append((max(0, end - need), end))
+        return windows
 
     def remove_skipped_blocks(
         self,
@@ -589,13 +614,13 @@ class SingleTypeKVCacheManager(ABC):
         if self.reuse_window is None:
             self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
             return
-        # Sliding window: blocks the window has moved past can never serve a
-        # future hit, so they are reused first -- otherwise a long prefill
-        # walks the whole free queue and evicts other requests' prefixes. The
-        # one exception is the cached window at the last alignment boundary
-        # of the prompt: a repeat of this prompt looks exactly that up, so it
-        # keeps normal cache priority while remaining evictable.
-        hold = self._cached_window_at_last_boundary(num_prompt_tokens)
+        # Sliding window: blocks the window has moved past can serve no future
+        # hit, so they are reused first -- otherwise a long prefill walks the
+        # whole free queue and evicts other requests' prefixes. The exceptions
+        # are the cached windows a later prompt resumes from (the last
+        # alignment boundary and retained Mamba checkpoints): they keep normal
+        # cache priority while remaining evictable.
+        hold = self._cached_windows(num_prompt_tokens)
         # `num_skipped_tokens` may include tokens that haven't been allocated yet
         # (e.g., when the attention window moves into the external computed tokens
         # range); `_remove_blocks_in_range` caps to the number of blocks that
@@ -690,7 +715,7 @@ class CircularBufferManager(FullAttentionManager):
         req_blocks = self.req_to_blocks[request_id]
         if req_blocks:
             return []
-        new_blocks = self.block_pool.get_new_blocks(1)
+        new_blocks = self.block_pool.get_new_blocks(1, self.kv_cache_group_id)
         req_blocks.extend(new_blocks)
         self.new_block_ids.extend(block.block_id for block in new_blocks)
         return new_blocks
@@ -1069,7 +1094,7 @@ class KpoolTailManager(FullAttentionManager):
         req_blocks = self.req_to_blocks[request_id]
         if req_blocks:
             return []
-        new_blocks = self.block_pool.get_new_blocks(1)
+        new_blocks = self.block_pool.get_new_blocks(1, self.kv_cache_group_id)
         req_blocks.extend(new_blocks)
         self.new_block_ids.extend(block.block_id for block in new_blocks)
         return new_blocks
@@ -1252,9 +1277,11 @@ class MambaManager(SingleTypeKVCacheManager):
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         if self.mamba_cache_mode == "align":
-            # Mapping from request ID to the index of the block
-            # allocated in the previous step
-            self.last_state_block_idx: dict[str, int] = {}
+            # Mapping from request ID to the indices of the state blocks that
+            # were superseded by a later allocation and still await release.
+            # Usually one entry; under async scheduling a second one can be
+            # pending because the previous step has not been processed yet.
+            self.last_state_block_idx: dict[str, list[int]] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
 
@@ -1325,23 +1352,33 @@ class MambaManager(SingleTypeKVCacheManager):
             request_id, processed_computed_tokens, num_prompt_tokens
         )
         if self.mamba_cache_mode == "align":
-            # `last_state_block_idx` refers to the block index allocated two steps ago.
-            # The block allocated in the previous step is used to copy Mamba states
-            # into the block allocated in the current step; the earlier block is
-            # no longer needed and should be freed here.
-            last_state_block_idx = self.last_state_block_idx.get(request_id)
+            # `last_state_block_idx` lists the indices of the state blocks that
+            # were superseded by a later allocation. The block allocated in the
+            # previous step is used to copy Mamba states into the block
+            # allocated in the current step; the earlier blocks are no longer
+            # needed and should be freed here.
+            pending = self.last_state_block_idx.get(request_id)
+            if not pending:
+                return
             # Blocks allocated during prefill may be non-contiguous. Use
-            # `last_state_block_idx` to free the appropriate block and replace it
-            # with a null block.
-            if (
-                last_state_block_idx is not None
-                and last_state_block_idx
-                < cdiv(processed_computed_tokens, self.block_size) - 1
-            ):
-                blocks = self.req_to_blocks[request_id]
-                if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
-                    blocks[last_state_block_idx] = self._null_block
+            # `last_state_block_idx` to free the appropriate blocks and replace
+            # them with null blocks. Under async scheduling the step scheduled
+            # just before this one is still in flight, so
+            # `processed_computed_tokens` lags by one more step and the block
+            # recorded last is still the copy source of that step: keep it
+            # pending (a later call frees it) instead of forgetting it, which
+            # would leak one block per prefill chunk until the request ends.
+            release_before = cdiv(processed_computed_tokens, self.block_size) - 1
+            blocks = self.req_to_blocks[request_id]
+            keep: list[int] = []
+            for idx in pending:
+                if idx < release_before:
+                    if blocks[idx] != self._null_block:
+                        self.block_pool.free_blocks([blocks[idx]])
+                        blocks[idx] = self._null_block
+                else:
+                    keep.append(idx)
+            self.last_state_block_idx[request_id] = keep
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1414,7 +1451,7 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            return num_new_blocks + num_evictable_computed_blocks
+            return max(0, num_new_blocks) + num_evictable_computed_blocks
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1441,26 +1478,33 @@ class MambaManager(SingleTypeKVCacheManager):
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            if num_required_blocks == len(req_blocks):
+            if num_required_blocks <= len(req_blocks):
+                # Rejected draft tokens can roll num_computed_tokens back across
+                # a block boundary (the scheduler subtracts num_rejected), so the
+                # cdiv below can come out one block short while req_blocks still
+                # holds the over-allocation from the previous step. Keep the extra
+                # blocks and allocate nothing this step; once the run grows past
+                # the boundary the requirement catches up on its own.
+                #
+                # Previously this tripped the assert below and killed the
+                # EngineCore (observed 63 < 64).
                 return []
             else:
-                assert num_required_blocks > len(req_blocks), (
-                    "num_required_blocks "
-                    f"{num_required_blocks} < len(req_blocks) {len(req_blocks)}"
-                )
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # Record the last state block
                 if blocks_allocated:
                     # We always save the running state at the last
                     # (1 + num_speculative_blocks) block
-                    self.last_state_block_idx[request_id] = (
+                    self.last_state_block_idx.setdefault(request_id, []).append(
                         prev_block_len - 1 - self.num_speculative_blocks
                     )
                 elif prev_block_len > 0:
                     # When a new request hits the prefix cache, the last block
                     # saves the hit state.
-                    self.last_state_block_idx[request_id] = prev_block_len - 1
+                    self.last_state_block_idx.setdefault(request_id, []).append(
+                        prev_block_len - 1
+                    )
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
@@ -1489,7 +1533,9 @@ class MambaManager(SingleTypeKVCacheManager):
                     assert num_new_blocks <= 1
                 else:
                     assert num_new_blocks <= self.num_speculative_blocks + 1
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self.block_pool.get_new_blocks(
+                    num_new_blocks, self.kv_cache_group_id
+                )
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
@@ -1559,7 +1605,7 @@ class MambaManager(SingleTypeKVCacheManager):
         replay_boundaries: Sequence[int] = (),
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        num_full_blocks = num_tokens // self.block_size
+        num_full_blocks = self.num_hashed_full_blocks(request, num_tokens)
         if num_cached_blocks_before >= num_full_blocks:
             return
         boundaries = list(replay_boundaries)

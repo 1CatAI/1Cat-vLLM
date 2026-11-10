@@ -834,16 +834,30 @@ class Glm5NextProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        """Build the processor directly from the checkpoint config.
+        """Build the processor directly from the checkpoint config (see
+        ``media_processors_from_pretrained``)."""
+        from transformers import AutoTokenizer
+
+        image_processor, video_processor = cls.media_processors_from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        return cls(
+            image_processor=image_processor,
+            tokenizer=AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            ),
+            video_processor=video_processor,
+        )
+
+    @staticmethod
+    def media_processors_from_pretrained(pretrained_model_name_or_path, **kwargs):
+        """Image and video processor from the checkpoint config.
 
         GLM-5.3-Flash stores nested image/video configs in
         ``processor_config.json`` and declares a custom processor class. This
         method reads those configs directly and caps only the video token budget.
         """
-        from transformers import AutoTokenizer
-
         model_path = pretrained_model_name_or_path
-        tokenizer = AutoTokenizer.from_pretrained(model_path, **kwargs)
 
         def _cap_cfg(cfg: dict, *, is_video: bool) -> dict:
             # Video keeps a serving token cap (the checkpoint's 240k-token
@@ -887,12 +901,7 @@ class Glm5NextProcessor(ProcessorMixin):
         video_processor = Glm5NextVideoProcessor(
             **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
         )
-
-        return cls(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            video_processor=video_processor,
-        )
+        return image_processor, video_processor
 
     def __call__(
         self,

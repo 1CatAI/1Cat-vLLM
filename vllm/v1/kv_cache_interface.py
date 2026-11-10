@@ -168,6 +168,42 @@ class AttentionSpec(KVCacheSpec):
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
 
+    def copy_with_new_block_size(self, block_size: int) -> Self:
+        """
+        Create a new KVCacheSpec from self but replacing the block size.
+
+        A padded physical page is a byte count, not a token count, so growing
+        the logical block grows the payload underneath it. Keep the padding at
+        or above the new payload; otherwise the returned spec fails its own
+        ``page_size_padded >= real_page_size`` invariant the first time
+        ``page_size_bytes`` is read. (A MambaSpec page does not depend on the
+        block size, so only attention pages need this.)
+        """
+        new_spec = replace(self, block_size=block_size)
+        padded = self.page_size_padded
+        if padded is not None and new_spec.real_page_size_bytes > padded:
+            new_spec = replace(new_spec, page_size_padded=new_spec.real_page_size_bytes)
+        return new_spec
+
+    def layout_cache_dtype(self, configured_dtype: str) -> str:
+        """Bind carrier shape to this spec's declared quantization layout.
+
+        Target and draft share an allocator but may use different codecs. This
+        compatibility spelling is only for backend shape/block-dim APIs; each
+        attention implementation retains its independently bound reader codec.
+        """
+        if get_kv_quant_mode(configured_dtype) == self.kv_quant_mode:
+            return configured_dtype
+        # Keep one entry per KVQuantMode: a missing spelling raises KeyError
+        # during KV allocation, far from the mode that was actually requested.
+        return {
+            KVQuantMode.NONE: "auto",
+            KVQuantMode.FP8_PER_TENSOR: "fp8",
+            KVQuantMode.INT8_PER_TOKEN_HEAD: "int8_per_token_head",
+            KVQuantMode.FP8_PER_TOKEN_HEAD: "fp8_per_token_head",
+            KVQuantMode.NVFP4: "nvfp4",
+        }[self.kv_quant_mode]
+
     @property
     def page_size_bytes(self) -> int:
         real_page_size = self.real_page_size_bytes
@@ -216,6 +252,9 @@ class FullAttentionSpec(AttentionSpec):
     """
 
     head_size_v: int = None  # type: ignore[assignment]
+
+    host_backed: bool = False
+    """Allocate authoritative attention pages in pinned host memory."""
 
     sliding_window: int | None = None
     """
@@ -272,6 +311,7 @@ class FullAttentionSpec(AttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            host_backed=specs[0].host_backed,
             dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
@@ -317,6 +357,22 @@ class FullAttentionSpec(AttentionSpec):
             * (self.head_size + self.head_size_v)
             * get_dtype_size(self.dtype)
         )
+
+
+def _bind_cache_dtype_codec(spec: MLAAttentionSpec | SlidingWindowMLASpec):
+    # An MLA spec that names its cache dtype stores that codec. The KV
+    # allocator shapes every carrier by the codec a spec declares
+    # (AttentionSpec.layout_cache_dtype), so a packed fp8 page left at NONE
+    # would be reshaped as a 16-bit one of the wrong width.
+    if spec.cache_dtype_str is None:
+        return
+    codec = get_kv_quant_mode(spec.cache_dtype_str)
+    if spec.kv_quant_mode not in (KVQuantMode.NONE, codec):
+        raise ValueError(
+            f"kv_quant_mode {spec.kv_quant_mode.name} contradicts "
+            f"cache_dtype_str {spec.cache_dtype_str!r}"
+        )
+    object.__setattr__(spec, "kv_quant_mode", codec)
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
@@ -365,6 +421,7 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        _bind_cache_dtype_codec(self)
         _apply_alignment_padding(self)
 
     @property
@@ -603,6 +660,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     model_version: str | None = None
 
     def __post_init__(self):
+        _bind_cache_dtype_codec(self)
         _apply_alignment_padding(self)
 
     @property
@@ -972,6 +1030,11 @@ class KVCacheTensor:
     interleaved one kernel block at a time in this order. ``None`` means at
     most one attention layer owns each block."""
 
+    host_backed: bool = False
+    """Pinned host allocation exposed through a lifetime-owning CUDA view."""
+    physical_num_blocks: int | None = None
+    """A fixed physical state pool independent of logical history capacity."""
+
 
 @dataclass
 class KVCacheGroupSpec:
@@ -1006,6 +1069,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    device_state_blocks: int = 0
+    device_state_group_ids: tuple[int, ...] = ()
 
     @property
     def has_mamba_layers(self) -> bool:

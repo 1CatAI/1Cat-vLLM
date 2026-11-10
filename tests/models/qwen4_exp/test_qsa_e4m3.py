@@ -8,6 +8,7 @@ import math
 import pytest
 import torch
 
+from tests.models.qwen4_exp.qsa_policy_utils import set_qsa_option
 from vllm import _custom_ops as ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 
@@ -165,7 +166,7 @@ def test_qsa_xqa_page4_receives_calibrated_e4m3_scales(monkeypatch) -> None:
         "v_scale": v_scale,
     }
 
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", False)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", False)
     reference = qsa_sparse_paged_attention(
         query,
         key_cache,
@@ -175,9 +176,9 @@ def test_qsa_xqa_page4_receives_calibrated_e4m3_scales(monkeypatch) -> None:
         token_to_req,
         **kwargs,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 1)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", False)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 1)
+    set_qsa_option(monkeypatch, "qsa_grouped_page4", False)
     actual = qsa_sparse_paged_attention(
         query,
         key_cache,
@@ -239,7 +240,7 @@ def test_qsa_e4m3_mixed_batch_split_matches_triton(monkeypatch) -> None:
         "v_scale": v_scale,
     }
 
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", False)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", False)
     reference = qsa_sparse_paged_attention(
         query,
         key_cache,
@@ -249,9 +250,9 @@ def test_qsa_e4m3_mixed_batch_split_matches_triton(monkeypatch) -> None:
         token_to_req,
         **kwargs,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 4096)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 4096)
+    set_qsa_option(monkeypatch, "qsa_grouped_page4", True)
     actual = qsa_sparse_paged_attention(
         query,
         key_cache,
@@ -298,7 +299,7 @@ def test_qsa_xqa_page4_large_e4m3_key_accumulates_in_fp32(monkeypatch) -> None:
         "v_scale": 1.0 / 448.0,
     }
 
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", False)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", False)
     reference = qsa_sparse_paged_attention(
         query,
         key_cache,
@@ -308,9 +309,9 @@ def test_qsa_xqa_page4_large_e4m3_key_accumulates_in_fp32(monkeypatch) -> None:
         token_to_req,
         **kwargs,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 1)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", False)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 1)
+    set_qsa_option(monkeypatch, "qsa_grouped_page4", False)
     actual = qsa_sparse_paged_attention(
         query,
         key_cache,
@@ -414,10 +415,10 @@ def test_qsa_grouped_page4_null_block_padding_no_nan(monkeypatch, pad_fix) -> No
     reference = torch.einsum("rhn,nd->rhd", torch.softmax(scores, dim=-1), sel_v)
 
     # Grouped route with the pad-fix in the requested state.
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 0)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAD_FIX", pad_fix)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 0)
+    set_qsa_option(monkeypatch, "qsa_grouped_page4", True)
+    set_qsa_option(monkeypatch, "qsa_grouped_pad_fix", pad_fix)
     actual = qsa_sparse_paged_attention(
         query, k_cache, v_cache, logical_indices, block_table, token_to_req, **kwargs
     )

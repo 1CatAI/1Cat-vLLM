@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.execution_policy import graph_policy
 
 
 def pinned_decode_active(config=None) -> bool:
@@ -114,7 +115,6 @@ def prepare_pinned_gguf_ple(config, tensors, names):
     import torch
     import torch.distributed as dist
 
-    import vllm.envs as envs
     from vllm.distributed.parallel_state import get_tp_group
     from vllm.model_executor.layers.ple_offload_layer import is_offload_process
     from vllm.models.qwen4_exp.common.ple import (
@@ -157,7 +157,7 @@ def prepare_pinned_gguf_ple(config, tensors, names):
         ),
         dual_compile_full_graphs=(
             config.use_v2_model_runner
-            and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+            and graph_policy().dual_compile
             and config.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ),
         disk_cascade=policy.ple_disk_cascade_active,

@@ -1,3 +1,4 @@
+#include "sm70_policy.h"
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
@@ -202,8 +203,9 @@ template <int Split, bool Gated, bool FullRows = false,
 __global__
 __launch_bounds__(256, FullRows ? 2 : 1) void nvfp4_qpn2_m32_twophase_sm70_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
-    const half* __restrict__ input, half* __restrict__ output, int width, int k,
-    int m, float global_scale) {
+    const half* __restrict__ input, half* __restrict__ output,
+    half* __restrict__ k16_output, int width, int k, int m,
+    float global_scale) {
   // A full row tile needs no input/output masking. Bound register usage so
   // prefetching does not remove the second resident CTA on SM70.
   if constexpr (FullRows) m = 32;
@@ -317,6 +319,12 @@ __launch_bounds__(256, FullRows ? 2 : 1) void nvfp4_qpn2_m32_twophase_sm70_kerne
           }
           output[static_cast<size_t>(row) * width + blockIdx.y * 32 + e % 32] =
               result;
+          if constexpr (Gated) {
+            if (k16_output != nullptr) {
+              k16_output[vllm::sm70::k16_half_index(
+                  row, blockIdx.y * 32 + e % 32, m)] = result;
+            }
+          }
         }
       }
     }
@@ -563,6 +571,88 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
   }
 }
 
+// Qualified M8 native gate/up shares A registers across both projections.
+template <bool Interleave>
+__global__ __launch_bounds__(
+    256, 3) void nvfp4_qpn2_m8_paired_gated_sm70_kernel(const uint8_t* codes,
+                                                        const uint8_t* scales,
+                                                        const half* input,
+                                                        half* output,
+                                                        int hidden, int k,
+                                                        float global) {
+  constexpr int Split = 8;
+  __shared__ float partials[2][Split][256];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int qp = (lane >> 2) & 3;
+  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int groups = k / 16;
+  const int per_warp = groups / Split;
+  Nvfp4PairReader<false, true> readers[2] = {
+      Nvfp4PairReader<false, true>(codes, scales, blockIdx.x, groups, lane,
+                                   global),
+      Nvfp4PairReader<false, true>(codes, scales, blockIdx.x + hidden / 32,
+                                   groups, lane, global)};
+  float accum[2][8] = {};
+#pragma unroll 4
+  for (int group = warp * per_warp; group < (warp + 1) * per_warp; ++group) {
+    const half* a = input + static_cast<size_t>(row) * k + group * 16;
+    const uint4 a01 = *reinterpret_cast<const uint4*>(a);
+    const uint4 a23 = *reinterpret_cast<const uint4*>(a + 8);
+    const unsigned* a0 = reinterpret_cast<const unsigned*>(&a01);
+    const unsigned* a1 = reinterpret_cast<const unsigned*>(&a23);
+    if constexpr (Interleave) {
+      half2 weights[2][8];
+#pragma unroll
+      for (int p = 0; p < 2; ++p) readers[p].load(group, weights[p]);
+      const unsigned* b0 = reinterpret_cast<const unsigned*>(weights[0]);
+      const unsigned* b1 = reinterpret_cast<const unsigned*>(weights[1]);
+      VLLM_SM70_QPN2_MMA(accum[0], a0[0], a0[1], b0[0], b0[1]);
+      VLLM_SM70_QPN2_MMA(accum[1], a0[0], a0[1], b1[0], b1[1]);
+      VLLM_SM70_QPN2_MMA(accum[0], a0[2], a0[3], b0[2], b0[3]);
+      VLLM_SM70_QPN2_MMA(accum[1], a0[2], a0[3], b1[2], b1[3]);
+      VLLM_SM70_QPN2_MMA(accum[0], a1[0], a1[1], b0[4], b0[5]);
+      VLLM_SM70_QPN2_MMA(accum[1], a1[0], a1[1], b1[4], b1[5]);
+      VLLM_SM70_QPN2_MMA(accum[0], a1[2], a1[3], b0[6], b0[7]);
+      VLLM_SM70_QPN2_MMA(accum[1], a1[2], a1[3], b1[6], b1[7]);
+    } else {
+#pragma unroll
+      for (int p = 0; p < 2; ++p) {
+        half2 weights[8];
+        readers[p].load(group, weights);
+        const unsigned* b = reinterpret_cast<const unsigned*>(weights);
+        VLLM_SM70_QPN2_MMA(accum[p], a0[0], a0[1], b[0], b[1]);
+        VLLM_SM70_QPN2_MMA(accum[p], a0[2], a0[3], b[2], b[3]);
+        VLLM_SM70_QPN2_MMA(accum[p], a1[0], a1[1], b[4], b[5]);
+        VLLM_SM70_QPN2_MMA(accum[p], a1[2], a1[3], b[6], b[7]);
+      }
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < 2; ++p) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int r = (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+      const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      partials[p][warp][r * 32 + qp * 8 + c] = accum[p][i];
+    }
+  }
+  __syncthreads();
+  const int e = threadIdx.x;
+  float gate = 0.0f, up = 0.0f;
+#pragma unroll
+  for (int w = 0; w < Split; ++w) {
+    gate += partials[0][w][e];
+    up += partials[1][w][e];
+  }
+  const half gh = __float2half(gate);
+  const half uh = __float2half(up);
+  const float gf = __half2float(gh);
+  const half silu = __float2half(gf / (1.0f + expf(-gf)));
+  output[static_cast<size_t>(e / 32) * hidden + blockIdx.x * 32 + e % 32] =
+      __hmul(silu, uh);
+}
+
 template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false,
           bool BundledScales = false>
 void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
@@ -605,10 +695,10 @@ void launch_qpn2_gated(const uint8_t* codes, const uint8_t* scales,
 }
 
 bool qpn2_m16_native_enabled(int m) {
-  const char* value = std::getenv("VLLM_SM70_NVFP4_QPN2_M16_NATIVE");
   const bool enabled =
       m > kQpn2RowsPerCta && m <= 16 &&
-      (value == nullptr || (value[0] == '1' && value[1] == '\0'));
+      vllm::sm70::policy_exact_one(
+          vllm::sm70::PolicyField::nvfp4_qpn2_m16_native, true);
   if (enabled) {
     static std::once_flag m16_log_once;
     std::call_once(m16_log_once, []() {
@@ -792,20 +882,16 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
     if (m > 16 && m <= 32 && k >= 4096 && n >= 2048 && n % 32 == 0 &&
         split_k == 16 && accumulator_chains == 2) {
-      auto packed_input = torch::empty_like(input);
+      torch::Tensor packed_input;
       auto* packed_ptr =
-          reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
-      constexpr int kThreads = 256;
-      vllm::sm70::pack_k16_input<<<
-          (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-          input_ptr, packed_ptr, m, k);
+          vllm::sm70::k16_packed_input(input, packed_input, stream);
       auto kernel = m == 32
                         ? nvfp4_qpn2_m32_twophase_sm70_kernel<
                               16, false, true, TurboMindLayout, BundledScales>
                         : nvfp4_qpn2_m32_twophase_sm70_kernel<
                               16, false, false, TurboMindLayout, BundledScales>;
       kernel<<<dim3(1, n / 32), 256, 0, stream>>>(
-          code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m,
+          code_ptr, scale_ptr, packed_ptr, output_ptr, nullptr, n, k, m,
           static_cast<float>(global_scale));
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
@@ -869,6 +955,17 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
   const int k = static_cast<int>(input.size(1));
   const int m = static_cast<int>(input.size(0));
 
+  if constexpr (!TurboMindLayout && BundledScales) {
+    if (m == 8 && k == 5120 && hidden == 4352 && split_k == 8 &&
+        accumulator_chains == 1) {
+      nvfp4_qpn2_m8_paired_gated_sm70_kernel<false><<<136, 256, 0, stream>>>(
+          code_ptr, scale_ptr, input_ptr, output_ptr, hidden, k,
+          static_cast<float>(global_scale));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+  }
+
   // Preserve the single-request route; M9-M16 shares A across two
   // projections without creating another persistent weight layout.
   {
@@ -881,22 +978,20 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
     if (m > 16 && m <= 32 && k >= 4096 && hidden >= 2048 && hidden % 32 == 0 &&
         split_k == 8 && accumulator_chains == 2) {
-      auto packed_input = torch::empty_like(input);
+      torch::Tensor packed_input, twin;
       auto* packed_ptr =
-          reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
-      constexpr int kThreads = 256;
-      vllm::sm70::pack_k16_input<<<
-          (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-          input_ptr, packed_ptr, m, k);
+          vllm::sm70::k16_packed_input(input, packed_input, stream);
+      half* k16_output = vllm::sm70::k16_twin_for(out, twin);
       auto kernel = m == 32
                         ? nvfp4_qpn2_m32_twophase_sm70_kernel<
                               8, true, true, TurboMindLayout, BundledScales>
                         : nvfp4_qpn2_m32_twophase_sm70_kernel<
                               8, true, false, TurboMindLayout, BundledScales>;
       kernel<<<dim3(1, hidden / 32), 256, 0, stream>>>(
-          code_ptr, scale_ptr, packed_ptr, output_ptr, hidden, k, m,
+          code_ptr, scale_ptr, packed_ptr, output_ptr, k16_output, hidden, k, m,
           static_cast<float>(global_scale));
       C10_CUDA_KERNEL_LAUNCH_CHECK();
+      if (k16_output != nullptr) vllm::sm70::k16_publish(out, twin);
       return;
     }
   }

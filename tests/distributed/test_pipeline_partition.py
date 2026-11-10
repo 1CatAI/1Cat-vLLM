@@ -8,6 +8,12 @@ import pytest
 from vllm.distributed.utils import get_pp_indices
 
 
+def test_explicit_automatic_partition_does_not_inherit_legacy(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,6")
+    assert get_pp_indices(8, 0, 2, partition=None) == (0, 4)
+    assert get_pp_indices(8, 0, 2, partition="3,5") == (0, 3)
+
+
 def test_custom_layer_partition(monkeypatch: pytest.MonkeyPatch):
     with monkeypatch.context() as m:
 

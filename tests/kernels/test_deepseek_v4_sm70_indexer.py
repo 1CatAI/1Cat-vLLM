@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.sm70_sparse import sparse_policy
 from vllm.models.deepseek_v4.sm70 import indexer as sm70_indexer
 from vllm.models.deepseek_v4.sm70.indexer import (
     sm70_indexer_decode_logits,
@@ -103,7 +104,7 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
     torch.manual_seed(20260819)
     generator = torch.Generator().manual_seed(20260819)
     num_queries, num_heads, num_keys = 5, 8, 37
-    monkeypatch.setattr(sm70_indexer, "_PREFILL_CUBLAS", use_cublas)
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_cublas", use_cublas)
 
     q, weights = _make_queries(num_queries, num_heads)
     bits, values = _random_fp8_keys(num_keys, generator)
@@ -128,7 +129,7 @@ def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
     torch.manual_seed(20260819)
     generator = torch.Generator().manual_seed(20260819)
     num_queries, num_heads, num_keys = 4, 8, 23
-    monkeypatch.setattr(sm70_indexer, "_RELU_LOGITS", False)
+    monkeypatch.setattr(sparse_policy(), "indexer_relu", False)
 
     q, weights = _make_queries(num_queries, num_heads)
     bits, values = _random_fp8_keys(num_keys, generator)
@@ -139,6 +140,33 @@ def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
     )
     expected = _reference_factored_logits(q, weights, values * scales[:, None])
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@requires_sm70
+def test_prefill_cublas_scores_survive_unscaled_key_magnitudes(monkeypatch):
+    """The cuBLAS route multiplies by keys with their scale left out, so e4m3
+    values reach 448 and one q . k passes fp16's 65504. Such scores are finite
+    once scaled and must stay finite; with an fp16 score tile they became inf,
+    and NaN where the mixed-sign head weights summed +inf and -inf."""
+    torch.manual_seed(20261031)
+    generator = torch.Generator().manual_seed(20261031)
+    num_queries, num_heads, num_keys = 3, 8, 16
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_cublas", True)
+
+    q, weights = _make_queries(num_queries, num_heads)
+    q[:, :2] = 2.0  # 128 * 2.0 * 448 = 114688 against the full-scale keys
+    weights[:, 0], weights[:, 1] = 1.0, -1.0
+    bits, values = _random_fp8_keys(num_keys, generator)
+    bits[: num_keys // 2] = 0x7E  # e4m3fn 448, the format's largest finite value
+    values[: num_keys // 2] = 448.0
+    scales = torch.full((num_keys,), 2.0**-8, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights
+    )
+    expected = _reference_index_logits(q, weights, values * scales[:, None])
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-2)
 
 
 @requires_sm70
@@ -158,8 +186,8 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
     """
     torch.manual_seed(20260819)
     generator = torch.Generator().manual_seed(20260819)
-    monkeypatch.setattr(sm70_indexer, "_RELU_LOGITS", relu)
-    monkeypatch.setattr(sm70_indexer, "_FUSED_DECODE_LOGITS", fused)
+    monkeypatch.setattr(sparse_policy(), "indexer_relu", relu)
+    monkeypatch.setattr(sparse_policy(), "indexer_fused_logits", fused)
 
     num_heads = 8
     seq_lens_list = [1, _BLOCK_SIZE + 1, 3 * _BLOCK_SIZE - 5]
@@ -215,15 +243,15 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
 # block-table row and one length per token. two_requests: the same, twice.
 @pytest.mark.parametrize("layout", ["native", "flattened", "two_requests"])
 @pytest.mark.parametrize("num_rows", [3, 8, 13])
+@pytest.mark.parametrize("graph_width", [2048, 8192])
 @requires_sm70
 def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
-    monkeypatch, padded_blocks, layout, num_rows
+    monkeypatch, padded_blocks, layout, num_rows, graph_width
 ):
     torch.manual_seed(20260824)
     generator = torch.Generator().manual_seed(20260824)
     num_heads = 64
-    live_seq_len = 1017
-    graph_width = 2048
+    live_seq_len = graph_width // 2 - 7
     blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
 
     bits, _ = _random_fp8_keys(blocks * _BLOCK_SIZE, generator)
@@ -268,7 +296,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
         ).contiguous()
     q, weights = _make_queries(num_rows * num_requests, num_heads)
 
-    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_cublas_enabled", False)
     baseline = sm70_indexer_decode_logits(
         q,
         cache,
@@ -299,8 +327,8 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
             workspace_requests.append(specs)
             return static_workspace
 
-    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", True)
-    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS_MIN_KEYS", 1)
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_cublas_enabled", True)
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_min_keys", 1)
     monkeypatch.setattr(
         sm70_indexer, "current_workspace_manager", lambda: StaticWorkspace()
     )
@@ -346,7 +374,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
     # Replay the same graph with a shorter live request. This exercises the
     # device-derived bound instead of merely validating the capture-time row.
     seq_lens.sub_(127)
-    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_cublas_enabled", False)
     replay_baseline = sm70_indexer_decode_logits(
         q,
         cache,
@@ -410,3 +438,103 @@ def test_sm70_indexer_decode_valid_logits_do_not_depend_on_workspace_width() -> 
     assert narrow.shape == (num_queries, 16)
     assert wide.shape == (num_queries, 64)
     torch.testing.assert_close(narrow[:, :num_keys], wide[:, :num_keys], rtol=0, atol=0)
+
+
+class _RecordingWorkspace:
+    """Allocates every requested buffer and records the requests."""
+
+    def __init__(self):
+        self.requests = []
+
+    def get_simultaneous(self, *specs):
+        self.requests.append(specs)
+        return tuple(
+            torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in specs
+        )
+
+
+@requires_sm70
+def test_decode_cublas_score_tiles_match_one_tile(monkeypatch):
+    """Above the budget for whole FP32 scores the cuBLAS decode route scores
+    key tiles. Each row keeps its top-k keys and its logits within FP32
+    rounding (cuBLAS may pick another GEMM for the narrower tiles), also when
+    the tiled route is captured and replayed as a CUDA graph."""
+    torch.manual_seed(20261016)
+    generator = torch.Generator().manual_seed(20261016)
+    num_heads = 64
+    rows = 6
+    graph_width = 6144
+    live_seq_len = 5000
+    blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+
+    bits, _ = _random_fp8_keys(blocks * _BLOCK_SIZE, generator)
+    value_bits = bits.reshape(blocks, _BLOCK_SIZE, _HEAD_DIM)
+    scales = torch.rand((blocks, _BLOCK_SIZE), generator=generator).cuda() + 0.5
+    cache = _build_paged_index_cache(value_bits, scales)
+    table = torch.full(
+        (1, graph_width // _BLOCK_SIZE), -1, dtype=torch.int32, device="cuda"
+    )
+    table[0, :blocks] = torch.randperm(blocks, generator=generator).to(
+        device="cuda", dtype=torch.int32
+    )
+    # The flattened speculative layout DeepSeek-V4 decodes with.
+    block_table = table.repeat(rows, 1).contiguous()
+    seq_lens = torch.arange(
+        live_seq_len - rows + 1, live_seq_len + 1, dtype=torch.int32, device="cuda"
+    ).view(rows, 1)
+    q, weights = _make_queries(rows, num_heads)
+
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_cublas_enabled", True)
+    workspace = _RecordingWorkspace()
+    monkeypatch.setattr(sm70_indexer, "current_workspace_manager", lambda: workspace)
+
+    def decode():
+        return sm70_indexer_decode_logits(
+            q,
+            cache,
+            weights,
+            seq_lens,
+            block_table,
+            graph_width,
+            rows,
+            indexer_decode_cublas=True,
+        )
+
+    single = decode()
+    assert workspace.requests[-1][2][0] == (rows * num_heads, graph_width)
+
+    # Gathered keys (1.5 MiB) plus a 1.5 MiB score tile: six tiles of 1024 keys.
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_tile_mb", 3)
+    tiled = decode()
+    assert workspace.requests[-1][2][0] == (rows * num_heads, 1024)
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            decode()
+    capture_stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        replayed = decode()
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    for candidate in (tiled, replayed):
+        for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
+            torch.testing.assert_close(
+                candidate[row, :row_len], single[row, :row_len], rtol=1e-4, atol=1e-5
+            )
+            expected = torch.topk(single[row, :row_len], 512).indices.sort().values
+            actual = torch.topk(candidate[row, :row_len], 512).indices.sort().values
+            assert torch.equal(actual, expected)
+
+    # Not even one 256-key tile next to the gathered keys: the paged kernel.
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_tile_mb", 1)
+    requests_before = len(workspace.requests)
+    paged = decode()
+    assert len(workspace.requests) == requests_before
+    for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
+        expected = torch.topk(single[row, :row_len], 512).indices.sort().values
+        actual = torch.topk(paged[row, :row_len], 512).indices.sort().values
+        assert torch.equal(actual, expected)

@@ -34,6 +34,7 @@ using marlin::sm70::sm70_active_split_k;
 using marlin::sm70::sm70_marlin_any_auto_env_is_set;
 using marlin::sm70::sm70_marlin_auto_packed_macro_n;
 using marlin::sm70::sm70_marlin_auto_params_from_env;
+using marlin::sm70::sm70_marlin_auto_params_from_policy;
 using marlin::sm70::sm70_marlin_cta_geometry_is_supported;
 using marlin::sm70::sm70_marlin_default_auto_params;
 using marlin::sm70::sm70_splitk_partition;
@@ -2188,7 +2189,11 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
       size_m,         size_n,
       size_k,         sm70_marlin_auto_packed_macro_n(size_n)};
 
-  if (sm70_marlin_moe_auto_env_is_set()) {
+  if (const auto* policy = vllm::sm70::bound_marlin_policy(true)) {
+    if (policy->active)
+      return sm70_marlin_auto_params_from_policy("MoE", *policy,
+                                                 ctx.packed_macro_n);
+  } else if (sm70_marlin_moe_auto_env_is_set()) {
     return sm70_marlin_moe_auto_params_from_env(ctx);
   }
 

@@ -27,6 +27,7 @@ class Sm70HcLLCommunicator:
             "scope": "hc_operator_capability",
         }
         cfg = get_current_vllm_config_or_none()
+        self.optimized_loads = bool(cfg and cfg.kernel_config.hc_ll_optimized_loads)
         reason = None
         if cfg is None or not cfg.kernel_config.hc_ll_shard:
             reason = "disabled_by_kernel_config"
@@ -52,7 +53,18 @@ class Sm70HcLLCommunicator:
             reason = next((r for r in reasons if r is not None), None)
         if reason is None:
             reason = self._prepare()
-        self.status.update(enabled=reason is None, reason=reason, min_m=1, max_m=20)
+        self.status.update(
+            enabled=reason is None,
+            reason=reason,
+            min_m=1,
+            max_m=20,
+            optimized_loads=reason is None and self.optimized_loads,
+            load_optimization_reason=(
+                reason
+                if reason is not None
+                else (None if self.optimized_loads else "disabled_by_kernel_config")
+            ),
+        )
         if cfg:
             cfg.kernel_config.collective_kernel_selections[
                 "hc_ll:" + (name or "<unnamed>")
@@ -154,6 +166,7 @@ class Sm70HcLLCommunicator:
             self.down_seq,
             self.logical_rank,
             1,
+            self.optimized_loads,
         )
         torch.ops._C.sm70_hc_ll_up_out(
             self.down_pointers[self.logical_rank],
@@ -168,6 +181,7 @@ class Sm70HcLLCommunicator:
             lora,
             injection,
             5,
+            self.optimized_loads,
         )
         return output, injection
 

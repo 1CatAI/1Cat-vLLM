@@ -7,6 +7,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention.sm70_qwen38_qk_rope import (
     _e4m3_satfinite,
+    _qk_norm_rope,
     qk_norm_rope,
 )
 from vllm.platforms import current_platform
@@ -119,3 +120,20 @@ def test_strided_positions_and_paged_cache(tokens):
     )
     torch.accelerator.synchronize()
     assert torch.equal(key_cache, expected_k) and torch.equal(value_cache, expected_v)
+
+
+def test_new_lengths_reuse_the_compiled_kernel():
+    qkv = torch.randn(1403, 3584, device="cuda", dtype=torch.float16)
+    weight = torch.randn(256, device="cuda", dtype=torch.float16) * 0.125
+    cache = torch.randn(10000, 64, device="cuda", dtype=torch.float16)
+    positions = torch.arange(1403, device="cuda", dtype=torch.int64)
+
+    def compiled():
+        return sum(len(kernels) for kernels, *_ in _qk_norm_rope.device_caches.values())
+
+    qk_norm_rope(qkv[:5], weight, weight, positions[:5], cache)
+    before = compiled()
+    for tokens in (7, 16, 758, 1403):
+        q, k = qk_norm_rope(qkv[:tokens], weight, weight, positions[:tokens], cache)
+        assert q.shape == (tokens, 1536) and k.shape == (tokens, 256)
+    assert compiled() == before

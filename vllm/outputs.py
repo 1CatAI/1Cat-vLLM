@@ -148,6 +148,11 @@ class RequestOutput:
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
 
+        # Parallel children can start in different steps. Keep the first
+        # prompt logprobs when merging a child's first DELTA into a later one.
+        if not self.prompt_logprobs and next_output.prompt_logprobs:
+            self.prompt_logprobs = next_output.prompt_logprobs
+
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
                 if completion.index == next_completion.index:
@@ -196,6 +201,22 @@ STREAM_FINISHED = RequestOutput(
     prompt_logprobs=None,
     outputs=[],
     finished=True,
+)
+
+# Idle keep-alive sentinel.
+# During long thinking or long prefill the engine can go many seconds without
+# emitting a token, and intermediaries (proxies, load balancers) drop the SSE
+# connection on their idle timeout. AsyncLLM emits one of these every 15s of
+# idleness so the API layer can keep the stream alive.
+# Note `finished=False`: this is not an end-of-request marker, so consumers
+# must recognise and skip it.
+STREAM_KEEPALIVE = RequestOutput(
+    request_id="",
+    prompt=None,
+    prompt_token_ids=None,
+    prompt_logprobs=None,
+    outputs=[],
+    finished=False,
 )
 
 _O = TypeVar("_O", default=PoolingOutput)

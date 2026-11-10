@@ -58,6 +58,13 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_tokenize_router(app)
 
+    if envs.VLLM_SERVER_DEV_MODE:
+        from vllm.entrypoints.serve.toolparser.api_router import (
+            attach_router as attach_toolparser_router,
+        )
+
+        attach_toolparser_router(app)
+
     from .instrumentator import register_instrumentator_api_routers
 
     register_instrumentator_api_routers(app)

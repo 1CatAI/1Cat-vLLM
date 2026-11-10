@@ -7,9 +7,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import SpeculativeConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.sm70_moe import unquantized_moe_policy
+from vllm.distributed.parallel_state import GraphCaptureContext
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -32,11 +33,16 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.draft_vocab import DraftVocab, make_draft_vocab
 from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
     PrefillEagleCudaGraphManager,
 )
-from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    get_target_lm_head,
+    load_eagle_model,
+)
+from vllm.v1.worker.gpu.spec_decode.speculator import TargetSamplingHooks
 
 logger = init_logger(__name__)
 
@@ -62,7 +68,7 @@ def _mtp_decode_warmup_request_sizes(
     return tuple(sorted(request_sizes))
 
 
-class EagleSpeculator:
+class EagleSpeculator(TargetSamplingHooks):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.device = device
@@ -121,6 +127,11 @@ class EagleSpeculator:
             device=device,
         )
         self.current_draft_step = torch.tensor(0, dtype=torch.int64, device=device)
+        # Optional observer of each step's drafts (e.g. PLE row prefetch). It
+        # must only enqueue stream-ordered, graph-capturable device work.
+        self.draft_step_listener: (
+            Callable[[torch.Tensor, torch.Tensor], None] | None
+        ) = None
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
@@ -149,7 +160,12 @@ class EagleSpeculator:
         self.prefill_cudagraph_manager: PrefillEagleCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
 
-    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+    def init_cudagraph_manager(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        *,
+        capture_context: GraphCaptureContext | None = None,
+    ) -> None:
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = PrefillEagleCudaGraphManager(
@@ -178,6 +194,36 @@ class EagleSpeculator:
         # Share a single pool between prefill and decode since they never
         # execute concurrently.
         self.decode_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
+        # Optionally record every draft decode step in one graph, so the
+        # per-step host work (slot mappings, metadata) leaves the critical path.
+        self.multistep_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
+        if (
+            cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and self.num_speculative_steps > 2
+            and self.vllm_config.kernel_config.capture_all_draft_steps
+        ):
+            self.multistep_cudagraph_manager = DecodeEagleCudaGraphManager(
+                self.vllm_config,
+                self.device,
+                cudagraph_mode,
+                decode_query_len=1,
+            )
+            self.multistep_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
+
+        # These routines execute serially in the runner. Share the capture
+        # stream's library workspaces while keeping target/draft graph pools
+        # separate so their live outputs cannot alias.
+        if self.prefill_cudagraph_manager.cudagraph_mode:
+            capture_context = (
+                capture_context or self.prefill_cudagraph_manager.get_capture_context()
+            )
+            for manager in (
+                self.prefill_cudagraph_manager,
+                self.decode_cudagraph_manager,
+                self.multistep_cudagraph_manager,
+            ):
+                if manager is not None:
+                    manager.capture_context = capture_context
 
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = get_layers_from_vllm_config(
@@ -186,7 +232,23 @@ class EagleSpeculator:
         ).keys()
 
         self.model = load_eagle_model(target_model, self.vllm_config)
+        self.draft_vocab = self._maybe_make_draft_vocab(target_model)
         self._validate_local_argmax_reduction()
+        # A target that keeps the drafter's input hidden state in a persistent
+        # buffer of the same shape (e.g. HC multi-stream MTP input) is read in
+        # place instead of being copied into a second max-token buffer.
+        get_target_hidden = getattr(target_model, "get_mtp_target_hidden_states", None)
+        target_hidden = get_target_hidden() if get_target_hidden else None
+        if (
+            isinstance(target_hidden, torch.Tensor)
+            and target_hidden.shape == self.hidden_states.shape
+            and target_hidden.dtype == self.hidden_states.dtype
+            and target_hidden.device == self.hidden_states.device
+        ):
+            self.hidden_states = target_hidden
+        adopt = getattr(self.model, "adopt_target_buffers", None)
+        if adopt is not None:
+            adopt(target_model)
 
         draft_hf_config = self.draft_model_config.hf_config
         self.share_mtp_topk_indices = (
@@ -230,7 +292,7 @@ class EagleSpeculator:
             self.method != "mtp"
             or self.device.type != "cuda"
             or not current_platform.is_device_capability(70)
-            or not envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            or not unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
         ):
             return ()
         if getattr(self, "_sm70_mtp_moe_warmed", False):
@@ -334,6 +396,34 @@ class EagleSpeculator:
             hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
 
+    def try_sample_target(
+        self,
+        model,
+        rejection_sampler,
+        hidden_states,
+        input_batch,
+        grammar_output,
+        *,
+        allow_graph: bool = True,
+    ):
+        """Compact top-k target sampling for argmax drafts (SM70, opt-in)."""
+        if self.draft_logits is not None or not getattr(
+            self.vllm_config.kernel_config, "sm70_sparse_target_sampling", False
+        ):
+            return None
+        from vllm.v1.worker.gpu.spec_decode.sm70_sparse_target import (
+            try_greedy_draft_sparse_rejection,
+        )
+
+        return try_greedy_draft_sparse_rejection(
+            model,
+            rejection_sampler,
+            hidden_states,
+            input_batch,
+            grammar_output,
+            reference_check=self.vllm_config.kernel_config.sm70_sparse_target_reference_check,
+        )
+
     def _validate_local_argmax_reduction(self) -> None:
         if not self.use_local_argmax_reduction:
             return
@@ -353,6 +443,26 @@ class EagleSpeculator:
             "(communication: O(2*tp_size) vs O(vocab_size))."
         )
 
+    def _maybe_make_draft_vocab(self, target_model: nn.Module) -> DraftVocab | None:
+        token_map = self.speculative_config.draft_token_map
+        if token_map is None:
+            return None
+        target_language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        target_lm_head = get_target_lm_head(target_model, target_language_model)
+        if target_lm_head is None:
+            raise ValueError("draft_token_map requires the target lm_head.")
+        return make_draft_vocab(
+            token_map,
+            self.vllm_config.model_config,
+            self.model,
+            target_lm_head,
+            self.speculative_config.draft_token_map_sha256,
+        )
+
     def _sample_draft(
         self,
         hidden_states: torch.Tensor,
@@ -361,8 +471,14 @@ class EagleSpeculator:
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        draft_vocab = self.draft_vocab
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
+            if draft_vocab is not None:
+                # Rejection sampling reads the proposal over the full vocab.
+                logits = draft_vocab.scatter(
+                    draft_vocab.restrict(logits), self.vocab_size
+                )
             # This drafter's position contract keys the proposed token at pos + 1.
             return gumbel_sample(
                 logits,
@@ -377,9 +493,12 @@ class EagleSpeculator:
                 use_fp64=self.use_fp64_gumbel,
             )
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
+            top = self.model.get_top_tokens(hidden_states)
+            return top if draft_vocab is None else draft_vocab.col_to_target[top]
         logits = self.model.compute_logits(hidden_states)
-        return logits.argmax(dim=-1)
+        if draft_vocab is None:
+            return logits.argmax(dim=-1)
+        return draft_vocab.target_ids[draft_vocab.restrict(logits).argmax(dim=-1)]
 
     def _mtp_prefill_begin(self) -> None:
         if self.share_mtp_topk_indices:
@@ -430,6 +549,8 @@ class EagleSpeculator:
         )
         self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = pos
+        if self.draft_step_listener is not None:
+            self.draft_step_listener(self.draft_tokens, self.current_draft_step)
 
     def multi_step_decode(
         self,
@@ -438,6 +559,16 @@ class EagleSpeculator:
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
     ) -> None:
+        multistep = getattr(self, "multistep_cudagraph_manager", None)
+        if (
+            multistep is not None
+            and self.vllm_config.kernel_config.capture_all_draft_steps
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and batch_desc in multistep.graphs
+        ):
+            multistep.run_fullgraph(batch_desc)
+            return
+
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
@@ -482,6 +613,45 @@ class EagleSpeculator:
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
 
+    def _generate_all_draft_steps(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        """Every draft decode step with its own slot mappings and metadata."""
+        del attn_metadata, slot_mappings
+        positions = self.input_buffers.positions[:num_reqs]
+        query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
+        idx_mapping = self.idx_mapping[:num_reqs]
+        for step in range(1, self.num_speculative_steps):
+            step_slot_mappings = self.block_tables.compute_slot_mappings(
+                idx_mapping,
+                query_start_loc,
+                positions,
+                num_tokens_padded,
+            )
+            step_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                step_slot_mappings, self.kv_cache_config
+            )
+            step_attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs,
+                num_tokens_padded=num_tokens_padded,
+            )
+            self.current_draft_step.fill_(step)
+            self.generate_draft(
+                num_reqs,
+                num_tokens_padded,
+                step_attn_metadata,
+                step_slot_mappings_by_layer,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+
     def generate_draft(
         self,
         num_reqs: int,
@@ -524,6 +694,8 @@ class EagleSpeculator:
             self.max_model_len,
             self.num_speculative_steps,
         )
+        if self.draft_step_listener is not None:
+            self.draft_step_listener(self.draft_tokens, self.current_draft_step)
 
     def _build_draft_attn_metadata(
         self,
@@ -605,6 +777,26 @@ class EagleSpeculator:
         finally:
             self._mtp_decode_end()
 
+        multistep = getattr(self, "multistep_cudagraph_manager", None)
+        if multistep is not None:
+            self._mtp_decode_begin()
+            try:
+                multistep.capture(
+                    self._generate_all_draft_steps,
+                    self.model_state,
+                    self.input_buffers,
+                    self.block_tables,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    progress_bar_desc="Capturing single-graph MTP draft decode",
+                )
+                logger.info(
+                    "Captured %d single-graph MTP draft decode shapes.",
+                    len(multistep.graphs),
+                )
+            finally:
+                self._mtp_decode_end()
+
     @torch.inference_mode()
     def propose(
         self,
@@ -654,7 +846,8 @@ class EagleSpeculator:
             )
         else:
             hidden_states = last_hidden_states
-        self.hidden_states[:num_tokens].copy_(hidden_states)
+        if hidden_states.data_ptr() != self.hidden_states.data_ptr():
+            self.hidden_states[:num_tokens].copy_(hidden_states)
 
         # Copy temperature, seeds, and idx mapping to the pre-allocated buffers.
         # NOTE(woosuk): For draft sampling, we only consider the temperature

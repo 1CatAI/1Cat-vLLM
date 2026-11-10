@@ -7,9 +7,9 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
+from tests.config.runtime_policy_utils import make_policy_defaults
 from vllm import envs
-from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
-from vllm.config import vllm as config_module
+from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.gguf import GGUFConfig
@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
 )
 from vllm.models.qwen4_exp.common.ple import ple_cascade_configured
+from vllm.platforms import runtime_defaults as config_module
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def config(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     envs.disable_envs_cache()
-    cfg = VllmConfig()
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
     cfg.model_config = NS(
         dtype=torch.float16,
         hf_text_config=NS(
@@ -46,7 +47,8 @@ def config(monkeypatch):
 
 def test_default_admission_and_engine_local_activation(config):
     before = dict(os.environ)
-    assert config_module._qwen4exp_ple_cascade_requested(config)
+    defaults = make_policy_defaults()
+    assert config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
     config_module._apply_qwen4exp_ple_cascade_defaults(config.parallel_config)
     assert dict(os.environ) == before
     assert config.parallel_config._ple_offload_ipc_path
@@ -60,7 +62,8 @@ def test_packed_gguf_admission_without_fp8_storage_hint(config):
     config.load_config.load_format = "gguf"
     config.quant_config = GGUFConfig()
     config.model_config.hf_text_config.ple_embedding_dtype = ""
-    assert config_module._qwen4exp_ple_cascade_requested(config)
+    defaults = make_policy_defaults()
+    assert config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
     assert config.kernel_config.ple_disk_cascade_reason is None
     with set_current_vllm_config(config):
         assert ple_cascade_configured()
@@ -71,7 +74,8 @@ def test_gguf_format_requires_supported_embedding_method(config):
     config.load_config.load_format = "gguf"
     config.quant_config = None
     config.model_config.hf_text_config.ple_embedding_dtype = ""
-    assert not config_module._qwen4exp_ple_cascade_requested(config)
+    defaults = make_policy_defaults()
+    assert not config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
     assert "packed GGUF" in config.kernel_config.ple_disk_cascade_reason
 
 
@@ -100,7 +104,8 @@ def test_capability_rejections(config, case, reason):
         config.model_config.hf_text_config.ple_layer_ids = []
     else:
         config.parallel_config.prefill_context_parallel_size = 2
-    assert not config_module._qwen4exp_ple_cascade_requested(config)
+    defaults = make_policy_defaults()
+    assert not config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
     assert reason in config.kernel_config.ple_disk_cascade_reason
 
 
@@ -109,7 +114,8 @@ def test_decode_context_parallel_preserves_cascade_admission(config, dcp_size):
     config.parallel_config.tensor_parallel_size = 4
     config.parallel_config.decode_context_parallel_size = dcp_size
     before = dict(os.environ)
-    assert config_module._qwen4exp_ple_cascade_requested(config)
+    defaults = make_policy_defaults()
+    assert config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
     assert config.kernel_config.ple_disk_cascade_active
     assert config.parallel_config.decode_context_parallel_size == dcp_size
     assert dict(os.environ) == before
@@ -135,28 +141,35 @@ def test_modelopt_mixed_storage_uses_checkpoint_layer_names(
             },
         }
     )
-    assert config_module._qwen4exp_ple_cascade_requested(config) is admitted
+    defaults = make_policy_defaults()
+    assert (
+        config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
+        is admitted
+    )
     if not admitted:
         assert "E4M3" in config.kernel_config.ple_disk_cascade_reason
 
 
 def test_pp_admission_uses_layer_layout(config):
     config.model_config.hf_text_config.ple_layer_ids = [3]
-    assert not config_module._qwen4exp_ple_cascade_requested(config)
+    defaults = make_policy_defaults()
+    assert not config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
     assert "first" in config.kernel_config.ple_disk_cascade_reason
 
 
 def test_existing_explicit_placement_takes_precedence(config, monkeypatch):
     monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
-    assert not config_module._qwen4exp_ple_cascade_requested(config)
+    defaults = make_policy_defaults()
+    assert not config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
     assert "precedence" in config.kernel_config.ple_disk_cascade_reason
 
 
 def test_multiple_engines_keep_independent_policy(config):
     other = copy.deepcopy(config)
     other.kernel_config.ple_disk_cascade = False
-    assert config_module._qwen4exp_ple_cascade_requested(config)
-    assert not config_module._qwen4exp_ple_cascade_requested(other)
+    defaults = make_policy_defaults()
+    assert config_module._qwen4exp_ple_cascade_requested(config, defaults=defaults)
+    assert not config_module._qwen4exp_ple_cascade_requested(other, defaults=defaults)
     assert config.kernel_config.ple_disk_cascade_active
     with set_current_vllm_config(other):
         assert not ple_offload_enabled()
@@ -188,7 +201,7 @@ def test_hf_config_clone_preserves_policy_ownership(tmp_path, active, policy):
         enforce_eager=True,
         max_model_len=64,
     )
-    parent = VllmConfig(model_config=model)
+    parent = VllmConfig(model_config=model, device_config=DeviceConfig(device="cpu"))
     if policy == "ple":
         parent.kernel_config.ple_disk_cascade_active = active
     else:
