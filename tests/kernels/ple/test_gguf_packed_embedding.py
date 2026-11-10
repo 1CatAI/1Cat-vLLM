@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.config import KernelConfig
+
 
 def packed_table(tmp_path):
     rng = np.random.default_rng(950)
@@ -31,7 +33,8 @@ def cpu_embedding(monkeypatch, tmp_path):
     monkeypatch.setattr(vocab, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(packed, "is_offload_process", lambda: True)
     config = SimpleNamespace(
-        compilation_config=SimpleNamespace(static_forward_context={})
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kernel_config=KernelConfig(),
     )
     monkeypatch.setattr(packed, "get_current_vllm_config", lambda: config)
     method = packed.Qwen4ExpPLEGGUFEmbeddingMethod(GGUFConfig())
@@ -68,6 +71,7 @@ def test_cpu_transport_preserves_row_order_and_output_dtype(
     monkeypatch.setattr(ple_layer, "is_offload_process", lambda: True)
     layer = object.__new__(ple_layer.Qwen4ExpNGramEmbedding)
     torch.nn.Module.__init__(layer)
+    layer.layer_name = "ple.ngram"
     layer.ngram_embedding = embedding
     layer._packed_gguf = True
     layer._cascade = cascade
@@ -184,7 +188,8 @@ def test_gpu_packets_match_cpu_and_changed_graph_ids(monkeypatch, tmp_path, plac
     monkeypatch.setattr(vocab, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(packed, "is_offload_process", lambda: False)
     config = SimpleNamespace(
-        compilation_config=SimpleNamespace(static_forward_context={})
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kernel_config=KernelConfig(),
     )
     monkeypatch.setattr(packed, "get_current_vllm_config", lambda: config)
     method = packed.Qwen4ExpPLEGGUFEmbeddingMethod(GGUFConfig())
@@ -239,6 +244,7 @@ def test_local_hybrid_lookup_waits_only_for_cascade_rows(monkeypatch, cascade):
     monkeypatch.setattr(ple_layer, "is_offload_process", lambda: True)
     layer = object.__new__(ple_layer.Qwen4ExpNGramEmbedding)
     torch.nn.Module.__init__(layer)
+    layer.layer_name = "ple.ngram"
     layer._is_cpu_offloaded = True
     if cascade is not None:
         layer._cascade = cascade

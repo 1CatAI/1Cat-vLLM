@@ -495,7 +495,8 @@ def sm70_mhc_pre_norm_from_staging(
         raise TypeError("SM70 mHC staging kernel requires FP16 norm weights")
 
     policy = layer_policy()
-    use_native_verify = num_tokens == 8 and policy.mhc_native_verify
+    # Initialization owns defaults, explicit overrides and calculation hashes.
+    use_native_verify = 2 <= num_tokens <= 8 and policy.mhc_native_verify
     if num_tokens == 1 or use_native_verify:
         if not hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
             raise RuntimeError(
@@ -503,7 +504,9 @@ def sm70_mhc_pre_norm_from_staging(
                 "Rebuild vLLM from source with CUDA arch 7.0."
             )
         if use_native_verify:
-            logger.info_once("SM70 GLM mHC native CUDA q8 final stage enabled.")
+            logger.info_once(
+                "SM70 GLM mHC native CUDA final stage enabled for 2-8 tokens."
+            )
         else:
             logger.info_once("SM70 GLM mHC native CUDA decode final stage enabled.")
         sm70_ops.sm70_glm_mhc_pre_norm_out(
@@ -522,7 +525,7 @@ def sm70_mhc_pre_norm_from_staging(
             hc_post_mult_value,
             sinkhorn_repeat,
             norm_eps,
-            threads=policy.mhc_pre_threads,
+            threads=128 if num_tokens == 1 else policy.mhc_pre_threads,
         )
         return
 

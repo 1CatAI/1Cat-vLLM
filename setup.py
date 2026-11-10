@@ -1191,8 +1191,15 @@ def _cuda_arch_contains(major: int, minor: int = 0) -> bool:
 
 
 def _volta_cuda_arch_list() -> str:
-    """Keep the requested Volta targets, including explicit PTX, for bundles."""
-    aliases = {"70": "7.0", "7.0": "7.0", "72": "7.2", "7.2": "7.2"}
+    """Keep the requested targets Flash-V100 supports, including explicit PTX."""
+    aliases = {
+        "70": "7.0",
+        "7.0": "7.0",
+        "72": "7.2",
+        "7.2": "7.2",
+        "75": "7.5",
+        "7.5": "7.5",
+    }
     arches = []
     for raw in re.split(r"[;,\s]+", os.environ.get("TORCH_CUDA_ARCH_LIST", "")):
         lowered = raw.strip().lower()

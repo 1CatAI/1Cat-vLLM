@@ -218,12 +218,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def(
       "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
-      "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
+      "int num_rows, int row_bytes, Tensor(a!) out, "
+      "int prefetch_window_bytes=0) -> ()");
   ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
   ops.def(
       "ple_disk_cached_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
       "int num_rows, int row_bytes, Tensor(a!) out, Tensor(b!) cache_ids, "
-      "Tensor(c!) cache_rows) -> ()");
+      "Tensor(c!) cache_rows, int prefetch_window_bytes=0) -> ()");
   ops.impl("ple_disk_cached_gather_u8", torch::kCPU,
            &ple_disk_cached_gather_u8);
 
@@ -1178,6 +1179,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "native_policy=None ) -> int");
   ops.impl("sm70_gemm_export_cache", torch::kCUDA,
            vllm::sm70::with_policy(&sm70_gemm_export_cache));
+
+  ops.def(
+      "sm70_gemm_freeze_tuning(Tensor device_hint, str? "
+      "native_policy=None ) -> int");
+  ops.impl("sm70_gemm_freeze_tuning", torch::kCUDA,
+           vllm::sm70::with_policy(&sm70_gemm_freeze_tuning));
 
   ops.def(
       "awq_moe_build_strided_ptrs(Tensor tm_weights, Tensor tm_scales, "

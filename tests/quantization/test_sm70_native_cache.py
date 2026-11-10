@@ -118,7 +118,7 @@ def test_complete_policy_cache_matches_current_calculation(tmp_path, native_tabl
         assert not cache.has_matching_policy_cache(path)
 
 
-def test_dynamic_dispatch_imports_only_complete_policy_cache(
+def test_dynamic_dispatch_imports_matching_policy_cache(
     tmp_path, native_tables, monkeypatch
 ):
     import torch
@@ -152,7 +152,7 @@ def test_warmup_uses_worker_configuration_and_restores_outer_scope(monkeypatch):
     observed = []
     monkeypatch.setattr(
         warmup,
-        "_sm70_awq_warmup_impl",
+        "_sm70_awq_warmup",
         lambda worker: observed.append(get_current_vllm_config_or_none()),
     )
     with set_current_vllm_config(outer):

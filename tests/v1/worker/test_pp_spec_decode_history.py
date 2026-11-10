@@ -74,6 +74,11 @@ def test_real_runner_keeps_each_requests_accepted_history(monkeypatch, num_reque
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
     monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
+    # CPU scheduler fixtures have no physical capability for simulated PP ranks.
+    monkeypatch.setattr(
+        "vllm.config.parallel.current_platform.get_device_capability",
+        lambda device_id=0: None,
+    )
     monkeypatch.setattr(
         runner_module,
         "get_pp_group",

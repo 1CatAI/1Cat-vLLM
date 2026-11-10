@@ -15,7 +15,7 @@
 
 include(ExternalProject)
 
-set(VLLM_FLASH_ATTN_SM75_COMMIT 43b9d29c9aa8e18d9351e7c643dc78ef7e7979fc)  # tag sm75-1cat-2026-09-13
+set(VLLM_FLASH_ATTN_SM75_COMMIT 6ab41c291b62be3641028a2ae1224a4fd473de3c)  # branch splitkv-wave-heuristic
 set(VLLM_FLASH_ATTN_SM75_LIB _vllm_fa2_C_sm75.abi3.so)
 
 if(DEFINED ENV{MAX_JOBS})

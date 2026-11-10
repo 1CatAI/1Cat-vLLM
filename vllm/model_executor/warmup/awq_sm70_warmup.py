@@ -22,6 +22,9 @@ from vllm.config.sm70_moe import (
 from vllm.config.sm70_native import NATIVE_FIELDS, UNSET, capture_linear_native_config
 from vllm.config.sm70_runtime import capture_runtime_config
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
+    SM70_FP8_GROUPED_DECODE_MAX_TOKENS,
+)
 from vllm.model_executor.kernels.linear.qpn.fp8_block import _QPN8_MAX_M
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
@@ -131,9 +134,9 @@ def _load_lut_cache(device: torch.device, skip_import: bool = False) -> int:
         return 0
     device_hint = torch.empty(0, dtype=torch.uint8, device=device)
     try:
-        # An explicitly supplied, complete policy-scoped table fixes the
-        # measured split-K choices across restarts. Untagged or mismatched
-        # tables retain the dynamic dispatch warmup behavior.
+        # Restore recorded split-K choices from an explicitly supplied table
+        # for the effective policy. Shape coverage can still grow unless tuning
+        # is frozen. Untagged or mismatched tables keep dynamic warmup behavior.
         if skip_import and not sm70_native_cache.has_matching_policy_cache(path):
             logger.info(
                 "Skipping SM70 GEMM LUT import for dynamic quant dispatch "
@@ -189,6 +192,27 @@ def _import_lut_bytes(device: torch.device, payload: bytes) -> int:
         path = Path(tmpdir) / "gemm-lut.bin"
         path.write_bytes(payload)
         return int(sm70_native_cache.import_cache(device_hint, str(path)))
+
+
+def _freeze_tuning_plan(device: torch.device) -> int:
+    """Make the plan measured during warmup final on this device: a shape it
+    lacks takes the plan of the next larger measured one instead of a
+    measurement on the request that brings it; returns the measured shapes."""
+    device_hint = torch.empty(0, dtype=torch.uint8, device=device)
+    return sm70_native_cache.freeze_tuning(device_hint)
+
+
+def _freeze_tuning_if_requested(worker: Worker, device: torch.device) -> None:
+    if not worker.vllm_config.kernel_config.sm70_runtime.value(
+        "freeze_tuning_after_warmup"
+    ):
+        return
+    logger.info(
+        "SM70 TurboMind tuning frozen after warmup: %d measured shapes "
+        "final for the service lifetime on device %s.",
+        _freeze_tuning_plan(device),
+        device,
+    )
 
 
 def _run_coordinated_dense_warmup(
@@ -700,25 +724,28 @@ def _warmup_fp8_dense_layers(
             calls += 1
         if getattr(layer, "sm70_fp8_bmm_grouped_decode", False):
             group_count = int(layer.sm70_fp8_bmm_groups)
-            grouped_x = torch.empty(
-                (group_count, k_dim), dtype=torch.float16, device=device
-            )
-            grouped_out = torch.empty(
-                (group_count, n_dim), dtype=torch.float16, device=device
-            )
-            native.fp8_moe_gemm_sm70_per_expert_dispatch_out(
-                grouped_out,
-                grouped_x,
-                layer.sm70_fp8_bmm_grouped_offsets,
-                layer.sm70_fp8_bmm_grouped_ptrs_w,
-                layer.sm70_fp8_bmm_grouped_ptrs_s,
-                group_count,
-                k_dim,
-                n_dim,
-                128,
-                False,
-            )
-            calls += 1
+            for tokens in m_values:
+                if tokens > SM70_FP8_GROUPED_DECODE_MAX_TOKENS:
+                    continue
+                grouped_x = torch.empty(
+                    (group_count * tokens, k_dim), dtype=torch.float16, device=device
+                )
+                grouped_out = torch.empty(
+                    (group_count * tokens, n_dim), dtype=torch.float16, device=device
+                )
+                native.fp8_moe_gemm_sm70_per_expert_dispatch_out(
+                    grouped_out,
+                    grouped_x,
+                    layer.sm70_fp8_bmm_grouped_offsets[tokens - 1],
+                    layer.sm70_fp8_bmm_grouped_ptrs_w,
+                    layer.sm70_fp8_bmm_grouped_ptrs_s,
+                    group_count,
+                    k_dim,
+                    n_dim,
+                    128,
+                    False,
+                )
+                calls += 1
     return calls
 
 
@@ -1231,13 +1258,14 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
 
 
 def sm70_awq_warmup(worker: Worker) -> None:
-    # Bind the same native owner and calculation policies used by forwards.
-    # Worker RPC warmup runs outside the model-loading configuration scope.
+    # The warmup captures its native policies from the current vLLM config;
+    # outside this context they are the defaults, a policy partition the layers
+    # never dispatch in, so nothing measured here would reach the service.
     with set_current_vllm_config(worker.vllm_config):
-        _sm70_awq_warmup_impl(worker)
+        _sm70_awq_warmup(worker)
 
 
-def _sm70_awq_warmup_impl(worker: Worker) -> None:
+def _sm70_awq_warmup(worker: Worker) -> None:
     if not worker.vllm_config.kernel_config.sm70_runtime.value("awq_warmup"):
         return
     if not hasattr(torch.ops._C, "awq_gemm_sm70_out"):
@@ -1345,3 +1373,4 @@ def _sm70_awq_warmup_impl(worker: Worker) -> None:
             exported_records,
             device,
         )
+    _freeze_tuning_if_requested(worker, device)
