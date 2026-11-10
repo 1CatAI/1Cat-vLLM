@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import importlib
+
 import pytest
 import torch
 
@@ -755,6 +757,84 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise(
     torch.testing.assert_close(candidate_sqrsum, baseline_sqrsum, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    not (
+        mhc_tilelang.current_platform.is_cuda()
+        and mhc_tilelang.current_platform.get_device_capability()
+        == DeviceCapability(7, 0)
+    ),
+    reason="NVIDIA V100/SM70 required",
+)
+@pytest.mark.parametrize("n_splits", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("num_tokens", [255, 256, 257])
+def test_mhc_sm70_prenorm_row_staging_matches_column_grid_bitwise(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int, n_splits: int
+) -> None:
+    # Imported by path: `from ...mhc import triton` resolves to the triton package.
+    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
+
+    torch.manual_seed(20261030)
+    device = mhc_tilelang.current_platform.device_type
+    hidden, outputs = 16384, 24
+    x = (torch.randn(num_tokens, hidden, device=device) * 3).half()
+    fn = torch.randn(outputs, hidden, device=device)
+
+    def run(min_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        monkeypatch.setattr(mhc_triton, "_MHC_ROW_STAGING_MIN_TOKENS", min_tokens)
+        mul = torch.full((n_splits, num_tokens, outputs), torch.nan, device=device)
+        sqrsum = torch.full((n_splits, num_tokens), torch.nan, device=device)
+        mhc_triton.sm70_mhc_prenorm_staging(x, fn, mul, sqrsum)
+        return mul, sqrsum
+
+    column_mul, column_sqrsum = run(num_tokens + 1)
+    row_mul, row_sqrsum = run(0)
+    torch.testing.assert_close(row_mul, column_mul, rtol=0, atol=0)
+    torch.testing.assert_close(row_sqrsum, column_sqrsum, rtol=0, atol=0)
+    assert torch.isfinite(row_mul).all()
+    assert torch.isfinite(row_sqrsum).all()
+
+
+@pytest.mark.parametrize(
+    "tokens,hidden,outputs,splits,expected",
+    [
+        (255, 16384, 24, 4, "columns"),
+        (256, 16384, 24, 4, "rows"),
+        (257, 16384, 24, 4, "rows"),
+        (2048, 16384, 24, 8, "rows"),
+        (64, 16384, 32, 4, "columns"),
+        (257, 16384, 32, 4, "columns"),
+        (257, 8192, 24, 4, "columns"),
+        (257, 16384, 24, 32, "columns"),
+        (257, 16384, 0, 4, "columns"),
+    ],
+)
+def test_mhc_prenorm_row_dispatch_retains_unqualified_fallbacks(
+    monkeypatch, tokens, hidden, outputs, splits, expected
+):
+    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
+    calls = []
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append(self.name)
+
+    monkeypatch.setattr(mhc_triton, "_mhc_prenorm_staging_rows_kernel", Kernel("rows"))
+    monkeypatch.setattr(
+        mhc_triton, "_sm70_mhc_prenorm_staging_kernel", Kernel("columns")
+    )
+    monkeypatch.setattr(mhc_triton, "_sm70_mhc_sqrsum_staging_kernel", Kernel("norm"))
+    mhc_triton.sm70_mhc_prenorm_staging(
+        torch.empty(tokens, hidden, dtype=torch.float16),
+        torch.empty(outputs, hidden, dtype=torch.float32),
+        torch.empty(splits, tokens, outputs),
+        torch.empty(splits, tokens),
+    )
+    assert calls == [expected]
+
+
 def _mhc_final_stage_inputs(num_tokens: int, n_splits: int, device, seed: int = 0):
     g = torch.Generator(device=device).manual_seed(seed)
     f32 = dict(device=device, dtype=torch.float32)
@@ -775,14 +855,15 @@ def _patch_policy(
     """layer_policy() builds a fresh object per call; replace the factory the
     dispatcher imported with one returning a fixed policy of known provenance."""
     import importlib
-    from types import SimpleNamespace
 
     mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
-    policy = SimpleNamespace(
-        mhc_native_verify=native,
-        mhc_pre_threads=threads,
-        sources={"mhc_native_verify": source, "mhc_pre_threads": source},
+    from vllm.config.execution_policy import LayerExecutionPolicy
+
+    policy = LayerExecutionPolicy(
+        mhc_native_verify=None if source == "default" else native,
+        mhc_pre_threads=None if source == "default" else threads,
     )
+    policy.resolve()
     monkeypatch.setattr(mhc_triton, "layer_policy", lambda cfg=None: policy)
 
 
@@ -811,7 +892,7 @@ def _run_final_stage(native: bool, inputs: dict, monkeypatch: pytest.MonkeyPatch
         2,
         1e-6,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return post_mix, comb_mix, layer_input
 
 
@@ -851,7 +932,7 @@ def test_mhc_sm70_native_final_stage_is_default_for_verify_rows(
     """With the policy field unset, 2..8 tokens route to the native op."""
     from vllm import _sm70_ops as sm70_ops
 
-    calls: list[int] = []
+    calls: list[tuple[int, int]] = []
     monkeypatch.setattr(
         torch.ops._C, "sm70_glm_mhc_pre_norm_out", lambda *a, **k: None, raising=False
     )

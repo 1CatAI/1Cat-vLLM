@@ -35,27 +35,86 @@ def _sm70_mhc_sqrsum_staging_kernel(
 
 
 @triton.jit
-def _sm70_mhc_dot_staging_kernel(
+def _sm70_mhc_prenorm_staging_kernel(
     x_ptr,
     fn_ptr,
     out_ptr,
+    sqrsum_ptr,
     x_stride_t,
     fn_stride_n,
     out_stride_s,
     out_stride_t,
+    sqrsum_stride_s,
+    sqrsum_stride_t,
+    N: tl.constexpr,
     K_PER_SPLIT: tl.constexpr,
+    SQRSUM_MULT: tl.constexpr,
+    WRITE_NORM: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     output_idx = tl.program_id(1)
     split_idx = tl.program_id(2)
     offsets = split_idx * K_PER_SPLIT + tl.arange(0, K_PER_SPLIT)
     x = tl.load(x_ptr + token_idx * x_stride_t + offsets).to(tl.float32)
-    weight = tl.load(fn_ptr + output_idx * fn_stride_n + offsets).to(tl.float32)
-    dot = tl.sum(x * weight, axis=0)
+    if N != 0:
+        weight = tl.load(fn_ptr + output_idx * fn_stride_n + offsets).to(tl.float32)
+        dot = tl.sum(x * weight, axis=0)
+        tl.store(
+            out_ptr + split_idx * out_stride_s + token_idx * out_stride_t + output_idx,
+            dot,
+        )
+    # One output column owns each norm partial. Keep the original FP32
+    # reductions and split boundaries; only the input load/launch is shared.
+    if WRITE_NORM and output_idx == 0:
+        sqrsum = tl.sum(x * x, axis=0) * SQRSUM_MULT
+        tl.store(
+            sqrsum_ptr + split_idx * sqrsum_stride_s + token_idx * sqrsum_stride_t,
+            sqrsum,
+        )
+
+
+@triton.jit
+def _mhc_prenorm_staging_rows_kernel(
+    x_ptr,
+    fn_ptr,
+    out_ptr,
+    sqrsum_ptr,
+    x_stride_t,
+    fn_stride_n,
+    out_stride_s,
+    out_stride_t,
+    sqrsum_stride_s,
+    sqrsum_stride_t,
+    N: tl.constexpr,
+    K_PER_SPLIT: tl.constexpr,
+    SQRSUM_MULT: tl.constexpr,
+):
+    # One program per (token, split) loads x once and walks every output column.
+    # The per-column FP32 tl.sum and the split boundaries are unchanged, so the
+    # results are bitwise equal to the per-column grid.
+    token_idx = tl.program_id(0)
+    split_idx = tl.program_id(1)
+    offsets = split_idx * K_PER_SPLIT + tl.arange(0, K_PER_SPLIT)
+    x = tl.load(x_ptr + token_idx * x_stride_t + offsets).to(tl.float32)
+    sqrsum = tl.sum(x * x, axis=0) * SQRSUM_MULT
     tl.store(
-        out_ptr + split_idx * out_stride_s + token_idx * out_stride_t + output_idx,
-        dot,
+        sqrsum_ptr + split_idx * sqrsum_stride_s + token_idx * sqrsum_stride_t,
+        sqrsum,
     )
+    for output_idx in tl.static_range(N):
+        weight = tl.load(fn_ptr + output_idx * fn_stride_n + offsets).to(tl.float32)
+        dot = tl.sum(x * weight, axis=0)
+        tl.store(
+            out_ptr + split_idx * out_stride_s + token_idx * out_stride_t + output_idx,
+            dot,
+        )
+
+
+# Reusing x helps larger batches, but serializing columns reduces parallelism.
+# Paired measurements qualify the 16384 x 24 geometry from 256 rows. Smaller
+# batches and other geometries retain the column grid (including N=32 at T=64,
+# where row staging is slower). This changes no reduction or precision policy.
+_MHC_ROW_STAGING_MIN_TOKENS = 256
 
 
 def sm70_mhc_prenorm_staging(
@@ -89,25 +148,60 @@ def sm70_mhc_prenorm_staging(
     if k_per_split & (k_per_split - 1):
         raise ValueError("SM70 mHC prenorm split size must be a power of two")
 
-    _sm70_mhc_sqrsum_staging_kernel[(x.shape[0], n_splits)](
-        x,
-        gemm_out_sqrsum,
-        x.stride(0),
-        gemm_out_sqrsum.stride(0),
-        gemm_out_sqrsum.stride(1),
-        K_PER_SPLIT=k_per_split,
-        SQRSUM_MULT=sqrsum_mult,
-        num_warps=8,
-    )
-    _sm70_mhc_dot_staging_kernel[(x.shape[0], fn.shape[0], n_splits)](
+    if (
+        x.shape[0] >= _MHC_ROW_STAGING_MIN_TOKENS
+        and x.shape[1] == 16384
+        and fn.shape[0] == 24
+        and n_splits in (1, 2, 4, 8, 16)
+    ):
+        _mhc_prenorm_staging_rows_kernel[(x.shape[0], n_splits)](
+            x,
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            x.stride(0),
+            fn.stride(0),
+            gemm_out_mul.stride(0),
+            gemm_out_mul.stride(1),
+            gemm_out_sqrsum.stride(0),
+            gemm_out_sqrsum.stride(1),
+            N=fn.shape[0],
+            K_PER_SPLIT=k_per_split,
+            SQRSUM_MULT=sqrsum_mult,
+            num_warps=8,
+        )
+        return
+
+    # Larger partials lose occupancy when x stays live for both reductions.
+    # Preserve the separate norm launch for those existing split choices.
+    fuse_norm = k_per_split <= 4096
+    if not fuse_norm:
+        _sm70_mhc_sqrsum_staging_kernel[(x.shape[0], n_splits)](
+            x,
+            gemm_out_sqrsum,
+            x.stride(0),
+            gemm_out_sqrsum.stride(0),
+            gemm_out_sqrsum.stride(1),
+            K_PER_SPLIT=k_per_split,
+            SQRSUM_MULT=sqrsum_mult,
+            num_warps=8,
+        )
+    columns = max(1, fn.shape[0]) if fuse_norm else fn.shape[0]
+    _sm70_mhc_prenorm_staging_kernel[(x.shape[0], columns, n_splits)](
         x,
         fn,
         gemm_out_mul,
+        gemm_out_sqrsum,
         x.stride(0),
         fn.stride(0),
         gemm_out_mul.stride(0),
         gemm_out_mul.stride(1),
+        gemm_out_sqrsum.stride(0),
+        gemm_out_sqrsum.stride(1),
+        N=fn.shape[0],
         K_PER_SPLIT=k_per_split,
+        SQRSUM_MULT=sqrsum_mult,
+        WRITE_NORM=fuse_norm,
         num_warps=8,
     )
 
@@ -199,7 +293,9 @@ def sm70_mhc_post(
         out = torch.empty_like(residual)
     elif out.shape != residual.shape or out.dtype != residual.dtype:
         raise ValueError("SM70 mHC post output must match the residual")
-    block_h = 512
+    # More independent CTAs help small batches without changing each element's
+    # FP32 arithmetic. Larger batches retain the existing memory-access geometry.
+    block_h = 256 if num_tokens <= 8 else 512
     _sm70_mhc_post_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
         x.view(num_tokens, hidden_size),
         residual,
@@ -399,18 +495,8 @@ def sm70_mhc_pre_norm_from_staging(
         raise TypeError("SM70 mHC staging kernel requires FP16 norm weights")
 
     policy = layer_policy()
-    # The native final stage handles any token count with one CTA per token. On
-    # V100 it runs the 2..8-token verify batch in 6.8-8.4 us against 35 us for
-    # the Triton program (3,600 calls per decode step at MTP k=3 on GLM-5.3-Flash
-    # TP4: -1.4 ms of a 38 ms step). Default on for that range; the policy field
-    # still forces it either way.
-    # The policy resolves an unset field to the environment default (off, 256
-    # threads) and records that provenance; only an explicit setting overrides.
-    sources = getattr(policy, "sources", {})
-    native_verify = policy.mhc_native_verify
-    if sources.get("mhc_native_verify", "default") == "default":
-        native_verify = True
-    use_native_verify = 2 <= num_tokens <= 8 and bool(native_verify)
+    # Initialization owns defaults, explicit overrides and calculation hashes.
+    use_native_verify = 2 <= num_tokens <= 8 and policy.mhc_native_verify
     if num_tokens == 1 or use_native_verify:
         if not hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
             raise RuntimeError(
@@ -439,11 +525,7 @@ def sm70_mhc_pre_norm_from_staging(
             hc_post_mult_value,
             sinkhorn_repeat,
             norm_eps,
-            # 1024 threads measured fastest for 2..8 tokens (6.8 us vs 8.4 us at
-            # 256); the kernel keeps 128 for a single token.
-            threads=policy.mhc_pre_threads
-            if sources.get("mhc_pre_threads", "default") != "default"
-            else (1024 if num_tokens > 1 else 128),
+            threads=128 if num_tokens == 1 else policy.mhc_pre_threads,
         )
         return
 

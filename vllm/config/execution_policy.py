@@ -282,6 +282,14 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Retain the independent SM70 shared-expert overlap rollback."""
     ple_spec_conv: bool | None = None
     """Retain the existing PLE MTP convolution and state-commit kernel."""
+    ple_prefill_conv: bool = False
+    """Use the FP16 PLE prefill convolution without a padded history."""
+    hc_prefill_sequence_parallel: bool = False
+    """Partition prefill residual rows across TP before HC projection."""
+    hc_mtp_prefill_sequence_parallel: bool = False
+    """Partition qualified Q8_0 MTP prefill HC rows; keep expert reductions."""
+    hc_prefill_peer_norm: bool = False
+    """Fuse qualified row-owned HC reduction/norm through full-mesh NVLink."""
     quant_backend: Literal["auto", "marlin", "turbomind"] | None = None
     """Shared pre-Ampere quantization backend; format flags retain their gates."""
     gptq_turbomind: bool | None = None
@@ -353,6 +361,10 @@ class LayerExecutionPolicy(ExecutionPolicy):
             deferred_errors=self.provider_errors,
         )
         super().resolve()
+        if self.sources.get("mhc_native_verify") == "default":
+            self.mhc_native_verify = True
+        if self.sources.get("mhc_pre_threads") == "default":
+            self.mhc_pre_threads = 1024
         from vllm import envs
 
         if "dense_log_enabled" not in self.sources:
@@ -379,6 +391,37 @@ class LayerExecutionPolicy(ExecutionPolicy):
 
     def compute_hash(self) -> str:
         factors: dict[str, object] = {"policy": super().compute_hash()}
+        if (
+            self.active
+            and self.ple_prefill_conv
+            and (self.hash_fields is None or "ple_spec_conv" in self.hash_fields)
+        ):
+            factors["ple_prefill_conv"] = True
+        if (
+            self.active
+            and self.hc_prefill_sequence_parallel
+            and (
+                self.hash_fields is None
+                or "hc_prefill_sequence_parallel" in self.hash_fields
+            )
+        ):
+            factors["hc_prefill_sequence_parallel"] = True
+        if (
+            self.active
+            and self.hc_mtp_prefill_sequence_parallel
+            and (
+                self.hash_fields is None
+                or "hc_mtp_prefill_sequence_parallel" in self.hash_fields
+            )
+        ):
+            factors["hc_mtp_prefill_sequence_parallel"] = True
+        if (
+            self.active
+            and self.hc_prefill_sequence_parallel
+            and self.hc_prefill_peer_norm
+            and (self.hash_fields is None or "hc_prefill_peer_norm" in self.hash_fields)
+        ):
+            factors["hc_prefill_peer_norm"] = True
         errors = {
             field: error
             for field, error in self.provider_errors.items()

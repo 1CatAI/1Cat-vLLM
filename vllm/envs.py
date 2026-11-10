@@ -8,12 +8,14 @@ import os
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from vllm.envs_metadata import bind_env_names, env_var, warn_deprecated_once
 
 if TYPE_CHECKING:
+    VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 32
+    VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES: int = 64 * 1024 * 1024
     VLLM_SM70_DEBUG: set[str] = set()
     VLLM_SM70_E4M3_LONG_ATTENTION: str | None = None
     VLLM_CPU_CI_ENV: str | None = None
@@ -431,6 +433,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
+    VLLM_V41_SUM2_PUSH_ANY: bool = False
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = True
@@ -446,6 +449,100 @@ if TYPE_CHECKING:
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
+    VLLM_EXPERT_CACHE_MEMLOG: bool = False
+    VLLM_INPLACE_AR_MIN: str = "0"
+    VLLM_PYNCCL_ALLGATHER: str = "1"
+    VLLM_V41_ATTN_TIMING: str = "0"
+    VLLM_V41_MARKOV_FUSED: str | None = None
+    VLLM_SM70_MXFP4_GROUPED_ANY: str | None = None
+    VLLM_V41K_LIB: str | None = None
+    VLLM_V41_ACT_PROGRAMS: str = "1024"
+    VLLM_V41_ASYNC: str = "0"
+    VLLM_V41_ASYNC_EVICT: str | None = None
+    VLLM_V41_ATTN_FUSED: str = "1"
+    VLLM_V41_COL_B: str = "2"
+    VLLM_V41_COL_BLOCK: str = "256"
+    VLLM_V41_COL_PROJ: str = "0"
+    VLLM_V41_COL_W: str = "4"
+    VLLM_V41_COORD_DEBUG: str | None = None
+    VLLM_V41_DENSE_TM: str = "1"
+    VLLM_V41_DMA_DEBUG: str | None = None
+    VLLM_V41_DMA_DEMAND: str | None = None
+    VLLM_V41_DMV_CTAS: str = "80"
+    VLLM_V41_DOWN_ROWS: str = "0"
+    VLLM_V41_EM: str = "1"
+    VLLM_V41_EM5: str = "1"
+    VLLM_V41_EM7: str = "1"
+    VLLM_V41_EM8: str | None = None
+    VLLM_V41_EMPTY_CACHE_TOKENS: str = "2048"
+    VLLM_V41_ENGRAM_READERS: str | None = None
+    VLLM_V41_EXACT_GEMM: str = "0"
+    VLLM_V41_EXPERT_FAST_HIT: str = "1"
+    VLLM_V41_FP8_GEMV: str = "1"
+    VLLM_V41_FREE_SLOTS: str | None = None
+    VLLM_V41_FUSED_SPARSE: str = "0"
+    VLLM_V41_FUSED_SPARSE_MIN: str = "64"
+    VLLM_V41_GATE_BF16: str = "1"
+    VLLM_V41_GATHER_WPD: str | None = None
+    VLLM_V41_HC_COLS: str = "32"
+    VLLM_V41_HC_CUDA: str = "0"
+    VLLM_V41_HC_FUSED: str = "1"
+    VLLM_V41_HC_FW: str = "4"
+    VLLM_V41_HC_PW: str = "4"
+    VLLM_V41_HC_TOKEN_BLOCKED: str = "0"
+    VLLM_V41_HC_V2: str = "0"
+    VLLM_V41_HC_V3: str = "1"
+    VLLM_V41_HC_V3_GROUPS: str = "8"
+    VLLM_V41_HC_WINDOW: str = "2048"
+    VLLM_V41_HITLOG_RELAXED: str = "1"
+    VLLM_V41_INDEX_DECODE_BLOCKS: str = "8"
+    VLLM_V41_INDEX_TILE_MB: str = "64"
+    VLLM_V41_INDEX_TOPK: str = "1"
+    VLLM_V41_JOB_EVENTS: str | None = None
+    VLLM_V41_KV_HOT_POSITIONS: str = "32768"
+    VLLM_V41_MAX_LEN: str = "16384"
+    VLLM_V41_MISS_HIST: str = "0"
+    VLLM_V41_PACKED_KV: str | None = None
+    VLLM_V41_PLAN_STATS: str | None = None
+    VLLM_V41_PRED_STATS: str = "0"
+    VLLM_V41_PREFETCH: str = "0"
+    VLLM_V41_PREFETCH_EVAL: str | None = None
+    VLLM_V41_PREFILL_DMA: str = "1"
+    VLLM_V41_PREFILL_GROUP: str | None = None
+    VLLM_V41_PREFILL_TIMING: str = "0"
+    VLLM_V41_ROUTED_PREFILL_MAX: str = "1536"
+    VLLM_V41_ROUTER_FUSED: str = "1"
+    VLLM_V41_ROUTE_TRACE: str | None = None
+    VLLM_V41_ROWS_TILE: str = "4,8"
+    VLLM_V41_SESSION_PREFIX: str = "0"
+    VLLM_V41_SKIP_BELOW: str = "0"
+    VLLM_V41_SKIP_DEFER: str = "1"
+    VLLM_V41_SKIP_LATE: str = "0"
+    VLLM_V41_SKIP_LATE_FROM: str = "2"
+    VLLM_V41_SKIP_MIN_RANK: str = "1"
+    VLLM_V41_SKIP_RENORM: str = "1"
+    VLLM_V41_SKIP_SUBST: str = "1"
+    VLLM_V41_STAGE_RING: str = "1"
+    VLLM_V41_STAGE_SLOTS: str = "128"
+    VLLM_V41_STASH_IN_PUBLISH: str = "1"
+    VLLM_V41_SWAP_CTAS: str = "1024"
+    VLLM_V41_SWAP_DMA: str = "0"
+    VLLM_V41_SWAP_FREE: str | None = None
+    VLLM_V41_SWAP_FUSED: str = "1"
+    VLLM_V41_SWAP_INPLACE: str | None = None
+    VLLM_V41_SWAP_WB_CTAS: str = "8"
+    VLLM_V41_TRUNC: str = "0"
+    VLLM_V41_TRUNC_CUTOFF: str = "0"
+    VLLM_V41_TUNE_PREFILL_PASSES: str = "0"
+    VLLM_V41_WARM_TORCH_NCCL: str = "0"
+    VLLM_V41_WINDOW_RING: str = "1"
+    VLLM_V41_WOA_VIEWS: str = "1"
+    VLLM_EXPERT_CACHE_STACKS: bool = False
+    VLLM_TM_COLD_DMA: bool = True
+    VLLM_TM_COLD_CTAS: int | None = None
+    VLLM_QSA_DUMP_DIR: str | None = None
+    VLLM_GGUF_LOAD_PROFILE: bool = False
+    VLLM_BALANCED_PREFILL_CHUNKS: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
     VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING: bool = False
     VLLM_SM70_TP4_M5_AR_THREADS: int | None = None
@@ -691,6 +788,7 @@ if TYPE_CHECKING:
     VLLM_SPEC_DUMP_ALIGNMENT_LIMIT: int = 3
     VLLM_SPEC_DUMP_ALIGNMENT_STEPS: str | None = None
     VLLM_DEBUG_MTP_LOAD: bool = False
+    VLLM_DEBUG_RENDER_TEMPLATE_KWARGS: bool = False
     VLLM_DEBUG_MTP_LOAD_VERBOSE: bool = False
     VLLM_DFLASH_PROFILE: bool = False
     VLLM_DFLASH_PROFILE_LOG_INTERVAL: int = 32
@@ -953,6 +1051,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+    VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE: bool = True
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1341,7 +1440,46 @@ def _resolve_rust_frontend_path() -> str | None:
     return raw
 
 
+def _get_weight_load_max_split_scope() -> bool:
+    override = os.getenv("VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE")
+    if override is not None:
+        return override != "0"
+    config = os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+    )
+    expandable = False
+    for option in config.split(","):
+        name, _, value = option.partition(":")
+        if name.strip() == "expandable_segments":
+            expandable = value.strip() == "True"
+    return not expandable
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "32")),
+        description=(
+            "MRv2 prompt logprobs rows per logits chunk. Default 32 bounds "
+            "temporary logits; raise only after memory acceptance. Use the "
+            "same value on all TP ranks."
+        ),
+        category="configuration",
+        declared_default="32",
+        effective_default="32; prompt logprobs only, valid range 1 through 1024.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES": env_var(
+        lambda: int(os.getenv("VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES", "67108864")),
+        description="MRv2 per-request prompt logprobs tensor output limit in bytes.",
+        category="configuration",
+        declared_default="67108864",
+        effective_default="67108864; 64 MiB of tensor output per MRv2 request.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_SM70_E4M3_LONG_ATTENTION": env_var(
         lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION"),
         description=(
@@ -6399,24 +6537,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MHC_NATIVE_VERIFY", "0"))),
         description=(
-            "Native SM70 final stage for the GLM-5.3 mHC verifier. Unset, the "
-            "GLM-5.3 route uses it for 2-8 tokens; set 0 to force the Triton "
-            "program there. Audited model and topology contracts enable the "
-            "eight-token q8 path while the global default "
-            "remains off."
+            "SM70 mHC native path; the layer policy resolves the "
+            "unset default at initialization and honors explicit overrides."
         ),
         category="configuration",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the legacy getter; True after layer policy resolution; "
+            "explicit overrides retained"
         ),
         automatic_conditions=(
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
-            ),
+            "vllm/config/execution_policy.py:LayerExecutionPolicy.resolve",
         ),
         acceleration_paths=("SM70 FP16 linear",),
         user_visible=False,
@@ -6518,15 +6649,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="256",
         effective_default=(
-            "256; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "256 at the legacy getter; 1024 after layer policy resolution; "
+            "explicit overrides retained"
         ),
         automatic_conditions=(
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1024' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
-            ),
+            "vllm/config/execution_policy.py:LayerExecutionPolicy.resolve",
         ),
         acceleration_paths=("SM70 FP16 linear",),
         user_visible=False,
@@ -6829,6 +6956,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
+    "VLLM_V41_SUM2_PUSH_ANY": env_var(
+        lambda: bool(int(os.getenv("VLLM_V41_SUM2_PUSH_ANY", "0"))),
+        description=(
+            "Admit aligned FP16 sum2 messages up to 80 KiB to the existing "
+            "push kernel on captured, fully connected SM70 TP4 communicators."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
     # Refuse to start when a checkpoint carries no calibrated QSA E4M3 K/V
     # scales. Off by default: an uncalibrated checkpoint runs on the module's
     # 1.0 defaults with a warning instead of failing to serve.
@@ -7017,6 +7157,1065 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "torch fallback paths."
         ),
         category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_EXPERT_CACHE_MEMLOG": env_var(
+        lambda: bool(os.getenv("VLLM_EXPERT_CACHE_MEMLOG")),
+        description=(
+            "Diagnostic: log CUDA memory around the first and last TurboMind "
+            "prefill MoE layer of the GGUF routed-expert cache."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_EXPERT_CACHE_STACKS": env_var(
+        lambda: bool(os.getenv("VLLM_EXPERT_CACHE_STACKS")),
+        description=(
+            "Diagnostic: dump all thread stacks when a GGUF routed-expert cache "
+            "miss waits on the host lane for too long."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_MXFP4_GROUPED_ANY": env_var(
+        lambda: os.getenv("VLLM_SM70_MXFP4_GROUPED_ANY"),
+        description=("SM70 kernel policy switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41K_LIB": env_var(
+        lambda: os.getenv("VLLM_V41K_LIB"),
+        description=(
+            "Path of the SM70 v41k CUDA extension (decode MoE, G3 row split, peer "
+            "gather, index scores); defaults to "
+            "benchmarks/deepseek_v41/v41k/build/v41k.so."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ACT_PROGRAMS": env_var(
+        lambda: os.getenv("VLLM_V41_ACT_PROGRAMS", "1024"),
+        description=(
+            "DS-V4.1 prefill: programs of the persistent-grid activation kernel (0 "
+            "uses the per-route grid)."
+        ),
+        category="tuning",
+        declared_default="'1024'",
+        effective_default="'1024'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ASYNC": env_var(
+        lambda: os.getenv("VLLM_V41_ASYNC", "0"),
+        description=("Allow asynchronous scheduling for the DS-V4.1 SM70 profile."),
+        category="configuration",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ASYNC_EVICT": env_var(
+        lambda: os.getenv("VLLM_V41_ASYNC_EVICT"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ATTN_FUSED": env_var(
+        lambda: os.getenv("VLLM_V41_ATTN_FUSED", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COL_B": env_var(
+        lambda: os.getenv("VLLM_V41_COL_B", "2"),
+        description=("DS-V4.1 column projection kernel tuning (developer)."),
+        category="tuning",
+        declared_default="'2'",
+        effective_default="'2'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COL_BLOCK": env_var(
+        lambda: os.getenv("VLLM_V41_COL_BLOCK", "256"),
+        description=("DS-V4.1 column projection kernel tuning (developer)."),
+        category="tuning",
+        declared_default="'256'",
+        effective_default="'256'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COL_PROJ": env_var(
+        lambda: os.getenv("VLLM_V41_COL_PROJ", "0"),
+        description=("DS-V4.1 column projection kernel tuning (developer)."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COL_W": env_var(
+        lambda: os.getenv("VLLM_V41_COL_W", "4"),
+        description=("DS-V4.1 column projection kernel tuning (developer)."),
+        category="tuning",
+        declared_default="'4'",
+        effective_default="'4'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COORD_DEBUG": env_var(
+        lambda: os.getenv("VLLM_V41_COORD_DEBUG"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DENSE_TM": env_var(
+        lambda: os.getenv("VLLM_V41_DENSE_TM", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DMA_DEBUG": env_var(
+        lambda: os.getenv("VLLM_V41_DMA_DEBUG"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DMA_DEMAND": env_var(
+        lambda: os.getenv("VLLM_V41_DMA_DEMAND"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DMV_CTAS": env_var(
+        lambda: os.getenv("VLLM_V41_DMV_CTAS", "80"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'80'",
+        effective_default="'80'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DOWN_ROWS": env_var(
+        lambda: os.getenv("VLLM_V41_DOWN_ROWS", "0"),
+        description=(
+            "DS-V4.1: split routed-expert down projections by output rows (no "
+            "duplicated TP boundary blocks); needs the v41k peer gather."
+        ),
+        category="configuration",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EM": env_var(
+        lambda: os.getenv("VLLM_V41_EM", "1"),
+        description=("DS-V4.1 expert-major decode MoE kernel switch (v41k)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EM5": env_var(
+        lambda: os.getenv("VLLM_V41_EM5", "1"),
+        description=("DS-V4.1 expert-major decode MoE kernel switch (v41k)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EM7": env_var(
+        lambda: os.getenv("VLLM_V41_EM7", "1"),
+        description=("DS-V4.1 expert-major decode MoE kernel switch (v41k)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EM8": env_var(
+        lambda: os.getenv("VLLM_V41_EM8"),
+        description=("DS-V4.1 expert-major decode MoE kernel switch (v41k)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EMPTY_CACHE_TOKENS": env_var(
+        lambda: os.getenv("VLLM_V41_EMPTY_CACHE_TOKENS", "2048"),
+        description=(
+            "DS-V4.1: empty the CUDA caching allocator before prefill passes of at "
+            "least this many tokens (0 disables)."
+        ),
+        category="tuning",
+        declared_default="'2048'",
+        effective_default="'2048'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ENGRAM_READERS": env_var(
+        lambda: os.getenv("VLLM_V41_ENGRAM_READERS"),
+        description=("DS-V4.1 Engram reader tuning."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EXACT_GEMM": env_var(
+        lambda: os.getenv("VLLM_V41_EXACT_GEMM", "0"),
+        description=(
+            "Experimental DS-V4.1 prefill: size grouped GEMMs per tile from host route"
+            " offsets (slower on SM70)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EXPERT_FAST_HIT": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_FAST_HIT", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_FP8_GEMV": env_var(
+        lambda: os.getenv("VLLM_V41_FP8_GEMV", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_FREE_SLOTS": env_var(
+        lambda: os.getenv("VLLM_V41_FREE_SLOTS"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_FUSED_SPARSE": env_var(
+        lambda: os.getenv("VLLM_V41_FUSED_SPARSE", "0"),
+        description=(
+            "Experimental DS-V4.1: fused flash-style sparse attention (slower on SM70 "
+            "Triton)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_FUSED_SPARSE_MIN": env_var(
+        lambda: os.getenv("VLLM_V41_FUSED_SPARSE_MIN", "64"),
+        description=(
+            "Experimental DS-V4.1: minimum tokens for the fused sparse attention path."
+        ),
+        category="experimental",
+        declared_default="'64'",
+        effective_default="'64'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_GATE_BF16": env_var(
+        lambda: os.getenv("VLLM_V41_GATE_BF16", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_GATHER_WPD": env_var(
+        lambda: os.getenv("VLLM_V41_GATHER_WPD"),
+        description=("DS-V4.1 v41k peer gather tuning."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_COLS": env_var(
+        lambda: os.getenv("VLLM_V41_HC_COLS", "32"),
+        description=("DS-V4.1 mHC transition kernel switch."),
+        category="tuning",
+        declared_default="'32'",
+        effective_default="'32'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_CUDA": env_var(
+        lambda: os.getenv("VLLM_V41_HC_CUDA", "0"),
+        description=("DS-V4.1 mHC transition kernel switch."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_FUSED": env_var(
+        lambda: os.getenv("VLLM_V41_HC_FUSED", "1"),
+        description=("DS-V4.1 mHC transition kernel switch."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_FW": env_var(
+        lambda: os.getenv("VLLM_V41_HC_FW", "4"),
+        description=("DS-V4.1 mHC transition kernel switch."),
+        category="tuning",
+        declared_default="'4'",
+        effective_default="'4'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_PW": env_var(
+        lambda: os.getenv("VLLM_V41_HC_PW", "4"),
+        description=("DS-V4.1 mHC transition kernel switch."),
+        category="tuning",
+        declared_default="'4'",
+        effective_default="'4'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_TOKEN_BLOCKED": env_var(
+        lambda: os.getenv("VLLM_V41_HC_TOKEN_BLOCKED", "0"),
+        description=(
+            "Experimental DS-V4.1: token-blocked HC transition for prefill (slower on "
+            "SM70)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_V2": env_var(
+        lambda: os.getenv("VLLM_V41_HC_V2", "0"),
+        description=("DS-V4.1 mHC transition kernel switch."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_V3": env_var(
+        lambda: os.getenv("VLLM_V41_HC_V3", "1"),
+        description=("DS-V4.1 mHC transition kernel switch."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_V3_GROUPS": env_var(
+        lambda: os.getenv("VLLM_V41_HC_V3_GROUPS", "8"),
+        description=("DS-V4.1 mHC transition kernel switch."),
+        category="tuning",
+        declared_default="'8'",
+        effective_default="'8'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HC_WINDOW": env_var(
+        lambda: os.getenv("VLLM_V41_HC_WINDOW", "2048"),
+        description=("DS-V4.1: token window of the prefill HC transition transients."),
+        category="tuning",
+        declared_default="'2048'",
+        effective_default="'2048'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_HITLOG_RELAXED": env_var(
+        lambda: os.getenv("VLLM_V41_HITLOG_RELAXED", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_INDEX_DECODE_BLOCKS": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_DECODE_BLOCKS", "8"),
+        description=(
+            "DS-V4.1 indexer: key blocks per program of the Triton decode fallback."
+        ),
+        category="tuning",
+        declared_default="'8'",
+        effective_default="'8'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_INDEX_TILE_MB": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_TILE_MB", "64"),
+        description=("DS-V4.1 indexer: FP16 score budget per query tile in MiB."),
+        category="tuning",
+        declared_default="'64'",
+        effective_default="'64'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_INDEX_TOPK": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_TOPK", "1"),
+        description=("DS-V4.1 indexer: fused dynamic-length top-k kernel."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_JOB_EVENTS": env_var(
+        lambda: os.getenv("VLLM_V41_JOB_EVENTS"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_KV_HOT_POSITIONS": env_var(
+        lambda: os.getenv("VLLM_V41_KV_HOT_POSITIONS", "32768"),
+        description=(
+            "DS-V4.1 packed KV: positions kept in the per-GPU hot ring of compressed "
+            "latents."
+        ),
+        category="tuning",
+        declared_default="'32768'",
+        effective_default="'32768'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_MAX_LEN": env_var(
+        lambda: os.getenv("VLLM_V41_MAX_LEN", "16384"),
+        description=(
+            "DS-V4.1 benchmark harness: max_model_len passed by "
+            "benchmarks/deepseek_v41/main_smoke.py."
+        ),
+        category="debug",
+        declared_default="'16384'",
+        effective_default="'16384'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_MISS_HIST": env_var(
+        lambda: os.getenv("VLLM_V41_MISS_HIST", "0"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PACKED_KV": env_var(
+        lambda: os.getenv("VLLM_V41_PACKED_KV"),
+        description=(
+            "DS-V4.1: lossless packed FP4 KV (compressed latents in shared host memory"
+            " plus a GPU hot ring, packed index keys on the GPU); enables contexts up "
+            "to 512K."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PLAN_STATS": env_var(
+        lambda: os.getenv("VLLM_V41_PLAN_STATS"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PRED_STATS": env_var(
+        lambda: os.getenv("VLLM_V41_PRED_STATS", "0"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFETCH": env_var(
+        lambda: os.getenv("VLLM_V41_PREFETCH", "0"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFETCH_EVAL": env_var(
+        lambda: os.getenv("VLLM_V41_PREFETCH_EVAL"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_DMA": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_DMA", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_GROUP": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_GROUP"),
+        description=(
+            "DS-V4.1 prefill: override of expert_cache_prefill_tokens (route group "
+            "size)."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_TIMING": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_TIMING", "0"),
+        description=(
+            "Diagnostic: DS-V4.1 prefill MoE segment timers (CUDA events, rank 0)."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ROUTED_PREFILL_MAX": env_var(
+        lambda: os.getenv("VLLM_V41_ROUTED_PREFILL_MAX", "1536"),
+        description=(
+            "DS-V4.1 prefill: passes up to this many tokens stage only routed cold "
+            "experts."
+        ),
+        category="tuning",
+        declared_default="'1536'",
+        effective_default="'1536'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ROUTER_FUSED": env_var(
+        lambda: os.getenv("VLLM_V41_ROUTER_FUSED", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ROUTE_TRACE": env_var(
+        lambda: os.getenv("VLLM_V41_ROUTE_TRACE"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ROWS_TILE": env_var(
+        lambda: os.getenv("VLLM_V41_ROWS_TILE", "4,8"),
+        description=(
+            "DS-V4.1 decode: rows and warps of the row-split down kernel, e.g. '4,8'."
+        ),
+        category="tuning",
+        declared_default="'4,8'",
+        effective_default="'4,8'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SESSION_PREFIX": env_var(
+        lambda: os.getenv("VLLM_V41_SESSION_PREFIX", "0"),
+        description=(
+            "DS-V4.1: same-session prefix caching (scheduler admits hits that continue"
+            " the last executed sequence; the worker rewinds Engram/C2 state)."
+        ),
+        category="configuration",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SKIP_BELOW": env_var(
+        lambda: os.getenv("VLLM_V41_SKIP_BELOW", "0"),
+        description=(
+            "Experimental DS-V4.1 lossy cold-expert skipping (off by default)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SKIP_DEFER": env_var(
+        lambda: os.getenv("VLLM_V41_SKIP_DEFER", "1"),
+        description=(
+            "Experimental DS-V4.1 lossy cold-expert skipping (off by default)."
+        ),
+        category="experimental",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SKIP_LATE": env_var(
+        lambda: os.getenv("VLLM_V41_SKIP_LATE", "0"),
+        description=(
+            "Experimental DS-V4.1 lossy cold-expert skipping (off by default)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SKIP_LATE_FROM": env_var(
+        lambda: os.getenv("VLLM_V41_SKIP_LATE_FROM", "2"),
+        description=(
+            "Experimental DS-V4.1 lossy cold-expert skipping (off by default)."
+        ),
+        category="experimental",
+        declared_default="'2'",
+        effective_default="'2'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SKIP_MIN_RANK": env_var(
+        lambda: os.getenv("VLLM_V41_SKIP_MIN_RANK", "1"),
+        description=(
+            "Experimental DS-V4.1 lossy cold-expert skipping (off by default)."
+        ),
+        category="experimental",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SKIP_RENORM": env_var(
+        lambda: os.getenv("VLLM_V41_SKIP_RENORM", "1"),
+        description=(
+            "Experimental DS-V4.1 lossy cold-expert skipping (off by default)."
+        ),
+        category="experimental",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SKIP_SUBST": env_var(
+        lambda: os.getenv("VLLM_V41_SKIP_SUBST", "1"),
+        description=(
+            "Experimental DS-V4.1 lossy cold-expert skipping (off by default)."
+        ),
+        category="experimental",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_STAGE_RING": env_var(
+        lambda: os.getenv("VLLM_V41_STAGE_RING", "1"),
+        description=(
+            "DS-V4.1 prefill: cold-expert staging ring issued ahead across tiles and "
+            "layers."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_STAGE_SLOTS": env_var(
+        lambda: os.getenv("VLLM_V41_STAGE_SLOTS", "128"),
+        description=("DS-V4.1 prefill: expert slots in the cold staging ring."),
+        category="tuning",
+        declared_default="'128'",
+        effective_default="'128'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_STASH_IN_PUBLISH": env_var(
+        lambda: os.getenv("VLLM_V41_STASH_IN_PUBLISH", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SWAP_CTAS": env_var(
+        lambda: os.getenv("VLLM_V41_SWAP_CTAS", "1024"),
+        description=("DS-V4.1 shared expert cache: miss swap kernel/path switch."),
+        category="tuning",
+        declared_default="'1024'",
+        effective_default="'1024'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SWAP_DMA": env_var(
+        lambda: os.getenv("VLLM_V41_SWAP_DMA", "0"),
+        description=("DS-V4.1 shared expert cache: miss swap kernel/path switch."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SWAP_FREE": env_var(
+        lambda: os.getenv("VLLM_V41_SWAP_FREE"),
+        description=("DS-V4.1 shared expert cache: miss swap kernel/path switch."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SWAP_FUSED": env_var(
+        lambda: os.getenv("VLLM_V41_SWAP_FUSED", "1"),
+        description=("DS-V4.1 shared expert cache: miss swap kernel/path switch."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SWAP_INPLACE": env_var(
+        lambda: os.getenv("VLLM_V41_SWAP_INPLACE"),
+        description=("DS-V4.1 shared expert cache: miss swap kernel/path switch."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SWAP_WB_CTAS": env_var(
+        lambda: os.getenv("VLLM_V41_SWAP_WB_CTAS", "8"),
+        description=("DS-V4.1 shared expert cache: miss swap kernel/path switch."),
+        category="tuning",
+        declared_default="'8'",
+        effective_default="'8'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_TRUNC": env_var(
+        lambda: os.getenv("VLLM_V41_TRUNC", "0"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_TRUNC_CUTOFF": env_var(
+        lambda: os.getenv("VLLM_V41_TRUNC_CUTOFF", "0"),
+        description=(
+            "Experimental DS-V4.1: static speculative verification truncation cutoff."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_TUNE_PREFILL_PASSES": env_var(
+        lambda: os.getenv("VLLM_V41_TUNE_PREFILL_PASSES", "0"),
+        description=(
+            "Experimental DS-V4.1 prefill: TurboMind measure passes for grouped GEMMs "
+            "(no gain measured)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_WARM_TORCH_NCCL": env_var(
+        lambda: os.getenv("VLLM_V41_WARM_TORCH_NCCL", "0"),
+        description=(
+            "DS-V4.1: create the torch NCCL communicator at load (all_gather uses "
+            "pynccl, so it is normally never created)."
+        ),
+        category="configuration",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_WINDOW_RING": env_var(
+        lambda: os.getenv("VLLM_V41_WINDOW_RING", "1"),
+        description=(
+            "DS-V4.1: keep sliding-window latents of target layers >= 1 in private "
+            "256-row rings instead of full-length paged KV."
+        ),
+        category="configuration",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_WOA_VIEWS": env_var(
+        lambda: os.getenv("VLLM_V41_WOA_VIEWS", "1"),
+        description=("DS-V4.1 SM70 runtime switch (developer)."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INPLACE_AR_MIN": env_var(
+        lambda: os.getenv("VLLM_INPLACE_AR_MIN")
+        or ("4194304" if os.getenv("VLLM_V41_PACKED_KV") == "1" else "0"),
+        description=(
+            "All-reduce large (prefill) temporaries in place at or above this many "
+            "elements; 0 disables. The all_reduce op is declared out-of-place, so "
+            "only the DeepSeek-V4.1 packed-KV prefill defaults to 4194304."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=("'4194304' with VLLM_V41_PACKED_KV=1",),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_PYNCCL_ALLGATHER": env_var(
+        lambda: os.getenv("VLLM_PYNCCL_ALLGATHER", "1"),
+        description=(
+            "Use the existing pynccl communicator for device all_gather instead of "
+            "creating a torch NCCL communicator."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ATTN_TIMING": env_var(
+        lambda: os.getenv("VLLM_V41_ATTN_TIMING", "0"),
+        description=(
+            "Diagnostic: DS-V4.1 prefill attention/HC segment timers (CUDA events, "
+            "rank 0)."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_MARKOV_FUSED": env_var(
+        lambda: os.getenv("VLLM_V41_MARKOV_FUSED"),
+        description=("DS-V4.1 DSpark fused Markov embedding switch (developer)."),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_TM_COLD_DMA": env_var(
+        lambda: os.getenv("VLLM_TM_COLD_DMA", "1") == "1",
+        description=(
+            "GGUF routed-expert cache TurboMind prefill: stage host-resident (cold) "
+            "experts on the device with copy-engine DMA before transcoding. 0 "
+            "transcodes them straight from mapped host memory with few CTAs, which "
+            "slows concurrent kernels on V100."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_TM_COLD_CTAS": env_var(
+        lambda: (
+            int(os.environ["VLLM_TM_COLD_CTAS"])
+            if "VLLM_TM_COLD_CTAS" in os.environ
+            else None
+        ),
+        description=(
+            "CTAs of the cold-expert transcode in the GGUF routed-expert cache "
+            "TurboMind prefill. Unset: 64 with DMA staging, 8 when reading mapped "
+            "host memory."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="Computed when unset: 64 with VLLM_TM_COLD_DMA, else 8",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_QSA_DUMP_DIR": env_var(
+        lambda: os.getenv("VLLM_QSA_DUMP_DIR"),
+        description=(
+            "Diagnostic: directory where TP rank 0 saves the inputs and output of a "
+            "few long-context QSA prefill attention calls for offline kernel "
+            "benchmarks."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_GGUF_LOAD_PROFILE": env_var(
+        lambda: bool(os.getenv("VLLM_GGUF_LOAD_PROFILE")),
+        description=(
+            "Diagnostic: sample the GGUF loading thread every 50 ms and log where "
+            "the load time goes."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_BALANCED_PREFILL_CHUNKS": env_var(
+        lambda: os.getenv("VLLM_BALANCED_PREFILL_CHUNKS", "0") == "1",
+        description=(
+            "Split a prompt that needs n prefill chunks into n near-equal block- "
+            "aligned chunks instead of full chunks and a short tail. Helps when "
+            "every prefill step has a fixed cost (e.g. host-resident experts "
+            "streamed over PCIe)."
+        ),
+        category="tuning",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -10671,6 +11870,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="debug",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_DEBUG_RENDER_TEMPLATE_KWARGS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEBUG_RENDER_TEMPLATE_KWARGS", "0"))),
+        description=(
+            "vLLM: dump the request-level, server-default and merged "
+            "chat_template_kwargs before rendering. Off by default."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
@@ -15294,6 +16506,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    "VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE": env_var(
+        _get_weight_load_max_split_scope,
+        description=(
+            "Temporarily set the CUDA allocator max_split_size_mb to 20 during "
+            "model loading, preserving the other allocator options. Disabled "
+            "by default with expandable_segments:True, enabled otherwise. "
+            "Set 0 or 1 to override. Does not change SM70 warmup scoping."
+        ),
+        category="configuration",
+        declared_default="auto",
+        effective_default="False with expandable_segments:True, otherwise True",
+        automatic_conditions=(
+            "Disabled when the effective allocator enables expandable segments.",
+        ),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": env_var(
         lambda: bool(int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))),
@@ -19043,7 +20272,7 @@ def _is_envs_cache_enabled() -> bool:
     return hasattr(__getattr__, "cache_clear")
 
 
-def enable_envs_cache() -> None:
+def enable_envs_cache(*, exclude: Collection[str] = ()) -> None:
     """
     Enables caching of environment variables. This is useful for performance
     reasons, as it avoids the need to re-evaluate environment variables on
@@ -19052,17 +20281,28 @@ def enable_envs_cache() -> None:
     NOTE: Currently, it's invoked after service initialization to reduce
     runtime overhead. This also means that environment variables should NOT
     be updated after the service is initialized.
+
+    Engine callers exclude aliases already owned by their serialized policies.
+    Standalone callers retain the complete legacy cache. Excluded getters are
+    not evaluated eagerly; explicit compatibility reads still work normally.
     """
     if _is_envs_cache_enabled():
         # Avoid wrapping functools.cache multiple times
         return
     # Tag __getattr__ with functools.cache
     global __getattr__
-    __getattr__ = functools.cache(__getattr__)
+    uncached_getattr = __getattr__
+    __getattr__ = functools.cache(uncached_getattr)
 
-    # Cache all environment variables
-    for key in environment_variables:
-        __getattr__(key)
+    # Nested getters must share the cache too. Roll back on failure so the
+    # next startup cannot skip validation through a partially warmed cache.
+    try:
+        for key in environment_variables:
+            if key not in exclude:
+                __getattr__(key)
+    except BaseException:
+        __getattr__ = uncached_getattr
+        raise
 
 
 def disable_envs_cache() -> None:
@@ -19104,6 +20344,93 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_INPLACE_AR_MIN",
+        "VLLM_PYNCCL_ALLGATHER",
+        "VLLM_V41_ATTN_TIMING",
+        "VLLM_V41_MARKOV_FUSED",
+        "VLLM_SM70_MXFP4_GROUPED_ANY",
+        "VLLM_V41K_LIB",
+        "VLLM_V41_ACT_PROGRAMS",
+        "VLLM_V41_ASYNC",
+        "VLLM_V41_ASYNC_EVICT",
+        "VLLM_V41_ATTN_FUSED",
+        "VLLM_V41_COL_B",
+        "VLLM_V41_COL_BLOCK",
+        "VLLM_V41_COL_PROJ",
+        "VLLM_V41_COL_W",
+        "VLLM_V41_COORD_DEBUG",
+        "VLLM_V41_DENSE_TM",
+        "VLLM_V41_DMA_DEBUG",
+        "VLLM_V41_DMA_DEMAND",
+        "VLLM_V41_DMV_CTAS",
+        "VLLM_V41_DOWN_ROWS",
+        "VLLM_V41_EM",
+        "VLLM_V41_EM5",
+        "VLLM_V41_EM7",
+        "VLLM_V41_EM8",
+        "VLLM_V41_EMPTY_CACHE_TOKENS",
+        "VLLM_V41_ENGRAM_READERS",
+        "VLLM_V41_EXACT_GEMM",
+        "VLLM_V41_EXPERT_FAST_HIT",
+        "VLLM_V41_FP8_GEMV",
+        "VLLM_V41_FREE_SLOTS",
+        "VLLM_V41_FUSED_SPARSE",
+        "VLLM_V41_FUSED_SPARSE_MIN",
+        "VLLM_V41_GATE_BF16",
+        "VLLM_V41_GATHER_WPD",
+        "VLLM_V41_HC_COLS",
+        "VLLM_V41_HC_CUDA",
+        "VLLM_V41_HC_FUSED",
+        "VLLM_V41_HC_FW",
+        "VLLM_V41_HC_PW",
+        "VLLM_V41_HC_TOKEN_BLOCKED",
+        "VLLM_V41_HC_V2",
+        "VLLM_V41_HC_V3",
+        "VLLM_V41_HC_V3_GROUPS",
+        "VLLM_V41_HC_WINDOW",
+        "VLLM_V41_HITLOG_RELAXED",
+        "VLLM_V41_INDEX_DECODE_BLOCKS",
+        "VLLM_V41_INDEX_TILE_MB",
+        "VLLM_V41_INDEX_TOPK",
+        "VLLM_V41_JOB_EVENTS",
+        "VLLM_V41_KV_HOT_POSITIONS",
+        "VLLM_V41_MAX_LEN",
+        "VLLM_V41_MISS_HIST",
+        "VLLM_V41_PACKED_KV",
+        "VLLM_V41_PLAN_STATS",
+        "VLLM_V41_PRED_STATS",
+        "VLLM_V41_PREFETCH",
+        "VLLM_V41_PREFETCH_EVAL",
+        "VLLM_V41_PREFILL_DMA",
+        "VLLM_V41_PREFILL_GROUP",
+        "VLLM_V41_PREFILL_TIMING",
+        "VLLM_V41_ROUTED_PREFILL_MAX",
+        "VLLM_V41_ROUTER_FUSED",
+        "VLLM_V41_ROUTE_TRACE",
+        "VLLM_V41_ROWS_TILE",
+        "VLLM_V41_SESSION_PREFIX",
+        "VLLM_V41_SKIP_BELOW",
+        "VLLM_V41_SKIP_DEFER",
+        "VLLM_V41_SKIP_LATE",
+        "VLLM_V41_SKIP_LATE_FROM",
+        "VLLM_V41_SKIP_MIN_RANK",
+        "VLLM_V41_SKIP_RENORM",
+        "VLLM_V41_SKIP_SUBST",
+        "VLLM_V41_STAGE_RING",
+        "VLLM_V41_STAGE_SLOTS",
+        "VLLM_V41_STASH_IN_PUBLISH",
+        "VLLM_V41_SWAP_CTAS",
+        "VLLM_V41_SWAP_DMA",
+        "VLLM_V41_SWAP_FREE",
+        "VLLM_V41_SWAP_FUSED",
+        "VLLM_V41_SWAP_INPLACE",
+        "VLLM_V41_SWAP_WB_CTAS",
+        "VLLM_V41_TRUNC",
+        "VLLM_V41_TRUNC_CUTOFF",
+        "VLLM_V41_TUNE_PREFILL_PASSES",
+        "VLLM_V41_WARM_TORCH_NCCL",
+        "VLLM_V41_WINDOW_RING",
+        "VLLM_V41_WOA_VIEWS",
         "MAX_JOBS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
@@ -19166,6 +20493,13 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_EXPERT_CACHE_MEMLOG",
+        "VLLM_EXPERT_CACHE_STACKS",
+        "VLLM_TM_COLD_DMA",
+        "VLLM_TM_COLD_CTAS",
+        "VLLM_QSA_DUMP_DIR",
+        "VLLM_GGUF_LOAD_PROFILE",
+        "VLLM_BALANCED_PREFILL_CHUNKS",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
@@ -19177,9 +20511,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         ignored_factors.update(compile_ignored_aliases(kernel_config))
 
     if vllm_config is not None:
-        from vllm.config.policy_defaults import runtime_compile_ignored_aliases
+        from vllm.config.policy_defaults import engine_policy_aliases
 
-        ignored_factors.update(runtime_compile_ignored_aliases(vllm_config))
+        ignored_factors.update(engine_policy_aliases(vllm_config))
 
     from vllm.config.utils import normalize_value
 

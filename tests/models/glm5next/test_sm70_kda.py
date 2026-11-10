@@ -340,13 +340,46 @@ def test_sm70_glm_kda_fp32_staging_avoids_fp16_overflow_and_graph() -> None:
     assert torch.equal(graph_output, normalized)
 
 
-def test_sm70_exact_kda_gemv_is_single_token_only() -> None:
-    """The exact native projection is taken for one token only; verify rows use
-    the standard projection (cuBLAS is ~2x faster there on V100)."""
-    import inspect
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 2, 8, 9])
+def test_sm70_exact_kda_projection_dispatch(monkeypatch, enabled, num_tokens):
+    """Execute the adapter through projection, without constructing a model."""
+    from types import SimpleNamespace
 
     from vllm.models.glm5next.nvidia import kda as kda_module
 
-    src = inspect.getsource(kda_module)
-    assert "and num_tokens == 1\n" in src
-    assert "and 1 <= num_tokens <= 8\n" not in src
+    calls = []
+
+    class StopAfterProjection(Exception):
+        pass
+
+    class Projection:
+        weight = torch.empty((6416, 4096), dtype=torch.float16, device="meta")
+
+        def __call__(self, x):
+            calls.append("standard")
+            return (torch.empty((num_tokens, 6416), device="meta"),)
+
+    class Exact:
+        def sm70_glm53_fp16_gemv_out(self, output, x, weight):
+            calls.append("exact")
+
+    def stop(prefix, stage, output):
+        assert stage == "projection"
+        assert output.shape == (num_tokens, 6416)
+        raise StopAfterProjection
+
+    monkeypatch.setattr(kda_module, "_debug_dflash_kda_finite", stop)
+    monkeypatch.setattr(
+        torch.ops._C, "sm70_glm53_fp16_gemv_out", lambda *a: None, raising=False
+    )
+    layer = SimpleNamespace(
+        _use_sm70_exact_kda_gemv=enabled,
+        in_proj_qkvbfg_a=Projection(),
+        _exact_gemv_ops=Exact(),
+        prefix="test",
+    )
+    hidden = torch.empty((num_tokens, 4096), dtype=torch.float16, device="meta")
+    with pytest.raises(StopAfterProjection):
+        kda_module.Glm5NextLinearAttention.forward(layer, hidden, None)
+    assert calls == ["exact" if enabled and num_tokens == 1 else "standard"]
