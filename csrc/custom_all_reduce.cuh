@@ -2159,6 +2159,7 @@ class CustomAllreduce {
   const CollectivePolicy policy_;
   std::atomic<bool> logged_norm_route_{false};
   std::atomic<bool> logged_sum2_route_{false};
+  std::atomic<bool> logged_sum2_generic_push_{false};
   int rank_;
   int world_size_;
   // Full NVLink or xGMI connection between GPUs.
@@ -2815,6 +2816,17 @@ class CustomAllreduce {
           bytes == kSm70Tp4PushAllreduceQwen4ExpBytes &&
           (qwen4_exp_m1 == nullptr || std::strcmp(qwen4_exp_m1, "1") == 0);
 
+      // Reuse ordinary TP4's bounded 16-byte admission. The opt-in is
+      // communicator-owned; unset/zero preserves sum2's existing selectors.
+      const char* sum2_push_any =
+          policy_.raw(CollectivePolicyField::sm70_tp4_sum2_push_any);
+      const char* small = policy_.raw(
+          CollectivePolicyField::sm70_tp4_push_allreduce_small_messages);
+      const bool generic_small =
+          sum2_push_any != nullptr && std::strcmp(sum2_push_any, "1") == 0 &&
+          small != nullptr && std::strcmp(small, "1") == 0 && bytes > 0 &&
+          bytes <= kSm70Tp4PushAllreduceM8Bytes && bytes % 16 == 0;
+
       if (sm70_tp8_hierarchical_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           sm70_tp8_hierarchical_custom_ar_enabled(policy_, world_size_,
@@ -2831,10 +2843,17 @@ class CustomAllreduce {
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          (qwen38_batch || qwen38_m2 || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
+          (generic_small || qwen38_batch || qwen38_m2 || qwen38_mtp5 ||
+           qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(policy_, bytes);
+        const int push_blocks =
+            sm70_tp4_push_allreduce_blocks(policy_, bytes, generic_small);
         if (push_blocks > 0) {
+          if (generic_small && !logged_sum2_generic_push_.exchange(true)) {
+            std::cerr << "V41 sum2 generic push active bytes=" << bytes
+                      << " blocks=" << push_blocks << " rank=" << rank_
+                      << std::endl;
+          }
           sm70_cross_device_reduce_sum2_1stage_push<
               kSm70Tp4PushAllreduceWorldSize>
               <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(

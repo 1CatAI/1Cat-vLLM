@@ -26,6 +26,10 @@ class CollectivePolicy {
     if (values.size() != size)
       throw std::invalid_argument("Custom all-reduce policy ABI size mismatch");
     std::copy(values.begin(), values.end(), values_.begin());
+    const auto& sum2_push_any = values_[static_cast<size_t>(
+        CollectivePolicyField::sm70_tp4_sum2_push_any)];
+    if (sum2_push_any != "\x1f" && sum2_push_any != "0" && sum2_push_any != "1")
+      throw std::invalid_argument("VLLM_V41_SUM2_PUSH_ANY must be 0 or 1");
   }
   static CollectivePolicy legacy() {
     std::vector<std::string> values;

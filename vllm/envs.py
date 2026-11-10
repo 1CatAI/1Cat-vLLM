@@ -433,6 +433,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
+    VLLM_V41_SUM2_PUSH_ANY: bool = False
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = True
@@ -6959,6 +6960,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    "VLLM_V41_SUM2_PUSH_ANY": env_var(
+        lambda: bool(int(os.getenv("VLLM_V41_SUM2_PUSH_ANY", "0"))),
+        description=(
+            "Admit aligned FP16 sum2 messages up to 80 KiB to the existing "
+            "push kernel on captured, fully connected SM70 TP4 communicators."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
