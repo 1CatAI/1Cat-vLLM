@@ -2145,6 +2145,46 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
     }
     return;
   }
+  // Reuse the family M32 chunk policy, bound at engine initialization. Block
+  // scales require an explicit opt-in; unset retains their qualified prefill
+  // fallback. Each row keeps the existing M<=8 reduction order. Only admit
+  // configurations the small-row kernel actually implements.
+  const bool block_scales =
+      group_scales.dim() == 2 && !channel_scales && k > 0 && k % 128 == 0 &&
+      packed_n > 0 && packed_n % (gated_silu ? 256 : 128) == 0 &&
+      group_scales.size(0) == k / 128 && group_scales.size(1) == packed_n / 32;
+  const bool small_split =
+      gated_silu ? (split_k == 4 || split_k == 8 || split_k == 16)
+                 : (split_k == 4 || split_k == 8 || split_k == 12 ||
+                    split_k == 16 || split_k == 32);
+  const bool small_chains = accumulator_chains == 1 || accumulator_chains == 2;
+  const bool exact_split =
+      split_k != 12 || (accumulator_chains == 2 && !prefetch_codes);
+  if (m > 8 && m <= 32 && block_scales && aligned_shape && small_split &&
+      small_chains && exact_split &&
+      vllm::sm70::policy_exact_one(PolicyField::fp8_qpn8_m32_chunked, false)) {
+    static std::once_flag block_chunked_log_once;
+    std::call_once(block_chunked_log_once, []() {
+      std::fprintf(stderr,
+                   "INFO SM70 block-FP8 QPN8 M=9..32 chunked decode route "
+                   "engaged by fp8_qpn8_m32_chunked=1.\n");
+    });
+    for (int64_t row = 0; row < m; row += 8) {
+      const int64_t rows = std::min<int64_t>(8, m - row);
+      auto input_chunk = input.narrow(0, row, rows);
+      auto out_chunk = out.narrow(0, row, rows);
+      if (gated_silu) {
+        fp8_qpn8_gated_pair_sm70_out(out_chunk, input_chunk, codes,
+                                     group_scales, split_k, accumulator_chains,
+                                     true, prefetch_codes);
+      } else {
+        fp8_qpn8_gemm_sm70_out(out_chunk, input_chunk, codes, group_scales,
+                               split_k, accumulator_chains, true,
+                               prefetch_codes);
+      }
+    }
+    return;
+  }
   fp8_qpn8_prefill_sm70_out(out, dense_weight_ptr, input, codes, group_scales,
                             gated_silu);
 }
