@@ -1348,7 +1348,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         sampler_output = None
         cached_logits = None
-        if input_batch.num_draft_tokens > 0:
+        # The sparse target path projects with the base lm_head, so batches
+        # with an active LoRA request use dense LoRA-aware logits instead.
+        if input_batch.num_draft_tokens > 0 and not (
+            self.lora_config is not None
+            and self.lora_state.lora_ids[input_batch.idx_mapping_np].any()
+        ):
             assert self.rejection_sampler is not None
             assert self.speculator is not None
             sparse_result = self.speculator.try_sample_target(
@@ -1582,6 +1587,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.req_ids,
                     input_batch.idx_mapping_np,
                     input_batch.num_scheduled_tokens,
+                    num_logits=(
+                        np.diff(input_batch.cu_num_logits_np)
+                        if input_batch.num_draft_tokens > 0
+                        else None
+                    ),
                 )
                 self._set_active_loras(*lora_inputs)
         else:
