@@ -527,6 +527,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             BatchExecutionDescriptor, BatchExecutionDescriptor
         ] = {}
         from vllm.v1.attention.ops.sm70_grouped_long import (
+            long_attention_batch_query_rows,
             long_attention_enabled,
             long_attention_graph_contract,
             long_attention_max_batch_size,
@@ -535,8 +536,9 @@ class ModelCudaGraphManager(CudaGraphManager):
             scalar_tail_attention_available,
         )
 
+        attention_options = vllm_config.attention_config.flash_v100.options
         if (
-            long_attention_enabled(vllm_config.attention_config.flash_v100.options)
+            long_attention_enabled(attention_options)
             and current_platform.is_cuda()
             and current_platform.is_device_capability((7, 0))
             and self.dp_size == 1
@@ -548,23 +550,18 @@ class ModelCudaGraphManager(CudaGraphManager):
             model_config = getattr(vllm_config, "model_config", None)
             served = int(getattr(model_config, "max_model_len", 0) or 0)
             context_limit, query_rows = long_attention_graph_contract(
-                served or None, policy=vllm_config.attention_config.flash_v100.options
+                served or None, policy=attention_options
             )
             max_batch_size = min(
                 self.max_num_reqs,
-                long_attention_max_batch_size(
-                    policy=vllm_config.attention_config.flash_v100.options
-                ),
+                long_attention_max_batch_size(policy=attention_options),
             )
+            batch_query_rows = long_attention_batch_query_rows(policy=attention_options)
             if not _supports_sm70_long_batch_graphs(vllm_config):
                 max_batch_size = 1
             if context_limit is not None:
                 if self._sm70_dflash2_tail_graphs and (
-                    bool(
-                        vllm_config.attention_config.flash_v100.options.value(
-                            "scalar_tail_manifest"
-                        )
-                    )
+                    bool(attention_options.value("scalar_tail_manifest"))
                     or scalar_tail_attention_available()
                 ):
                     query_rows = (1, *query_rows)
@@ -575,22 +572,20 @@ class ModelCudaGraphManager(CudaGraphManager):
                         and desc.uniform_token_count in query_rows
                         and desc.num_tokens == desc.uniform_token_count
                     )
-                    # Reuse the same kernel and bound for request-major q8
-                    # batches only when the loaded native build admits them.
-                    batch_q8_variant = (
+                    # Request width and capacity come from the loaded provider.
+                    request_major_variant = (
                         desc.num_reqs is not None
                         and 2 <= desc.num_reqs <= max_batch_size
-                        and 8 in query_rows
-                        and desc.uniform_token_count == 8
-                        and desc.num_tokens == desc.num_reqs * 8
+                        and desc.uniform_token_count in batch_query_rows
+                        and desc.num_tokens == desc.num_reqs * desc.uniform_token_count
                     )
-                    if single_request_variant or batch_q8_variant:
+                    if single_request_variant or request_major_variant:
                         variant = replace(desc, attention_context_bucket=context_limit)
                         self._long_attention_graphs[desc] = variant
                         descs.append(variant)
                 logger.info_once(
                     "SM70 E4M3 long-context graph variants captured at bound=%d "
-                    "for query rows %s and q8 batch capacity=%d (served window=%s).",
+                    "for query rows %s and batch capacity=%d (served window=%s).",
                     context_limit,
                     tuple(query_rows),
                     max_batch_size,
@@ -664,9 +659,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         if 0 < upper <= limit:
             if desc.num_reqs > 1:
                 logger.info_once(
-                    "SM70 long q8 attention graph replay selected: "
-                    "requests=%d bound=%d.",
+                    "SM70 long attention graph replay selected: "
+                    "requests=%d query_rows=%d bound=%d.",
                     desc.num_reqs,
+                    desc.uniform_token_count,
                     limit,
                     scope="process",
                 )

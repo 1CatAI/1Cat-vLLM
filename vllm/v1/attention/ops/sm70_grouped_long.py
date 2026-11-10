@@ -32,7 +32,7 @@ BUILTIN_OP = "sm70_grouped_long_fwd"
 # route was qualified with. The source digest names that layout so a rebuilt
 # kernel cannot silently inherit the workspace identity of a different one.
 BUILTIN_SOURCE_SHA256 = (
-    "1d91f30dcac2359d4e19c56e8b3c17f99cd82e4dfac6eda39e6505e58a1f7e5d"
+    "c1365b915bb43e8297d6b28bd8cea037730ca7fc9540ac79203f1d86943a8140"
 )
 # Every B1 verifier tail width uses the long-context graph contract at this
 # capacity; q1 additionally has the compact scalar tail.
@@ -111,7 +111,7 @@ def load_long_attention(manifest_name: str):
         raise ValueError("The long-attention serving route requires 80 six-head splits")
     context_limit, query_rows = long_attention_contract(manifest)
     logger.info_once(
-        "Loaded experimental SM70 E4M3 q8 attention: module=%s SHA256=%s "
+        "Loaded experimental SM70 E4M3 attention: module=%s SHA256=%s "
         "max_context=%d query_rows=%s; 80 splits, compensated FP32 state.",
         manifest["module_name"],
         manifest["library_sha256"],
@@ -203,13 +203,18 @@ def resolve_long_attention(policy=None, capacity: int | None = None):
     capability = builtin_context_limit(capacity)
     manifest = dict(BUILTIN_MANIFEST, max_context=capability)
     logger.info_once(
-        "Using the shipped SM70 E4M3 q8 long-context route (%s): capability=%d "
+        "Using the shipped SM70 E4M3 long-context route (%s): capability=%d "
         "query_rows=%s; 80 splits, compensated FP32 state.",
         BUILTIN_OP,
         capability,
         BUILTIN_QUERY_ROWS,
         scope="process",
     )
+    revision = getattr(
+        torch.ops._vllm_fa2_C, "sm70_grouped_long_query_rows_revision", None
+    )
+    if revision is not None:
+        manifest = {**manifest, "query_rows_revision": int(revision())}
     return operator, manifest
 
 
@@ -231,9 +236,20 @@ def long_attention_max_batch_size(manifest=None, *, policy=None) -> int:
         query = getattr(torch.ops._vllm_fa2_C, "sm70_grouped_long_max_batch_size", None)
         return int(query()) if query is not None else 1
     batch_size = manifest.get("max_batch_size", 1)
-    if type(batch_size) is not int or not 1 <= batch_size <= 16:
+    if type(batch_size) is not int or batch_size < 1:
         raise ValueError("Unsupported long-attention batch contract")
     return batch_size
+
+
+def long_attention_batch_query_rows(manifest=None, *, policy=None) -> tuple[int, ...]:
+    if manifest is None:
+        _, manifest = resolve_long_attention(policy)
+    if manifest is None:
+        return ()
+    rows = long_attention_query_rows(manifest)
+    if manifest.get("query_rows_revision", 1) >= 2:
+        return rows
+    return tuple(row for row in rows if row == 8)
 
 
 # Keep the qualified fixed pages for older native libraries. Rebuilt libraries
@@ -265,12 +281,19 @@ def _report_unadmitted_page_size(page_size: int) -> None:
 
 
 def wrap_long_attention(fallback):
+    from vllm.config import get_current_vllm_config_or_none
+
     operator, manifest = resolve_long_attention()
     if operator is None:
         return fallback
     capability = long_attention_capability(manifest)
     query_rows = long_attention_query_rows(manifest)
     max_batch_size = long_attention_max_batch_size(manifest)
+    request_query_rows = long_attention_batch_query_rows(manifest)
+    config = get_current_vllm_config_or_none()
+    model = getattr(config, "model_config", None)
+    model_capacity = getattr(model, "max_model_len", None)
+    variable_request_rows = manifest.get("query_rows_revision", 1) >= 2
 
     def run(
         q, k, v, table, row_lengths, *, out, softmax_scale, k_scale=1.0, v_scale=1.0
@@ -283,10 +306,14 @@ def wrap_long_attention(fallback):
         bucket = getattr(descriptor, "attention_context_bucket", None)
         batch_size = int(table.shape[0]) if table.ndim == 2 else 0
         num_rows = q.shape[0] if q.ndim == 3 else 0
-        request_major_q8 = (
+        if bucket is None and variable_request_rows and table.ndim == 2 and k.ndim == 4:
+            # Bind the loaded model's window once. The physical table supplies
+            # a conservative bound for direct callers without a model config.
+            bucket = model_capacity or int(table.shape[1]) * int(k.shape[1])
+        request_major_batch = (
             2 <= batch_size <= max_batch_size
-            and 8 in query_rows
-            and num_rows == batch_size * 8
+            and num_rows % batch_size == 0
+            and num_rows // batch_size in request_query_rows
         )
         single_request_tail = batch_size == 1 and num_rows in query_rows
         # The graph builder owns the served window: it stamps the bound it
@@ -296,7 +323,7 @@ def wrap_long_attention(fallback):
             bucket is not None
             and bucket <= capability
             and q.ndim == 3
-            and (single_request_tail or request_major_q8)
+            and (single_request_tail or request_major_batch)
             and q.shape[1] > 0
             and q.shape[2] == 256
             and k.ndim == 4
@@ -325,11 +352,12 @@ def wrap_long_attention(fallback):
         # Allocate a fixed workspace once for each warmup/capture stream. Graph
         # replay never allocates. Layers reuse it in stream order; different
         # streams and versions never share the legacy 80-split buffers.
-        if request_major_q8:
+        if request_major_batch:
             logger.info_once(
-                "SM70 E4M3 long q8 request-major route selected: batch=%d "
-                "page=%d bound=%d; shared full-q8 kernel, FP32 state.",
+                "SM70 E4M3 long request-major route selected: batch=%d "
+                "query_rows=%d page=%d bound=%d; FP32 state.",
                 batch_size,
+                num_rows // batch_size,
                 k.shape[1],
                 bucket,
                 scope="process",
@@ -370,6 +398,13 @@ def wrap_long_attention(fallback):
             float(v_scale),
         )
 
+    if variable_request_rows and (
+        model_capacity is None or model_capacity <= capability
+    ):
+        run.__dict__.update(
+            request_query_rows=request_query_rows,
+            max_batch_size=max_batch_size,
+        )
     return run
 
 

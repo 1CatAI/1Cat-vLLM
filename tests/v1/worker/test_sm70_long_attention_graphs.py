@@ -197,7 +197,9 @@ def test_tail_capture_and_dispatch_from_real_initialization(
     assert manager.dispatch(1, 8, 8).cg_mode == CUDAGraphMode.FULL
 
 
-@pytest.mark.parametrize("native_capacity", [1, 16])
+@pytest.mark.parametrize("native_capacity", [1, 16, 32])
+@pytest.mark.parametrize("query_rows", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("revision", [1, 2])
 @pytest.mark.parametrize(
     "query_heads,kv_heads,head_dim,kv_dtype,admit_batch",
     [
@@ -211,7 +213,15 @@ def test_tail_capture_and_dispatch_from_real_initialization(
     ],
 )
 def test_batch_long_graph_capture_requires_native_capability(
-    monkeypatch, native_capacity, query_heads, kv_heads, head_dim, kv_dtype, admit_batch
+    monkeypatch,
+    native_capacity,
+    query_rows,
+    revision,
+    query_heads,
+    kv_heads,
+    head_dim,
+    kv_dtype,
+    admit_batch,
 ):
     from vllm.v1.attention.ops import sm70_e4m3_long as long
 
@@ -225,6 +235,11 @@ def test_batch_long_graph_capture_requires_native_capability(
     )
     monkeypatch.setattr(
         long, "long_attention_max_batch_size", lambda *, policy=None: native_capacity
+    )
+    monkeypatch.setattr(
+        long,
+        "long_attention_batch_query_rows",
+        lambda *, policy=None: tuple(range(2, 9)) if revision >= 2 else (8,),
     )
     monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(cg.current_platform, "is_device_capability", lambda cap: True)
@@ -247,26 +262,27 @@ def test_batch_long_graph_capture_requires_native_capability(
         cache_config=SimpleNamespace(cache_dtype=kv_dtype),
         compilation_config=CompilationConfig(
             runtime=GraphPolicy(split_draft_graphs=False),
-            cudagraph_capture_sizes=[8, 16, 32, 64, 128, 256],
-            max_cudagraph_capture_size=256,
+            cudagraph_capture_sizes=[b * query_rows for b in (1, 2, 4, 8, 16, 32)],
+            max_cudagraph_capture_size=32 * query_rows,
         ),
         parallel_config=SimpleNamespace(
             data_parallel_size=1, tensor_parallel_size=4, pipeline_parallel_size=1
         ),
         speculative_config=SimpleNamespace(
-            method="dflash", num_speculative_tokens=7, ngram_assist=False
+            method="mtp", num_speculative_tokens=query_rows - 1, ngram_assist=False
         ),
     )
     config.attention_config.flash_v100.options.resolve()
     manager = ModelCudaGraphManager(
-        config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, 8
+        config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, query_rows
     )
     manager._graphs_captured = True
     for batch in (1, 2, 4, 8, 16, 32):
-        desc = manager.dispatch(batch, batch * 8, 8)
+        desc = manager.dispatch(batch, batch * query_rows, query_rows)
         variant = manager._long_attention_graphs.get(desc)
         assert (variant is not None) == (
-            batch <= native_capacity and (batch == 1 or admit_batch)
+            batch <= native_capacity
+            and (batch == 1 or (admit_batch and (revision >= 2 or query_rows == 8)))
         )
         if variant is not None:
             assert variant.attention_context_bucket == 131072
@@ -340,6 +356,7 @@ def test_runner_does_not_dispatch_short_prefill_as_tail(
     for method in ("finish_requests", "free_states", "add_requests", "update_requests"):
         setattr(runner, method, lambda _: None)
     runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None)
+    runner.kv_connector = SimpleNamespace(handle_preemptions=lambda _: None)
     runner.cudagraph_manager = SimpleNamespace(_sm70_dflash2_tail_graphs=True)
     runner.req_states = SimpleNamespace(
         req_id_to_index={"r": 0},
@@ -353,6 +370,7 @@ def test_runner_does_not_dispatch_short_prefill_as_tail(
     runner.device = torch.device("cpu")
     scheduler = SimpleNamespace(
         new_block_ids_to_zero=[],
+        kv_block_copies=[],
         total_num_scheduled_tokens=query_len,
         num_scheduled_tokens={"r": query_len},
     )
