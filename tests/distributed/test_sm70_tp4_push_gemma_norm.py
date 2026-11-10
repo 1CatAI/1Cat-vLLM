@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _check_push_norm(rank: int, rendezvous: str) -> None:
+def _check_push_norm(rank: int, rendezvous: str, algorithm: str | None) -> None:
     from vllm import _sm70_ops as linear_ops
     from vllm.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
@@ -37,11 +37,16 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
     codes, scales = linear_ops.fp8_qpn8_prepare_sm70(
         projection_weight, projection_scales
     )
+    row_counts = (
+        (1, 3, 5, 8, 9, 16, 17, 25, 32, 33, 40, 51, 52, 63, 64)
+        if algorithm is None
+        else (1, 5, 52, 64)
+    )
     try:
         # MTP and DFlash retain independent packets across changing batch sizes.
         for rows, dtype in [
             (rows, dtype)
-            for rows in (1, 3, 5, 8, 9, 16, 17, 25, 32, 33, 40, 63, 64)
+            for rows in row_counts
             for dtype in (torch.float16, torch.float32)
         ]:
             storage = torch.zeros(
@@ -85,6 +90,11 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
                 weight.normal_().mul_(0.05)
                 if cycle == 0:
                     x.zero_()
+                    residual.zero_()
+                elif cycle == 1:
+                    # Cancellation exposes the distinct FP32 addition order of
+                    # each two-stage partition before the FP16 result is stored.
+                    x.fill_((65504.0, 0.1, -65504.0, 0.1)[rank])
                     residual.zero_()
                 dist.barrier()
                 for graph in graphs:
@@ -139,15 +149,22 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
-def test_sm70_tp4_push_norm_fp64_and_interleaved_replay(tmp_path):
+@pytest.mark.parametrize("algorithm", [None, "1stage", "2stage"])
+def test_sm70_tp4_push_norm_fp64_and_interleaved_replay(
+    tmp_path, monkeypatch, algorithm
+):
     if torch.accelerator.device_count() != 4 or torch.cuda.get_device_capability() != (
         7,
         0,
     ):
         pytest.skip("requires an isolated full NVLink mesh of four V100 GPUs")
+    if algorithm is None:
+        monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_ALGO", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_ALGO", algorithm)
     mp.spawn(
         _check_push_norm,
-        args=((tmp_path / "push-norm-rendezvous").as_uri(),),
+        args=((tmp_path / "push-norm-rendezvous").as_uri(), algorithm),
         nprocs=4,
         join=True,
     )

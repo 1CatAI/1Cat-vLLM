@@ -890,6 +890,21 @@ __global__ void __launch_bounds__(512, 1)
   sm70_pack32_barrier_at_end<ngpus>(sg, self_sg, rank);
 }
 
+// Match the per-partition accumulation order of the TP4 two-stage reduction.
+template <typename P, typename A>
+DINLINE P sm70_push_reduce_partition(P (&values)[4], int owner) {
+  switch (owner) {
+    case 1:
+      return sm70_push_reduce<P, 4, A, 1>(values);
+    case 2:
+      return sm70_push_reduce<P, 4, A, 2>(values);
+    case 3:
+      return sm70_push_reduce<P, 4, A, 3>(values);
+    default:
+      return sm70_push_reduce<P, 4, A>(values);
+  }
+}
+
 template <int ngpus, bool RotatedOrder = false>
 __global__ void __launch_bounds__(1024, 1)
     sm70_cross_device_reduce_1stage_push(RankData push_buffers,
@@ -950,19 +965,8 @@ __global__ void __launch_bounds__(1024, 1)
       // Match that FP32 addition order, including cancellation and signed zero.
       const int partition = offset / (packed_size / ngpus);
       const int owner = partition < ngpus ? partition : ngpus - 1;
-      switch (owner) {
-        case 1:
-          reduced = sm70_push_reduce<P, ngpus, A, 1>(peer_values);
-          break;
-        case 2:
-          reduced = sm70_push_reduce<P, ngpus, A, 2>(peer_values);
-          break;
-        case 3:
-          reduced = sm70_push_reduce<P, ngpus, A, 3>(peer_values);
-          break;
-        default:
-          reduced = sm70_push_reduce<P, ngpus, A>(peer_values);
-      }
+      static_assert(ngpus == 4);
+      reduced = sm70_push_reduce_partition<P, A>(peer_values, owner);
     } else {
       reduced = sm70_push_reduce<P, ngpus, A>(peer_values);
     }
@@ -1830,7 +1834,8 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
     RankData buffers, const half* __restrict__ input,
     const float* __restrict__ residual, const Weight* __restrict__ weight,
     half* __restrict__ output, half* __restrict__ k16_output,
-    float* __restrict__ residual_out, const void* local_buffer, float epsilon) {
+    float* __restrict__ residual_out, const void* local_buffer, float epsilon,
+    bool rotated_order) {
   constexpr int Width = 5120, Stride = kSm70MtpNormRows * Width / 8;
   using P = typename packed_t<half>::P;
   using A = typename packed_t<half>::A;
@@ -1876,7 +1881,12 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
       }
       if (!missing) break;
     }
-    sum = sm70_push_reduce<P, 4, A>(peers);
+    if (rotated_order) {
+      const int partition_owner = pack / (gridDim.x * 160);
+      sum = sm70_push_reduce_partition<P, A>(peers, partition_owner);
+    } else {
+      sum = sm70_push_reduce<P, 4, A>(peers);
+    }
 #pragma unroll
     for (int peer = 0; peer < 4; ++peer) {
       if (peer != Rank)
@@ -2888,6 +2898,23 @@ class CustomAllreduce {
 
     if constexpr (ngpus == 4 && std::is_same_v<ResidualT, float>) {
       if (!benchmark_reference && sm70_push_norm_mtp_ready(num_tokens)) {
+        const char* algorithm =
+            policy_.raw(CollectivePolicyField::custom_allreduce_algo);
+        bool rotated_order =
+            static_cast<size_t>(num_tokens) * hidden_size * sizeof(half) >=
+            512 * 1024;
+        if (algorithm != nullptr) {
+          if (std::strcmp(algorithm, "1stage") == 0 ||
+              std::strcmp(algorithm, "oneshot") == 0) {
+            rotated_order = false;
+          } else if (std::strcmp(algorithm, "2stage") == 0 ||
+                     std::strcmp(algorithm, "twoshot") == 0) {
+            rotated_order = true;
+          } else {
+            throw std::runtime_error("Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: " +
+                                     std::string(algorithm));
+          }
+        }
         RankData mtp_buffers{};
         for (int peer = 0; peer < 4; ++peer) {
           mtp_buffers.ptrs[peer] =
@@ -2899,25 +2926,29 @@ class CustomAllreduce {
             sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 0>
                 <<<num_tokens, 640, 0, stream>>>(
                     mtp_buffers, input, residual, weight, normalized_out,
-                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon);
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
             break;
           case 1:
             sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 1>
                 <<<num_tokens, 640, 0, stream>>>(
                     mtp_buffers, input, residual, weight, normalized_out,
-                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon);
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
             break;
           case 2:
             sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 2>
                 <<<num_tokens, 640, 0, stream>>>(
                     mtp_buffers, input, residual, weight, normalized_out,
-                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon);
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
             break;
           case 3:
             sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 3>
                 <<<num_tokens, 640, 0, stream>>>(
                     mtp_buffers, input, residual, weight, normalized_out,
-                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon);
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
             break;
         }
         return;
