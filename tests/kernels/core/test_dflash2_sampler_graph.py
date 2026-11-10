@@ -91,6 +91,8 @@ def test_graph_matches_existing_rejection_with_live_slots(
     original_graph_try = sampler_graph.try_graph_rejection
     previous = None
     for iteration in range(20):
+        states.temperature.np.fill([1.0, 0.7, 1.0, 0.7][iteration % 4])
+        states.top_p.np.fill([1.0, 1.0, 0.9, 0.9][iteration % 4])
         # Replacing all input/proposal tensors must reuse the same graph and
         # preserve the current proposal distribution, not a captured address.
         hidden = torch.randn_like(hidden)
@@ -175,5 +177,82 @@ def test_graph_matches_existing_rejection_with_live_slots(
             assert torch.equal(output, saved), "Replay overwrote outstanding output"
         previous = (actual.sampled_token_ids, actual.sampled_token_ids.clone())
     # Fresh request metadata allocations and changing slots do not recapture.
-    assert len(rejection._sm70_dflash2_rejection_graphs) == 1
-    assert sum(rejection.sm70_dflash2_reference_counts.cpu().tolist()) == 10
+    assert len(rejection._sm70_dflash2_rejection_graphs) == 2
+    counters = (
+        torch.stack(
+            [
+                graph.counters
+                for graph in rejection._sm70_dflash2_rejection_graphs.values()
+            ]
+        )
+        .sum(0)
+        .cpu()
+        .tolist()
+    )
+    # Counters reset when the request identity changes after ten iterations.
+    assert sum(counters) == 10
+    assert all(count > 0 for count in counters)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_graph_view_replays_live_parameters_after_neutral_capture(default_vllm_config):
+    from vllm.utils.torch_utils import current_stream
+
+    slots, vocab, rows = 8, 256, 4
+    requests = RequestState(slots, 1024, rows, 0, vocab, torch.device("cuda"))
+    sampler = Sampler(slots, vocab, torch.device("cuda"), requests)
+    for slot in range(slots):
+        sampler.add_request(
+            slot, 0, SamplingParams(temperature=1, top_k=20, top_p=0.9, seed=slot)
+        )
+    sampler.apply_staged_writes()
+    view, copies = sampler_graph._snapshot_sampling_inputs(sampler)
+    view.sampling_states.capture_mode = True
+    assert not sampler.sampling_states.capture_mode
+    addresses = [destination.data_ptr() for _, destination in copies]
+    mapping = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")
+    indices = np.array([0, 1], dtype=np.int32)
+    inputs = torch.linspace(-4, 4, vocab, device="cuda").repeat(rows, 1)
+
+    def transformed(states):
+        logits = inputs.clone()
+        states.apply_temperature(logits, mapping, indices)
+        states.apply_min_p(logits, mapping, indices)
+        return states.apply_top_k_top_p(logits, mapping, indices)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            transformed(view.sampling_states)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = transformed(view.sampling_states)
+    for iteration in range(12):
+        indices[:] = [(iteration + 2) % slots, (iteration + 6) % slots]
+        mapping.copy_(torch.tensor(np.tile(indices, 2), device="cuda"))
+        for slot in indices:
+            sampler.add_request(
+                int(slot),
+                0,
+                SamplingParams(
+                    temperature=[1, 0.7, 0, 1.3][iteration % 4],
+                    top_k=20,
+                    top_p=0.9,
+                    min_p=0,
+                    seed=100 + iteration,
+                ),
+            )
+        sampler.apply_staged_writes()
+        # The production graph prepare step refreshes these private buffers
+        # from the current UVA pool slot before every replay.
+        for source, destination in copies:
+            destination.copy_(source.gpu)
+        expected = transformed(sampler.sampling_states)
+        graph.replay()
+        current_stream().synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert [destination.data_ptr() for _, destination in copies] == addresses
+        assert not sampler.sampling_states.capture_mode
