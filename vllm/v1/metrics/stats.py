@@ -197,6 +197,12 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Reclaimable retained history is excluded from allocated kv_cache_usage.
+    # The high watermark starts age-independent trimming outside the grace
+    # window; the separately configured absolute cap also bounds recent blocks.
+    warm_blocks: int = 0
+    warm_block_cap: int = 0
+
 
 @dataclass
 class RequestStateStats:

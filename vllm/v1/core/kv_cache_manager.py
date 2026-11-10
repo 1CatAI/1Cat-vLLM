@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal, overload
 
 import vllm.envs as envs
+from vllm.config.cache import KVRetentionConfig
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -145,6 +146,7 @@ class KVCacheManager:
         prefix_cache_retention_interval: int | None = None,
         partial_prefix_cache: bool = False,
         num_speculative_tokens: int = 0,
+        retention_policy: KVRetentionConfig | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         self.num_speculative_tokens = num_speculative_tokens
@@ -175,6 +177,7 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
+            retention_policy=retention_policy,
         )
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval

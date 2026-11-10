@@ -294,6 +294,7 @@ class Scheduler(SchedulerInterface):
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
             partial_prefix_cache=self.cache_config.partial_prefix_cache,
             num_speculative_tokens=self.num_spec_tokens,
+            retention_policy=self.cache_config.retention,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -2693,6 +2694,11 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            # Warm blocks are reclaimable and excluded from allocated
+            # usage; reporting them
+            # separately is what makes that usage explainable.
+            warm_blocks=self.kv_cache_manager.block_pool.warm_block_count,
+            warm_block_cap=self.kv_cache_manager.block_pool.warm_block_cap,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

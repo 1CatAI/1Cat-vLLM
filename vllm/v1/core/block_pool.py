@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
+from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from itertools import groupby
 from typing import Any
 
+from vllm.config.cache import KVRetentionConfig
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -200,6 +203,7 @@ class BlockPool:
         device_state_blocks: int = 0,
         device_state_group_ids: tuple[int, ...] = (),
         use_lookahead_block_hashes: bool = False,
+        retention_policy: KVRetentionConfig | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -238,6 +242,36 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        policy = retention_policy or KVRetentionConfig()
+        self._warm_enabled = policy.enabled
+        self.warm_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
+        self._warm_freed_at: dict[int, float] = {}
+        self._warm_hits: dict[BlockHashWithGroupId, int] = {}
+        self._warm_grace_s = policy.grace_seconds
+        self._device_state_blocks = device_state_blocks
+        self._retention_tiers = list(
+            zip(
+                (0.25, 0.35, 0.50, 0.65, 0.80),
+                (
+                    policy.p25_seconds,
+                    policy.p35_seconds,
+                    policy.p50_seconds,
+                    policy.p65_seconds,
+                    policy.p80_seconds,
+                ),
+            )
+        )
+        # Block zero is null. In a partitioned pool it is already inside the
+        # state partition, so the history count must not subtract it twice.
+        history_blocks = num_gpu_blocks - max(device_state_blocks, 1)
+        self._warm_soft_cap = int(history_blocks * policy.soft_cap)
+        self._warm_hard_cap = int(history_blocks * policy.hard_cap)
+        self._warm_abs_cap = int(history_blocks * policy.absolute_cap)
+
+    def _warm_active(self) -> bool:
+        """warm 机制是否可用（开关打开且确实处于缓存模式）。"""
+        return self._warm_enabled and self.enable_caching
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -404,6 +438,21 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks(kv_cache_group_id):
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        # [本地 2026-11-09 重放 P-05] 空闲队列不够时，先从 warm 表按
+        # 「压力门控的保留时长」逐出最老的块（cold→hot）补进来。
+        # `get_num_free_blocks` 已把 warm 计入总量，所以上面的预检通过并不代表
+        # free 队列本身够用 —— 这里必须补足，否则 popleft_n 会拿到少于请求的块。
+        if self._warm_active() and self.warm_blocks:
+            _queue_free = (
+                self.free_block_queue.for_group(kv_cache_group_id).num_free_blocks
+                if isinstance(self.free_block_queue, _PartitionedBlockQueue)
+                and kv_cache_group_id is not None
+                else self.free_block_queue.num_free_blocks
+            )
+            _shortage = num_blocks - _queue_free
+            if _shortage > 0:
+                self._promote_warm_blocks(_shortage, kv_cache_group_id)
+
         ret: list[KVCacheBlock] = (
             self.free_block_queue.popleft_n(num_blocks, kv_cache_group_id)
             if isinstance(self.free_block_queue, _PartitionedBlockQueue)
@@ -437,6 +486,13 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        # Connector invalidation must detach warm entries as well. Promotion
+        # and trimming remove them first and therefore enqueue exactly once.
+        if self.warm_blocks.pop(block.block_id, None) is not None:
+            assert block.ref_cnt == 0
+            self._warm_freed_at.pop(block.block_id, None)
+            self.free_block_queue.append_n([block])
+
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -451,6 +507,10 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        # The content is going away for good, so its reuse count would only
+        # leak. Keyed exactly as `touch` records it, group id included.
+        if self.cached_block_hash_to_block.get_one_block(block_hash) is None:
+            self._warm_hits.pop(block_hash, None)
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -472,9 +532,25 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
+            # [本地 2026-11-09 重放 P-05] 命中 warm 块时把它从 warm 表摘掉。
+            # 它不在 free 队列里（warm 块不是 free 候选），故不能走下面的
+            # `free_block_queue.remove`。摘掉后它被正常引用；下次释放时会拿到
+            # **新的**时间戳并排到队尾 —— 这就是「热块自然存活更久」的机制。
+            _in_warm = False
+            if self._warm_active() and block.ref_cnt == 0 and not block.is_null:
+                _in_warm = self.warm_blocks.pop(block.block_id, None) is not None
+                if _in_warm:
+                    self._warm_freed_at.pop(block.block_id, None)
+            # Count the reuse against the content, not the block: this is what
+            # lets a repeatedly-requested prefix outlive a one-shot one in the
+            # trim below.
+            if self._warm_active() and not block.is_null and block.block_hash:
+                self._warm_hits[block.block_hash] = (
+                    self._warm_hits.get(block.block_hash, 0) + 1
+                )
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0 and not block.is_null and not _in_warm:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -516,13 +592,36 @@ class BlockPool:
                     if reuse_first or block.block_hash is None
                 ]
             )
-            self.free_block_queue.append_n(
-                [
-                    block
-                    for block in freed_blocks
-                    if not reuse_first and block.block_hash is not None
-                ]
-            )
+            # [本地 2026-11-09 重放 P-05] 带 hash 的块不再直接进 free 队列，
+            # 而是进 warm 表：它们仍挂在 prefix-cache hash 表上，后续同前缀请求
+            # 可以直接命中，省掉一次重算。等空闲块真的不够时再由
+            # `_promote_warm_blocks` 逐出。
+            #
+            # `reuse_first`（滑动窗口已划过的块）**不进 warm** —— 它们在任何
+            # 对齐边界上都不可能再命中，留着只会占位。
+            if self._warm_active():
+                _now = time.monotonic()
+                _to_queue: list[KVCacheBlock] = []
+                for block in freed_blocks:
+                    if reuse_first or block.block_hash is None:
+                        continue
+                    if block.block_id < self._device_state_blocks:
+                        _to_queue.append(block)
+                        continue
+                    self.warm_blocks[block.block_id] = block
+                    self._warm_freed_at[block.block_id] = _now
+                if len(self.warm_blocks) > self._warm_soft_cap:
+                    _to_queue.extend(self._trim_warm(_now))
+                if _to_queue:
+                    self.free_block_queue.append_n(_to_queue)
+            else:
+                self.free_block_queue.append_n(
+                    [
+                        block
+                        for block in freed_blocks
+                        if not reuse_first and block.block_hash is not None
+                    ]
+                )
         else:
             self.free_block_queue.append_n(freed_blocks)
 
@@ -566,6 +665,13 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
+        # Reset invalidates all hashes together. Return every reclaimable
+        # warm entry before clearing metadata; active blocks were rejected above.
+        self.free_block_queue.append_n(list(self.warm_blocks.values()))
+        self.warm_blocks.clear()
+        self._warm_freed_at.clear()
+        self._warm_hits.clear()
+
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
@@ -580,8 +686,246 @@ class BlockPool:
 
         return True
 
+    def _belongs_to_group(self, block_id: int, kv_cache_group_id: int | None) -> bool:
+        """[本地 2026-11-09 重放 P-05] 该块是否属于指定 kv-cache 组。
+
+        未分区（`device_state_blocks == 0`）时恒为 True —— G30 即此形态。
+        分区时按 block_id 数值范围判定：state 组 = `block_id < device_state_blocks`。
+        """
+        if kv_cache_group_id is None or not self._device_state_blocks:
+            return True
+        if not isinstance(self.free_block_queue, _PartitionedBlockQueue):
+            return True
+        in_state = kv_cache_group_id in self.free_block_queue.state_group_ids
+        return (block_id < self._device_state_blocks) == in_state
+
+    @property
+    def warm_block_count(self) -> int:
+        """Blocks currently held in the warm table."""
+        return len(self.warm_blocks)
+
+    @property
+    def warm_block_cap(self) -> int:
+        """High watermark; only the absolute cap overrides the grace window."""
+        return self._warm_hard_cap if self._warm_active() else 0
+
+    @property
+    def warm_block_soft_cap(self) -> int:
+        """Target size; above it only expired entries are trimmed."""
+        return self._warm_soft_cap
+
+    def _trim_order(self, block_id: int) -> tuple[float, int]:
+        """Eviction rank: release time first, hit count second.
+
+        Time is the primary axis because age is what "nobody is using this
+        anymore" means. Two entries from the same moment are then separated by
+        how often their content was reused: within equally old entries, the
+        one hit by every session outlives the one that was used once.
+
+        Ascending on both keys, so the result reads least-wanted-first.
+        """
+        block_hash = self.warm_blocks[block_id].block_hash
+        return (
+            self._warm_freed_at.get(block_id, 0.0),
+            self._warm_hits.get(block_hash, 0) if block_hash is not None else 0,
+        )
+
+    def _trim_warm(self, now: float) -> list[KVCacheBlock]:
+        """Trim the warm table under two watermarks and two ranking signals.
+
+        The warm table is not a cache of everything a session touched -- most
+        of a long context is never read again. What earns a place is a record
+        of reuse: the system prompt and tool preamble that every session hits,
+        and the parts of earlier sessions that new requests actually re-read.
+        Everything else should age out.
+
+        Two signals rank an entry, time first and reuse second (see
+        `_trim_order`):
+
+          * release time -- content nobody has asked for in a while is not
+            worth keeping, whatever else is true of it;
+          * hit count, accumulated per block hash in `touch` -- among entries
+            of comparable age, the content that keeps getting reused wins.
+
+        Combining them this way keeps a frequently reused block ahead of a
+        one-shot one from the same era, while still letting genuinely stale
+        content age out even if it was popular once.
+
+        A grace window overrides both: a block touched within
+        `_warm_grace_s` is never trimmed. Without it a block used one step ago
+        could lose to a colder but older-looking entry purely because it was
+        freshly inserted, and the request that just used it would recompute.
+
+        Watermarks:
+
+          * below soft, nothing is trimmed;
+          * above soft, entries past the retention tier and out of the grace
+            window are dropped, coldest-and-least-reused first;
+          * above hard, the retention tier stops gating, but the grace window
+            still holds. Only if the table is *still* over hard once every
+            remaining entry is recent does age alone decide -- size is a hard
+            bound because `get_num_free_blocks` counts these blocks as usable.
+
+        Returns:
+            Blocks moved back to the free queue.
+        """
+        returned: list[KVCacheBlock] = []
+
+        def _release(block_id: int) -> None:
+            block = self.warm_blocks.pop(block_id)
+            self._warm_freed_at.pop(block_id, None)
+            self._maybe_evict_cached_block(block)
+            returned.append(block)
+
+        retention = self._get_retention_seconds()
+
+        def _evictable(block_id: int) -> bool:
+            """Recently touched blocks are off-limits.
+
+            A block used moments ago must not lose to a cold one: the request
+            that just referenced it would have to recompute the prefix, so a
+            low hit count on a brand-new block is not evidence of low value.
+            """
+            freed_at = self._warm_freed_at.get(block_id, 0.0)
+            return freed_at > 0.0 and (now - freed_at) >= self._warm_grace_s
+
+        # Phase 1: drop entries that are both past the retention tier and out
+        # of the grace window, stopping at the soft cap.
+        if len(self.warm_blocks) > self._warm_soft_cap:
+            surplus = len(self.warm_blocks) - self._warm_soft_cap
+            candidates = [
+                block_id
+                for block_id in self.warm_blocks
+                if _evictable(block_id)
+                and (now - self._warm_freed_at.get(block_id, 0.0)) >= retention
+            ]
+            candidates.sort(key=self._trim_order)
+            for block_id in candidates[:surplus]:
+                _release(block_id)
+
+        # Phase 2: still above the hard cap, so the retention tier stops
+        # gating. The grace window still holds -- eviction here is about
+        # making room, not about discarding what is in active use.
+        if len(self.warm_blocks) > self._warm_hard_cap:
+            excess = len(self.warm_blocks) - self._warm_soft_cap
+            candidates = [b for b in self.warm_blocks if _evictable(b)]
+            candidates.sort(key=self._trim_order)
+            for block_id in candidates[:excess]:
+                _release(block_id)
+
+            # Entries inside the grace window stay past the hard cap -- that is
+            # the point of the window. They do not get to stay forever: the
+            # absolute cap below bounds how much of the pool retention may
+            # hold, so a sustained burst cannot starve the free queue.
+            if len(self.warm_blocks) > self._warm_abs_cap:
+                victims = sorted(self.warm_blocks.keys(), key=self._trim_order)[
+                    : len(self.warm_blocks) - self._warm_abs_cap
+                ]
+                for block_id in victims:
+                    _release(block_id)
+
+        if returned:
+            logger.debug(
+                "warm trim: released %d (now %d, soft=%d, hard=%d, "
+                "retention=%.0fs, grace=%.0fs)",
+                len(returned),
+                len(self.warm_blocks),
+                self._warm_soft_cap,
+                self._warm_hard_cap,
+                retention,
+                self._warm_grace_s,
+            )
+        return returned
+
+    def _get_retention_seconds(self) -> float:
+        """[本地 2026-11-09 重放 P-05] 当前压力下 warm 块的保留时长（秒）。
+
+        压力越低保留越久；≥80% 返回 0（立即 cold→hot 回收）。
+        此压力口径包括已分配和 warm；`get_usage` 只包括已分配块。
+        """
+        total = self.num_gpu_blocks - 1  # 排除 null block
+        free = self.free_block_queue.num_free_blocks
+        warm = len(self.warm_blocks)
+        allocated = max(total - free - warm, 0)
+        usage = (allocated + warm) / max(total, 1)
+
+        for threshold, retention in self._retention_tiers:
+            if usage < threshold:
+                return float(retention)
+        return 0.0
+
+    def _promote_warm_blocks(
+        self, num_blocks: int, kv_cache_group_id: int | None = None
+    ) -> int:
+        """[本地 2026-11-09 重放 P-05] 把 warm 块降级回 free 队列。
+
+        始终 oldest-first（cold→hot）。两阶段：
+          Phase 1 —— 逐出**已超过**当前保留时长的块；
+          Phase 2 —— 若仍不足，无论年龄继续从队头逐出（保证调用方拿到块）。
+
+        频繁命中的块天然受保护：每次命中都会被 `touch()` 移出 warm，重新释放时
+        拿到新时间戳并排到队尾，因此能熬过很多轮回收；冷块从队头先老死。
+
+        逐出时一并清掉 hash（`_maybe_evict_cached_block`），此后该块不再可能
+        被前缀命中 —— 这正是「降级」的含义。
+
+        Returns:
+            实际降级的块数。
+        """
+        if not self.warm_blocks:
+            return 0
+        now = time.monotonic()
+        retention = self._get_retention_seconds()
+        promoted = 0
+
+        def _promote(block_id: int) -> None:
+            block = self.warm_blocks.pop(block_id)
+            self._warm_freed_at.pop(block_id, None)
+            self._maybe_evict_cached_block(block)
+            self.free_block_queue.append_n([block])
+
+        # Phase 1：按 FIFO 序逐出已超时的块。
+        expired: list[int] = []
+        for block_id in self.warm_blocks:
+            if promoted >= num_blocks:
+                break
+            if not self._belongs_to_group(block_id, kv_cache_group_id):
+                continue
+            freed_at = self._warm_freed_at.get(block_id, 0.0)
+            if freed_at <= 0.0 or (now - freed_at) >= retention:
+                expired.append(block_id)
+                promoted += 1
+        for block_id in expired:
+            _promote(block_id)
+
+        # Phase 2：仍不足 ⇒ 无视年龄继续从队头取。
+        if promoted < num_blocks:
+            for block_id in list(self.warm_blocks.keys()):
+                if promoted >= num_blocks:
+                    break
+                if not self._belongs_to_group(block_id, kv_cache_group_id):
+                    continue
+                _promote(block_id)
+                promoted += 1
+
+        if promoted:
+            logger.debug(
+                "Promoted %d warm blocks (retention=%.0fs, %d remain).",
+                promoted,
+                retention,
+                len(self.warm_blocks),
+            )
+        return promoted
+
     def get_num_free_blocks(self, kv_cache_group_id: int | None = None) -> int:
         """Get the number of free blocks in the pool.
+
+        [本地 2026-11-09 重放 P-05] Includes warm blocks: they are freed (can be
+        promoted back into the free queue on demand), so excluding them makes
+        callers believe the pool is full while warm blocks sit unused — the
+        scheduler then raises "Cannot get N free blocks" before
+        `_promote_warm_blocks` ever runs, and the engine stalls with
+        `waiting > 0` and an idle GPU. Both return paths must add them.
 
         Returns:
             The number of free blocks.
@@ -589,8 +933,14 @@ class BlockPool:
         if kv_cache_group_id is not None and isinstance(
             self.free_block_queue, _PartitionedBlockQueue
         ):
-            return self.free_block_queue.for_group(kv_cache_group_id).num_free_blocks
-        return self.free_block_queue.num_free_blocks
+            in_state = kv_cache_group_id in self.free_block_queue.state_group_ids
+            # Only history blocks enter warm retention; group accounting is O(1).
+            warm_n = 0 if in_state else len(self.warm_blocks)
+            return (
+                self.free_block_queue.for_group(kv_cache_group_id).num_free_blocks
+                + warm_n
+            )
+        return self.free_block_queue.num_free_blocks + len(self.warm_blocks)
 
     def can_allocate_group_blocks(self, demand: dict[int, int]) -> bool:
         """Check partition quotas; callers still check aggregate free capacity."""
@@ -602,7 +952,8 @@ class BlockPool:
         history = sum(demand.values()) - state
         return (
             state <= self.free_block_queue.state.num_free_blocks
-            and history <= self.free_block_queue.history.num_free_blocks
+            and history
+            <= self.free_block_queue.history.num_free_blocks + len(self.warm_blocks)
         )
 
     def get_usage(self) -> float:
