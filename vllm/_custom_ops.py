@@ -653,6 +653,83 @@ if hasattr(torch.ops._C, "awq_gemm"):
 
 
 # gptq
+
+
+# exl3 routed-expert MoE
+def exl3_moe_pre_out(
+    out: torch.Tensor,
+    out2: torch.Tensor | None,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    suh: torch.Tensor,
+    suh2: torch.Tensor | None,
+) -> None:
+    torch.ops._C.exl3_moe_pre_out(out, out2, x, topk_ids, suh, suh2)
+
+
+def exl3_moe_gemv_out(
+    y: torch.Tensor,
+    y2: torch.Tensor | None,
+    x: torch.Tensor,
+    x2: torch.Tensor | None,
+    trellis: torch.Tensor,
+    trellis2: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    group_rows: torch.Tensor | None,
+    colmajor: bool,
+) -> None:
+    torch.ops._C.exl3_moe_gemv_out(
+        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor
+    )
+
+
+def exl3_moe_mid_out(
+    out: torch.Tensor,
+    yg: torch.Tensor,
+    yu: torch.Tensor,
+    topk_ids: torch.Tensor,
+    g_svh: torch.Tensor,
+    u_svh: torch.Tensor,
+    d_suh: torch.Tensor,
+) -> None:
+    torch.ops._C.exl3_moe_mid_out(out, yg, yu, topk_ids, g_svh, u_svh, d_suh)
+
+
+def exl3_moe_post_out(
+    out: torch.Tensor,
+    yd: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    d_svh: torch.Tensor,
+) -> None:
+    torch.ops._C.exl3_moe_post_out(out, yd, topk_ids, topk_weights, d_svh)
+
+
+def exl3_moe_available() -> bool:
+    return hasattr(torch.ops._C, "exl3_moe_gemv_out")
+
+
+if hasattr(torch.ops._C, "exl3_moe_gemv_out"):
+
+    @register_fake("_C::exl3_moe_pre_out")
+    def _exl3_moe_pre_out_fake(out, out2, x, topk_ids, suh, suh2) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_gemv_out")
+    def _exl3_moe_gemv_out_fake(
+        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor
+    ) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_mid_out")
+    def _exl3_moe_mid_out_fake(out, yg, yu, topk_ids, g_svh, u_svh, d_suh) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_post_out")
+    def _exl3_moe_post_out_fake(out, yd, topk_ids, topk_weights, d_svh) -> None:
+        return None
+
+
 def gptq_gemm(
     a: torch.Tensor,
     b_q_weight: torch.Tensor,

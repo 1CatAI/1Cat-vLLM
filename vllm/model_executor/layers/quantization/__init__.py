@@ -19,6 +19,7 @@ QuantizationMethods = Literal[
     "modelopt_mxfp8",
     "modelopt_mixed",
     "gguf",
+    "exl3",
     "auto_gptq",
     "gptq",
     "gptq_marlin",
@@ -178,6 +179,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
+    from .exl3 import Exl3Config
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
@@ -205,6 +207,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "modelopt_mxfp8": ModelOptMxFp8Config,
         "modelopt_mixed": ModelOptMixedPrecisionConfig,
         "gguf": GGUFConfig,
+        "exl3": Exl3Config,
         "auto_gptq": AutoGPTQConfig,
         "gptq": AutoGPTQConfig,
         "gptq_marlin": AutoGPTQConfig,
