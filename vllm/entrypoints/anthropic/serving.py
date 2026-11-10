@@ -676,6 +676,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                 return event
 
             async for item in generator:
+                if item.startswith(":"):
+                    yield item
+                    continue
                 if item.startswith("data:"):
                     data_str = item[5:].strip().rstrip("\n")
                     if data_str == "[DONE]":
