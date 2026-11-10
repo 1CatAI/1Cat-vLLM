@@ -468,6 +468,8 @@ if TYPE_CHECKING:
     VLLM_V41_DMA_DEBUG: str | None = None
     VLLM_V41_DMA_DEMAND: str | None = None
     VLLM_V41_DMV_CTAS: str = "80"
+    VLLM_V41_DMV_X: str = "0"
+    VLLM_V41_DMV_X_CONFIG: str = ""
     VLLM_V41_DOWN_ROWS: str = "0"
     VLLM_V41_EM: str = "1"
     VLLM_V41_EM5: str = "1"
@@ -7326,6 +7328,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DMV_X": env_var(
+        lambda: os.getenv("VLLM_V41_DMV_X", "0"),
+        description=(
+            "DS-V4.1 DMV_X: M<=8 Q5_K/Q8_0 dense projections on the v41k"
+            " dmv13_x kernel (same math and reduction order as dmv13 at the"
+            " same warps/split: bit-identical), with the two wo_a O groups in"
+            " one block-diagonal launch and a max-shared carveout. Needs a"
+            " v41k build with dmv13_x; otherwise the dmv13 path stays."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DMV_X_CONFIG": env_var(
+        lambda: os.getenv("VLLM_V41_DMV_X_CONFIG", ""),
+        description=(
+            "DS-V4.1 DMV_X: per-role dmv13_x launch overrides,"
+            " 'role=warps,split,acc;...' with role in qkv, q_b, wo_a, wo_b,"
+            " shared, head, engram, extra; warps 2/4/8, split 1-8, acc 1/2."
+            " Any override changes the FP32 summation order (near-tie gate)."
+        ),
+        category="tuning",
+        declared_default="''",
+        effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
