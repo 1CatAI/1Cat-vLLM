@@ -90,10 +90,6 @@ class ModelCard(OpenAIBaseModel):
     root: str | None = None
     parent: str | None = None
     max_model_len: int | None = None
-    # [本地 2026-11-09 重放 opt21 第 5 项] 对外能力宣告：客户端可据这两个字段
-    # 预检「能塞多少历史」与「最多能生成多少」，不必自己猜 max_model_len 怎么切。
-    context_window: int | None = None
-    max_output_tokens: int | None = None
     permission: list[ModelPermission] = Field(default_factory=list)
 
 
@@ -107,19 +103,20 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
 
 
 class CompletionTokenUsageInfo(OpenAIBaseModel):
-    # [本地 2026-11-09 重放 I-11] How many of `completion_tokens` were reasoning.
-    # A client that shows one output number cannot otherwise tell a long
-    # deliberation from a long answer: on a reasoning model the two differ by
-    # several times, and only this split says which one a caller is paying for.
     reasoning_tokens: int | None = None
 
 
 class UsageInfo(OpenAIBaseModel):
+    completion_tokens_details: CompletionTokenUsageInfo | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
-    completion_tokens_details: CompletionTokenUsageInfo | None = None
+    timings: dict[str, float] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class RequestResponseMetadata(BaseModel):

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pydantic models for Anthropic API protocol"""
 
-import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -29,6 +28,14 @@ class AnthropicUsage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    # Per-request phase breakdown, same shape the OpenAI endpoint carries in
+    # `usage.timings`. The Anthropic wire format has no field for it, so it
+    # rides as an extra key: clients that do not know it ignore it, while those
+    # that do (the Studio proxy) get the same measured attribution here as on
+    # the OpenAI dialect instead of reconstructing it from token timing.
+    timings: dict[str, float] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AnthropicContentBlock(BaseModel):
@@ -143,6 +150,31 @@ class AnthropicMessagesRequest(BaseModel):
             "Will be accessible by the template."
         ),
     )
+    # Per-chunk output token ids are opt-in,
+    # mirroring the OpenAI protocol's `return_token_ids` (default off). A live
+    # TPS meter wants them; callers that do not should not pay for them. The
+    # same switch can be given as a request header (`x-return-token-ids`) for
+    # proxies that forward the body verbatim — see
+    # `AnthropicServingMessages._wants_token_ids`.
+    return_token_ids: bool = Field(
+        default=False,
+        description=(
+            "If true, each response carries the token ids its output decodes "
+            "from (`token_ids` per `content_block_delta`, or on the message for "
+            "a non-streaming reply). The Anthropic schema defines no such field; "
+            "this mirrors the OpenAI protocol's `return_token_ids`."
+        ),
+    )
+    # The prompt is typically tens of thousands of ids, so echoing it back is a
+    # separate, even more explicit opt-in than the output ids above.
+    return_prompt_token_ids: bool = Field(
+        default=False,
+        description=(
+            "If true, the response also carries the prompt's token ids in "
+            "`prompt_token_ids`. The Anthropic schema defines no such field; "
+            "this mirrors the OpenAI protocol's `prompt_token_ids`."
+        ),
+    )
 
     @field_validator("model")
     @classmethod
@@ -197,6 +229,13 @@ class AnthropicStreamEvent(BaseModel):
     index: int | None = None
     error: AnthropicError | None = None
     usage: AnthropicUsage | None = None
+    # Not part of the Anthropic spec, but useful for
+    # tracing the tokens in agent scenarios — the token ids a
+    # `content_block_delta` decodes from, mirroring the OpenAI protocol's
+    # per-chunk `choices[].token_ids`.
+    token_ids: list[int] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -217,10 +256,47 @@ class AnthropicMessagesResponse(BaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    # The output tokens this message produced
+    # (mirroring the OpenAI protocol's `choices[].token_ids`), plus the prompt's
+    # ids when the request opted in with `return_prompt_token_ids`.
+    # Neither is in the Anthropic spec.
+    token_ids: list[int] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    prompt_token_ids: list[int] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
-    def model_post_init(self, __context):
-        if not self.id:
-            self.id = f"msg_{int(time.time() * 1000)}"
+    @field_validator("id", mode="before")
+    @classmethod
+    def _normalize_id(cls, v: Any) -> str:
+        """Normalise the id to the Anthropic `msg_` prefix.
+
+        Two things:
+
+        1. An empty id falls back to a uuid. The previous
+           `model_post_init` used `msg_{int(time.time()*1000)}`, and millisecond
+           timestamps collide under load.
+        2. A `chatcmpl-` prefix from upstream is rewritten. This endpoint
+           forwards to the OpenAI chat path internally, so `generator.id` is
+           `chatcmpl-{uuid}`; passing it through verbatim hands Anthropic
+           clients an id they do not recognise as a message.
+
+        A `field_validator(mode="before")` is used rather than
+        `model_post_init`, whose `if not self.id` guard never fires because
+        callers always pass an id explicitly.
+        """
+        from vllm.utils import random_uuid
+
+        if not v:
+            return f"msg_{random_uuid()}"
+        v = str(v)
+        if v.startswith("msg_"):
+            return v
+        for prefix in ("chatcmpl-", "cmpl-"):
+            if v.startswith(prefix):
+                return f"msg_{v[len(prefix) :]}"
+        return f"msg_{v}"
 
 
 class AnthropicContextManagement(BaseModel):
