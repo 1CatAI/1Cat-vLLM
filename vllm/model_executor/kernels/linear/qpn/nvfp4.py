@@ -133,6 +133,7 @@ def _missing_qpn2_prefill_ops() -> list[str]:
 
 
 class TurboMindNvFp4LinearKernel(NvFp4LinearKernel):
+    input_dtype = torch.float16
     config: Sm70NvFp4LinearLayerConfig
 
     @classmethod
