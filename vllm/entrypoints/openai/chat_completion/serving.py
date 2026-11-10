@@ -57,6 +57,7 @@ from vllm.entrypoints.openai.engine.serving import (
     clamp_prompt_logprobs,
     drop_misaligned_logprobs,
 )
+from vllm.entrypoints.openai.engine.usage import get_request_usage_timings
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_stop_tokens_for_assistant_actions,
@@ -88,43 +89,6 @@ def _token_list(rendered: Any) -> list[int]:
     if isinstance(rendered, dict) or hasattr(rendered, "keys"):
         rendered = rendered["input_ids"]
     return list(rendered)
-
-
-def _usage_timings(metrics: object) -> dict | None:
-    """Engine per-request prefill/decode breakdown for the response usage.
-
-    ``metrics`` is the ``RequestStateStats`` the engine attaches to every
-    finished ``RequestOutput`` (v1/engine/output_processor.py). Only its
-    monotonic timestamps are re-expressed as durations here -- nothing new is
-    measured in the serving layer.
-
-    Returns None when stats were not collected (the engine ran with
-    ``log_stats=False``, or the request finished before any timestamp was
-    taken). The field is then omitted rather than reported as zero, because a
-    zero decode time and "not measured" mean different things to a client
-    computing throughput.
-
-    Returned as a plain dict rather than a model: ``UsageInfo`` is declared
-    with ``extra="allow"``, so assigning this dict to ``usage.timings``
-    serialises it verbatim without adding a field to the protocol.
-    """
-    if metrics is None:
-        return None
-    queued = getattr(metrics, "queued_ts", 0.0)
-    scheduled = getattr(metrics, "scheduled_ts", 0.0)
-    first = getattr(metrics, "first_token_ts", 0.0)
-    last = getattr(metrics, "last_token_ts", 0.0)
-    if not (queued and scheduled and first and last):
-        return None
-    return {
-        "queue_s": scheduled - queued,
-        "prefill_s": first - scheduled,
-        "decode_s": last - first,
-        "inference_s": last - scheduled,
-        # Wider than queue_s + prefill_s by the frontend-to-core hop, which
-        # queue + prefill cannot see.
-        "ttft_s": getattr(metrics, "first_token_latency", None) or None,
-    }
 
 
 class _PrefixCacheBoundaries:
@@ -1146,13 +1110,15 @@ class OpenAIServingChat(OpenAIServing):
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
                 )
-                if self.enable_prompt_tokens_details and num_cached_tokens:
+                if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens
                     )
                 # Engine-authoritative per-request timings. Omitted when the
                 # engine collected no stats for this request.
-                final_usage.timings = _usage_timings(last_metrics)
+                final_usage.timings = get_request_usage_timings(
+                    last_metrics, num_choices=num_choices
+                )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1583,7 +1549,10 @@ class OpenAIServingChat(OpenAIServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
-        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
+        if (
+            self.enable_prompt_tokens_details
+            and final_res.num_cached_tokens is not None
+        ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
             )
@@ -1591,7 +1560,9 @@ class OpenAIServingChat(OpenAIServing):
         # non-streaming caller has no prefill/decode split at all, and any
         # consumer that derives rates from a token stream sees the whole
         # request as one point in time.
-        usage.timings = _usage_timings(getattr(final_res, "metrics", None))
+        usage.timings = get_request_usage_timings(
+            getattr(final_res, "metrics", None), num_choices=len(choices)
+        )
 
         request_metadata.final_usage_info = usage
 

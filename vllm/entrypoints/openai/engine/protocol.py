@@ -107,6 +107,9 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+    timings: dict[str, float] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class RequestResponseMetadata(BaseModel):

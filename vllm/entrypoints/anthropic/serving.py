@@ -37,10 +37,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionStreamResponse,
     ChatCompletionToolsParam,
 )
-from vllm.entrypoints.openai.chat_completion.serving import (
-    OpenAIServingChat,
-    _usage_timings,
-)
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     JsonSchemaResponseFormat,
@@ -60,7 +57,14 @@ def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
 
 
+def _timing_usage_fields(usage: UsageInfo | None) -> dict[str, dict[str, float]]:
+    if usage is not None and usage.timings is not None:
+        return {"timings": usage.timings}
+    return {}
+
+
 def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
+    """Anthropic `cache_read_input_tokens`, when the engine measured a hit."""
     if usage is not None and usage.prompt_tokens_details is not None:
         cached_tokens = usage.prompt_tokens_details.cached_tokens
         if cached_tokens is not None:
@@ -68,22 +72,17 @@ def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
     return {}
 
 
-def _timing_usage_fields(engine_usage: object, metrics: object = None) -> dict:
-    """Per-request phase timings for the Anthropic usage block.
+def _anthropic_input_tokens(usage: UsageInfo | None) -> int:
+    """Report fresh prompt tokens, subtracting measured cache reads.
 
-    The OpenAI endpoint attaches these to `usage.timings` directly; here the
-    value is already on the usage object it produced (`timings`) or, failing
-    that, recomputable from the request metrics attached to the output. Both
-    dialects therefore report the same measured breakdown rather than leaving
-    Anthropic clients to infer it from token arrival times.
-
-    Returns an empty dict when nothing was measured, so the key is omitted
-    instead of serialised as null.
+    Without a cache breakdown, preserve the engine's prompt count. This also
+    covers deployments that do not enable prompt token details. Streaming
+    updates can refine the count when cache details become available.
     """
-    timings = getattr(engine_usage, "timings", None)
-    if not isinstance(timings, dict) or not timings:
-        timings = _usage_timings(metrics)
-    return {"timings": timings} if timings else {}
+    if usage is None:
+        return 0
+    cached = _cache_usage_fields(usage).get("cache_read_input_tokens", 0)
+    return max(0, usage.prompt_tokens - cached)
 
 
 class AnthropicServingMessages(OpenAIServingChat):
@@ -533,15 +532,23 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> AnthropicMessagesResponse:
         result = AnthropicMessagesResponse(
             id=generator.id,
+            # Explicit, not relying on the pydantic field defaults in
+            # `protocol.py`: the response is serialized with
+            # `exclude_unset=True`, which drops any field that was never
+            # assigned — defaults included. A `message_start` without
+            # `type`/`role` is not a recognizable message to the Anthropic
+            # SDK, which silently discards it, so the assistant turn never
+            # reaches the client and the conversation history looks lost
+            # after a reload.
+            type="message",
+            role="assistant",
             content=[],
             model=generator.model,
             usage=AnthropicUsage(
-                input_tokens=generator.usage.prompt_tokens,
+                input_tokens=_anthropic_input_tokens(generator.usage),
                 output_tokens=generator.usage.completion_tokens,
                 **_cache_usage_fields(generator.usage),
-                **_timing_usage_fields(
-                    generator.usage, getattr(generator, "metrics", None)
-                ),
+                **_timing_usage_fields(generator.usage),
             ),
             kv_transfer_params=generator.kv_transfer_params,
         )
@@ -689,14 +696,21 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_start",
                                 message=AnthropicMessagesResponse(
                                     id=origin_chunk.id,
+                                    # Same reason as `messages_full_converter`:
+                                    # `exclude_unset=True` on the way out drops
+                                    # any field not explicitly assigned, and a
+                                    # `message_start` missing `type`/`role` is
+                                    # discarded by the Anthropic SDK.
+                                    type="message",
+                                    role="assistant",
                                     content=[],
                                     model=origin_chunk.model,
                                     stop_reason=None,
                                     stop_sequence=None,
                                     usage=AnthropicUsage(
-                                        input_tokens=origin_chunk.usage.prompt_tokens
-                                        if origin_chunk.usage
-                                        else 0,
+                                        input_tokens=_anthropic_input_tokens(
+                                            origin_chunk.usage
+                                        ),
                                         output_tokens=0,
                                         **_cache_usage_fields(origin_chunk.usage),
                                     ),
@@ -718,17 +732,17 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_delta",
                                 delta=AnthropicDelta(stop_reason=stop_reason),
                                 usage=AnthropicUsage(
-                                    input_tokens=origin_chunk.usage.prompt_tokens
-                                    if origin_chunk.usage
-                                    else 0,
+                                    # By the time `message_delta` arrives the
+                                    # chunk carries `prompt_tokens_details`, so
+                                    # this is the authoritative fresh count.
+                                    input_tokens=_anthropic_input_tokens(
+                                        origin_chunk.usage
+                                    ),
                                     output_tokens=origin_chunk.usage.completion_tokens
                                     if origin_chunk.usage
                                     else 0,
                                     **_cache_usage_fields(origin_chunk.usage),
-                                    **_timing_usage_fields(
-                                        origin_chunk.usage,
-                                        getattr(origin_chunk, "metrics", None),
-                                    ),
+                                    **_timing_usage_fields(origin_chunk.usage),
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)

@@ -34,7 +34,9 @@ class AnthropicUsage(BaseModel):
     # rides as an extra key: clients that do not know it ignore it, while those
     # that do (the Studio proxy) get the same measured attribution here as on
     # the OpenAI dialect instead of reconstructing it from token timing.
-    timings: dict | None = None
+    timings: dict[str, float] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AnthropicContentBlock(BaseModel):
