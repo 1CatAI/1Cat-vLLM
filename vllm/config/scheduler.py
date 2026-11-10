@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -176,6 +177,15 @@ class SchedulerConfig:
     checking the first chunk. Prevents over-admission and KV cache thrashing
     with chunked prefill."""
 
+    phase_separation: bool | None = None
+    """Opt in to separate resident decode and prefill in synchronous PP1."""
+    phase_decode_share: float | None = Field(default=None, ge=0, lt=1)
+    """Target decode wall-time share for the phase controller."""
+    phase_max_wait_ms: float | None = Field(default=None, gt=0)
+    """Maximum prefill streak before eligible decoders take priority."""
+    phase_log_interval: int | None = Field(default=None, ge=0)
+    """Phase statistics interval; zero disables the diagnostic."""
+
     pp_keep_batch: bool | None = None
     """Opt-in V1 persistent-batch retention across empty pipeline steps."""
 
@@ -184,6 +194,10 @@ class SchedulerConfig:
     sm70_inputs: LegacyInputs = Field(default_factory=LegacyInputs, init=False)
     """Initialization snapshot for deferred scheduler override errors."""
     sm70_aliases: ClassVar[dict[str, str]] = {
+        "phase_separation": "VLLM_SM70_PHASE_SEPARATION",
+        "phase_decode_share": "VLLM_SM70_PHASE_DECODE_SHARE",
+        "phase_max_wait_ms": "VLLM_SM70_PHASE_MAX_WAIT_MS",
+        "phase_log_interval": "VLLM_SM70_PHASE_LOG_INTERVAL",
         "pp_keep_batch": "VLLM_PP_KEEP_BATCH",
         "sm70_async_queue_depth": "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH",
     }
@@ -285,6 +299,28 @@ class SchedulerConfig:
         self.capture_sm70_inputs()
         if self.pp_keep_batch is None:
             self.pp_keep_batch = self.legacy_scheduler_value("pp_keep_batch")
+        if self.phase_separation is None:
+            self.phase_separation = self.legacy_scheduler_value("phase_separation")
+        if self.phase_separation:
+            for name in (
+                "phase_decode_share",
+                "phase_max_wait_ms",
+                "phase_log_interval",
+            ):
+                if getattr(self, name) is None:
+                    setattr(self, name, self.legacy_scheduler_value(name))
+            assert self.phase_decode_share is not None
+            assert self.phase_max_wait_ms is not None
+            assert self.phase_log_interval is not None
+            if (
+                not math.isfinite(self.phase_decode_share)
+                or not 0 <= self.phase_decode_share < 1
+            ):
+                raise ValueError("phase_decode_share must be finite and in [0, 1)")
+            if not math.isfinite(self.phase_max_wait_ms) or self.phase_max_wait_ms <= 0:
+                raise ValueError("phase_max_wait_ms must be finite and positive")
+            if self.phase_log_interval < 0:
+                raise ValueError("phase_log_interval must be non-negative")
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True

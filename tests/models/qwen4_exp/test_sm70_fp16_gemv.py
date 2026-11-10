@@ -88,12 +88,20 @@ def test_qwen38_sm70_fused_shared_gate_uses_local_tp_shape() -> None:
 def test_qwen38_sm70_shared_expert_custom_silu_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 0))
+    from vllm.model_executor.models import qwen2_moe as module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Shared-expert discovery must not initialize CUDA")
+
+    monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
+    monkeypatch.setattr(module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(module.current_platform, "is_device_capability", lambda _: True)
     assert _sm70_force_shared_expert_silu_custom_op("layers.0.mlp.shared_expert")
     assert not _sm70_force_shared_expert_silu_custom_op("layers.0.mlp.experts")
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(
+        module.current_platform, "is_device_capability", lambda _: False
+    )
     assert not _sm70_force_shared_expert_silu_custom_op("layers.0.mlp.shared_expert")
 
 

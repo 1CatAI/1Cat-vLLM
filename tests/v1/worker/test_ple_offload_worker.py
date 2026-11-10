@@ -336,6 +336,19 @@ def test_ple_prefault_touches_unique_storage_when_capacity_allows(
     assert ple_offload_worker._prefault_module_storage([module]) == required
 
 
+def test_ple_prefault_skips_tables_with_no_cpu_rows(monkeypatch) -> None:
+    layer = _WeightLoadingPleLayer()
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_PREFAULT", True)
+    monkeypatch.setattr(layer, "needs_weight_prefault", lambda: False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Unused table must not trigger RAM prefault")
+
+    monkeypatch.setattr(layer, "parameters", forbidden)
+    monkeypatch.setattr(ple_offload_worker.psutil, "Process", forbidden)
+    assert ple_offload_worker._prefault_module_storage([layer]) == 0
+
+
 def test_ple_prefault_skips_when_host_capacity_is_insufficient(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -357,6 +370,11 @@ def test_ple_prefault_skips_when_host_capacity_is_insufficient(
         ),
     )
 
+    monkeypatch.setattr(
+        ple_offload_worker.logger,
+        "handlers",
+        [*ple_offload_worker.logger.handlers, caplog.handler],
+    )
     with caplog.at_level("WARNING", logger=ple_offload_worker.__name__):
         touched = ple_offload_worker._prefault_module_storage([module])
 
@@ -386,6 +404,11 @@ def test_ple_host_memory_pressure_warns_without_rejecting(
         lambda: SimpleNamespace(used=3 * gib),
     )
 
+    monkeypatch.setattr(
+        ple_offload_worker.logger,
+        "handlers",
+        [*ple_offload_worker.logger.handlers, caplog.handler],
+    )
     with caplog.at_level("WARNING", logger=ple_offload_worker.__name__):
         required = ple_offload_worker._log_ple_host_memory_capacity([])
 
@@ -401,6 +424,7 @@ def test_ple_offload_uses_event_per_inflight_mrv2_batch() -> None:
     connector.dp_rank = 0
     connector.fast_lane = None
     connector._uses_cuda_inputs = True
+    connector._next_seq = 0
     connector._request_queue = queue.Queue(maxsize=2)
     connector._d2h_event_pool = queue.Queue(maxsize=2)
     first_event = Mock()

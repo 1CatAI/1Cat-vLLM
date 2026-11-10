@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
+import numpy as np
 import torch
 
 # ---------------------------------------------------------------------------
@@ -42,6 +43,9 @@ class PleOffloadRegistration:
     # TP0's mapped request slot for the owner's native request lane.
     fast_lane_request: torch.Tensor | None = None
     fast_lane_geometry: tuple[int, int] | None = None
+    # TP0's shared int64 counter: the worker stores the seq of each request
+    # after its last layer, so early requests do not overwrite live inputs.
+    request_done_buf: torch.Tensor | None = None
 
 
 @dataclass
@@ -51,6 +55,21 @@ class PleOffloadRequest:
     dp_rank: int
     num_tokens: int
     num_reqs: int
+    # Per-connector request order, published back through request_done_buf.
+    seq: int = 0
+
+
+@dataclass(frozen=True)
+class PleCpuInputs:
+    """Host copies of a prompt-only batch's PLE inputs, built at scheduling.
+
+    Shapes match the shared buffers: ``input_ids`` (num_tokens,),
+    ``query_start_loc`` (num_reqs + 1,), ``ngram_context`` (num_reqs, context).
+    """
+
+    input_ids: np.ndarray
+    query_start_loc: np.ndarray
+    ngram_context: np.ndarray | None
 
 
 _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)
