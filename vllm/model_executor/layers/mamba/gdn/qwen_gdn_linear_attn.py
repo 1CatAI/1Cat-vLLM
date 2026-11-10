@@ -5902,6 +5902,7 @@ def qwen_gdn_input_projection_core(
         hidden_states.ndim == 2
         and hidden_states.shape[1] == 5120
         and 2 <= hidden_states.shape[0] <= 32
+        and z_out.is_contiguous()
         and not _sm70_gdn_projection_dump_requested(layer_name)
     ):
         rows = hidden_states.shape[0]
@@ -6065,6 +6066,7 @@ def qwen_gdn_input_projection(
         hidden_states.ndim == 2
         and hidden_states.shape[1] == 5120
         and 2 <= hidden_states.shape[0] <= 32
+        and z_out.is_contiguous()
         and not _sm70_gdn_projection_dump_requested(layer_name)
     ):
         fused_verify_projection = apply_gdn_ba_verify(
