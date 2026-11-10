@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_PP_KEEP_BATCH: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -1202,6 +1203,13 @@ def sm70_debug_enabled(channel: str, legacy_name: str) -> bool:
     if "VLLM_SM70_DEBUG" in os.environ:
         return channel in environment_variables["VLLM_SM70_DEBUG"]()
     return bool(int(os.getenv(legacy_name, "0")))
+
+
+def _pp_keep_batch_input() -> bool:
+    value = (os.getenv("VLLM_PP_KEEP_BATCH", "0") or "0").strip()
+    if value not in ("0", "1"):
+        raise ValueError("VLLM_PP_KEEP_BATCH must be 0 or 1")
+    return value == "1"
 
 
 def env_with_choices(
@@ -2519,6 +2527,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     # Pipeline stage partition strategy
+    "VLLM_PP_KEEP_BATCH": env_var(
+        lambda: _pp_keep_batch_input(),
+        description=(
+            "Retain the V1 persistent batch across empty synchronous PP steps; "
+            "unsupported explicit requests raise."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("V1 synchronous pipeline parallel request retention",),
+        user_visible=True,
+    ),
     "VLLM_PP_LAYER_PARTITION": env_var(
         lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
         description="Pipeline stage partition strategy",

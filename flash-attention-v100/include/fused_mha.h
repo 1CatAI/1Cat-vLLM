@@ -88,6 +88,9 @@ at::Tensor flash_attention_grouped_sparse_page4_plan(
     at::Tensor& output_masks, at::Tensor& output_seq_lens, const int page_size,
     const int physical_page_stride, const int num_cache_blocks);
 
+bool flash_attention_grouped_sparse_page4_device_supported(
+    int64_t device_index);
+
 at::Tensor flash_attention_decode_paged_wmma(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,

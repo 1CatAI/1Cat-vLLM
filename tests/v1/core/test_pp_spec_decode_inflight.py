@@ -14,6 +14,11 @@ def test_inflight_verify_does_not_schedule_negative_token_count(
     monkeypatch, num_requests
 ):
     monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
+    # CPU scheduler fixtures have no physical capability for simulated PP ranks.
+    monkeypatch.setattr(
+        "vllm.config.parallel.current_platform.get_device_capability",
+        lambda device_id=0: None,
+    )
     scheduler = create_scheduler(
         pipeline_parallel_size=2,
         device_config=DeviceConfig(device="cpu"),

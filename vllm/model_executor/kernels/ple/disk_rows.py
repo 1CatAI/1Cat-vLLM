@@ -33,11 +33,13 @@ class MappedRowGatherKernel:
         num_rows: int,
         row_bytes: int,
         cache_bytes: int = 0,
+        prefetch_window_bytes: int = 0,
     ):
         self.pointers = torch.tensor(pointers, dtype=torch.int64, device="cpu")
         self.shard_size = shard_size
         self.num_rows = num_rows
         self.row_bytes = row_bytes
+        self.prefetch_window_bytes = prefetch_window_bytes
         self.operator = torch.ops._C.ple_disk_gather_u8
         self._apply_lock = threading.Lock()
         self.cache_ids = self.cache_rows = None
@@ -72,10 +74,17 @@ class MappedRowGatherKernel:
                     output,
                     self.cache_ids,
                     self.cache_rows,
+                    self.prefetch_window_bytes,
                 )
             return
         self.operator(
-            ids, self.pointers, self.shard_size, self.num_rows, self.row_bytes, output
+            ids,
+            self.pointers,
+            self.shard_size,
+            self.num_rows,
+            self.row_bytes,
+            output,
+            self.prefetch_window_bytes,
         )
 
     def qualify(self) -> dict:
@@ -129,6 +138,7 @@ def prepare_mapped_row_gather(
     file_backed: bool,
     enabled: bool,
     cache_bytes: int = 0,
+    prefetch_window_bytes: int = 0,
 ) -> tuple[MappedRowGatherKernel | None, dict]:
     if not enabled:
         return None, {"selected": None, "reason": "disabled_by_policy"}
@@ -141,7 +151,7 @@ def prepare_mapped_row_gather(
     if not hasattr(torch.ops._C, "ple_disk_gather_u8"):
         return None, {"selected": None, "reason": "native_operator_unavailable"}
     kernel = MappedRowGatherKernel(
-        pointers, shard_size, num_rows, row_bytes, cache_bytes
+        pointers, shard_size, num_rows, row_bytes, cache_bytes, prefetch_window_bytes
     )
     try:
         measurement = kernel.qualify()

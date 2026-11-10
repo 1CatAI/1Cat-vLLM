@@ -320,19 +320,29 @@ def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch, com
         exported = torch.export.export(
             Projection(),
             (torch.zeros(2, 4),),
-            dynamic_shapes={"x": {0: torch.export.Dim("rows", min=1, max=128)}},
+            dynamic_shapes={"x": {0: torch.export.Dim("rows", min=1, max=129)}},
         )
         artifact = io.BytesIO()
         torch.export.save(exported, artifact)
         artifact.seek(0)
         reloaded = torch.export.load(artifact).module()
-        for rows in (1, 32, 33, 65):
+        for rows in (1, 32, 33, 65, 128, 129):
             assert reloaded(torch.zeros(rows, 4)).shape == (rows, 8)
+        # M33-M128 use legal native chunks; the full policy must survive
+        # export/reload for every chunk. M129 retains the dense fallback.
         assert observed == [
             (1, arguments),
             (32, arguments),
-            (33, "dense"),
-            (65, "dense"),
+            (32, arguments),
+            (1, arguments),
+            (32, arguments),
+            (32, arguments),
+            (1, arguments),
+            (32, arguments),
+            (32, arguments),
+            (32, arguments),
+            (32, arguments),
+            (129, "dense"),
         ]
     finally:
         if lib is not None:
