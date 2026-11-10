@@ -6,7 +6,9 @@ import torch
 import torch.nn.functional as F
 
 import vllm._sm70_ops as sm70_ops
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fla.ops.kda import (
+    FusedRMSNormGated,
     fused_recurrent_kda,
     layer_norm_gated_fwd,
 )
@@ -261,6 +263,55 @@ def test_sm70_glm53_fp16_gemv_swizzle_matches_baseline_and_graph(
     graph.replay()
     torch.accelerator.synchronize()
     assert torch.equal(swizzled_output, half2_output)
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda()
+        and current_platform.get_device_capability() == DeviceCapability(7, 0)
+    ),
+    reason="NVIDIA V100/SM70 KDA output norm route",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 8])
+def test_sm70_kda_output_norm_triton_matches_decomposed(
+    num_tokens: int,
+) -> None:
+    """Qualify the optional fused norm against the existing FP32 reference."""
+    device = torch.device(current_platform.device_type)
+    heads, dim = 16, 128
+    with set_current_vllm_config(VllmConfig()):
+        norm = FusedRMSNormGated(
+            dim, eps=1e-5, activation="sigmoid", device=device, dtype=torch.float16
+        )
+        assert not FusedRMSNormGated.enabled()
+    torch.manual_seed(20261010 + num_tokens)
+    with torch.no_grad():
+        norm.weight.copy_(1 + 0.1 * torch.randn(dim, device=device))
+    x = torch.randn(1, num_tokens, heads, dim, device=device, dtype=torch.float32)
+    x[0, 0, 0] *= 300.0  # rows the FP16 path would overflow on the way in
+    gate = torch.randn(num_tokens, heads, dim, device=device, dtype=torch.float16)
+
+    decomposed = norm.forward_native(x, gate, out_dtype=torch.float16)
+    triton_out = norm.forward_cuda(x, gate, out_dtype=torch.float16)
+    torch.accelerator.synchronize()
+
+    assert triton_out.dtype == torch.float16
+    assert triton_out.shape == decomposed.shape
+    if num_tokens < 8:
+        torch.testing.assert_close(triton_out, decomposed, rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(triton_out, decomposed, rtol=1e-3, atol=2.5e-4)
+
+    # Independent FP64 oracle, and a mutation check on the gate.
+    ref = (
+        x.double()
+        * torch.rsqrt(x.double().pow(2).mean(-1, keepdim=True) + 1e-5)
+        * norm.weight.double()
+        * torch.sigmoid(gate.double())
+    ).half()
+    torch.testing.assert_close(triton_out, ref, rtol=2e-3, atol=2e-3)
+    wrong_gate = norm.forward_cuda(x, -gate, out_dtype=torch.float16)
+    assert not torch.equal(wrong_gate, triton_out)
 
 
 @pytest.mark.skipif(

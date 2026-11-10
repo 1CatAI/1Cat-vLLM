@@ -621,13 +621,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         if core_output_dtype != hidden_states.dtype:
+            # Keep the recurrent output in FP32 until normalization. The
+            # CustomOp owner selects Triton when enabled and preserves an
+            # explicit disable instead of bypassing its captured dispatch.
             core_attn_out = self.o_norm(
                 core_attn_out,
                 g2,
                 out_dtype=hidden_states.dtype,
             )
             logger.info_once(
-                "SM70 GLM KDA keeps recurrent output in FP32 through RMSNorm."
+                "SM70 GLM KDA keeps recurrent output in FP32 through the "
+                "configured gated RMSNorm."
             )
         else:
             core_attn_out = self.o_norm(core_attn_out, g2)
