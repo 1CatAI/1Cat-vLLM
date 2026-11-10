@@ -976,10 +976,10 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel_and_zero(
   }
 }
 
-// Keep the next compressed K panel in registers while the current P @ V
-// runs. Conversion still happens at the original shared-memory handoff.
+// Keep compressed K/V panels in registers across matrix operations.
+// Conversion happens at the original shared-memory handoff.
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT>
-__device__ __forceinline__ uint4 prefetch_k_pair(
+__device__ __forceinline__ uint4 prefetch_kv_pair(
     const void* __restrict__ kv_cache, const int* __restrict__ page_ids,
     int pair_idx, int pair_stride, int tile_page_offset, int block_size,
     int64_t block_stride, int64_t token_stride) {
@@ -2499,6 +2499,22 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
   for (int tile_start = split_start; tile_start < split_end;
        tile_start += kGroupedVerifyBlockN) {
     const int valid_k_rows = min(kGroupedVerifyBlockN, split_end - tile_start);
+
+    // Overlap compressed V reads with QK before reusing the shared K panel.
+    uint4 prefetched_values[kGroupedVerifyBlockN / 32];
+    if constexpr (PAIR_E4M3 && kGroupedVerifyBlockN > 32) {
+#pragma unroll
+      for (int part = 0; part < kGroupedVerifyBlockN / 32; ++part) {
+        const int index = tid + part * kGroupedVerifyThreads;
+        prefetched_values[part] = make_uint4(0, 0, 0, 0);
+        if (tile_start + index / 16 < split_end)
+          prefetched_values[part] =
+              prefetch_kv_pair<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT>(
+                  v_cache, page_ids, index, 16, tile_start, page_block_size,
+                  v_block_stride, v_token_stride);
+      }
+    }
+
     if constexpr (SPARSE_PAGE4) {
       const int valid_sparse_pages = (valid_k_rows + 3) / 4;
       if (tid < kGroupedVerifyBlockN / 4) {
@@ -2592,7 +2608,20 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
     const int next_tile = tile_start + kGroupedVerifyBlockN;
 
     if constexpr (kGroupedVerifyBlockN > kReductionTile) {
-      {
+      if constexpr (PAIR_E4M3) {
+#pragma unroll
+        for (int part = 0; part < kGroupedVerifyBlockN / 32; ++part) {
+          const int index = tid + part * kGroupedVerifyThreads;
+          const int offset = (index / 16) * kSharedStrideVec + (index % 16) * 2;
+          const uint4 raw = prefetched_values[part];
+          const uint64_t lo = uint64_t(raw.x) | (uint64_t(raw.y) << 32);
+          const uint64_t hi = uint64_t(raw.z) | (uint64_t(raw.w) << 32);
+          reinterpret_cast<uint4*>(shared_values)[offset] =
+              fp8_e4m3fn_vector_to_half8_lut(lo, e4m3_lut);
+          reinterpret_cast<uint4*>(shared_values)[offset + 1] =
+              fp8_e4m3fn_vector_to_half8_lut(hi, e4m3_lut);
+        }
+      } else {
         constexpr int kValueLoadThreads = kGroupedVerifyThreads;
         const int value_load_tid = tid;
         load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
@@ -2612,9 +2641,9 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
           reinterpret_cast<uint4*>(shared_values)[idx] = make_uint4(0, 0, 0, 0);
         }
       }
-
       __syncthreads();
     }
+
     uint4 next_keys[kGroupedVerifyBlockN / 32];
     if constexpr (PAIR_E4M3) {
 #pragma unroll
@@ -2623,7 +2652,7 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
         const int index = tid + part * kGroupedVerifyThreads;
         if (next_tile + index / 16 < split_end) {
           next_keys[part] =
-              prefetch_k_pair<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT>(
+              prefetch_kv_pair<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT>(
                   k_cache, page_ids, index, 16, next_tile, page_block_size,
                   k_block_stride, k_token_stride);
         }

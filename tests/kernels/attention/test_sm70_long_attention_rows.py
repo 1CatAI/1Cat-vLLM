@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Runtime-width K prefetch must respect paged tails, strides and live graph lengths."""
+"""Runtime-width KV prefetch respects paged tails, strides and live graph lengths."""
 
 import pytest
 import torch
@@ -71,10 +71,12 @@ def test_runtime_rows_paged_prefetch_graph_and_oracle(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    for state in ("live", "mixed", "zero", "restore"):
+    for state in ("live", "mixed", "short", "zero", "restore"):
         lengths.copy_(initial)
         if state == "mixed":
             lengths[::2] = 0
+        elif state == "short":
+            lengths.clamp_max_(2049)
         elif state == "zero":
             lengths.zero_()
         query.mul_(0.875)
