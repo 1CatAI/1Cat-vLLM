@@ -1,0 +1,133 @@
+{
+  "initial_inventory": {
+    "number": 1388,
+    "title": "[Model][SM70] DeepSeek-V4.1 indexer: fused SM70 prefill index scores (VLLM_V41_INDEX_FUSE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1388",
+    "isDraft": false,
+    "headRefOid": "90eccca2679040fd6729f2ecc720caf31819f1b5",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1388,
+    "title": "[Model][SM70] DeepSeek-V4.1 indexer: fused SM70 prefill index scores (VLLM_V41_INDEX_FUSE, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370** (PP2): this branch sits on it because both touch `attention_ops.py`'s indexer setup; the change itself does not use PP. Near our tiled-scorer PR #1372 and index-reduce PR #1386 in the same file; whichever lands later needs a small rebase.\n\n## Purpose\n\nAt prefill, the lightning indexer (`select_packed_positions` -> `select_compressed_positions`) scores each all-reduce tile of R query rows as `torch.mm` -> `relu_` -> `mul_` -> `sum(1)`. That writes an [R, 8, N] fp16 tile once and reads it three times per rank (about 96 bytes per query-key pair), then runs one TP all-reduce and one top-k launch per tile. At long context this is a visible share of time to first token.\n\nWith **`VLLM_V41_INDEX_FUSE=<order>`** (default `0`, off):\n\n- `benchmarks/deepseek_v41/v41pidx/`: a small separate SM70 extension (own `torch.ops.v41pidx` namespace; `build.py`). `index_head_sum` computes the per-rank head sums of a block of whole tiles in one kernel: `mma.m8n8k4` scores held in registers, ReLU, weight and the 8-head FP32 sum, 2 bytes per pair written. Built with `--fmad=false`; every add and multiply is spelled with `__fadd_rn` / `__fmul_rn`.\n- `vllm/models/deepseek_v41/index_fuse.py`: the knob parser and `select`. Every tile of a block goes through the same `all_reduce` call as today (same rows, shape and contents, so the same collective and the same bits), then one `index_topk` launch covers the block's rows. With `VLLM_V41_INDEX_OVERLAP=1` too, a block's reductions and top-k run on the overlap side stream while the next block is scored.\n- `attention_ops.py`: `select_packed_positions` calls `_select_fused` when the knob is on (eager prefill only; it refuses under graph capture and requires `VLLM_V41_INDEX_TOPK=1`).\n- `vllm/envs.py`: `VLLM_V41_INDEX_FUSE`, `VLLM_V41_INDEX_FUSE_LIB` (path of `v41pidx.so`, required when on) and `VLLM_V41_INDEX_FUSE_MB` (block budget, default 64 MiB), all with metadata.\n\n**Exactness.** The selected index sets equal today's if and only if the kernel gives today's per-rank partial sums bit for bit. That depends on the order in which cuBLAS feeds K and on the FP32 order of PyTorch's `sum(1)` over 8 heads, both GPU facts. So the knob value names the head-sum order (`seq`, `ilp2`, `ilp4`, `tree`), and `benchmarks/deepseek_v41/v41pidx/check.py` reports which orders match on the GPU at hand. A bad value or a missing library raises; nothing is guessed. Columns at or past the live key count are +0 here and uninitialized-key scores today, and top-k never reads them.\n\n- `tests/models/test_deepseek_v41_index_fuse.py`: CPU tests (off loads nothing; registered defaults are off; knob and budget parsing; missing library refuses; block sizes are whole tiles; `select` issues today's all-reduce tiles and equals the per-tile reference top-k for one and several tiles per block).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_index_fuse.py tests/models/test_deepseek_v41_attention_ops.py tests/models/test_deepseek_v41_index_overlap.py\nV41PIDX_BUILD_DIR=build python benchmarks/deepseek_v41/v41pidx/build.py   # sm_70\npython benchmarks/deepseek_v41/v41pidx/check.py build/v41pidx.so          # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Fused prefill index scores | DeepSeek-V4.1 packed index keys, fp16 q/w/keys, 8 heads per rank, dim 128 | SM70, eager prefill, `VLLM_V41_INDEX_TOPK=1`, knob on and library set | `index_fuse.select`; refuses (raises) under capture, without top-k or without the library | CPU tests; sm_70 build; GPU check on one V100 (bit-exact head sums, equal index rows); measured on 8x V100 PP2 x TP4 | TP other than 4 (8 heads per rank assumed); non-V100 SM70 parts |\n| Decode | — | any | unchanged (prefill branch only) | source; measured decode neutral | — |\n| Switch off | all | default | today's `select_compressed_positions`, nothing loads | CPU test | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_INDEX_FUSE` defaults to `0`.\n- Required CLI options and environment switches: `VLLM_V41_INDEX_FUSE=ilp4` (the order our check and serving runs used), `VLLM_V41_INDEX_FUSE_LIB=<path>/v41pidx.so`, `VLLM_V41_INDEX_TOPK=1` (default).\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone on #1370, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41pidx.so` from this tree.\n- User-entry route-hit, speed, and output-quality evidence: below. Activation logs one `V4.1 indexer: VLLM_V41_INDEX_FUSE=<order> ...` line per rank at import and one `v41pidx fused prefill select first call` line at the first long prefill.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; refusals raise with the reason.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: three tuning variables with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +3 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-04,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request per prompt, two runs per arm, `ilp4` on vs off:\n\n| Prompt | TTFT off (s) | TTFT on (s) | Change |\n| --- | --- | --- | --- |\n| 32K | — | — | +0.3 % (noise) |\n| 150K | 85.1 / 86.2 | 81.3 / 81.6 | **-4.9 %** |\n| 300K | 174.1 / 176.8 | 159.0 / 158.4 | **-9.5 %** |\n\nOutput identical between arms; decode neutral (+0.015 ms per round).\n\n**Re-run for this PR, 2026-11-05,** on this branch (on #1370, rebased onto `main` `3c051b52e`):\n\n- sm_70 build of `v41pidx.so` from this tree: OK.\n- `check.py` on one V100-SXM2: all four orders give 0 head-sum mismatches against `torch.mm -> relu_ -> mul_ -> sum(1)` (two shapes, up to 9000 keys); `index_fuse.select` vs `select_compressed_positions` (identity all-reduce, one rank), five shapes from 300 to 2000 rows, 2048 to 9000 keys and 1 to 5 tiles per block, every order: 0 rows differ.\n- pytest, the three files above, CPU only: 21 passed, 10 skipped (CUDA-only attention-op cases).\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: multi-GPU (TP all-reduce) runs, timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1388",
+    "isDraft": false,
+    "headRefName": "pli/v41-index-fuse",
+    "headRefOid": "90eccca2679040fd6729f2ecc720caf31819f1b5",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1388,
+    "id": "PR_kwDORjYFXs8AAAABNJ2U_w",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "90eccca2679040fd6729f2ecc720caf31819f1b5",
+    "title": "[Model][SM70] DeepSeek-V4.1 indexer: fused SM70 prefill index scores (VLLM_V41_INDEX_FUSE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1388",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370** (PP2): this branch sits on it because both touch `attention_ops.py`'s indexer setup; the change itself does not use PP. Near our tiled-scorer PR #1372 and index-reduce PR #1386 in the same file; whichever lands later needs a small rebase.\n\n## Purpose\n\nAt prefill, the lightning indexer (`select_packed_positions` -> `select_compressed_positions`) scores each all-reduce tile of R query rows as `torch.mm` -> `relu_` -> `mul_` -> `sum(1)`. That writes an [R, 8, N] fp16 tile once and reads it three times per rank (about 96 bytes per query-key pair), then runs one TP all-reduce and one top-k launch per tile. At long context this is a visible share of time to first token.\n\nWith **`VLLM_V41_INDEX_FUSE=<order>`** (default `0`, off):\n\n- `benchmarks/deepseek_v41/v41pidx/`: a small separate SM70 extension (own `torch.ops.v41pidx` namespace; `build.py`). `index_head_sum` computes the per-rank head sums of a block of whole tiles in one kernel: `mma.m8n8k4` scores held in registers, ReLU, weight and the 8-head FP32 sum, 2 bytes per pair written. Built with `--fmad=false`; every add and multiply is spelled with `__fadd_rn` / `__fmul_rn`.\n- `vllm/models/deepseek_v41/index_fuse.py`: the knob parser and `select`. Every tile of a block goes through the same `all_reduce` call as today (same rows, shape and contents, so the same collective and the same bits), then one `index_topk` launch covers the block's rows. With `VLLM_V41_INDEX_OVERLAP=1` too, a block's reductions and top-k run on the overlap side stream while the next block is scored.\n- `attention_ops.py`: `select_packed_positions` calls `_select_fused` when the knob is on (eager prefill only; it refuses under graph capture and requires `VLLM_V41_INDEX_TOPK=1`).\n- `vllm/envs.py`: `VLLM_V41_INDEX_FUSE`, `VLLM_V41_INDEX_FUSE_LIB` (path of `v41pidx.so`, required when on) and `VLLM_V41_INDEX_FUSE_MB` (block budget, default 64 MiB), all with metadata.\n\n**Exactness.** The selected index sets equal today's if and only if the kernel gives today's per-rank partial sums bit for bit. That depends on the order in which cuBLAS feeds K and on the FP32 order of PyTorch's `sum(1)` over 8 heads, both GPU facts. So the knob value names the head-sum order (`seq`, `ilp2`, `ilp4`, `tree`), and `benchmarks/deepseek_v41/v41pidx/check.py` reports which orders match on the GPU at hand. A bad value or a missing library raises; nothing is guessed. Columns at or past the live key count are +0 here and uninitialized-key scores today, and top-k never reads them.\n\n- `tests/models/test_deepseek_v41_index_fuse.py`: CPU tests (off loads nothing; registered defaults are off; knob and budget parsing; missing library refuses; block sizes are whole tiles; `select` issues today's all-reduce tiles and equals the per-tile reference top-k for one and several tiles per block).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_index_fuse.py tests/models/test_deepseek_v41_attention_ops.py tests/models/test_deepseek_v41_index_overlap.py\nV41PIDX_BUILD_DIR=build python benchmarks/deepseek_v41/v41pidx/build.py   # sm_70\npython benchmarks/deepseek_v41/v41pidx/check.py build/v41pidx.so          # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Fused prefill index scores | DeepSeek-V4.1 packed index keys, fp16 q/w/keys, 8 heads per rank, dim 128 | SM70, eager prefill, `VLLM_V41_INDEX_TOPK=1`, knob on and library set | `index_fuse.select`; refuses (raises) under capture, without top-k or without the library | CPU tests; sm_70 build; GPU check on one V100 (bit-exact head sums, equal index rows); measured on 8x V100 PP2 x TP4 | TP other than 4 (8 heads per rank assumed); non-V100 SM70 parts |\n| Decode | — | any | unchanged (prefill branch only) | source; measured decode neutral | — |\n| Switch off | all | default | today's `select_compressed_positions`, nothing loads | CPU test | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_INDEX_FUSE` defaults to `0`.\n- Required CLI options and environment switches: `VLLM_V41_INDEX_FUSE=ilp4` (the order our check and serving runs used), `VLLM_V41_INDEX_FUSE_LIB=<path>/v41pidx.so`, `VLLM_V41_INDEX_TOPK=1` (default).\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone on #1370, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41pidx.so` from this tree.\n- User-entry route-hit, speed, and output-quality evidence: below. Activation logs one `V4.1 indexer: VLLM_V41_INDEX_FUSE=<order> ...` line per rank at import and one `v41pidx fused prefill select first call` line at the first long prefill.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; refusals raise with the reason.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: three tuning variables with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +3 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-04,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request per prompt, two runs per arm, `ilp4` on vs off:\n\n| Prompt | TTFT off (s) | TTFT on (s) | Change |\n| --- | --- | --- | --- |\n| 32K | — | — | +0.3 % (noise) |\n| 150K | 85.1 / 86.2 | 81.3 / 81.6 | **-4.9 %** |\n| 300K | 174.1 / 176.8 | 159.0 / 158.4 | **-9.5 %** |\n\nOutput identical between arms; decode neutral (+0.015 ms per round).\n\n**Re-run for this PR, 2026-11-05,** on this branch (on #1370, rebased onto `main` `3c051b52e`):\n\n- sm_70 build of `v41pidx.so` from this tree: OK.\n- `check.py` on one V100-SXM2: all four orders give 0 head-sum mismatches against `torch.mm -> relu_ -> mul_ -> sum(1)` (two shapes, up to 9000 keys); `index_fuse.select` vs `select_compressed_positions` (identity all-reduce, one rank), five shapes from 300 to 2000 rows, 2048 to 9000 keys and 1 to 5 tiles per block, every order: 0 rows differ.\n- pytest, the three files above, CPU only: 21 passed, 10 skipped (CUDA-only attention-op cases).\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: multi-GPU (TP all-reduce) runs, timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-index-fuse",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1388,
+    "title": "[Model][SM70] DeepSeek-V4.1 indexer: fused SM70 prefill index scores (VLLM_V41_INDEX_FUSE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1388",
+    "isDraft": false,
+    "headRefOid": "90eccca2679040fd6729f2ecc720caf31819f1b5",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/main_smoke.py",
+      "benchmarks/deepseek_v41/serve-pp2-eager.yaml",
+      "benchmarks/deepseek_v41/serve-pp2.yaml",
+      "benchmarks/deepseek_v41/tools/pp2_m1.py",
+      "benchmarks/deepseek_v41/v41pidx/build.py",
+      "benchmarks/deepseek_v41/v41pidx/check.py",
+      "benchmarks/deepseek_v41/v41pidx/v41pidx.cu",
+      "docs/design/architecture/runtime_reference.md",
+      "tests/models/gguf/test_shared_expert_pp_stage.py",
+      "tests/models/test_deepseek_v41_index_fuse.py",
+      "tests/models/test_deepseek_v41_index_overlap.py",
+      "tests/models/test_deepseek_v41_markov_shard.py",
+      "tests/models/test_deepseek_v41_pp_commit.py",
+      "tests/models/test_deepseek_v41_pp_drafter.py",
+      "tests/models/test_deepseek_v41_pp_forward.py",
+      "tests/models/test_deepseek_v41_pp_split.py",
+      "tests/v1/worker/test_gpu_model_runner.py",
+      "vllm/config/kernel.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_expert_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_layout.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_prefill.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_runtime.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py",
+      "vllm/model_executor/model_loader/gguf_adapters/deepseek_v41.py",
+      "vllm/model_executor/model_loader/gguf_loader.py",
+      "vllm/models/deepseek_v41/attention_ops.py",
+      "vllm/models/deepseek_v41/contract.py",
+      "vllm/models/deepseek_v41/dense_tm.py",
+      "vllm/models/deepseek_v41/dspark.py",
+      "vllm/models/deepseek_v41/index_fuse.py",
+      "vllm/models/deepseek_v41/markov_shard.py",
+      "vllm/models/deepseek_v41/model.py",
+      "vllm/models/deepseek_v41/pp_commit.py",
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/spec_decode/dspark.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 257488,
+    "diff_sha256": "5c5b53523310771cff3ae16f7d3554e0e6598d5a77554a27310762e3652da45c"
+  },
+  "full_tree_diff_proof": null
+}

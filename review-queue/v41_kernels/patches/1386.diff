@@ -1,0 +1,828 @@
+diff --git a/benchmarks/deepseek_v41/v41k/v41k.cu b/benchmarks/deepseek_v41/v41k/v41k.cu
+index 2245702499..c2bac61173 100644
+--- a/benchmarks/deepseek_v41/v41k/v41k.cu
++++ b/benchmarks/deepseek_v41/v41k/v41k.cu
+@@ -1726,6 +1726,78 @@ __global__ void __launch_bounds__(128 * WPD)
+   }
+ }
+ 
++// ---- INDEX_REDUCE: live-prefix TP4 reduce of decode index scores ---------------
++// Each rank's bank: kRedFlags bytes of per-CTA flags (CTA b, rank r at word
++// b * 4 + r), then that rank's FP16 partial scores [8][n_pad] (written by
++// index_scores_decode into its own bank). CTA b publishes a per-CTA epoch to
++// every peer (release, system scope) and waits for theirs (acquire), so no
++// CTA depends on another CTA of its own grid. It then adds columns [0, end)
++// of the four partials in rank order 0..3 in FP32 and rounds once (custom
++// all-reduce 1-stage numerics; identical on all ranks), end =
++// (positions[T-1] + 1) / ratio as in index_scores_decode, clamped to width.
++// The all-reduces that separate two decode index calls bound rank skew, so
++// one partial slot per rank is enough (as for peer_gather).
++constexpr int kRedCtas = 64;
++constexpr int kRedFlags = kRedCtas * 4 * 4;  // bytes
++
++__global__ void __launch_bounds__(256)
++    index_reduce_live(half* __restrict__ out, uint8_t* p0, uint8_t* p1,
++                      uint8_t* p2, uint8_t* p3, int rank,
++                      unsigned* __restrict__ epochs,
++                      const int64_t* __restrict__ positions, int tokens,
++                      int64_t n_pad, int64_t width, int ratio) {
++  __shared__ unsigned s_epoch;
++  const int b = blockIdx.x;
++  if (threadIdx.x == 0) s_epoch = epochs[b] + 1;
++  __syncthreads();
++  const unsigned epoch = s_epoch;
++  uint8_t* peers[4] = {p0, p1, p2, p3};
++  if (threadIdx.x < 4 && int(threadIdx.x) != rank) {
++    const int r = threadIdx.x;
++    __threadfence_system();  // this rank's partial (previous kernel) first
++    v41k_st_release(reinterpret_cast<unsigned*>(peers[r]) + b * 4 + rank,
++                    epoch);
++    const unsigned* own =
++        reinterpret_cast<const unsigned*>(peers[rank]) + b * 4 + r;
++    while (int(v41k_ld_acquire(own) - epoch) < 0) {
++    }
++  }
++  __syncthreads();
++  int64_t end = (positions[tokens - 1] + 1) / ratio;
++  end = end < 0 ? 0 : (end > width ? width : end);
++  const int64_t chunks = (end + 7) / 8;  // one int4 = 8 halves
++  const int64_t row4 = n_pad / 8;
++  const int4* src[4];
++#pragma unroll
++  for (int r = 0; r < 4; ++r)
++    src[r] = reinterpret_cast<const int4*>(peers[r] + kRedFlags);
++  int4* dst = reinterpret_cast<int4*>(out);
++  const int64_t total = int64_t(tokens) * chunks;
++  for (int64_t i = int64_t(b) * blockDim.x + threadIdx.x; i < total;
++       i += int64_t(gridDim.x) * blockDim.x) {
++    const int64_t at = (i / chunks) * row4 + i % chunks;
++    float acc[8];
++#pragma unroll
++    for (int r = 0; r < 4; ++r) {
++      const int4 v = __ldcg(src[r] + at);  // L2 only: peer data changes
++      const half2* h = reinterpret_cast<const half2*>(&v);
++#pragma unroll
++      for (int k = 0; k < 4; ++k) {
++        const float2 f = __half22float2(h[k]);
++        acc[2 * k] = r ? acc[2 * k] + f.x : f.x;
++        acc[2 * k + 1] = r ? acc[2 * k + 1] + f.y : f.y;
++      }
++    }
++    int4 o;
++    half2* oh = reinterpret_cast<half2*>(&o);
++#pragma unroll
++    for (int k = 0; k < 4; ++k)
++      oh[k] = __floats2half2_rn(acc[2 * k], acc[2 * k + 1]);
++    dst[at] = o;
++  }
++  if (threadIdx.x == 0) epochs[b] = epoch;
++}
++
+ // ---- G4b decode indexer: scores over packed FP4 index keys ----------------
+ // Packed key row (68 B): 64 B E2M1 nibbles (even element in the low nibble)
+ // then 4 power-of-two scale exponents (biased) for groups of 32. Rows q/w are
+@@ -3401,6 +3473,31 @@ void v41k_peer_gather(int64_t p0, int64_t p1, int64_t p2, int64_t p3,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++void v41k_index_reduce_live(torch::Tensor out, int64_t p0, int64_t p1,
++                            int64_t p2, int64_t p3, int64_t rank,
++                            torch::Tensor epochs, torch::Tensor positions,
++                            int64_t ratio, int64_t width) {
++  const at::cuda::OptionalCUDAGuard guard(out.device());
++  const int tokens = out.size(0);
++  TORCH_CHECK(out.scalar_type() == torch::kHalf && out.dim() == 2 &&
++                  out.is_contiguous() && out.size(1) % 8 == 0 && tokens >= 1 &&
++                  tokens <= 8 && width >= 0 && width <= out.size(1) &&
++                  ratio >= 1 && rank >= 0 && rank < 4,
++              "index_reduce_live: bad out/width/ratio/rank");
++  TORCH_CHECK(positions.scalar_type() == torch::kInt64 &&
++                  positions.is_contiguous() && positions.numel() >= tokens &&
++                  epochs.scalar_type() == torch::kInt32 &&
++                  epochs.numel() >= v41k::kRedCtas,
++              "index_reduce_live: bad positions/epochs");
++  auto stream = at::cuda::getCurrentCUDAStream();
++  auto ptr = [](int64_t v) { return reinterpret_cast<uint8_t*>(v); };
++  v41k::index_reduce_live<<<v41k::kRedCtas, 256, 0, stream>>>(
++      reinterpret_cast<half*>(out.data_ptr()), ptr(p0), ptr(p1), ptr(p2),
++      ptr(p3), int(rank), reinterpret_cast<unsigned*>(epochs.data_ptr<int>()),
++      positions.data_ptr<int64_t>(), tokens, out.size(1), width, int(ratio));
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void v41k_index_scores_decode(torch::Tensor out, torch::Tensor q,
+                               torch::Tensor w, torch::Tensor keys,
+                               torch::Tensor positions, int64_t heads,
+@@ -3431,6 +3528,11 @@ TORCH_LIBRARY(v41k, m) {
+       "flag_offset, "
+       "Tensor(a!) epoch) -> ()",
+       &v41k_peer_gather);
++  m.def(
++      "index_reduce_live(Tensor(a!) out, int p0, int p1, int p2, int p3, "
++      "int rank, Tensor(b!) epochs, Tensor positions, int ratio, int width) "
++      "-> ()",
++      &v41k_index_reduce_live);
+   m.def(
+       "gate_up7(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "
+       "ids32, Tensor prob, "
+diff --git a/tests/models/test_deepseek_v41_index_reduce.py b/tests/models/test_deepseek_v41_index_reduce.py
+new file mode 100644
+index 0000000000..75372977c9
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_index_reduce.py
+@@ -0,0 +1,465 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""V4.1 indexer INDEX_REDUCE: live-prefix decode index-score reduce.
++
++The functions come from ``attention_ops.py`` / ``kv_store.py`` source (the
++modules need a CUDA build to import). CPU checks, with fake v41k ops:
++
++- bank=None (VLLM_V41_INDEX_REDUCE unset or "0"): scores are a fresh
++  [tokens, rows] tensor, all_reduce runs once, index_reduce_live never runs;
++- with a bank, every rank scores into its own bank slot, index_reduce_live
++  runs once per call with the bank's pointers / rank / epochs and the store
++  width, all_reduce never runs, and every rank's top-k equals the knob-off
++  top-k and a torch reference (the fake reduce, like the kernel, adds the
++  four partials in rank order in FP32 over the live columns only);
++- more tokens than bank rows falls back to all_reduce;
++- the live path requires the CUDA scorer (never the Triton fallback);
++- _index_bank_ready: off by default, refuses non-TP4 / no custom AR / a v41k
++  build without index_reduce_live;
++- the kernel's int4 walk covers exactly the live columns of every row and
++  stays inside the padded row; the CUDA schema, the binding's argument order
++  and the bank layout constants match the Python side;
++- model.py hands the store's bank to select_packed_positions.
++
++    python tests/models/test_deepseek_v41_index_reduce.py   # or pytest
++"""
++
++import ast
++import re
++import sys
++import types
++from pathlib import Path
++
++import torch
++
++ROOT = Path(__file__).resolve().parents[2]
++OPS = ROOT / "vllm" / "models" / "deepseek_v41" / "attention_ops.py"
++STORE = ROOT / "vllm" / "models" / "deepseek_v41" / "kv_store.py"
++MODEL = ROOT / "vllm" / "models" / "deepseek_v41" / "model.py"
++KERNEL = ROOT / "benchmarks" / "deepseek_v41" / "v41k" / "v41k.cu"
++ENVS = ROOT / "vllm" / "envs.py"
++
++HEADS = 8  # index_n_heads 32 / TP4
++RANKS = 4
++TOP_K = 64
++
++
++_SAVED: dict = {}
++
++
++def _fake_module(module):
++    """Install a fake module; teardown_module puts the originals back."""
++    _SAVED.setdefault(module.__name__, sys.modules.get(module.__name__))
++    sys.modules[module.__name__] = module
++
++
++def teardown_module(module=None):
++    for name, original in _SAVED.items():
++        if original is None:
++            sys.modules.pop(name, None)
++        else:
++            sys.modules[name] = original
++    _SAVED.clear()
++
++
++def _functions(path, names, namespace):
++    tree = ast.parse(path.read_text())
++    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
++    assert len(nodes) == len(names), [n.name for n in nodes]
++    exec(compile(ast.Module(nodes, []), str(path), "exec"), namespace)
++    return namespace
++
++
++def _constant(path, name):
++    tree = ast.parse(path.read_text())
++    for node in tree.body:
++        if isinstance(node, ast.Assign) and any(
++            isinstance(t, ast.Name) and t.id == name for t in node.targets
++        ):
++            return node.value
++    raise AssertionError(name)
++
++
++# -- fakes ------------------------------------------------------------------
++def fake_scores(out, q, w, keys, positions, heads, ratio):
++    """index_scores_decode on fp16 [rows, 128] keys: live columns only."""
++    tokens = out.shape[0]
++    end = int(positions[tokens - 1] + 1) // ratio
++    dots = torch.einsum(
++        "thd,nd->thn", q.view(tokens, heads, 128).float(), keys[:end].float()
++    )
++    s = dots.half().float().clamp_min(0)
++    s = (s * w.view(tokens, heads, 1).float()).half().float()
++    out[:, :end] = s.sum(1).half()
++
++
++def reference_topk(out, scores, positions, valid, ratio, k):
++    width = scores.shape[1]
++    out.fill_(-1)
++    for r in range(scores.shape[0]):
++        n = min(int(positions[r] + 1) // ratio, width) if int(valid[r]) else 0
++        take = min(k, n)
++        if take:
++            order = torch.sort(scores[r, :n].float(), descending=True, stable=True)
++            top = order.indices[:take]
++            out[r, :take] = torch.sort(top).values.to(out.dtype)
++    return out
++
++
++class FakeV41k:
++    """index_scores_decode plus index_reduce_live over a pointer registry."""
++
++    def __init__(self):
++        self.registry = {}  # pointer -> bank
++        self.reduce_calls = []
++
++    def index_scores_decode(self, *args):
++        fake_scores(*args)
++
++    def index_reduce_live(
++        self, out, p0, p1, p2, p3, rank, epochs, positions, ratio, width
++    ):
++        self.reduce_calls.append((out.shape, (p0, p1, p2, p3), rank, ratio, width))
++        tokens = out.shape[0]
++        end = max(0, min(int(positions[tokens - 1] + 1) // ratio, width))
++        acc = None
++        for p in (p0, p1, p2, p3):
++            part = self.registry[p].partial[:tokens, :end].float()
++            acc = part if acc is None else acc + part
++        out[:, :end] = acc.half()
++        epochs.add_(1)
++
++
++class TorchProxy(types.ModuleType):
++    def __init__(self, v41k):
++        super().__init__("torch")
++        self.ops = types.SimpleNamespace(v41k=v41k)
++
++    def __getattr__(self, name):
++        return getattr(torch, name)
++
++
++class Bank:
++    def __init__(self, rank, rows, pointers, decode_rows=8):
++        self.rank = rank
++        self.width = (rows + 7) // 8 * 8
++        self.pointers = pointers
++        self.partial = torch.full(
++            (decode_rows, self.width), float("nan"), dtype=torch.float16
++        )
++        self.epochs = torch.zeros(64, dtype=torch.int32)
++
++
++def _ops(cuda=True):
++    v41k = FakeV41k()
++    topk = types.ModuleType("vllm.models.deepseek_v41.index_topk")
++    topk.index_topk = lambda out, s, p, v, ratio, k: reference_topk(
++        out, s, p, v, ratio, k
++    )
++    topk.index_topk_parallel = topk.index_topk
++    _fake_module(topk)
++    namespace = dict(torch=TorchProxy(v41k), _cuda_index_scores=lambda: cuda)
++    _functions(OPS, ("_index_reduce_live", "select_packed_positions"), namespace)
++    return namespace, v41k
++
++
++def _case(seed=0, rows=1001, tokens=3, first=500, ratio=1):
++    g = torch.Generator().manual_seed(seed)
++    keys = (torch.randn(rows, 128, generator=g) * 0.5).half()
++    qs = [
++        (torch.randn(tokens, HEADS, 128, generator=g) * 0.3).half()
++        for _ in range(RANKS)
++    ]
++    ws = [torch.rand(tokens, HEADS, generator=g).half() for _ in range(RANKS)]
++    positions = torch.arange(first, first + tokens, dtype=torch.int64)
++    valid = torch.ones(tokens, dtype=torch.int32)
++    return keys, qs, ws, positions, valid, ratio
++
++
++def _partials(keys, qs, ws, positions, ratio):
++    parts = []
++    for q, w in zip(qs, ws):
++        out = torch.zeros(q.shape[0], keys.shape[0], dtype=torch.float16)
++        fake_scores(
++            out, q.reshape(-1, 128), w.reshape(-1), keys, positions, HEADS, ratio
++        )
++        parts.append(out)
++    return parts
++
++
++def _reference(keys, qs, ws, positions, valid, ratio):
++    parts = _partials(keys, qs, ws, positions, ratio)
++    total = sum(p.float() for p in parts).half()
++    out = torch.empty(len(positions), TOP_K, dtype=torch.int32)
++    return reference_topk(out, total, positions, valid, ratio, TOP_K), total
++
++
++def _knob_off(keys, qs, ws, positions, valid, ratio):
++    ns, v41k = _ops()
++    total = sum(p.float() for p in _partials(keys, qs, ws, positions, ratio)).half()
++    calls = []
++
++    def all_reduce(x):
++        calls.append(tuple(x.shape))
++        return total.clone()
++
++    results = [
++        ns["select_packed_positions"](
++            qs[r], ws[r], keys, positions, valid, ratio, all_reduce, top_k=TOP_K
++        )
++        for r in range(RANKS)
++    ]
++    return results, calls, v41k
++
++
++def _knob_on(keys, qs, ws, positions, valid, ratio, decode_rows=8, cuda=True):
++    ns, v41k = _ops(cuda)
++    pointers = tuple(1000 + r for r in range(RANKS))
++    banks = [Bank(r, keys.shape[0], pointers, decode_rows) for r in range(RANKS)]
++    for r, bank in enumerate(banks):
++        v41k.registry[pointers[r]] = bank
++    # Concurrent ranks: every partial is in place before anyone reduces.
++    for r, bank in enumerate(banks):
++        if len(positions) <= decode_rows:
++            fake_scores(
++                bank.partial[: len(positions)],
++                qs[r].reshape(-1, 128),
++                ws[r].reshape(-1),
++                keys,
++                positions,
++                HEADS,
++                ratio,
++            )
++    calls = []
++    total = sum(p.float() for p in _partials(keys, qs, ws, positions, ratio)).half()
++
++    def all_reduce(x):
++        calls.append(tuple(x.shape))
++        return total.clone()
++
++    results = [
++        ns["select_packed_positions"](
++            qs[r],
++            ws[r],
++            keys,
++            positions,
++            valid,
++            ratio,
++            all_reduce,
++            top_k=TOP_K,
++            bank=banks[r],
++        )
++        for r in range(RANKS)
++    ]
++    return results, calls, v41k, banks
++
++
++# -- tests ------------------------------------------------------------------
++def test_knob_off_keeps_all_reduce():
++    case = _case()
++    results, calls, v41k = _knob_off(*case)
++    keys, *_ = case
++    assert calls == [(3, keys.shape[0])] * RANKS
++    assert v41k.reduce_calls == []
++    expected, _ = _reference(*case)
++    for result in results:
++        assert torch.equal(result, expected)
++
++
++def test_bank_reduces_live_prefix_without_all_reduce():
++    for seed, (rows, tokens, first, ratio) in enumerate(
++        [(1001, 3, 500, 1), (1001, 1, 77, 1), (2049, 8, 1900, 1), (513, 4, 900, 2)]
++    ):
++        case = _case(seed, rows, tokens, first, ratio)
++        keys, qs, ws, positions, valid, ratio = case
++        on, calls, v41k, banks = _knob_on(*case)
++        off, _, _ = _knob_off(*case)
++        expected, total = _reference(*case)
++        assert calls == []
++        assert len(v41k.reduce_calls) == RANKS
++        width = (rows + 7) // 8 * 8
++        for r, (shape, pointers, rank, got_ratio, got_width) in enumerate(
++            v41k.reduce_calls
++        ):
++            assert shape == (tokens, width)
++            assert pointers == banks[r].pointers and rank == r
++            assert got_ratio == ratio and got_width == rows
++            assert int(banks[r].epochs[0]) == 1
++        for r in range(RANKS):
++            assert torch.equal(on[r], expected), (seed, r)
++            assert torch.equal(on[r], off[r])
++
++
++def test_live_scores_equal_custom_ar_sum():
++    ns, v41k = _ops()
++    keys, qs, ws, positions, valid, ratio = _case(7, 1001, 5, 600, 1)
++    pointers = (11, 12, 13, 14)
++    banks = [Bank(r, 1001, pointers) for r in range(RANKS)]
++    for r, bank in enumerate(banks):
++        v41k.registry[pointers[r]] = bank
++        fake_scores(
++            bank.partial[:5],
++            qs[r].reshape(-1, 128),
++            ws[r].reshape(-1),
++            keys,
++            positions,
++            HEADS,
++            ratio,
++        )
++    reduced = ns["_index_reduce_live"](
++        banks[2], banks[2].partial[:5], positions, ratio, 1001
++    )
++    assert reduced.shape == (5, 1001) and reduced.stride(1) == 1
++    end = (600 + 4 + 1) // ratio
++    _, total = _reference(keys, qs, ws, positions, valid, ratio)
++    assert torch.equal(reduced[:, :end], total[:, :end])
++
++
++def test_too_many_tokens_fall_back():
++    case = _case(3, 1001, 3, 500, 1)
++    on, calls, v41k, _ = _knob_on(*case, decode_rows=2)
++    assert v41k.reduce_calls == []
++    assert calls == [(3, 1001)] * RANKS
++    expected, _ = _reference(*case)
++    for result in on:
++        assert torch.equal(result, expected)
++
++
++def test_live_path_requires_cuda_scorer():
++    tree = ast.parse(OPS.read_text())
++    fn = next(
++        n
++        for n in tree.body
++        if isinstance(n, ast.FunctionDef) and n.name == "select_packed_positions"
++    )
++    live = next(
++        n
++        for n in ast.walk(fn)
++        if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "live"
++    )
++    text = ast.unparse(live.value)
++    for part in (
++        "bank is not None",
++        "bank.partial.shape[0]",
++        "bank.width",
++        "_cuda_index_scores()",
++    ):
++        assert part in text, text
++
++
++def _ready(knob, world=4, ca=True, disabled=False, connected=True, op=True):
++    warnings = []
++    logger = types.SimpleNamespace(warning=lambda *a: warnings.append(a))
++    moe = types.ModuleType("vllm.model_executor.layers.quantization.gguf_v41_moe")
++    moe._expert_major_ready = lambda: True
++    _fake_module(moe)
++    v41k = types.SimpleNamespace(**({"index_reduce_live": object()} if op else {}))
++    namespace = dict(
++        envs=types.SimpleNamespace(VLLM_V41_INDEX_REDUCE=knob),
++        logger=logger,
++        torch=types.SimpleNamespace(ops=types.SimpleNamespace(v41k=v41k)),
++    )
++    _functions(STORE, ("_index_bank_ready",), namespace)
++    comm = types.SimpleNamespace(
++        ca_comm=types.SimpleNamespace(disabled=disabled, fully_connected=connected)
++        if ca
++        else None
++    )
++    group = types.SimpleNamespace(world_size=world, device_communicator=comm)
++    return namespace["_index_bank_ready"](group), warnings
++
++
++def test_bank_gate():
++    assert _ready("0") == (False, [])
++    assert _ready("1")[0] is True
++    for kwargs in (
++        dict(world=2),
++        dict(ca=False),
++        dict(disabled=True),
++        dict(connected=False),
++        dict(op=False),
++    ):
++        ok, warnings = _ready("1", **kwargs)
++        assert ok is False and len(warnings) == 1, kwargs
++
++
++def test_knob_default_off():
++    env = ENVS.read_text()
++    assert 'VLLM_V41_INDEX_REDUCE: str = "0"' in env
++    assert 'os.getenv("VLLM_V41_INDEX_REDUCE", "0")' in env
++    ignored = env[env.index('"VLLM_V41_INDEX_DECODE_BLOCKS",\n') :][:4000]
++    assert '"VLLM_V41_INDEX_REDUCE"' not in ignored  # a compile factor
++
++
++def _kernel_walk(tokens, end, n_pad, ctas=64, threads=256):
++    """The kernel's grid-stride walk: int4 slots written per row."""
++    chunks = (end + 7) // 8
++    row4 = n_pad // 8
++    written = set()
++    total = tokens * chunks
++    for start in range(ctas * threads):
++        for i in range(start, total, ctas * threads):
++            at = (i // chunks) * row4 + i % chunks
++            assert at not in written
++            written.add(at)
++    return written
++
++
++def test_kernel_walk_covers_live_columns():
++    for tokens, end, rows in (
++        (1, 0, 1001),
++        (1, 1, 1001),
++        (3, 503, 1001),
++        (8, 1001, 1001),
++        (6, 17, 33),
++    ):
++        n_pad = (rows + 7) // 8 * 8
++        written = _kernel_walk(tokens, end, n_pad)
++        for t in range(tokens):
++            cols = set()
++            for at in written:
++                if at // (n_pad // 8) == t:
++                    cols.update(
++                        range((at % (n_pad // 8)) * 8, (at % (n_pad // 8)) * 8 + 8)
++                    )
++            assert set(range(end)) <= cols and max(cols, default=-1) < n_pad
++
++
++def test_kernel_contract_matches_python():
++    cu = KERNEL.read_text()
++    assert "constexpr int kRedCtas = 64;" in cu
++    assert "constexpr int kRedFlags = kRedCtas * 4 * 4;" in cu
++    assert ast.literal_eval(_constant(STORE, "REDUCE_CTAS")) == 64
++    assert ast.unparse(_constant(STORE, "REDUCE_FLAGS")) == "REDUCE_CTAS * 4 * 4"
++    schema = re.search(r'"index_reduce_live\((.*?)\) "\s*"-> \(\)"', cu, re.S)
++    assert schema, "schema"
++    args = "".join(re.findall(r'"([^"]*)"', cu[schema.start() : schema.end()]))
++    assert args.startswith(
++        "index_reduce_live(Tensor(a!) out, int p0, int p1, int p2, int p3, int rank, "
++        "Tensor(b!) epochs, Tensor positions, int ratio, int width)"
++    ), args
++    call = re.search(
++        r"torch\.ops\.v41k\.index_reduce_live\((.*?)\)\n", OPS.read_text(), re.S
++    )
++    assert call and " ".join(call.group(1).split()) == (
++        "out, *bank.pointers, bank.rank, bank.epochs, positions.long(), ratio, width"
++    )
++    # The flag and partial layout the bank allocates is the kernel's.
++    store = STORE.read_text()
++    assert (
++        "own[REDUCE_FLAGS:].view(torch.float16).view(DECODE_ROWS, self.width)" in store
++    )
++    assert "peers[r] + kRedFlags" in cu and "b * 4 + rank" in cu
++
++
++def test_model_passes_bank():
++    text = MODEL.read_text()
++    assert 'bank=getattr(store, "index_bank", None),' in text
++
++
++if __name__ == "__main__":
++    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
++    for test in tests:
++        test()
++    teardown_module()
++    print(f"{len(tests)} passed")
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..6e0003ba9e 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -493,6 +493,7 @@
+     VLLM_V41_HC_WINDOW: str = "2048"
+     VLLM_V41_HITLOG_RELAXED: str = "1"
+     VLLM_V41_INDEX_DECODE_BLOCKS: str = "8"
++    VLLM_V41_INDEX_REDUCE: str = "0"
+     VLLM_V41_INDEX_TILE_MB: str = "64"
+     VLLM_V41_INDEX_TOPK: str = "1"
+     VLLM_V41_JOB_EVENTS: str | None = None
+@@ -7586,6 +7587,22 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_INDEX_REDUCE": env_var(
++        lambda: os.getenv("VLLM_V41_INDEX_REDUCE", "0"),
++        description=(
++            "DS-V4.1 indexer INDEX_REDUCE: decode index scores are reduced across"
++            " the TP4 group over the live key prefix only, by a v41k IPC"
++            " kernel (custom all-reduce 1-stage numerics, graph-safe), instead"
++            " of a whole-store NCCL all-reduce. Needs TP4, a fully connected"
++            " custom all-reduce and a v41k build with index_reduce_live."
++        ),
++        category="tuning",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_INDEX_TILE_MB": env_var(
+         lambda: os.getenv("VLLM_V41_INDEX_TILE_MB", "64"),
+         description=("DS-V4.1 indexer: FP16 score budget per query tile in MiB."),
+diff --git a/vllm/models/deepseek_v41/attention_ops.py b/vllm/models/deepseek_v41/attention_ops.py
+index f9dfadc1cb..6a2d88764d 100644
+--- a/vllm/models/deepseek_v41/attention_ops.py
++++ b/vllm/models/deepseek_v41/attention_ops.py
+@@ -777,18 +777,58 @@ def _cuda_index_scores():
+     return _CUDA_INDEX["ok"]
+ 
+ 
++def _index_reduce_live(bank, partial, positions, ratio, width):
++    """INDEX_REDUCE: sum the four ranks' partial scores over the live columns only.
++
++    v41k index_reduce_live reads every rank's bank over CUDA IPC (per-CTA
++    epoch flags, release/acquire at system scope) and adds columns
++    [0, (positions[-1] + 1) // ratio) in rank order 0..3 in FP32, rounding
++    once: the custom all-reduce 1-stage numerics, the same on every rank.
++    Columns past the live end are not written; index_topk never reads them.
++    """
++    out = torch.empty_like(partial)
++    torch.ops.v41k.index_reduce_live(
++        out, *bank.pointers, bank.rank, bank.epochs, positions.long(), ratio, width
++    )
++    return out[:, :width]
++
++
+ def select_packed_positions(
+-    q, weights, keys, positions, valid_tokens, ratio, all_reduce, *, top_k=512
++    q,
++    weights,
++    keys,
++    positions,
++    valid_tokens,
++    ratio,
++    all_reduce,
++    *,
++    top_k=512,
++    bank=None,
+ ):
+-    """select_compressed_positions over packed, position-addressed index keys."""
++    """select_compressed_positions over packed, position-addressed index keys.
++
++    bank: the store's V41IndexBank (VLLM_V41_INDEX_REDUCE=1) or None. With a
++    bank, decode scores are written into this rank's bank slot and reduced
++    over the live prefix by _index_reduce_live instead of all_reduce.
++    """
+     from vllm.models.deepseek_v41.index_topk import index_topk
+ 
+     tokens, heads = q.shape[0], q.shape[1]
+     if tokens * heads <= 64:
+         # Decode: bounded fused scores over the live keys only (graph-safe).
+-        scores = torch.empty(
+-            tokens, keys.shape[0], dtype=torch.float16, device=q.device
++        live = (
++            bank is not None
++            and tokens <= bank.partial.shape[0]
++            and keys.shape[0] <= bank.width
++            and _cuda_index_scores()
+         )
++        if live:
++            # index_scores_decode uses out.size(1) as the row stride.
++            scores = bank.partial[:tokens]
++        else:
++            scores = torch.empty(
++                tokens, keys.shape[0], dtype=torch.float16, device=q.device
++            )
+         if _cuda_index_scores():
+             # Volta: Triton dots fall back to FMA; the CUDA kernel is bounded too.
+             torch.ops.v41k.index_scores_decode(
+@@ -820,7 +860,10 @@ def select_packed_positions(
+                 BLOCKS=_DECODE_BLOCKS,
+                 num_warps=4,
+             )
+-        scores = all_reduce(scores)
++        if live:
++            scores = _index_reduce_live(bank, scores, positions, ratio, keys.shape[0])
++        else:
++            scores = all_reduce(scores)
+         result = torch.empty(tokens, top_k, dtype=torch.int32, device=q.device)
+         if keys.shape[0] > 16384:
+             from vllm.models.deepseek_v41.index_topk import index_topk_parallel
+diff --git a/vllm/models/deepseek_v41/kv_store.py b/vllm/models/deepseek_v41/kv_store.py
+index 69d83fb56d..1d89c48efa 100644
+--- a/vllm/models/deepseek_v41/kv_store.py
++++ b/vllm/models/deepseek_v41/kv_store.py
+@@ -29,6 +29,11 @@
+ 
+ HOT_POSITIONS = int(envs.VLLM_V41_KV_HOT_POSITIONS)
+ DECODE_ROWS = 8  # at most this many tokens use the selected-row buffer
++# Live-prefix index reduce (VLLM_V41_INDEX_REDUCE): the v41k kernel's
++# CTA count and its per-CTA flag words (CTA b, rank r at word b * 4 + r) in
++# front of each rank's partial scores. Mirrors kRedCtas / kRedFlags in v41k.cu.
++REDUCE_CTAS = 64
++REDUCE_FLAGS = REDUCE_CTAS * 4 * 4
+ 
+ 
+ def _share_arena(size, group):
+@@ -69,6 +74,75 @@ def _share_arena(size, group):
+         return SharedHostArena.receive(connection)
+ 
+ 
++def _index_bank_ready(group):
++    """Every condition is the same on all TP ranks (the bank is collective)."""
++    if envs.VLLM_V41_INDEX_REDUCE != "1":
++        return False
++    communicator = getattr(group, "device_communicator", None)
++    ca = getattr(communicator, "ca_comm", None)
++    if group.world_size != 4 or ca is None or ca.disabled or not ca.fully_connected:
++        logger.warning(
++            "VLLM_V41_INDEX_REDUCE=1 needs TP4 and a fully connected custom "
++            "all-reduce; the decode index scores stay on the all-reduce"
++        )
++        return False
++    from vllm.model_executor.layers.quantization.gguf_v41_moe import (
++        _expert_major_ready,
++    )
++
++    if not (_expert_major_ready() and hasattr(torch.ops.v41k, "index_reduce_live")):
++        logger.warning(
++            "VLLM_V41_INDEX_REDUCE=1 but the loaded v41k library has no "
++            "index_reduce_live (rebuild v41k); the decode index scores stay on "
++            "the all-reduce"
++        )
++        return False
++    return True
++
++
++class V41IndexBank:
++    """INDEX_REDUCE: per-rank IPC bank for the live-prefix decode index reduce.
++
++    Each rank's buffer holds REDUCE_FLAGS bytes of per-CTA epoch flags, then
++    its partial FP16 scores [DECODE_ROWS, width] (width = the largest index
++    store, rounded up to 8 columns). index_scores_decode writes a rank's own
++    partial; v41k index_reduce_live reads all four over CUDA IPC and sums the
++    live columns. The all-reduces between two decode index calls bound rank
++    skew, so one partial slot per rank is enough.
++    """
++
++    def __init__(self, rows, device, group):
++        from vllm.distributed.device_communicators.custom_all_reduce import (
++            CustomAllreduce,
++        )
++        from vllm.model_executor.layers.quantization.gguf_shared_prefill import (
++            _DeviceView,
++        )
++
++        self.rank = group.rank_in_group
++        self.width = (rows + 7) // 8 * 8
++        size = REDUCE_FLAGS + DECODE_ROWS * self.width * 2
++        self.pointers = tuple(
++            int(p) for p in CustomAllreduce.create_shared_buffer(size, group.cpu_group)
++        )
++        own = torch.as_tensor(
++            _DeviceView(self.pointers[self.rank], (size,), "|u1"), device=device
++        )
++        own.zero_()
++        self.own = own
++        self.partial = (
++            own[REDUCE_FLAGS:].view(torch.float16).view(DECODE_ROWS, self.width)
++        )
++        self.epochs = torch.zeros(REDUCE_CTAS, dtype=torch.int32, device=device)
++        torch.accelerator.synchronize(device)
++        group.barrier()  # every rank's flags are zero before any reduce
++        logger.info(
++            "V4.1 index reduce bank (INDEX_REDUCE): %d columns, %.1f MiB per rank",
++            self.width,
++            size / 2**20,
++        )
++
++
+ @triton.jit(do_not_specialize=["HOT_ROWS"])
+ def _insert_c(
+     values,
+@@ -168,6 +242,11 @@ def __init__(self, sources, max_len, device, group):
+         self.selected = torch.zeros(
+             DECODE_ROWS, 512, C_ROW, dtype=torch.uint8, device=device
+         )
++        self.index_bank = (
++            V41IndexBank(max(self.rows.values()), device, group)
++            if self.sources and _index_bank_ready(group)
++            else None
++        )
+         logger.info(
+             "V4.1 packed KV: max_len %d, host %.0f MiB, "
+             "GPU index %.0f MiB, hot %.0f MiB, "
+diff --git a/vllm/models/deepseek_v41/model.py b/vllm/models/deepseek_v41/model.py
+index 1a224cb554..d59b176b38 100644
+--- a/vllm/models/deepseek_v41/model.py
++++ b/vllm/models/deepseek_v41/model.py
+@@ -323,6 +323,7 @@ def forward(
+                 valid_tokens,
+                 ratio,
+                 tensor_model_parallel_all_reduce,
++                bank=getattr(store, "index_bank", None),
+             )
+         metadata = source_cache.metadata()
+         keys = gather_index_keys(

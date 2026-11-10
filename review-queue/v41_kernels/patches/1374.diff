@@ -1,0 +1,698 @@
+diff --git a/docs/configuration/env_var_reference.md b/docs/configuration/env_var_reference.md
+index 0cd2a4f70a..246391d40d 100644
+--- a/docs/configuration/env_var_reference.md
++++ b/docs/configuration/env_var_reference.md
+@@ -336,6 +336,7 @@ This is the user reference. Internal tuning, diagnostics and compatibility alias
+ | `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE` | tuning | Controls the maximum number of requests to handle in a single asyncio task when processing per-token outputs in the V1 AsyncLLM interface. It is applicable when handling a high concurrency of streaming requests. Setting this too high can result in a higher variance of inter-message latencies. Setting it too low can negatively impact TTFT and overall throughput. | 128 | 128 | None | No SM70 path association |
+ | `VLLM_V1_USE_OUTLINES_CACHE` | configuration | Whether to turn on the outlines cache for V1 This cache is unbounded and on disk, so it's not safe to use in an environment with potentially malicious users. | False | False | None | No SM70 path association |
+ | `VLLM_V2_CUDAGRAPH_MEM_MIB` | configuration | Explicit CUDA graph memory reservation for the V2 GPU model runner, which does not profile graph memory yet. The default preserves upstream behavior. Set this from a measured capture result when sizing a tight KV cache pool. | 0.0 | 0.0 | None | No SM70 path association |
++| `VLLM_V41_DRAFT_MP_SHARD` | experimental | Shard the V4.1 DSpark main projection output rows on the existing raw FP8 GEMV path. | False | False | None | DeepSeek V4.1 SM70 |
+ | `VLLM_VIDEO_FETCH_TIMEOUT` | configuration | Timeout for fetching videos when serving multimodal models Default is 30 seconds | 30 | 30 | None | No SM70 path association |
+ | `VLLM_VIDEO_LOADER_BACKEND` | configuration | Backend for Video IO — selects the frame-sampling algorithm. - "opencv": uniform sampling. - "opencv\_dynamic": duration-aware dynamic sampling. - "identity": returns raw video bytes for model processor to handle.  Custom backend implementations can be registered via `@VIDEO_LOADER_REGISTRY.register("my_custom_video_loader")` and imported at runtime. If a non-existing backend is used, an AssertionError will be thrown. | 'opencv' | 'opencv' | None | No SM70 path association |
+ | `VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY` | configuration | Disable using pytorch's pin memory for CPU offloading. | False | False | None | No SM70 path association |
+diff --git a/docs/design/architecture/runtime_reference.md b/docs/design/architecture/runtime_reference.md
+index fec78b664f..68724add52 100644
+--- a/docs/design/architecture/runtime_reference.md
++++ b/docs/design/architecture/runtime_reference.md
+@@ -37,13 +37,14 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.gdn_schedule.GdnScheduleConfig` | kernel_config.gdn.schedule | resolve: [vllm/config/gdn_schedule.py](../../../vllm/config/gdn_schedule.py#L129); graph_options: [vllm/config/gdn_schedule.py](../../../vllm/config/gdn_schedule.py#L160) | [vllm/config/gdn_schedule.py](../../../vllm/config/gdn_schedule.py#L49) |
+ | `vllm.config.gdn_state.GdnStateConfig` | kernel_config.gdn.state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L39); graph_options: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L52) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L23) |
+ | `vllm.config.gdn_state.GdnStateTraceConfig` | observability_config.gdn_state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L99); compile_ignored_aliases: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L142) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L59) |
+-| `vllm.config.kernel.IrOpPriorityConfig` | kernel_config.ir_op_priority | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L84) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L67) |
+-| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1129) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L662) |
+-| `vllm.config.kernel.Sm70AwqConfig` | kernel_config.sm70_awq | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L338); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L317) |
+-| `vllm.config.kernel.Sm70Fp8Config` | kernel_config.sm70_fp8 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L433); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L369) |
+-| `vllm.config.kernel.Sm70GgufConfig` | kernel_config.sm70_gguf |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L498) |
+-| `vllm.config.kernel.Sm70NvFp4Config` | kernel_config.sm70_nvfp4 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L277); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L236) |
+-| `vllm.config.kernel.Sm70RingConfig` | kernel_config.sm70_ring |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L651) |
++| `vllm.config.kernel.IrOpPriorityConfig` | kernel_config.ir_op_priority | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L85) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L68) |
++| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1148) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L676) |
++| `vllm.config.kernel.Sm70AwqConfig` | kernel_config.sm70_awq | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L339); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L217) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L318) |
++| `vllm.config.kernel.Sm70Fp8Config` | kernel_config.sm70_fp8 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L447); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L217) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L383) |
++| `vllm.config.kernel.Sm70GgufConfig` | kernel_config.sm70_gguf |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L512) |
++| `vllm.config.kernel.Sm70NvFp4Config` | kernel_config.sm70_nvfp4 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L278); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L217) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L237) |
++| `vllm.config.kernel.Sm70RingConfig` | kernel_config.sm70_ring |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L665) |
++| `vllm.config.kernel.V41DraftProjectionPolicy` | kernel_config.v41_draft_projection | resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L29); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L370) |
+ | `vllm.config.kv_events.KVEventsConfig` | kv_events_config | __post_init__: [vllm/config/kv_events.py](../../../vllm/config/kv_events.py#L50) | [vllm/config/kv_events.py](../../../vllm/config/kv_events.py#L11) |
+ | `vllm.config.kv_transfer.KVTransferConfig` | kv_transfer_config | compute_hash: [vllm/config/kv_transfer.py](../../../vllm/config/kv_transfer.py#L75); __post_init__: [vllm/config/kv_transfer.py](../../../vllm/config/kv_transfer.py#L93) | [vllm/config/kv_transfer.py](../../../vllm/config/kv_transfer.py#L23) |
+ | `vllm.config.legacy_inputs.LegacyInputs` | kernel_config.sm70_awq.legacy, kernel_config.sm70_fp8.legacy, kernel_config.sm70_moe.awq.legacy, kernel_config.sm70_moe.fp8.legacy, kernel_config.sm70_moe.mxfp4.legacy, kernel_config.sm70_moe.nvfp4.legacy, kernel_config.sm70_nvfp4.legacy, scheduler_config.sm70_inputs | value: [vllm/config/legacy_inputs.py](../../../vllm/config/legacy_inputs.py#L39) | [vllm/config/legacy_inputs.py](../../../vllm/config/legacy_inputs.py#L15) |
+diff --git a/tests/config/test_v41_draft_projection_policy.py b/tests/config/test_v41_draft_projection_policy.py
+new file mode 100644
+index 0000000000..e562edc20b
+--- /dev/null
++++ b/tests/config/test_v41_draft_projection_policy.py
+@@ -0,0 +1,49 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Per-engine projection policy, serialization and inactive graph contracts."""
++
++import pickle
++
++import pytest
++
++from vllm import envs
++from vllm.config.kernel import KernelConfig, V41DraftProjectionPolicy
++
++
++def test_projection_inputs_freeze_and_only_bound_drafter_changes_hash(monkeypatch):
++    envs.disable_envs_cache()
++    monkeypatch.setenv("VLLM_V41_DRAFT_MP_SHARD", "1")
++    config = KernelConfig()
++    before = config.compute_hash()
++    config.v41_draft_projection.resolve()
++    assert config.compute_hash() == before
++    copy = pickle.loads(pickle.dumps(config.v41_draft_projection))
++    monkeypatch.setenv("VLLM_V41_DRAFT_MP_SHARD", "invalid-after-initialization")
++    copy.resolve()
++    assert copy.enabled is True
++    config.v41_draft_projection.active = True
++    assert config.compute_hash() != before
++
++
++def test_typed_projection_override_wins(monkeypatch):
++    envs.disable_envs_cache()
++    monkeypatch.setenv("VLLM_V41_DRAFT_MP_SHARD", "invalid")
++    policy = V41DraftProjectionPolicy(enabled=False)
++    policy.resolve()
++    assert policy.enabled is False
++    assert policy.sources["enabled"] == "typed"
++
++
++@pytest.mark.parametrize("value", ["2", " ", "true"])
++def test_invalid_legacy_flag_refuses(monkeypatch, value):
++    envs.disable_envs_cache()
++    monkeypatch.setenv("VLLM_V41_DRAFT_MP_SHARD", value)
++    with pytest.raises(ValueError, match="VLLM_V41_DRAFT_MP_SHARD"):
++        V41DraftProjectionPolicy().resolve()
++
++
++def test_empty_legacy_flag_preserves_disabled_contract(monkeypatch):
++    envs.disable_envs_cache()
++    monkeypatch.setenv("VLLM_V41_DRAFT_MP_SHARD", "")
++    policy = V41DraftProjectionPolicy()
++    policy.resolve()
++    assert policy.enabled is False
+diff --git a/tests/models/test_deepseek_v41_draft_projection_routing.py b/tests/models/test_deepseek_v41_draft_projection_routing.py
+new file mode 100644
+index 0000000000..78163b7c93
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_draft_projection_routing.py
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU model-adapter tests; provider arithmetic is qualified separately."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch import nn
++
++from vllm.models.deepseek_v41 import draft_projection, dspark, fp8_linear
++
++
++@pytest.mark.parametrize("m", [1, 8, 9])
++@pytest.mark.parametrize("enabled", [False, True])
++def test_model_routes_small_rows_to_shards(monkeypatch, m, enabled):
++    model = dspark.V41DraftModel.__new__(dspark.V41DraftModel)
++    nn.Module.__init__(model)
++    model.shard_main_projection = enabled
++    model._shard_main_projection_logged = True
++    model.main_norm = nn.Identity()
++    calls = []
++
++    class Projection(nn.Module):
++        weight = torch.empty(128, 384, dtype=torch.float8_e4m3fn)
++        weight_scale_inv = torch.empty(4, 12, dtype=torch.float8_e8m0fnu)
++
++        def forward(self, x):
++            calls.append("replicated")
++            return x[:, :128] + 1
++
++    model.main_proj = Projection()
++
++    def sharded(x, weight, scales, rank, world, gather):
++        assert weight is model.main_proj.weight
++        assert scales is model.main_proj.weight_scale_inv
++        assert (rank, world) == (1, 4)
++        calls.append("sharded")
++        return x[:, :128] + 2
++
++    monkeypatch.setattr(draft_projection, "sharded_projection", sharded)
++    monkeypatch.setattr(dspark, "get_tensor_model_parallel_rank", lambda: 1)
++    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
++    result = model.combine_hidden_states(torch.zeros(m, 384, dtype=torch.float16))
++    use_shard = enabled and m <= 8
++    assert calls == ["sharded" if use_shard else "replicated"]
++    assert torch.equal(result, torch.full_like(result, 2 if use_shard else 1))
++
++
++@pytest.mark.parametrize("kind", ["wrong_weight", "missing_scales", "wrong_scales"])
++def test_model_construction_refuses_non_raw_fp8(monkeypatch, kind):
++    class Projection(nn.Module):
++        def __init__(self, *args, **kwargs):
++            super().__init__()
++            self.bias = None
++            self.weight = nn.Parameter(
++                torch.empty(
++                    128,
++                    384,
++                    dtype=(
++                        torch.float16 if kind == "wrong_weight" else torch.float8_e4m3fn
++                    ),
++                ),
++                requires_grad=False,
++            )
++            if kind != "missing_scales":
++                self.weight_scale_inv = nn.Parameter(
++                    torch.empty(
++                        4,
++                        12,
++                        dtype=(
++                            torch.float16
++                            if kind == "wrong_scales"
++                            else torch.float8_e8m0fnu
++                        ),
++                    ),
++                    requires_grad=False,
++                )
++
++    monkeypatch.setattr(dspark, "ReplicatedLinear", Projection)
++    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
++    monkeypatch.setattr(fp8_linear, "_gemv_ready", lambda: True)
++    config = SimpleNamespace(
++        kernel_config=SimpleNamespace(
++            v41_draft_projection=SimpleNamespace(enabled=True)
++        ),
++        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(hidden_size=128)),
++        quant_config=None,
++    )
++    with pytest.raises(ValueError, match="raw E4M3 weights and UE8M0 scales"):
++        dspark.V41DraftModel(config, "draft")
+diff --git a/tests/models/test_deepseek_v41_draft_projection_shard.py b/tests/models/test_deepseek_v41_draft_projection_shard.py
+new file mode 100644
+index 0000000000..3f14ad375d
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_draft_projection_shard.py
+@@ -0,0 +1,128 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Real TP shard/replicated parity, split-K mutation and drafter graph context.
++
++Run under torchrun with 2/4/8 SM70 ranks and VLLM_V41_FP8_GEMV=1.
++VLLM_V41K_LIB must name a built v41k extension. No replacement kernels.
++"""
++
++import os
++from dataclasses import replace
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v41 import draft_projection
++from vllm.models.deepseek_v41.fp8_linear import _gemv_ready, fp8_block32_linear
++
++
++@pytest.fixture(scope="module")
++def tp_group():
++    world = int(os.environ.get("WORLD_SIZE", "1"))
++    if world not in (2, 4, 8) or not torch.cuda.is_available():
++        pytest.skip("torchrun with 2/4/8 SM70 GPUs required")
++    rank = int(os.environ["RANK"])
++    local_rank = int(os.environ["LOCAL_RANK"])
++    torch.cuda.set_device(local_rank)
++    from vllm.distributed import (
++        destroy_distributed_environment,
++        destroy_model_parallel,
++        init_distributed_environment,
++        initialize_model_parallel,
++        tensor_model_parallel_all_gather,
++    )
++
++    init_distributed_environment(world, rank, "env://", local_rank, "nccl")
++    initialize_model_parallel(tensor_model_parallel_size=world)
++    try:
++        ready = torch.tensor(
++            int(torch.cuda.get_device_capability() == (7, 0) and _gemv_ready()),
++            device="cuda",
++        )
++        torch.distributed.all_reduce(ready, op=torch.distributed.ReduceOp.MIN)
++        if not ready.item():
++            pytest.skip("every rank requires SM70 and a compatible v41k FP8 GEMV")
++        yield rank, world, tensor_model_parallel_all_gather
++    finally:
++        destroy_model_parallel()
++        destroy_distributed_environment()
++
++
++def projection_inputs(m):
++    """The same signed, finite FP8 inputs qualify parity and the mutant."""
++    generator = torch.Generator(device="cuda").manual_seed(517)
++    x = torch.randn(m, 15360, device="cuda", generator=generator).half() * 0.01
++    raw = torch.randint(
++        0, 256, (5120, 15360), device="cuda", dtype=torch.uint8, generator=generator
++    )
++    raw[(raw & 127) == 127] = 0
++    weight = raw.view(torch.float8_e4m3fn)
++    scales = torch.full((160, 480), 119, device="cuda", dtype=torch.uint8).view(
++        torch.float8_e8m0fnu
++    )
++    return x, weight, scales
++
++
++def collective_mismatch(actual, expected):
++    mismatch = torch.tensor(
++        int(not torch.equal(actual.view(torch.int16), expected.view(torch.int16))),
++        device="cuda",
++    )
++    torch.distributed.all_reduce(mismatch, op=torch.distributed.ReduceOp.MAX)
++    return bool(mismatch.item())
++
++
++@pytest.mark.parametrize("m", range(1, 9))
++def test_real_projection_shards_and_graph_replay(tp_group, m):
++    from vllm.distributed import graph_capture
++    from vllm.platforms import current_platform
++
++    rank, world, gather = tp_group
++    x, weight, scales = projection_inputs(m)
++    assert draft_projection.projection_plan(5120, 15360, m, world, rank).split == 2
++
++    def sharded():
++        return draft_projection.sharded_projection(
++            x, weight, scales, rank, world, gather
++        )
++
++    expected = fp8_block32_linear(x, weight, scales)
++    actual = sharded()
++    # Every rank reaches the same decision before anyone enters another collective.
++    assert not collective_mismatch(actual, expected), "eager shard parity failed"
++    sharded()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with (
++        graph_capture(device=x.device) as context,
++        torch.cuda.graph(
++            graph, pool=current_platform.get_global_graph_pool(), stream=context.stream
++        ),
++    ):
++        captured = sharded()
++    x.mul_(0.5)
++    expected = fp8_block32_linear(x, weight, scales)
++    graph.replay()
++    assert not collective_mismatch(captured, expected), "graph replay parity failed"
++
++
++def test_wrong_local_split_is_detected(tp_group, monkeypatch):
++    rank, world, gather = tp_group
++    original_plan = draft_projection.projection_plan
++
++    def local_split(n, k, m, size, local_rank):
++        plan = original_plan(n, k, m, size, local_rank)
++        local_ctas = ((n // size) + 31) // 32
++        return replace(
++            plan, split=max(1, min(k // 512, (240 + local_ctas - 1) // local_ctas))
++        )
++
++    monkeypatch.setattr(draft_projection, "projection_plan", local_split)
++    detected = False
++    for m in range(1, 9):
++        x, weight, scales = projection_inputs(m)
++        expected = fp8_block32_linear(x, weight, scales)
++        mutated = draft_projection.sharded_projection(
++            x, weight, scales, rank, world, gather
++        )
++        detected = collective_mismatch(mutated, expected) or detected
++    assert detected, "INCONCLUSIVE: parity inputs did not detect the split-K mutation"
+diff --git a/tests/tools/test_v41_draft_projection_plan.py b/tests/tools/test_v41_draft_projection_plan.py
+new file mode 100644
+index 0000000000..a64ca2cae9
+--- /dev/null
++++ b/tests/tools/test_v41_draft_projection_plan.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Arithmetic acceptance for output-row sharding; no GPU or replacement op."""
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v41 import draft_projection as projection
++
++
++def projection_weights():
++    return dict(
++        weight=torch.empty(5120, 15360, dtype=torch.float8_e4m3fn, device="meta"),
++        scales=torch.empty(160, 480, dtype=torch.float8_e8m0fnu, device="meta"),
++    )
++
++
++@pytest.mark.parametrize("world", [1, 2, 4, 8])
++def test_shards_cover_full_weight_once_and_keep_full_call_split(world):
++    plans = [
++        projection.projection_plan(5120, 15360, 6, world, rank) for rank in range(world)
++    ]
++    assert [(p.first, p.last) for p in plans] == [
++        (r * (5120 // world), (r + 1) * (5120 // world)) for r in range(world)
++    ]
++    assert all(p.split == 2 for p in plans)  # ceil(240 / ceil(5120 / 32)) = 2
++
++
++@pytest.mark.parametrize(
++    "args",
++    [
++        (5120, 15360, 6, 4, -1),
++        (5120, 15360, 6, 4, 4),
++        (5120, 15360, 0, 4, 0),
++        (5120, 15360, 9, 4, 0),
++        (5120, 15360, 6, 3, 0),
++        (5120, 15359, 6, 4, 0),
++    ],
++)
++def test_invalid_geometry_refuses(args):
++    with pytest.raises(ValueError):
++        projection.projection_plan(*args)
++
++
++@pytest.mark.parametrize(
++    "world, gemv_ready, biased, message",
++    [(1, True, False, "TP"), (4, False, False, "GEMV"), (4, True, True, "bias-free")],
++)
++def test_construction_admission_refuses(world, gemv_ready, biased, message):
++    with pytest.raises(ValueError, match=message):
++        projection.admit_projection(
++            world, gemv_ready, biased, 5120, 15360, **projection_weights()
++        )
++
++
++def test_construction_admission_accepts_supported_projection():
++    projection.admit_projection(4, True, False, 5120, 15360, **projection_weights())
+diff --git a/vllm/config/execution_policy.py b/vllm/config/execution_policy.py
+index 95e85a0301..1e71c354ef 100644
+--- a/vllm/config/execution_policy.py
++++ b/vllm/config/execution_policy.py
+@@ -787,6 +787,7 @@ def gib_bytes(self, field: str) -> int | None:
+ POLICY_OWNERS = {
+     "compilation_config.runtime": "GraphPolicy",
+     "kernel_config.layer_execution": "LayerExecutionPolicy",
++    "kernel_config.v41_draft_projection": "V41DraftProjectionPolicy",
+     "kernel_config.sm70_sparse": "Sm70SparseConfig",
+     "parallel_config.communication": "CommunicationPolicy",
+     "offload_config.ple": "PlePlacementPolicy",
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index fa6e979a24..c909c0b4ab 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -8,6 +8,7 @@
+ from pydantic import Field, field_validator, model_validator
+ 
+ from vllm.config.execution_policy import LayerExecutionPolicy
++from vllm.config.execution_policy_base import ExecutionPolicy
+ from vllm.config.gdn import GdnConfig
+ from vllm.config.legacy_inputs import LegacyInputs
+ from vllm.config.sm70_moe import Sm70MoEConfig
+@@ -365,6 +366,19 @@ def resolve(self) -> None:
+         self.resolved = True
+ 
+ 
++@config
++class V41DraftProjectionPolicy(ExecutionPolicy):
++    """Exact output-row sharding for the V4.1 DSpark main projection."""
++
++    enabled: bool | None = None
++    """Opt in only for the existing raw-FP8 small-M GEMV path."""
++    active: bool = Field(default=False, init=False)
++    """Only a constructed V4.1 drafter binds this computation."""
++    aliases: ClassVar[dict[str, str]] = {
++        "enabled": "VLLM_V41_DRAFT_MP_SHARD",
++    }
++
++
+ @config
+ class Sm70Fp8Config(Sm70LinearCompatibility):
+     """Per-engine serialized block-FP8 variants; native tuning stays unchanged.
+@@ -766,6 +780,11 @@ def resolve_sm70_rmsnorm_gated(self, *, qualified: bool) -> None:
+     sm70_awq: Sm70AwqConfig = Field(default_factory=Sm70AwqConfig)
+     """SM70 dense AWQ policy, resolved per engine."""
+ 
++    v41_draft_projection: V41DraftProjectionPolicy = Field(
++        default_factory=V41DraftProjectionPolicy
++    )
++    """Model-admitted DSpark projection computation; independent of FP8 selection."""
++
+     sm70_fp8: Sm70Fp8Config = Field(default_factory=Sm70Fp8Config)
+     """SM70 serialized block-FP8 variant policy, resolved per engine."""
+ 
+@@ -1179,6 +1198,7 @@ def compute_hash(self) -> str:
+                     "ple_disk_cascade_active",
+                 }
+             )
++        ignored_factors.add("v41_draft_projection")
+         if not self.sm70_awq.resolved:
+             # An unused format must not perturb another format's graph cache.
+             ignored_factors.add("sm70_awq")
+@@ -1239,6 +1259,8 @@ def compute_hash(self) -> str:
+             factors["sm70_mxfp4"] = self.sm70_mxfp4.hash_options()
+         if self.sm70_marlin.values:
+             factors["sm70_marlin"] = self.sm70_marlin.hash_options()
++        if self.v41_draft_projection.active:
++            factors["v41_draft_projection"] = self.v41_draft_projection.compute_hash()
+         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
+         return hash_factors(factors)
+ 
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..8ec70e930c 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -475,6 +475,7 @@
+     VLLM_V41_ENGRAM_READERS: str | None = None
+     VLLM_V41_EXACT_GEMM: str = "0"
+     VLLM_V41_EXPERT_FAST_HIT: str = "1"
++    VLLM_V41_DRAFT_MP_SHARD: bool = False
+     VLLM_V41_FP8_GEMV: str = "1"
+     VLLM_V41_FREE_SLOTS: str | None = None
+     VLLM_V41_FUSED_SPARSE: str = "0"
+@@ -7396,6 +7397,21 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_DRAFT_MP_SHARD": env_var(
++        lambda: (
++            env_with_choices("VLLM_V41_DRAFT_MP_SHARD", "0", ["0", "1", ""])() == "1"
++        ),
++        description=(
++            "Shard the V4.1 DSpark main projection output rows on the existing "
++            "raw FP8 GEMV path."
++        ),
++        category="experimental",
++        declared_default="False",
++        effective_default="False",
++        automatic_conditions=(),
++        acceleration_paths=("DeepSeek V4.1 SM70",),
++        user_visible=True,
++    ),
+     "VLLM_V41_FP8_GEMV": env_var(
+         lambda: os.getenv("VLLM_V41_FP8_GEMV", "1"),
+         description=("DS-V4.1 SM70 runtime switch (developer)."),
+diff --git a/vllm/models/deepseek_v41/draft_projection.py b/vllm/models/deepseek_v41/draft_projection.py
+new file mode 100644
+index 0000000000..3f5e5df703
+--- /dev/null
++++ b/vllm/models/deepseek_v41/draft_projection.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Shard independent output rows without changing the full-call split-K."""
++
++from collections.abc import Callable
++from dataclasses import dataclass
++
++import torch
++
++
++@dataclass(frozen=True)
++class ProjectionPlan:
++    first: int
++    last: int
++    split: int
++
++    def __post_init__(self) -> None:
++        if (
++            self.first < 0
++            or self.last <= self.first
++            or self.first % 32
++            or self.last % 32
++            or self.split < 1
++        ):
++            raise ValueError(
++                "projection plan requires aligned increasing rows and positive split"
++            )
++
++
++def projection_plan(n: int, k: int, m: int, world: int, rank: int) -> ProjectionPlan:
++    """Validated row slice and the original replicated GEMV's split count."""
++    if world not in (1, 2, 4, 8) or not 0 <= rank < world:
++        raise ValueError("draft projection requires TP 1/2/4/8 and a valid rank")
++    if n <= 0 or k <= 0 or n % (32 * world) or k % 32 or not 1 <= m <= 8:
++        raise ValueError("draft projection requires aligned N/K and 1..8 input rows")
++    rows = n // world
++    ctas = (n + 31) // 32
++    split = max(1, min(max(1, k // 512), (240 + ctas - 1) // ctas))
++    return ProjectionPlan(rank * rows, (rank + 1) * rows, split)
++
++
++def admit_projection(
++    world: int,
++    gemv_ready: bool,
++    biased: bool,
++    n: int,
++    k: int,
++    *,
++    weight: torch.Tensor,
++    scales: torch.Tensor | None,
++) -> None:
++    """Refuse unsupported immutable model/provider conditions at construction."""
++    if world not in (2, 4, 8):
++        raise ValueError("V4.1 draft projection sharding requires TP 2/4/8")
++    if not gemv_ready:
++        raise ValueError("V4.1 draft projection sharding requires the v41k FP8 GEMV")
++    if biased:
++        raise ValueError("V4.1 sharded main projection must be bias-free")
++    projection_plan(n, k, 1, world, 0)
++    if (
++        weight.dtype != torch.float8_e4m3fn
++        or scales is None
++        or scales.dtype != torch.float8_e8m0fnu
++    ):
++        raise ValueError("draft projection requires raw E4M3 weights and UE8M0 scales")
++    if (
++        weight.shape != (n, k)
++        or scales.shape != (n // 32, k // 32)
++        or not (weight.is_contiguous() and scales.is_contiguous())
++    ):
++        raise ValueError("draft projection requires aligned contiguous weight/scales")
++
++
++def sharded_projection(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    scales: torch.Tensor,
++    rank: int,
++    world: int,
++    gather: Callable[[torch.Tensor], torch.Tensor],
++) -> torch.Tensor:
++    n, k = weight.shape
++    plan = projection_plan(n, k, x.shape[0], world, rank)
++    if (
++        x.ndim != 2
++        or x.shape[1] != k
++        or x.dtype != torch.float16
++        or not x.is_contiguous()
++    ):
++        raise ValueError("draft projection requires contiguous FP16 [M, K] input")
++    if weight.dtype != torch.float8_e4m3fn or scales.dtype != torch.float8_e8m0fnu:
++        raise ValueError("draft projection requires raw E4M3 weights and UE8M0 scales")
++    if scales.shape != (n // 32, k // 32) or not (
++        weight.is_contiguous() and scales.is_contiguous()
++    ):
++        raise ValueError("draft projection requires aligned contiguous weight/scales")
++    local_weight = weight[plan.first : plan.last]
++    local_scales = scales[plan.first // 32 : plan.last // 32]
++    result = torch.empty(
++        x.shape[0], plan.last - plan.first, dtype=x.dtype, device=x.device
++    )
++    partials = torch.empty(
++        plan.split * result.numel() if plan.split > 1 else 1,
++        dtype=torch.float32,
++        device=x.device,
++    )
++    torch.ops.v41k.fp8_gemv(
++        result,
++        x,
++        local_weight.view(torch.uint8),
++        local_scales.view(torch.uint8),
++        partials,
++        plan.split,
++        None,
++    )
++    return gather(result)
+diff --git a/vllm/models/deepseek_v41/dspark.py b/vllm/models/deepseek_v41/dspark.py
+index da92c375f3..6217073873 100644
+--- a/vllm/models/deepseek_v41/dspark.py
++++ b/vllm/models/deepseek_v41/dspark.py
+@@ -11,10 +11,13 @@
+ 
+ from vllm.config import set_current_vllm_config
+ from vllm.distributed import (
++    get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
++    tensor_model_parallel_all_gather,
+     tensor_model_parallel_all_reduce,
+ )
+ from vllm.forward_context import get_forward_context, is_forward_context_available
++from vllm.logger import init_logger
+ from vllm.model_executor.kernels.mhc.deepseek_v41 import collapse_hc
+ from vllm.model_executor.layers.fused_moe import FusedMoE
+ from vllm.model_executor.layers.linear import LinearBase, ReplicatedLinear
+@@ -32,6 +35,8 @@
+ from .quant_rope import apply_rope, attention_qdq, rope_table
+ from .query_graph import V41ContextGraphs, V41GreedyDraftGraph, V41QueryGraph
+ 
++logger = init_logger(__name__)
++
+ _MARKOV_FUSED = __import__("os").environ.get("VLLM_V41_MARKOV_FUSED", "1") == "1"
+ 
+ 
+@@ -110,6 +115,13 @@ class V41DraftBlock(V41Block):
+ class V41DraftModel(nn.Module):
+     def __init__(self, vllm_config, prefix):
+         super().__init__()
++        policy = vllm_config.kernel_config.v41_draft_projection
++        if not isinstance(policy.enabled, bool):
++            raise RuntimeError("V4.1 draft projection policy was not initialized")
++        # Bound by the model adapter before graph-key creation.
++        policy.active = policy.enabled
++        self.shard_main_projection = policy.enabled
++        self._shard_main_projection_logged = False
+         c = vllm_config.model_config.hf_text_config
+         self.hidden_size = c.hidden_size
+         # The proposer replaces these modules before profiling or generation.
+@@ -123,6 +135,19 @@ def __init__(self, vllm_config, prefix):
+             quant_config=vllm_config.quant_config,
+             prefix=prefix + ".main_proj",
+         )
++        if policy.enabled:
++            from .draft_projection import admit_projection
++            from .fp8_linear import _gemv_ready
++
++            admit_projection(
++                get_tensor_model_parallel_world_size(),
++                _gemv_ready(),
++                self.main_proj.bias is not None,
++                c.hidden_size,
++                c.hidden_size * 3,
++                weight=self.main_proj.weight,
++                scales=getattr(self.main_proj, "weight_scale_inv", None),
++            )
+         self.main_norm, self.norm = V41Norm(c.hidden_size), V41Norm(c.hidden_size)
+         shared = _SharedAttention()
+         self.layers = nn.ModuleList(
+@@ -155,6 +180,22 @@ def combine_hidden_states(self, auxiliary):
+         # the following RMS normalization removes this common factor.
+         if auxiliary.dtype != torch.float16:  # target stores pre-scaled FP16
+             auxiliary = (auxiliary * (2.0**-6)).to(torch.float16)
++        if self.shard_main_projection and 1 <= auxiliary.shape[0] <= 8:
++            from .draft_projection import sharded_projection
++
++            if not self._shard_main_projection_logged:
++                logger.info("V4.1 DSpark main_proj: TP-sharded GEMV active")
++                self._shard_main_projection_logged = True
++            return self.main_norm(
++                sharded_projection(
++                    auxiliary,
++                    self.main_proj.weight,
++                    self.main_proj.weight_scale_inv,
++                    get_tensor_model_parallel_rank(),
++                    get_tensor_model_parallel_world_size(),
++                    tensor_model_parallel_all_gather,
++                )
++            )
+         return self.main_norm(self.main_proj(auxiliary))
+ 
+     def precompute_and_store_context_kv(self, states, positions, slots=None):

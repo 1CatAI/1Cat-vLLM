@@ -1,0 +1,105 @@
+{
+  "initial_inventory": {
+    "number": 1374,
+    "title": "[Perf][SM70][DeepSeek-V4] Shard the DSpark main projection output rows",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1374",
+    "isDraft": false,
+    "headRefOid": "a19f07f72bb381738785ca1938963267d1dc4181",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1374,
+    "title": "[Perf][SM70][DeepSeek-V4] Shard the DSpark main projection output rows",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code) and reviewed in three rounds before opening. Independent of our other DeepSeek-V4.1 PRs: it applies to `main` alone and keeps main's TP4/PP1 admission. The effect is small (below our detection threshold); it is offered because it is exact and adds no native kernel.\n\n## Purpose\n\nCompute disjoint output rows of the DSpark main projection and all-gather before normalization. Keep the full replicated call's split-K so FP32 accumulation boundaries remain unchanged; larger prefill continues to use the replicated path. Reuses v41k FP8 GEMV without a new native kernel.\n\nThe model-specific kernel_config.v41_draft_projection policy is independent of generic FP8 selection. Construction refuses TP1, unavailable native GEMV, bias, non-raw FP8 weights/scales and unsupported geometry. #1021's native block-FP8 support is related storage work, not this sharding algorithm.\n\n## Test Plan\n\n```bash\npython -m tools.generate_architecture_reference --check\npython -m tools.generate_env_reference --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.config_inventory --check\npython tools/pre_commit/check_layering.py\n```\n\n```bash\npython -m pytest -q --confcutdir=tests/tools tests/tools/test_v41_draft_projection_plan.py tests/tools/test_architecture_reference.py tests/tools/test_architecture_doc_urls.py tests/tools/test_architecture_check_scope.py\npython -m pytest -q --confcutdir=tests/config tests/config/test_v41_draft_projection_policy.py tests/config/test_projection_sampling_policy.py tests/config/test_runtime_default_ownership.py\npython -m pytest -q --confcutdir=tests/models tests/models/test_deepseek_v41_draft_projection_routing.py\n# GPU: real replicated vs sharded operator, TP gather, split-K mutation and graphs\nVLLM_V41_FP8_GEMV=1 VLLM_V41K_LIB=\"$V41K\" \\\n  torchrun --standalone --nproc-per-node=4 -m pytest -q --confcutdir=tests/models \\\n  tests/models/test_deepseek_v41_draft_projection_shard.py\n```\n\nThe GPU test skips unless torchrun supplies 2/4/8 SM70 ranks and every rank has the native GEMV. Mismatch decisions are collective so another rank cannot enter a later collective alone. It uses the drafter's graph_capture context, global pool and stream. Parity and the local-split mutation share identical input generation. The GPU test uses M=1..8 and N=5120/K=15360, with replicated split=2. It compares the real sharded path and real all-gather with the existing replicated operator, captures/replays with changed input, and checks that a deliberately wrong local-width split changes results. This test has not run on GPU; its mutation sensitivity and collective capture safety are unverified.\n\nFor serving, set CHECKPOINT to a compatible V4.1 checkpoint and compare ENABLED=0/1 using paired disabled/enabled/enabled/disabled arms, repeated for the small effect:\n\n```bash\nVLLM_V41_PACKED_KV=1 VLLM_V41K_LIB=\"$V41K\" VLLM_V41_FP8_GEMV=1 \\\nVLLM_V41_DRAFT_MP_SHARD=\"$ENABLED\" \\\n  vllm serve \"$CHECKPOINT\" --tensor-parallel-size 4 --pipeline-parallel-size 1 \\\n  --max-num-seqs 1 --max-num-batched-tokens 8192 --no-async-scheduling \\\n  --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5}'\n```\n\nWarm greedy and seeded sampled paths first. Compare output token IDs, native hits, post-normalization values, first-token time, decode milliseconds/round and acceptance separately. Also verify M>8 remains on the original prefill route. The PP2 model changes (#1370) and the GGUF hybrid checkpoint are not in this branch, so these commands qualify the public path rather than reproduce the historical values.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| DSpark main projection | Raw E4M3 weights, UE8M0 scales, FP16 input | M1..8; provider supports TP2/4/8, model retains TP4 admission; full-call split=2 at 5120×15360 | Opt-in row sharding, actual TP all-gather, original norm | Executed CPU geometry/admission/config; historical measurement; GPU test supplied | Real kernel/collective parity, deliberate GPU mutant and graph capture/replay are untested |\n| Disabled / larger prefill | Same | OFF or M>8 | Original replicated projection | Executed CPU model routing and policy contracts | Current-main serving |\n| Unsupported immutable inputs | Same | TP1, missing GEMV, bias, non-raw weight/scales, invalid geometry | Construction refuses loudly | CPU admission tests | Complete model construction on GPU |\n| Other FP8 models | Other providers | V4.1 drafter not bound | Inactive policy omitted from hash | CPU hash/default tests | No speed claim |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: Opt-in through kernel_config.v41_draft_projection.enabled or VLLM_V41_DRAFT_MP_SHARD=1.\n- Required CLI options and environment switches: V4.1 DSpark with five speculative tokens, VLLM_V41_FP8_GEMV=1 and compatible v41k; existing model/topology admission retained.\n- KV cache dtype used for the benchmark: Historical #1277 packed V4.1 KV; projection adds no codec.\n- Wheel SHA or source commit: This branch: rebased onto `main` `3c051b52e`. The numbers were measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port (#1370); this branch has not run on a GPU.\n- PYTHONPATH, source overlays, or external native libraries used (write \"none\" if absent): Historical unpublished PP2 model changes and existing v41k library. No extra kernel library for this projection-only contribution.\n- User-entry route-hit, speed, and output-quality evidence: MEASURED 2026-11-04: -0.130 ms per decode round, eight of eight pairs negative, identical outputs; isolated draft 841.7 to 640.7 microseconds. Below our predeclared detection threshold; no statistically established serving win. Reproducing them needs the PP2 port (#1370) and a GGUF hybrid checkpoint.\n- Existing kernel/backend registry and capability-rejection reasons: Existing raw FP8 GEMV; model-owned admission for TP/geometry and provider availability; dynamic input/scales validation in helper. No MoE priority change.\n- Per-engine configuration and deprecated-variable compatibility: ExecutionPolicy field owned directly by KernelConfig for model projection computation; serialized and resolved once; typed override wins, empty alias OFF. Only the bound drafter contributes its hash before graph-key creation.\n- New/changed environment metadata and generated reference check: One experimental alias registered; generated architecture/env and metadata/registration/ownership gates rerun.\n- Route snapshot command and intentional changed rows (write \"none\" for refactors): python -m tools.sm70_route_snapshot --category moe --output /dev/stdout; compare with main. No intentional MoE selection changes; separate native projection tracing required.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: SM70-named count unchanged; one V41 alias added; zero new unregistered runtime reads. No broader model qualification.\n\n## Test Result\n\n**MEASURED, 2026-11-04,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4 (#1370), one request, DSpark 5, paired arms: -0.130 ms per decode round, eight of eight pairs negative, outputs identical; the isolated draft step went from 841.7 to 640.7 microseconds. The round-time change is below our predeclared detection threshold.\n\n**Re-run on `main` for this PR, 2026-11-05,** CPU only (no visible GPU), branch rebased onto `3c051b52e`:\n\n- pytest, the nine files in the plan: 83 passed, 9 skipped, 10 failed. The 9 skips are the distributed GPU test (`torchrun with 2/4/8 SM70 GPUs required`). The 10 failures are all in `tests/config/test_runtime_default_ownership.py` and fail identically on unmodified `main` (`SimpleNamespace` has no attribute `model`).\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass. `check_layering.py` output is identical to `main`.\n- ruff 0.14.0 `check` and `format --check` on the 9 changed Python files: pass.\n\nNot run: the distributed GPU parity, mutation and graph test (it needs 2, 4 or 8 SM70 GPUs; we had one free card), so GPU bitwise parity, mutation sensitivity and all-gather capture safety are INCONCLUSIVE on this branch. No serving re-measurement.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1374",
+    "isDraft": false,
+    "headRefName": "pli/v41-draft-mp-shard",
+    "headRefOid": "a19f07f72bb381738785ca1938963267d1dc4181",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1374,
+    "id": "PR_kwDORjYFXs8AAAABNISHEQ",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "a19f07f72bb381738785ca1938963267d1dc4181",
+    "title": "[Perf][SM70][DeepSeek-V4] Shard the DSpark main projection output rows",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1374",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code) and reviewed in three rounds before opening. Independent of our other DeepSeek-V4.1 PRs: it applies to `main` alone and keeps main's TP4/PP1 admission. The effect is small (below our detection threshold); it is offered because it is exact and adds no native kernel.\n\n## Purpose\n\nCompute disjoint output rows of the DSpark main projection and all-gather before normalization. Keep the full replicated call's split-K so FP32 accumulation boundaries remain unchanged; larger prefill continues to use the replicated path. Reuses v41k FP8 GEMV without a new native kernel.\n\nThe model-specific kernel_config.v41_draft_projection policy is independent of generic FP8 selection. Construction refuses TP1, unavailable native GEMV, bias, non-raw FP8 weights/scales and unsupported geometry. #1021's native block-FP8 support is related storage work, not this sharding algorithm.\n\n## Test Plan\n\n```bash\npython -m tools.generate_architecture_reference --check\npython -m tools.generate_env_reference --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.config_inventory --check\npython tools/pre_commit/check_layering.py\n```\n\n```bash\npython -m pytest -q --confcutdir=tests/tools tests/tools/test_v41_draft_projection_plan.py tests/tools/test_architecture_reference.py tests/tools/test_architecture_doc_urls.py tests/tools/test_architecture_check_scope.py\npython -m pytest -q --confcutdir=tests/config tests/config/test_v41_draft_projection_policy.py tests/config/test_projection_sampling_policy.py tests/config/test_runtime_default_ownership.py\npython -m pytest -q --confcutdir=tests/models tests/models/test_deepseek_v41_draft_projection_routing.py\n# GPU: real replicated vs sharded operator, TP gather, split-K mutation and graphs\nVLLM_V41_FP8_GEMV=1 VLLM_V41K_LIB=\"$V41K\" \\\n  torchrun --standalone --nproc-per-node=4 -m pytest -q --confcutdir=tests/models \\\n  tests/models/test_deepseek_v41_draft_projection_shard.py\n```\n\nThe GPU test skips unless torchrun supplies 2/4/8 SM70 ranks and every rank has the native GEMV. Mismatch decisions are collective so another rank cannot enter a later collective alone. It uses the drafter's graph_capture context, global pool and stream. Parity and the local-split mutation share identical input generation. The GPU test uses M=1..8 and N=5120/K=15360, with replicated split=2. It compares the real sharded path and real all-gather with the existing replicated operator, captures/replays with changed input, and checks that a deliberately wrong local-width split changes results. This test has not run on GPU; its mutation sensitivity and collective capture safety are unverified.\n\nFor serving, set CHECKPOINT to a compatible V4.1 checkpoint and compare ENABLED=0/1 using paired disabled/enabled/enabled/disabled arms, repeated for the small effect:\n\n```bash\nVLLM_V41_PACKED_KV=1 VLLM_V41K_LIB=\"$V41K\" VLLM_V41_FP8_GEMV=1 \\\nVLLM_V41_DRAFT_MP_SHARD=\"$ENABLED\" \\\n  vllm serve \"$CHECKPOINT\" --tensor-parallel-size 4 --pipeline-parallel-size 1 \\\n  --max-num-seqs 1 --max-num-batched-tokens 8192 --no-async-scheduling \\\n  --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5}'\n```\n\nWarm greedy and seeded sampled paths first. Compare output token IDs, native hits, post-normalization values, first-token time, decode milliseconds/round and acceptance separately. Also verify M>8 remains on the original prefill route. The PP2 model changes (#1370) and the GGUF hybrid checkpoint are not in this branch, so these commands qualify the public path rather than reproduce the historical values.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| DSpark main projection | Raw E4M3 weights, UE8M0 scales, FP16 input | M1..8; provider supports TP2/4/8, model retains TP4 admission; full-call split=2 at 5120×15360 | Opt-in row sharding, actual TP all-gather, original norm | Executed CPU geometry/admission/config; historical measurement; GPU test supplied | Real kernel/collective parity, deliberate GPU mutant and graph capture/replay are untested |\n| Disabled / larger prefill | Same | OFF or M>8 | Original replicated projection | Executed CPU model routing and policy contracts | Current-main serving |\n| Unsupported immutable inputs | Same | TP1, missing GEMV, bias, non-raw weight/scales, invalid geometry | Construction refuses loudly | CPU admission tests | Complete model construction on GPU |\n| Other FP8 models | Other providers | V4.1 drafter not bound | Inactive policy omitted from hash | CPU hash/default tests | No speed claim |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: Opt-in through kernel_config.v41_draft_projection.enabled or VLLM_V41_DRAFT_MP_SHARD=1.\n- Required CLI options and environment switches: V4.1 DSpark with five speculative tokens, VLLM_V41_FP8_GEMV=1 and compatible v41k; existing model/topology admission retained.\n- KV cache dtype used for the benchmark: Historical #1277 packed V4.1 KV; projection adds no codec.\n- Wheel SHA or source commit: This branch: rebased onto `main` `3c051b52e`. The numbers were measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port (#1370); this branch has not run on a GPU.\n- PYTHONPATH, source overlays, or external native libraries used (write \"none\" if absent): Historical unpublished PP2 model changes and existing v41k library. No extra kernel library for this projection-only contribution.\n- User-entry route-hit, speed, and output-quality evidence: MEASURED 2026-11-04: -0.130 ms per decode round, eight of eight pairs negative, identical outputs; isolated draft 841.7 to 640.7 microseconds. Below our predeclared detection threshold; no statistically established serving win. Reproducing them needs the PP2 port (#1370) and a GGUF hybrid checkpoint.\n- Existing kernel/backend registry and capability-rejection reasons: Existing raw FP8 GEMV; model-owned admission for TP/geometry and provider availability; dynamic input/scales validation in helper. No MoE priority change.\n- Per-engine configuration and deprecated-variable compatibility: ExecutionPolicy field owned directly by KernelConfig for model projection computation; serialized and resolved once; typed override wins, empty alias OFF. Only the bound drafter contributes its hash before graph-key creation.\n- New/changed environment metadata and generated reference check: One experimental alias registered; generated architecture/env and metadata/registration/ownership gates rerun.\n- Route snapshot command and intentional changed rows (write \"none\" for refactors): python -m tools.sm70_route_snapshot --category moe --output /dev/stdout; compare with main. No intentional MoE selection changes; separate native projection tracing required.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: SM70-named count unchanged; one V41 alias added; zero new unregistered runtime reads. No broader model qualification.\n\n## Test Result\n\n**MEASURED, 2026-11-04,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4 (#1370), one request, DSpark 5, paired arms: -0.130 ms per decode round, eight of eight pairs negative, outputs identical; the isolated draft step went from 841.7 to 640.7 microseconds. The round-time change is below our predeclared detection threshold.\n\n**Re-run on `main` for this PR, 2026-11-05,** CPU only (no visible GPU), branch rebased onto `3c051b52e`:\n\n- pytest, the nine files in the plan: 83 passed, 9 skipped, 10 failed. The 9 skips are the distributed GPU test (`torchrun with 2/4/8 SM70 GPUs required`). The 10 failures are all in `tests/config/test_runtime_default_ownership.py` and fail identically on unmodified `main` (`SimpleNamespace` has no attribute `model`).\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass. `check_layering.py` output is identical to `main`.\n- ruff 0.14.0 `check` and `format --check` on the 9 changed Python files: pass.\n\nNot run: the distributed GPU parity, mutation and graph test (it needs 2, 4 or 8 SM70 GPUs; we had one free card), so GPU bitwise parity, mutation sensitivity and all-gather capture safety are INCONCLUSIVE on this branch. No serving re-measurement.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-draft-mp-shard",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1374,
+    "title": "[Perf][SM70][DeepSeek-V4] Shard the DSpark main projection output rows",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1374",
+    "isDraft": false,
+    "headRefOid": "a19f07f72bb381738785ca1938963267d1dc4181",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "docs/configuration/env_var_reference.md",
+      "docs/design/architecture/runtime_reference.md",
+      "tests/config/test_v41_draft_projection_policy.py",
+      "tests/models/test_deepseek_v41_draft_projection_routing.py",
+      "tests/models/test_deepseek_v41_draft_projection_shard.py",
+      "tests/tools/test_v41_draft_projection_plan.py",
+      "vllm/config/execution_policy.py",
+      "vllm/config/kernel.py",
+      "vllm/envs.py",
+      "vllm/models/deepseek_v41/draft_projection.py",
+      "vllm/models/deepseek_v41/dspark.py"
+    ],
+    "diff_bytes": 33624,
+    "diff_sha256": "898f9f74edac099cd5a481896a61093f700c089f8a5c66cc3396e0c564c64427"
+  },
+  "full_tree_diff_proof": null
+}

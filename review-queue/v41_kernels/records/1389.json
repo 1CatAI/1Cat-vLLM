@@ -1,0 +1,134 @@
+{
+  "initial_inventory": {
+    "number": 1389,
+    "title": "[Perf][SM70] DeepSeek-V4.1 decode: fuse attention prep and post kernels (VLLM_V41_FUSE_ATTN_PREP/POST, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1389",
+    "isDraft": false,
+    "headRefOid": "04b5f9d4f41672caafdd4b8c7fc09789561f0c3c",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1389,
+    "title": "[Perf][SM70] DeepSeek-V4.1 decode: fuse attention prep and post kernels (VLLM_V41_FUSE_ATTN_PREP/POST, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370** (PP2): this branch sits on it because both edit `V41Attention` in `model.py`; the change itself does not use PP.\n\n## Purpose\n\nAt decode (1-8 tokens), `V41Attention.forward` launches four small kernels after `wq_b` (query RoPE; window `kv_norm`, RoPE and FP8 QDQ) and three after attention (window ring insert, inverse RoPE and the output FP8 QDQ in `project_output`). Each is a few microseconds and they run on every layer of every round.\n\n- **`VLLM_V41_FUSE_ATTN_PREP=1`** (default off): `attn_fuse._attn_prep` does the four prologue steps in one Triton launch (1-6 tokens).\n- **`VLLM_V41_FUSE_ATTN_POST=1`** (default off): `attn_fuse._attn_post` does the deferred window ring insert, the inverse RoPE and the QDQ in one launch (1-8 tokens); `_project_quantized` then runs `project_output`'s projections on the quantized output.\n- Same arithmetic in the same order as the replaced kernels (`enable_fp_fusion=False`, the same reduction layouts), so outputs are bit-identical. Outside the token ranges, or when the wrapper declines (`return None`), the original kernels run.\n- `vllm/envs.py`: the two knobs, with metadata and in the `compile_factors` ignore list.\n\nTests and checks (all new):\n\n- `tests/models/test_deepseek_v41_small_fuse.py` (Triton interpreter): `_attn_prep` vs `_rotate` / `_short_rms` / `_qdq`, and `_attn_post` vs `_ring_insert` / `_rotate(inverse)` / `_qdq`, bit for bit, into NaN-poisoned buffers; zero rows, sub-floor QDQ groups, near-FP16-max values, positions past the RoPE table, invalid ring tokens.\n- `tests/models/test_deepseek_v41_small_fuse_knob_off.py`: an AST proof that with both knobs off, `forward()` reduces to the base code and every other function, and the old kernel modules, are unchanged.\n- `tests/models/test_deepseek_v41_small_fuse_sm70.py` -> `benchmarks/deepseek_v41/small_fuse_sm70_check.py`: compiles old and new kernels for sm_70 on the CPU; every FP32 add-reduction in a fused kernel uses a layout and axis the replaced kernels use, and ptxas reports no spills.\n- `benchmarks/deepseek_v41/small_fuse_check.py`: the same bit checks on a GPU, eager and inside CUDA graphs with new inputs per replay.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\npytest -q tests/models/test_deepseek_v41_small_fuse_knob_off.py tests/models/test_deepseek_v41_small_fuse_sm70.py\nTRITON_INTERPRET=1 pytest -q tests/models/test_deepseek_v41_small_fuse.py\npython benchmarks/deepseek_v41/small_fuse_check.py --json small_fuse.json   # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Attention prologue | DeepSeek-V4.1 fp16 q / kv, 16 heads per rank, dim 512 | decode, 1-6 tokens, eager or CUDA graph, PREP on | `_attn_prep`; else the four original kernels | interpreter bit tests; sm_70 TTGIR layout check; GPU bit check (eager + graphs); measured on 8x V100 PP2 x TP4 | other head counts (TP other than 4) |\n| Attention epilogue | same, window ring | decode, 1-8 tokens, POST on | `_attn_post` + `_project_quantized`; else the three original kernels | same | same |\n| Knobs off | all | default | original code (AST-proved) | knob-off test | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; both knobs default to `0`.\n- Required CLI options and environment switches: `VLLM_V41_FUSE_ATTN_PREP=1`, `VLLM_V41_FUSE_ATTN_POST=1`.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone on #1370, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none (Triton kernels).\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: two tuning variables with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +2 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request, paired arms (both knobs on vs off): **-0.18 / -0.20 ms per round** at temperature 0 and **-0.12 / -0.29 ms per round** at temperature 1 (average about -0.19 ms; an A/A pair read -0.09 / -0.07, so this is a modest win); output texts identical 11/11; greedy check passed. Kernel times on one V100 (CUDA graph, 6 tokens): prologue 6.5 -> 3.5 us, epilogue 5.3 -> 3.3 us per layer.\n\n**Re-run for this PR, 2026-11-05,** on this branch (on #1370, rebased onto `main` `3c051b52e`):\n\n- `small_fuse_check.py` on one V100-SXM2 (torch 2.10, Triton 3.6): 36 prologue cases, 40 epilogue cases and 12 CUDA-graph replays, **0 mismatches**.\n- pytest: knob-off proof + sm_70 compile check, 6 passed; interpreter bit tests, 24 passed (CPU).\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1389",
+    "isDraft": false,
+    "headRefName": "pli/v41-fuse-attn",
+    "headRefOid": "04b5f9d4f41672caafdd4b8c7fc09789561f0c3c",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1389,
+    "id": "PR_kwDORjYFXs8AAAABNJ8DTw",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "04b5f9d4f41672caafdd4b8c7fc09789561f0c3c",
+    "title": "[Perf][SM70] DeepSeek-V4.1 decode: fuse attention prep and post kernels (VLLM_V41_FUSE_ATTN_PREP/POST, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1389",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370** (PP2): this branch sits on it because both edit `V41Attention` in `model.py`; the change itself does not use PP.\n\n## Purpose\n\nAt decode (1-8 tokens), `V41Attention.forward` launches four small kernels after `wq_b` (query RoPE; window `kv_norm`, RoPE and FP8 QDQ) and three after attention (window ring insert, inverse RoPE and the output FP8 QDQ in `project_output`). Each is a few microseconds and they run on every layer of every round.\n\n- **`VLLM_V41_FUSE_ATTN_PREP=1`** (default off): `attn_fuse._attn_prep` does the four prologue steps in one Triton launch (1-6 tokens).\n- **`VLLM_V41_FUSE_ATTN_POST=1`** (default off): `attn_fuse._attn_post` does the deferred window ring insert, the inverse RoPE and the QDQ in one launch (1-8 tokens); `_project_quantized` then runs `project_output`'s projections on the quantized output.\n- Same arithmetic in the same order as the replaced kernels (`enable_fp_fusion=False`, the same reduction layouts), so outputs are bit-identical. Outside the token ranges, or when the wrapper declines (`return None`), the original kernels run.\n- `vllm/envs.py`: the two knobs, with metadata and in the `compile_factors` ignore list.\n\nTests and checks (all new):\n\n- `tests/models/test_deepseek_v41_small_fuse.py` (Triton interpreter): `_attn_prep` vs `_rotate` / `_short_rms` / `_qdq`, and `_attn_post` vs `_ring_insert` / `_rotate(inverse)` / `_qdq`, bit for bit, into NaN-poisoned buffers; zero rows, sub-floor QDQ groups, near-FP16-max values, positions past the RoPE table, invalid ring tokens.\n- `tests/models/test_deepseek_v41_small_fuse_knob_off.py`: an AST proof that with both knobs off, `forward()` reduces to the base code and every other function, and the old kernel modules, are unchanged.\n- `tests/models/test_deepseek_v41_small_fuse_sm70.py` -> `benchmarks/deepseek_v41/small_fuse_sm70_check.py`: compiles old and new kernels for sm_70 on the CPU; every FP32 add-reduction in a fused kernel uses a layout and axis the replaced kernels use, and ptxas reports no spills.\n- `benchmarks/deepseek_v41/small_fuse_check.py`: the same bit checks on a GPU, eager and inside CUDA graphs with new inputs per replay.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\npytest -q tests/models/test_deepseek_v41_small_fuse_knob_off.py tests/models/test_deepseek_v41_small_fuse_sm70.py\nTRITON_INTERPRET=1 pytest -q tests/models/test_deepseek_v41_small_fuse.py\npython benchmarks/deepseek_v41/small_fuse_check.py --json small_fuse.json   # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Attention prologue | DeepSeek-V4.1 fp16 q / kv, 16 heads per rank, dim 512 | decode, 1-6 tokens, eager or CUDA graph, PREP on | `_attn_prep`; else the four original kernels | interpreter bit tests; sm_70 TTGIR layout check; GPU bit check (eager + graphs); measured on 8x V100 PP2 x TP4 | other head counts (TP other than 4) |\n| Attention epilogue | same, window ring | decode, 1-8 tokens, POST on | `_attn_post` + `_project_quantized`; else the three original kernels | same | same |\n| Knobs off | all | default | original code (AST-proved) | knob-off test | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; both knobs default to `0`.\n- Required CLI options and environment switches: `VLLM_V41_FUSE_ATTN_PREP=1`, `VLLM_V41_FUSE_ATTN_POST=1`.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone on #1370, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none (Triton kernels).\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: two tuning variables with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +2 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request, paired arms (both knobs on vs off): **-0.18 / -0.20 ms per round** at temperature 0 and **-0.12 / -0.29 ms per round** at temperature 1 (average about -0.19 ms; an A/A pair read -0.09 / -0.07, so this is a modest win); output texts identical 11/11; greedy check passed. Kernel times on one V100 (CUDA graph, 6 tokens): prologue 6.5 -> 3.5 us, epilogue 5.3 -> 3.3 us per layer.\n\n**Re-run for this PR, 2026-11-05,** on this branch (on #1370, rebased onto `main` `3c051b52e`):\n\n- `small_fuse_check.py` on one V100-SXM2 (torch 2.10, Triton 3.6): 36 prologue cases, 40 epilogue cases and 12 CUDA-graph replays, **0 mismatches**.\n- pytest: knob-off proof + sm_70 compile check, 6 passed; interpreter bit tests, 24 passed (CPU).\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-fuse-attn",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1389,
+    "title": "[Perf][SM70] DeepSeek-V4.1 decode: fuse attention prep and post kernels (VLLM_V41_FUSE_ATTN_PREP/POST, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1389",
+    "isDraft": false,
+    "headRefOid": "04b5f9d4f41672caafdd4b8c7fc09789561f0c3c",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/main_smoke.py",
+      "benchmarks/deepseek_v41/serve-pp2-eager.yaml",
+      "benchmarks/deepseek_v41/serve-pp2.yaml",
+      "benchmarks/deepseek_v41/small_fuse_check.py",
+      "benchmarks/deepseek_v41/small_fuse_sm70_check.py",
+      "benchmarks/deepseek_v41/tools/pp2_m1.py",
+      "docs/design/architecture/runtime_reference.md",
+      "tests/models/gguf/test_shared_expert_pp_stage.py",
+      "tests/models/test_deepseek_v41_index_overlap.py",
+      "tests/models/test_deepseek_v41_markov_shard.py",
+      "tests/models/test_deepseek_v41_pp_commit.py",
+      "tests/models/test_deepseek_v41_pp_drafter.py",
+      "tests/models/test_deepseek_v41_pp_forward.py",
+      "tests/models/test_deepseek_v41_pp_split.py",
+      "tests/models/test_deepseek_v41_small_fuse.py",
+      "tests/models/test_deepseek_v41_small_fuse_knob_off.py",
+      "tests/models/test_deepseek_v41_small_fuse_sm70.py",
+      "tests/v1/worker/test_gpu_model_runner.py",
+      "vllm/config/kernel.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_expert_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_layout.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_prefill.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_runtime.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py",
+      "vllm/model_executor/model_loader/gguf_adapters/deepseek_v41.py",
+      "vllm/model_executor/model_loader/gguf_loader.py",
+      "vllm/models/deepseek_v41/attention_ops.py",
+      "vllm/models/deepseek_v41/attn_fuse.py",
+      "vllm/models/deepseek_v41/contract.py",
+      "vllm/models/deepseek_v41/dense_tm.py",
+      "vllm/models/deepseek_v41/dspark.py",
+      "vllm/models/deepseek_v41/markov_shard.py",
+      "vllm/models/deepseek_v41/model.py",
+      "vllm/models/deepseek_v41/pp_commit.py",
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/spec_decode/dspark.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 273751,
+    "diff_sha256": "c48ccd0af1b5d589f403b0b2718b2de054264587d76eacc39fb5f966152828ab"
+  },
+  "full_tree_diff_proof": null
+}

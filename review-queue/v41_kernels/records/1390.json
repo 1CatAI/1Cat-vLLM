@@ -1,0 +1,101 @@
+{
+  "initial_inventory": {
+    "number": 1390,
+    "title": "[Perf][SM70] DeepSeek-V4.1 decode: dense GGUF mat-vec on a v41k dmv13_x kernel (VLLM_V41_DMV_X, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1390",
+    "isDraft": false,
+    "headRefOid": "c9a380b7fae39728b395dac945bec65f7c513676",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1390,
+    "title": "[Perf][SM70] DeepSeek-V4.1 decode: dense GGUF mat-vec on a v41k dmv13_x kernel (VLLM_V41_DMV_X, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone. It adds an op next to `index_reduce_live` in `v41k.cu` from our index-reduce PR #1386; whichever lands second needs a one-hunk rebase there.\n\n## Purpose\n\nAt decode, the DeepSeek-V4.1 dense projections (q/kv, `q_b`, `wo_a`, `wo_b`, shared experts, engram, LM head) are M <= 8 GGUF mat-vecs on TurboMind's `gguf_dmv13_dense` (Q5_K and Q8_0). `wo_a` takes one launch per O group.\n\nWith **`VLLM_V41_DMV_X=1`** (default off), `dense_tm.py` runs the same runners on a new v41k op, `dmv13_x` (`csrc/sm70_turbomind/ops/gguf_dmv13_x.cuh`):\n\n- the same Q5_K / Q8_0 decode, `mma.m8n8k4` tile order and FP32 reduction order as dmv13 at the same warps and split, so outputs are **bit-identical**;\n- streaming (`__ldcs`) plane loads and a max-shared carveout;\n- the two `wo_a` O groups in one block-diagonal launch.\n\nOther formats, and a `v41k.so` built without the op, stay on dmv13 (a missing op is checked once and falls back).\n\n`VLLM_V41_DMV_X_CONFIG` (`role=warps,split,acc;...`) overrides the launch shape per role. Any override changes the FP32 summation order, so it is a tuning tool to use behind a near-tie output gate. It is empty by default, and our measurements below use the default.\n\nAlso included:\n\n- `benchmarks/deepseek_v41/v41k/bench_dmv_x.py`: a one-GPU microbench (dmv13 vs dmv13_x per role, with a warps x split x acc sweep). `--no-time` runs only the bit check for M = 1..8.\n- `tests/models/test_deepseek_v41_dmv_x.py`: dispatch tests (knob off keeps dmv13; knob on has the same launch config; role overrides; unsupported formats and a missing op fall back; `wo_a` is merged into one launch; the bench shapes match `dense_tm`).\n- `tests/kernels/quantization/test_dmv13_x_contract.py`: a text-level contract that the new kernel keeps dmv13's decode and accumulate sequence.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_dmv_x.py tests/kernels/quantization/test_dmv13_x_contract.py\npython benchmarks/deepseek_v41/v41k/build.py                                  # sm_70\nVLLM_V41K_LIB=benchmarks/deepseek_v41/v41k/build/v41k.so \\\n  python benchmarks/deepseek_v41/v41k/bench_dmv_x.py --no-time                 # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Dense decode mat-vec | GGUF Q5_K, Q8_0 | SM70, M <= 8, knob on, v41k with `dmv13_x` | `dmv13_x` at dmv13's config (bit-identical); otherwise dmv13 | CPU dispatch and contract tests; sm_70 build; GPU bit check for all 6 roles at M = 1..8; measured on 8x V100 PP2 x TP4 | TP other than 4 (shapes are per TP4 rank); single-stage TP4 without PP not timed |\n| `VLLM_V41_DMV_X_CONFIG` override | same | explicit opt-in | `dmv13_x` with the given shape (FP32 order changes) | CPU tests | outputs not bit-identical by design |\n| Other formats / knob off | all | default | dmv13, unchanged | CPU tests | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_DMV_X` defaults to `0`, `VLLM_V41_DMV_X_CONFIG` to empty.\n- Required CLI options and environment switches: `VLLM_V41_DMV_X=1` and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: two tuning variables with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +2 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request, ABBA arms (off / on / on / off): **31.1 / 30.6 / 30.7 / 31.1 ms per round** (99.3 / 100.0 tok/s off vs 100.7 / 100.5 on), about **-0.45 ms per round**. Our published lever table records it as -0.42 ms per round (ABBA, 6/6). Greedy outputs were the same as off (the one near-tie row is the same row in both arms).\n\n**Re-run for this PR, 2026-11-05,** on this branch (rebased onto `main` `3c051b52e`):\n\n- sm_70 build of `v41k.so` from this tree: OK.\n- `bench_dmv_x.py --no-time` on one V100-SXM2: for qkv, q_b, wo_a (merged), wo_b, shared and head at M = 1..8, `dmv13_x` vs dmv13 at dmv13's config were **bitwise equal in 48/48 cases** (reference dmv13 from our #1277 build's `vllm._C`).\n- pytest, the two files above, CPU only: 70 passed.\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1390",
+    "isDraft": false,
+    "headRefName": "pli/v41-dmv-x",
+    "headRefOid": "c9a380b7fae39728b395dac945bec65f7c513676",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1390,
+    "id": "PR_kwDORjYFXs8AAAABNKCZ6g",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "c9a380b7fae39728b395dac945bec65f7c513676",
+    "title": "[Perf][SM70] DeepSeek-V4.1 decode: dense GGUF mat-vec on a v41k dmv13_x kernel (VLLM_V41_DMV_X, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1390",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone. It adds an op next to `index_reduce_live` in `v41k.cu` from our index-reduce PR #1386; whichever lands second needs a one-hunk rebase there.\n\n## Purpose\n\nAt decode, the DeepSeek-V4.1 dense projections (q/kv, `q_b`, `wo_a`, `wo_b`, shared experts, engram, LM head) are M <= 8 GGUF mat-vecs on TurboMind's `gguf_dmv13_dense` (Q5_K and Q8_0). `wo_a` takes one launch per O group.\n\nWith **`VLLM_V41_DMV_X=1`** (default off), `dense_tm.py` runs the same runners on a new v41k op, `dmv13_x` (`csrc/sm70_turbomind/ops/gguf_dmv13_x.cuh`):\n\n- the same Q5_K / Q8_0 decode, `mma.m8n8k4` tile order and FP32 reduction order as dmv13 at the same warps and split, so outputs are **bit-identical**;\n- streaming (`__ldcs`) plane loads and a max-shared carveout;\n- the two `wo_a` O groups in one block-diagonal launch.\n\nOther formats, and a `v41k.so` built without the op, stay on dmv13 (a missing op is checked once and falls back).\n\n`VLLM_V41_DMV_X_CONFIG` (`role=warps,split,acc;...`) overrides the launch shape per role. Any override changes the FP32 summation order, so it is a tuning tool to use behind a near-tie output gate. It is empty by default, and our measurements below use the default.\n\nAlso included:\n\n- `benchmarks/deepseek_v41/v41k/bench_dmv_x.py`: a one-GPU microbench (dmv13 vs dmv13_x per role, with a warps x split x acc sweep). `--no-time` runs only the bit check for M = 1..8.\n- `tests/models/test_deepseek_v41_dmv_x.py`: dispatch tests (knob off keeps dmv13; knob on has the same launch config; role overrides; unsupported formats and a missing op fall back; `wo_a` is merged into one launch; the bench shapes match `dense_tm`).\n- `tests/kernels/quantization/test_dmv13_x_contract.py`: a text-level contract that the new kernel keeps dmv13's decode and accumulate sequence.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_dmv_x.py tests/kernels/quantization/test_dmv13_x_contract.py\npython benchmarks/deepseek_v41/v41k/build.py                                  # sm_70\nVLLM_V41K_LIB=benchmarks/deepseek_v41/v41k/build/v41k.so \\\n  python benchmarks/deepseek_v41/v41k/bench_dmv_x.py --no-time                 # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Dense decode mat-vec | GGUF Q5_K, Q8_0 | SM70, M <= 8, knob on, v41k with `dmv13_x` | `dmv13_x` at dmv13's config (bit-identical); otherwise dmv13 | CPU dispatch and contract tests; sm_70 build; GPU bit check for all 6 roles at M = 1..8; measured on 8x V100 PP2 x TP4 | TP other than 4 (shapes are per TP4 rank); single-stage TP4 without PP not timed |\n| `VLLM_V41_DMV_X_CONFIG` override | same | explicit opt-in | `dmv13_x` with the given shape (FP32 order changes) | CPU tests | outputs not bit-identical by design |\n| Other formats / knob off | all | default | dmv13, unchanged | CPU tests | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_DMV_X` defaults to `0`, `VLLM_V41_DMV_X_CONFIG` to empty.\n- Required CLI options and environment switches: `VLLM_V41_DMV_X=1` and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: two tuning variables with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +2 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request, ABBA arms (off / on / on / off): **31.1 / 30.6 / 30.7 / 31.1 ms per round** (99.3 / 100.0 tok/s off vs 100.7 / 100.5 on), about **-0.45 ms per round**. Our published lever table records it as -0.42 ms per round (ABBA, 6/6). Greedy outputs were the same as off (the one near-tie row is the same row in both arms).\n\n**Re-run for this PR, 2026-11-05,** on this branch (rebased onto `main` `3c051b52e`):\n\n- sm_70 build of `v41k.so` from this tree: OK.\n- `bench_dmv_x.py --no-time` on one V100-SXM2: for qkv, q_b, wo_a (merged), wo_b, shared and head at M = 1..8, `dmv13_x` vs dmv13 at dmv13's config were **bitwise equal in 48/48 cases** (reference dmv13 from our #1277 build's `vllm._C`).\n- pytest, the two files above, CPU only: 70 passed.\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-dmv-x",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1390,
+    "title": "[Perf][SM70] DeepSeek-V4.1 decode: dense GGUF mat-vec on a v41k dmv13_x kernel (VLLM_V41_DMV_X, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1390",
+    "isDraft": false,
+    "headRefOid": "c9a380b7fae39728b395dac945bec65f7c513676",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/v41k/bench_dmv_x.py",
+      "benchmarks/deepseek_v41/v41k/v41k.cu",
+      "csrc/sm70_turbomind/ops/gguf_dmv13_x.cuh",
+      "tests/kernels/quantization/test_dmv13_x_contract.py",
+      "tests/models/test_deepseek_v41_dmv_x.py",
+      "vllm/envs.py",
+      "vllm/models/deepseek_v41/dense_tm.py"
+    ],
+    "diff_bytes": 60233,
+    "diff_sha256": "a25961b633c4f68ae168ffe4fdc49fe141d430957783b6c898cb6f5553a45dad"
+  },
+  "full_tree_diff_proof": null
+}
