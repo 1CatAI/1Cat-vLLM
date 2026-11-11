@@ -36,6 +36,10 @@ logger = init_logger(__name__)
 WAITING_REASON_CAPACITY = "capacity"
 WAITING_REASON_DEFERRED = "deferred"
 
+# [本地 2026-11-10 P-05] KV value tiers, highest first. Index in
+# SchedulerStats.kv_tier_blocks is the reverse of this order (0 = L3).
+_KV_TIER_NAMES = ("L1", "L2A", "L2B", "L2C", "L3")
+
 PerEngineStatLoggerFactory = Callable[[VllmConfig, int], "StatLoggerBase"]
 AggregateStatLoggerFactory = type["AggregateStatLoggerBase"]
 StatLoggerFactory = AggregateStatLoggerFactory | PerEngineStatLoggerFactory
@@ -248,18 +252,33 @@ class LoggingStatLogger(StatLoggerBase):
         log_parts.extend(
             [
                 "GPU KV cache usage: %.1f%%",
-                "Warm blocks: %d/%d",
                 "Prefix cache hit rate: %.1f%%",
             ]
         )
         log_args.extend(
             [
                 self.last_scheduler_stats.kv_cache_usage * 100,
-                self.last_scheduler_stats.warm_blocks,
-                self.last_scheduler_stats.warm_block_cap,
                 self.prefix_caching_metrics.hit_rate * 100,
             ]
         )
+
+        # [本地 2026-11-10 P-05] 各价值层块数，让 usage 那个数字可解释。
+        #
+        # [本地 2026-11-11 观测 P2] L3 恒为 0 是【必然】，不是故障：这里的
+        # 数字只统计有 block_hash 的块，而 L3 的终局就是被 sweep 清掉 hash
+        # 退场 —— 一个块在 L3 最多待 L3_TTL(600s) 就走了，任何统计时刻都
+        # 看不到存量。所以 L3 要看的是【回收速率】，那个数在
+        # `KV tier sweep: ... retired ttl_expiry=...` 那行里，不要把这个 0
+        # 读成「没有东西在过期」。
+        _tiers = self.last_scheduler_stats.kv_tier_blocks
+        if _tiers is not None:
+            log_parts.append(
+                "KV tiers: L1 %d, L2A %d, L2B %d, L2C %d, "
+                "L3 %d (flow, see retire rate in tier sweep)"
+            )
+            log_args.extend(
+                [_tiers[4], _tiers[3], _tiers[2], _tiers[1], _tiers[0]]
+            )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             log_parts.append("Corrupted: %d reqs")
@@ -529,31 +548,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
-        # Account for reclaimable retained history separately from allocations.
-        self.gauge_warm_blocks = create_metric_per_engine(
-            self._gauge_cls(
-                name="vllm:warm_blocks",
-                documentation=(
-                    "Blocks retained for prefix reuse. They are not in the free "
-                    "queue and are excluded from allocated kv_cache_usage_perc."
-                ),
-                multiprocess_mode="mostrecent",
-                labelnames=labelnames,
+        # [本地 2026-11-10 P-05] 每个价值层一个 gauge，prometheus 侧按 tier
+        # 标签直接取，不必再解析日志行。
+        # `labels()` 不接受位置参数与关键字参数混用，所以基标签也按名传。
+        _tier_gauge = self._gauge_cls(
+            name="vllm:kv_tier_blocks",
+            documentation=(
+                "Cached KV blocks per value tier. These are counted in "
+                "kv_cache_usage_perc; the split shows how much of it is "
+                "content still worth keeping."
             ),
-            per_engine_labelvalues,
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames + ["tier"],
         )
-        self.gauge_warm_block_cap = create_metric_per_engine(
-            self._gauge_cls(
-                name="vllm:warm_block_cap",
-                documentation=(
-                    "History-block high watermark for age-independent trimming "
-                    "outside the grace window; the absolute cap bounds all ages."
-                ),
-                multiprocess_mode="mostrecent",
-                labelnames=labelnames,
-            ),
-            per_engine_labelvalues,
-        )
+        self.gauge_kv_tier_blocks = {
+            idx: {
+                name: _tier_gauge.labels(**dict(zip(labelnames, vals)), tier=name)
+                for name in _KV_TIER_NAMES
+            }
+            for idx, vals in per_engine_labelvalues.items()
+        }
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
@@ -1108,8 +1122,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
-            self.gauge_warm_blocks[engine_idx].set(scheduler_stats.warm_blocks)
-            self.gauge_warm_block_cap[engine_idx].set(scheduler_stats.warm_block_cap)
+
+            # [本地 2026-11-10 P-05] kv_tier_blocks 是 L3→L1 序，这里按层名取。
+            _tiers = scheduler_stats.kv_tier_blocks
+            if _tiers is not None and engine_idx in self.gauge_kv_tier_blocks:
+                _gauges = self.gauge_kv_tier_blocks[engine_idx]
+                for _i, _name in enumerate(reversed(_KV_TIER_NAMES)):
+                    _gauges[_name].set(_tiers[_i])
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

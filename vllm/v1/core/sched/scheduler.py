@@ -309,7 +309,6 @@ class Scheduler(SchedulerInterface):
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
             partial_prefix_cache=self.cache_config.partial_prefix_cache,
             num_speculative_tokens=self.num_spec_tokens,
-            retention_policy=self.cache_config.retention,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -3050,16 +3049,23 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        # [本地 2026-11-11 P0] partial 价值分布诊断。放在这里而不是塞进
+        # SchedulerStats：那边是对外契约，不该为一个自带日志的只读诊断
+        # 加字段。stats 节拍是引擎唯一稳定的周期点，借它驱动即可；
+        # log_partial_diagnostics 内部自带节流，重复调用无副作用。
+        self.kv_cache_manager.log_partial_diagnostics()
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
-            # Warm blocks are reclaimable and excluded from allocated
-            # usage; reporting them
-            # separately is what makes that usage explainable.
-            warm_blocks=self.kv_cache_manager.block_pool.warm_block_count,
-            warm_block_cap=self.kv_cache_manager.block_pool.warm_block_cap,
+            # [本地 2026-11-10 P-05] 各价值层块数，下标即 tier（0=L3 … 4=L1）。
+            # 这些块全都算在 kv_cache_usage 里，单独列出来是为了让那个数字
+            # 可解释：否则看到池子被一段不再被引用的前缀占着，无从判断是
+            # 缓存复用还是真的卡住了。
+            kv_tier_blocks=self.kv_cache_manager.block_pool.tier_block_counts()
+            if getattr(self.kv_cache_manager.block_pool, "_tier_enabled", False)
+            else None,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

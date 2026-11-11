@@ -3,10 +3,42 @@
 
 import asyncio
 import io
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import TYPE_CHECKING, cast
+
+
+# Must match ``vllm.v1.request.PREFIX_CACHE_BOUNDARY_ALIGNMENT``: ``Request``
+# rounds every boundary down to this multiple, so the value chosen here is
+# already expressed in the same units and the rounding becomes a no-op.
+_BOUNDARY_ALIGN = 64
+
+
+def _partial_boundaries_completion_enabled() -> bool:
+    """[本地 2026-11-11 P-06] Emit a partial-prefix boundary for completions.
+
+    Default off: it changes how many entries the cache holds for a traffic
+    mix that was never measured with it on.
+    """
+    return os.environ.get(
+        "VLLM_PARTIAL_BOUNDARIES_COMPLETION", "0"
+    ).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _cache_block_size(engine_client) -> int:
+    """KV block size, or 0 when it cannot be read.
+
+    Only used to avoid placing a boundary on a block multiple, where the
+    ordinary full-block cache already resumes and the partial cache would
+    keep nothing. 0 means "unknown": the caller then keeps the raw boundary
+    and accepts that ~3% of prompt lengths produce no entry.
+    """
+    try:
+        return int(engine_client.vllm_config.cache_config.block_size)
+    except Exception:  # noqa: BLE001
+        return 0
 
 import numpy as np
 import pybase64 as base64
@@ -177,6 +209,51 @@ class OpenAIServingCompletion(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                # [本地 2026-11-11 P-06] The chat path already records a
+                # partial-prefix boundary near the end of the prompt; native
+                # completions did not, so agent turns driven over this
+                # endpoint never produced a resumable entry.
+                if _partial_boundaries_completion_enabled():
+                    # A boundary is a pure cache hint: if deriving it fails for
+                    # any prompt shape we must still serve the request, so this
+                    # is deliberately fail-open. ``_extract_prompt_len`` raises
+                    # ValueError when a prompt carries neither token ids nor
+                    # embeds, and that must not turn into a 500 on a completions
+                    # call that would otherwise have worked.
+                    try:
+                        prompt_len = self._extract_prompt_len(engine_input)
+                    except Exception:
+                        prompt_len = None
+                    # Two filters downstream decide whether this boundary
+                    # survives, and both must be satisfied or no entry is
+                    # created at all:
+                    #
+                    #   1. ``Request`` rounds it down to a multiple of
+                    #      PREFIX_CACHE_BOUNDARY_ALIGNMENT and requires it to
+                    #      be strictly below the prompt length, so the value
+                    #      handed over here is one less than the length.
+                    #   2. ``partial_prefix_stops`` drops boundaries that land
+                    #      on a block multiple -- those are covered by the
+                    #      ordinary full-block cache and carry no in-block
+                    #      tail to preserve.
+                    #
+                    # (2) is why the raw length must be avoided twice over:
+                    # after rounding down it can still land exactly on a block
+                    # boundary (e.g. prompt 4157 -> 4156 -> rounded 4096 =
+                    # 2*2048), producing nothing. Stepping back one alignment
+                    # unit returns it inside the block; the gain drops by at
+                    # most one unit out of a whole block.
+                    if prompt_len and prompt_len > 1:
+                        align = _BOUNDARY_ALIGN
+                        boundary = (prompt_len - 1) // align * align
+                        block = _cache_block_size(self.engine_client)
+                        if block > 0 and boundary % block == 0:
+                            boundary -= align
+                        if boundary > 0:
+                            sampling_params.extra_args = {
+                                **(sampling_params.extra_args or {}),
+                                "prefix_cache_boundaries": (boundary,),
+                            }
 
             request_id_item = f"{request_id}-{i}"
 

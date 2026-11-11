@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import time  # [本地 2026-11-11 P-06] TieredBlockQueue.append_n
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -136,6 +137,27 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # --- [本地 2026-11-10 P-05] 价值分级状态 ---
+    # These three only affect how long a block keeps its cached identity while
+    # sitting in the free queue. They never influence allocation: a block is
+    # allocatable exactly as before, whatever its tier.
+    #
+    # Cumulative hit count, accumulated across requests. This is what
+    # separates "the system prompt every session reads" from "a one-off
+    # report nobody will open again".
+    hit_count: int = 0
+    # Monotonic seconds of the most recent hit. 0 means never hit.
+    last_hit_ts: float = 0.0
+    # Value tier: 0=L3 plain, 1=L2-C, 2=L2-B, 3=L2-A, 4=L1.
+    tier: int = 0
+    # --- [本地 2026-11-11 P-06] 价值度量（P0 诊断用） ---
+    # Monotonic seconds the block first got its hash. Diagnostic only.
+    created_ts: float = 0.0
+    # Hit count over a sliding window (exponential decay applied lazily by
+    # BlockPool._decay_hits_recent). Cumulative ``hit_count`` cannot tell a
+    # block that was hot three hours ago from one that is hot now.
+    hits_recent: float = 0.0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -150,6 +172,20 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+
+    def reset_value_state(self):
+        """Forget the reuse history when the block's content is gone.
+
+        The block is being handed out for new content, so whatever it used to
+        hold is no longer addressable and its hit history describes nothing.
+        Keeping the old count would let a dead block inherit the reputation of
+        the prefix that used to live there.
+        """
+        self.hit_count = 0
+        self.last_hit_ts = 0.0
+        self.tier = 0
+        self.created_ts = 0.0
+        self.hits_recent = 0.0
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -395,6 +431,252 @@ class FreeKVCacheBlockQueue:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
+
+
+class TieredBlockQueue:
+    """[本地 2026-11-11 P-06] Free queue ordered by value tier, then LRU.
+
+    The only behavioural difference from ``FreeKVCacheBlockQueue`` is the
+    allocation order: lowest tier first, LRU inside a tier. Three invariants
+    keep this from repeating past incidents:
+
+    1. Every free block is in exactly one tier. Nothing is ever parked
+       outside the queue -- that is what made the warm-block episode
+       under-count free blocks and wedge the scheduler.
+    2. An empty low tier falls through to the next one, so allocation never
+       fails because of the layering. Worst case it is plain LRU.
+    3. With every block in one tier the sequence is identical to
+       ``FreeKVCacheBlockQueue`` (covered by a differential test).
+    """
+
+    __slots__ = (
+        "num_tiers",
+        "layers",
+        "_tier_of",
+        "_expected_total",
+        "_n_allocated",
+        "_reclassify",
+    )
+
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        num_tiers: int = 5,
+        reclassify=None,
+    ) -> None:
+        self.num_tiers = num_tiers
+        self._reclassify = reclassify
+        self._expected_total = len(blocks)
+        # Allocated-block counter. Must be maintained explicitly: deriving it
+        # by scanning ``_tier_of`` is O(n) and this class sits on the hot path
+        # (every popleft_n, every hit's remove).
+        self._n_allocated = 0
+        self._tier_of: dict[int, int] = {}
+
+        # Bucket explicitly instead of filtering per tier: a block whose tier
+        # is out of range would be silently dropped by a filter, with no
+        # assertion firing until much later.
+        by_tier: list[list[KVCacheBlock]] = [[] for _ in range(num_tiers)]
+        for block in blocks:
+            t = block.tier if 0 <= block.tier < num_tiers else 0
+            block.tier = t
+            by_tier[t].append(block)
+            self._tier_of[block.block_id] = t
+        self.layers: list[FreeKVCacheBlockQueue] = [
+            FreeKVCacheBlockQueue(group) for group in by_tier
+        ]
+        self._assert_conserved()  # fail at construction, not at first allocation
+
+    def _assert_conserved(self) -> None:
+        """Free blocks across tiers plus allocated blocks must equal the total.
+
+        Must stay O(1): this runs on every pop/push. Scanning the id->tier map
+        here measured 42.9 us at 1281 blocks (380x this counter) and cost up
+        to 1.4% of a 15 ms decode step.
+        """
+        in_layers = sum(layer.num_free_blocks for layer in self.layers)
+        assert in_layers + self._n_allocated == self._expected_total, (
+            f"tiered queue lost blocks: layers={in_layers} "
+            f"allocated={self._n_allocated} total={self._expected_total}"
+        )
+
+    @property
+    def num_free_blocks(self) -> int:
+        return sum(layer.num_free_blocks for layer in self.layers)
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        """Take from the lowest tiers first; LRU order inside a tier."""
+        if n <= 0:
+            return []
+        avail = self._expected_total - self._n_allocated
+        if n > avail:
+            raise ValueError(f"Cannot get {n} free blocks, only {avail} available")
+        out: list[KVCacheBlock] = []
+        for tier in range(self.num_tiers):
+            if len(out) >= n:
+                break
+            layer = self.layers[tier]
+            k = min(n - len(out), layer.num_free_blocks)
+            if k <= 0:
+                continue
+            got = layer.popleft_n(k)
+            for block in got:
+                self._tier_of[block.block_id] = -1
+            out.extend(got)
+        assert len(out) == n
+        self._n_allocated += n
+        self._assert_conserved()
+        return out
+
+    def _tier_on_return(self, block: KVCacheBlock, now: float) -> int:
+        """Which tier a block lands in when it comes back to the queue.
+
+        Recomputing instead of trusting ``block.tier`` matters because a block
+        is invisible to ``repromote`` while allocated: the field freezes, so a
+        tier-4 block held by one request for ten minutes would come back as
+        tier 4 even though nobody has reused it since.
+
+        Hashless blocks go to tier 0 unconditionally. ``free_blocks`` already
+        routes them through ``prepend_n``, but an invariant checked only by
+        the caller is not an invariant.
+
+        ``now`` is passed in so a bulk return pays for one clock read, not
+        one per block (1281 of them measured 0.21 ms, 14% of the whole call).
+        """
+        if block.is_null or block.block_hash is None:
+            return 0
+        t = (
+            self._reclassify(block, now)
+            if self._reclassify is not None
+            else block.tier
+        )
+        # Clamp on both paths. The classifier is a callback whose return value
+        # this class does not control, and an out-of-range tier would raise
+        # IndexError mid-append and take the engine down. One guard, one place.
+        if not (0 <= t < self.num_tiers):
+            t = 0
+        block.tier = t
+        return t
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Return blocks to the tail of their (recomputed) tier."""
+        if not blocks:
+            return
+        # One clock read for the whole batch; see _tier_on_return.
+        now = time.monotonic() if self._reclassify is not None else 0.0
+        by_tier: list[list[KVCacheBlock]] = [[] for _ in range(self.num_tiers)]
+        for block in blocks:
+            t = self._tier_on_return(block, now)
+            by_tier[t].append(block)
+            self._tier_of[block.block_id] = t
+        for t, group in enumerate(by_tier):
+            if group:
+                self.layers[t].append_n(group)
+        self._n_allocated -= len(blocks)
+        self._assert_conserved()
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Recycle these blocks before anything else in the queue.
+
+        Callers use this for blocks that can never serve a future hit: a
+        sliding window has moved past them, or they never got a hash. Handing
+        them out last would let a long prefill rotate the whole pool and evict
+        other requests' prefixes. No reclassify here -- their value is zero by
+        construction.
+        """
+        if not blocks:
+            return
+        for block in blocks:
+            self._tier_of[block.block_id] = 0
+        self.layers[0].prepend_n(blocks)
+        self._n_allocated -= len(blocks)
+        self._assert_conserved()
+
+    def remove(self, block: KVCacheBlock) -> None:
+        """Take one free block out of the queue (it is being reused).
+
+        Fails loudly on a block that is not free. Returning quietly would let
+        an already-allocated block vanish from the accounting: the id map says
+        -1 so it is "allocated", but no caller holds it and no tier counts it,
+        and the pool silently shrinks. The single caller guards with
+        ``ref_cnt == 0``, so raising here is safe.
+        """
+        t = self._tier_of.get(block.block_id, -1)
+        if t < 0:
+            raise RuntimeError(
+                f"remove() on block {block.block_id} which is not in any tier "
+                f"(already allocated, or never added)"
+            )
+        self.layers[t].remove(block)
+        self._tier_of[block.block_id] = -1
+        self._n_allocated += 1
+        self._assert_conserved()
+
+    def repromote(self, block: KVCacheBlock, new_tier: int) -> bool:
+        """Move a queued block to another tier. Returns whether it moved.
+
+        ``block`` must be in the queue (ref_cnt == 0). Allocated blocks are
+        skipped: they land in the right tier on their next ``append_n``.
+        """
+        if not (0 <= new_tier < self.num_tiers):
+            return False
+        old = self._tier_of.get(block.block_id, -1)
+        if old < 0 or old == new_tier:
+            return False
+        self.layers[old].remove(block)
+        self.layers[new_tier].append_n([block])
+        self._tier_of[block.block_id] = new_tier
+        block.tier = new_tier
+        self._assert_conserved()
+        return True
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        out: list[KVCacheBlock] = []
+        for layer in self.layers:
+            out.extend(layer.get_all_free_blocks())
+        return out
+
+    def rebuild(self, blocks: list[KVCacheBlock]) -> None:
+        """Re-bucket the queue in place from these blocks' current tiers.
+
+        In place on purpose: callers may hold a reference to this queue
+        object, so replacing it would leave them driving a detached copy while
+        the pool allocates from the new one. Only the caller that owns the
+        attribute may swap it, and nothing else does.
+        """
+        assert len(blocks) == self._expected_total, (
+            f"rebuild needs every block, got {len(blocks)} "
+            f"of {self._expected_total}"
+        )
+        by_tier: list[list[KVCacheBlock]] = [[] for _ in range(self.num_tiers)]
+        self._tier_of = {}
+        for block in blocks:
+            t = block.tier if 0 <= block.tier < self.num_tiers else 0
+            block.tier = t
+            by_tier[t].append(block)
+            self._tier_of[block.block_id] = t
+        self.layers = [FreeKVCacheBlockQueue(group) for group in by_tier]
+        self._n_allocated = 0
+        self._assert_conserved()
+
+    def tier_occupancy(self) -> list[int]:
+        """Free blocks per tier, lowest value first. For diagnostics."""
+        return [layer.num_free_blocks for layer in self.layers]
+
+    def peek_free_blocks(self, n: int) -> list[KVCacheBlock]:
+        """The next ``n`` blocks allocation would take, without removing them.
+
+        O(n) over the linked lists; only used on pool-pressure paths.
+        """
+        out: list[KVCacheBlock] = []
+        for layer in self.layers:
+            head = layer.fake_free_list_head.next_free_block
+            while head is not None and head.next_free_block is not None:
+                if len(out) >= n:
+                    return out
+                out.append(head)
+                head = head.next_free_block
+        return out
 
 
 def need_extra_keys(request: Request) -> bool:
@@ -3055,6 +3337,23 @@ def _report_kv_cache_config(
     # accounted for in each spec's `max_memory_usage_bytes`.
     num_tokens = int(max_concurrency * max_model_len)
 
+    # [本地 2026-11-11 观测 P1] 块池口径，与上面那个 num_tokens 分开标注。
+    #
+    # 两者【都不是】「块数 × block_size」那么简单，实测已确认（2026-11-11）：
+    #   · kv_cache_usage_perc 是【块比例】：1 - free_blocks/(num_blocks-1)
+    #   · 但一个 token 在 2 个 full-attn group 里各占一个位置，Mamba 组
+    #     (align) 每请求只占 ~2 块、与长度无关 ⇒ 每 2048 token 实耗 2 块
+    #   · 实测拟合（32K/64K/128K 三档，重复 3 次极差 0~1 块）：
+    #       块数 = 0.000969 × tokens + 56.8   ⇒ 1 块 ≈ 1032 tokens
+    #     反推 262144 tokens/请求 ⇒ 311 块 ⇒ 并发 4.12，与 num_tokens 的
+    #     4.057 吻合到 1.6% ⇒ num_tokens 才是接近真实可用量的那个数。
+    #
+    # 所以 num_blocks × block_size 只是【块容量算术积】，会高估约 2 倍，
+    # 不能用来把 usage 换算成 token。真正的换算系数是 1 块 ≈ block_size/2
+    # （本模型 2 个 full-attn group），这行日志只报块数，不报那个积。
+    block_size = vllm_config.cache_config.block_size
+    num_blocks = kv_cache_config.num_blocks
+
     logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
     total_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
     logger.info_once(
@@ -3070,6 +3369,14 @@ def _report_kv_cache_config(
             f"first={g.layer_names[0] if g.layer_names else None}"
             for g in kv_cache_config.kv_cache_groups
         ),
+    )
+    logger.info_once(
+        "GPU KV cache blocks: %s blocks of %s tokens each "
+        "(kv_cache_usage_perc is a fraction of this block count; "
+        "a token costs ~2 blocks here, so do NOT multiply by %s)",
+        f"{num_blocks:,}",
+        f"{block_size:,}",
+        f"{block_size:,}",
     )
     logger.info_once(
         "Maximum concurrency for %s tokens per request: %.2fx",
