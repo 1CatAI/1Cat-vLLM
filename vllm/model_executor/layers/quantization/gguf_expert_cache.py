@@ -197,11 +197,14 @@ _NATIVE = None
 def _native():
     global _NATIVE
     if _NATIVE is None:
-        try:
-            _NATIVE = importlib.import_module("vllm._gguf_expert_cache_C")
-            return _NATIVE
-        except ImportError:
-            pass
+        # VLLM_GGUF_EXPERT_CACHE_JIT=1 compiles the module from this source
+        # tree even when a prebuilt one is installed (new reader geometry).
+        if envs.VLLM_GGUF_EXPERT_CACHE_JIT != "1":
+            try:
+                _NATIVE = importlib.import_module("vllm._gguf_expert_cache_C")
+                return _NATIVE
+            except ImportError:
+                pass
         # Source checkouts without the prebuilt module compile it on demand.
         from torch.utils.cpp_extension import load
 

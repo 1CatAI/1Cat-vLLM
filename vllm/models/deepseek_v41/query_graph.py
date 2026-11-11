@@ -15,7 +15,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from .cache import V41CacheMetadata
+from .cache import BATCH, V41CacheMetadata
 
 logger = init_logger(__name__)
 
@@ -33,17 +33,28 @@ def _storage(tensor):
 
 
 class V41QueryGraph:
+    """One graph per query count: M5 for one request; VLLM_V41_BATCH adds
+    M = 5 R for R requests (captured on first use, keyed by M)."""
+
     def __init__(self, forward):
         self.forward = forward
-        self.graph: torch.cuda.CUDAGraph | None = None
-        self.output: torch.Tensor | None = None
-        self.signature: list[object] | None = None
-        self.references: tuple | None = None
+        self.entries: dict[int, tuple] = {}
         self.captures = self.replays = 0
 
     def __call__(self, input_ids, positions, inputs_embeds=None):
+        if torch.cuda.is_current_stream_capturing():
+            # Inside VLLM_V41_PROPOSE_GRAPH's round capture: record the kernels
+            # (a graph cannot be replayed while another one is captured).
+            return self.forward(input_ids, positions, inputs_embeds)
         metadata = get_forward_context().attn_metadata
-        if positions.shape != (5,) or not isinstance(metadata, dict) or not metadata:
+        rows = positions.shape[0]
+        allowed = rows % 5 == 0 and rows > 0 if BATCH else rows == 5
+        if (
+            positions.ndim != 1
+            or not allowed
+            or not isinstance(metadata, dict)
+            or (not metadata)
+        ):
             raise ValueError("V4.1 draft graph requires M5 with real KV metadata")
         signature = [_storage(t) for t in (input_ids, positions, inputs_embeds)]
         for name, item in sorted(metadata.items()):
@@ -54,30 +65,37 @@ class V41QueryGraph:
                 _storage(t)
                 for t in (item.block_table, item.slot_mapping, item.is_prefilling)
             )
-        if self.graph is None:
+            if item.layout is not None:
+                signature.append(("requests", item.layout.num_reqs))
+        entry = self.entries.get(rows)
+        if entry is None:
             # Warm the attention kernels with real metadata. This forward
             # does not insert query KV or advance accepted-prefix state.
             self.forward(input_ids, positions, inputs_embeds)
             torch.accelerator.synchronize(positions.device)
-            self.references = input_ids, positions, inputs_embeds, metadata
-            self.signature = signature
-            self.graph = torch.cuda.CUDAGraph()
+            graph = torch.cuda.CUDAGraph()
             with (
                 graph_capture(device=positions.device) as context,
                 torch.cuda.graph(
-                    self.graph,
+                    graph,
                     pool=current_platform.get_global_graph_pool(),
                     stream=context.stream,
                 ),
             ):
-                self.output = self.forward(input_ids, positions, inputs_embeds)
+                output = self.forward(input_ids, positions, inputs_embeds)
+            references = input_ids, positions, inputs_embeds, metadata
+            entry = self.entries[rows] = (graph, output, signature, references)
             self.captures += 1
-            logger.info("Captured V4.1 DSpark M5 query graph with real KV metadata")
-        elif signature != self.signature:
-            raise ValueError("V4.1 M5 graph input storage or metadata geometry changed")
-        self.graph.replay()
+            logger.info(
+                "Captured V4.1 DSpark M%d query graph with real KV metadata", rows
+            )
+        elif signature != entry[2]:
+            raise ValueError(
+                "V4.1 draft graph input storage or metadata geometry changed"
+            )
+        entry[0].replay()
         self.replays += 1
-        return self.output
+        return entry[1]
 
 
 class V41GreedyDraftGraph:
@@ -86,52 +104,62 @@ class V41GreedyDraftGraph:
     The proposer gathers hidden rows into a fresh allocation each round.
     Copy those values and the current anchor into owned graph inputs; never
     capture an address belonging to that temporary gather or a previous token.
+    One graph per request count R (M = 5 R, R anchors; R > 1 needs
+    VLLM_V41_BATCH and the sharded Markov head).
     """
 
     def __init__(self, forward):
         self.forward = forward
-        self.graph: torch.cuda.CUDAGraph | None = None
-        self.hidden: torch.Tensor | None = None
-        self.anchor: torch.Tensor | None = None
-        self.output: torch.Tensor | None = None
+        self.entries: dict[int, tuple] = {}
         self.captures = self.replays = 0
 
     def __call__(self, hidden, anchor):
+        if torch.cuda.is_current_stream_capturing():
+            return self.forward(hidden, anchor)
+        reqs = anchor.numel()
         if (
             hidden.ndim != 2
-            or hidden.shape[0] != 5
+            or hidden.shape[0] != 5 * reqs
             or not hidden.is_cuda
-            or anchor.shape != (1,)
+            or anchor.ndim != 1
+            or (reqs != 1 and not BATCH)
             or anchor.device != hidden.device
             or anchor.dtype not in (torch.int32, torch.int64)
         ):
-            raise ValueError("V4.1 greedy draft graph requires M5 and one anchor")
-        if self.graph is None:
-            self.hidden, self.anchor = hidden.clone(), anchor.clone()
-            self.forward(self.hidden, self.anchor)
+            raise ValueError("V4.1 greedy draft graph requires M5 per anchor")
+        entry = self.entries.get(reqs)
+        if entry is None:
+            owned_hidden, owned_anchor = hidden.clone(), anchor.clone()
+            self.forward(owned_hidden, owned_anchor)
             torch.accelerator.synchronize(hidden.device)
-            self.graph = torch.cuda.CUDAGraph()
+            graph = torch.cuda.CUDAGraph()
             with (
                 graph_capture(device=hidden.device) as context,
                 torch.cuda.graph(
-                    self.graph,
+                    graph,
                     pool=current_platform.get_global_graph_pool(),
                     stream=context.stream,
                 ),
             ):
-                self.output = self.forward(self.hidden, self.anchor)
+                output = self.forward(owned_hidden, owned_anchor)
+            entry = self.entries[reqs] = (graph, owned_hidden, owned_anchor, output)
             self.captures += 1
         else:
-            assert self.hidden is not None and self.anchor is not None
-            if _storage(hidden)[1:] != _storage(self.hidden)[1:] or (
-                _storage(anchor)[1:] != _storage(self.anchor)[1:]
+            _, owned_hidden, owned_anchor, _ = entry
+            if _storage(hidden)[1:] != _storage(owned_hidden)[1:] or (
+                _storage(anchor)[1:] != _storage(owned_anchor)[1:]
             ):
                 raise ValueError("V4.1 greedy graph input geometry changed")
-            self.hidden.copy_(hidden)
-            self.anchor.copy_(anchor)
-        self.graph.replay()
+            owned_hidden.copy_(hidden)
+            owned_anchor.copy_(anchor)
+        entry[0].replay()
         self.replays += 1
-        return self.output
+        return entry[3]
+
+
+# VLLM_V41_BATCH: context rows of several requests (padded by the caller to
+# a few sizes; padding rows carry slot -1 and store nothing).
+_CONTEXT_MAX = 192
 
 
 class V41ContextGraphs:
@@ -143,9 +171,11 @@ class V41ContextGraphs:
         self.captures = self.replays = 0
 
     def __call__(self, states, positions, slots):
+        if torch.cuda.is_current_stream_capturing():
+            return self.forward(states, positions, slots)
         rows = states.shape[0]
         if (
-            not 1 <= rows <= 6
+            not 1 <= rows <= (_CONTEXT_MAX if BATCH else 6)
             or states.ndim != 2
             or not states.is_cuda
             or states.dtype != torch.float16

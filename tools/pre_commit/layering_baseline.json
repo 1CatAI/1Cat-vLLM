@@ -10,7 +10,7 @@
  },
  "vllm/compilation/passes/fusion/allreduce_rms_fusion.py": {
   "model": 1,
-  "platform": 77
+  "platform": 75
  },
  "vllm/compilation/passes/fusion/sequence_parallelism.py": {
   "platform": 6
@@ -68,7 +68,7 @@
   "platform": 13
  },
  "vllm/config/speculative.py": {
-  "model": 142,
+  "model": 141,
   "platform": 17
  },
  "vllm/config/speculative_sampling.py": {
@@ -97,14 +97,14 @@
  },
  "vllm/distributed/device_communicators/cuda_communicator.py": {
   "model": 2,
-  "platform": 53
+  "platform": 51
  },
  "vllm/distributed/device_communicators/custom_all_reduce.py": {
   "model": 20,
   "platform": 71
  },
  "vllm/distributed/parallel_state.py": {
-  "platform": 57
+  "platform": 55
  },
  "vllm/engine/arg_utils.py": {
   "model": 14,
@@ -182,7 +182,7 @@
   "platform": 1
  },
  "vllm/model_executor/layers/fla/ops/gdn_selector.py": {
-  "platform": 20
+  "platform": 18
  },
  "vllm/model_executor/layers/fla/ops/kda.py": {
   "platform": 1
@@ -277,7 +277,7 @@
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py": {
   "model": 4,
-  "platform": 151
+  "platform": 147
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py": {
   "platform": 13
@@ -341,8 +341,8 @@
   "env": 1
  },
  "vllm/platforms/runtime_defaults.py": {
-  "model": 34,
-  "platform": 196
+  "model": 32,
+  "platform": 195
  },
  "vllm/platforms/xpu.py": {
   "env": 1
@@ -512,7 +512,7 @@
  },
  "vllm/v1/worker/gpu/cudagraph_utils.py": {
   "model": 11,
-  "platform": 33
+  "platform": 30
  },
  "vllm/v1/worker/gpu/mamba_align.py": {
   "model": 2
@@ -522,7 +522,7 @@
   "platform": 12
  },
  "vllm/v1/worker/gpu/model_states/mamba_hybrid.py": {
-  "model": 75,
+  "model": 74,
   "platform": 23
  },
  "vllm/v1/worker/gpu/pp_utils.py": {
@@ -535,7 +535,7 @@
   "platform": 11
  },
  "vllm/v1/worker/gpu/spec_decode/__init__.py": {
-  "model": 16
+  "model": 12
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py": {
   "model": 6

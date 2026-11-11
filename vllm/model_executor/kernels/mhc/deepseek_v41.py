@@ -103,7 +103,8 @@ def _col_projection2(
         a = tl.load(
             x + rows[:, None] * K + k[None, :], mask=(rows < M)[:, None], other=0.0
         ).to(tl.float32)
-        b = tl.load(weight + cols[:, None] * K + k[None, :])
+        # BF16 coefficients widen exactly in registers (no FP32 copy).
+        b = tl.load(weight + cols[:, None] * K + k[None, :]).to(tl.float32)
         acc += tl.sum(a[:, None, :] * b[None, :, :], 2)
         if NORMALIZE:
             sq += tl.sum(a * a, 1)
@@ -161,7 +162,7 @@ def fp32_projection(x, weight, *, normalized=False, eps=1e-20):
         result = torch.empty(
             x.shape[0], weight.shape[0], dtype=torch.float32, device=x.device
         )
-        if weight.dtype == torch.bfloat16 and (normalized or _COL_PROJECTION):
+        if weight.dtype == torch.bfloat16 and normalized:
             weight = weight.float()
         if normalized and weight.shape == (24, 20480) and x.shape[0] > 0:
             dots = torch.empty(20, x.shape[0], 24, dtype=torch.float32, device=x.device)

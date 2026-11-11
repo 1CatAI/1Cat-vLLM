@@ -3056,6 +3056,21 @@ def _report_kv_cache_config(
     num_tokens = int(max_concurrency * max_model_len)
 
     logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
+    total_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+    logger.info_once(
+        "KV pool: %d blocks, %.2f GiB, %d groups: %s",
+        kv_cache_config.num_blocks,
+        total_bytes / 2**30,
+        len(kv_cache_config.kv_cache_groups),
+        "; ".join(
+            f"{type(g.kv_cache_spec).__name__} x{len(g.layer_names)} "
+            f"bs={g.kv_cache_spec.block_size} page={g.kv_cache_spec.page_size_bytes} "
+            f"win={getattr(g.kv_cache_spec, 'sliding_window', None)} "
+            f"ratio={getattr(g.kv_cache_spec, 'compress_ratio', None)} "
+            f"first={g.layer_names[0] if g.layer_names else None}"
+            for g in kv_cache_config.kv_cache_groups
+        ),
+    )
     logger.info_once(
         "Maximum concurrency for %s tokens per request: %.2fx",
         f"{max_model_len:,}",

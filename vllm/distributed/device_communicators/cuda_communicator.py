@@ -26,6 +26,8 @@ from .base_device_communicator import _PYNCCL_ALLGATHER, DeviceCommunicatorBase
 from .collective_provider import CollectiveTrace
 
 logger = init_logger(__name__)
+
+_AR_ALLGATHER = envs.VLLM_V41_AR_ALLGATHER == "1"
 _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
 _PYNCCL_GATHER_DTYPES = {
     torch.int8,
@@ -393,6 +395,34 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        # VLLM_V41_AR_ALLGATHER=1 (default off): small all-gathers as one
+        # custom all-reduce of a zero-padded stack (exact: x + 0 == x). On a
+        # node-local TP group the push all-reduce costs tens of microseconds
+        # where NCCL's LL ring all-gather of a few hundred KiB costs hundreds.
+        ca = self.ca_comm
+        if (
+            _AR_ALLGATHER
+            and ca is not None
+            and not ca.disabled
+            and input_.is_cuda
+            and input_.is_contiguous()
+            and input_.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        ):
+            stacked = torch.zeros(
+                (self.world_size,) + tuple(input_.shape),
+                dtype=input_.dtype,
+                device=input_.device,
+            )
+            stacked[self.rank_in_group].copy_(input_)
+            if ca.should_custom_ar(stacked):
+                reduced = ca.custom_all_reduce(stacked)
+                if reduced is not None:
+                    if dim < 0:
+                        dim += input_.dim()
+                    size = input_.size()
+                    return reduced.movedim(0, dim).reshape(
+                        size[:dim] + (self.world_size * size[dim],) + size[dim + 1 :]
+                    )
         communicator = self.pynccl_comm
         if (
             _PYNCCL_ALLGATHER

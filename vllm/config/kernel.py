@@ -567,12 +567,15 @@ class Sm70GgufConfig:
     """Host expert representation. ``shared_original`` uses one unsliced GGUF
     cold pool per local TP4 group, with a single native swap coordinator."""
 
-    expert_cache_offload_fraction: float = Field(default=0.30, gt=0.0, lt=1.0)
+    expert_cache_offload_fraction: float = Field(default=0.30, ge=0.0, lt=1.0)
     """Actual fraction of cold experts in ``shared_original`` mode. GPU spare
-    slots are additional capacity and do not reduce this fraction."""
+    slots are additional capacity and do not reduce this fraction. 0 (only with
+    ``expert_cache_spare_slots=0``) keeps every expert resident: no cold pool,
+    no swap coordinator and no decode resolve (PP2 stages)."""
 
-    expert_cache_spare_slots: int = Field(default=8, ge=1, le=64)
-    """Free GPU slots kept per layer so decode misses never wait on eviction."""
+    expert_cache_spare_slots: int = Field(default=8, ge=0, le=64)
+    """Free GPU slots kept per layer so decode misses never wait on eviction.
+    ``shared_original``: 0 exactly when ``expert_cache_offload_fraction`` is 0."""
 
     expert_cache_host_slack: float = Field(default=0.1, ge=0.0, le=1.0)
     """Extra host slots per layer, as a fraction of experts, that keep copies
@@ -675,11 +678,20 @@ class Sm70GgufConfig:
                 )
             if self.expert_cache_profile is not None:
                 raise ValueError("shared_original currently uses deterministic hot ids")
+            if (self.expert_cache_offload_fraction == 0) != (
+                self.expert_cache_spare_slots == 0
+            ):
+                raise ValueError(
+                    "A cold set of zero is expert_cache_offload_fraction=0 with "
+                    "expert_cache_spare_slots=0; any other offload needs spares"
+                )
             if (
                 self.expert_cache_prefill != "turbomind"
                 or self.expert_cache_prefill_prepare != "all"
             ):
                 raise ValueError("shared_original requires complete TurboMind prefill")
+        elif 0 < self.expert_cache_fraction < 1 and not self.expert_cache_spare_slots:
+            raise ValueError("The rank-local expert cache requires spare slots")
 
 
 @config

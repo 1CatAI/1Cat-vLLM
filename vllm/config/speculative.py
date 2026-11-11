@@ -1169,12 +1169,16 @@ class SpeculativeConfig:
                         self.draft_model_config.max_model_len,
                         self.target_model_config.max_model_len,
                     )
-                if (
-                    self.method == "dspark"
-                    and __import__("os").environ.get("VLLM_V41_PACKED_KV", "0") == "1"
+                if self.method == "dspark" and (
+                    __import__("os").environ.get("VLLM_V41_PACKED_KV", "0") == "1"
+                    or getattr(
+                        self.target_model_config.hf_text_config, "model_type", None
+                    )
+                    == "deepseek_v41_text"
                 ):
                     # V4.1 DSpark attends only its sliding window and rotates
-                    # RoPE on the fly past its table: it covers the target length.
+                    # RoPE on the fly past its table: it covers the target length
+                    # (without this, requests past its 16K table get no drafts).
                     self.draft_model_config.max_model_len = max(
                         self.draft_model_config.max_model_len,
                         self.target_model_config.max_model_len,

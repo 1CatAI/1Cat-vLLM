@@ -15,6 +15,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
+from vllm.v1.sample.ops.fast_argmax import argmax_rows
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
@@ -299,7 +300,7 @@ class Sampler(nn.Module):
 
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
-        return logits.argmax(dim=-1).view(-1)
+        return argmax_rows(logits).view(-1)
 
     @staticmethod
     def _try_sm70_compact_topk20_sample(

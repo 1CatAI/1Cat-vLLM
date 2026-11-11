@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -13,6 +14,12 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
+
+# VLLM_V41_LIVE_TABLE=1 (default off): commit only the block-table columns the
+# rows can use (their live block counts, rounded up) instead of the full
+# max_model_len / block_size width. At a 1M max length the full width is
+# 256 KiB per request and KV group, staged and copied every step a row grows.
+_LIVE_TABLE = envs.VLLM_V41_LIVE_TABLE == "1"
 
 logger = init_logger(__name__)
 
@@ -139,7 +146,7 @@ class BlockTable:
         block_ids: list[int],
         row_idx: int,
     ) -> None:
-        if not block_ids:
+        if len(block_ids) == 0:
             return
 
         if self.use_hybrid_blocks:
@@ -295,13 +302,30 @@ class BlockTable:
                 BLOCK_SIZE=64,
             )
 
+    def _live_width(self, num_reqs: int) -> int:
+        """Columns that cover every committed row's blocks (256-aligned).
+
+        Kernels read a row's table only below its live length, so columns
+        past this width keep whatever the GPU copy held before."""
+        if num_reqs <= 0:
+            return 0
+        used = int(self.num_blocks_per_row[:num_reqs].max())
+        return min(self.max_num_blocks_per_req, max(256, -(-used // 256) * 256))
+
     def commit_block_table(self, num_reqs: int) -> None:
         if (
             self._block_table_dirty_until == 0
             and num_reqs <= self._block_table_committed_until
         ):
             return
-        self.block_table.copy_to_gpu(num_reqs)
+        if _LIVE_TABLE:
+            width = self._live_width(num_reqs)
+            buffer = self.block_table
+            buffer.gpu[:num_reqs, :width].copy_(
+                buffer.cpu[:num_reqs, :width], non_blocking=True
+            )
+        else:
+            self.block_table.copy_to_gpu(num_reqs)
         self._block_table_committed_until = max(
             self._block_table_committed_until, num_reqs
         )
@@ -314,7 +338,14 @@ class BlockTable:
             and num_reqs <= self._block_table_committed_until
         ):
             return
-        self.block_table.copy_to_gpu_staged(num_reqs)
+        if _LIVE_TABLE:
+            width = self._live_width(num_reqs)
+            buffer = self.block_table
+            buffer.copy_view_to_gpu_staged(
+                buffer.cpu[:num_reqs, :width], buffer.gpu[:num_reqs, :width]
+            )
+        else:
+            self.block_table.copy_to_gpu_staged(num_reqs)
         self._block_table_committed_until = max(
             self._block_table_committed_until, num_reqs
         )

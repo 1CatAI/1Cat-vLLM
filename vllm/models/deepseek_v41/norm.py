@@ -17,12 +17,28 @@ def _short_rms(x, weight, out, H: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.con
     tl.store(out + row * H + at, result, at < H)
 
 
+# VLLM_V41_BATCH: True while the current forward holds only decode-sized
+# requests (<= 6 tokens each). Their rows then take the same per-request short
+# routes as a one-request decode, whatever the batch's total row count.
+_DECODE_ROWS = [False]
+
+
+def set_decode_rows(value):
+    _DECODE_ROWS[0] = bool(value)
+
+
+def short_rows(n, limit=6):
+    """Whether n rows take a short (decode) route: n <= limit, or a batch of
+    decode-sized requests."""
+    return 1 <= n <= limit or (n >= 1 and _DECODE_ROWS[0])
+
+
 def short_rms_norm(x, weight, eps):
     if (
         x.ndim != 2
         or not x.is_cuda
         or x.dtype != torch.float16
-        or not 1 <= x.shape[0] <= 6
+        or not short_rows(x.shape[0])
         or x.shape[1] not in (128, 512, 1280, 5120)
         or not x.is_contiguous()
         or weight.shape != (x.shape[1],)

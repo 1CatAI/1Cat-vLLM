@@ -10,6 +10,7 @@ prefix; ``commit`` selects the accepted input count, including the anchor.
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 
 from .quantization.gguf_shared_protocol import _fail_if
@@ -361,3 +362,359 @@ def apply_engram_gate(
         enable_fp_fusion=False,
     )
     return result
+
+
+# ---- VLLM_V41_BATCH: per-request hash state slots --------------------------
+# Same hashes and commit rule as V41EngramHashState, for a batch of requests.
+# Token t belongs to request row rows[t] whose first token in this forward is
+# bases[t]; the row's state lives in slot slots[row]. A slot keeps its own
+# candidate histories (prefix 0 .. N of its pending forward), so a commit needs
+# only (slot, count) and may run after later forwards of other slots.
+
+
+@triton.jit
+def _bcompressed(ids, token_map, mask, at, VOCAB: tl.constexpr):
+    token = tl.load(ids + at).to(tl.int64)
+    _fail_if((token < 0) | (token >= VOCAB))
+    compressed = tl.load(token_map + token).to(tl.int64)
+    return tl.where(tl.load(mask + at), compressed, -1)
+
+
+@triton.jit
+def _bhash_request(
+    ids,
+    positions,
+    mask,
+    query_start_loc,
+    slots,
+    history,
+    metadata,
+    scratch,
+    errors,
+    VOCAB: tl.constexpr,
+    MAX_CONTEXT: tl.constexpr,
+    RECORD: tl.constexpr,
+):
+    r = tl.program_id(0)
+    first = tl.load(query_start_loc + r).to(tl.int64)
+    n = tl.load(query_start_loc + r + 1).to(tl.int64) - first
+    slot = tl.load(slots + r).to(tl.int64)
+    # Triton: nested ifs on tensors (no short-circuit `and`).
+    if (n > 0) & (slot != scratch):  # noqa: SIM102 (scratch = graph padding)
+        if tl.load(mask + first):
+            start = tl.load(positions + first).to(tl.int64)
+            previous = tl.load(history + slot * 4 + 3)
+            pending = tl.load(metadata + slot * 3 + 2)
+            bad = (
+                (start < 0)
+                | (start + n > MAX_CONTEXT)
+                | ((start != 0) & ((start != previous) | (pending != 0)))
+            )
+            if RECORD:
+                # VLLM_V41_BATCH_DEBUG: record the first failure, do not trap.
+                if bad:  # noqa: SIM102
+                    if tl.atomic_cas(errors, 0, 1) == 0:
+                        tl.store(errors + 1, slot.to(tl.int32))
+                        tl.store(errors + 2, start.to(tl.int32))
+                        tl.store(errors + 3, previous.to(tl.int32))
+                        tl.store(errors + 4, pending.to(tl.int32))
+                        tl.store(errors + 5, n.to(tl.int32))
+                        tl.store(errors + 6, r)
+            else:
+                _fail_if(bad)
+            for i in range(0, n):
+                pos = tl.load(positions + first + i).to(tl.int64)
+                token = tl.load(ids + first + i).to(tl.int64)
+                _fail_if((pos != start + i) | (token < 0) | (token >= VOCAB))
+            tl.store(metadata + slot * 3, start)
+            tl.store(metadata + slot * 3 + 1, n)
+            tl.store(metadata + slot * 3 + 2, 1)
+
+
+@triton.jit
+def _bhash_rows(
+    ids,
+    positions,
+    mask,
+    rows,
+    bases,
+    slots,
+    token_map,
+    primes,
+    offsets,
+    multipliers,
+    pad,
+    history,
+    hashes,
+    VOCAB: tl.constexpr,
+):
+    t, layer = tl.program_id(0), tl.program_id(1)
+    heads = tl.arange(0, 32)
+    base = tl.load(bases + t)
+    slot = tl.load(slots + tl.load(rows + t)).to(tl.int64)
+    local = t - base
+    start = tl.load(positions + base)
+    blocked = tl.full((), False, tl.int1)
+    products = tl.full((4,), 0, tl.int64)
+    live = tl.load(mask + t)
+    for lag in tl.static_range(4):
+        at = local - lag
+        inside = live & (at >= 0)
+        token = tl.load(ids + base + at, inside, 0).to(tl.int64)
+        _fail_if(inside & ((token < 0) | (token >= VOCAB)))
+        current = tl.load(token_map + token, inside, 0).to(tl.int64)
+        current = tl.where(tl.load(mask + base + at, inside, False), current, -1)
+        old = tl.load(history + slot * 4 + at + 3, live & (at < 0) & (at >= -3), -1)
+        old = tl.where(start == 0, -1, old)
+        current = tl.where(at >= 0, current, old)
+        current = tl.where(live, current, -1)
+        blocked |= current == -1
+        current = tl.where(blocked, tl.load(pad), current)
+        product = current * tl.load(multipliers + layer * 4 + lag)
+        products = tl.where(tl.arange(0, 4) == lag, product, products)
+    p0 = tl.sum(tl.where(tl.arange(0, 4) == 0, products, 0), 0)
+    p1 = tl.sum(tl.where(tl.arange(0, 4) == 1, products, 0), 0)
+    p2 = tl.sum(tl.where(tl.arange(0, 4) == 2, products, 0), 0)
+    p3 = tl.sum(tl.where(tl.arange(0, 4) == 3, products, 0), 0)
+    value = p0 ^ p1
+    value = tl.where(heads >= 8, value ^ p2, value)
+    value = tl.where(heads >= 16, value ^ p3, value)
+    prime = tl.load(primes + layer * 24 + heads, heads < 24, 1)
+    offset = tl.load(offsets + layer * 24 + heads, heads < 24, 0)
+    tl.store(hashes + (t * 2 + layer) * 24 + heads, value % prime + offset, heads < 24)
+
+
+@triton.jit
+def _bhistory_candidates(
+    ids,
+    positions,
+    mask,
+    rows,
+    bases,
+    slots,
+    token_map,
+    history,
+    candidates,
+    PREFIXES: tl.constexpr,
+    VOCAB: tl.constexpr,
+):
+    # Token t writes its row's prefix local + 1; a row's first token also
+    # writes prefix 0. Padding tokens (mask false) write nothing.
+    t = tl.program_id(0)
+    if tl.load(mask + t):
+        row = tl.load(rows + t)
+        base = tl.load(bases + t)
+        slot = tl.load(slots + row).to(tl.int64)
+        local = t - base
+        start = tl.load(positions + base)
+        for extra in tl.static_range(2):
+            prefix = local + 1 - extra
+            if (extra == 0) | (local == 0):
+                for column in tl.static_range(3):
+                    at = prefix - 3 + column
+                    inside = at >= 0
+                    token = tl.load(ids + base + at, inside, 0).to(tl.int64)
+                    current = tl.load(token_map + token, inside, 0).to(tl.int64)
+                    current = tl.where(
+                        tl.load(mask + base + at, inside, False), current, -1
+                    )
+                    old = tl.load(history + slot * 4 + at + 3, ~inside, -1)
+                    old = tl.where(start == 0, -1, old)
+                    value = tl.where(inside, current, old)
+                    tl.store(
+                        candidates + (slot * PREFIXES + prefix) * 3 + column, value
+                    )
+
+
+@triton.jit
+def _bcommit_history(
+    candidates,
+    metadata,
+    history,
+    selector,
+    slots,
+    errors,
+    PREFIXES: tl.constexpr,
+    RECORD: tl.constexpr,
+):
+    # selector[i] < 0: entry i has no forward to commit (it is skipped).
+    i = tl.program_id(0)
+    count = tl.load(selector + i).to(tl.int64)
+    if count >= 0:
+        slot = tl.load(slots + i).to(tl.int64)
+        length, start = tl.load(metadata + slot * 3 + 1), tl.load(metadata + slot * 3)
+        pending = tl.load(metadata + slot * 3 + 2)
+        bad = (pending != 1) | (count > length)
+        if RECORD:
+            if bad:
+                if tl.atomic_cas(errors, 0, 2) == 0:
+                    tl.store(errors + 1, slot.to(tl.int32))
+                    tl.store(errors + 2, start.to(tl.int32))
+                    tl.store(errors + 3, count.to(tl.int32))
+                    tl.store(errors + 4, pending.to(tl.int32))
+                    tl.store(errors + 5, length.to(tl.int32))
+                    tl.store(errors + 6, i)
+                return
+        else:
+            _fail_if(bad)
+        col = tl.arange(0, 4)
+        value = tl.load(candidates + (slot * PREFIXES + count) * 3 + col, col < 3, 0)
+        value = tl.where(col < 3, value, start + count)
+        tl.store(history + slot * 4 + col, value)
+        tl.store(metadata + slot * 3 + 2, 0)
+
+
+_DEBUG_LEVEL = int(envs.VLLM_V41_BATCH_DEBUG)
+# Batched state checks record the first protocol violation on device and the
+# host raises with it at the next step (check_errors), instead of a device
+# trap: same detection, and the trap path failed under PP micro-batches with
+# no violation ever recorded by this path (2026-11-08, 48-64 requests).
+_DEBUG = True
+_DEBUG_SYNC = _DEBUG_LEVEL >= 2  # also synchronous host checks and commit logs
+
+
+class V41EngramHashBatch(nn.Module):
+    """V41EngramHashState with one history per request slot."""
+
+    def __init__(self, single, slots):
+        super().__init__()
+        device = single.history.device
+        self.single = single
+        self.history = torch.tensor(
+            [-1, -1, -1, 0], dtype=torch.int64, device=device
+        ).repeat(slots, 1)
+        self.metadata = torch.zeros(slots, 3, dtype=torch.int64, device=device)
+        self.prefixes = single.max_tokens + 1
+        self.candidates = torch.empty(
+            slots * self.prefixes, 3, dtype=torch.int64, device=device
+        )
+        self.max_context = single.max_context
+        # The commit reads the forward's query_start_loc and slots after the
+        # runner may have moved on: keep the ones that forward used.
+        self.query_start_loc = torch.zeros(slots + 1, dtype=torch.int32, device=device)
+        self.forward_slots = torch.zeros(slots, dtype=torch.int32, device=device)
+        self.errors = torch.zeros(8, dtype=torch.int32, device=device)
+
+    def check_errors(self):
+        """VLLM_V41_BATCH_DEBUG: raise with the first recorded begin failure
+        (reads the copy started one step earlier; never synchronizes)."""
+        if not hasattr(self, "_errors_host"):
+            self._errors_host = torch.zeros(8, dtype=torch.int32).pin_memory()
+            self._errors_event = torch.cuda.Event()
+            self._errors_event.record()
+        if not self._errors_event.query():
+            return
+        values = self._errors_host.tolist()
+        self._errors_host.copy_(self.errors, non_blocking=True)
+        self._errors_event.record()
+        if values[0] == 2:
+            raise RuntimeError(
+                f"V4.1 batch debug (commit): entry {values[6]} slot {values[1]} "
+                f"pending forward starts at {values[2]} with {values[5]} tokens, "
+                f"pending flag {values[4]}, commit count {values[3]}"
+            )
+        if values[0]:
+            slot = values[1]
+            raise RuntimeError(
+                f"V4.1 batch debug (graph): row {values[6]} slot {slot} starts at "
+                f"{values[2]} ({values[5]} tokens), committed {values[3]}, pending "
+                f"{values[4]}"
+            )
+
+    def reset(self, slot):
+        self.history[slot] = torch.tensor([-1, -1, -1, 0], device=self.history.device)
+        self.metadata[slot].zero_()
+
+    def forward(self, input_ids, positions, token_mask, layout, slots):
+        s = self.single
+        n = input_ids.numel()
+        reqs = layout.num_reqs
+        result = torch.empty(n, 2, 24, dtype=torch.int64, device=input_ids.device)
+        vocab = s.token_map.numel()
+        self.query_start_loc[: reqs + 1].copy_(layout.query_start_loc[: reqs + 1])
+        self.forward_slots[:reqs].copy_(slots[:reqs])
+        if _DEBUG_SYNC:
+            self._debug_check(positions, token_mask, reqs)
+        _bhash_request[(reqs,)](
+            input_ids,
+            positions,
+            token_mask,
+            self.query_start_loc,
+            self.forward_slots,
+            self.history,
+            self.metadata,
+            self.history.shape[0] - 1,
+            self.errors,
+            VOCAB=vocab,
+            MAX_CONTEXT=self.max_context,
+            RECORD=_DEBUG,
+        )
+        _bhash_rows[(n, 2)](
+            input_ids,
+            positions,
+            token_mask,
+            layout.rows,
+            layout.bases,
+            self.forward_slots,
+            s.token_map,
+            s.primes,
+            s.offsets,
+            s.multipliers,
+            s.pad,
+            self.history,
+            result,
+            VOCAB=vocab,
+        )
+        _bhistory_candidates[(n,)](
+            input_ids,
+            positions,
+            token_mask,
+            layout.rows,
+            layout.bases,
+            self.forward_slots,
+            s.token_map,
+            self.history,
+            self.candidates,
+            PREFIXES=self.prefixes,
+            VOCAB=vocab,
+        )
+        return result
+
+    def _debug_check(self, positions, token_mask, reqs):
+        torch.accelerator.synchronize()
+        qsl = self.query_start_loc[: reqs + 1].tolist()
+        slots = self.forward_slots[:reqs].tolist()
+        for r in range(reqs):
+            a, b = qsl[r], qsl[r + 1]
+            if b <= a or not bool(token_mask[a]):
+                continue
+            start = int(positions[a])
+            previous = int(self.history[slots[r], 3])
+            pending = int(self.metadata[slots[r], 2])
+            if start != 0 and (start != previous or pending != 0):
+                raise RuntimeError(
+                    f"V4.1 batch debug: row {r} slot {slots[r]} starts at {start} "
+                    f"({b - a} tokens), committed {previous}, pending {pending}; "
+                    f"slots {slots} qsl {qsl}"
+                )
+
+    def commit(self, selector, slots):
+        """selector[i] accepted inputs of the pending forward of slots[i]."""
+        if _DEBUG_SYNC:
+            torch.accelerator.synchronize()
+            print(
+                f"[v41 batch debug] commit selector {selector.tolist()} slots "
+                f"{slots.tolist()} pending "
+                f"{[int(self.metadata[x, 2]) for x in slots.tolist()]}",
+                flush=True,
+            )
+        _bcommit_history[(selector.numel(),)](
+            self.candidates,
+            self.metadata,
+            self.history,
+            selector,
+            slots,
+            self.errors,
+            PREFIXES=self.prefixes,
+            RECORD=_DEBUG,
+        )

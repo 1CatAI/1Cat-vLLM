@@ -132,6 +132,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.v1 import v41_trace as _v41_trace
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -151,7 +152,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, TokenTail
 from vllm.v1.core.sched.pp_keep_batch import pp_keep_batch_decision
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -290,12 +291,15 @@ def _unwrap_pipeline_intermediate_hidden_states(
 ) -> torch.Tensor:
     if not isinstance(output, IntermediateTensors):
         return output
-    try:
-        return output.tensors["hidden_states"]
-    except KeyError as exc:
-        raise RuntimeError(
-            "Pipeline intermediate output must contain a 'hidden_states' tensor."
-        ) from exc
+    # DeepSeek-V4.1 PP2 hands off {"hidden", "pre"} (FP32 HC residual plus the
+    # last stage-1 FFN collapse weights); other models use "hidden_states".
+    for key in ("hidden_states", "hidden"):
+        if key in output.tensors:
+            return output.tensors[key]
+    raise RuntimeError(
+        "Pipeline intermediate output must contain a 'hidden_states' or "
+        f"'hidden' tensor (got {sorted(output.tensors)})."
+    )
 
 
 def _dflash_ddtree_debug_enabled() -> bool:
@@ -384,6 +388,37 @@ def _clip_stateful_sample_limits(
             # Include the first stop itself, excluding every later candidate.
             after = stop.to(torch.int32).cumsum(0) - stop.to(torch.int32) > 0
             values.masked_fill_(after, -1)
+
+
+def _v41_fused_clip_count(runner, output_token_ids, batch):
+    """VLLM_V41_FUSED_CLIP: V4.1 single-request clip + count in one launch."""
+    from vllm.models.deepseek_v41 import native as v41_native
+
+    if (
+        not v41_native.FUSED_CLIP
+        or batch is None
+        or output_token_ids.shape[0] != 1
+        or not output_token_ids.is_cuda
+        or not output_token_ids.is_contiguous()
+        or getattr(runner.model, "stateful_output_budget", None) is None
+    ):
+        return None
+    request = runner.requests[batch.req_ids[0]]
+    params = request.sampling_params
+    if params is None or params.max_tokens is None:
+        return None
+    stops = set(params.stop_token_ids or ())
+    if not params.ignore_eos and params.eos_token_id is not None:
+        stops.add(params.eos_token_id)
+    if output_token_ids.shape[1] <= 1:
+        stops = set()
+    return v41_native.fused_clip_count(
+        runner.model,
+        output_token_ids,
+        params.max_tokens,
+        request.num_prompt_tokens,
+        sorted(stops),
+    )
 
 
 def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
@@ -598,16 +633,22 @@ def _maybe_dump_sm70_qwen_layer_graph_buffers(stage: str, *, diagnostics=None) -
     flush_runner_graphs(stage, owner=diagnostics)
 
 
+_SAMPLE_HIDDEN_EVENT_POLICY: list[bool] = []
+
+
 def _should_record_sm70_sample_hidden_ready_event(
     sample_hidden_states: torch.Tensor,
     cudagraph_mode: CUDAGraphMode,
 ) -> bool:
-    return (
-        sample_hidden_states.is_cuda
-        and cudagraph_mode == CUDAGraphMode.FULL
-        and bool(graph_policy().compile_graph)
-        and current_platform.is_device_capability(70)
-    )
+    if not sample_hidden_states.is_cuda or cudagraph_mode != CUDAGraphMode.FULL:
+        return False
+    if not _SAMPLE_HIDDEN_EVENT_POLICY:
+        # Fixed for the process; resolving the policy costs ~90 us per step.
+        _SAMPLE_HIDDEN_EVENT_POLICY.append(
+            bool(graph_policy().compile_graph)
+            and current_platform.is_device_capability(70)
+        )
+    return _SAMPLE_HIDDEN_EVENT_POLICY[0]
 
 
 def _record_sm70_sample_hidden_ready_event(
@@ -1083,6 +1124,37 @@ def _non_greedy_rows_carry_drafts(
 
 _V41_TRUNC_CUTOFF = int(envs.VLLM_V41_TRUNC_CUTOFF)
 _V41_TRUNC = envs.VLLM_V41_TRUNC == "1"
+# PP + async speculative decoding: the last stage hands each round's sampled
+# and draft token ids to the other stages in one device broadcast on a
+# dedicated NCCL communicator, instead of two host round trips over gloo.
+# No host on any stage waits for them (default off).
+_PP_TOKEN_NCCL = envs.VLLM_V41_PP_TOKEN_NCCL == "1"
+# VLLM_V41_PP_MICRO (with PP_TOKEN_NCCL): PP micro-batches. A request's next
+# step is scheduled pp_size steps later, so its drafts cannot come from "the
+# previous step"; every stage keeps each request's latest drafts in a device
+# table (by request slot), and a non-last stage receives a round's state on a
+# side stream so the next micro-batch's forward does not wait for it.
+_V41_MICRO = envs.VLLM_V41_PP_MICRO == "1"
+# VLLM_V41_PP_AHEAD (with PP_MICRO): requests scheduled while a step of theirs
+# is in flight read that step's sampled token, valid count, drafts and computed
+# count from per-request device tables (by slot) instead of "the previous
+# batch", so any earlier step can be the one in flight.
+_V41_AHEAD = _V41_MICRO and envs.VLLM_V41_PP_AHEAD == "1"
+# VLLM_V41_STAGED_PREP: staged input copies for every step (no prep sync).
+_V41_STAGED_PREP = envs.VLLM_V41_STAGED_PREP == "1"
+# VLLM_V41_STAGED_PREP_STAGES="3" (default unset = all stages): the PP stages
+# that use VLLM_V41_STAGED_PREP.
+_V41_STAGED_PREP_STAGES = envs.VLLM_V41_STAGED_PREP_STAGES
+# VLLM_V41_LATE_GATHER=1 (default off): on a non-first PP stage, enqueue the
+# wait for the previous stage's hidden states after the input-prep event, so
+# that event (which the host waits on before the next step) only covers the
+# host-to-device input copies. The host then prepares the next step and posts
+# its receive while this step's data is still in flight.
+_V41_LATE_GATHER = envs.VLLM_V41_LATE_GATHER == "1"
+# VLLM_V41_PROPOSE_GRAPH=1 (default off): the padded drafter round as one CUDA
+# graph per shape (GPUModelRunner._v41_propose_graphed).
+_V41_PROPOSE_GRAPH = envs.VLLM_V41_PROPOSE_GRAPH == "1"
+_V41_GREEDY_VERIFY = envs.VLLM_V41_NATIVE == "1" and envs.VLLM_V41_GREEDY_VERIFY == "1"
 
 
 class GPUModelRunner(
@@ -1302,6 +1374,9 @@ class GPUModelRunner(
         self._sm70_async_worker_execute_trace_step = 0
         self._sm70_async_worker_sample_trace_step = 0
         self._input_transfer = create_input_transfer(vllm_config, device, logger=logger)
+        from vllm.utils.staged_copy import StagedCopyOwner
+
+        self._v41_staged = StagedCopyOwner()
         from vllm.diagnostics import bind_event_tracer
 
         self._event_tracer = bind_event_tracer(vllm_config)
@@ -1553,8 +1628,15 @@ class GPUModelRunner(
             # uses output token ids so we set this conservatively.
             # ThinkingTokenBudgetLogitsProcessor also needs output token ids to
             # correctly track think start/end token sequences in async scheduling.
+            # VLLM_V41_LAZY_OUTPUT_IDS=1 (default off): a reasoning config alone
+            # does not keep output token ids (a host sync per sampled step);
+            # requests with a thinking budget still get them through the
+            # thinking-budget holder (InputBatch._make_sampling_metadata).
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs)
-            or self.vllm_config.reasoning_config is not None,
+            or (
+                self.vllm_config.reasoning_config is not None
+                and envs.VLLM_V41_LAZY_OUTPUT_IDS != "1"
+            ),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
@@ -1819,6 +1901,20 @@ class GPUModelRunner(
         # scheduler_output, kept until the sampled matrix arrives from the
         # last rank in sample_tokens() (hybrid-state update).
         self._pp_nonlast_scheduler_output: SchedulerOutput | None = None
+        self._pp_sampled_payload: torch.Tensor | None = None
+        # VLLM_V41_PP_MICRO: per-request draft table and its readiness events.
+        self._v41_draft_table: torch.Tensor | None = None
+        self._v41_draft_slot: dict[str, int] = {}
+        self._v41_draft_free: list[int] = []
+        self._v41_draft_event: dict[str, torch.cuda.Event] = {}
+        self._v41_tok_table: torch.Tensor | None = None
+        self._v41_cnt_table: torch.Tensor | None = None
+        self._v41_comp_table: torch.Tensor | None = None
+        self._v41_cnt_host: dict[str, tuple] = {}
+        # This step's ahead requests -> slot (None: not VLLM_V41_PP_AHEAD).
+        self._v41_ahead_map: dict[str, int] | None = None
+        self._v41_side_stream: torch.cuda.Stream | None = None
+        self._v41_propose_graph: Any = None  # V41ProposeGraph, built on first use
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
@@ -1937,6 +2033,14 @@ class GPUModelRunner(
     def _can_use_sm70_staged_input_prep(
         self, scheduler_output: "SchedulerOutput"
     ) -> bool:
+        if _V41_STAGED_PREP and (
+            _V41_STAGED_PREP_STAGES is None
+            or str(get_pp_group().rank_in_group) in _V41_STAGED_PREP_STAGES.split(",")
+        ):
+            # Every CPU -> GPU input copy of the step goes through a fresh
+            # pinned staging tensor: the host does not wait for the previous
+            # step's copies (queued behind that step's round wait / forward).
+            return not scheduler_output.scheduled_encoder_inputs
         if not self._input_transfer.eligible:
             return False
         return self._input_transfer.can_stage(
@@ -2178,7 +2282,7 @@ class GPUModelRunner(
         req_index: int | None,
         num_computed_tokens: int,
         sent_token_ids: list[int],
-        all_token_ids: dict[str, list[int]],
+        all_token_ids: dict[str, list[int] | TokenTail],
     ) -> list[int]:
         """Non-last PP rank, non-async scheduling: rebuild the tokens sampled
         since this rank's last update.
@@ -2195,7 +2299,8 @@ class GPUModelRunner(
         if num_accepted <= 0:
             return sent_token_ids
         full = all_token_ids.get(req_id)
-        if full is not None:
+        # A TokenTail (VLLM_V41_FAST_READD) keeps only the newest tokens.
+        if full is not None and getattr(full, "offset", 0) <= req_state.num_tokens:
             if len(full) < num_computed_tokens:
                 raise RuntimeError(
                     f"PP spec decode: full token history is shorter than "
@@ -2243,6 +2348,22 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        release = getattr(getattr(self, "model", None), "v41_release", None)
+        if release is not None and scheduler_output.finished_req_ids:
+            done = None
+            if _V41_MICRO and self._v41_side_stream is not None:
+                # Deferred commits of their last rounds may still be queued on
+                # the side stream: a reused slot waits for them.
+                done = torch.cuda.Event()
+                done.record(self._v41_side_stream)
+            release(list(scheduler_output.finished_req_ids), done)
+        if _V41_MICRO:
+            for req_id in scheduler_output.finished_req_ids:
+                slot = self._v41_draft_slot.pop(req_id, None)
+                if slot is not None:
+                    self._v41_draft_free.append(slot)
+                self._v41_draft_event.pop(req_id, None)
+                self._v41_cnt_host.pop(req_id, None)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
@@ -2425,12 +2546,18 @@ class GPUModelRunner(
                 # the spec tokens length, but in third step it contains the
                 # spec tokens length. we only need to update num_computed_tokens
                 # when prev_num_draft_len > 0.
-                if req_index is None:
+                if req_index is None and not (
+                    # VLLM_V41_PP_AHEAD: a micro-batch's request is out of the
+                    # persistent batch whenever another group ran; its step in
+                    # flight is still found by slot.
+                    self._v41_ahead_map and req_id in self._v41_ahead_map
+                ):
                     req_state.prev_num_draft_len = 0
                 elif self.sync_spec_decode_accept_counts:
-                    assert self.input_batch.prev_req_id_to_index is not None
+                    prev_map = self._v41_prev_map()
+                    assert prev_map is not None
                     assert sync_valid_sampled_token_count is not None
-                    prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
+                    prev_req_index = prev_map[req_id]
                     num_accepted = sync_valid_sampled_token_count[prev_req_index] - 1
                     num_rejected = req_state.prev_num_draft_len - num_accepted
                     num_computed_tokens -= num_rejected
@@ -2446,11 +2573,8 @@ class GPUModelRunner(
                         (req_id, optimistic_num_accepted, req_state)
                     )
 
-                    async_prev_req_index = (
-                        self.input_batch.prev_req_id_to_index.get(req_id)
-                        if self.input_batch.prev_req_id_to_index
-                        else None
-                    )
+                    prev_map = self._v41_prev_map()
+                    async_prev_req_index = prev_map.get(req_id) if prev_map else None
                     if async_prev_req_index is not None:
                         self.prev_num_draft_tokens.np[async_prev_req_index] = (
                             optimistic_num_accepted
@@ -2609,7 +2733,7 @@ class GPUModelRunner(
                 valid_sampled_token_count = self._get_valid_sampled_token_count()
                 if not valid_sampled_token_count:
                     return
-                prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+                prev_req_id_to_index = self._v41_prev_map()
                 if not prev_req_id_to_index:
                     return
                 for (
@@ -2620,6 +2744,8 @@ class GPUModelRunner(
                     prev_req_index = prev_req_id_to_index.get(req_id)
                     if prev_req_index is None:
                         continue
+                    if valid_sampled_token_count[prev_req_index] <= 0:
+                        continue  # VLLM_V41_PP_AHEAD: not arrived yet
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
                     correction = optimistic_num_accepted - num_accepted
                     req_state.num_computed_tokens -= correction
@@ -2661,12 +2787,33 @@ class GPUModelRunner(
             # selects its full input length for a prefill chunk, including
             # chunks whose sampler output is intentionally discarded.
             batch = getattr(self, "input_batch", None)
-            if batch is not None:
+            fused = _v41_fused_clip_count(self, output_token_ids, batch)
+            if fused is not None:
+                commit_state(fused)
+                batch = None
+            elif batch is not None:
                 budget = None
                 get_budget = getattr(self.model, "stateful_output_budget", None)
-                if get_budget is not None:
-                    if output_token_ids.shape[0] != 1:
-                        raise ValueError("Private V4.1 state requires one request")
+                if get_budget is not None and output_token_ids.shape[0] > 1:
+                    # VLLM_V41_BATCH: one budget per row.
+                    limits, prompts = [], []
+                    for req_id in batch.req_ids[: output_token_ids.shape[0]]:
+                        request = self.requests.get(req_id)
+                        params = None if request is None else request.sampling_params
+                        maximum = None if params is None else params.max_tokens
+                        limits.append(1 << 40 if maximum is None else maximum)
+                        prompts.append(
+                            0 if request is None else request.num_prompt_tokens
+                        )
+                    budget = get_budget(
+                        torch.tensor(limits, dtype=torch.int64).to(
+                            output_token_ids.device, non_blocking=True
+                        ),
+                        torch.tensor(prompts, dtype=torch.int64).to(
+                            output_token_ids.device, non_blocking=True
+                        ),
+                    )
+                elif get_budget is not None:
                     request = self.requests[batch.req_ids[0]]
                     params = request.sampling_params
                     if params is not None and params.max_tokens is not None:
@@ -2676,7 +2823,8 @@ class GPUModelRunner(
                 _clip_stateful_sample_limits(
                     output_token_ids, batch.req_ids, self.requests, budget
                 )
-            commit_state(_count_contiguous_spec_tokens(output_token_ids))
+            if fused is None:
+                commit_state(_count_contiguous_spec_tokens(output_token_ids))
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
@@ -4499,7 +4647,7 @@ class GPUModelRunner(
 
         Populates self.prev_positions.np[:num_reqs] with the mapping.
         """
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        prev_req_id_to_index = self._v41_prev_map()
         prev_positions = self.prev_positions.np[:num_reqs]
 
         if not prev_req_id_to_index:
@@ -4574,7 +4722,142 @@ class GPUModelRunner(
                     + np.asarray(payload.node_depths, dtype=np.int64)[None, :]
                 )
 
+    def _v41_prev_map(self) -> dict[str, int] | None:
+        """Where a request's in-flight step is found: by previous-batch row,
+        or (VLLM_V41_PP_AHEAD) by table slot for this step's ahead requests."""
+        if self._v41_ahead_map is not None:
+            return self._v41_ahead_map
+        return self.input_batch.prev_req_id_to_index
+
+    def _v41_slots(self, req_ids) -> tuple[list[int], torch.Tensor]:
+        """VLLM_V41_PP_MICRO: per-request table slots (allocated on first use)
+        and their device index tensor."""
+        if self._v41_draft_table is None:
+            rows = self.max_num_reqs
+            k = self.num_spec_tokens
+            self._v41_draft_table = torch.zeros(
+                rows, k, dtype=torch.int32, device=self.device
+            )
+            self._v41_tok_table = torch.zeros(
+                rows, dtype=torch.int32, device=self.device
+            )
+            self._v41_cnt_table = torch.zeros(
+                rows, dtype=torch.int32, device=self.device
+            )
+            self._v41_comp_table = torch.zeros(
+                rows, dtype=self.num_computed_tokens.dtype, device=self.device
+            )
+            self._v41_draft_free = list(range(rows - 1, -1, -1))
+        slots = []
+        for req_id in req_ids:
+            slot = self._v41_draft_slot.get(req_id)
+            if slot is None:
+                slot = self._v41_draft_free.pop()
+                self._v41_draft_slot[req_id] = slot
+            slots.append(slot)
+        index = torch.tensor(slots, dtype=torch.int64, pin_memory=self.pin_memory)
+        return slots, index.to(self.device, non_blocking=True)
+
+    def _v41_store_drafts(self, req_ids, drafts: torch.Tensor) -> None:
+        """VLLM_V41_PP_MICRO: keep these requests' latest drafts by slot
+        (enqueued on the current stream)."""
+        k = self.num_spec_tokens
+        slots, index = self._v41_slots(req_ids)
+        assert self._v41_draft_table is not None  # allocated by _v41_slots
+        self._v41_draft_table.index_copy_(
+            0, index, drafts[: len(slots), :k].to(torch.int32)
+        )
+
+    def _v41_store_round(self, next_token_ids, valid_counts) -> None:
+        """VLLM_V41_PP_AHEAD: this step's sampled token and valid count by slot
+        (current stream), and a host copy of the counts for the deferred CPU
+        correction of a step scheduled ahead of this one."""
+        n = next_token_ids.shape[0]
+        req_ids = self.input_batch.req_ids[:n]
+        slots, index = self._v41_slots(req_ids)
+        assert self._v41_tok_table is not None and self._v41_cnt_table is not None
+        self._v41_tok_table.index_copy_(0, index, next_token_ids[:n].to(torch.int32))
+        self._v41_cnt_table.index_copy_(0, index, valid_counts[:n].to(torch.int32))
+        host = torch.empty(n, dtype=torch.int32, pin_memory=self.pin_memory)
+        host.copy_(valid_counts[:n].to(torch.int32), non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        for j, req_id in enumerate(req_ids):
+            self._v41_cnt_host[req_id] = (event, host, j)
+
+    def _v41_ahead_counts(self) -> list[int]:
+        """VLLM_V41_PP_AHEAD: the valid counts of the in-flight steps of this
+        step's ahead requests, as a list indexed by slot."""
+        counts = [0] * self.max_num_reqs
+        for req_id, slot in (self._v41_ahead_map or {}).items():
+            entry = self._v41_cnt_host.get(req_id)
+            if entry is None:
+                continue
+            event, host, j = entry
+            # Never block the host on a round still in flight (it would hold
+            # back the other micro-batches' steps): a count that has not
+            # arrived leaves this step's host-side bookkeeping optimistic, and
+            # the next scheduler output carries the corrected count.
+            if event.query():
+                counts[slot] = int(host[j])
+        return counts
+
+    def _v41_wait_rounds(self) -> None:
+        """VLLM_V41_PP_MICRO: a request whose last round state is still being
+        received on the side stream: this step reads its tokens, counts, drafts
+        and committed state, so the current stream waits for that round."""
+        stream = torch.cuda.current_stream()
+        waited = set()
+        for req_id in self.input_batch.req_ids[: self.input_batch.num_reqs]:
+            event = self._v41_draft_event.pop(req_id, None)
+            if event is not None and id(event) not in waited:
+                stream.wait_event(event)
+                waited.add(id(event))
+
+    def _v41_fill_drafts(self, scheduler_output, num_reqs, cu_num_tokens) -> None:
+        """VLLM_V41_PP_MICRO: draft placeholders of requests whose previous
+        step was not the last one get their drafts from the device table."""
+        if self._v41_draft_table is None:
+            return
+        spec = scheduler_output.scheduled_spec_decode_tokens
+        positions: list[int] = []
+        sources: list[int] = []
+        for i in range(num_reqs):
+            req_id = self.input_batch.req_ids[i]
+            draft_len = len(spec.get(req_id, ()))
+            slot = self._v41_draft_slot.get(req_id)
+            if not draft_len or slot is None:
+                continue
+            end = int(cu_num_tokens[i])
+            positions.extend(range(end - draft_len, end))
+            k = self.num_spec_tokens
+            sources.extend(range(slot * k, slot * k + draft_len))
+        if not positions:
+            return
+        to = lambda v: torch.tensor(  # noqa: E731
+            v, dtype=torch.int64, pin_memory=self.pin_memory
+        ).to(self.device, non_blocking=True)
+        self.input_ids.gpu.index_copy_(
+            0, to(positions), self._v41_draft_table.view(-1)[to(sources)]
+        )
+
     def _prepare_input_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        self._prepare_input_ids_base(
+            scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens
+        )
+        if _V41_MICRO:
+            # After the base path: requests in common with the previous step
+            # already have their drafts; the rest read the table (same values
+            # where both exist).
+            self._v41_fill_drafts(scheduler_output, num_reqs, cu_num_tokens)
+
+    def _prepare_input_ids_base(
         self,
         scheduler_output: "SchedulerOutput",
         num_reqs: int,
@@ -4590,8 +4873,14 @@ class GPUModelRunner(
         Uses self.prev_positions[:num_reqs] which maps current pos -> prev pos
         (-1 for new requests).
         """
+        prev_sampled = self.input_batch.prev_sampled_token_ids
+        draft_source = self._draft_token_ids
+        if self._v41_ahead_map is not None and self._v41_tok_table is not None:
+            # VLLM_V41_PP_AHEAD: prev_positions are table slots.
+            prev_sampled = self._v41_tok_table.view(-1, 1)
+            draft_source = self._v41_draft_table
 
-        if self.input_batch.prev_sampled_token_ids is None:
+        if prev_sampled is None:
             # Normal scheduling case
             self._copy_buffer_to_gpu(self.input_ids, total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
@@ -4660,7 +4949,7 @@ class GPUModelRunner(
             # The indices are both the same permutation of 0..N-1 so
             # we can copy directly using a single slice.
             self.input_ids.gpu[:num_common_tokens].copy_(
-                self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
+                prev_sampled[:num_common_tokens, 0],
                 non_blocking=True,
             )
             return
@@ -4674,26 +4963,24 @@ class GPUModelRunner(
         self.input_ids.gpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
-            src=self.input_batch.prev_sampled_token_ids[
-                prev_common_req_indices_tensor, 0
-            ],
+            src=prev_sampled[prev_common_req_indices_tensor, 0],
         )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
         if not spec_flattened_indices:
             return
 
-        if self._draft_token_ids is None:
+        if draft_source is None:
             raise RuntimeError(
                 "Speculative decode scheduled draft input slots, but the "
                 "worker has no draft token tensor to scatter. Continuing would "
                 "reuse stale GPU input_ids and can corrupt generation."
             )
 
-        if not isinstance(self._draft_token_ids, torch.Tensor):
+        if not isinstance(draft_source, torch.Tensor):
             raise RuntimeError(
                 "Speculative decode scheduled draft input slots, but the "
-                f"worker draft tokens are {type(self._draft_token_ids).__name__} "
+                f"worker draft tokens are {type(draft_source).__name__} "
                 "instead of a tensor. The scheduler must trim invalid draft "
                 "slots before target verification."
             )
@@ -4703,12 +4990,12 @@ class GPUModelRunner(
         ).to(self.device, non_blocking=True)
         if prev_draft_token_indices:
             max_prev_draft_index = max(prev_draft_token_indices)
-            if max_prev_draft_index >= self._draft_token_ids.numel():
+            if max_prev_draft_index >= draft_source.numel():
                 raise RuntimeError(
                     "Speculative decode scheduled more draft input slots than "
                     "the worker produced: "
                     f"required_flat_index={max_prev_draft_index}, "
-                    f"available={self._draft_token_ids.numel()}."
+                    f"available={draft_source.numel()}."
                 )
         prev_draft_token_indices_tensor = torch.tensor(
             prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
@@ -4716,7 +5003,7 @@ class GPUModelRunner(
 
         # because input_ids dtype is torch.int32,
         # so convert draft_token_ids to torch.int32 here.
-        draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+        draft_token_ids = draft_source.to(dtype=torch.int32)
 
         self.input_ids.gpu.scatter_(
             dim=0,
@@ -4825,6 +5112,8 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        if _V41_MICRO:
+            self._v41_wait_rounds()
         profile_inputs = _dflash_ddtree_worker_profile_enabled()
         profile_prepare_t0 = time.perf_counter() if profile_inputs else 0.0
         profile_parent_ms = 0.0
@@ -4994,7 +5283,7 @@ class GPUModelRunner(
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        prev_req_id_to_index = self._v41_prev_map()
         self._compute_prev_positions(num_reqs)
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
@@ -5062,30 +5351,62 @@ class GPUModelRunner(
             and participating_prev_positions.size > 0
         ):
             max_prev_position = int(participating_prev_positions.max())
-            if max_prev_position >= self.valid_sampled_token_count_gpu.shape[0]:
+            counts_rows = (
+                self._v41_cnt_table
+                if self._v41_ahead_map is not None and self._v41_cnt_table is not None
+                else self.valid_sampled_token_count_gpu
+            ).shape[0]
+            if max_prev_position >= counts_rows:
                 raise RuntimeError(
                     "Async speculative decode draft-count state is inconsistent: "
                     f"required previous row {max_prev_position}, but valid sampled "
                     "token counts contain only "
-                    f"{self.valid_sampled_token_count_gpu.shape[0]} rows."
+                    f"{counts_rows} rows."
                 )
             self._copy_buffer_to_gpu(self.prev_positions, num_reqs)
             self._copy_buffer_to_gpu(self.prev_num_draft_tokens)
-            cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                device=self.device, non_blocking=True
-            )
+            if self._input_transfer.active:
+                # Staged (VLLM_V41_STAGED_PREP): the pinned source is rewritten
+                # next step without waiting for this copy.
+                cpu_values = torch.empty(
+                    num_reqs,
+                    dtype=self.input_batch.num_computed_tokens_cpu_tensor.dtype,
+                    device=self.device,
+                )
+                self._v41_staged.copy(
+                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                    cpu_values,
+                )
+            else:
+                cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[
+                    :num_reqs
+                ].to(device=self.device, non_blocking=True)
+            ahead = self._v41_ahead_map is not None and self._v41_cnt_table is not None
             update_num_computed_tokens_for_batch_change(
                 self.num_computed_tokens,
                 self.num_accepted_tokens.gpu[:num_reqs],
                 self.prev_positions.gpu[:num_reqs],
-                self.valid_sampled_token_count_gpu,
+                self._v41_cnt_table if ahead else self.valid_sampled_token_count_gpu,
                 self.prev_num_draft_tokens.gpu,
                 cpu_values,
+                prev_num_computed_tokens=self._v41_comp_table if ahead else None,
+            )
+        elif self._input_transfer.active:
+            self._v41_staged.copy(
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                self.num_computed_tokens[:num_reqs],
             )
         else:
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
+            )
+        if self._v41_ahead_map is not None:
+            # This step's corrected counts, for a step scheduled ahead of it.
+            _, index = self._v41_slots(self.input_batch.req_ids[:num_reqs])
+            assert self._v41_comp_table is not None
+            self._v41_comp_table.index_copy_(
+                0, index, self.num_computed_tokens[:num_reqs]
             )
         if profile_inputs:
             profile_num_computed_ms = (time.perf_counter() - profile_inner_t0) * 1000.0
@@ -6526,11 +6847,18 @@ class GPUModelRunner(
                 destination = self.intermediate_tensors[k][:num_tokens]
                 source = v[:num_tokens]
                 if (
-                    destination.data_ptr() != source.data_ptr()
-                    or destination.shape != source.shape
-                    or destination.stride() != source.stride()
+                    destination.data_ptr() == source.data_ptr()
+                    and destination.stride() == source.stride()
+                    and source.shape[0] <= destination.shape[0]
+                    and source.shape[1:] == destination.shape[1:]
                 ):
-                    destination.copy_(source, non_blocking=True)
+                    # Received in place (e.g. fewer real tokens than a padded
+                    # graph size): the rows are already there.
+                    continue
+                # A sender with fewer real tokens than this padded graph size:
+                # its rows land in front, the padding rows keep stale values.
+                rows = min(source.shape[0], destination.shape[0])
+                destination[:rows].copy_(source[:rows], non_blocking=True)
 
         return IntermediateTensors(
             {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}
@@ -6853,7 +7181,7 @@ class GPUModelRunner(
 
         if is_first_rank:
             intermediate_tensors = None
-        else:
+        elif not _V41_LATE_GATHER:
             assert intermediate_tensors is not None
             intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True
@@ -7214,6 +7542,16 @@ class GPUModelRunner(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+
+        if logits is None and self._can_use_v41_greedy_top_tokens(
+            scheduler_output, spec_decode_metadata
+        ):
+            from vllm.models.deepseek_v41.greedy_head import verify_top_tokens
+
+            top_tokens = self.model.get_v41_top_tokens(sample_hidden_states)
+            sampled = verify_top_tokens(top_tokens, spec_decode_metadata)
+            logger.info_once("V4.1 TP-local greedy verification enabled")
+            return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
         spec_config = self.speculative_config
         ddtree_payloads = scheduler_output.scheduled_ddtree_payloads or {}
@@ -7717,6 +8055,17 @@ class GPUModelRunner(
             )
         return sampler_output
 
+    def _can_use_v41_greedy_top_tokens(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        if not _V41_GREEDY_VERIFY or _V41_TRUNC:
+            return False
+        from vllm.models.deepseek_v41.greedy_head import can_verify_top_tokens
+
+        return can_verify_top_tokens(self, scheduler_output, spec_decode_metadata)
+
     def _can_use_greedy_token_fastpath(
         self,
         scheduler_output: "SchedulerOutput",
@@ -8068,6 +8417,10 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
+        from vllm.v1.worker import gpu_worker
+
+        if gpu_worker._DELAY["gpu"]:
+            torch.cuda._sleep(gpu_worker._DELAY["gpu"])
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -8503,7 +8856,20 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             trace_update_states_t0 = time.perf_counter() if trace_log else 0.0
+            if _V41_AHEAD:
+                ahead = scheduler_output.v41_ahead_req_ids
+                if ahead is None:
+                    self._v41_ahead_map = None
+                else:
+                    self._v41_slots([])  # tables exist
+                    self._v41_ahead_map = {
+                        r: self._v41_draft_slot[r]
+                        for r in ahead
+                        if r in self._v41_draft_slot
+                    }
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if _v41_trace.ENABLED:
+                _v41_trace.mark("upd_done")
             if trace_log:
                 trace_update_states_ms = (
                     time.perf_counter() - trace_update_states_t0
@@ -8550,6 +8916,15 @@ class GPUModelRunner(
                     "it when the requests need prompt logprobs"
                 )
 
+            if _V41_MICRO:
+                self._v41_wait_rounds()
+            # VLLM_V41_BATCH: the model's per-request state slots of this batch.
+            set_batch = getattr(self.get_model(), "v41_set_batch", None)
+            if set_batch is not None:
+                set_batch(self.input_batch.req_ids[: self.input_batch.num_reqs])
+            if not get_pp_group().is_last_rank:
+                self._pp_stage_before_forward()
+
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -8558,6 +8933,8 @@ class GPUModelRunner(
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
             trace_prepare_inputs_t0 = time.perf_counter() if trace_log else 0.0
+            if _v41_trace.ENABLED:
+                _v41_trace.mark("prep_start")
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -8577,6 +8954,8 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            if _v41_trace.ENABLED:
+                _v41_trace.mark("pi_done")
             trace_batch_desc_t0 = time.perf_counter() if trace_log else 0.0
             (
                 cudagraph_mode,
@@ -8680,6 +9059,8 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            if _v41_trace.ENABLED:
+                _v41_trace.mark("bd_done")
             trace_slot_mapping_t0 = time.perf_counter() if trace_log else 0.0
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
@@ -8696,6 +9077,8 @@ class GPUModelRunner(
                     time.perf_counter() - trace_slot_mapping_t0
                 ) * 1000.0
 
+            if _v41_trace.ENABLED:
+                _v41_trace.mark("sm_done")
             trace_attn_metadata_t0 = time.perf_counter() if trace_log else 0.0
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -8718,6 +9101,8 @@ class GPUModelRunner(
                     time.perf_counter() - trace_attn_metadata_t0
                 ) * 1000.0
 
+            if _v41_trace.ENABLED:
+                _v41_trace.mark("preproc_start")
             trace_model_preprocess_t0 = time.perf_counter() if trace_log else 0.0
             (
                 input_ids,
@@ -8759,6 +9144,12 @@ class GPUModelRunner(
 
         if trace_log:
             trace_preprocess_ms = (time.perf_counter() - trace_preprocess_t0) * 1000.0
+        if _V41_LATE_GATHER and intermediate_tensors is not None:
+            intermediate_tensors = self.sync_and_gather_intermediate_tensors(
+                num_tokens_padded, intermediate_tensors, True
+            )
+        if _v41_trace.ENABLED:
+            _v41_trace.gmark("data")
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -8832,6 +9223,9 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if _v41_trace.ENABLED:
+                _v41_trace.mark("fwd_call")
+                _v41_trace.gmark("fwd_start")
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -8856,6 +9250,9 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
+            if not get_pp_group().is_last_rank:
+                self._pp_stage_after_forward()
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -8882,6 +9279,9 @@ class GPUModelRunner(
                         scheduler_output, spec_decode_metadata
                     )
                     or self._can_use_sm70_compact_topk20_tokens(
+                        scheduler_output, spec_decode_metadata
+                    )
+                    or self._can_use_v41_greedy_top_tokens(
                         scheduler_output, spec_decode_metadata
                     )
                     or self._can_use_ddtree_greedy_top_tokens(
@@ -9484,6 +9884,7 @@ class GPUModelRunner(
             if (
                 spec_config is not None
                 and self.parallel_config.pipeline_parallel_size > 1
+                and not _V41_MICRO  # the engine takes these drafts itself
             ):
                 output.set_draft_token_ids(self.take_draft_token_ids())
             if self.routed_experts_initialized:
@@ -9598,6 +9999,32 @@ class GPUModelRunner(
             )
         return async_output
 
+    def _pp_stage_before_forward(self) -> None:
+        """Non-last PP stage, before its forward.
+
+        A model whose per-step state lives on this stage commits the previous
+        forward's deferred count here, since this stage never samples
+        (DeepSeek-V4.1: models/deepseek_v41/pp_commit.py).
+        """
+        hook = getattr(self.get_model(), "pp_before_forward", None)
+        if hook is not None:
+            num_reqs = self.input_batch.num_reqs
+            hook(
+                self.input_batch.req_ids[:num_reqs],
+                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+            )
+
+    def _pp_stage_after_forward(self) -> None:
+        """Non-last PP stage, after its forward: commit it now or arm it."""
+        hook = getattr(self.get_model(), "pp_after_forward", None)
+        if hook is not None:
+            num_reqs = self.input_batch.num_reqs
+            hook(
+                self.input_batch.req_ids[:num_reqs],
+                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                self.input_batch.num_prompt_tokens[:num_reqs].tolist(),
+            )
+
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor, sampler_input: torch.Tensor
     ) -> None:
@@ -9630,6 +10057,10 @@ class GPUModelRunner(
                 device=sampled_token_ids.device,
             )
             payload[:, : sampled_token_ids.shape[1]] = sampled_token_ids
+            if _PP_TOKEN_NCCL:
+                # Sent with the drafts in _pp_broadcast_draft_token_ids.
+                self._pp_sampled_payload = payload
+                return
             payload_cpu = payload.cpu()
             self._pp_check_token_ids(
                 "sampled",
@@ -9678,6 +10109,18 @@ class GPUModelRunner(
                 dtype=torch.int32,
                 device=self.device,
             )
+        if _V41_MICRO:
+            self._v41_store_drafts(self.input_batch.req_ids[:num_reqs], payload)
+        if _PP_TOKEN_NCCL:
+            sampled = self._pp_sampled_payload
+            self._pp_sampled_payload = None
+            assert sampled is not None and sampled.shape[0] == num_reqs
+            # Kept until the next round: the broadcast reads it on the stream.
+            self._pp_token_payload = torch.cat([sampled, payload], dim=1)
+            self._pp_token_comm().broadcast(
+                self._pp_token_payload, src=pp.world_size - 1
+            )
+            return
         payload_cpu = payload.cpu()
         self._pp_check_token_ids("draft", payload_cpu, skip_discarded=False)
         torch.distributed.broadcast(payload_cpu, src=pp.rank, group=pp.cpu_group)
@@ -9701,7 +10144,11 @@ class GPUModelRunner(
             # entries are padding; an active request still needs a first token.
             consumed = (token_ids != -1).to(torch.int32).cumprod(dim=1).bool()
             invalid &= consumed
-            invalid[:, 0] |= token_ids[:, 0] < 0
+            # A model that clips its samples to the output budget on device
+            # (DeepSeek-V4.1) empties the row of an async step scheduled past
+            # the request's end; the scheduler discards that step's output.
+            if getattr(self.model, "stateful_output_budget", None) is None:
+                invalid[:, 0] |= token_ids[:, 0] < 0
         if skip_discarded:
             num_reqs = token_ids.shape[0]
             discarded = torch.from_numpy(self.discard_request_mask.np[:num_reqs])
@@ -9742,6 +10189,9 @@ class GPUModelRunner(
         does in its full sample_tokens() path.
         """
         pp = get_pp_group()
+        if _PP_TOKEN_NCCL:
+            self._pp_receive_spec_decode_state_nccl(num_reqs)
+            return
         sampled_cpu = torch.empty(
             (num_reqs, self.num_spec_tokens + 1), dtype=torch.int32
         )
@@ -9749,9 +10199,13 @@ class GPUModelRunner(
         self._pp_check_token_ids("sampled", sampled_cpu, skip_discarded=True)
         sampled = sampled_cpu.to(self.device, non_blocking=True)
         valid_counts = _count_contiguous_spec_tokens(sampled)
-        next_token_ids = sampled.gather(
-            1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
-        ).squeeze(1)
+        next_token_ids = (
+            sampled.gather(
+                1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
+            )
+            .squeeze(1)
+            .clamp_(min=0)  # an emptied (budget-clipped) row: never consumed
+        )
         assert self.valid_sampled_token_count_event is not None
         self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
 
@@ -9760,6 +10214,95 @@ class GPUModelRunner(
         self._pp_check_token_ids("draft", drafts_cpu, skip_discarded=False)
         self._draft_token_ids = drafts_cpu.to(self.device, non_blocking=True)
 
+        scheduler_output = self._pp_nonlast_scheduler_output
+        self._pp_nonlast_scheduler_output = None
+        if scheduler_output is None:
+            raise RuntimeError(
+                "PP speculative decoding: this non-last rank has no stashed "
+                "scheduler_output for the hybrid-state update."
+            )
+        self._update_states_after_model_execute(sampled, scheduler_output)
+
+    def _pp_token_comm(self):
+        """VLLM_V41_PP_TOKEN_NCCL: this PP group's own NCCL communicator.
+
+        Created on first use, which every rank of the group reaches in the
+        same round (the last rank's draft broadcast, the others' receive).
+        Separate from the pipeline's send/recv communicator."""
+        comm = getattr(self, "_pp_token_nccl", None)
+        if comm is None:
+            from vllm.distributed.device_communicators.pynccl import (
+                PyNcclCommunicator,
+            )
+
+            comm = PyNcclCommunicator(get_pp_group().cpu_group, device=self.device)
+            if comm.disabled:
+                raise RuntimeError("VLLM_V41_PP_TOKEN_NCCL needs NCCL")
+            self._pp_token_nccl = comm
+        return comm
+
+    def _pp_receive_spec_decode_state_nccl(self, num_reqs: int) -> None:
+        """The round state as one device broadcast [sampled | drafts].
+
+        Everything derived from it is enqueued on the stream; the host goes
+        on to prepare the next step while the GPU waits for the data."""
+        if _V41_MICRO:
+            # The next forward belongs to another micro-batch: receive (and
+            # commit this round's state) on a side stream. This round's
+            # requests wait for the event before their next forward.
+            if self._v41_side_stream is None:
+                self._v41_side_stream = torch.cuda.Stream(device=self.device)
+            side = self._v41_side_stream
+            main = torch.cuda.current_stream()
+            side.wait_stream(main)
+            model = self.get_model()
+            begin = getattr(model, "v41_begin_deferred", None)
+            if begin is not None:
+                begin()
+            with torch.cuda.stream(side):
+                try:
+                    self._pp_receive_spec_decode_state_nccl_body(num_reqs)
+                finally:
+                    end = getattr(model, "v41_end_deferred", None)
+                    if end is not None:
+                        end()
+                req_ids = self.input_batch.req_ids[:num_reqs]
+                assert isinstance(self._draft_token_ids, torch.Tensor)
+                self._v41_store_drafts(req_ids, self._draft_token_ids)
+                event = torch.cuda.Event()
+                event.record(side)
+            # Allocated on the side stream, read on the main stream next step.
+            for tensor in (
+                self.input_batch.prev_sampled_token_ids,
+                self.valid_sampled_token_count_gpu,
+                self._draft_token_ids,
+            ):
+                if isinstance(tensor, torch.Tensor):
+                    tensor.record_stream(main)
+            for req_id in req_ids:
+                self._v41_draft_event[req_id] = event
+            return
+        self._pp_receive_spec_decode_state_nccl_body(num_reqs)
+
+    def _pp_receive_spec_decode_state_nccl_body(self, num_reqs: int) -> None:
+        pp = get_pp_group()
+        k = self.num_spec_tokens
+        payload = torch.empty(
+            (num_reqs, 2 * k + 1), dtype=torch.int32, device=self.device
+        )
+        self._pp_token_comm().broadcast(payload, src=pp.world_size - 1)
+        sampled = payload[:, : k + 1].contiguous()
+        valid_counts = _count_contiguous_spec_tokens(sampled)
+        next_token_ids = (
+            sampled.gather(
+                1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
+            )
+            .squeeze(1)
+            .clamp_(min=0)  # an emptied (budget-clipped) row: never consumed
+        )
+        assert self.valid_sampled_token_count_event is not None
+        self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
+        self._draft_token_ids = payload[:, k + 1 :].contiguous()
         scheduler_output = self._pp_nonlast_scheduler_output
         self._pp_nonlast_scheduler_output = None
         if scheduler_output is None:
@@ -9930,8 +10473,12 @@ class GPUModelRunner(
             # Stash for GPU-side correction in _prepare_inputs.
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+        if _V41_AHEAD:
+            self._v41_store_round(next_token_ids, valid_sampled_tokens_count)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
+        if self._v41_ahead_map is not None:
+            return self._v41_ahead_counts()
         # Wait until valid_sampled_tokens_count is copied to cpu,
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         sampled_count_event = self.valid_sampled_token_count_event
@@ -9972,6 +10519,77 @@ class GPUModelRunner(
             value_token_ids=self._draft_confidence_token_ids,
             spec_decode_metadata=spec_decode_metadata,
         )
+
+    def _v41_propose_graphed(
+        self,
+        common_attn_metadata,
+        spec_decode_metadata,
+        valid_sampled_tokens_count,
+        next_token_ids,
+        aux_hidden_states,
+        sampling_metadata,
+        slot_mappings,
+    ) -> torch.Tensor:
+        """VLLM_V41_PROPOSE_GRAPH: the padded drafter round (input preparation
+        through the greedy draft) as one CUDA graph per request count and
+        shapes (vllm/models/deepseek_v41/propose_graph.py)."""
+        if self._v41_propose_graph is None:
+            from vllm.models.deepseek_v41.propose_graph import V41ProposeGraph
+
+            self._v41_propose_graph = V41ProposeGraph()
+        cad = common_attn_metadata
+        inputs = {
+            "qsl": cad.query_start_loc,
+            "seq_lens": cad.seq_lens,
+            "block_table": cad.block_table_tensor,
+            "slot": cad.slot_mapping,
+            "cu": spec_decode_metadata.cu_num_draft_tokens,
+            "valid": valid_sampled_tokens_count,
+            "next": next_token_ids,
+        }
+        for i, h in enumerate(aux_hidden_states):
+            inputs[f"aux{i}"] = h[: cad.num_actual_tokens]
+
+        # The DSpark proposer (VLLM_V41_PROPOSE_GRAPH is only used with it).
+        drafter: Any = self.drafter
+
+        def round_fn(d: dict[str, torch.Tensor]) -> torch.Tensor:
+            static_cad = replace(
+                cad,
+                query_start_loc=d["qsl"],
+                seq_lens=d["seq_lens"],
+                block_table_tensor=d["block_table"],
+                slot_mapping=d["slot"],
+            )
+            spec = replace(spec_decode_metadata, cu_num_draft_tokens=d["cu"])
+            spec_cad, token_indices, num_rejected = drafter.prepare_inputs_padded(
+                static_cad, spec, d["valid"]
+            )
+            total = spec_cad.num_actual_tokens
+            hidden = torch.cat(
+                [d[f"aux{i}"][:total] for i in range(len(aux_hidden_states))],
+                dim=-1,
+            )
+            return drafter.propose(
+                target_token_ids=self.input_ids.gpu[:total],
+                target_positions=self._get_positions(total),
+                target_hidden_states=hidden,
+                next_token_ids=d["next"],
+                token_indices_to_sample=token_indices,
+                sampling_metadata=sampling_metadata,
+                common_attn_metadata=spec_cad,
+                mm_embed_inputs=None,
+                num_rejected_tokens_gpu=num_rejected,
+                slot_mappings=slot_mappings,
+            )
+
+        if cad.max_query_len > self.num_spec_tokens + 1:
+            # A prefill chunk in the step: its shape is new nearly every time
+            # and a graph keeps chunk-sized static copies (~1.5 GB each at
+            # 4K tokens) alive, so such steps run eagerly.
+            return round_fn(inputs)
+        key = (cad.num_reqs, cad.num_actual_tokens, cad.max_query_len)
+        return self._v41_propose_graph(key, round_fn, inputs)
 
     def propose_draft_token_ids(
         self,
@@ -10202,6 +10820,24 @@ class GPUModelRunner(
                         )
                     else:
                         target_hidden_states = hidden_states[token_indices]
+                elif (
+                    _V41_PROPOSE_GRAPH
+                    and self.use_aux_hidden_state_outputs
+                    and aux_hidden_states is not None
+                    and not (
+                        self.supports_mm_inputs and self.drafter.supports_mm_inputs
+                    )
+                    and not self._diagnostics.channels["mtp_step"].policy.directory
+                ):
+                    return self._v41_propose_graphed(
+                        common_attn_metadata,
+                        spec_decode_metadata,
+                        valid_sampled_tokens_count,
+                        next_token_ids,
+                        aux_hidden_states,
+                        sampling_metadata,
+                        slot_mappings,
+                    )
                 else:
                     (
                         common_attn_metadata,
