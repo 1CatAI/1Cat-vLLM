@@ -59,12 +59,14 @@ fi
 vllm_cli=$(command -v "$vllm_cli")
 exec "$vllm_cli" serve "$model" \
   --tensor-parallel-size 4 --dtype half --kv-cache-dtype float16 \
-  --language-model-only --max-model-len 262144 \
+  --max-model-len 262144 \
   --max-num-batched-tokens 4096 --max-num-seqs 8 \
   --gpu-memory-utilization 0.89 --attention-backend FLASH_ATTN_V100 \
   --enable-prefix-caching --partial-prefix-cache \
   --block-size 2048 --mamba-block-size 2048 --mixed-prefill-step-latency-ms 0 \
   --prefix-cache-retention-interval 8192 \
   --mamba-ssm-cache-dtype float32 --enable-prompt-tokens-details \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 --mm-encoder-tp-mode data \
   --kernel-config "$kernel_config" \
   --speculative-config "$speculative" "${serve_options[@]}"
