@@ -81,6 +81,7 @@ _SUPPORTED_CONTRACTS: Final = {
     (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
     (2560, 640, 512, 10),  # Qwen3.8-Flash-Next
     (4096, 2048, 288, 8),  # GLM-5.3-Flash
+    (2816, 704, 128, 8),  # Gemma-4-26B-A4B
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
@@ -785,7 +786,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             raise NotImplementedError("SM70 NVFP4 MoE does not support expert bias.")
         if layer.activation != MoEActivation.SILU:
             raise NotImplementedError(
-                "SM70 NVFP4 MoE currently supports SwiGLU/SILU only."
+                f"SM70 NVFP4 MoE supports SwiGLU/SILU only, got "
+                f"{layer.activation}; quantize with compressed-tensors "
+                f"for the generic MoE path."
             )
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
