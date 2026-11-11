@@ -156,6 +156,33 @@ _EM7 = envs.VLLM_V41_EM7 == "1"
 os.environ.setdefault("VLLM_V41_EM8", "0")  # single-barrier down: no gain measured
 
 
+_PLAN_FUSE = envs.VLLM_V41_PLAN_FUSE == "1"
+_PLAN_FUSE_LOGGED = False
+
+
+def _q8_and_plan(xq, xd, x, ids32, plan):
+    """Quantize x for the expert rows path and build this layer's expert plan.
+
+    Returns the gate/up op to call next: gate_up7 builds the plan itself in a
+    separate moe_plan launch; with VLLM_V41_PLAN_FUSE=1 q8_plan builds the
+    same plan inside the quantization launch and gate_up7p skips moe_plan.
+    """
+    if not _PLAN_FUSE:
+        torch.ops.v41k.q8_aligned(xq, xd, x)
+        return torch.ops.v41k.gate_up7
+    if not hasattr(torch.ops.v41k, "q8_plan"):
+        raise RuntimeError(
+            "VLLM_V41_PLAN_FUSE=1 needs a v41k.so with q8_plan and gate_up7p "
+            "(rebuild benchmarks/deepseek_v41/v41k); loaded: " + default_v41k_library()
+        )
+    global _PLAN_FUSE_LOGGED
+    if not _PLAN_FUSE_LOGGED:
+        _PLAN_FUSE_LOGGED = True
+        logger.info("VLLM_V41_PLAN_FUSE=1: expert plan built in q8_plan, gate_up7p")
+    torch.ops.v41k.q8_plan(xq, xd, x, ids32, plan)
+    return torch.ops.v41k.gate_up7p
+
+
 def _plan(device):
     key = ("plan", device)
     if key not in _EM["books"]:  # type: ignore[operator]
@@ -199,24 +226,132 @@ def _rows_context(device):
     return _ROWS[device]
 
 
-def _v41_experts_rows(
+_EXPERT_FAST = envs.VLLM_V41_EXPERT_FAST == "1"
+
+
+def _expert_fast_book(kind, device):
+    """v41k fast_table(kind) once per device; checks the library has the ops."""
+    key = ("fast", kind, device)
+    if key not in _EM["books"]:  # type: ignore[operator]
+        missing = [
+            op
+            for op in ("fast_table", "gate_up_fast", "down_rows_fast")
+            if not hasattr(torch.ops.v41k, op)
+        ]
+        if missing:
+            raise RuntimeError(
+                "VLLM_V41_EXPERT_FAST=1 needs a v41k.so with "
+                + " and ".join(missing)
+                + " (rebuild benchmarks/deepseek_v41/v41k); loaded: "
+                + default_v41k_library()
+            )
+        logger.info_once(
+            "VLLM_V41_EXPERT_FAST=1: routed experts on v41k gate_up_fast and "
+            "down_rows_fast (bit-identical to gate_up7 / gate_up7p and to "
+            "down_rows at row tile rows=4)",
+            scope="process",
+        )
+        book = torch.ops.v41k.fast_table(kind, device)
+        _EM["books"][key] = book  # type: ignore[index]
+    return _EM["books"][key]  # type: ignore[index]
+
+
+def _v41_experts_rows_fast(
     x, ids32, probabilities, gate, up, down, source_type, down_type, rows, warps
 ):
-    """Row-split down: local Q8 h groups are gathered, then 1280 rows per rank."""
+    """_v41_experts_rows with gate/up on gate_up_fast and down on down_rows_fast.
+
+    gate_up_fast reproduces gate_up7 (build_plan=True: moe_plan first) and
+    gate_up7p (build_plan=False: the plan q8_plan built under
+    VLLM_V41_PLAN_FUSE) bit for bit. down_rows_fast reproduces
+    down_rows(rows=4, dn_warps=warps) bit for bit (warps == 8: eight
+    accumulation classes, anything else: four, as in down_rows); other row
+    tiles change the FP order, so they are refused.
+    """
+    if rows != 4:
+        raise ValueError(
+            "VLLM_V41_EXPERT_FAST=1 matches down_rows only at row tile rows=4 "
+            f"(VLLM_V41_ROWS_TILE '4,8'); got rows={rows}"
+        )
+    gbook = _expert_fast_book(source_type, x.device)
+    fbook = _expert_fast_book(down_type, x.device)
     m = x.shape[0]
     routes = m * 6
     stride = (routes * 648 + 255) // 256 * 256
     xq = torch.empty((m, 160, 32), dtype=torch.int8, device=x.device)
     xd = torch.empty((m, 160), dtype=torch.float32, device=x.device)
-    torch.ops.v41k.q8_aligned(xq, xd, x.contiguous())
+    plan = _plan(x.device)
+    # q8_aligned, or q8_plan + plan under VLLM_V41_PLAN_FUSE; gate_up_fast
+    # then builds the plan itself exactly when gate_up7 would have.
+    _q8_and_plan(xq, xd, x.contiguous(), ids32, plan)
+    peer = _PEER.get(x.device)
+    if peer is not None and hasattr(torch.ops.v41k, "peer_gather"):
+        rank, pointers, own, epoch = peer
+        hq = own[rank * stride : rank * stride + routes * 576]
+        hd = own[rank * stride + routes * 576 : rank * stride + routes * 648]
+        gathered = own
+    else:
+        rank, nccl = _rows_context(x.device)
+        packed = torch.empty(stride, dtype=torch.uint8, device=x.device)
+        hq = packed[: routes * 576]
+        hd = packed[routes * 576 : routes * 648]
+    torch.ops.v41k.gate_up_fast(
+        xq,
+        xd,
+        hq.view(torch.int8).view(routes, 18, 32),
+        hd.view(torch.float32).view(routes, 18),
+        ids32,
+        probabilities.contiguous(),
+        gate,
+        up,
+        source_type,
+        gbook,
+        plan,
+        not _PLAN_FUSE,
+    )
+    if peer is not None and hasattr(torch.ops.v41k, "peer_gather"):
+        torch.ops.v41k.peer_gather(*pointers, rank, stride, ROWS_FLAGS, epoch)
+    else:
+        gathered = torch.empty(4 * stride, dtype=torch.uint8, device=x.device)
+        nccl.all_gather(gathered, packed)
+    result = torch.empty_like(x)  # down_rows_fast writes zeros in other rows
+    torch.ops.v41k.down_rows_fast(
+        result,
+        gathered,
+        stride,
+        routes,
+        down,
+        down_type,
+        rank * down.shape[1],
+        fbook,
+        8 if warps == 8 else 4,
+        plan,
+    )
+    return result
+
+
+def _v41_experts_rows(
+    x, ids32, probabilities, gate, up, down, source_type, down_type, rows, warps
+):
+    """Row-split down: local Q8 h groups are gathered, then 1280 rows per rank."""
+    if _EXPERT_FAST:
+        return _v41_experts_rows_fast(
+            x, ids32, probabilities, gate, up, down, source_type, down_type, rows, warps
+        )
+    m = x.shape[0]
+    routes = m * 6
+    stride = (routes * 648 + 255) // 256 * 256
+    xq = torch.empty((m, 160, 32), dtype=torch.int8, device=x.device)
+    xd = torch.empty((m, 160), dtype=torch.float32, device=x.device)
+    plan = _plan(x.device)
+    gate_up7 = _q8_and_plan(xq, xd, x.contiguous(), ids32, plan)
     peer = _PEER.get(x.device)
     if peer is not None and hasattr(torch.ops.v41k, "peer_gather"):
         rank, pointers, own, epoch = peer
         slot = own[rank * stride : rank * stride + routes * 648]
         hq = slot[: routes * 576].view(torch.int8).view(routes, 18, 32)
         hd = slot[routes * 576 :].view(torch.float32).view(routes, 18)
-        plan = _plan(x.device)
-        torch.ops.v41k.gate_up7(
+        gate_up7(
             xq,
             xd,
             hq,
@@ -249,8 +384,7 @@ def _v41_experts_rows(
     packed = torch.empty(stride, dtype=torch.uint8, device=x.device)
     hq = packed[: routes * 576].view(torch.int8).view(routes, 18, 32)
     hd = packed[routes * 576 : routes * 648].view(torch.float32).view(routes, 18)
-    plan = _plan(x.device)
-    torch.ops.v41k.gate_up7(
+    gate_up7(
         xq,
         xd,
         hq,
