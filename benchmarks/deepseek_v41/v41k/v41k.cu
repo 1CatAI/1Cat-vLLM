@@ -1171,12 +1171,13 @@ __global__ void fp8_reduce(half* out, const float* partials, const half* bias,
 }
 
 // ---- v5: aligned activations (int8 qs as two int4 + float scale arrays) ----
-__global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
-                                  float* __restrict__ ds,
-                                  const half* __restrict__ x, int K) {
-  // one warp per 32-element group
+// one warp per 32-element group
+__device__ __forceinline__ void q8_aligned_row(int8_t* __restrict__ qs,
+                                               float* __restrict__ ds,
+                                               const half* __restrict__ x,
+                                               int K, int row) {
   const int g = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  const int lane = threadIdx.x % 32, row = blockIdx.y, groups = K / 32;
+  const int lane = threadIdx.x % 32, groups = K / 32;
   if (g >= groups) return;
   const float v = __half2float(x[int64_t(row) * K + g * 32 + lane]);
   float m = fabsf(v);
@@ -1186,6 +1187,78 @@ __global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
   qs[(int64_t(row) * groups + g) * 32 + lane] =
       m == 0.f ? 0 : int8_t(roundf(v / d));
   if (!lane) ds[int64_t(row) * groups + g] = __half2float(__float2half_rn(d));
+}
+
+__global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
+                                  float* __restrict__ ds,
+                                  const half* __restrict__ x, int K) {
+  q8_aligned_row(qs, ds, x, K, blockIdx.y);
+}
+
+// The moe_plan plan (same entries, same values, other entries untouched) from
+// registers: each lane holds routes lane and lane + 32 and compares them with
+// every route broadcast by shuffle, so there is no shared memory and no serial
+// first-occurrence scan. One full warp calls it.
+__device__ __forceinline__ void plan_warp(int* __restrict__ plan,
+                                          const int* __restrict__ ids,
+                                          int routes) {
+  const int lane = threadIdx.x % 32;
+  int e[2], c[2] = {0, 0}, cnt[2] = {0, 0}, q0[2];
+  bool live[2];
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int r = lane + 32 * h;
+    e[h] = r < routes ? ids[r] : -1;
+    live[h] = r < routes && e[h] >= 0;  // id < 0: route dropped
+    q0[h] = r;
+  }
+  for (int q = 0; q < routes; ++q) {
+    const int v = __shfl_sync(0xffffffffU, q < 32 ? e[0] : e[1], q & 31);
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int r = lane + 32 * h;
+      if (live[h] && v == e[h]) {
+        if (q < r) {
+          ++c[h];  // earlier routes of this expert
+          q0[h] = min(q0[h], q);
+        } else {
+          ++cnt[h];  // this and later routes of this expert
+        }
+      }
+    }
+  }
+  const bool first0 = live[0] && c[0] == 0, first1 = live[1] && c[1] == 0;
+  const unsigned b0 = __ballot_sync(0xffffffffU, first0);
+  const unsigned b1 = __ballot_sync(0xffffffffU, first1);
+  const unsigned below = (1u << lane) - 1u;
+  const int own0 = __popc(b0 & below), own1 = __popc(b0) + __popc(b1 & below);
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    // distinct index of this route's expert = own index of its first route
+    const int u0 = __shfl_sync(0xffffffffU, own0, q0[h] & 31);
+    const int u1 = __shfl_sync(0xffffffffU, own1, q0[h] & 31);
+    const int u = q0[h] < 32 ? u0 : u1, r = lane + 32 * h;
+    if (!live[h]) continue;
+    if (c[h] < 6) plan[73 + 6 * u + c[h]] = r;
+    if (c[h] == 0) {
+      plan[1 + u] = e[h];
+      plan[37 + u] = cnt[h] < 6 ? cnt[h] : 6;
+    }
+  }
+  if (lane == 0) plan[0] = __popc(b0) + __popc(b1);
+}
+
+// q8_aligned for rows 0..M-1 (grid y 1..M) plus the expert plan (grid y 0, one
+// warp), so the plan needs no launch of its own and overlaps the quantization.
+__global__ void q8_plan_kernel(int8_t* __restrict__ qs, float* __restrict__ ds,
+                               const half* __restrict__ x, int K,
+                               int* __restrict__ plan,
+                               const int* __restrict__ ids, int routes) {
+  if (blockIdx.y == 0) {
+    if (blockIdx.x == 0 && threadIdx.x < 32) plan_warp(plan, ids, routes);
+    return;
+  }
+  q8_aligned_row(qs, ds, x, K, blockIdx.y - 1);
 }
 
 __device__ __forceinline__ void load_q8(const int8_t* qs, const float* ds,
@@ -2873,6 +2946,21 @@ void v41k_fp8_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor w,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// q8_aligned plus the moe_plan plan for ids32 in the same launch.
+void v41k_q8_plan(torch::Tensor qs, torch::Tensor ds, torch::Tensor x,
+                  torch::Tensor ids32, torch::Tensor plan) {
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  const int M = x.size(0), K = x.size(1), routes = ids32.numel();
+  TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
+  TORCH_CHECK(ids32.is_contiguous() && plan.is_contiguous());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  v41k::q8_plan_kernel<<<dim3((K / 32 + 7) / 8, M + 1), 256, 0, stream>>>(
+      reinterpret_cast<int8_t*>(qs.data_ptr()), ds.data_ptr<float>(),
+      reinterpret_cast<const half*>(x.data_ptr()), K, plan.data_ptr<int>(),
+      ids32.data_ptr<int>(), routes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void v41k_q8_aligned(torch::Tensor qs, torch::Tensor ds, torch::Tensor x) {
   const at::cuda::OptionalCUDAGuard guard(x.device());
   const int M = x.size(0), K = x.size(1);
@@ -3301,10 +3389,11 @@ void v41k_swap_combined(torch::Tensor b0, torch::Tensor b1, torch::Tensor b2,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
-                   torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
-                   torch::Tensor gate, torch::Tensor up, int64_t gtype,
-                   torch::Tensor gbook, torch::Tensor plan) {
+static void gate_up7_impl(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+                          torch::Tensor hd, torch::Tensor ids32,
+                          torch::Tensor prob, torch::Tensor gate,
+                          torch::Tensor up, int64_t gtype, torch::Tensor gbook,
+                          torch::Tensor plan, bool build_plan) {
   const at::cuda::OptionalCUDAGuard guard(xq.device());
   const int routes = ids32.numel();
   TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
@@ -3313,7 +3402,8 @@ void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
     return reinterpret_cast<int8_t*>(t.data_ptr());
   };
   int* pl = plan.data_ptr<int>();
-  v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
+  if (build_plan)
+    v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
 #define V41K_GU7R(T)                                                           \
   v41k::gate_up_em5<T><<<dim3(18, routes), 512, 0, stream>>>(                  \
       i8(hq), hd.data_ptr<float>(), i8(xq), xd.data_ptr<float>(),              \
@@ -3327,6 +3417,23 @@ void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
   else
     V41K_GU7R(29);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+                   torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
+                   torch::Tensor gate, torch::Tensor up, int64_t gtype,
+                   torch::Tensor gbook, torch::Tensor plan) {
+  gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,
+                true);
+}
+
+// gate_up7 with the plan already built by q8_plan (VLLM_V41_PLAN_FUSE).
+void v41k_gate_up7p(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+                    torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
+                    torch::Tensor gate, torch::Tensor up, int64_t gtype,
+                    torch::Tensor gbook, torch::Tensor plan) {
+  gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,
+                false);
 }
 
 void v41k_down_rows(torch::Tensor out, torch::Tensor gathered,
@@ -3458,6 +3565,15 @@ TORCH_LIBRARY(v41k, m) {
       &v41k_diag);
   m.def("q8_aligned(Tensor(a!) qs, Tensor(b!) ds, Tensor x) -> ()",
         &v41k_q8_aligned);
+  m.def(
+      "q8_plan(Tensor(a!) qs, Tensor(b!) ds, Tensor x, Tensor ids32, "
+      "Tensor(c!) plan) -> ()",
+      &v41k_q8_plan);
+  m.def(
+      "gate_up7p(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "
+      "ids32, Tensor prob, "
+      "Tensor gate, Tensor up, int gtype, Tensor gbook, Tensor plan) -> ()",
+      &v41k_gate_up7p);
   m.def(
       "moe5(Tensor(a!) out, Tensor xq, Tensor xd, Tensor(b!) hq, Tensor(c!) "
       "hd, Tensor ids32, "

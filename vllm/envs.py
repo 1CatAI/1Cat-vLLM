@@ -596,6 +596,7 @@ if TYPE_CHECKING:
     VLLM_V41_MAX_LEN: str = "16384"
     VLLM_V41_MISS_HIST: str = "0"
     VLLM_V41_PACKED_KV: str | None = None
+    VLLM_V41_PLAN_FUSE: str = "0"
     VLLM_V41_PLAN_STATS: str | None = None
     VLLM_V41_PP_BOUNDARY_SIM: str | None = None
     VLLM_V41_PRED_STATS: str = "0"
@@ -8799,6 +8800,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PLAN_FUSE": env_var(
+        lambda: os.getenv("VLLM_V41_PLAN_FUSE", "0"),
+        description=(
+            "DS-V4.1 TP4 row-split experts: 1 = build the per-layer expert "
+            "plan inside the q8 activation launch (v41k q8_plan + gate_up7p) "
+            "instead of a separate moe_plan launch; same plan bit for bit."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
