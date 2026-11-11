@@ -83,6 +83,30 @@ class Gemma3nImagePixelInputs(TensorSchema):
     pixel_values: Annotated[torch.Tensor, TensorShape("bn", 3, "h", "w")]
 
 
+def batch_audio_features(
+    input_features: torch.Tensor | list[torch.Tensor],
+    input_features_mask: torch.Tensor | list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(input_features, torch.Tensor):
+        assert isinstance(input_features_mask, torch.Tensor)
+        return input_features.squeeze(1), input_features_mask.squeeze(1)
+
+    assert isinstance(input_features_mask, list)
+    max_len = max(features.shape[0] for features in input_features)
+    batched_features = input_features[0].new_zeros(
+        (len(input_features), max_len, input_features[0].shape[-1])
+    )
+    batched_mask = input_features_mask[0].new_zeros(
+        (len(input_features_mask), max_len), dtype=torch.bool
+    )
+    for i, (features, mask) in enumerate(
+        zip(input_features, input_features_mask, strict=True)
+    ):
+        batched_features[i, : features.shape[0]] = features
+        batched_mask[i, : mask.shape[0]] = mask
+    return batched_features, batched_mask
+
+
 class Gemma3nAudioInputs(TensorSchema):
     """
     Dimensions:
