@@ -666,17 +666,25 @@ def update_num_computed_tokens_for_batch_change(
     valid_sampled_token_count: torch.Tensor,
     prev_num_draft_tokens: torch.Tensor,
     cpu_num_computed_tokens: torch.Tensor,
+    prev_num_computed_tokens: torch.Tensor | None = None,
 ) -> None:
     """Correct num_computed_tokens for async spec decode drift.
 
     Requests that had drafts: corrected = prev_gpu + valid_count.
     New requests or non-draft (e.g. prefills): use CPU value directly.
+    prev_num_computed_tokens: where the previous counts are found by
+    prev_positions (default: num_computed_tokens, by previous-batch row).
     """
     # Clamp because prev_positions can be -1 for new requests
     gather_indices = prev_positions.clamp(min=0)
 
     valid_counts = valid_sampled_token_count[gather_indices]
-    prev_computed = num_computed_tokens[gather_indices]
+    source = (
+        num_computed_tokens
+        if prev_num_computed_tokens is None
+        else (prev_num_computed_tokens)
+    )
+    prev_computed = source[gather_indices]
     prev_drafts = prev_num_draft_tokens[gather_indices]
 
     participating = (prev_positions >= 0) & (prev_drafts > 0)

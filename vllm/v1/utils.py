@@ -107,6 +107,18 @@ class ConstantList(Generic[T], Sequence):
         return self._x.copy()
 
 
+# VLLM_V41_RING_PREP=1 (default off): staged input copies (VLLM_V41_STAGED_PREP)
+# go through RING_PREP_SLOTS preallocated pinned copies of each buffer instead
+# of a fresh pinned tensor and an event per copy. InputTransferSession advances
+# RING_PREP["step"] once per staged step and waits for the step that used the
+# slot RING_PREP_SLOTS steps earlier, so the host can run that far ahead.
+RING_PREP_SLOTS = 4
+RING_PREP = {
+    "on": envs.VLLM_V41_RING_PREP == "1",
+    "step": 0,
+}
+
+
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
@@ -152,15 +164,38 @@ class CpuGpuBuffer:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
 
+    def _ring_view(self, src: torch.Tensor) -> torch.Tensor | None:
+        """``src`` (a view of ``self.cpu``) at the same place in this step's
+        ring slot, or None when ``src`` is not a view of ``self.cpu``."""
+        if src.untyped_storage().data_ptr() != self.cpu.untyped_storage().data_ptr():
+            return None
+        ring = getattr(self, "_ring", None)
+        if ring is None:
+            ring = self._ring = [
+                torch.empty_like(self.cpu, pin_memory=self.cpu.is_pinned())
+                for _ in range(RING_PREP_SLOTS)
+            ]
+        slot = ring[RING_PREP["step"] % RING_PREP_SLOTS]
+        return slot.as_strided(
+            src.size(),
+            src.stride(),
+            slot.storage_offset() + src.storage_offset() - self.cpu.storage_offset(),
+        )
+
     def copy_view_to_gpu_staged(
         self, src: torch.Tensor, dst: torch.Tensor
     ) -> torch.Tensor:
+        if RING_PREP["on"] and dst.device.type == "cuda":
+            staging = self._ring_view(src)
+            if staging is not None:
+                staging.copy_(src)
+                return dst.copy_(staging, non_blocking=True)
         return self._staged_copy_owner.copy(src, dst)
 
     def copy_to_gpu_staged(self, n: int | None = None) -> torch.Tensor:
         src = self.cpu if n is None else self.cpu[:n]
         dst = self.gpu if n is None else self.gpu[:n]
-        return self._staged_copy_owner.copy(src, dst)
+        return self.copy_view_to_gpu_staged(src, dst)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization

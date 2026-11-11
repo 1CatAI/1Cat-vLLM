@@ -8,9 +8,11 @@ import torch
 
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast,
-    fp32_to_fp8_e4m3fn_bits,
 )
-from vllm.triton_utils import tl, triton
+from vllm.models.deepseek_v4.common.ops.fp8_software import (
+    fp32_to_fp8_e4m3fn_bits_bitcast as fp32_to_fp8_e4m3fn_bits,
+)
+from vllm.triton_utils import tl, tldevice, triton
 
 
 @triton.jit
@@ -19,6 +21,12 @@ def _ceil_power_two(x):
     exponent = (bits >> 23).to(tl.int32) - 127
     exponent += ((bits & 0x7FFFFF) != 0).to(tl.int32)
     return ((exponent + 127) << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _reciprocal_power_two(x):
+    exponent = x.to(tl.uint32, bitcast=True) >> 23
+    return ((254 - exponent) << 23).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -58,7 +66,7 @@ def _qdq(x, out, GROUP: tl.constexpr, FP4: tl.constexpr, E4M3_SCALE: tl.constexp
         amax = tl.maximum(amax, 1e-4)
         scale = _ceil_power_two(amax * (1.0 / 448.0))
         quant = fp8_e4m3fn_bits_to_fp32_bitcast(
-            fp32_to_fp8_e4m3fn_bits(tl.div_rn(value, scale))
+            fp32_to_fp8_e4m3fn_bits(value * _reciprocal_power_two(scale))
         )
     tl.store(out + group * GROUP + i, quant * scale)
 
@@ -147,7 +155,9 @@ def _rotate(
         )
     else:
         angle = position.to(tl.float32) * tl.load(table + LENGTH * 64 + i)
-        c, s = tl.cos(angle), tl.sin(angle)
+        # Full-range cos/sin (libdevice): tl.cos/tl.sin lower to cos.approx,
+        # whose error at these angles (10^4..10^6 rad) is O(1).
+        c, s = tldevice.cos(angle), tldevice.sin(angle)
     if INVERSE:
         s = -s
     a = tl.load(x + base + D - 64 + 2 * i).to(tl.float32)

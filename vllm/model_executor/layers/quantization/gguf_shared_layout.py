@@ -21,6 +21,11 @@ import vllm.envs as envs
 DOWN_ROWS = envs.VLLM_V41_DOWN_ROWS == "1"
 
 
+# Hot experts pass through the exchange reserve in batches of this many
+# experts at start-up (``SharedOriginalExpertCache.store_original_bank``).
+LOAD_BATCH = 8
+
+
 @dataclass(frozen=True)
 class SharedExpertBudget:
     """Capacity measured in original cold experts, independently of GPU spares.
@@ -28,6 +33,11 @@ class SharedExpertBudget:
     ``expert_bytes`` contains one original expert's three projections for each
     layer. Exchange space is group-wide and must cover all outstanding M6
     routes plus spare operations at the largest layer, without reusing inputs.
+
+    A cold set of zero is configured exactly as ``offload_fraction == 0`` with
+    ``spare_slots == 0``: every expert stays in its own GPU slot (slot = id),
+    there is no cold pool or decode plan, and the exchange reserve only carries
+    the start-up load batches.
     """
 
     num_experts: int
@@ -41,21 +51,32 @@ class SharedExpertBudget:
         if (
             self.num_experts <= 1
             or not math.isfinite(self.offload_fraction)
-            or not 0 < self.offload_fraction < 1
+            or not 0 <= self.offload_fraction < 1
             or not self.expert_bytes
             or min(self.expert_bytes) <= 0
-            or self.spare_slots <= 0
+            or self.spare_slots < 0
             or self.max_routes <= 0
         ):
             raise ValueError("Invalid shared expert cache dimensions")
-        if not 0 < self.cold_experts < self.num_experts:
+        if self.offload_fraction == 0:
+            if self.spare_slots:
+                raise ValueError(
+                    "A cold set of zero requires expert_cache_spare_slots=0"
+                )
+        elif not 0 < self.cold_experts < self.num_experts:
             raise ValueError("Offload fraction rounds to an empty cold or hot set")
+        elif self.spare_slots == 0:
+            raise ValueError("A nonzero cold set requires GPU spare slots")
         if self.gpu_slots > self.num_experts:
             raise ValueError("Offload fraction cannot accommodate the spare slots")
         if self.max_routes > self.hot_experts:
             raise ValueError("Hot capacity cannot hold the maximum routed set")
         if self.exchange_bytes < self.required_exchange_bytes:
             raise ValueError("Shared exchange reserve cannot hold the maximum plan")
+
+    @property
+    def all_resident(self) -> bool:
+        return self.cold_experts == 0
 
     @property
     def cold_experts(self) -> int:
@@ -75,6 +96,9 @@ class SharedExpertBudget:
 
     @property
     def required_exchange_bytes(self) -> int:
+        if self.all_resident:
+            # No decode plan exists; only the start-up batches use the reserve.
+            return LOAD_BATCH * max(self.expert_bytes)
         return (self.max_routes + self.spare_slots) * max(self.expert_bytes)
 
     @property

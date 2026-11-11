@@ -5,6 +5,7 @@ import os
 import pickle
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -517,8 +518,16 @@ class MultiprocExecutor(Executor):
     def max_concurrent_batches(self) -> int:
         # PP requires PP-size concurrent batches to fill the pipeline.
         pp_size = self.parallel_config.pipeline_parallel_size
+        if envs.VLLM_V41_PP_SERIAL == "1":
+            # One request, synchronous speculative decoding: only one step is
+            # ever in flight, and filling the queue would only add empty steps.
+            return 1
         if pp_size <= 1 and self.scheduler_config.async_scheduling:
             return max(2, self.scheduler_config.sm70_queue_depth())
+        if envs.VLLM_V41_PP_MICRO == "1" and envs.VLLM_V41_PP_AHEAD == "1":
+            # Every micro-batch keeps its next step queued behind the one in
+            # flight: two steps per pipeline slot.
+            return 2 * pp_size
         return pp_size
 
     def _get_output_rank(self) -> int:
@@ -850,6 +859,12 @@ class WorkerProc:
         """Worker initialization and execution loops.
         This runs a background process"""
 
+        # VLLM_V41_SWITCH_US (default unset): GIL switch interval of this
+        # process. The default 5 ms lets a busy Python thread hold the GIL
+        # that long while a helper thread (output send, input receive) waits.
+        if envs.VLLM_V41_SWITCH_US:
+            sys.setswitchinterval(float(envs.VLLM_V41_SWITCH_US) * 1e-6)
+
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
         # processes to terminate without error
@@ -1004,10 +1019,63 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        from vllm.v1 import v41_trace
+
+        if v41_trace.ENABLED and self.rank % 4 == 0:
+            v41_trace.set_role(f"w{self.rank}")
+        pin = envs.VLLM_V41_PIN_CORES
+        pin_others = None
+        if pin:
+            # VLLM_V41_PIN_CORES="c0,c1,..." (one physical core per local rank,
+            # on its GPU's NUMA node; VLLM_V41_PIN_NUMA="n0,n1,..." those
+            # nodes): the main thread launches every kernel of a step, and
+            # unpinned it shared a physical core (HT sibling) with a 100%
+            # busy-polling native thread (NCCL proxy with a receive always
+            # posted), so one S0 TP rank launched ~2x slower and held the TP
+            # all-reduces back by ~7 ms per step. Only the main thread gets
+            # the core; every other thread (also ones created later, which
+            # inherit the main thread's mask) is moved to the rest of the
+            # NUMA node.
+            cores = [int(x) for x in pin.split(",")]
+            nodes = [
+                int(x)
+                for x in (envs.VLLM_V41_PIN_NUMA or ",".join("0" for _ in cores)).split(
+                    ","
+                )
+            ]
+            local = self.rank % len(cores)
+            ncpu = os.cpu_count() or 1
+            half = ncpu // 2
+            mine = {cores[local], cores[local] + half}
+            reserved = {c for c in cores} | {c + half for c in cores}
+            engine = envs.VLLM_V41_PIN_ENGINE
+            if engine:
+                reserved |= {int(x) for x in engine.split(",")}
+            node = nodes[local]
+            node_cpus = set()
+            try:
+                with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+                    for part in f.read().strip().split(","):
+                        a, _, b = part.partition("-")
+                        node_cpus |= set(range(int(a), int(b or a) + 1))
+            except OSError:
+                node_cpus = set(range(ncpu))
+            pin_others = (node_cpus - reserved) or (node_cpus - mine)
+            os.sched_setaffinity(0, mine)
+        main_tid = threading.get_native_id()
+        loops = 0
         while True:
+            if pin_others is not None and loops % 512 == 0:
+                for tid in os.listdir("/proc/self/task"):
+                    if int(tid) != main_tid:
+                        with suppress(OSError):
+                            os.sched_setaffinity(int(tid), pin_others)
+            loops += 1
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
             )
+            if v41_trace.ENABLED:
+                v41_trace.mark("deq", m=method if isinstance(method, str) else "fn")
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
@@ -1015,6 +1083,8 @@ class WorkerProc:
                     func = partial(cloudpickle.loads(method), self.worker)
 
                 output = func(*args, **kwargs)
+                if v41_trace.ENABLED:
+                    v41_trace.mark("done")
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
@@ -1028,6 +1098,8 @@ class WorkerProc:
 
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(output)
+                if v41_trace.ENABLED:
+                    v41_trace.mark("out_sent")
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

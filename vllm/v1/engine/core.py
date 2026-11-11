@@ -4,6 +4,7 @@ import gc
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -78,7 +79,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
@@ -86,10 +87,17 @@ from vllm.v1.utils import IterationDetails, compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+# VLLM_V41_SKIP_EMPTY (default off): never execute an empty step while results
+# are pending. Measured slower with PP micro-batches (N=4 24.9 -> 27.8,
+# N=8 36.4 -> 41.9 ms/round, 2026-11-09).
+_V41_SKIP_EMPTY = envs.VLLM_V41_SKIP_EMPTY == "1"
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+_NO_DRAFTS = object()
 
 
 class EngineCore:
@@ -190,6 +198,16 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
+        # VLLM_V41_PP_MICRO: DeepSeek-V4.1 PP micro-batches own their draft
+        # handoff (see step_with_batch_queue).
+        self._v41_micro = envs.VLLM_V41_PP_MICRO == "1"
+        _v41_ahead = self._v41_micro and envs.VLLM_V41_PP_AHEAD == "1"
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        self._v41_depth = (
+            min(self.batch_queue_size, pp_size) if _v41_ahead else self.batch_queue_size
+        )
+        # VLLM_V41_PP_AHEAD: never run an empty step while results are pending.
+        self._v41_skip = int(_v41_ahead)
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
@@ -488,6 +506,11 @@ class EngineCore:
             return {}, False
         profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
         scheduler_output = self.scheduler.schedule()
+        from vllm.v1 import v41_trace
+
+        if v41_trace.ENABLED:
+            v41_trace.set_role("engine")
+            v41_trace.mark("e_sched", n=scheduler_output.total_num_scheduled_tokens)
         if profile_ddtree_engine:
             profile_schedule_ms = (time.perf_counter() - profile_part_t0) * 1000.0
             profile_part_t0 = time.perf_counter()
@@ -511,6 +534,10 @@ class EngineCore:
                 model_output = self.model_executor.sample_tokens(grammar_output)
                 if profile_ddtree_engine:
                     profile_sample_ms = (time.perf_counter() - profile_part_t0) * 1000.0
+            if v41_trace.ENABLED:
+                v41_trace.mark("e_result")
+            # VLLM_V41_INLINE_DRAFTS: this step's drafts came with its output.
+            self._v41_inline_drafts = getattr(model_output, "v41_drafts", _NO_DRAFTS)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -519,6 +546,8 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if v41_trace.ENABLED:
+            v41_trace.mark("e_update")
         if profile_ddtree_engine:
             profile_update_ms = (time.perf_counter() - profile_part_t0) * 1000.0
             logger.info(
@@ -543,7 +572,8 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        # Queued PP outputs carry the drafts of their own completed step.
+        # Queued PP outputs carry the drafts of their own completed step
+        # (VLLM_V41_PP_MICRO: taken in step_with_batch_queue instead).
         if (
             not self.async_scheduling
             and self.use_spec_decode
@@ -557,7 +587,13 @@ class EngineCore:
             profile_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
             # Take the draft token ids.
             profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
-            draft_token_ids = self.model_executor.take_draft_token_ids()
+            inline = getattr(self, "_v41_inline_drafts", _NO_DRAFTS)
+            self._v41_inline_drafts = _NO_DRAFTS
+            draft_token_ids = (
+                self.model_executor.take_draft_token_ids()
+                if inline is _NO_DRAFTS
+                else cast(DraftTokenIds | None, inline)
+            )
             profile_take_draft_ms = (
                 (time.perf_counter() - profile_part_t0) * 1000.0
                 if profile_ddtree_engine
@@ -601,6 +637,11 @@ class EngineCore:
 
         batch_queue = self.batch_queue
         assert batch_queue is not None
+        from vllm.v1 import v41_live, v41_trace
+
+        if v41_trace.ENABLED:
+            v41_trace.set_role("engine")
+            v41_trace.mark("e_step", q=len(batch_queue))
 
         trace_enabled = self.vllm_config.observability_config.runtime_trace.async_cpu
         trace_step = self._sm70_async_cpu_trace_step
@@ -621,12 +662,32 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
+        # VLLM_V41_PP_AHEAD: the queue holds 2 x pp steps, but only pp_size
+        # are kept in flight; more queued decode steps only wait for rounds
+        # not back yet (8 x 8K: 38 vs 80 ms/round). VLLM_V41_LIVE_FILE
+        # "qdepth N" overrides it (diagnostic).
+        depth = v41_live.get("qdepth", self._v41_depth)
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        scheduler_output = None
+        if self.scheduler.has_requests() and len(batch_queue) < depth:
             trace_schedule_t0 = time.perf_counter() if trace_log else 0.0
             scheduler_output = self.scheduler.schedule()
+            if (
+                (_V41_SKIP_EMPTY or v41_live.get("skip_empty", self._v41_skip))
+                and batch_queue
+                and scheduler_output.total_num_scheduled_tokens == 0
+                and not scheduler_output.finished_req_ids
+                and not scheduler_output.scheduled_new_reqs
+            ):
+                # VLLM_V41_PP_MICRO: every schedulable request is in flight.
+                # An empty step would still run on every stage (and drop the
+                # requests from each persistent batch); wait for a result.
+                scheduler_output = None
+        if scheduler_output is not None:
+            if v41_trace.ENABLED:
+                v41_trace.mark("e_sched", n=scheduler_output.total_num_scheduled_tokens)
             if trace_log:
                 trace_schedule_ms = (time.perf_counter() - trace_schedule_t0) * 1000.0
                 trace_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -671,7 +732,7 @@ class EngineCore:
                 batch_queue.appendleft((future, scheduler_output, exec_future))
                 if (
                     model_executed
-                    and len(batch_queue) < self.batch_queue_size
+                    and len(batch_queue) < depth
                     and not batch_queue[-1][0].done()
                 ):
                     # Don't block on next worker response unless the queue is full
@@ -708,7 +769,11 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             trace_wait_t0 = time.perf_counter() if trace_log else 0.0
+            if v41_trace.ENABLED:
+                v41_trace.mark("e_wait")
             model_output = future.result()
+            if v41_trace.ENABLED:
+                v41_trace.mark("e_result")
             if trace_log:
                 trace_wait_ms = (time.perf_counter() - trace_wait_t0) * 1000.0
             if model_output is None:
@@ -724,11 +789,35 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if v41_trace.ENABLED:
+            v41_trace.mark("e_update")
         if trace_log:
             trace_update_ms = (time.perf_counter() - trace_update_t0) * 1000.0
+        if (
+            self._v41_micro
+            and self.use_spec_decode
+            and not self.async_scheduling
+            and not deferred_scheduler_output
+            and not any(
+                queued.total_num_scheduled_tokens for _, queued, _ in batch_queue
+            )
+        ):
+            # No later step with tokens is in flight (empty steps neither run
+            # the drafter nor clear its drafts), so the worker's latest drafts
+            # belong to the step just applied, whose sampled token is now
+            # appended. A request scheduled with drafts but without that token
+            # would get fewer query rows than draft_len + 1.
+            if hasattr(model_output, "v41_drafts"):
+                # VLLM_V41_INLINE_DRAFTS: the last stage returned them inline.
+                draft_token_ids = model_output.v41_drafts
+            else:
+                draft_token_ids = self.model_executor.take_draft_token_ids()
+            if draft_token_ids is not None:
+                self.scheduler.update_draft_token_ids(draft_token_ids)
 
         if (
-            self.use_spec_decode
+            not self._v41_micro
+            and self.use_spec_decode
             and not self.async_scheduling
             and scheduler_output.total_num_scheduled_tokens > 0
         ):
@@ -749,7 +838,7 @@ class EngineCore:
             # we need to get the draft token ids from the prior step before
             # we can compute the grammar bitmask for the deferred request.
             if self.use_spec_decode:
-                if self.async_scheduling:
+                if self.async_scheduling or self._v41_micro:
                     draft_token_ids = self.model_executor.take_draft_token_ids()
                 else:
                     draft_token_ids = model_output.draft_token_ids
@@ -1359,6 +1448,12 @@ class EngineCoreProc(EngineCore):
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
 
+        # VLLM_V41_SWITCH_US (default unset): GIL switch interval of this
+        # process. The default 5 ms lets a busy Python thread hold the GIL
+        # that long while a helper thread (output send, input receive) waits.
+        if envs.VLLM_V41_SWITCH_US:
+            sys.setswitchinterval(float(envs.VLLM_V41_SWITCH_US) * 1e-6)
+
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
 
@@ -1458,6 +1553,11 @@ class EngineCoreProc(EngineCore):
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        pin = envs.VLLM_V41_PIN_ENGINE
+        if pin:
+            # VLLM_V41_PIN_ENGINE="c,..." keeps the engine's polling thread off
+            # the cores of the workers (see VLLM_V41_PIN_CORES).
+            os.sched_setaffinity(0, {int(x) for x in pin.split(",")})
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()

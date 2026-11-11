@@ -999,11 +999,15 @@ class ParallelConfig:
                 "Disabled the custom all-reduce kernel because it is not "
                 "supported on current platform."
             )
-        if self.nnodes > 1:
+        # Custom all-reduce runs inside one TP group. Multi-node pipeline
+        # parallelism with each TP group on one node keeps it (CustomAllreduce
+        # still refuses a group whose ranks are not on one node).
+        node_gpus = (self.tensor_parallel_size * self.pipeline_parallel_size) // max(
+            1, self.nnodes_within_dp
+        )
+        if self.nnodes > 1 and self.tensor_parallel_size > max(1, node_gpus):
             self.disable_custom_all_reduce = True
-            logger.debug(
-                "Disabled the custom all-reduce since we are running on multi-node."
-            )
+            logger.debug("Disabled the custom all-reduce since a TP group spans nodes.")
         if self.ray_workers_use_nsight and not self.use_ray:
             raise ValueError(
                 "Unable to use nsight profiling unless workers run with Ray."

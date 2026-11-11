@@ -1,0 +1,38 @@
+# DeepSeek-V4.1-Flash-1017 original checkpoint, 4 x C4140 (PP4 x TP4), DSpark 5.
+# Stage k = node k: layers 0-7 / 8-19 / 20-31 / 32-39 + head + drafter.
+model: /home/ymzx/models/ds41-1017
+tokenizer: /home/ymzx/models/ds41-1017
+tokenizer-mode: deepseek_v41
+served-model-name: deepseek-v4.1-flash
+host: 0.0.0.0
+port: 18000
+dtype: half
+tensor-parallel-size: 4
+pipeline-parallel-size: 4
+distributed-executor-backend: mp
+max-model-len: 16384
+max-num-seqs: 1
+max-num-batched-tokens: 1024
+kv-cache-memory-bytes: 1073741824
+gpu-memory-utilization: 0.96
+compilation-config:
+  mode: 0
+  cudagraph_mode: FULL
+  cudagraph_capture_sizes: [1, 2, 3, 4, 5, 6]
+  max_cudagraph_capture_size: 6
+no-async-scheduling: true
+no-enable-prefix-caching: true
+enable-chunked-prefill: true
+no-disable-custom-all-reduce: true
+reasoning-parser: deepseek_v4
+default-chat-template-kwargs: '{"thinking": true}'
+model-loader-extra-config:
+  engram_path: /home/ymzx/models/ds41-1017/engram
+speculative-config:
+  method: dspark
+  model: /home/ymzx/models/ds41-1017-dspark
+  quantization: fp8
+  num_speculative_tokens: 5
+  draft_load_config:
+    load_format: safetensors
+  enforce_eager: false

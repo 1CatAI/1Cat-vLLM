@@ -23,6 +23,7 @@ from vllm.v1.sample.logits_processor.builtin import (
 )
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
+from vllm.v1.sample.ops.fast_argmax import argmax_rows
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
@@ -992,7 +993,7 @@ def rejection_sample(
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         profile_greedy_start = _rejection_profile_start(profile_events)
-        target_argmax = target_logits.argmax(dim=-1)
+        target_argmax = argmax_rows(target_logits)
         rejection_greedy_sample_kernel[(batch_size,)](
             output_token_ids,
             cu_num_draft_tokens,

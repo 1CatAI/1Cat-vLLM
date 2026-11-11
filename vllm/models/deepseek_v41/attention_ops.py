@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FP16 paged latent caches and bounded sparse attention for local TP4."""
 
+import contextlib
+
 import torch
 
 import vllm.envs as envs
@@ -106,8 +108,8 @@ def gather_index_keys(
 ):
     """One bounded contiguous key matrix; unreachable rows are zero-filled."""
     _validate_cache(cache, block_table, block_size, ratio)
-    if cache.shape[-1] != 128 or max_context > 16384 or max_context % ratio:
-        raise ValueError("V4.1 short-context index keys require 128 dimensions")
+    if cache.shape[-1] != 128 or max_context % ratio:
+        raise ValueError("V4.1 index keys require 128 dimensions")
     result = torch.empty(
         max_context // ratio, 128, dtype=torch.float16, device=cache.device
     )
@@ -126,9 +128,86 @@ def gather_index_keys(
 
 
 _FUSED_TOPK = envs.VLLM_V41_INDEX_TOPK == "1"
+# VLLM_V41_INDEX_SHARD=1 (default off): batched decode indexer sharded by key
+# tiles across TP ranks instead of by heads (_sharded_index_topk).
+_INDEX_SHARD = envs.VLLM_V41_INDEX_SHARD == "1"
 
 
 _INDEX_TILE_BYTES = int(envs.VLLM_V41_INDEX_TILE_MB) << 20
+
+# L4: with this knob on, select_compressed_positions hands
+# off to _select_compressed_positions_overlap, where the TP reduction and
+# top-k of score tile i run on a side stream while the main stream scores
+# tile i + 1. Same kernels on the same inputs, and every rank issues the same
+# collectives in the same order. Off by default (the port maps
+# VLLM_V41_INDEX_OVERLAP here); off, none of the code below runs.
+_INDEX_OVERLAP = envs.VLLM_V41_INDEX_OVERLAP == "1"
+_INDEX_SIDE: dict = {}
+
+
+def _index_overlap(q, tile):
+    return (
+        _INDEX_OVERLAP
+        and q.is_cuda
+        and q.shape[0] > tile
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _index_side_stream(device):
+    stream = _INDEX_SIDE.get(device)
+    if stream is None:
+        stream = _INDEX_SIDE[device] = torch.cuda.Stream(device=device)
+    return stream
+
+
+@contextlib.contextmanager
+def _on_side_stream(head):
+    """Fork: the side stream waits for everything queued so far on the main
+    stream, and the allocator keeps ``head`` (allocated on the main stream)
+    until the side stream's work on it is done."""
+    side = _index_side_stream(head.device)
+    side.wait_stream(torch.cuda.current_stream())
+    head.record_stream(side)
+    with torch.cuda.stream(side):
+        yield
+
+
+def _join_side_stream(device):
+    torch.cuda.current_stream().wait_stream(_index_side_stream(device))
+
+
+def _index_tile_topk(
+    head, all_reduce, result, column, positions, valid_tokens, first, last, ratio, top_k
+):
+    """TP-reduce one tile's head sums and write its top-k rows of ``result``
+    (the tail of select_compressed_positions' tile loop)."""
+    width = result.shape[1]
+    scores = all_reduce(head)
+    if _FUSED_TOPK and width == top_k and scores.dtype == torch.float16:
+        from vllm.models.deepseek_v41.index_topk import index_topk, index_topk_parallel
+
+        # One CTA per row scans the whole row three times: past 16K columns
+        # the segmented version (rows x 8K segments; segments past a row's
+        # length exit) keeps long contexts from serializing on it.
+        select = index_topk_parallel if scores.shape[1] > 16384 else index_topk
+        select(
+            result[first:last],
+            scores.contiguous(),
+            positions[first:last],
+            valid_tokens[first:last],
+            ratio,
+            top_k,
+        )
+        return
+    length = ((positions[first:last] + 1) // ratio)[:, None]
+    scores.masked_fill_(
+        (column >= length) | ~valid_tokens[first:last, None], float("-inf")
+    )
+    indices = scores.topk(width, dim=-1, sorted=False).indices.sort(dim=-1).values
+    indices = torch.where(indices < length, indices, -1)
+    indices = torch.where(valid_tokens[first:last, None], indices, -1)
+    result[first:last].copy_(indices)
 
 
 def select_compressed_positions(
@@ -140,6 +219,10 @@ def select_compressed_positions(
     ReLU/weight and head-sum boundaries are retained before the TP reduction.
     No full [prefill, heads, context] tensor is materialized.
     """
+    if _INDEX_OVERLAP:
+        return _select_compressed_positions_overlap(
+            q, weights, keys, positions, valid_tokens, ratio, all_reduce, top_k=top_k
+        )
     if (
         q.dtype != torch.float16
         or q.shape[2] != 128
@@ -154,7 +237,9 @@ def select_compressed_positions(
     # Long chunks: size query tiles to a fixed FP16 score budget instead of 32
     # rows, so launches and TP reductions stay O(chunk / tile).
     budget = _INDEX_TILE_BYTES // max(1, q.shape[1] * keys.shape[0] * 2)
-    tile = max(32, min(1024, budget // 32 * 32))
+    # 32-row multiples up to 1024; past ~64K keys the FP16 score budget
+    # allows fewer than 32 rows per tile.
+    tile = max(1, min(1024, budget // 32 * 32 if budget >= 32 else budget))
     for first in range(0, q.shape[0], tile):
         last = min(first + tile, q.shape[0])
         heads = q.shape[1]
@@ -183,6 +268,56 @@ def select_compressed_positions(
         indices = torch.where(indices < length, indices, -1)
         indices = torch.where(valid_tokens[first:last, None], indices, -1)
         result[first:last].copy_(indices)
+    return result
+
+
+def _select_compressed_positions_overlap(
+    q, weights, keys, positions, valid_tokens, ratio, all_reduce, *, top_k=512
+):
+    """select_compressed_positions with L4: the same score tiles, and tile i's
+    TP reduction and top-k (_index_tile_topk) run on a side stream while the
+    main stream scores tile i + 1. For CPU tensors, a single tile and under
+    stream capture it all stays on the current stream."""
+    if (
+        q.dtype != torch.float16
+        or q.shape[2] != 128
+        or weights.shape != q.shape[:2]
+        or weights.dtype != torch.float16
+        or keys.shape[1] != 128
+    ):
+        raise ValueError("V4.1 indexer requires FP16 queries, keys and weights")
+    width = min(top_k, keys.shape[0])
+    result = torch.empty(q.shape[0], width, device=q.device, dtype=torch.int32)
+    column = torch.arange(keys.shape[0], device=q.device)[None]
+    budget = _INDEX_TILE_BYTES // max(1, q.shape[1] * keys.shape[0] * 2)
+    # 32-row multiples up to 1024; past ~64K keys the FP16 score budget
+    # allows fewer than 32 rows per tile.
+    tile = max(1, min(1024, budget // 32 * 32 if budget >= 32 else budget))
+    overlap = _index_overlap(q, tile)
+    for first in range(0, q.shape[0], tile):
+        last = min(first + tile, q.shape[0])
+        heads = q.shape[1]
+        scores = torch.mm(q[first:last].reshape(-1, 128), keys.T).view(
+            last - first, heads, -1
+        )
+        scores.relu_().mul_(weights[first:last, :, None])
+        head = scores.sum(1)
+        del scores  # the [tile, heads, N] buffer is freed on the main stream
+        with _on_side_stream(head) if overlap else contextlib.nullcontext():
+            _index_tile_topk(
+                head,
+                all_reduce,
+                result,
+                column,
+                positions,
+                valid_tokens,
+                first,
+                last,
+                ratio,
+                top_k,
+            )
+    if overlap:
+        _join_side_stream(q.device)
     return result
 
 
@@ -893,6 +1028,20 @@ def _gather_attention_packed(
 
 
 _ATTN_FUSED = envs.VLLM_V41_ATTN_FUSED == "1"
+# Draft attention (width 128 + n) on v41sk.attn_dec instead of bmm + softmax
+# + bmm. Default off.
+_ATTN_DEC = envs.VLLM_V41_ATTN_DEC == "1"
+# Target decode attention with the ring gather fused (v41sk.attn_ring_dec).
+_ATTN_RING = envs.VLLM_V41_ATTN_RING == "1"
+# VLLM_V41_BINDEX_CUDA: batched index scores by the v41sk WMMA kernel.
+_BINDEX_CUDA = envs.VLLM_V41_BINDEX_CUDA == "1"
+_ATTN_RING_POST = envs.VLLM_V41_ATTN_RING_POST == "1"
+# The same kernel for prefill chunks (default off).
+_ATTN_RING_PREFILL = envs.VLLM_V41_ATTN_RING_PREFILL == "1"
+
+
+def nchunk_ok(width):
+    return 0 < width <= 64 * 32
 
 
 @triton.jit
@@ -939,6 +1088,77 @@ def _attend_fused(q, keys, unused, scale, attn_sink, output, scores):
         num_warps=4,
     )
     torch.bmm(probs, keys, out=output)
+
+
+def attend_ring_post(
+    q,
+    positions,
+    valid_tokens,
+    attn_sink,
+    rope,
+    *,
+    window_block,
+    window_ring=None,
+    window_values=None,
+    compressed_cache=None,
+    compressed_table=None,
+    compressed_block=16,
+    ratio=1,
+    topk=None,
+    window=128,
+    packed=None,
+):
+    """Decode attention, inverse RoPE, FP8 QDQ and ring insertion in two launches.
+
+    Return None when the existing attention/post paths should handle the call.
+    """
+    compressed = compressed_cache is not None
+    count = topk.shape[1] if compressed else 0
+    if not (
+        _ATTN_RING_POST
+        and _ATTN_RING
+        and window_ring is not None
+        and packed is None
+        and 1 <= q.shape[0] <= 8
+        and q.shape[1:] == (16, 512)
+        and q.dtype == torch.float16
+        and q.is_contiguous()
+        and positions.dtype == torch.int64
+        and (not compressed or topk.dtype == torch.int32)
+        and (compressed or topk is None)
+        and nchunk_ok(window + count)
+        and rope.dtype == torch.float32
+        and rope.ndim == 2
+        and rope.shape[1] == 64
+        and rope.is_contiguous()
+    ):
+        return None
+    if compressed:
+        _validate_cache(compressed_cache, compressed_table, compressed_block, ratio)
+    from vllm.models.deepseek_v41.native import load_v41sk
+
+    load_v41sk()
+    result = torch.empty_like(q)
+    torch.ops.v41sk.attn_ring_dec(
+        result,
+        q,
+        window_ring,
+        window_values,
+        positions,
+        compressed_cache if compressed else window_ring,
+        compressed_table if compressed else positions,
+        positions,
+        valid_tokens,
+        topk if compressed else positions,
+        attn_sink,
+        512**-0.5,
+        compressed_block if compressed else 1,
+        ratio if compressed else 1,
+        window,
+        count,
+        rope,
+    )
+    return result.view(q.shape[0], 2, 4096)
 
 
 def attend_paged_latents(
@@ -1011,9 +1231,81 @@ def attend_paged_latents(
             window_values,
         )
     result = torch.empty_like(q)
+    if (
+        _ATTN_RING_PREFILL
+        and ring
+        and packed is None
+        and q.shape[0] > 8
+        and q.shape[1] == 16
+        and nchunk_ok(width)
+    ):
+        # Prefill: one CTA per token walks all its keys (gather + QK + online
+        # sink softmax + PV, v41sk.attn_ring_tok); no key tensor, no combine.
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        # Compressed layers read int32 top-k rows; window layers pass positions.
+        top32 = (
+            (topk if topk.dtype == torch.int32 else topk.to(torch.int32))
+            if compressed
+            else positions
+        )
+        for first in range(0, q.shape[0], 4096):
+            last = min(first + 4096, q.shape[0])
+            torch.ops.v41sk.attn_ring_tok(
+                result[first:last],
+                q[first:last].contiguous(),
+                window_ring,
+                window_values,
+                positions,
+                compressed_cache if compressed else window_ring,
+                compressed_table if compressed else positions,
+                positions[first:last],
+                valid_tokens[first:last],
+                top32[first:last].contiguous() if compressed else top32,
+                attn_sink,
+                512**-0.5,
+                compressed_block if compressed else 1,
+                ratio if compressed else 1,
+                window,
+                count,
+            )
+        return result
     for first in range(0, q.shape[0], tokens_per_pass):
         last = min(first + tokens_per_pass, q.shape[0])
         n, heads = last - first, q.shape[1]
+        if (
+            _ATTN_RING
+            and ring
+            and packed is None
+            and n <= 8
+            and heads == 16
+            and (not compressed or topk.dtype == torch.int32)
+        ):
+            # Gather + QK + sink softmax + PV in one split-key launch pair
+            # (v41sk.attn_ring_dec): no [n, width, 512] key tensor.
+            from vllm.models.deepseek_v41.native import load_v41sk
+
+            load_v41sk()
+            torch.ops.v41sk.attn_ring_dec(
+                result[first:last],
+                q[first:last].contiguous(),
+                window_ring,
+                window_values,
+                positions,
+                compressed_cache if compressed else window_ring,
+                compressed_table if compressed else positions,
+                positions[first:last],
+                valid_tokens[first:last],
+                topk[first:last] if compressed else positions,
+                attn_sink,
+                512**-0.5,
+                compressed_block if compressed else 1,
+                ratio if compressed else 1,
+                window,
+                count,
+            )
+            continue
         keys = torch.empty(n, width, 512, dtype=torch.float16, device=q.device)
         unused = torch.empty(n, width, dtype=torch.bool, device=q.device)
         if packed is not None:
@@ -1199,6 +1491,14 @@ def attend_draft_latents(q, kv, positions, valid, cache, table, sink, block_size
     )
     scores = torch.empty(n, heads, width, dtype=torch.float32, device=q.device)
     result = torch.empty_like(q)
+    if _ATTN_DEC and heads == 16 and q.is_cuda:
+        # v41sk.attn_dec zeroes unused rows itself; cuBLAS picks a slow path
+        # for these odd widths (128 + n): 32 -> 16 us per draft layer.
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        torch.ops.v41sk.attn_dec(result, q.contiguous(), keys, unused, sink, 512**-0.5)
+        return result
     if _ATTN_FUSED:
         keys.masked_fill_(unused[:, :, None], 0)
         _attend_fused(q, keys, unused, 512**-0.5, sink, result, scores)
@@ -1215,4 +1515,888 @@ def attend_draft_latents(q, kv, positions, valid, cache, table, sink, block_size
         logits,
         torch.empty_like(logits),
     )
+    return result
+
+
+# ---- VLLM_V41_BATCH: several requests per forward ---------------------------
+# Token t belongs to request row rows[t] (its block-table row); its request's
+# first token in this forward is bases[t]. Block tables are [rows, blocks].
+
+
+def _validate_batch_cache(cache, block_table, block_size, ratio):
+    if (
+        not cache.is_cuda
+        or cache.dtype != torch.float16
+        or cache.ndim != 3
+        or cache.shape[1] != block_size // ratio
+        or block_size % ratio
+        or cache.shape[2] not in (128, 512)
+        or cache.stride(1) != cache.shape[2]
+        or cache.stride(2) != 1
+        or block_table.ndim != 2
+        or block_table.stride(1) != 1
+        or block_table.dtype != torch.int32
+        or block_table.device != cache.device
+    ):
+        raise ValueError("V4.1 batched caches require int32 block tables, FP16 rows")
+
+
+@triton.jit
+def _binsert(
+    values,
+    positions,
+    valid_tokens,
+    rows,
+    block_table,
+    cache,
+    TABLE_STRIDE,
+    STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    RATIO: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    position = tl.load(positions + token).to(tl.int64)
+    valid = tl.load(valid_tokens + token) & ((position + 1) % RATIO == 0)
+    table = block_table + tl.load(rows + token).to(tl.int64) * TABLE_STRIDE
+    page = tl.load(table + position // BLOCK_SIZE, valid, -1).to(tl.int64)
+    valid &= page >= 0
+    col = tl.arange(0, BLOCK)
+    data = tl.load(values + token * D + col, valid & (col < D), 0)
+    row = (position % BLOCK_SIZE) // RATIO
+    tl.store(cache + page * STRIDE + row * D + col, data, valid & (col < D))
+
+
+def insert_latents_batch(
+    cache, values, positions, valid_tokens, block_table, layout, *, block_size, ratio=1
+):
+    """insert_latents for a batch: each token uses its request's table row."""
+    _validate_batch_cache(cache, block_table, block_size, ratio)
+    if (
+        values.shape != (positions.numel(), cache.shape[-1])
+        or values.dtype != torch.float16
+        or valid_tokens.shape != positions.shape
+    ):
+        raise ValueError("V4.1 latent insertion shapes do not match")
+    if values.shape[0]:
+        _binsert[(values.shape[0],)](
+            values,
+            positions,
+            valid_tokens,
+            layout.rows,
+            block_table,
+            cache,
+            block_table.stride(0),
+            STRIDE=cache.stride(0),
+            BLOCK_SIZE=block_size,
+            RATIO=ratio,
+            D=values.shape[1],
+            BLOCK=triton.next_power_of_2(values.shape[1]),
+        )
+
+
+@triton.jit(do_not_specialize=["TABLE_STRIDE", "N_OUT"])
+def _bindex_scores(
+    q,
+    w,
+    cache,
+    block_table,
+    positions,
+    query_start_loc,
+    out,
+    TABLE_STRIDE,
+    N_OUT,
+    STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    RATIO: tl.constexpr,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    BN: tl.constexpr,
+):
+    """Request row r, key tile nb: out[t, n] = sum_h fp16(fp16(relu(fp16(q.k)))
+    * w) for every token t of the row, keys read once from the paged cache."""
+    r, nb = tl.program_id(0), tl.program_id(1)
+    first = tl.load(query_start_loc + r)
+    count = tl.load(query_start_loc + r + 1) - first
+    if count > 0:
+        end = (tl.load(positions + first + count - 1).to(tl.int64) + 1) // RATIO
+        n0 = nb * BN
+        if n0 < end:
+            n = n0 + tl.arange(0, BN)
+            live = n < end
+            table = block_table + r.to(tl.int64) * TABLE_STRIDE
+            page = tl.load(table + n // (BLOCK_SIZE // RATIO), live, -1).to(tl.int64)
+            live &= page >= 0
+            d = tl.arange(0, 128)
+            kv = tl.load(
+                cache
+                + (page * STRIDE + (n % (BLOCK_SIZE // RATIO)) * 128)[:, None]
+                + d[None, :],
+                live[:, None],
+                0.0,
+            )
+            for c in range(0, count, BT):
+                lane = tl.arange(0, BT * H)
+                tt = first + c + lane // H
+                inside = (c + lane // H) < count
+                hh = lane % H
+                qv = tl.load(
+                    q + (tt.to(tl.int64) * H + hh)[:, None] * 128 + d[None, :],
+                    inside[:, None],
+                    0.0,
+                )
+                score = tl.dot(qv, tl.trans(kv)).to(tl.float16).to(tl.float32)
+                score = tl.maximum(score, 0.0)
+                wv = tl.load(w + tt * H + hh, inside, 0.0).to(tl.float32)
+                score = (score * wv[:, None]).to(tl.float16).to(tl.float32)
+                total = tl.sum(tl.reshape(score, (BT, H, BN)), 1)
+                t = first + c + tl.arange(0, BT)
+                tl.store(
+                    out + t.to(tl.int64)[:, None] * N_OUT + n[None, :],
+                    total.to(tl.float16),
+                    ((c + tl.arange(0, BT)) < count)[:, None] & (n < end)[None, :],
+                )
+
+
+def select_compressed_positions_batch(
+    q,
+    weights,
+    cache,
+    block_table,
+    positions,
+    valid_tokens,
+    layout,
+    ratio,
+    all_reduce,
+    *,
+    block_size,
+    max_context=16384,
+    top_k=512,
+    all_gather=None,
+    tp_rank=0,
+    tp_size=1,
+):
+    """select_compressed_positions over paged index keys, several requests."""
+    _validate_batch_cache(cache, block_table, block_size, ratio)
+    tokens, heads = q.shape[0], q.shape[1]
+    if (
+        q.dtype != torch.float16
+        or q.shape[2] != 128
+        or weights.shape != (tokens, heads)
+        or weights.dtype != torch.float16
+        or cache.shape[-1] != 128
+        or 128 % heads
+    ):
+        raise ValueError("V4.1 indexer requires FP16 queries, keys and weights")
+    columns = max_context // ratio
+    width = min(top_k, columns)
+    starts = layout.query_start_loc_cpu[: layout.num_reqs + 1].tolist()
+    if any(b - a > 8 for a, b in zip(starts, starts[1:])):
+        # A prefill chunk in the step: every request goes through the
+        # single-request gather + cuBLAS scores, row by row (decode-only
+        # steps, and so every graph, take the batched kernel below).
+        result = torch.full((tokens, width), -1, device=q.device, dtype=torch.int32)
+        last_positions = positions[
+            torch.tensor(starts[1:], device=positions.device).clamp(min=1) - 1
+        ].tolist()
+        if (
+            _INDEX_SHARD
+            and all_gather is not None
+            and tp_size > 1
+            and heads * tp_size <= 32
+            and width == top_k
+        ):
+            _sharded_index_prefill(
+                result,
+                q,
+                weights,
+                cache,
+                block_table,
+                positions,
+                valid_tokens,
+                starts,
+                last_positions,
+                ratio,
+                top_k,
+                all_gather,
+                tp_rank,
+                tp_size,
+            )
+            return result
+        for r, (a, b) in enumerate(zip(starts, starts[1:])):
+            if b <= a:
+                continue
+            # Keys up to this request's live length (not max_context): long
+            # contexts gather and score only what exists.
+            live = -(-(int(last_positions[r]) + 1) // ratio) * ratio
+            keys = gather_index_keys(
+                cache,
+                block_table[r : r + 1],
+                positions[a:b],
+                valid_tokens[a:b],
+                block_size=block_size,
+                ratio=ratio,
+                max_context=min(max_context, max(live, top_k * ratio)),
+            )
+            result[a:b].copy_(
+                select_compressed_positions(
+                    q[a:b],
+                    weights[a:b],
+                    keys,
+                    positions[a:b],
+                    valid_tokens[a:b],
+                    ratio,
+                    all_reduce,
+                    top_k=top_k,
+                )
+            )
+        return result
+    if (
+        _INDEX_SHARD
+        and all_gather is not None
+        and tp_size > 1
+        and heads * tp_size <= 32
+        and width == top_k
+    ):
+        return _sharded_index_topk(
+            q,
+            weights,
+            cache,
+            block_table,
+            positions,
+            valid_tokens,
+            layout,
+            ratio,
+            columns,
+            top_k,
+            all_gather,
+            tp_rank,
+            tp_size,
+        )
+    head = torch.empty(tokens, columns, dtype=torch.float16, device=q.device)
+    if _BINDEX_CUDA and 8 * heads <= 64:
+        # VLLM_V41_BINDEX_CUDA: the WMMA kernel (v41sk.cu), same rounding.
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        torch.ops.v41sk.index_scores(
+            head,
+            q.contiguous(),
+            weights.contiguous(),
+            cache,
+            block_table,
+            positions if positions.dtype == torch.int64 else positions.long(),
+            layout.query_start_loc,
+            layout.num_reqs,
+            ratio,
+            # Key-tile CTAs per request: 32 cover 16K; longer contexts spread
+            # over the 80 SMs (a CTA past its request's length exits at once).
+            min(triton.cdiv(columns, 32), max(32, 320 // max(1, layout.num_reqs))),
+        )
+    else:
+        _bindex_scores_launch(
+            head,
+            q,
+            weights,
+            cache,
+            block_table,
+            positions,
+            layout,
+            columns,
+            ratio,
+            heads,
+            block_size,
+        )
+    result = torch.empty(tokens, width, device=q.device, dtype=torch.int32)
+    column = torch.arange(columns, device=q.device)[None]
+    _index_tile_topk(
+        head,
+        all_reduce,
+        result,
+        column,
+        positions,
+        valid_tokens,
+        0,
+        tokens,
+        ratio,
+        top_k,
+    )
+    return result
+
+
+def _gather_queries(q, weights, all_gather):
+    """All heads' index queries and weights from every TP rank, one gather."""
+    tokens, heads = q.shape[0], q.shape[1]
+    packed = torch.cat([q.reshape(tokens, heads * 128), weights], dim=1)
+    world = all_gather(packed.contiguous(), 1).view(tokens, -1, heads * 129)
+    q_all = world[:, :, : heads * 128].reshape(tokens, -1, 128).contiguous()
+    w_all = world[:, :, heads * 128 :].reshape(tokens, -1).contiguous()
+    return q_all, w_all
+
+
+def _sharded_index_topk(
+    q,
+    weights,
+    cache,
+    block_table,
+    positions,
+    valid_tokens,
+    layout,
+    ratio,
+    columns,
+    top_k,
+    all_gather,
+    rank,
+    world,
+):
+    """VLLM_V41_INDEX_SHARD: the decode indexer sharded by key tiles.
+
+    The head-sharded path has every rank read all (replicated) index keys for
+    its heads, then all-reduces a [tokens, columns] score matrix sized by the
+    longest admitted context. Here the ranks gather the (small) queries and
+    weights, score all heads on their own 32-key tiles (tile t on rank
+    t % world: a quarter of the key reads), take their tiles' top-k and
+    exchange only those candidates: no score all-reduce, and every cost
+    follows the live length. Same scores up to FP32 summation order."""
+    q_all, w_all = _gather_queries(q, weights, all_gather)
+    return _sharded_index_core(
+        q_all,
+        w_all,
+        cache,
+        block_table,
+        positions,
+        valid_tokens,
+        layout,
+        ratio,
+        columns,
+        top_k,
+        all_gather,
+        rank,
+        world,
+    )
+
+
+def _sharded_index_core(
+    q_all,
+    w_all,
+    cache,
+    block_table,
+    positions,
+    valid_tokens,
+    layout,
+    ratio,
+    columns,
+    top_k,
+    all_gather,
+    rank,
+    world,
+):
+    """_sharded_index_topk after the query / weight gather (all heads)."""
+    from vllm.models.deepseek_v41.index_topk import index_topk, index_topk_parallel
+    from vllm.models.deepseek_v41.native import load_v41sk
+
+    load_v41sk()
+    tokens, kt = q_all.shape[0], 32
+    q = q_all
+    local_columns = triton.cdiv(columns, kt * world) * kt
+    head = torch.empty(tokens, local_columns, dtype=torch.float16, device=q.device)
+    torch.ops.v41sk.index_scores_shard(
+        head,
+        q_all,
+        w_all,
+        cache,
+        block_table,
+        positions if positions.dtype == torch.int64 else positions.long(),
+        layout.query_start_loc,
+        layout.num_reqs,
+        ratio,
+        min(triton.cdiv(local_columns, kt), max(32, 320 // max(1, layout.num_reqs))),
+        rank,
+        world,
+    )
+    # This rank's keys below each row's length (whole tiles t % world == rank,
+    # plus the partial last tile when it is ours), as the select kernels'
+    # positions: p = mine * ratio - 1 makes their (p + 1) // ratio == mine.
+    mine = torch.empty(tokens, dtype=torch.int64, device=q.device)
+    _shard_lengths[(triton.cdiv(tokens, 128),)](
+        positions,
+        valid_tokens,
+        mine,
+        tokens,
+        columns,
+        RATIO=ratio,
+        KT=kt,
+        RANK=rank,
+        WORLD=world,
+        BLOCK=128,
+    )
+    local = torch.empty(tokens, top_k, dtype=torch.int32, device=q.device)
+    select = index_topk_parallel if local_columns > 16384 else index_topk
+    select(local, head, mine, valid_tokens, ratio, top_k)
+    # One gather: [global indices | FP16 score bits] per rank.
+    packed = torch.empty(tokens, 2 * top_k, dtype=torch.int32, device=q.device)
+    _shard_pack[(tokens,)](
+        local, head, packed, head.stride(0), KT=kt, RANK=rank, WORLD=world, K=top_k
+    )
+    # (bit-cast to FP32: the one-shot TP gather moves FP16/FP32 rows)
+    packed = all_gather(packed.view(torch.float32), 1).view(torch.int32)
+    result = torch.empty(tokens, top_k, dtype=torch.int32, device=q.device)
+    _shard_merge[(tokens,)](
+        packed, result, packed.stride(0), K=top_k, N=world * top_k, num_warps=8
+    )
+    return result
+
+
+@triton.jit
+def _shard_lengths(
+    positions,
+    valid,
+    out,
+    rows,
+    columns,
+    RATIO: tl.constexpr,
+    KT: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = row < rows
+    pos = tl.load(positions + row, m, 0).to(tl.int64)
+    ok = tl.load(valid + row, m, 0) != 0
+    n = tl.where(ok, tl.minimum((pos + 1) // RATIO, columns), 0)
+    full, rest = n // KT, n % KT
+    mine = (full - RANK + WORLD - 1) // WORLD * KT + tl.where(
+        full % WORLD == RANK, rest, 0
+    )
+    tl.store(out + row, mine * RATIO - 1, m)
+
+
+@triton.jit
+def _shard_pack(
+    local,
+    head,
+    packed,
+    stride,
+    KT: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    K: tl.constexpr,
+):
+    """This rank's top-k (local tile columns) as [global index | score bits],
+    -1 / -inf past the row's candidates."""
+    row = tl.program_id(0)
+    lanes = tl.arange(0, K)
+    at = tl.load(local + row * K + lanes)
+    ok = at >= 0
+    at = tl.maximum(at, 0)
+    score = tl.load(head + row.to(tl.int64) * stride + at, ok, float("-inf"))
+    bits = score.to(tl.int16, bitcast=True).to(tl.int32)
+    index = tl.where(ok, ((at // KT) * WORLD + RANK) * KT + at % KT, -1)
+    tl.store(packed + row * 2 * K + lanes, index)
+    tl.store(packed + row * 2 * K + K + lanes, bits)
+
+
+@triton.jit
+def _shard_merge(packed, out, stride, K: tl.constexpr, N: tl.constexpr):
+    """Top-K of the WORLD ranks' candidates by score, as ascending positions
+    with -1 after them (index_topk's layout). Ties at the threshold keep the
+    lowest candidate slots."""
+    row = tl.program_id(0)
+    j = tl.arange(0, N)
+    at = packed + row.to(tl.int64) * stride + (j // K) * 2 * K + j % K
+    index = tl.load(at)
+    u = tl.load(at + K) & 0xFFFF
+    u = tl.where(u >= 0x8000, 0xFFFF - u, u | 0x8000)
+    bins = tl.arange(0, 256)
+    hist = tl.histogram(u >> 8, 256)
+    suffix = N - (tl.cumsum(hist, 0) - hist)
+    hi = tl.max(tl.where(suffix >= K, bins, -1), 0)
+    want = K - tl.sum(tl.where(bins > hi, hist, 0), 0)
+    hist = tl.histogram(u & 255, 256, mask=(u >> 8) == hi)
+    total = tl.sum(hist, 0)
+    suffix = total - (tl.cumsum(hist, 0) - hist)
+    lo = tl.max(tl.where(suffix >= want, bins, -1), 0)
+    want = want - tl.sum(tl.where(bins > lo, hist, 0), 0)
+    threshold = hi * 256 + lo
+    eq = (u == threshold).to(tl.int32)
+    take = ((u > threshold) | ((eq != 0) & (tl.cumsum(eq, 0) - eq < want))).to(tl.int32)
+    # Exactly K taken: compact them into the row, then sort those K only.
+    last = 2147483647
+    at = tl.cumsum(take, 0) - take
+    dst = out + row * K
+    tl.store(dst + at, tl.where(index >= 0, index, last), take != 0)
+    tl.debug_barrier()
+    lanes = tl.arange(0, K)
+    key = tl.sort(tl.load(dst + lanes))
+    tl.debug_barrier()
+    tl.store(dst + lanes, tl.where(key == last, -1, key))
+
+
+def _sharded_index_prefill(
+    result,
+    q,
+    weights,
+    cache,
+    block_table,
+    positions,
+    valid_tokens,
+    starts,
+    last_positions,
+    ratio,
+    top_k,
+    all_gather,
+    rank,
+    world,
+):
+    """VLLM_V41_INDEX_SHARD for prefill chunks: the decode kernel over groups
+    of 6 rows (each group one pseudo-request on the request's block table),
+    in row tiles whose [rows, this rank's columns] FP16 scores fit 64 MB.
+    No [rows, heads, keys] product and no score all-reduce."""
+    from types import SimpleNamespace
+
+    q_all, w_all = _gather_queries(q, weights, all_gather)
+    group, kt = 6, 32
+    for r, (a, b) in enumerate(zip(starts, starts[1:])):
+        if b <= a:
+            continue
+        columns = max(-(-(int(last_positions[r]) + 1) // ratio), top_k)
+        local_columns = triton.cdiv(columns, kt * world) * kt
+        tile = max(group, min(1536, (64 << 20) // (2 * local_columns) // group * group))
+        for first in range(a, b, tile):
+            last = min(first + tile, b)
+            groups = triton.cdiv(last - first, group)
+            qsl = (
+                torch.arange(groups + 1, device=q.device, dtype=torch.int32) * group
+            ).clamp_(max=last - first)
+            result[first:last] = _sharded_index_core(
+                q_all[first:last],
+                w_all[first:last],
+                cache,
+                block_table[r : r + 1].expand(groups, -1),
+                positions[first:last],
+                valid_tokens[first:last],
+                SimpleNamespace(query_start_loc=qsl, num_reqs=groups),
+                ratio,
+                columns,
+                top_k,
+                all_gather,
+                rank,
+                world,
+            )
+
+
+def _bindex_scores_launch(
+    head,
+    q,
+    weights,
+    cache,
+    block_table,
+    positions,
+    layout,
+    columns,
+    ratio,
+    heads,
+    block_size,
+):
+    bt = 128 // heads
+    _bindex_scores[(layout.num_reqs, triton.cdiv(columns, 64))](
+        q.contiguous(),
+        weights.contiguous(),
+        cache,
+        block_table,
+        positions,
+        layout.query_start_loc,
+        head,
+        block_table.stride(0),
+        columns,
+        STRIDE=cache.stride(0),
+        BLOCK_SIZE=block_size,
+        RATIO=ratio,
+        H=heads,
+        BT=bt,
+        BN=64,
+        num_warps=8,
+    )
+
+
+@triton.jit
+def _bgather_attention(
+    window_cache,
+    window_table,
+    compressed_cache,
+    compressed_table,
+    rows,
+    positions,
+    valid_tokens,
+    topk,
+    keys,
+    unused,
+    WINDOW_TABLE_STRIDE,
+    COMPRESSED_TABLE_STRIDE,
+    WINDOW_STRIDE: tl.constexpr,
+    COMPRESSED_STRIDE: tl.constexpr,
+    WINDOW_BLOCK: tl.constexpr,
+    COMPRESSED_BLOCK: tl.constexpr,
+    RATIO: tl.constexpr,
+    WINDOW: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    token, key = tl.program_id(0), tl.program_id(1)
+    position = tl.load(positions + token).to(tl.int64)
+    valid = tl.load(valid_tokens + token)
+    row = tl.load(rows + token).to(tl.int64)
+    col = tl.arange(0, 512)
+    if key < WINDOW:
+        at = position - WINDOW + 1 + key
+        valid &= at >= 0
+        table = window_table + row * WINDOW_TABLE_STRIDE
+        page = tl.load(table + at // WINDOW_BLOCK, valid, -1).to(tl.int64)
+        valid &= page >= 0
+        value = tl.load(
+            window_cache + page * WINDOW_STRIDE + (at % WINDOW_BLOCK) * 512 + col,
+            valid,
+            0,
+        )
+    else:
+        index = tl.load(topk + token * TOPK + key - WINDOW).to(tl.int64)
+        valid &= (index >= 0) & (index < (position + 1) // RATIO)
+        table = compressed_table + row * COMPRESSED_TABLE_STRIDE
+        page = tl.load(table + index // (COMPRESSED_BLOCK // RATIO), valid, -1).to(
+            tl.int64
+        )
+        valid &= page >= 0
+        value = tl.load(
+            compressed_cache
+            + page * COMPRESSED_STRIDE
+            + (index % (COMPRESSED_BLOCK // RATIO)) * 512
+            + col,
+            valid,
+            0,
+        )
+    tl.store(keys + (token * (WINDOW + TOPK) + key) * 512 + col, value)
+    tl.store(unused + token * (WINDOW + TOPK) + key, ~valid)
+
+
+def _has_prefill_chunk(layout):
+    """A request with more than 8 query rows (a prefill chunk) in the step.
+
+    Decode steps (and so every graph) keep the split-K decode kernels: one CTA
+    per token (attn_paged_tok) leaves most SMs idle at decode batch sizes."""
+    starts = layout.query_start_loc_cpu[: layout.num_reqs + 1]
+    return layout.num_reqs > 0 and bool((starts[1:] - starts[:-1]).max() > 8)
+
+
+def attend_paged_latents_batch(
+    q,
+    positions,
+    valid_tokens,
+    window_cache,
+    window_table,
+    attn_sink,
+    layout,
+    *,
+    window_block,
+    compressed_cache=None,
+    compressed_table=None,
+    compressed_block=16,
+    ratio=1,
+    topk=None,
+    window=128,
+    tokens_per_pass=64,
+):
+    """attend_paged_latents for a batch (paged window cache, no rings)."""
+    _validate_batch_cache(window_cache, window_table, window_block, 1)
+    compressed = compressed_cache is not None
+    if compressed:
+        _validate_batch_cache(
+            compressed_cache, compressed_table, compressed_block, ratio
+        )
+    if (
+        q.dtype != torch.float16
+        or q.ndim != 3
+        or q.shape[2] != 512
+        or attn_sink.dtype != torch.float32
+        or attn_sink.shape != (q.shape[1],)
+    ):
+        raise ValueError("V4.1 sparse attention requires FP16 queries and FP32 sinks")
+    count = topk.shape[1] if compressed else 0
+    width = window + count
+    result = torch.empty_like(q)
+    if (
+        _ATTN_RING_PREFILL
+        and _has_prefill_chunk(layout)
+        and q.shape[1] == 16
+        and (not compressed or topk.dtype == torch.int32)
+        and nchunk_ok(width)
+    ):
+        # Prefill (the window rows are already inserted): v41sk.attn_paged_tok,
+        # one CTA per token gathering its keys from the paged caches, online
+        # sink softmax + PV; no [T, width, 512] key tensor, no combine.
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        torch.ops.v41sk.attn_paged_tok(
+            result,
+            q.contiguous(),
+            window_cache,
+            window_table,
+            compressed_cache if compressed else window_cache,
+            compressed_table if compressed else window_table,
+            layout.rows,
+            positions if positions.dtype == torch.int64 else positions.long(),
+            valid_tokens,
+            topk.contiguous() if compressed else window_table,
+            attn_sink,
+            512**-0.5,
+            window_block,
+            compressed_block if compressed else 1,
+            ratio if compressed else 1,
+            window,
+            count,
+        )
+        return result
+    for first in range(0, q.shape[0], tokens_per_pass):
+        last = min(first + tokens_per_pass, q.shape[0])
+        n, heads = last - first, q.shape[1]
+        keys = torch.empty(n, width, 512, dtype=torch.float16, device=q.device)
+        unused = torch.empty(n, width, dtype=torch.bool, device=q.device)
+        _bgather_attention[(n, width)](
+            window_cache,
+            window_table,
+            compressed_cache if compressed else window_cache,
+            compressed_table if compressed else window_table,
+            layout.rows[first:last],
+            positions[first:last],
+            valid_tokens[first:last],
+            topk[first:last] if compressed else positions,
+            keys,
+            unused,
+            window_table.stride(0),
+            (compressed_table if compressed else window_table).stride(0),
+            WINDOW_STRIDE=window_cache.stride(0),
+            COMPRESSED_STRIDE=compressed_cache.stride(0) if compressed else 0,
+            WINDOW_BLOCK=window_block,
+            COMPRESSED_BLOCK=compressed_block,
+            RATIO=ratio,
+            WINDOW=window,
+            TOPK=count,
+        )
+        if _ATTN_DEC and heads == 16:
+            from vllm.models.deepseek_v41.native import load_v41sk
+
+            load_v41sk()
+            torch.ops.v41sk.attn_dec(
+                result[first:last],
+                q[first:last].contiguous(),
+                keys,
+                unused,
+                attn_sink,
+                512**-0.5,
+            )
+            continue
+        scores = torch.empty(n, heads, width, dtype=torch.float32, device=q.device)
+        keys.masked_fill_(unused[:, :, None], 0)
+        _attend_fused(
+            q[first:last],
+            keys,
+            unused,
+            512**-0.5,
+            attn_sink,
+            result[first:last],
+            scores,
+        )
+    return result
+
+
+@triton.jit
+def _bgather_draft(
+    cache,
+    table,
+    query_kv,
+    rows,
+    bases,
+    positions,
+    valid_queries,
+    keys,
+    unused,
+    TABLE_STRIDE,
+    STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    QUERIES: tl.constexpr,
+):
+    token, key = tl.program_id(0), tl.program_id(1)
+    col = tl.arange(0, 512)
+    valid = tl.load(valid_queries + token)
+    base = tl.load(bases + token)
+    if key < 128:
+        # The request's queries see the same accepted context and each other.
+        at = tl.load(positions + base).to(tl.int64) - 128 + key
+        valid &= at >= 0
+        own = table + tl.load(rows + token).to(tl.int64) * TABLE_STRIDE
+        page = tl.load(own + at // BLOCK, valid, -1).to(tl.int64)
+        valid &= page >= 0
+        value = tl.load(cache + page * STRIDE + (at % BLOCK) * 512 + col, valid, 0)
+    else:
+        index = base + key - 128
+        valid &= tl.load(valid_queries + index)
+        value = tl.load(query_kv + index.to(tl.int64) * 512 + col, valid, 0)
+    tl.store(keys + (token * (128 + QUERIES) + key) * 512 + col, value)
+    tl.store(unused + token * (128 + QUERIES) + key, ~valid)
+
+
+def attend_draft_latents_batch(
+    q, kv, positions, valid, cache, table, sink, block_size, layout, queries
+):
+    """attend_draft_latents for a batch of requests with `queries` rows each."""
+    _validate_batch_cache(cache, table, block_size, 1)
+    n, heads, dimension = q.shape
+    if (
+        n % queries
+        or dimension != 512
+        or kv.shape != (n, 512)
+        or q.dtype != torch.float16
+        or kv.dtype != torch.float16
+        or sink.shape != (heads,)
+        or valid.shape != (n,)
+    ):
+        raise ValueError("V4.1 batched draft attention: rows are request blocks")
+    width = 128 + queries
+    keys = torch.empty(n, width, 512, device=q.device, dtype=torch.float16)
+    unused = torch.empty(n, width, device=q.device, dtype=torch.bool)
+    _bgather_draft[(n, width)](
+        cache,
+        table,
+        kv,
+        layout.rows,
+        layout.bases,
+        positions,
+        valid,
+        keys,
+        unused,
+        table.stride(0),
+        STRIDE=cache.stride(0),
+        BLOCK=block_size,
+        QUERIES=queries,
+    )
+    result = torch.empty_like(q)
+    if _ATTN_DEC and heads == 16:
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        for first in range(0, n, 8):
+            last = min(first + 8, n)
+            torch.ops.v41sk.attn_dec(
+                result[first:last],
+                q[first:last].contiguous(),
+                keys[first:last],
+                unused[first:last],
+                sink,
+                512**-0.5,
+            )
+        return result
+    scores = torch.empty(n, heads, width, dtype=torch.float32, device=q.device)
+    keys.masked_fill_(unused[:, :, None], 0)
+    _attend_fused(q, keys, unused, 512**-0.5, sink, result, scores)
     return result

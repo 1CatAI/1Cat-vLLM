@@ -11,6 +11,7 @@ using Pivot-based Truncation and Selection" By Park et al.
 
 import torch
 
+import vllm.envs as envs
 from vllm.config.execution_policy import layer_policy
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -1229,6 +1230,22 @@ def _apply_top_k_top_p_compact(
     return result
 
 
+# VLLM_V41_TOPP_NO_FENCE=1 (default off): rows the pivot kernel flags as
+# ambiguous keep the pivot mask instead of an exact reference recomputation, so
+# the step needs no device-to-host sync. `reference_rows.any()` held the host
+# until the step's forward had finished; on the last PP stage that serializes
+# the micro-batches (4 x 1K T=0.6: py-spy 27% of stage-3 time there, 38 vs 26
+# ms/round). Flagged rows are rare (tied logits at the cutoff, cutoffs within
+# rounding of a logit): their nucleus may differ by tied or boundary tokens.
+# Every row keeps its largest logit, which both filters always keep.
+_NO_FENCE = envs.VLLM_V41_TOPP_NO_FENCE == "1"
+
+
+def _keep_row_maxima(result: torch.Tensor, original: torch.Tensor) -> torch.Tensor:
+    top = original.argmax(dim=-1, keepdim=True)
+    return result.scatter_(1, top, original.gather(1, top))
+
+
 def apply_top_k_top_p_triton(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -1293,7 +1310,8 @@ def apply_top_k_top_p_triton(
         p_ptr = logits  # Dummy pointer (won't be read)
 
     if (
-        topk_enabled
+        not _NO_FENCE
+        and topk_enabled
         and topp_enabled
         and batch_size >= 2
         and vocab_size >= 32768
@@ -1372,6 +1390,8 @@ def apply_top_k_top_p_triton(
         **launch_kwargs,
     )
 
+    if _NO_FENCE and logits.is_cuda:
+        return _keep_row_maxima(logits, original_logits)
     if reference_rows.any():
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 

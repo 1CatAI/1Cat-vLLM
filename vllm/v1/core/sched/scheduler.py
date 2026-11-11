@@ -33,6 +33,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1 import v41_live
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -47,6 +48,7 @@ from vllm.v1.core.sched.output import (
     GrammarOutput,
     NewRequestData,
     SchedulerOutput,
+    TokenTail,
 )
 from vllm.v1.core.sched.phase_separation import (
     Phase,
@@ -70,6 +72,14 @@ from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+
+# VLLM_V41_PREFILL_PIPELINE=1 (default off, with VLLM_V41_PP_AHEAD): a prefilling
+# request may have one chunk per PP stage in flight instead of two.
+_V41_PREFILL_PIPELINE = envs.VLLM_V41_PREFILL_PIPELINE == "1"
+# VLLM_V41_FAST_READD=1 (default off): a running request that skipped the
+# previous step gets the last _READD_TAIL tokens (TokenTail), not its history.
+_V41_FAST_READD = envs.VLLM_V41_FAST_READD == "1"
+_READD_TAIL = 512
 
 logger = init_logger(__name__)
 
@@ -307,6 +317,18 @@ class Scheduler(SchedulerInterface):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        # VLLM_V41_PP_MICRO: PP micro-batches. With two or more decoding
+        # requests, a request is never scheduled while one of its steps is in
+        # flight and a step takes at most ceil(decoders / pp_size) of them, so
+        # the decoders rotate through pp_size groups that fill the pipeline.
+        self.v41_micro = self.use_pp and envs.VLLM_V41_PP_MICRO == "1"
+        # VLLM_V41_PP_AHEAD (with PP_MICRO): a request with one step in flight
+        # may be scheduled again (any earlier step, not only the previous one),
+        # so each micro-batch's next step is queued before its round returns.
+        self.v41_ahead = self.v41_micro and envs.VLLM_V41_PP_AHEAD == "1"
+        self._v41_inflight: dict[str, int] = {}
+        self._v41_last_step: dict[str, int] = {}  # step id of the latest launch
+        self._v41_step = 0
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # VLLM_PP_KEEP_BATCH: keep the previous-step record across a fully
         # empty pipeline step, so a running request's history is not resent.
@@ -850,6 +872,56 @@ class Scheduler(SchedulerInterface):
                 _sweep_quota = min(_sweep_quota, _est)
             self.phase_separation.clear_sweep()
 
+        micro_cap = 0
+        micro_decodes = 0
+        v41_ahead_ids: set[str] = set()
+        idle_decoders = self.v41_ahead and any(
+            prefill_remaining[r.request_id] == 0
+            and r.num_output_tokens > 0
+            and not self._v41_inflight.get(r.request_id)
+            for r in self.running
+        )
+        if self.v41_micro:
+            decoders = sum(
+                1
+                for r in self.running
+                if prefill_remaining[r.request_id] == 0 and r.num_output_tokens > 0
+            )
+            if decoders >= 2:
+                pp_size = self.parallel_config.pipeline_parallel_size
+                micro_cap = -(-decoders // pp_size)
+
+        # Requests scheduled ahead run on every stage in launch order and each
+        # waits for its own round on the GPU: pick them in the order their
+        # rounds come back (oldest in-flight step first), else a request whose
+        # round is back waits behind one whose round is not (head-of-line).
+        ahead_allowed: set[str] | None = None
+        # Steps in flight per decoding request under VLLM_V41_PP_AHEAD: two
+        # only while the decoders do not fill the stages (a second step of a
+        # full pipeline only waits for its round: 8 x 1K 41 vs 34 ms/round).
+        # VLLM_V41_LIVE_FILE "dec_ahead" (diagnostic): 2 always two, 0 one.
+        dec_mode = v41_live.get("dec_ahead", 1) if self.v41_ahead else 2
+        decoder_limit = 2
+        if dec_mode == 0 or (
+            dec_mode == 1
+            and micro_cap
+            and decoders > self.parallel_config.pipeline_parallel_size
+        ):
+            decoder_limit = 1
+        if self.v41_ahead and micro_cap:
+            # Strict round robin over the decoders: each step takes the
+            # micro_cap decoders whose latest launch is oldest (fewer than
+            # two steps in flight). Requests in-flight order == launch order
+            # == round-return order, and no request is passed over.
+            waiting = sorted(
+                (self._v41_last_step.get(r.request_id, 0), r.request_id)
+                for r in self.running
+                if prefill_remaining[r.request_id] == 0
+                and r.num_output_tokens > 0
+                and self._v41_inflight.get(r.request_id, 0) < decoder_limit
+            )
+            ahead_allowed = {rid for _, rid in waiting[:micro_cap]}
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -866,6 +938,56 @@ class Scheduler(SchedulerInterface):
             if self.current_step < request.next_decode_eligible_step:
                 req_index += 1
                 continue
+
+            micro_decode = False
+            if self.v41_ahead:
+                # At most two steps in flight per request, and a request is
+                # scheduled ahead only when no decoder is idle (so the
+                # micro-batches rotate instead of one running twice).
+                inflight = self._v41_inflight.get(request.request_id, 0)
+                decoder = (
+                    prefill_remaining[request.request_id] == 0
+                    and request.num_output_tokens > 0
+                )
+                # Prefill chunks do not wait for a round (their tokens are the
+                # prompt's): up to one chunk per stage in flight, so a long
+                # prompt keeps the whole pipeline busy.
+                limit = (
+                    self.parallel_config.pipeline_parallel_size
+                    if prefill_remaining[request.request_id] > 0
+                    and _V41_PREFILL_PIPELINE
+                    else decoder_limit
+                )
+                if (
+                    inflight >= limit
+                    or (ahead_allowed is None and inflight == 1 and idle_decoders)
+                    or (
+                        ahead_allowed is not None
+                        and decoder
+                        and request.request_id not in ahead_allowed
+                    )
+                ):
+                    req_index += 1
+                    continue
+            elif (
+                self.v41_micro
+                and request.num_output_placeholders > 0
+                and (
+                    micro_cap
+                    or request.request_id not in self.prev_step_scheduled_req_ids
+                )
+            ):
+                # A step of this request is in flight. Scheduling ahead of it is
+                # only safe when that step was the previous one (the worker
+                # corrects the optimistic positions from the previous step's
+                # accepted counts); otherwise wait for its output.
+                req_index += 1
+                continue
+            if micro_cap:
+                micro_decode = prefill_remaining[request.request_id] == 0
+                if micro_decode and micro_decodes >= micro_cap:
+                    req_index += 1
+                    continue
 
             if (
                 request.num_output_placeholders > 0
@@ -1092,6 +1214,9 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            micro_decodes += micro_decode
+            if self.v41_ahead and request.num_output_placeholders > 0:
+                v41_ahead_ids.add(request_id)
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -1596,6 +1721,12 @@ class Scheduler(SchedulerInterface):
                 boundary_state_offloads if self.connector is not None else None
             ),
         )
+        if self.v41_ahead:
+            scheduler_output.v41_ahead_req_ids = v41_ahead_ids
+            self._v41_step += 1
+            for rid in num_scheduled_tokens:
+                self._v41_inflight[rid] = self._v41_inflight.get(rid, 0) + 1
+                self._v41_last_step[rid] = self._v41_step
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1817,7 +1948,7 @@ class Scheduler(SchedulerInterface):
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
         new_block_ids: list[tuple[list[int], ...] | None] = []
-        all_token_ids: dict[str, list[int]] = {}
+        all_token_ids: dict[str, list[int] | TokenTail] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
@@ -1853,7 +1984,17 @@ class Scheduler(SchedulerInterface):
             # pp_size-th step) the copy and its serialization would cost the whole
             # context length per decode step: about 4 ms at 287k tokens.
             if not scheduled_in_prev_step and not self.use_v2_model_runner:
-                all_token_ids[req_id] = req.all_token_ids.copy()
+                if _V41_FAST_READD:
+                    # The runner reads the tokens since its last update of
+                    # this request (a few PP rounds back) and, on resume, the
+                    # last num_output_tokens (outputs + placeholders) tokens.
+                    n_out = req.num_output_tokens + req.num_output_placeholders
+                    offset = max(0, req.num_tokens - max(_READD_TAIL, n_out))
+                    all_token_ids[req_id] = TokenTail(
+                        offset, list(req.all_token_ids[offset:])
+                    )
+                else:
+                    all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
@@ -2065,6 +2206,13 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         self.mixed_prefill_budget.update(model_runner_output.mixed_prefill_timing)
+        if self.v41_ahead:
+            for rid in scheduler_output.num_scheduled_tokens:
+                left = self._v41_inflight.get(rid, 0) - 1
+                if left > 0:
+                    self._v41_inflight[rid] = left
+                else:
+                    self._v41_inflight.pop(rid, None)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
