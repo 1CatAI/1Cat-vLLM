@@ -1,0 +1,13 @@
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index b3178168c9..0f8a2b419e 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -631,7 +631,7 @@ platformdirs==4.3.6
+     #   black
+     #   pooch
+     #   virtualenv
+-plotly==5.24.1
++plotly==7.1.0
+     # via
+     #   -r requirements/test/cuda.in
+     #   genai-perf
