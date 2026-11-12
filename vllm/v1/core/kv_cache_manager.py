@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
 import vllm.envs as envs
-from vllm.config.cache import KVRetentionConfig
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -17,6 +18,8 @@ from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize, KVCacheBlock
 from vllm.v1.core.partial_prefix_cache import (
     PartialEntry,
     PartialPrefixCache,
+    _partial_max_frac,
+    _partial_value_evict_enabled,
     tail_mm_items,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -146,7 +149,6 @@ class KVCacheManager:
         prefix_cache_retention_interval: int | None = None,
         partial_prefix_cache: bool = False,
         num_speculative_tokens: int = 0,
-        retention_policy: KVRetentionConfig | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         self.num_speculative_tokens = num_speculative_tokens
@@ -177,7 +179,6 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
-            retention_policy=retention_policy,
         )
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
@@ -219,6 +220,16 @@ class KVCacheManager:
             The KV cache usage (between 0.0 and 1.0).
         """
         return self.block_pool.get_usage()
+
+    def log_partial_diagnostics(self) -> None:
+        """[本地 2026-11-11 P0] Emit the partial-cache value distribution.
+
+        Lives here, not on ``BlockPool``: the pool does not hold the partial
+        cache and never should (the dependency runs manager -> pool). Throttled
+        inside ``log_diagnostics`` so callers can fire on every stats tick.
+        """
+        if self.partial_cache is not None:
+            self.partial_cache.log_diagnostics()
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -272,14 +283,56 @@ class KVCacheManager:
             block_pool=self.block_pool,
             # Allocation reclaims entries under pressure; the bound keeps a
             # burst of new turns from displacing the full-block cache.
-            max_blocks=max(2 * len(managers), self.block_pool.num_gpu_blocks // 4),
+            #
+            # [本地 2026-11-11] 从硬编码 ``num_gpu_blocks // 4``（25%）改为
+            # 可配置比例，默认 5%。
+            #
+            # 理由（生产实测 25% 时）：partial 长期顶满 319/320（99.7%），
+            # 而 ``never_hit=21`` —— 66% 的 entry 从未被复用。即四分之一
+            # 的显存被一批没有命中记录的内容占着。
+            #
+            # 更关键的是**层级关系**：partial 是 L1/L2 三层机制之下的兜底
+            # 缓存（存不对齐块边界的尾巴）。三层本身已拿到
+            # VLLM_KV_TIER_PROTECT_FRAC（15%）的预算，partial 再拿 25% 就
+            # 本末倒置了 —— 垫底那层不该比主角还大。
+            max_blocks=self._partial_max_blocks(len(managers)),
+            # 供热重载重算预算时复用同一个下限（2 × groups）。
+            _num_groups=len(managers),
+            # [本地 2026-11-11 P-06] Value ranking needs the same block size
+            # the entries were built with, otherwise gain_tokens is wrong.
+            block_size=self.partial_block_size,
+            # [本地 2026-11-11 P-06b] New entries start at value zero and must
+            # survive long enough to be resumed from.
+            _grace_s=max(
+                float(
+                    os.environ.get("VLLM_PARTIAL_GRACE_S", "300")
+                ),
+                0.0,
+            ),
         )
         logger.info(
             "Partial prefix cache enabled: %d-token boundary blocks, %d groups, "
-            "up to %d entry blocks.",
+            "up to %d entry blocks (%.1f%% of the %d-block pool).",
             self.partial_block_size,
             len(managers),
             self.partial_cache.max_blocks,
+            100.0 * _partial_max_frac(),
+            self.block_pool.num_gpu_blocks,
+        )
+
+    def _partial_max_blocks(self, num_groups: int) -> int:
+        """[本地 2026-11-11] partial entry 的块预算。
+
+        ``VLLM_PARTIAL_MAX_FRAC`` 是占总池的比例，默认 0.05；下限
+        ``2 * num_groups`` 保证每个 group 至少能放下一个 entry ——
+        预算再小也不能让机制本身失效。
+
+        夹到 [0, 1]：错值不该把预算放大到超过整个池子。
+        """
+        frac = min(max(_partial_max_frac(), 0.0), 1.0)
+        return max(
+            2 * num_groups,
+            int(self.block_pool.num_gpu_blocks * frac),
         )
 
     def _partial_parent(self, request: Request, boundary: int):
@@ -376,6 +429,10 @@ class KVCacheManager:
                         group_hashes[i], [group_id]
                     )
                     if cached is None:
+                        # [本地 2026-11-11 观测 P1] entry 找到了，但它依赖的
+                        # boundary 之前整块已被驱逐 ⇒ 这个 entry 永久失效，
+                        # 却仍占着 blocks。只计数，不改变行为。
+                        cache.dep_miss_count += 1
                         return None
                     full.append(cached[0])
                 blocks.append(full + entry.blocks[group_id])
@@ -464,6 +521,9 @@ class KVCacheManager:
                     blocks=targets,
                     copy_last=[boundary % m.block_size != 0 for m in managers],
                     ready_step=self._step,
+                    # [本地 2026-11-11 P-06] Start the value clock at insert;
+                    # a fresh entry has no resume record yet.
+                    created_ts=time.monotonic(),
                 )
             )
 
@@ -472,14 +532,83 @@ class KVCacheManager:
 
         Partial entries only save recomputation, so running requests take
         precedence over them.
+
+        [本地 2026-11-11 P-06] Only *which* entry to sacrifice changes under
+        ``VLLM_PARTIAL_VALUE_EVICT``; whether to sacrifice at all does not.
+        Returning False makes ``allocate_slots`` yield None and the request
+        wait, so "this entry looks valuable, keep it" would deadlock the pool.
+        There is also no cross-layer trade to make here:
+        ``get_num_free_blocks()`` already counts every evictable ordinary
+        block, so ordinary blocks are never an alternative source of blocks.
         """
         if num_blocks <= self.block_pool.get_num_free_blocks():
             return True
         cache = self.partial_cache
-        while cache is not None and cache.evict_one():
+        if cache is None:
+            return False
+
+        # Value ranking needs live value metrics; with tiers disabled
+        # hits_recent never advances and every entry ties at zero, which
+        # would pick victims arbitrarily.
+        if not (
+            _partial_value_evict_enabled()
+            and getattr(self.block_pool, "_tier_enabled", False)
+        ):
+            while cache.evict_one():
+                if num_blocks <= self.block_pool.get_num_free_blocks():
+                    return True
+            return False
+
+        while True:
             if num_blocks <= self.block_pool.get_num_free_blocks():
                 return True
-        return False
+            victim = cache.lowest_value_entry()
+            if victim is None:
+                return False
+            cache.remove_entry(victim.key)
+
+    def reload_partial_settings(self) -> dict:
+        """[本地 2026-11-11] Re-read the partial-cache knobs, in place.
+
+        ``VLLM_PARTIAL_VALUE_EVICT`` needs no work here: it is consulted on
+        every insert and every reclaim, so writing the environment is enough.
+        Only the grace window is captured at construction and must be pushed
+        into the live cache.
+        """
+        if self.partial_cache is None:
+            return {}
+        raw = os.environ.get("VLLM_PARTIAL_GRACE_S", "300")
+        try:
+            grace = max(float(raw), 0.0)
+        except ValueError:
+            logger.warning(
+                "Ignoring malformed VLLM_PARTIAL_GRACE_S=%r; keeping 300s", raw
+            )
+            grace = 300.0
+        self.partial_cache._grace_s = grace
+        # [本地 2026-11-11] partial 预算也可热改。改小之后**不等**下一轮
+        # insert 才生效 —— 直接收敛一次，否则一个下调的预算要等到下次插入
+        # 才被遵守，运维会以为没生效。
+        new_max = self._partial_max_blocks(self.partial_cache._num_groups)
+        old_max = self.partial_cache.max_blocks
+        self.partial_cache.max_blocks = new_max
+        evicted = 0
+        if new_max < old_max:
+            evicted = self.partial_cache.enforce_budget()
+            logger.info(
+                "Partial budget lowered %d -> %d blocks (%.1f%% of pool); "
+                "evicted %d entries.",
+                old_max,
+                new_max,
+                100.0 * _partial_max_frac(),
+                evicted,
+            )
+        return {
+            "grace_s": grace,
+            "max_blocks": new_max,
+            "max_frac": _partial_max_frac(),
+            "evicted": evicted,
+        }
 
     def take_block_copies(self) -> list[tuple[int, int]]:
         copies, self._block_copies = self._block_copies, []

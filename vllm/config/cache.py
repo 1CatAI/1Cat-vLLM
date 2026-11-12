@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
 from collections.abc import Callable
 from dataclasses import field
 from typing import Any, ClassVar, Literal
@@ -38,69 +37,6 @@ MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
-
-
-@config
-class KVRetentionConfig:
-    """Initialization-bound policy for reclaimable, hashed history blocks."""
-
-    aliases: ClassVar[dict[str, str]] = {
-        "enabled": "VLLM_KV_RETENTION_ENABLED",
-        "p25_seconds": "VLLM_KV_RETENTION_P25",
-        "p35_seconds": "VLLM_KV_RETENTION_P35",
-        "p50_seconds": "VLLM_KV_RETENTION_P50",
-        "p65_seconds": "VLLM_KV_RETENTION_P65",
-        "p80_seconds": "VLLM_KV_RETENTION_P80",
-        "grace_seconds": "VLLM_KV_RETENTION_GRACE",
-        "soft_cap": "VLLM_KV_RETENTION_SOFT_CAP",
-        "hard_cap": "VLLM_KV_RETENTION_HARD_CAP",
-        "absolute_cap": "VLLM_KV_RETENTION_ABS_CAP",
-    }
-
-    enabled: bool = Field(default=None)  # type: ignore[assignment]
-    """None captures the registered opt-in default; resolved to bool at init."""
-    p25_seconds: int = Field(default=None)  # type: ignore[assignment]
-    """None captures legacy retention below 25 percent pressure."""
-    p35_seconds: int = Field(default=None)  # type: ignore[assignment]
-    """None captures legacy retention below 35 percent pressure."""
-    p50_seconds: int = Field(default=None)  # type: ignore[assignment]
-    """None captures legacy retention below 50 percent pressure."""
-    p65_seconds: int = Field(default=None)  # type: ignore[assignment]
-    """None captures legacy retention below 65 percent pressure."""
-    p80_seconds: int = Field(default=None)  # type: ignore[assignment]
-    """None captures legacy retention below 80 percent pressure."""
-    grace_seconds: float = Field(default=None)  # type: ignore[assignment]
-    """None captures the bounded recent-release grace window, in seconds."""
-    soft_cap: float = Field(default=None)  # type: ignore[assignment]
-    """None captures the history fraction above which expired blocks trim."""
-    hard_cap: float = Field(default=None)  # type: ignore[assignment]
-    """None captures the history high watermark for age-independent trimming."""
-    absolute_cap: float = Field(default=None)  # type: ignore[assignment]
-    """None captures the absolute history fraction, including recent blocks."""
-    sources: dict[str, str] = Field(default_factory=dict, init=False, repr=False)
-    """Captured typed/default/legacy provenance transferred with the policy."""
-
-    def __post_init__(self) -> None:
-        resolve_legacy_fields(self, self.aliases)
-
-    @model_validator(mode="after")
-    def _check_watermarks(self) -> "KVRetentionConfig":
-        if not 0 <= self.soft_cap <= self.hard_cap <= self.absolute_cap <= 1:
-            raise ValueError("KV retention requires 0 <= soft <= hard <= absolute <= 1")
-        if not math.isfinite(self.grace_seconds) or self.grace_seconds < 0:
-            raise ValueError("KV retention grace must be finite and non-negative")
-        if any(
-            value < 0
-            for value in (
-                self.p25_seconds,
-                self.p35_seconds,
-                self.p50_seconds,
-                self.p65_seconds,
-                self.p80_seconds,
-            )
-        ):
-            raise ValueError("KV retention durations must be non-negative")
-        return self
 
 
 @config
@@ -267,9 +203,6 @@ class CacheConfig:
     """The backend to use for KV cache offloading. Supported backends include
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
-
-    retention: KVRetentionConfig = field(default_factory=KVRetentionConfig)
-    """Warm history-block retention policy, captured once per engine."""
 
     def compute_hash(self) -> str:
         """

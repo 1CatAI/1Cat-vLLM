@@ -980,6 +980,62 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def reload_kv_config(self, updates: dict | None = None) -> dict:
+        """[本地 2026-11-11] Retune the KV / partial caches without a restart.
+
+        Reached through ``call_utility_async`` from the *full* branch of
+        ``POST /v1/internal/reload``. A cold start costs minutes and is
+        dominated by weight loading and CUDA-graph capture, neither of which
+        depends on these numbers; retuning them should not pay that cost.
+
+        ``updates`` maps environment-variable names to new values. They are
+        written into this process's environment, which is what makes knobs
+        read on every call (``VLLM_PARTIAL_VALUE_EVICT``) take effect at once.
+        Knobs captured at construction are pushed into the live objects
+        explicitly.
+
+        Structural switches are reported, not applied: they decide whether the
+        tier fields exist and which queue class is installed, so flipping them
+        still requires a restart. Saying so beats silently ignoring them.
+        """
+        updates = updates or {}
+        result: dict = {}
+
+        structural = {"VLLM_KV_TIER_ENABLED", "VLLM_KV_TIERED_QUEUE"}
+        ignored = sorted(structural & set(updates))
+        if ignored:
+            result["requires_restart"] = ignored
+
+        for name, value in updates.items():
+            if not (isinstance(name, str) and name.startswith("VLLM_")):
+                continue
+            if name in structural:
+                # Reported above, deliberately not written: nothing reads it
+                # at runtime, and leaving a value in the environment that does
+                # not match what is actually installed only misleads whoever
+                # inspects it next.
+                continue
+            os.environ[name] = str(value)
+
+        km = getattr(self.scheduler, "kv_cache_manager", None)
+        if km is None:
+            result["error"] = "no kv_cache_manager"
+            return result
+
+        pool = getattr(km, "block_pool", None)
+        if pool is not None and hasattr(pool, "reload_tier_settings"):
+            result["tiers"] = pool.reload_tier_settings()
+        if hasattr(km, "reload_partial_settings"):
+            result["partial"] = km.reload_partial_settings()
+
+        from vllm.v1.core.partial_prefix_cache import _partial_value_evict_enabled
+
+        result["partial_value_evict"] = _partial_value_evict_enabled()
+        result["applied"] = sorted(
+            name for name in updates if isinstance(name, str) and name.startswith("VLLM_")
+        )
+        return result
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

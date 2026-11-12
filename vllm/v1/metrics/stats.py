@@ -197,11 +197,12 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
-    # Reclaimable retained history is excluded from allocated kv_cache_usage.
-    # The high watermark starts age-independent trimming outside the grace
-    # window; the separately configured absolute cap also bounds recent blocks.
-    warm_blocks: int = 0
-    warm_block_cap: int = 0
+    # [本地 2026-11-10 P-05] Block count per value tier, indexed by tier
+    # (0=L3 plain … 4=L1 fixed prefix). None when tiering is off.
+    # These blocks are already counted in `kv_cache_usage`; the breakdown is
+    # what makes that number readable -- a pool held at a steady baseline by
+    # cached prefixes and a pool leaking blocks look the same without it.
+    kv_tier_blocks: list[int] | None = None
 
 
 @dataclass

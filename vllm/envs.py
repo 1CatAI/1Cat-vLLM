@@ -18,16 +18,6 @@ if TYPE_CHECKING:
     VLLM_SM70_PHASE_DECODE_SHARE: float
     VLLM_SM70_PHASE_MAX_WAIT_MS: float
     VLLM_SM70_PHASE_LOG_INTERVAL: int
-    VLLM_KV_RETENTION_ABS_CAP: float
-    VLLM_KV_RETENTION_ENABLED: bool
-    VLLM_KV_RETENTION_GRACE: float
-    VLLM_KV_RETENTION_HARD_CAP: float
-    VLLM_KV_RETENTION_P25: int
-    VLLM_KV_RETENTION_P35: int
-    VLLM_KV_RETENTION_P50: int
-    VLLM_KV_RETENTION_P65: int
-    VLLM_KV_RETENTION_P80: int
-    VLLM_KV_RETENTION_SOFT_CAP: float
     VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 32
     VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES: int = 64 * 1024 * 1024
     VLLM_SM70_DEBUG: set[str] = set()
@@ -1615,123 +1605,275 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 scheduler phase separation",),
         user_visible=False,
     ),
-    "VLLM_KV_RETENTION_ABS_CAP": env_var(
-        lambda: float(os.getenv("VLLM_KV_RETENTION_ABS_CAP", "0.60")),
-        description=(
-            "Ceiling the grace window cannot cross, as a fraction of the "
-            "history blocks. Bounds how much of the pool retention may hold "
-            "during a sustained burst of freshly released blocks."
-        ),
-        category="configuration",
-        declared_default="0.6",
-        effective_default="0.6",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=True,
-    ),
-    "VLLM_KV_RETENTION_ENABLED": env_var(
-        lambda: os.getenv("VLLM_KV_RETENTION_ENABLED", "0").strip().lower()
+    "VLLM_KV_TIER_ENABLED": env_var(
+        lambda: os.getenv("VLLM_KV_TIER_ENABLED", "1").strip().lower()
         not in ("", "0", "false", "no", "off"),
         description=(
-            "Opt into warm KV history-block retention using cache_config.retention. "
-            "The default free queue already preserves valid prefix hashes until "
-            "allocation needs their blocks. Warm retention changes eviction priority."
+            "Value-tier the KV blocks so reusable content keeps its cached "
+            "identity longer. Off restores upstream behaviour exactly."
         ),
-        category="configuration",
-        declared_default="False",
-        effective_default="False",
+        category="performance",
+        declared_default=True,
+        effective_default=True,
         automatic_conditions=(),
-        acceleration_paths=("SM70 warm-block KV retention",),
+        acceleration_paths=(),
         user_visible=True,
     ),
-    "VLLM_KV_RETENTION_GRACE": env_var(
-        lambda: float(os.getenv("VLLM_KV_RETENTION_GRACE", "60")),
+    "VLLM_KV_TIER_AGE_SPAN": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_AGE_SPAN", "21600")),
         description=(
-            "Seconds a warm block is protected from trimming after it was last "
-            "touched, regardless of hit count. Prevents a block that a request "
-            "used moments ago from being evicted for being new to the pool."
+            "Seconds over which recency decays to zero when scoring a block. "
+            "A block hit just now scores 1, one idle for this long scores 0."
         ),
-        category="configuration",
-        declared_default="60.0",
-        effective_default="60.0",
+        category="performance",
+        declared_default=21600.0,
+        effective_default=21600.0,
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
     ),
-    "VLLM_KV_RETENTION_HARD_CAP": env_var(
-        lambda: float(os.getenv("VLLM_KV_RETENTION_HARD_CAP", "0.35")),
+    "VLLM_KV_TIER_FREQ_SAT": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_FREQ_SAT", "64")),
         description=(
-            "Warm-table hard ceiling as a fraction of the history blocks. Above "
-            "it, entries are trimmed oldest-first down to the soft cap "
-            "regardless of age."
+            "Hit count at which the frequency score saturates. Lower makes "
+            "moderately reused content rank as hot."
         ),
-        category="configuration",
-        declared_default="0.35",
-        effective_default="0.35",
+        category="performance",
+        declared_default=64.0,
+        effective_default=64.0,
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
     ),
-    "VLLM_KV_RETENTION_P25": env_var(
-        lambda: int(os.getenv("VLLM_KV_RETENTION_P25", "21600")),
-        description="Warm-block retention seconds while KV usage < 25%.",
-        category="configuration",
-        declared_default="21600",
-        effective_default="21600",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=True,
-    ),
-    "VLLM_KV_RETENTION_P35": env_var(
-        lambda: int(os.getenv("VLLM_KV_RETENTION_P35", "7200")),
-        description="Warm-block retention seconds while KV usage < 35%.",
-        category="configuration",
-        declared_default="7200",
-        effective_default="7200",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=True,
-    ),
-    "VLLM_KV_RETENTION_P50": env_var(
-        lambda: int(os.getenv("VLLM_KV_RETENTION_P50", "3600")),
-        description="Warm-block retention seconds while KV usage < 50%.",
-        category="configuration",
-        declared_default="3600",
-        effective_default="3600",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=True,
-    ),
-    "VLLM_KV_RETENTION_P65": env_var(
-        lambda: int(os.getenv("VLLM_KV_RETENTION_P65", "1800")),
-        description="Warm-block retention seconds while KV usage < 65%.",
-        category="configuration",
-        declared_default="1800",
-        effective_default="1800",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=True,
-    ),
-    "VLLM_KV_RETENTION_P80": env_var(
-        lambda: int(os.getenv("VLLM_KV_RETENTION_P80", "600")),
-        description="Warm-block retention seconds while KV usage < 80%.",
-        category="configuration",
-        declared_default="600",
-        effective_default="600",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=True,
-    ),
-    "VLLM_KV_RETENTION_SOFT_CAP": env_var(
-        lambda: float(os.getenv("VLLM_KV_RETENTION_SOFT_CAP", "0.25")),
+    "VLLM_KV_TIER_L1_MIN_HITS": env_var(
+        lambda: int(os.getenv("VLLM_KV_TIER_L1_MIN_HITS", "3")),
         description=(
-            "Warm-table target size as a fraction of the history blocks. Above "
-            "it, entries that have outlived the current retention tier are "
-            "trimmed; entries still inside their window are kept."
+            "Absolute floor on cumulative hits before a block may enter L1, "
+            "regardless of recency. The effective threshold is this floor or "
+            "the pool's VLLM_KV_TIER_L1_FRAC quantile, whichever is higher. "
+            "L1 ignores age on purpose: a system prompt nobody reads "
+            "overnight is still the prompt every session reads next morning."
         ),
-        category="configuration",
-        declared_default="0.25",
-        effective_default="0.25",
+        category="performance",
+        declared_default=3,
+        effective_default=3,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_L1_FRAC": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_L1_FRAC", "0.9")),
+        description=(
+            "Quantile of reused blocks (by cumulative hits) that qualifies "
+            "for L1. 0.9 means the top 10% of blocks that have been reused at "
+            "least once. Recomputed every sweep from a full-pool pass, which "
+            "the sweep already performs."
+        ),
+        category="performance",
+        declared_default=0.9,
+        effective_default=0.9,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_HOT_FREQ": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_HOT_FREQ", "0.6")),
+        description="Frequency score at or above which a block counts as hot.",
+        category="performance",
+        declared_default=0.6,
+        effective_default=0.6,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_HOT_AGE": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_HOT_AGE", "0.5")),
+        description="Recency score at or above which a block counts as fresh.",
+        category="performance",
+        declared_default=0.5,
+        effective_default=0.5,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_L3_TTL": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_L3_TTL", "600")),
+        description=(
+            "Seconds an unpromoted block may sit idle before it drops its "
+            "prefix hash. The block stays allocatable; it just stops being "
+            "findable by prefix."
+        ),
+        category="performance",
+        declared_default=600.0,
+        effective_default=600.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_L2C_TTL": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_L2C_TTL", "1800")),
+        description="Seconds an L2-C block may sit idle before demotion to L3.",
+        category="performance",
+        declared_default=1800.0,
+        effective_default=1800.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_L2B_TTL": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_L2B_TTL", "3600")),
+        description="Seconds an L2-B block may sit idle before demotion to L3.",
+        category="performance",
+        declared_default=3600.0,
+        effective_default=3600.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_L2A_TTL": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_L2A_TTL", "7200")),
+        description="Seconds an L2-A block may sit idle before demotion to L3.",
+        category="performance",
+        declared_default=7200.0,
+        effective_default=7200.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_L1_TTL": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_L1_TTL", "21600")),
+        description="Seconds an L1 block may sit idle before demotion to L3.",
+        category="performance",
+        declared_default=21600.0,
+        effective_default=21600.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_SWEEP_S": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_SWEEP_S", "60")),
+        description=(
+            "Seconds between tier re-classification sweeps. Purely a policy "
+            "timer; a sweep that never fires only delays demotion."
+        ),
+        category="performance",
+        declared_default=60.0,
+        effective_default=60.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIERED_QUEUE": env_var(
+        lambda: os.getenv("VLLM_KV_TIERED_QUEUE", "0").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Order the free queue by value tier so low-value blocks are "
+            "allocated first. Off keeps the plain LRU queue."
+        ),
+        category="performance",
+        declared_default=False,
+        effective_default=False,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_VALUE_WINDOW_S": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_VALUE_WINDOW_S", "3600")),
+        description=(
+            "Sliding window for the per-block hit counter used by value-based "
+            "eviction. Must be >= VLLM_KV_TIER_SWEEP_S."
+        ),
+        category="performance",
+        declared_default=3600.0,
+        effective_default=3600.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_DIAG_S": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_DIAG_S", "60")),
+        description=(
+            "Seconds between block-value diagnostic log lines. Diagnostics "
+            "are read-only and never change eviction."
+        ),
+        category="performance",
+        declared_default=60.0,
+        effective_default=60.0,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_QUOTA_ENABLED": env_var(
+        lambda: os.getenv("VLLM_KV_TIER_QUOTA_ENABLED", "0").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Cap how much of the GPU KV pool the protected value tiers "
+            "(L1+L2) may hold. When the cap is exceeded the sweep evicts the "
+            "lowest-value protected blocks until the pool fits again. Off "
+            "keeps tiering purely observational (previous behaviour)."
+        ),
+        category="performance",
+        declared_default=False,
+        effective_default=False,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_PROTECT_FRAC": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_PROTECT_FRAC", "0.15")),
+        description=(
+            "Maximum share of the total KV pool that L1+L2 may protect, as a "
+            "fraction. Only consulted when VLLM_KV_TIER_QUOTA_ENABLED is on. "
+            "0.15 means at most 15% of the pool is held by protected tiers."
+        ),
+        category="performance",
+        declared_default=0.15,
+        effective_default=0.15,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KV_TIER_L1_SHARE": env_var(
+        lambda: float(os.getenv("VLLM_KV_TIER_L1_SHARE", "0.2")),
+        description=(
+            "Share of the protected budget (L1+L2) that tier L1 may take. "
+            "0.2 gives L1:L2 = 1:4. Only consulted when "
+            "VLLM_KV_TIER_QUOTA_ENABLED is on."
+        ),
+        category="performance",
+        declared_default=0.2,
+        effective_default=0.2,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_PARTIAL_VALUE_EVICT": env_var(
+        lambda: os.getenv("VLLM_PARTIAL_VALUE_EVICT", "0").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        description=(
+            "Sacrifice the least valuable partial-prefix entry instead of the "
+            "oldest one. Off keeps LRU."
+        ),
+        category="performance",
+        declared_default=False,
+        effective_default=False,
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_PARTIAL_MAX_FRAC": env_var(
+        lambda: float(os.getenv("VLLM_PARTIAL_MAX_FRAC", "0.05")),
+        description=(
+            "Share of the GPU KV pool that partial-prefix entries may hold. "
+            "They sit below the L1/L2 value tiers: the protected tiers get "
+            "VLLM_KV_TIER_PROTECT_FRAC of the pool, and this is the separate "
+            "budget for the partial (non-block-aligned) tail cache. Was "
+            "hard-coded at 0.25 before 2026-11-11, which measured 99.7% full "
+            "with 66% of entries never hit."
+        ),
+        category="performance",
+        declared_default=0.05,
+        effective_default=0.05,
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
@@ -21532,16 +21674,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_SM70_PHASE_DECODE_SHARE",
         "VLLM_SM70_PHASE_MAX_WAIT_MS",
         "VLLM_SM70_PHASE_LOG_INTERVAL",
-        "VLLM_KV_RETENTION_ABS_CAP",
-        "VLLM_KV_RETENTION_ENABLED",
-        "VLLM_KV_RETENTION_GRACE",
-        "VLLM_KV_RETENTION_HARD_CAP",
-        "VLLM_KV_RETENTION_P25",
-        "VLLM_KV_RETENTION_P35",
-        "VLLM_KV_RETENTION_P50",
-        "VLLM_KV_RETENTION_P65",
-        "VLLM_KV_RETENTION_P80",
-        "VLLM_KV_RETENTION_SOFT_CAP",
+
+
+
         "VLLM_STARTUP_LOG_FILE",
         "VLLM_INPLACE_AR_MIN",
         "VLLM_PYNCCL_ALLGATHER",
