@@ -1,0 +1,596 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 60c5988081..9106416aac 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -6,7 +6,7 @@
+ import json
+ import time
+ from collections import OrderedDict
+-from collections.abc import AsyncGenerator, AsyncIterator
++from collections.abc import AsyncGenerator, AsyncIterator, Iterable
+ from collections.abc import Sequence as GenericSequence
+ from http import HTTPStatus
+ from typing import TYPE_CHECKING, Any, Final
+@@ -46,6 +46,7 @@
+     DeltaToolCall,
+     ErrorResponse,
+     FunctionCall,
++    CompletionTokenUsageInfo,
+     PromptTokenUsageInfo,
+     RequestResponseMetadata,
+     ToolCall,
+@@ -68,7 +69,11 @@
+ from vllm.inputs import EngineInput
+ from vllm.logger import init_logger
+ from vllm.logprobs import Logprob
+-from vllm.outputs import CompletionOutput, RequestOutput
++from vllm.outputs import (
++    STREAM_KEEPALIVE,
++    CompletionOutput,
++    RequestOutput,
++)
+ from vllm.parser import ParserManager
+ from vllm.parser.abstract_parser import Parser
+ from vllm.reasoning import ReasoningParser
+@@ -90,6 +95,29 @@ def _token_list(rendered: Any) -> list[int]:
+     return list(rendered)
+ 
+ 
++def _count_reasoning_tokens(
++    reasoning_parser: "ReasoningParser | None",
++    token_ids_per_choice: Iterable[GenericSequence[int]] | None,
++) -> int | None:
++    """Count reasoning tokens among the generated ids.
++
++    Returns None when there is nothing to measure — no reasoning parser, or no
++    ids retained for any choice. The caller then omits the field instead of
++    reporting zero, because a zero and "we did not look" mean different things
++    to whoever is reading the number.
++    """
++    if reasoning_parser is None or token_ids_per_choice is None:
++        return None
++    total = 0
++    measured = False
++    for token_ids in token_ids_per_choice:
++        if not token_ids:
++            continue
++        total += reasoning_parser.count_reasoning_tokens(token_ids)
++        measured = True
++    return total if measured else None
++
++
+ class _PrefixCacheBoundaries:
+     """Prompt positions worth a partial prefix-cache entry.
+ 
+@@ -374,6 +402,24 @@ async def create_chat_completion(
+         for the API specification. This API mimics the OpenAI
+         Chat Completion API.
+         """
++        # With tool_choice="none", do not hand the tools to the template.
++        #
++        # The model cannot see tool_choice at all -- upstream measurements show
++        # the first 12 generated token ids are identical for auto and none. So
++        # as long as the template carries tools, the model writes a call body
++        # even when the user asked it not to, and the engine emits it as plain
++        # text: the client receives an unparsed `<tool_call>...</tool_call>`
++        # blob.
++        # With no tools passed at all, the model instead produces a useful
++        # ```bash ...``` command example.
++        #
++        # Only active behind --exclude-tools-when-tool-choice-none.
++        if (
++            self.exclude_tools_when_tool_choice_none
++            and request.tool_choice == "none"
++            and request.tools
++        ):
++            request = request.model_copy(update={"tools": None, "tool_choice": None})
+         return await self._with_kv_transfer_rejection_cleanup(
+             self._create_chat_completion(request, raw_request), request, raw_request
+         )
+@@ -512,6 +558,10 @@ async def _create_chat_completion(
+                     }
+                     if reasoning_parser
+                     else None,
++                    # Only streaming requests enable the idle keep-alive
++                    # sentinel -- only the chat streaming generator knows how
++                    # to recognise and consume it.
++                    keepalive=bool(request.stream),
+                 )
+ 
+             generators.append(generator)
+@@ -568,6 +618,9 @@ async def chat_completion_stream_generator(
+         num_choices = 1 if request.n is None else request.n
+         previous_num_tokens = [0] * num_choices
+         finish_reason_sent = [False] * num_choices
++        # Accumulate each choice's generated token ids so reasoning_tokens
++        # can be counted at finish time.
++        generated_ids_per_choice: list[list[int]] = [[] for _ in range(num_choices)]
+         num_prompt_tokens = 0
+         num_cached_tokens = None
+         if self.use_harmony:
+@@ -646,8 +699,23 @@ async def chat_completion_stream_generator(
+             stream_options, self.enable_force_include_usage
+         )
+ 
++        # Two-sided keep-alive:
++        #   the engine emits a STREAM_KEEPALIVE sentinel after 15s of idleness;
++        #   the API layer, on receiving one, writes an SSE comment frame
++        #   (`: keepalive`) to the client if nothing has actually been sent for
++        #   >= 120s. A comment frame carries no message and does not affect
++        #   client parsing, but it shows intermediaries that the connection is
++        #   still alive, so long thinking does not get cut off.
++        last_server_send_time = time.time()
+         try:
+             async for res in result_generator:
++                if res is STREAM_KEEPALIVE:
++                    now = time.time()
++                    if now - last_server_send_time >= 120:
++                        yield ": keepalive\n\n"
++                        last_server_send_time = now
++                    continue
++
+                 if res.prompt_token_ids is not None:
+                     num_prompt_tokens = len(res.prompt_token_ids)
+                     if res.encoder_prompt_token_ids is not None:
+@@ -901,6 +969,14 @@ async def chat_completion_stream_generator(
+ 
+                     # set the previous values for the next iteration
+                     previous_num_tokens[i] += len(output.token_ids)
++                    # Accumulate generated ids for the reasoning count. This
++                    # must run on **every** frame, not inside the finish branch,
++                    # or only the last frame gets accumulated.
++                    # output.token_ids is incremental.
++                    if 0 <= i < len(generated_ids_per_choice):
++                        generated_ids_per_choice[i].extend(
++                            as_list(output.token_ids) or []
++                        )
+ 
+                     # if the message delta is None (e.g. because it was a
+                     # "control token" for tool calls or the parser otherwise
+@@ -979,14 +1055,158 @@ async def chat_completion_stream_generator(
+                                 if auto_tools_called
+                                 else 0
+                             )
++                        # On EOS, re-parse the whole text through the
++                        # **non-streaming** path and emit whatever tail the
++                        # stream missed.
++                        # Division of labour with `_remaining_tool_args` below:
++                        #   flush     -- source is `extract_tool_calls(full text)`,
++                        #                so the judgement is complete
++                        #   remaining -- source is prev_tool_call_arr (partial),
++                        #                the same source the stream used
++                        # Measured on a 3-level nested structure: streaming and
++                        # partial both saw 99B, non-streaming 157B.
++                        # flush advances streamed_args_for_tool, so the
++                        # subsequent `_remaining_tool_args` computes an empty
++                        # string and does not re-emit.
++                        _flush_done = False
++                        if tool_parser and hasattr(
++                            tool_parser, "flush_streaming_finish"
++                        ):
++                            try:
++                                flush_msg = tool_parser.flush_streaming_finish()
++                            except Exception:
++                                flush_msg = None
++                            if flush_msg and flush_msg.tool_calls:
++                                # flush already advanced
++                                # streamed_args_for_tool inside the parser, so
++                                # only merge the delta into this frame.
++                                delta_message = self._merge_flush_delta(
++                                    delta_message, flush_msg
++                                )
++                                # If flush already covered it, skip the
++                                # partial re-emission below:
++                                # streamed_args_for_tool now holds the
++                                # non-streaming complete value while
++                                # expected_call comes from the partial path and
++                                # is shorter, so the prefix test no longer
++                                # holds and tolerance alignment would compute a
++                                # wrong delta.
++                                _flush_done = True
++
++                        # With thinking enabled, calls to tools outside
++                        # `_STREAMING_TOOLS` (Bash/Grep/Glob/...) are
++                        # **deliberately deferred** by the parser
++                        # (`_should_defer_parsing` returns True and sets
++                        # `_deferred_used=True`) so that tag-shaped text quoted
++                        # inside the thinking block is not mistaken for a real
++                        # call. Those calls must be emitted at **finish time**
++                        # from the complete text. Without this:
++                        #   a client that sends no `chat_template_kwargs`
++                        #   => `_thinking_enabled_of()` defaults to True
++                        #   => every non-whitelisted tool is deferred
++                        #   => nothing emits them at finish
++                        #   => **the tool calls silently vanish**
++                        #      (finish_reason=stop, empty content), which the
++                        #      user experiences as "the model said it would run
++                        #      something and nothing happened".
++                        #
++                        # Note that `_thinking_enabled_of` reads the **raw**
++                        # request kwargs while template rendering uses the
++                        # merged `with_defaults` value. Deployments that set
++                        # `--default-chat-template-kwargs {"enable_thinking":
++                        # false}` make the two disagree, and this emission is
++                        # then the only fallback.
++                        if (
++                            tool_parser
++                            and previous_texts is not None
++                            and reasoning_parser is not None
++                            and (
++                                getattr(tool_parser, "_thinking_enabled", False)
++                                or getattr(tool_parser, "_coalesce_mode", False)
++                            )
++                            and getattr(tool_parser, "_deferred_used", False)
++                        ):
++                            # Capture how many calls were already streamed so
++                            # the deferred ones continue the numbering. This
++                            # must be read here: the `extract_tool_calls_deferred`
++                            # that follows resets current_tool_index inside
++                            # `_reset_streaming_state()`.
++                            _streamed_base = getattr(tool_parser, "current_tool_index", 0)
++                            _, _deferred_content = reasoning_parser.extract_reasoning(
++                                previous_texts[i], request=request
++                            )
++                            _deferred_info = tool_parser.extract_tool_calls_deferred(
++                                _deferred_content or "", request
++                            )
++                            if _deferred_info.tools_called:
++                                if delta_message is None:
++                                    delta_message = DeltaMessage()
++                                _base = max(
++                                    _streamed_base,
++                                    len(delta_message.tool_calls or []),
++                                )
++                                # Prefer the parser's recorded **original
++                                # index**; `_base + _di` is only a fallback.
++                                # Renumbering lets a client merge two calls'
++                                # arguments under one index -> `Extra data`.
++                                _deferred_indices = (
++                                    getattr(tool_parser, "_deferred_indices", None) or []
++                                )
++                                delta_message.tool_calls = list(
++                                    delta_message.tool_calls or []
++                                ) + [
++                                    DeltaToolCall(
++                                        index=(
++                                            _deferred_indices[_di]
++                                            if _di < len(_deferred_indices)
++                                            else _base + _di
++                                        ),
++                                        id=_tc.id,
++                                        type="function",
++                                        function=DeltaFunctionCall(
++                                            name=_tc.function.name,
++                                            arguments=_tc.function.arguments,
++                                        ),
++                                    )
++                                    for _di, _tc in enumerate(_deferred_info.tool_calls)
++                                ]
++                                auto_tools_called = True
++                                _flush_done = True
+                         should_check = (
+-                            self._should_check_for_unstreamed_tool_arg_tokens(
++                            not _flush_done
++                            and self._should_check_for_unstreamed_tool_arg_tokens(
+                                 delta_message, output
+                             )
+                         )
+                         # only check if there are any tool calls
+                         # detected by partial parsing
+-                        if should_check and tool_parser and auto_tools_called:
++                        # Bounds guard.
++                        # `index` was computed **above** from the length of
++                        # `prev_tool_call_arr` at that moment. But
++                        # `flush_streaming_finish()` and
++                        # `extract_tool_calls_deferred()` may have run in
++                        # between, and both call `_reset_streaming_state()`,
++                        # which clears and rebuilds `prev_tool_call_arr` and
++                        # `streamed_args_for_tool`. If they decided nothing
++                        # needed emitting (`_flush_done` still False), control
++                        # reaches here with an out-of-range index:
++                        #   IndexError: list index out of range
++                        # That exception is wrapped into an `{"error": {...}}`
++                        # SSE frame, which the Anthropic layer feeds to
++                        # `ChatCompletionStreamResponse.model_validate_json`
++                        # -> ValidationError: `model`/`choices` Field required
++                        # -> a 500 for the whole turn and a lost tool call.
++                        # Re-check against the **current** length: if the list
++                        # is too short there is no accounted call, so skip.
++                        _pca = getattr(tool_parser, "prev_tool_call_arr", ()) or ()
++                        _sat = getattr(tool_parser, "streamed_args_for_tool", ()) or ()
++                        if (
++                            should_check
++                            and tool_parser
++                            and auto_tools_called
++                            and 0 <= index < len(_pca)
++                            and 0 <= index < len(_sat)
++                        ):
+                             latest_delta_len = 0
+                             if (
+                                 isinstance(
+@@ -1022,15 +1242,48 @@ async def chat_completion_stream_generator(
+                             # get what we've streamed so far for arguments
+                             # for the current tool
+                             actual_call = tool_parser.streamed_args_for_tool[index]
++                            # The subtraction must not go out of bounds.
++                            # `actual_call[:-N]` **silently yields an empty
++                            # string** when N > len(actual), a Python negative-
++                            # slice property. Observed when the finish frame
++                            # already carried a flush-emitted delta (1231B)
++                            # while the streaming side had accumulated only 30B:
++                            # the subtraction reduced 30B to "" -> "the client
++                            # received nothing" -> remaining degraded to the
++                            # full text -> duplicated head, invalid JSON.
++                            # Going out of bounds means that delta was the
++                            # finish-time emission, not new in this frame, so
++                            # merge it into actual and use prefix alignment.
+                             if latest_delta_len > 0:
+-                                actual_call = actual_call[:-latest_delta_len]
++                                cut = len(actual_call) - latest_delta_len
++                                if cut >= 0:
++                                    actual_call = actual_call[:cut]
++                                else:
++                                    flush_delta = (
++                                        delta_message.tool_calls[0].function.arguments
++                                        or ""
++                                    )
++                                    actual_call = actual_call + flush_delta
+ 
+                             # check to see if there's anything left to stream
+-                            remaining_call = expected_call.replace(actual_call, "", 1)
++                            # Prefix alignment replaces
++                            # `expected_call.replace(actual_call, "", 1)`, which
++                            # matches nothing when actual is not a substring and
++                            # then returns the whole text -> duplicated args.
++                            remaining_call = self._remaining_tool_args(
++                                expected_call, actual_call
++                            )
+                             # set that as a delta message
+                             delta_message = self._create_remaining_args_delta(
+                                 delta_message, remaining_call, index
+                             )
++                            if remaining_call:
++                                # Idempotence: advance "already sent" to the
++                                # complete value so later finish outputs do not
++                                # emit the same tail again.
++                                self._advance_streamed_args(
++                                    tool_parser, index, expected_call
++                                )
+ 
+                         # Send the finish response for each request.n only once
+                         # In OpenAI's API, when a tool is called, the
+@@ -1106,6 +1359,14 @@ async def chat_completion_stream_generator(
+                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
+                         cached_tokens=num_cached_tokens
+                     )
++                # Split reasoning from content for the token counts.
++                _rt = _count_reasoning_tokens(
++                    reasoning_parser, generated_ids_per_choice
++                )
++                if _rt is not None:
++                    final_usage.completion_tokens_details = (
++                        CompletionTokenUsageInfo(reasoning_tokens=_rt)
++                    )
+ 
+                 final_usage_chunk = ChatCompletionStreamResponse(
+                     id=request_id,
+@@ -1172,6 +1433,9 @@ async def chat_completion_full_generator(
+ 
+         try:
+             async for res in result_generator:
++                # Skip the idle keep-alive sentinel; it carries no output.
++                if res is STREAM_KEEPALIVE:
++                    continue
+                 final_res = res
+         except asyncio.CancelledError:
+             return self.create_error_response("Client disconnected")
+@@ -1540,6 +1804,16 @@ async def chat_completion_full_generator(
+             usage.prompt_tokens_details = PromptTokenUsageInfo(
+                 cached_tokens=final_res.num_cached_tokens
+             )
++        # Split reasoning from content for the token counts. Non-streaming
++        # output.token_ids is the **complete** id list, not a delta.
++        _rt = _count_reasoning_tokens(
++            reasoning_parser,
++            [as_list(o.token_ids) or [] for o in final_res.outputs],
++        )
++        if _rt is not None:
++            usage.completion_tokens_details = CompletionTokenUsageInfo(
++                reasoning_tokens=_rt
++            )
+ 
+         request_metadata.final_usage_info = usage
+ 
+@@ -1724,6 +1998,141 @@ def _should_check_for_unstreamed_tool_arg_tokens(
+             and delta_message.tool_calls[0].function.arguments is not None
+         )
+ 
++    @staticmethod
++    def _coverage_end(actual_call: str, expected_call: str) -> int | None:
++        """Estimate how far ``actual`` covers ``expected``; None if uncertain.
++
++        ``actual`` is usually a prefix of ``expected`` because the stream emits
++        incrementally, but it can also be an **approximate** prefix: the
++        partial path appends a trailing newline to a parameter value and
++        truncates the tail, which defeats both ``startswith`` and ``replace``.
++
++        Approach: take a slice of ``actual``'s tail as a probe, locate it in
++        ``expected``, and treat the probe's end as the coverage point. Several
++        probe lengths keep this robust, and a bound on (end - len(actual))
++        rejects false matches. Returns None when every probe fails, so the
++        caller conservatively emits nothing.
++        """
++        n = len(actual_call)
++        if n == 0:
++            return 0
++        tol = max(16, n // 100)
++        for probe in (128, 96, 64, 32, 16):
++            if n < probe:
++                continue
++            pos = expected_call.rfind(actual_call[-probe:])
++            if pos < 0:
++                continue
++            end = pos + probe
++            if end <= len(expected_call) and abs(end - n) <= tol:
++                return end
++        return None
++
++    @staticmethod
++    def _merge_flush_delta(
++        delta_message: DeltaMessage | None, flush_msg: DeltaMessage
++    ) -> DeltaMessage:
++        """Merge the EOS tail (``flush_streaming_finish``) into this frame's delta.
++
++        The flush delta is the tail the stream missed, and the client has to
++        receive it or the tool arguments stay incomplete. Appended by index so
++        it lands on the right call.
++        """
++        if delta_message is None or not delta_message.tool_calls:
++            return flush_msg
++        by_index = {tc.index: tc for tc in delta_message.tool_calls}
++        for ftc in flush_msg.tool_calls:
++            cur = by_index.get(ftc.index)
++            if cur is None:
++                delta_message.tool_calls.append(ftc)
++                continue
++            if ftc.function and ftc.function.arguments:
++                if cur.function is None:
++                    cur.function = ftc.function
++                else:
++                    cur.function.arguments = (
++                        cur.function.arguments or ""
++                    ) + ftc.function.arguments
++        return delta_message
++
++    @staticmethod
++    def _remaining_tool_args(expected_call: str, actual_call: str) -> str:
++        """Return the argument tail that still needs to be sent.
++
++        Replaces `expected_call.replace(actual_call, "", 1)`, which had two
++        defects:
++        1. When actual is not a substring of expected, `replace` matches
++           nothing and returns the **whole** of expected -> the client receives
++           duplicated arguments -> JSON parse failure.
++        2. Even when it matches, an actual that appears mid-string rather than
++           as a prefix leaves a malformed splice.
++
++        Now: a true prefix emits the tail; an approximate prefix uses the
++        coverage point; when neither applies nothing is emitted, so duplication
++        cannot happen.
++        """
++        if actual_call and expected_call.startswith(actual_call):
++            return expected_call[len(actual_call) :]
++        n = len(actual_call)
++        if n == 0:
++            return expected_call
++        tol = max(16, n // 100)
++        # Binary-search the largest k such that act[:k] is a proper prefix of
++        # exp (no guessing, O(n log n)).
++        lo, hi = 0, n - 1
++        while lo < hi:
++            mid = (lo + hi + 1) // 2
++            if expected_call.startswith(actual_call[:mid]):
++                lo = mid
++            else:
++                hi = mid - 1
++        k = lo
++        # Only accept the "short extra tail" shape (the partial path appends
++        # 1-2B in practice; 4B is the upper bound). A mid-string mismatch
++        # leaves act[k:] a dozen bytes long, and mistaking that for alignment
++        # would emit in the wrong place.
++        if k >= n - tol and k > 0 and (n - k) <= 4:
++            overflow = actual_call[k:].rstrip()
++            head_raw = expected_call[k:]
++            head = head_raw.lstrip()
++            if (
++                overflow
++                and head
++                and overflow[-1] == head[0]
++                and overflow[-1] in '"}]:,'
++            ):
++                # Overlap: the client already has this closer, so skip that
++                # position in expected.
++                skip = (len(head_raw) - len(head)) + 1
++                return expected_call[k + skip :]
++            return expected_call[k:]
++        end = OpenAIServingChat._coverage_end(actual_call, expected_call)
++        if end is None:
++            return ""
++        return expected_call[end:]
++
++    @staticmethod
++    def _advance_streamed_args(tool_parser, index: int, expected_call: str) -> None:
++        """Advance "already sent" to the complete value after emitting (idempotence).
++
++        Upstream emits the delta without updating state, and the emission
++        trigger is only `finish_reason is not None`. That condition holds for
++        several consecutive outputs, so this block is entered repeatedly and
++        the same remaining tail gets emitted again and again.
++        """
++        try:
++            if index < len(tool_parser.streamed_args_for_tool):
++                tool_parser.streamed_args_for_tool[index] = expected_call
++        except Exception:
++            pass
++
++    # Without `@staticmethod`, calling
++    # `self._create_remaining_args_delta(a, b, c)` counts `self` as the first
++    # positional argument -> TypeError ("takes 3 positional arguments but 4
++    # were given") -> the streaming generator raises and aborts, so the finish
++    # frame is never sent and the argument tail is never emitted. The client
++    # then holds truncated, invalid JSON (observed `{"path": "/tmp/1.txt"`
++    # with no content) and the tool call is lost.
+     @staticmethod
+     def _create_remaining_args_delta(
+         delta_message: DeltaMessage,
+@@ -1733,7 +2142,14 @@ def _create_remaining_args_delta(
+         """
+         Create a delta message for remaining tool arguments, preserving
+         id/type/name from the original delta.
++
++        When `remaining_call` is empty, return `delta_message` **unchanged**.
++        Unconditionally overwriting the arguments with it replaced a correct
++        in-frame delta (1259B measured) with the empty string, so the client
++        received a **call with empty arguments**.
+         """
++        if not remaining_call:
++            return delta_message
+         original_tc = next(
+             (tc for tc in delta_message.tool_calls if tc.index == index),
+             None,
+diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
+index 19ee3fc2e7..c5982a2830 100644
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -90,6 +90,10 @@ class ModelCard(OpenAIBaseModel):
+     root: str | None = None
+     parent: str | None = None
+     max_model_len: int | None = None
++    # [本地 2026-11-09 重放 opt21 第 5 项] 对外能力宣告：客户端可据这两个字段
++    # 预检「能塞多少历史」与「最多能生成多少」，不必自己猜 max_model_len 怎么切。
++    context_window: int | None = None
++    max_output_tokens: int | None = None
+     permission: list[ModelPermission] = Field(default_factory=list)
+ 
+ 
+@@ -102,11 +106,20 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
+     cached_tokens: int | None = None
+ 
+ 
++class CompletionTokenUsageInfo(OpenAIBaseModel):
++    # [本地 2026-11-09 重放 I-11] How many of `completion_tokens` were reasoning.
++    # A client that shows one output number cannot otherwise tell a long
++    # deliberation from a long answer: on a reasoning model the two differ by
++    # several times, and only this split says which one a caller is paying for.
++    reasoning_tokens: int | None = None
++
++
+ class UsageInfo(OpenAIBaseModel):
+     prompt_tokens: int = 0
+     total_tokens: int = 0
+     completion_tokens: int | None = 0
+     prompt_tokens_details: PromptTokenUsageInfo | None = None
++    completion_tokens_details: CompletionTokenUsageInfo | None = None
+ 
+ 
+ class RequestResponseMetadata(BaseModel):
