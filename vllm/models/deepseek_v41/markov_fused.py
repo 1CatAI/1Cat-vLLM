@@ -113,16 +113,26 @@ class MarkovGreedy:
 
 @triton.jit
 def _markov_bias(
-    weight, embed_rows, out, V: tl.constexpr, K: tl.constexpr, ROWS: tl.constexpr
+    weight,
+    embed_rows,
+    out,
+    n_rows,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
-    pid, n = tl.program_id(0), tl.program_id(1)
+    # One program per vocabulary block reads its weight rows once for every
+    # embedding row (the cost was one full weight read per row: 16 rows at
+    # c64 made ~6 ms per verify step).
+    pid = tl.program_id(0)
     v = pid * ROWS + tl.arange(0, ROWS)
     k = tl.arange(0, K)
     valid = v < V
     raw = tl.load(weight + v[:, None] * K + k[None, :], valid[:, None], 0)
     w = (raw.to(tl.int32) << 16).to(tl.float32, bitcast=True)
-    e = tl.load(embed_rows + n * K + k).to(tl.float32)
-    tl.store(out + n * V + v, tl.sum(w * e[None, :], 1), valid)
+    for n in range(n_rows):
+        e = tl.load(embed_rows + n * K + k).to(tl.float32)
+        tl.store(out + n * V + v, tl.sum(w * e[None, :], 1), valid)
 
 
 def markov_bias(greedy, embedding):
@@ -132,10 +142,11 @@ def markov_bias(greedy, embedding):
         rows.shape[0], greedy.vocab, dtype=torch.float32, device=rows.device
     )
     if rows.shape[0]:
-        _markov_bias[(greedy.blocks, rows.shape[0])](
+        _markov_bias[(greedy.blocks,)](
             greedy.weight,
             rows,
             out,
+            rows.shape[0],
             V=greedy.vocab,
             K=greedy.rank,
             ROWS=ROWS,

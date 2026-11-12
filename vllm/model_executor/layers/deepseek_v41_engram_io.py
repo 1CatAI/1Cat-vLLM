@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""One node-level Engram reader and bounded shared IQ4_NL row buffers."""
+"""One node-level Engram reader and bounded shared Engram row buffers.
+
+Rows come from the GGUF sidecar (IQ4_NL, 144 bytes) or, for the original
+checkpoint (VLLM_V41_NATIVE=1), from a directory of repacked tables: one
+``engram-LL.rows`` file of 264-byte rows (256 E4M3 codes + 8 E8M0 scales) and
+an ``engram-LL.json`` description per Engram layer.
+"""
 
 import atexit
 import hashlib
@@ -13,6 +19,7 @@ from dataclasses import asdict, dataclass
 import gguf
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 from vllm.utils.shared_host import SharedHostArena
 
@@ -25,9 +32,52 @@ class EngramTableSpec:
     path: str
     offset: int
     rows: int
+    row_bytes: int = 144
+    # Native rows: decoded values carry 2^row_bias (exact; the projection's
+    # scales carry 2^-row_bias).
+    row_bias: int = 0
+
+
+NATIVE_ROW_BYTES = 264
+
+
+def native_row_bias(meta):
+    """Power-of-two bias of the FP16 row decode (VLLM_V41_ENGRAM_ROW_BIAS)."""
+    value = envs.VLLM_V41_ENGRAM_ROW_BIAS
+    if value is not None:
+        return int(value)
+    # No bias when FP16 already holds every row value exactly: the largest
+    # (448 * 2^max) stays below 2^15 and the smallest subnormal code
+    # (2^-9 * 2^min) above 2^-24. The projection's scales then stay as in the
+    # checkpoint (and inside the v41q8 decode window).
+    low, high = int(meta["scale_min"]) - 127, int(meta["scale_max"]) - 127
+    if high + 9 <= 15 and low - 9 >= -24:
+        return 0
+    return int(meta["row_bias"])
 
 
 def engram_table_specs(path):
+    if os.path.isdir(path):
+        result: list[EngramTableSpec | None] = []
+        for layer in (1, 14):
+            description = os.path.join(path, f"engram-{layer:02d}.json")
+            if not os.path.exists(os.path.join(path, f"engram-{layer:02d}.rows")):
+                result.append(None)  # a stage without this layer need not keep it
+                continue
+            with open(description) as file:
+                meta = json.load(file)
+            if meta["row_bytes"] != NATIVE_ROW_BYTES or meta["nan_codes"]:
+                raise ValueError(f"V4.1 Engram rows of layer {layer} are invalid")
+            result.append(
+                EngramTableSpec(
+                    os.path.abspath(os.path.join(path, f"engram-{layer:02d}.rows")),
+                    0,
+                    int(meta["rows"]),
+                    NATIVE_ROW_BYTES,
+                    native_row_bias(meta),
+                )
+            )
+        return tuple(result)
     reader = gguf.GGUFReader(path, mode="r")
     expected = ("blk.1.engram_embd.weight", "blk.14.engram_embd.weight")
     tensors = {t.name: t for t in reader.tensors}
@@ -44,8 +94,17 @@ def engram_table_specs(path):
     return tuple(result)
 
 
+def _row_bytes(specs):
+    sizes = {s.row_bytes for s in specs}
+    if len(sizes) != 1 or sizes - {144, NATIVE_ROW_BYTES}:
+        raise ValueError("V4.1 Engram tables must share one supported row size")
+    return sizes.pop()
+
+
 def _fingerprint(specs, maximum):
-    value = dict(tables=[asdict(s) for s in specs], maximum=maximum, row_bytes=144)
+    value = dict(
+        tables=[asdict(s) for s in specs], maximum=maximum, row_bytes=_row_bytes(specs)
+    )
     return int.from_bytes(
         hashlib.sha256(json.dumps(value, sort_keys=True).encode()).digest()[:8], "big"
     ) & ((1 << 63) - 1)
@@ -56,11 +115,14 @@ class SharedEngramOwner:
         if len(specs) != 2 or not 1 <= max_tokens <= 16384:
             raise ValueError("V4.1 Engram requires two bounded table channels")
         maximum = max_tokens * 24
+        row_bytes = _row_bytes(specs)
         native = _native()
         words, channel_words, _ = native.shared_engram_control_layout(maximum)
         self.data = self.control = self.reader = None
         try:
-            self.data = SharedHostArena.create(2 * maximum * 144, "vllm-engram-rows")
+            self.data = SharedHostArena.create(
+                2 * maximum * row_bytes, "vllm-engram-rows"
+            )
             self.control = SharedHostArena.create(words * 8, "vllm-engram-control")
             files = []
             try:
@@ -71,7 +133,7 @@ class SharedEngramOwner:
                     self.data.size,
                     self.control.address,
                     maximum,
-                    144,
+                    row_bytes,
                     [
                         native.SharedEngramTable(fd, s.offset, s.rows)
                         for fd, s in zip(files, specs)
@@ -196,19 +258,50 @@ def _consume(
     tl.store(counters + CHANNEL, sequence + 1)
 
 
+@triton.jit
+def _decode_native_rows(raw, out, BIAS: tl.constexpr):
+    """One 264-byte row: 256 E4M3 codes then 8 E8M0 scales (one per 32)."""
+    row = tl.program_id(0)
+    lanes = tl.arange(0, 256)
+    codes = tl.load(raw + row * 264 + lanes).to(tl.uint32)
+    exponent = tl.load(raw + row * 264 + 256 + lanes // 32).to(tl.int32) + BIAS
+    # E4M3 bits -> FP32 exactly (subnormals included); NaN codes are refused
+    # when the tables are repacked.
+    sign = (codes & 0x80) << 24
+    magnitude = codes & 0x7F
+    normal = (((magnitude + (120 << 3)) << 20) | sign).to(tl.float32, bitcast=True)
+    subnormal = tl.where(sign != 0, -1.0, 1.0) * magnitude.to(tl.float32) * (2.0**-9)
+    value = tl.where(magnitude >= 8, normal, subnormal)
+    scale = (exponent.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    tl.store(out + row * 256 + lanes, (value * scale).to(tl.float16))
+
+
+def decode_native_rows(raw, bias):
+    """[n, 264] native rows -> [n, 256] FP16 values times 2^bias."""
+    out = torch.empty(raw.shape[0], 256, device=raw.device, dtype=torch.float16)
+    _decode_native_rows[(raw.shape[0],)](raw, out, BIAS=int(bias), num_warps=4)
+    return out
+
+
 class SharedEngramRank:
     """Per-process CUDA registration; each GPU dequantizes the shared raw rows."""
 
-    def __init__(self, data, control, rank, specs, max_tokens=2048):
+    def __init__(self, data, control, rank, specs, max_tokens=2048, channels=(0, 1)):
         if rank not in range(4) or torch.accelerator.current_device_index() != rank:
             raise ValueError("Select the TP rank's CUDA device before mapping Engram")
         self.data, self.control, self.rank = data, control, rank
         self.maximum = max_tokens * 24
+        self.row_bytes = _row_bytes(specs)
+        self.row_bias = tuple(s.row_bias for s in specs)
+        # A pipeline stage publishes and consumes only its own Engram layers.
+        self.channels = tuple(channels)
+        if not self.channels or set(self.channels) - {0, 1}:
+            raise ValueError("V4.1 Engram channels must be a subset of (0, 1)")
         self.native = _native()
         words, self.channel_words, self.rank_words = (
             self.native.shared_engram_control_layout(self.maximum)
         )
-        if data.size < 2 * self.maximum * 144 or control.size < words * 8:
+        if data.size < 2 * self.maximum * self.row_bytes or control.size < words * 8:
             raise ValueError("Engram mapping is smaller than its declared capacity")
         self._registered = []
         self.host = self.control_host = self.mapped = self.control_view = None
@@ -261,7 +354,7 @@ class SharedEngramRank:
         from .quantization.gguf import dequantize_gguf_rows
 
         dummy = torch.zeros(1, 2, 24, device=self.rank, dtype=torch.int64)
-        for channel in range(2):
+        for channel in self.channels:
             meta = self._meta(channel)
             _can_publish.warmup(self.control_view, self.counters, **meta, grid=(1,))
             _copy_request.warmup(
@@ -280,13 +373,19 @@ class SharedEngramRank:
                 grid=(1,),
             )
             _consume.warmup(self.control_view, self.counters, **meta, grid=(1,))
-        dequantize_gguf_rows(
-            torch.zeros(1, 144, device=self.rank, dtype=torch.uint8),
-            20,
-            256,
-            torch.float16,
-            True,
-        )
+        if self.row_bytes == NATIVE_ROW_BYTES:
+            decode_native_rows(
+                torch.zeros(1, NATIVE_ROW_BYTES, device=self.rank, dtype=torch.uint8),
+                0,
+            )
+        else:
+            dequantize_gguf_rows(
+                torch.zeros(1, 144, device=self.rank, dtype=torch.uint8),
+                20,
+                256,
+                torch.float16,
+                True,
+            )
         torch.accelerator.synchronize(self.rank)
         self.ready = True
 
@@ -302,7 +401,7 @@ class SharedEngramRank:
         ):
             raise ValueError("Engram prefetch requires warmed, contiguous GPU hashes")
         count = hashes.shape[0] * 24
-        for channel in range(2):
+        for channel in self.channels:
             meta = self._meta(channel)
             _can_publish[(1,)](self.control_view, self.counters, **meta)
             _copy_request[(triton.cdiv(count, 256),)](
@@ -316,7 +415,7 @@ class SharedEngramRank:
         if (
             not self.ready
             or self.mapped is None
-            or channel not in (0, 1)
+            or channel not in self.channels
             or not 0 < tokens * 24 <= self.maximum
         ):
             raise ValueError("Invalid Engram table or row count")
@@ -329,9 +428,13 @@ class SharedEngramRank:
             CHANNEL=channel,
             CHANNEL_WORDS=self.channel_words,
         )
-        first = channel * self.maximum * 144
-        raw = self.mapped[first : first + count * 144].view(count, 144)
-        result = dequantize_gguf_rows(raw, 20, 256, torch.float16, True)
+        size = self.row_bytes
+        first = channel * self.maximum * size
+        raw = self.mapped[first : first + count * size].view(count, size)
+        if size == NATIVE_ROW_BYTES:
+            result = decode_native_rows(raw, self.row_bias[channel])
+        else:
+            result = dequantize_gguf_rows(raw, 20, 256, torch.float16, True)
         _consume[(1,)](self.control_view, self.counters, **self._meta(channel))
         return result.view(tokens, 6144)
 
@@ -349,7 +452,7 @@ class SharedEngramRank:
 
 
 class SharedEngramIO:
-    def __init__(self, path, max_tokens=2048, group=None):
+    def __init__(self, path, max_tokens=2048, group=None, channels=(0, 1)):
         from .quantization.gguf_shared_storage import _join_shared_group
 
         if group is None:
@@ -361,13 +464,26 @@ class SharedEngramIO:
         specs = group.broadcast_object(
             engram_table_specs(path) if group.rank_in_group == 0 else None, src=0
         )
+        if any(specs[c] is None for c in channels):
+            raise ValueError(f"V4.1 Engram tables for channels {channels} are missing")
+        if set(channels) != {0, 1}:
+            # The reader keeps two channels; one this stage never publishes
+            # reuses the active table's spec, so its file need not exist here.
+            active = specs[channels[0]]
+            specs = tuple(specs[c] if c in channels else active for c in range(2))
         self.owner, self.data, self.control = _join_shared_group(
             None, group, owner_factory=lambda: SharedEngramOwner(specs, max_tokens)
         )
         self.runtime = None
         try:
+            self.specs = specs
             self.runtime = SharedEngramRank(
-                self.data, self.control, group.rank_in_group, specs, max_tokens
+                self.data,
+                self.control,
+                group.rank_in_group,
+                specs,
+                max_tokens,
+                channels,
             )
             self.runtime.warmup()
             torch.distributed.barrier(group=group.cpu_group)

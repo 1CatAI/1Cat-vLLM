@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.utils import RING_PREP, RING_PREP_SLOTS, CpuGpuBuffer
 
 
 class InputTransferSession:
@@ -37,6 +37,9 @@ class InputTransferSession:
         self.active = False
         self.trace_step = 0
         self.logged = False
+        # VLLM_V41_RING_PREP: the event of each of the last RING_PREP_SLOTS
+        # staged steps (their copies read that ring slot).
+        self.ring_events: list[torch.cuda.Event | None] = [None] * RING_PREP_SLOTS
 
     def can_stage(
         self,
@@ -96,6 +99,13 @@ class InputTransferSession:
             else "event"
         )
         try:
+            ring = skip_sync and RING_PREP["on"]
+            if ring:
+                RING_PREP["step"] += 1
+                slot = RING_PREP["step"] % RING_PREP_SLOTS
+                previous_use = self.ring_events[slot]
+                if previous_use is not None:
+                    previous_use.synchronize()
             if self.event is not None:
                 if skip_sync:
                     if not self.logged:
@@ -104,9 +114,15 @@ class InputTransferSession:
                         self.logged = True
                 else:
                     sync_start = time.perf_counter() if trace_log else 0.0
+                    from vllm.v1 import v41_trace
+
+                    if v41_trace.ENABLED:
+                        v41_trace.mark("psync", done=int(self.event.query()))
                     self.synchronize(
                         self.event, "GPUModelRunner.prepare_inputs_event.synchronize"
                     )
+                    if v41_trace.ENABLED:
+                        v41_trace.mark("psync_end")
                     if trace_log:
                         sync_ms = (time.perf_counter() - sync_start) * 1000.0
             body_start = time.perf_counter() if trace_log else 0.0
@@ -116,6 +132,10 @@ class InputTransferSession:
             finally:
                 if self.event is not None:
                     self.event.record()
+                if ring:
+                    ring_event = torch.cuda.Event()
+                    ring_event.record()
+                    self.ring_events[slot] = ring_event
         finally:
             self.active = previous
             if started and trace_log and self.logger is not None:

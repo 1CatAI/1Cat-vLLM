@@ -1,0 +1,38 @@
+# Concurrency bring-up (VLLM_V41_BATCH=1 VLLM_V41_WINDOW_RING=0): CUDA graphs, 8 requests.
+# Stage k = node k: layers 0-7 / 8-19 / 20-31 / 32-39 + head + drafter.
+model: /home/ymzx/models/ds41-1017
+tokenizer: /home/ymzx/models/ds41-1017
+tokenizer-mode: deepseek_v41
+served-model-name: deepseek-v4.1-flash
+host: 0.0.0.0
+port: 18000
+dtype: half
+tensor-parallel-size: 4
+pipeline-parallel-size: 4
+distributed-executor-backend: mp
+max-model-len: 16384
+max-num-seqs: 8
+max-num-batched-tokens: 1024
+kv-cache-memory-bytes: 1073741824
+gpu-memory-utilization: 0.96
+compilation-config:
+  mode: 0
+  cudagraph_mode: FULL_DECODE_ONLY
+  cudagraph_capture_sizes: [6, 12, 18, 24, 30, 36, 42, 48]
+  max_cudagraph_capture_size: 48
+no-async-scheduling: true
+no-enable-prefix-caching: true
+enable-chunked-prefill: true
+no-disable-custom-all-reduce: true
+reasoning-parser: deepseek_v4
+default-chat-template-kwargs: '{"thinking": true}'
+model-loader-extra-config:
+  engram_path: /home/ymzx/models/ds41-1017/engram
+speculative-config:
+  method: dspark
+  model: /home/ymzx/models/ds41-1017-dspark
+  quantization: fp8
+  num_speculative_tokens: 5
+  draft_load_config:
+    load_format: safetensors
+  enforce_eager: false

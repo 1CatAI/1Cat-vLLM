@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from copy import deepcopy
@@ -61,6 +62,7 @@ from vllm.utils.torch_utils import (
     set_high_precision_cuda_matmul_defaults,
     set_random_seed,
 )
+from vllm.v1 import v41_trace
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -87,6 +89,113 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+_PP_RANK0 = envs.VLLM_V41_PP_RANK0 == "1"
+# Prefill PP receives posted on a side stream into fresh tensors (overlap the
+# previous forward). Requires VLLM_V41_PP_RANK0. Default off.
+_PP_RECV_EARLY = _PP_RANK0 and envs.VLLM_V41_PP_RECV_EARLY == "1"
+# VLLM_V41_PP_RECV_SIDE=1 (default off, needs VLLM_V41_PP_RANK0): decode
+# steps (<= 256 tokens) also receive on the side stream (as RECV_EARLY does
+# for prefill), so the transfer is not queued behind this stage's previous
+# step on the GPU and the upstream stage's send completes as soon as the
+# receive is posted.
+_PP_RECV_SIDE = _PP_RANK0 and envs.VLLM_V41_PP_RECV_SIDE == "1"
+# Overlap a stage's PP send with its next forward (wait two steps later, the
+# send reads a copy). Requires VLLM_V41_PP_RANK0. Default off.
+_PP_SEND_DEFER = _PP_RANK0 and envs.VLLM_V41_PP_SEND_DEFER == "1"
+# VLLM_V41_INLINE_DRAFTS=1 (default off): the last PP stage returns its drafts
+# with the sampled output (engine/core.py uses them instead of an RPC). Exact
+# for one request under synchronous scheduling; #1371 is the general form.
+_INLINE_DRAFTS = envs.VLLM_V41_INLINE_DRAFTS == "1"
+# VLLM_V41_DELAY_FILE=path (diagnostic, default off): lines "host STAGE US"
+# (busy wait), "sleep STAGE US" or "gpu STAGE CYCLES" in that file add a
+# host busy-wait / a GPU spin before each forward of that PP stage, to find
+# which resource paces the pipeline (the GPU spin runs right before the
+# forward, after its inputs arrived).
+# Re-read when the file changes, so delays switch without a restart.
+_DELAY_FILE = envs.VLLM_V41_DELAY_FILE
+_DELAY = {"mtime": None, "host": 0, "sleep": 0, "gpu": 0}
+
+
+def _injected_delay(stage: int) -> None:
+    assert _DELAY_FILE is not None
+    try:
+        mtime = os.stat(_DELAY_FILE).st_mtime_ns
+    except OSError:
+        mtime = 0
+    if mtime != _DELAY["mtime"]:
+        _DELAY.update(mtime=mtime, host=0, sleep=0, gpu=0)
+        if mtime:
+            with open(_DELAY_FILE) as f:
+                for line in f:
+                    kind, st, val = (line.split() + ["", "", ""])[:3]
+                    if kind in _DELAY and st.isdigit() and int(st) == stage:
+                        _DELAY[kind] = int(val)
+    if _DELAY["host"]:
+        end = time.perf_counter() + _DELAY["host"] * 1e-6
+        while time.perf_counter() < end:
+            pass
+    if _DELAY["sleep"]:
+        # Same wait, but the GIL is free for this process's other threads.
+        time.sleep(_DELAY["sleep"] * 1e-6)
+
+
+# VLLM_V41_MEMSNAP_DIR=dir (diagnostic, default off): TP rank 0 of every PP
+# stage records the CUDA allocation history after startup, logs each step
+# that raises the allocated peak by 256 MiB, and dumps a snapshot to
+# dir/stage<k>.pickle on an out-of-memory error or when dir/dump appears.
+_MEMSNAP_DIR = envs.VLLM_V41_MEMSNAP_DIR
+_MEMSNAP = {"on": False, "peak": 0, "dumped": False}
+
+
+def _memsnap_dump(stage: int) -> None:
+    assert _MEMSNAP_DIR is not None
+    if _MEMSNAP["on"] and not _MEMSNAP["dumped"]:
+        _MEMSNAP["dumped"] = True
+        path = os.path.join(_MEMSNAP_DIR, f"stage{stage}.pickle")
+        torch.cuda.memory._dump_snapshot(path)
+        logger.warning("V41 memsnap: dumped %s", path)
+
+
+def _memsnap_step(stage: int, tokens: int, reqs: int) -> None:
+    assert _MEMSNAP_DIR is not None
+    if not _MEMSNAP["on"]:
+        if get_tp_group().rank_in_group != 0:
+            return
+        if envs.VLLM_V41_MEMSNAP_HISTORY == "1":
+            # Stack capture per allocation slows the host; 0 = peaks only.
+            torch.cuda.memory._record_memory_history(max_entries=200000)
+        torch.accelerator.reset_peak_memory_stats()
+        _MEMSNAP["on"] = True
+    peak = torch.accelerator.max_memory_allocated()
+    if peak > _MEMSNAP["peak"] + (256 << 20):
+        _MEMSNAP["peak"] = peak
+        logger.warning(
+            "V41 memsnap: stage %d peak %.2f GiB (reserved %.2f) at %d tokens, "
+            "%d requests",
+            stage,
+            peak / 2**30,
+            torch.accelerator.memory_reserved() / 2**30,
+            tokens,
+            reqs,
+        )
+    if os.path.exists(os.path.join(_MEMSNAP_DIR, "dump")):
+        _memsnap_dump(stage)
+
+
+# VLLM_V41_STEP_TIMING=1 (default off): per-step GPU time from "inputs
+# ready" (stage start, or PP receive done) to the end of execute_model, and
+# the host time of execute_model, logged as medians every 50 steps.
+_STEP_TIMING = envs.VLLM_V41_STEP_TIMING == "1"
+_TIMING: dict = {"ready": None, "rows": []}
+
+
+def _timing_mark_ready() -> None:
+    if _STEP_TIMING:
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        _TIMING["ready"] = event
+
+
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -111,6 +220,9 @@ class AsyncIntermediateTensors(IntermediateTensors):
             for fn in self._comm_postprocess:
                 fn()
         self._comm_waited = True
+        _timing_mark_ready()
+        if v41_trace.ENABLED:
+            v41_trace.mark("pp_ready", sync=True)
 
     def __getattribute__(self, name: str):
         # ensure `.tensors` is ready before use
@@ -200,6 +312,14 @@ class Worker(WorkerBase):
         self._pp_send_tensors: dict[str, torch.Tensor] | None = None
         # whether that send may still run while the next step computes
         self._pp_send_overlaps_next_step = False
+        self._pp_send_old: list[Handle] = []
+        self._pp_recv_stream = None
+        # VLLM_V41_PP_RECV_SIDE: persistent receive slots (the caching
+        # allocator could hand the side stream memory that queued main-stream
+        # kernels still read) and one main-stream event per receiving step.
+        self._pp_side_slots: list[dict[str, torch.Tensor]] = []
+        self._pp_side_step = 0
+        self._pp_side_events: list[torch.cuda.Event | None] = [None] * 4
 
     def _has_ple_layers(self) -> bool:
         if not ple_offload_enabled(getattr(self, "vllm_config", None)):
@@ -1267,7 +1387,47 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        if _INLINE_DRAFTS and get_pp_group().is_last_rank:
+            v41_trace.mark("s_enter")
+            output = self.model_runner.sample_tokens(grammar_output)
+            if isinstance(output, ModelRunnerOutput):
+                # The drafts of this step ride with its output, so the engine
+                # needs no take_draft_token_ids round trip through every worker.
+                setattr(  # noqa: B010 (a V4.1-only attribute of this output)
+                    output, "v41_drafts", self.model_runner.take_draft_token_ids()
+                )
+            v41_trace.mark("s_exit", sync=True)
+            v41_trace.gmark("tail_end")
+            return output
+        if v41_trace.ENABLED:
+            v41_trace.mark("s_enter")
+            output = self.model_runner.sample_tokens(grammar_output)
+            v41_trace.mark("s_exit", sync=True)
+            v41_trace.gmark("tail_end")
+            return output
+        if not _STEP_TIMING:
+            return self.model_runner.sample_tokens(grammar_output)
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        host = time.perf_counter()
+        output = self.model_runner.sample_tokens(grammar_output)
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        end.synchronize()
+        rows = _TIMING.setdefault("sample", [])
+        rows.append((start.elapsed_time(end), (time.perf_counter() - host) * 1e3))
+        if len(rows) >= 50 and get_tp_group().rank_in_group == 0:
+            gpu = sorted(r[0] for r in rows)[len(rows) // 2]
+            cpu = sorted(r[1] for r in rows)[len(rows) // 2]
+            logger.info(
+                "V41 step timing sample_tokens: GPU %.2f ms, host %.2f ms "
+                "(median of %d)",
+                gpu,
+                cpu,
+                len(rows),
+            )
+            rows.clear()
+        return output
 
     def _use_sm70_static_pp_hidden_transfer(self, num_tokens: int) -> bool:
         """Whether this step has the exact metadata-free PP tensor contract."""
@@ -1327,6 +1487,116 @@ class Worker(WorkerBase):
         self._sm70_static_pp_hidden_contract = enabled
         return enabled
 
+    def _record_step_timing(self, host_start: float) -> None:
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        end.synchronize()
+        gpu = _TIMING["ready"].elapsed_time(end)
+        _TIMING["ready"] = None
+        rows = _TIMING["rows"]
+        rows.append((gpu, (time.perf_counter() - host_start) * 1e3))
+        if len(rows) >= 50 and get_tp_group().rank_in_group == 0:
+            gpu_ms = sorted(r[0] for r in rows)[len(rows) // 2]
+            host_ms = sorted(r[1] for r in rows)[len(rows) // 2]
+            logger.info(
+                "V41 step timing PP%d: GPU ready->end %.2f ms, host "
+                "execute_model %.2f ms (median of %d decode steps)",
+                get_pp_group().rank_in_group,
+                gpu_ms,
+                host_ms,
+                len(rows),
+            )
+            rows.clear()
+
+    def _rank0_pp_recv(self, num_tokens: int):
+        """VLLM_V41_PP_RANK0=1 (default off): metadata-free PP receive.
+
+        The previous stage's TP rank 0 sends the replicated tensors straight
+        into this stage's persistent graph-input buffers (both sides know the
+        schema: the model's intermediate tensors, cut to the scheduled
+        tokens). The other TP ranks zero theirs, and one TP all-reduce per
+        tensor (a sum with zeros, exact) gives every rank the same bytes at
+        the same time. One copy crosses the network; no CPU metadata blocks
+        the host before the forward.
+        """
+        if not _PP_RANK0:
+            return None
+        buffers = self.model_runner.intermediate_tensors
+        if buffers is None:
+            # The sender has no fallback: both sides must use this protocol.
+            raise RuntimeError("VLLM_V41_PP_RANK0 needs persistent PP input buffers")
+        tp = get_tp_group()
+        views = {key: value[:num_tokens] for key, value in buffers.tensors.items()}
+        if _PP_RECV_SIDE and num_tokens <= 256:
+            # Slot j is reused 4 receiving steps later. The side stream first
+            # waits for the main stream to pass the start of the step two
+            # receives back, which is after the last reader of slot j (the
+            # TP exchange of the step four receives back) was enqueued.
+            slots = 4
+            if not self._pp_side_slots:
+                self._pp_side_slots = [
+                    {
+                        key: torch.empty_like(value[:256])
+                        for key, value in buffers.tensors.items()
+                    }
+                    for _ in range(slots)
+                ]
+            step = self._pp_side_step
+            self._pp_side_step += 1
+            event = torch.cuda.Event()
+            event.record()
+            self._pp_side_events[step % slots] = event
+            slot = self._pp_side_slots[step % slots]
+            views = {key: slot[key][:num_tokens] for key in views}
+            if tp.rank_in_group == 0:
+                side = self._pp_recv_stream
+                if side is None:
+                    side = self._pp_recv_stream = torch.cuda.Stream()
+                guard = self._pp_side_events[(step - 2) % slots]
+                if step >= 2 and guard is not None:
+                    side.wait_event(guard)
+                with torch.cuda.stream(side):
+                    handles = get_pp_group().irecv_tensor_dict_static(views)
+            else:
+                handles = []
+                for value in views.values():
+                    value.zero_()
+        elif _PP_RECV_EARLY and num_tokens > 8:
+            # Prefill: receive into fresh tensors from an idle side stream, so
+            # the transfer overlaps the previous step's forward (the graph
+            # input buffers are still being read by it).
+            views = {key: torch.empty_like(value) for key, value in views.items()}
+            if tp.rank_in_group == 0:
+                side = self._pp_recv_stream
+                if side is None:
+                    side = self._pp_recv_stream = torch.cuda.Stream()
+                with torch.cuda.stream(side):
+                    handles = get_pp_group().irecv_tensor_dict_static(views)
+            else:
+                handles = []
+                for value in views.values():
+                    value.zero_()
+        elif tp.rank_in_group == 0:
+            handles = get_pp_group().irecv_tensor_dict_static(views)
+        else:
+            handles = []
+            for value in views.values():
+                value.zero_()
+        tensor_dict = dict(views)
+
+        def _broadcast() -> None:
+            for key, value in views.items():
+                if tp.world_size == 1:
+                    continue
+                if value.is_floating_point() and (
+                    value.numel() * value.element_size() <= (4 << 20)
+                ):
+                    tensor_dict[key] = tp.all_reduce(value)
+                else:
+                    tp.broadcast(value, src=0)
+
+        return tensor_dict, handles, [_broadcast]
+
     @staticmethod
     def _is_static_pp_hidden_tensor_dict(
         tensor_dict: dict[str, torch.Tensor], num_tokens: int
@@ -1369,11 +1639,20 @@ class Worker(WorkerBase):
         # providers can return reusable workspace even outside CUDA graphs.
         # That copy stays live until communication completes, allowing the next
         # forward to overlap the send without overwriting its input.
-        if not self._pp_send_overlaps_next_step:
+        if _PP_SEND_DEFER:
+            # Sends read private copies: wait for the one two steps back, so
+            # the previous step's send overlaps this step's forward.
+            for handle in self._pp_send_old:
+                handle.wait()
+            self._pp_send_old = self._pp_send_work
+            self._pp_send_work = []
+        elif not self._pp_send_overlaps_next_step:
             self._wait_pp_sends()
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        if forward_pass and _DELAY_FILE:
+            _injected_delay(get_pp_group().rank_in_group)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
@@ -1414,10 +1693,14 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
+            comm_postprocess: list[Callable[[], None]]
             tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
-            if tensor_dict is not None:
+            rank0 = self._rank0_pp_recv(num_scheduled_tokens)
+            if rank0 is not None:
+                tensor_dict, comm_handles, comm_postprocess = rank0
+            elif tensor_dict is not None:
                 comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
-                comm_postprocess: list[Callable[[], None]] = []
+                comm_postprocess = []
                 logger.info_once(
                     "Default SM70 metadata-free PP hidden transfer enabled."
                 )
@@ -1435,10 +1718,32 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        if _STEP_TIMING:
+            host_start = time.perf_counter()
+            if get_pp_group().is_first_rank:
+                _timing_mark_ready()
+        if v41_trace.ENABLED:
+            v41_trace.mark("launch", n=num_scheduled_tokens)
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            if _MEMSNAP_DIR and forward_pass:
+                _memsnap_step(
+                    get_pp_group().rank_in_group,
+                    num_scheduled_tokens,
+                    len(scheduler_output.num_scheduled_tokens),
+                )
+            try:
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+            except torch.OutOfMemoryError:
+                if _MEMSNAP_DIR:
+                    _memsnap_dump(get_pp_group().rank_in_group)
+                raise
+            if _STEP_TIMING and num_scheduled_tokens <= 8 and _TIMING["ready"]:
+                self._record_step_timing(host_start)
+            if v41_trace.ENABLED:
+                v41_trace.mark("fwd_done", sync=True, n=num_scheduled_tokens)
+                v41_trace.gmark("fwd_end", n=num_scheduled_tokens)
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -1459,12 +1764,34 @@ class Worker(WorkerBase):
 
         self._wait_pp_sends()
         static_transfer = self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens)
-        self._pp_send_overlaps_next_step = self._pp_send_overlaps(
+        # VLLM_V41_PP_RANK0 sends manage their own copies (PP_SEND_DEFER).
+        self._pp_send_overlaps_next_step = not _PP_RANK0 and self._pp_send_overlaps(
             num_scheduled_tokens, static_transfer
         )
         # The exact SM70 B1 path sends the replicated tensor directly into
         # the next stage's persistent graph-input buffer without CPU metadata.
-        if static_transfer:
+        if _PP_RANK0:
+            # Replicated across TP: only TP rank 0 sends, without metadata.
+            self._pp_send_work = (
+                get_pp_group().isend_tensor_dict_static(
+                    {
+                        # A private copy under VLLM_V41_PP_SEND_DEFER: the
+                        # hidden state lives in this stage's receive buffer,
+                        # which the next step's receive overwrites.
+                        key: (
+                            value[:num_scheduled_tokens].clone()
+                            if _PP_SEND_DEFER
+                            else value[:num_scheduled_tokens]
+                        )
+                        for key, value in output.tensors.items()
+                    }
+                )
+                if get_tp_group().rank_in_group == 0
+                else []
+            )
+            if v41_trace.ENABLED:
+                v41_trace.mark("sent")
+        elif static_transfer:
             if not self._is_static_pp_hidden_tensor_dict(
                 output.tensors, num_scheduled_tokens
             ):

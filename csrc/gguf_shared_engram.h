@@ -58,9 +58,9 @@ class SharedEngramReader {
         timeout_(timeout_ns),
         tables_(std::move(tables)) {
     if (!data || !control || reinterpret_cast<uintptr_t>(control) % 64 ||
-        !maximum || maximum > 16384 * 24 || row_bytes != 144 ||
-        tables_.size() != kChannels || !timeout_ ||
-        bytes < kChannels * maximum * row_bytes)
+        !maximum || maximum > 16384 * 24 ||
+        (row_bytes != 144 && row_bytes != 264) || tables_.size() != kChannels ||
+        !timeout_ || bytes < kChannels * maximum * row_bytes)
       throw std::invalid_argument("invalid shared Engram geometry");
     try {
       for (const auto& table : tables_) {
@@ -75,7 +75,9 @@ class SharedEngramReader {
         fds_.push_back(fd);
       }
       std::fill_n(control_, control_words(maximum), 0);
-      // A short decode reads at most 144 rows per channel. Creating and
+      // Rows are 144-byte IQ4_NL (GGUF sidecar) or 264-byte E4M3+E8M0
+      // (native checkpoint tables). A short decode reads at most 144 rows per
+      // channel. Creating and
       // joining eight threads for each batch can outlast the cached reads.
       // Keep the same bounded I/O parallelism for both hot and cold rows.
       // Cold rows are random 144-byte NVMe reads: queue depth (threads)

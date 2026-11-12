@@ -29,6 +29,31 @@ else:
     Request = object
 
 
+class TokenTail:
+    """The last tokens of a request's history, indexed as the whole history.
+
+    ``CachedRequestData.all_token_ids`` under VLLM_V41_FAST_READD: a request
+    that skipped a step (every pp_size-th step under PP) gets only its recent
+    tokens instead of a copy of its whole context. Slices must start at or
+    after ``offset``."""
+
+    __slots__ = ("offset", "tail")
+
+    def __init__(self, offset: int, tail: list[int]):
+        self.offset, self.tail = offset, tail
+
+    def __len__(self) -> int:
+        return self.offset + len(self.tail)
+
+    def __getitem__(self, index):
+        if not isinstance(index, slice):
+            raise TypeError("TokenTail supports slices only")
+        start, stop, step = index.indices(len(self))
+        if start < self.offset:
+            raise IndexError(f"TokenTail starts at {self.offset}, not {start}")
+        return self.tail[start - self.offset : stop - self.offset : step]
+
+
 @dataclass
 class NewRequestData:
     req_id: str
@@ -122,7 +147,8 @@ class CachedRequestData:
     new_token_ids: list[list[int]]
     # For requests not scheduled in the last step, propagate the token ids to the
     # connector. Won't contain requests that were scheduled in the prior step.
-    all_token_ids: dict[str, list[int]]
+    # A TokenTail instead of a list under VLLM_V41_FAST_READD.
+    all_token_ids: dict[str, list[int] | TokenTail]
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
@@ -261,6 +287,10 @@ class SchedulerOutput:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]}.
     # Scheduler-local; cleared after connector metadata is built.
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]] | None = None
+
+    # VLLM_V41_PP_AHEAD: requests scheduled while a step of theirs is still in
+    # flight (the worker reads their previous round from per-request tables).
+    v41_ahead_req_ids: set[str] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

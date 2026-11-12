@@ -68,7 +68,18 @@ def test_unwrap_pipeline_intermediate_hidden_states_uses_semantic_key():
         )
         is hidden_states
     )
-    with pytest.raises(RuntimeError, match="must contain a 'hidden_states' tensor"):
+    # DeepSeek-V4.1 PP2 hand-off schema.
+    hidden = torch.zeros((2, 4, 3))
+    pre = torch.ones((2, 4))
+    assert (
+        gpu_model_runner_module._unwrap_pipeline_intermediate_hidden_states(
+            IntermediateTensors({"hidden": hidden, "pre": pre})
+        )
+        is hidden
+    )
+    with pytest.raises(
+        RuntimeError, match="must contain a 'hidden_states' or 'hidden' tensor"
+    ):
         gpu_model_runner_module._unwrap_pipeline_intermediate_hidden_states(
             IntermediateTensors({"residual": residual})
         )
@@ -2001,3 +2012,24 @@ def test_non_last_pp_rank_profiles_with_speculative_config(
         runner._dummy_run(num_tokens=16, is_profile=True, force_attention=True)
         # Non-last ranks build no drafter -- but the attribute must exist.
         assert runner.drafter is None
+
+
+def test_pp_prepend_accepted_drafts():
+    """Non-last PP rank after a spec-decode step: the scheduler sends only the
+    bonus token; the accepted drafts must come from the previous step's drafts
+    (or the scheduler's full history when the request was re-added)."""
+    from types import SimpleNamespace
+
+    fn = GPUModelRunner._pp_prepend_accepted_drafts
+    req_state = SimpleNamespace(num_tokens=11)  # prompt + outputs through pos 10
+    runner = SimpleNamespace(input_batch=SimpleNamespace(spec_token_ids=[[7, 8, 9]]))
+    # 2 of 3 drafts accepted: computed 11 -> 13, bonus at position 13.
+    assert fn(runner, "r", req_state, 0, 13, [42], {}) == [7, 8, 42]
+    # No drafts accepted (or no spec decode): unchanged.
+    assert fn(runner, "r", req_state, 0, 11, [42], {}) == [42]
+    # Request not in the persistent batch: use the scheduler's full history.
+    full = list(range(100, 114))
+    assert fn(runner, "r", req_state, None, 13, [42], {"r": full}) == [111, 112, 42]
+    # Nothing to recover from: the runner refuses to corrupt its history.
+    with pytest.raises(RuntimeError, match="accepted draft token"):
+        fn(runner, "r", req_state, None, 13, [42], {})

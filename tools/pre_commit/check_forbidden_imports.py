@@ -96,6 +96,12 @@ CHECK_IMPORTS = {
             # Standalone source-built kernel screen: run before installing a
             # vLLM runtime, including CPU-only layout tests and compilation.
             "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",
+            # DeepSeek-V4.1 SM70 AOT compile check (compiler/backend modules).
+            "benchmarks/deepseek_v41/small_fuse_sm70_check.py",
+            # TRITON_INTERPRET CPU tests: triton is imported before vLLM so the
+            # interpreter takes effect, then shimmed in as vllm.triton_utils.
+            "tests/models/test_deepseek_v41_markov_shard.py",
+            "tests/models/test_deepseek_v41_small_fuse.py",
         },
     ),
 }

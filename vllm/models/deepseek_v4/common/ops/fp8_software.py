@@ -76,3 +76,18 @@ def fp32_to_fp8_e4m3fn_bits(x):
     magnitude_bits = tl.where(value < (2.0**-6), subnormal_mantissa, normal_bits)
     magnitude_bits = tl.where(value == 0.0, 0, magnitude_bits)
     return (sign_bit | magnitude_bits).to(tl.uint8)
+
+
+@triton.jit
+def fp32_to_fp8_e4m3fn_bits_bitcast(x):
+    """Finite E4M3FN RNE conversion using IEEE mantissa bits on SM70."""
+    sign = (x.to(tl.uint32, bitcast=True) >> 24) & 0x80
+    value = tl.minimum(tl.abs(x), 448.0)
+    bits = value.to(tl.uint32, bitcast=True)
+    # Round 23 fraction bits to three, including ties-to-even and exponent carry.
+    rounded = (bits + 0x7FFFF + ((bits >> 20) & 1)) >> 20
+    normal = tl.minimum(tl.maximum(rounded.to(tl.int32) - 960, 8), 126)
+    subnormal = _round_nearest_even_i32(value * 512.0)
+    subnormal = tl.minimum(tl.maximum(subnormal, 0), 8)
+    magnitude = tl.where(value < (2.0**-6), subnormal, normal)
+    return (sign | magnitude.to(tl.uint32)).to(tl.uint8)

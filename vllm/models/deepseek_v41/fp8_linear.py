@@ -145,6 +145,117 @@ def _gemv_ready():
     return envs.VLLM_V41_FP8_GEMV == "1" and _expert_major_ready()
 
 
+# ---- v41q8: QPN8 HMMA small-M GEMM on 32x32 UE8M0 blocks (VLLM_V41_Q8) ----
+_Q8: dict = {}
+
+
+def q8_ready():
+    """The v41q8 JIT extension (benchmarks/deepseek_v41/v41k/build.py)."""
+    if "ok" not in _Q8:
+        _Q8["ok"] = False
+        if envs.VLLM_V41_Q8 == "1":
+            from vllm.model_executor.layers.quantization.gguf_v41_moe import (
+                default_v41k_library,
+            )
+
+            path = default_v41k_library().replace("v41k.so", "v41q8.so")
+            if __import__("os").path.exists(path):
+                torch.ops.load_library(path)
+                _Q8["ok"] = True
+    return _Q8["ok"]
+
+
+def q8_split(n, k):
+    """Measured on V100 at M=6 (V4.1 layer-3 projections, 877 MHz memory)."""
+    groups = k // 16
+    order = (16, 8, 32, 4) if n >= 4096 and k <= 2048 else (32, 16, 8, 4)
+    if n >= 4096 and k <= 1280:
+        order = (8, 16, 4, 32)
+    for split in order:
+        if groups % split == 0:
+            return split
+    return None
+
+
+def q8_scales(scales):
+    """[N/32, K/32] UE8M0 -> [K/32, N/32] FP16 holding 256 * 2^(e - 127)."""
+    exponent = scales.view(torch.uint8).to(torch.int32) - 127 + 8
+    if bool((exponent < -14).any()) or bool((exponent > 15).any()):
+        return None
+    return torch.pow(2.0, exponent.float()).half().t().contiguous()
+
+
+def q8_prepare(weight, scales):
+    """(packed codes, FP16 scales, split) or None when the shape or range fails."""
+    n, k = weight.shape
+    split = q8_split(n, k)
+    half_scales = q8_scales(scales[: (n + 31) // 32])
+    if n % 32 or k % 32 or split is None or half_scales is None:
+        return None
+    packed = torch.empty(n * k, dtype=torch.uint8, device=weight.device)
+    torch.ops.v41q8.prepack(packed, weight.view(torch.uint8))
+    return packed, half_scales, split
+
+
+_ABLATE_DENSE = "dense" in envs.VLLM_V41_ABLATE
+# Grouped wo_a in one QPN8 launch instead of per-group copies + GEMMs + cat.
+_Q8_GROUPED = envs.VLLM_V41_Q8_GROUPED == "1"
+
+
+def q8_linear(x, prepared, n, bias=None):
+    packed, half_scales, split = prepared
+    if _ABLATE_DENSE:  # timing experiments only (VLLM_V41_ABLATE)
+        return torch.zeros(x.shape[0], n, dtype=torch.float16, device=x.device)
+    out = torch.empty(x.shape[0], n, dtype=torch.float16, device=x.device)
+    torch.ops.v41q8.gemm(out, x, packed, half_scales, split, 2)
+    return out if bias is None else out + bias
+
+
+# Batched decode (VLLM_V41_BATCH): M in 9..64 on the multi-row QPN8 kernel
+# (v41q8.gemm_rows), which decodes each weight fragment once for all rows.
+_ROWS_MAX = int(envs.VLLM_V41_Q8_ROWS_MAX)
+_BATCH_ROWS = envs.VLLM_V41_BATCH == "1"
+_ROWS_TICKETS: dict = {}
+
+
+def q8_rows_config(m, n, k):
+    """(warps, parts, row_tiles) measured on V4.1 shapes (rows_bench.py)."""
+    row_tiles = 2 if m <= 16 else 4 if m <= 32 else 8
+    warps = {2: 16 if n <= 2048 else 8, 4: 8, 8: 4}[row_tiles]
+    if n >= 4096 and row_tiles == 2:
+        warps = 8
+    groups = k // 16
+    while groups % warps:
+        warps //= 2
+    target = max(1, 256 // max(1, n // 32))
+    parts = 1
+    for candidate in range(1, target + 1):
+        if groups % (warps * candidate) == 0:
+            parts = candidate
+    return warps, parts, row_tiles
+
+
+def q8_rows(x, packed, half_scales, n, tickets=None):
+    """x [M, K] (or grouped [M, G, K]) @ W^T for 8 < M <= 64."""
+    m, k = x.shape[0], x.shape[-1]
+    if tickets is None:
+        tickets = _ROWS_TICKETS.get(packed.data_ptr())
+        if tickets is None:
+            tickets = _ROWS_TICKETS[packed.data_ptr()] = torch.zeros(
+                n // 32, dtype=torch.int32, device=x.device
+            )
+    warps, parts, row_tiles = q8_rows_config(m, n, k)
+    out = torch.empty(m, n, dtype=torch.float16, device=x.device)
+    torch.ops.v41q8.gemm_rows(
+        out, x.contiguous(), packed, half_scales, tickets, warps, parts, row_tiles
+    )
+    return out
+
+
+def _rows_eligible(x):
+    return 8 < x.shape[0] <= _ROWS_MAX and x.dtype == torch.float16 and x.is_cuda
+
+
 def fp8_block32_linear(x, weight, scales, bias=None, *, split_k=None):
     if (
         not x.is_cuda
@@ -215,6 +326,8 @@ def fp8_block32_linear(x, weight, scales, bias=None, *, split_k=None):
             enable_fp_fusion=False,
         )
         return result
+    if _DEQUANT_MM_ROWS and x.shape[0] >= _DEQUANT_MM_ROWS:
+        return _fp8_dequant_mm(x, weight, scales, bias)
     if x.shape[0]:
         _linear[(triton.cdiv(x.shape[0], 16), triton.cdiv(weight.shape[0], 64))](
             x,
@@ -233,6 +346,36 @@ def fp8_block32_linear(x, weight, scales, bias=None, *, split_k=None):
             enable_fp_fusion=False,
         )
     return result
+
+
+@triton.jit
+def _dequant_fp16(weight, scales, out, N: tl.constexpr, K: tl.constexpr):
+    """One 32x32 block: E4M3 codes * 2^(e - 127) -> FP16 (as _linear's b)."""
+    nb, kb = tl.program_id(0), tl.program_id(1)
+    rows = nb * 32 + tl.arange(0, 32)
+    cols = kb * 32 + tl.arange(0, 32)
+    codes = tl.load(weight + rows[:, None] * K + cols[None, :], rows[:, None] < N, 0)
+    exponent = tl.load(scales + nb * (K // 32) + kb).to(tl.uint32)
+    scale = tl.where(exponent == 0, 1 << 22, exponent << 23)
+    scale = scale.to(tl.float32, bitcast=True)
+    value = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scale).to(tl.float16)
+    tl.store(out + rows[:, None] * K + cols[None, :], value, rows[:, None] < N)
+
+
+# Prefill (M >= _DEQUANT_MM_ROWS): dequantize the weight once to FP16 and use
+# cuBLAS tensor-core GEMM instead of the 16-row Triton tiles, which re-decode
+# every weight tile once per 16 activation rows.
+_DEQUANT_MM_ROWS = int(envs.VLLM_V41_DEQUANT_MM_ROWS)
+
+
+def _fp8_dequant_mm(x, weight, scales, bias):
+    n, k = weight.shape
+    w16 = torch.empty(n, k, dtype=torch.float16, device=x.device)
+    _dequant_fp16[(triton.cdiv(n, 32), k // 32)](
+        weight.view(torch.uint8), scales.view(torch.uint8), w16, N=n, K=k, num_warps=4
+    )
+    out = torch.mm(x, w16.t())
+    return out if bias is None else out + bias
 
 
 @register_weight_loader_v2_supported_method
@@ -283,8 +426,43 @@ class V41Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer):
         if (layer.weight_scale_inv.view(torch.uint8) == 255).any():
             raise ValueError("Nonfinite UE8M0 scale in V4.1 draft weights")
+        self.prepare_q8(layer)
+
+    @staticmethod
+    def prepare_q8(layer):
+        """A second, QPN8 fragment-order copy for 1..8-row decode (HMMA).
+
+        The checkpoint layout stays for prefill. Grouped ``wo_a`` keeps one
+        prepared copy per 1024-row O group. Re-run after the scales change.
+        """
+        layer.v41_q8 = layer.v41_q8_groups = layer.v41_q8_grouped = None
+        if not q8_ready() or not layer.weight.is_cuda:
+            return
+        weight, scales = layer.weight.data, layer.weight_scale_inv.data
+        layer.v41_q8 = q8_prepare(weight, scales)
+        if weight.shape[0] % 1024 == 0 and weight.shape[1] == 4096:
+            layer.v41_q8_groups = [
+                q8_prepare(
+                    weight[g * 1024 : (g + 1) * 1024],
+                    scales[g * 32 : (g + 1) * 32],
+                )
+                for g in range(weight.shape[0] // 1024)
+            ]
+            if _Q8_GROUPED and layer.v41_q8 is not None:
+                # All groups in one launch (gemm_grouped) on the full prepack;
+                # tickets re-arm themselves after every launch.
+                tickets = torch.zeros(
+                    weight.shape[0] // 32, dtype=torch.int32, device=weight.device
+                )
+                layer.v41_q8_grouped = (*layer.v41_q8[:2], tickets)
 
     def apply(self, layer, x, bias=None):
+        prepared = getattr(layer, "v41_q8", None)
+        if prepared is not None and 1 <= x.shape[0] <= 8 and x.is_contiguous():
+            return q8_linear(x, prepared, layer.weight.shape[0], bias)
+        if prepared is not None and _rows_eligible(x):
+            out = q8_rows(x, prepared[0], prepared[1], layer.weight.shape[0])
+            return out if bias is None else out + bias
         return fp8_block32_linear(x, layer.weight, layer.weight_scale_inv, bias)
 
     def apply_grouped(self, layer, x):
@@ -294,6 +472,29 @@ class V41Fp8LinearMethod(LinearMethodBase):
             or layer.weight.shape[0] != x.shape[1] * 1024
         ):
             raise ValueError("V4.1 grouped FP8 projection requires 1024 rows/group")
+        grouped = getattr(layer, "v41_q8_grouped", None)
+        if grouped is not None and 1 <= x.shape[0] <= 8:
+            packed, half_scales, tickets = grouped
+            out = torch.empty(
+                x.shape[0], layer.weight.shape[0], dtype=torch.float16, device=x.device
+            )
+            # Measured best at K=4096, 2 groups/rank: 4 warps x 8 K-parts.
+            torch.ops.v41q8.gemm_grouped(
+                out, x.contiguous(), packed, half_scales, tickets, 4, 8, 2
+            )
+            return out
+        if grouped is not None and _rows_eligible(x):
+            packed, half_scales, tickets = grouped
+            return q8_rows(x, packed, half_scales, layer.weight.shape[0], tickets)
+        groups = getattr(layer, "v41_q8_groups", None)
+        if groups is not None and 1 <= x.shape[0] <= 8 and all(groups):
+            return torch.cat(
+                [
+                    q8_linear(x[:, group].contiguous(), groups[group], 1024)
+                    for group in range(x.shape[1])
+                ],
+                dim=-1,
+            )
         return torch.cat(
             [
                 fp8_block32_linear(
@@ -308,3 +509,85 @@ class V41Fp8LinearMethod(LinearMethodBase):
             ],
             dim=-1,
         )
+
+
+class Q8Fused:
+    """Same-input FP8 projections as one v41q8 GEMM (``dense_tm.fused``).
+
+    Concatenated rows of e.g. wq_a+wkv or the shared expert's gate+up; the
+    outputs are column views of one result.
+    """
+
+    def __init__(self, prepared, widths):
+        self.prepared, self.widths = prepared, tuple(widths)
+        self.n = sum(widths)
+        # VLLM_V41_BATCH decode rows (9..64) take the multi-row kernel.
+        self.max_m = _ROWS_MAX if _BATCH_ROWS else 8
+
+    def __call__(self, x):
+        if 8 < x.shape[0] <= self.max_m and not _ABLATE_DENSE:
+            out = q8_rows(x, self.prepared[0], self.prepared[1], self.n)
+            return [part.contiguous() for part in out.split(self.widths, dim=-1)]
+        if len(self.widths) == 2 and 1 <= x.shape[0] <= 8 and not _ABLATE_DENSE:
+            # Two parts: the kernel writes each contiguously (no split copies).
+            packed, half_scales, split = self.prepared
+            rows, dev = x.shape[0], x.device
+            a = torch.empty(rows, self.widths[0], dtype=torch.float16, device=dev)
+            b = torch.empty(rows, self.widths[1], dtype=torch.float16, device=dev)
+            torch.ops.v41q8.gemm2(a, b, x.contiguous(), packed, half_scales, split, 2)
+            return [a, b]
+        out = q8_linear(x.contiguous(), self.prepared, self.n)
+        # Consumers (shared SwiGLU, short RMSNorm) take contiguous matrices.
+        return [part.contiguous() for part in out.split(self.widths, dim=-1)]
+
+
+def attach_q8_fused(groups):
+    """groups: iterable of same-input FP8 linear tuples. Returns the count."""
+    count = 0
+    for linears in groups:
+        if not q8_ready() or any(
+            getattr(layer, "v41_q8", None) is None for layer in linears
+        ):
+            continue
+        weight = torch.cat([layer.weight.data for layer in linears])
+        scales = torch.cat(
+            [
+                layer.weight_scale_inv.data[: layer.weight.shape[0] // 32]
+                for layer in linears
+            ]
+        )
+        prepared = q8_prepare(weight, scales)
+        del weight, scales
+        if prepared is None:
+            continue
+        linears[0].v41_small_m = Q8Fused(
+            prepared, [layer.weight.shape[0] for layer in linears]
+        )
+        for layer in linears:
+            layer.v41_q8 = None  # the fused copy serves decode
+        count += 1
+    return count
+
+
+def q8_channel_prepare(weight):
+    """FP16 [N, K] -> E4M3 codes (QPN8 order) with one scale per row.
+
+    Lossy (round to nearest E4M3): for draft-only projections, whose outputs
+    are verified by the target. Returns (packed, FP16 scales * 256, split).
+    """
+    n, k = weight.shape
+    if not q8_ready() or n % 32 or k % 16 or (k // 16) % 16:
+        return None
+    scale = weight.float().abs().amax(dim=1).clamp_min(1e-30) / 448.0
+    codes = (weight.float() / scale[:, None]).to(torch.float8_e4m3fn)
+    packed = torch.empty(n * k, dtype=torch.uint8, device=weight.device)
+    torch.ops.v41q8.prepack(packed, codes.view(torch.uint8).contiguous())
+    split = 32 if (k // 16) % 32 == 0 else 16
+    return packed, (scale * 256.0).half().contiguous(), split
+
+
+def q8_channel_linear(x, prepared, n):
+    packed, scales, split = prepared
+    out = torch.empty(x.shape[0], n, dtype=torch.float16, device=x.device)
+    torch.ops.v41q8.gemm_channel(out, x.contiguous(), packed, scales, split)
+    return out

@@ -5,9 +5,15 @@
 import torch
 from typing_extensions import override
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer
+
+# Diagnostics: every batch size takes the general Markov sampling path.
+_GENERAL_DRAFTS = envs.VLLM_V41_GENERAL_DRAFTS == "1"
+# VLLM_V41_BATCH: greedy drafts of several requests in one captured graph.
+_BATCH_DRAFTS = envs.VLLM_V41_BATCH == "1" and envs.VLLM_V41_BATCH_DRAFTS == "1"
 
 
 class DSparkProposer(DFlashProposer):
@@ -54,6 +60,24 @@ class DSparkProposer(DFlashProposer):
         )
         self._last_confidence_logits: torch.Tensor | None = None
         self._last_verification_lengths: torch.Tensor | None = None
+
+    @override
+    def _maybe_share_embeddings(self, target_language_model: torch.nn.Module) -> None:
+        super()._maybe_share_embeddings(target_language_model)
+        # Under pipeline parallelism the legacy contract skips the embedding.
+        # V4.1 DSpark has no table of its own; it binds the target's copy on
+        # this (last) stage. Other DSpark models do not define the hook.
+        bind = getattr(self.model, "bind_pipeline_embedding", None)
+        if bind is not None:
+            bind(target_language_model)
+
+    @override
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        super().load_model(target_model)
+        # V4.1 VLLM_V41_MARKOV_SHARD: checked against the head shared above.
+        prepare = getattr(self.model, "prepare_markov_shard", None)
+        if prepare is not None:
+            prepare()
 
     def take_last_confidence_logits(self) -> torch.Tensor | None:
         confidence_logits = self._last_confidence_logits
@@ -118,19 +142,43 @@ class DSparkProposer(DFlashProposer):
         greedy_graph = getattr(self.model, "greedy_draft_tokens", None)
         if (
             greedy_graph is not None
-            and batch_size == 1
+            and not _GENERAL_DRAFTS
+            and (batch_size == 1 or _BATCH_DRAFTS)
             and logits is None
             and sampling_metadata is not None
-            and sampling_metadata.all_greedy
+            # Argmax drafts (draft_sample_method "greedy", the default) are
+            # the graph's tokens at any temperature: the rejection sampler
+            # verifies them without draft probabilities. The general path
+            # below gave the same drafts at T > 0 with a full-vocabulary head,
+            # bias and argmax per step (~1.5 ms per verify step at c8).
+            and (
+                sampling_metadata.all_greedy
+                or not self._enable_probabilistic_draft_probs
+            )
             and not self.collect_confidence_logits
             and self._static_draft_vocab is None
         ):
-            tokens = greedy_graph(hidden_states, self.input_ids[:1])
+            if batch_size == 1:
+                tokens = greedy_graph(hidden_states, self.input_ids[:1])
+            else:
+                # Pad to a power-of-two request count: a few captured graphs
+                # instead of one per count (each capture stalls serving).
+                padded = 1 << (batch_size - 1).bit_length()
+                anchors = self.input_ids[self._anchor_indices[:padded]]
+                rows = padded * self.num_speculative_tokens
+                if rows != num_rows:
+                    hidden = hidden_states.new_zeros(rows, hidden_states.shape[1])
+                    hidden[:num_rows].copy_(hidden_states)
+                else:
+                    hidden = hidden_states
+                tokens = greedy_graph(hidden, anchors)
+                if tokens is not None:
+                    tokens = tokens[:num_rows]
             if tokens is not None:
                 self._last_confidence_logits = None
                 self._last_verification_lengths = (
                     torch.full(
-                        (1,),
+                        (batch_size,),
                         self._max_verification_tokens,
                         dtype=torch.int32,
                         device=hidden_states.device,

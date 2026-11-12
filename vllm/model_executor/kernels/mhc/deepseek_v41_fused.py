@@ -40,6 +40,7 @@ def _transition_parts(
     H: tl.constexpr,
     COLS: tl.constexpr,
     CHUNKS: tl.constexpr,
+    DOTS: tl.constexpr = True,
 ):
     t, chunk = tl.program_id(0), tl.program_id(1)
     col = chunk * COLS + tl.arange(0, COLS)
@@ -98,6 +99,7 @@ def _transition_parts(
             squares + t * CHUNKS + chunk,
             tl.sum(n0 * n0 + n1 * n1 + n2 * n2 + n3 * n3, 0),
         )
+    if MIX and DOTS:
         for r in tl.static_range(24):
             w = fn + r * 4 * H
             d = (
@@ -113,6 +115,8 @@ COLS_T = 128
 CHUNKS_T = H // COLS_T  # 40
 TOK_T = 16
 _TOKEN_BLOCKED = envs.VLLM_V41_HC_TOKEN_BLOCKED == "1"
+# Prefill transition parts on v41sk.hc_parts_tb (8 tokens per CTA). Default off.
+_HC_PARTS_CUDA = envs.VLLM_V41_HC_PARTS_CUDA == "1"
 
 
 @triton.jit(do_not_specialize=["TOKENS"])
@@ -201,6 +205,7 @@ def _transition_finish(
     HC_EPS: tl.constexpr,
     ITERS: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCH: tl.constexpr = 0,
 ):
     t = tl.program_id(0)
     total = tl.full((), 0, tl.float32)
@@ -221,8 +226,10 @@ def _transition_finish(
         q = tl.zeros((4,), tl.float32)
         location = i[:, None] * 4 + i[None, :]
         m = tl.zeros((4, 4), tl.float32)
-        for c in range(CHUNKS):
-            row = dots + (t * CHUNKS + c) * 24
+        # DCH: dots chunks (0 = CHUNKS partial sums from the parts kernel,
+        # 1 = one GEMM row per token, VLLM_V41_HC_GEMM)
+        for c in range(DCH if DCH > 0 else CHUNKS):
+            row = dots + (t * (DCH if DCH > 0 else CHUNKS) + c) * 24
             p += tl.load(row + i)
             q += tl.load(row + 4 + i)
             m += tl.load(row + 8 + location)
@@ -241,6 +248,11 @@ def _transition_finish(
 
 
 _WINDOW = int(envs.VLLM_V41_HC_WINDOW)
+# VLLM_V41_HC_GEMM=1 (default off): prefill transitions take the 24 HC mix
+# projections as one FP32 cuBLAS GEMM over the new residual (as TileKernels'
+# mHC pre takes gemm_out_mul), instead of per (token, 256 columns) dot loops
+# that re-read fn from L2 (~2 MB per token).
+_HC_GEMM = envs.VLLM_V41_HC_GEMM == "1"
 COLS2 = int(envs.VLLM_V41_HC_COLS)
 CHUNKS2 = H // COLS2
 PARTS_WARPS = int(envs.VLLM_V41_HC_PW)
@@ -390,6 +402,31 @@ def hc_transition(
         raise ValueError("V4.1 fused HC transition requires FP32 [T, 4, 5120]")
     mix = fn is not None
     device = residual.device
+    if _HC_SIDE:
+        hc_join()
+    if (
+        _HC_SIDE
+        and mix
+        and 0 < tokens <= _HC_SIDE_MAX
+        and residual.is_cuda
+        and fn.dtype == torch.float32
+        and fn.is_contiguous()
+        and (_V3 or not _CUDA)
+    ):
+        return _hc_transition_side(
+            residual,
+            y,
+            post,
+            comb,
+            collapse_pre,
+            norm_weight,
+            fn,
+            scale,
+            base,
+            norm_eps,
+            hc_eps,
+            iters,
+        )
     if _V3 and 0 < tokens <= 8:
         return _hc_transition3(
             residual,
@@ -464,6 +501,7 @@ def hc_transition(
     else:
         dots = sq = csq
     out = torch.empty(tokens, H, dtype=torch.float16, device=device)
+    gemm = mix and _HC_GEMM and fn.dtype == torch.float32 and not _HC_PARTS_CUDA
     for a in range(0, tokens, window):
         b = min(a + window, tokens)
         n = b - a
@@ -471,26 +509,48 @@ def hc_transition(
             pre_w, post_w, comb_w = pre[a:b], post_n[a:b], comb_n[a:b]
         else:
             pre_w = post_w = comb_w = csq
-        _transition_parts[(n, CHUNKS)](
-            residual[a:b],
-            y[a:b],
-            post[a:b],
-            comb[a:b],
-            fn if mix else post,
-            collapse_pre[a:b],
-            cbuf,
-            dots,
-            sq,
-            csq,
-            MIX=mix,
-            H=H,
-            COLS=COLS,
-            CHUNKS=CHUNKS,
-            num_warps=4,
-            enable_fp_fusion=False,
-        )
+        if _HC_PARTS_CUDA and (fn is None or fn.dtype == torch.float32):
+            # CUDA, 8 tokens per CTA: fn coefficients read once per block.
+            from vllm.models.deepseek_v41.native import load_v41sk
+
+            load_v41sk()
+            torch.ops.v41sk.hc_parts_tb(
+                residual[a:b],
+                y[a:b].contiguous(),
+                post[a:b].contiguous(),
+                comb[a:b].contiguous(),
+                fn.contiguous() if mix else None,
+                collapse_pre[a:b].contiguous(),
+                cbuf,
+                dots,
+                sq,
+                csq,
+            )
+        else:
+            _transition_parts[(n, CHUNKS)](
+                residual[a:b],
+                y[a:b],
+                post[a:b],
+                comb[a:b],
+                fn if mix else post,
+                collapse_pre[a:b],
+                cbuf,
+                dots,
+                sq,
+                csq,
+                MIX=mix,
+                H=H,
+                COLS=COLS,
+                CHUNKS=CHUNKS,
+                DOTS=not gemm,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
+        if gemm:
+            # [n, 4H] new residual x [4H, 24] mix projections, FP32.
+            dots_g = torch.mm(residual[a:b].view(n, 4 * H), fn.view(24, 4 * H).t())
         _transition_finish[(n,)](
-            dots,
+            dots_g if gemm else dots,
             sq,
             csq,
             cbuf,
@@ -508,6 +568,7 @@ def hc_transition(
             HC_EPS=hc_eps,
             ITERS=iters,
             BLOCK=1024,
+            DCH=1 if gemm else 0,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -729,6 +790,113 @@ def _hc_transition_cuda(
         iters,
     )
     return out, ((pre, post_n, comb_n) if mix else None)
+
+
+# Mixes off the critical path (VLLM_V41_HC_SIDE, default off): the transition
+# runs without its mixes (only the collapse feeds the next sublayer) and
+# v41sk.hc_mix computes them from the updated residual on a side stream; they
+# are first used one sublayer later. Consumers call hc_join() (hc_transition
+# does it itself) before reading pre / post / comb.
+_HC_SIDE = envs.VLLM_V41_HC_SIDE == "1"
+# Token counts the side path covers (v41sk.hc_mix loops 8-token chunks; up to
+# 128). Several requests per step stay off the critical path too.
+_HC_SIDE_MAX = int(envs.VLLM_V41_HC_SIDE_MAX)
+_HC_STREAMS: dict = {}
+_HC_PENDING: list = []
+_HC_DEFERRED: list = []
+
+
+def hc_kick():
+    """Launch deferred side-stream mixes now (callers pick a point where the
+    main stream runs latency-bound kernels, not a bandwidth-bound GEMV)."""
+    while _HC_DEFERRED:
+        _HC_DEFERRED.pop(0)()
+
+
+def hc_join():
+    """Make the current stream wait for outstanding side-stream mixes."""
+    hc_kick()
+    if _HC_PENDING:
+        stream = torch.cuda.current_stream()
+        for event, _ in _HC_PENDING:
+            stream.wait_event(event)
+        _HC_PENDING.clear()
+
+
+def _hc_transition_side(
+    residual,
+    y,
+    post,
+    comb,
+    collapse_pre,
+    norm_weight,
+    fn,
+    scale,
+    base,
+    norm_eps,
+    hc_eps,
+    iters,
+):
+    from vllm.models.deepseek_v41.native import load_v41sk
+
+    load_v41sk()
+    hc_join()  # post / comb / collapse_pre may come from the previous side mix
+    out, _ = _hc_transition3(
+        residual,
+        y,
+        post,
+        comb,
+        collapse_pre,
+        norm_weight,
+        None,
+        None,
+        None,
+        norm_eps,
+        hc_eps,
+        iters,
+    )
+    tokens, device = residual.shape[0], residual.device
+    main = torch.cuda.current_stream(device)
+    key = (device, main.cuda_stream)
+    state = _HC_STREAMS.get(key)
+    if state is None:
+        state = _HC_STREAMS[key] = (
+            torch.cuda.Stream(device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+        )
+    side, ticket = state
+    pre = torch.empty(tokens, 4, dtype=torch.float32, device=device)
+    post_n = torch.empty_like(pre)
+    comb_n = torch.empty(tokens, 4, 4, dtype=torch.float32, device=device)
+    ws = torch.empty(80 * tokens * 25, dtype=torch.float32, device=device)
+
+    def launch():
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):
+            torch.ops.v41sk.hc_mix(
+                residual,
+                fn,
+                scale,
+                base,
+                pre,
+                post_n,
+                comb_n,
+                ws,
+                ticket,
+                norm_eps,
+                hc_eps,
+                iters,
+            )
+            event = torch.cuda.Event()
+            event.record(side)
+        # Held until the join: no main-stream reuse of these before the side
+        # kernel is done (the join orders main after it).
+        _HC_PENDING.append((event, ws))
+
+    # Deferred to the next hc_kick (or hc_join); the residual is not written
+    # again before the join, so a later start reads the same values.
+    _HC_DEFERRED.append(launch)
+    return out, (pre, post_n, comb_n)
 
 
 _V3 = envs.VLLM_V41_HC_V3 == "1"

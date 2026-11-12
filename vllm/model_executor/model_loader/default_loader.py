@@ -184,6 +184,8 @@ class DefaultModelLoader(BaseModelLoader):
             "enable_multithread_load",
             "num_threads",
             "enable_weights_track",
+            # Read by the model itself (DeepSeek-V4.1's Engram row tables).
+            "engram_path",
         }
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 

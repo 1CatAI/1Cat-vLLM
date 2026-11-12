@@ -8,6 +8,7 @@ from typing import cast
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config.reasoning import ReasoningConfig
 from vllm.config.sm70_runtime import Sm70RuntimeConfig, bind_output_token_repair
 from vllm.lora.request import LoRARequest
@@ -29,6 +30,32 @@ from vllm.v1.sample.thinking_budget_state import (
 )
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
+
+# VLLM_V41_FAST_READD=1 (default off): re-adding a request (under PP it skips
+# pp_size - 1 of every pp_size steps and leaves the persistent batch each time)
+# copies cached NumPy arrays of its prompt and block ids, converting only what
+# the lists gained since the last re-add, instead of the whole Python lists.
+_V41_FAST_READD = envs.VLLM_V41_FAST_READD == "1"
+
+
+def _grown_array(request: "CachedRequestState", key: str, values: list[int]):
+    """``values`` (a list that only grows) as int32 NumPy, cached on request."""
+    caches = request.__dict__.setdefault("_v41_arrays", {})
+    n = len(values)
+    entry = caches.get(key)
+    if entry is None or entry[0] is not values or entry[2] > n:
+        buffer = np.asarray(values, dtype=np.int32)
+        caches[key] = [values, buffer, n]
+        return buffer
+    _, buffer, filled = entry
+    if n > filled:
+        if n > buffer.shape[0]:
+            grown = np.empty(max(n, 2 * buffer.shape[0]), dtype=np.int32)
+            grown[:filled] = buffer[:filled]
+            buffer = entry[1] = grown
+        buffer[filled:n] = values[filled:n]
+        entry[2] = n
+    return buffer[:n]
 
 
 @dataclass
@@ -369,7 +396,11 @@ class InputBatch:
         start_idx = num_prompt_tokens
         end_idx = start_idx + len(request.output_token_ids)
         if request.prompt_token_ids is not None:
-            self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
+            self.token_ids_cpu[req_index, :num_prompt_tokens] = (
+                _grown_array(request, "prompt", request.prompt_token_ids)
+                if _V41_FAST_READD
+                else request.prompt_token_ids
+            )
             if request.prompt_is_token_ids is not None:
                 self.is_token_ids[req_index, :num_prompt_tokens] = (
                     request.prompt_is_token_ids
@@ -386,7 +417,16 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
-        self.block_table.add_row(request.block_ids, req_index)
+        if _V41_FAST_READD:
+            self.block_table.add_row(
+                tuple(
+                    _grown_array(request, f"blocks{i}", ids)
+                    for i, ids in enumerate(request.block_ids)
+                ),
+                req_index,
+            )
+        else:
+            self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
             if sampling_params.sampling_type == SamplingType.GREEDY:
